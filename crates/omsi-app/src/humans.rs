@@ -5408,7 +5408,29 @@ impl Humans {
             Place::Ground => {
                 p.position.x = w.pos.x;
                 p.position.y = w.pos.y;
-                if let Some(z) = world.walk_height_near(p.position.x, p.position.y, p.position.z) {
+                // [ROLLBACK bridge-1] a pavement path over the road carries the walker at its
+                // own height: a footbridge is an editor-only spline placed at height with no
+                // floor of its own (BeijingCity's `Human_path.sli`, its drawn profile 100 m
+                // under ground, the bridge mesh `[nocollision]`), so the probe found the road
+                // six metres below and lowered the people onto it, where they crossed the
+                // junction on the bridge's line, through the traffic and past the lights.
+                // Omsi.exe walks its people at the path's height.
+                let path_z = match (&p.state, net) {
+                    (State::Strolling(walk), Some(net)) => walk.legs.get(walk.leg).and_then(|leg| {
+                        let l = net.lanes.get(leg.lane)?;
+                        let s = if leg.b >= leg.a { leg.a + walk.s } else { leg.a - walk.s };
+                        Some(l.at(s.clamp(0.0, l.length())).0.z)
+                    }),
+                    _ => None,
+                };
+                let floor = world
+                    .walk_height_near(p.position.x, p.position.y, p.position.z)
+                    .map(|z| match path_z {
+                        Some(pz) if pz - z > 1.0 => pz,
+                        _ => z,
+                    })
+                    .or(path_z);
+                if let Some(z) = floor {
                     // up a kerb quickly, down it smoothly (the feet find the kerb themselves);
                     // more than a kerb below the surface is no step but a wrong height (the
                     // pavement's tile came after them): straight onto it
