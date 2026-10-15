@@ -2077,7 +2077,9 @@ impl AiState {
     /// A random way on from the end of `lane`. Lanes the map closes to this vehicle ([rule]
     /// no_cars, bus, trucks: `Lane::allows`) and lanes whose traffic density is zero are not driven
     /// into - filtering them only at spawn still let cars turn into a pedestrian street or a
-    /// depot yard from next door. A car that has taken a turn lane takes the turn.
+    /// depot yard from next door. A car that has taken a turn lane takes the turn. A way that
+    /// ends the network just ahead (`Network::reach`) is taken like any other, as in OMSI: the
+    /// car is taken away where it runs off the end.
     fn choose_after(
         &mut self,
         net: &Network,
@@ -2108,15 +2110,6 @@ impl AiState {
         let weighted = pooled.is_some();
         let open = pooled.unwrap_or_else(|| open_to(false));
         let mut choices = if open.is_empty() { next.clone() } else { open };
-        // and a way that goes on rather than into the end of the network, where there is
-        // the choice (the map's edge is where OMSI takes its cars away; a village like
-        // Grundorf had a queue of twenty growing at the end of its one outbound road)
-        if l.kind == LaneKind::Street && net.reach.len() == net.lanes.len() {
-            let through: Vec<usize> = choices.iter().copied().filter(|&n| net.reach[n] >= DEAD_END).collect();
-            if !through.is_empty() {
-                choices = through;
-            }
-        }
         if self.turn_wish != 0 {
             let wished: Vec<usize> = choices.iter().copied().filter(|&n| net.lanes[n].turn == self.turn_wish).collect();
             if !wished.is_empty() {
@@ -3152,8 +3145,10 @@ mod tests {
     }
 
     #[test]
-    fn a_driver_with_a_choice_keeps_out_of_a_dead_end() {
-        // a lane that forks: one way ends after 50 m, the other runs round a long loop
+    fn a_driver_with_a_choice_takes_a_dead_end_like_any_other_way() {
+        // a lane that forks: one way ends after 50 m, the other runs round a long loop;
+        // `reach` tells them apart, but the driver takes either (as in OMSI, which spawns on
+        // and drives into every path and takes the car away where it runs off the end)
         let a = LaneBuilder::arc(DVec3::ZERO, 0.0, 30.0, 0.0, 0.0, LaneKind::Street, 3.0);
         let dead = LaneBuilder::arc(DVec3::new(0.0, 30.0, 0.0), 10.0, 50.0, 0.0, 0.0, LaneKind::Street, 3.0);
         let on = LaneBuilder::arc(DVec3::new(0.0, 30.0, 0.0), 350.0, 700.0, 0.0, 0.0, LaneKind::Street, 3.0);
@@ -3161,11 +3156,17 @@ mod tests {
         net.link(1.5);
         assert_eq!(net.lanes[0].next.len(), 2);
         assert!(net.reach[1] < DEAD_END && net.reach[0] >= DEAD_END && net.reach[2] >= DEAD_END);
+        let (mut into_dead, mut on_round) = (0, 0);
         for seed in 1..40 {
             let mut car = AiState::new(0, 0.0, seed);
             car.plan_next(&net);
-            assert_eq!(car.planned_next, Some(2), "seed {seed}");
+            match car.planned_next {
+                Some(1) => into_dead += 1,
+                Some(2) => on_round += 1,
+                other => panic!("seed {seed}: {other:?}"),
+            }
         }
+        assert!(into_dead > 0 && on_round > 0, "{into_dead} into the dead end, {on_round} on round");
     }
 
     #[test]
