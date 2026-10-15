@@ -813,6 +813,9 @@ impl Viewer {
 /// How far from the player cars are kept (m) and how far out of sight one may be before it
 /// is taken off (m); in plain view a car stays until it is too small to see.
 const DESPAWN_FACTOR: f64 = 1.6;
+/// [ROLLBACK jamguard-1] See `Traffic::jammed`.
+const JAM_MIN_CARS: usize = 15;
+const JAM_SHARE: f32 = 0.35;
 /// [ROLLBACK appearfar-1] Further off than this (m) a random car may appear in plain view.
 const APPEAR_IN_VIEW_BEYOND: f64 = 300.0;
 
@@ -2791,6 +2794,13 @@ impl Traffic {
             })
             .count();
         let mut count = unscheduled;
+        // [ROLLBACK jamguard-1] nothing into a jam (see `jammed`)
+        if kind == LaneKind::Street && !self.initial && self.jammed(center) {
+            if self.debug_population {
+                log::info!("population t={:.1}: the road is jammed, no car put down ({} in range)", self.time, unscheduled);
+            }
+            return;
+        }
         while count < target && attempts < target * 12 {
             attempts += 1;
             let x = self.rand_f() as f32 * total_w;
@@ -2828,6 +2838,15 @@ impl Traffic {
                 .cars
                 .iter()
                 .any(|c| (c.vehicle.position - p).length() < 14.0)
+            {
+                continue;
+            }
+            // [ROLLBACK jamguard-1] nor behind a car standing on this lane within 60 m
+            // ahead: a car put down behind a queue only lengthens it
+            if kind == LaneKind::Street
+                && self.cars.iter().any(|c| {
+                    c.state.lane == lane && c.state.s > s && c.state.s - s < 60.0 && c.stopped > 3.0
+                })
             {
                 continue;
             }
@@ -2949,8 +2968,28 @@ impl Traffic {
 
     /// The cars out of range that have come near again take their bodies back - where
     /// nobody sees it happen, up to a little over the number asked for around the player.
+    /// [ROLLBACK jamguard-1] The traffic about `center` is jammed: of the random cars within
+    /// the spawn radius (at least `JAM_MIN_CARS` of them), more than `JAM_SHARE` have stood
+    /// for five seconds. No new car is put down then, and none woken - every one put into a
+    /// jam only lengthens it, and the spawner filled a boulevard bumper to bumper in every
+    /// lane until the junctions locked (BeijingCity, a target of 490 cars).
+    fn jammed(&self, center: DVec3) -> bool {
+        let r = self.spawn_radius;
+        let (mut standing, mut all) = (0usize, 0usize);
+        for c in &self.cars {
+            if c.is_bus() || c.gone || c.at_stop() || (c.vehicle.position - center).length() > r {
+                continue;
+            }
+            all += 1;
+            if c.stopped > 5.0 {
+                standing += 1;
+            }
+        }
+        all >= JAM_MIN_CARS && standing as f32 > JAM_SHARE * all as f32
+    }
+
     fn wake_dormant(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, target: usize) {
-        if self.dormant.is_empty() {
+        if self.dormant.is_empty() || self.jammed(center) {
             return;
         }
         let active = self.cars.iter().filter(|c| !c.is_bus() && !c.gone).count();
