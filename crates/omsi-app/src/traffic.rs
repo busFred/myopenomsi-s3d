@@ -1037,6 +1037,9 @@ pub struct Traffic {
     count_near: Option<(DVec3, f64)>,
     /// LAN play: where the other players are (host): the traffic is kept around them too.
     pub lan_centers: Vec<DVec3>,
+    /// [ROLLBACK clockjump-traffic-1] The clock as of the last `note_clock` (NaN before the
+    /// first), for telling a time set by hand from the clock running.
+    clock_seen: f64,
 }
 
 /// `[boundingbox]` of a vehicle that gives none.
@@ -1484,6 +1487,25 @@ impl Traffic {
     /// Make the population deterministic for a LAN room.  The room's session id is
     /// shared by the host and every client, so the same map/time produces the same
     /// initial cars instead of each process inventing a different world.
+    /// [ROLLBACK clockjump-traffic-1] Note the clock (`day_time`, set before): true when it
+    /// was set to another time by hand - a step of over 90 s beyond what the time speed makes
+    /// in a frame (as `Schedule::note_clock`).
+    pub fn note_clock(&mut self, dt: f64, speed: f64) -> bool {
+        let jumped = self.clock_seen.is_finite() && (self.day_time - self.clock_seen).abs() > 90.0 + dt.max(0.0) * speed.max(1.0) * 5.0;
+        self.clock_seen = self.day_time;
+        jumped
+    }
+
+    /// [ROLLBACK clockjump-traffic-1] The clock was set to another time: the next population
+    /// pass fills the roads up as at load, cars appearing anywhere - the density of the new
+    /// hour came at once, but the cars only where nobody saw them appear, and a jump from the
+    /// early morning into the rush hour left the streets empty for minutes.
+    pub fn clock_jumped(&mut self) {
+        if !self.mirror {
+            self.initial = true;
+        }
+    }
+
     pub fn set_lan_seed(&mut self, seed: u64) {
         self.rng = seed | 1;
     }
@@ -1828,6 +1850,7 @@ impl Traffic {
             mirror: false,
             count_near: None,
             lan_centers: Vec::new(),
+            clock_seen: f64::NAN,
         };
         t.sort_parked(parked_cars, lanes);
         Ok(t)
