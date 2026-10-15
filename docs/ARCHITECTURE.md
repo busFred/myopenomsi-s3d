@@ -1030,7 +1030,12 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   the heart of a puddle) and every use of the friction in the step - the longitudinal clamp,
   the slip and lock of the wheel, the lateral cap and the holding threshold - takes the
   tyre's own. `OMSI_UNIFORM_GRIP=1` gives all tyres the road's one friction again. Bare
-  terrain is `Soft` whatever is painted on it (the ground paint lives on the GPU).
+  terrain reads the ground brush: each tile's paint masks (`load_ground_paint`, the GPU's
+  layers) are summed once into a 128 x 128 raster of kinds (`omsi_geometry::GroundPaint`,
+  `World::ground_paint`, in and out with the tile's `Terrain`) - the base `[groundtex]`
+  everywhere, each painted layer's kind where its alpha covers, an unclassified layer leaving
+  what is under it - so a car park painted asphalt or a side street painted cobbles grips as
+  such, and puddles may stand on it; unpainted terrain stays `Soft`.
   *Open differential* (diff-1): `M_Wheel` went to every driven wheel in a fixed share; a bus
   axle is an open differential, so the side with grip passes on no more than the spinning
   side's sliding friction and nothing while its partner is in the air (`step_slice`, before
