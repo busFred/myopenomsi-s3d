@@ -1031,6 +1031,11 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   the slip and lock of the wheel, the lateral cap and the holding threshold - takes the
   tyre's own. `OMSI_UNIFORM_GRIP=1` gives all tyres the road's one friction again. Bare
   terrain is `Soft` whatever is painted on it (the ground paint lives on the GPU).
+  *Open differential* (diff-1): `M_Wheel` went to every driven wheel in a fixed share; a bus
+  axle is an open differential, so the side with grip passes on no more than the spinning
+  side's sliding friction and nothing while its partner is in the air (`step_slice`, before
+  the tyre forces). `OMSI_NO_DIFF=1` restores the fixed shares. `Velocity` and `n_Wheel`
+  stay the mean of the driven wheels, so a spinning wheel still shows to the ASR scripts.
 * **Mouse steering** (0x6f4284): the window's full width is the full lock, divided by
   max(1, km/h / 10); a one-second ease-in after switching on; the mouse owns the wheel (a
   steering key's leftover no longer takes over when the cursor passes the middle). The speed

@@ -55,6 +55,13 @@ fn uniform_grip_default() -> bool {
     *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_UNIFORM_GRIP").is_some())
 }
 
+/// `OMSI_NO_DIFF=1`: every driven wheel takes its fixed share of `M_Wheel` whatever its
+/// partner across the axle does (the old split; A/B).
+fn open_diff_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_NO_DIFF").is_none())
+}
+
 /// Grip of a tyre on each kind of ground, as a share of the road's own (`road_grip`: dry
 /// asphalt 0.85, wet 0.6, snow 0.3, ice 0.12). Concrete holds like asphalt; setts and slabs
 /// are polished by the traffic and take about four fifths of it dry and less wet (the
@@ -467,6 +474,9 @@ pub struct RigidBody {
     /// no surfaces, ode.dll gets one `mu`); `OMSI_UNIFORM_GRIP=1`, and the default of a
     /// body whose ground reports no surface.
     pub uniform_grip: bool,
+    /// An open differential on every driven axle (`OMSI_NO_DIFF=1` gives each driven wheel
+    /// its fixed share whatever its partner does, as before). See `step_slice`.
+    pub open_diff: bool,
     /// Wheels a face stopped during the last step, one entry per wheel.
     pub wheel_impacts: Vec<Impact>,
     /// The parts coupled behind (see [`CoupledPart`]); `drive_torque` is shared by their
@@ -537,7 +547,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, street_cond: 0.0, uniform_grip: uniform_grip_default(), wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, street_cond: 0.0, uniform_grip: uniform_grip_default(), open_diff: open_diff_default(), wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
     }
 
     /// [ROLLBACK payload-121] Carry `kg` of passengers whose centre is at `at` (the model's frame): the body's
@@ -601,6 +611,7 @@ impl RigidBody {
         n.friction = self.friction;
         n.street_cond = self.street_cond;
         n.uniform_grip = self.uniform_grip;
+        n.open_diff = self.open_diff;
         n.wheel_impacts = self.wheel_impacts.clone();
         n.coupled = self.coupled.clone();
         n.spawned_inside = self.spawned_inside.clone();
@@ -1188,6 +1199,36 @@ impl RigidBody {
                     lateral: false,
                     wheel: None,
                 });
+            }
+            // The differential. Omsi.exe hands every driven wheel its fixed share of
+            // `M_Wheel` whatever the one across the axle does, and so did this body: a bus
+            // with one rear wheel on ice still had half its drive at the other, and an ASR
+            // script never saw the case it is written for. A bus axle has an open
+            // differential: both sides get the same torque, so the side with grip can pass
+            // on no more than the side that spins - the sliding friction under the spinning
+            // tyre - and nothing at all while its partner hangs in the air and takes the
+            // whole torque into its own spin. (A limited-slip or locked axle is a script's
+            // or a file's business: none of the stock buses has one.)
+            if self.open_diff {
+                let axles = self.wheel_axle.iter().copied().max().map_or(0, |a| a + 1);
+                for a in 0..axles {
+                    let sides: Vec<usize> = (0..self.wheels.len()).filter(|&i| self.wheel_axle[i] == a && self.wheels[i].driven).collect();
+                    if sides.len() != 2 {
+                        continue;
+                    }
+                    let at = |i: usize| contacts.iter().position(|c| c.wheel == Some(i));
+                    let (l, r) = (at(sides[0]), at(sides[1]));
+                    for (mine, partner, partner_wheel) in [(l, r, sides[1]), (r, l, sides[0])] {
+                        let Some(k) = mine else { continue };
+                        let cap = match partner {
+                            None => 0.0,
+                            Some(j) if self.wheels[partner_wheel].slipping => contacts[j].mu * contacts[j].grip,
+                            Some(_) => f32::INFINITY,
+                        };
+                        let d = contacts[k].drive;
+                        contacts[k].drive = d.clamp(-cap, cap);
+                    }
+                }
             }
             // Tyre forces as OMSI has them (Omsi.exe 0x7e2dc1..0x7e44ee).
             // Along the tyre: a rolling one passes on the drive and the brake, a slipping one
@@ -2652,4 +2693,37 @@ mod tests {
         assert!(wheels.iter().all(|w| w.locked), "every wheel locked under a brake of the body's weight");
     }
 
+    /// The left rear tyre in a puddle on the grass, a third of the asphalt's grip: with the
+    /// open differential it spins and the right one, whatever it could hold, passes on no
+    /// more than the spinning side does; with the fixed shares (`OMSI_NO_DIFF`) the right
+    /// one still drove the bus at nearly its full grip.
+    #[test]
+    fn one_wheel_in_a_puddle_spins_and_takes_the_drive_of_the_other() {
+        let g = road(1e9, 0.0);
+        let puddle = |x: f64, y: f64| x < 0.0 && y < 0.0;
+        let s = move |x: f64, y: f64, _z: f64| if puddle(x, y) { Surface { kind: SurfaceKind::Soft, water: 1.0 } } else { Surface { kind: SurfaceKind::Asphalt, water: 0.0 } };
+        let pull = |open: bool| {
+            let mut rb = RigidBody::from_definition(&bus(), &[]);
+            rb.open_diff = open;
+            rb.place(DVec3::ZERO, 0.0);
+            run(&mut rb, 1.0, 0.0, 0.0, &g);
+            let v0 = rb.forward_speed();
+            for _ in 0..60 {
+                rb.step_on(1.0 / 60.0, 30_000.0, &[0.0; 4], 0.0, &g, &s);
+            }
+            (rb.forward_speed() - v0, rb.wheels.clone())
+        };
+        let (dv_open, w) = pull(true);
+        let (dv_fixed, _) = pull(false);
+        assert!(w[2].slipping && w[2].spin * w[2].radius > rb_speed(&w) + 1.0, "the left rear spins: {} rad/s", w[2].spin);
+        assert!(!w[3].slipping, "the right rear grips");
+        assert!(w[2].mu < 0.4 * w[3].mu, "{} {}", w[2].mu, w[3].mu);
+        assert!(dv_open > 0.3, "it still pulls away: {dv_open}");
+        assert!(dv_open < 0.65 * dv_fixed, "open {dv_open} fixed {dv_fixed}");
+    }
+
+    /// The ground speed under the rear right tyre (the body's, for a straight run).
+    fn rb_speed(w: &[RigidWheel]) -> f32 {
+        w[3].spin * w[3].radius
+    }
 }
