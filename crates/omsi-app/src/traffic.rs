@@ -2743,25 +2743,15 @@ impl Traffic {
             // zero, are not spawned on at all; a lower density makes a lane that much less
             // likely to be picked
             .filter(|(_, l)| !l.no_cars && l.density > 0.0)
-            // [ROLLBACK spawnnear-1] nor a lane that lies wholly within 40 m of the player:
-            // nothing is put down there (below), and the hundreds of short paths of a big
-            // crossing object round the bus took nine picks in ten (BeijingCity, Ditan:
-            // 5 600 of 6 000 attempts a pass thrown away, 0 to 4 cars put down against a
-            // target of 500 - the junction stayed empty)
-            .filter(|(_, l)| {
-                kind != LaneKind::Street || l.points.iter().any(|p| (*p - center).truncate().length() >= 40.0)
-            })
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
             // [ROLLBACK crowd-96] and the nearer the player, the likelier: a low target
             // went out over the whole 400 m round and left the streets about the player
-            // empty. [ROLLBACK spawnnear-1] Level out to 150 m and falling gently beyond
-            // (was falling from 0 m, half at 150 m): within 350 m a car may appear only
-            // behind a building, so the picks have to reach the ground where it can.
+            // empty
             .map(|(i, l)| {
                 let near = if kind == LaneKind::Street {
-                    let d = (((l.start() - center).truncate().length() - 150.0).max(0.0) / 250.0) as f32;
+                    let d = ((l.start() - center).truncate().length() / 150.0) as f32;
                     1.0 / (1.0 + d * d)
                 } else {
                     1.0
