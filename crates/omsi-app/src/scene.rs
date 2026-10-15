@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use glam::{DVec2, DVec3, Mat4};
 use hashbrown::HashMap;
 use omsi_geometry::{
-    build_spline_mesh, build_terrain_mesh, mesh_from_o3d, object_rotation, MeshData, SplineCurve,
-    TileSurface,
+    build_spline_mesh, build_terrain_mesh, mesh_from_o3d, object_rotation, FaceClasses, MeshData,
+    SplineCurve, SurfaceKind, TileSurface,
 };
 use omsi_map::{tile_size, GlobalCfg, Terrain};
 use omsi_model::{MaterialDef, MeshDef, Model};
@@ -23,6 +23,7 @@ use omsi_texture::{Image, TextureCache, TextureData};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// A loaded scenery object type: model meshes + material descriptions.
@@ -486,6 +487,9 @@ pub struct SplineType {
     pub dir: PathBuf,
     /// The `.surf` map of each of `def.textures` (see [`surf_map`]).
     pub surf: Vec<Option<Arc<omsi_geometry::HeightMap>>>,
+    /// What each of `def.textures` is a picture of, read off its file name
+    /// ([`surface_class`]): the grip of the faces it draws.
+    pub classes: Vec<SurfaceKind>,
 }
 
 #[derive(Debug, Default)]
@@ -709,8 +713,8 @@ pub struct StagedTile {
     /// The whole spline meshes, in the order of `splines`, until the tile is placed.
     meshes: Mutex<Option<Vec<Arc<MeshData>>>>,
     /// The `[heightprofile]` surfaces of the tile's splines (local to `origin`) with their
-    /// world bounds and `.surf` maps: what the wheels roll on.
-    drive: Vec<(MeshData, [f64; 4], Option<omsi_geometry::SurfFaces>)>,
+    /// world bounds, `.surf` maps and the kinds of their textures: what the wheels roll on.
+    drive: Vec<(MeshData, [f64; 4], Option<omsi_geometry::SurfFaces>, Option<FaceClasses>)>,
     /// Lanes, taken when the tile is loaded for the first time.
     lanes: Mutex<Vec<Lane>>,
     /// The street lanes' points of the tile's splines, kept for good (what an object's box
@@ -1987,6 +1991,10 @@ pub struct World {
     pub terrains: Arc<RwLock<HashMap<(i32, i32), Arc<Terrain>>>>,
     /// Surface rasters (roads) by tile coordinate.
     pub surfaces: Arc<RwLock<HashMap<(i32, i32), Arc<TileSurface>>>>,
+    /// The wetness the renderer draws the puddles with this frame (`puddles::road_wetness`:
+    /// 0..1, 0 under snow), an f32 as its bits, written where the spray reads it and read by
+    /// every [`DriveGround`] under a tyre - the tyres and the picture agree on the water.
+    pub road_wetness: Arc<AtomicU32>,
     /// GPU resources per vehicle type (by .bus path) and paint scheme, shared by AI vehicles.
     vehicle_gpu: Mutex<HashMap<VehicleKey, VehicleSet>>,
     /// GPU textures of vehicles by file: one bus spawned in twenty adverts used to upload
@@ -2572,13 +2580,52 @@ const WALL_TOP_STEP: f32 = 0.3;
 pub struct DriveGround {
     pub terrains: Arc<RwLock<HashMap<(i32, i32), Arc<Terrain>>>>,
     pub surfaces: Arc<RwLock<HashMap<(i32, i32), Arc<TileSurface>>>>,
+    /// [`World::road_wetness`]: how wet the roads are drawn (f32 bits), so that a tyre in a
+    /// drawn puddle finds the water the picture shows there.
+    pub wetness: Arc<AtomicU32>,
 }
+
+/// How far a tyre's settled height may lie off a road face for the face to be the one it
+/// stands on (m): a hair over the probe's own seam tolerance, under any painted layer.
+const SURFACE_FACE_TOL: f32 = 0.03;
+/// The same for the terrain, whose height is read off a raster the tyre only nearly agrees
+/// with (its samples are bilinear, the wheel model's own are the triangles).
+const SURFACE_TERRAIN_TOL: f32 = 0.08;
 
 type TileRefs = ((i32, i32), Option<Arc<TileSurface>>, Option<Arc<Terrain>>);
 
 impl omsi_sim::rigid::Ground for DriveGround {
     fn probe(&self, x: f64, y: f64, top: f64) -> omsi_sim::rigid::GroundProbe {
         drive_probe(&self.terrains, &self.surfaces, x, y, top)
+    }
+
+    /// The face under a tyre at (x, y, z), the height the wheel model settled on: the kind
+    /// of the road face there (within `SURFACE_FACE_TOL`), else `Soft` where the terrain is
+    /// that height (the verge, a field), else `Unknown` (a face nobody classified, or the
+    /// tyre is off the ground). Standing water only on a road face, and only where the
+    /// renderer's puddle mask puts it (the shader's noise on the CPU, `puddles::water_at`):
+    /// a puddle never lies on bare terrain, and a dry or snowy road has none. Called a few
+    /// times per wheel per frame: one map lock per call, one grid cell of faces, no
+    /// allocation.
+    fn surface(&self, x: f64, y: f64, z: f64) -> omsi_geometry::Surface {
+        let key = tile_key(x, y);
+        let lx = (x - key.0 as f64 * tile_size()) as f32;
+        let ly = (y - key.1 as f64 * tile_size()) as f32;
+        let surface = self.surfaces.read().get(&key).cloned();
+        let road = surface.as_deref().and_then(|s| s.drive.class_at(lx, ly, z as f32, SURFACE_FACE_TOL));
+        let kind = match road {
+            Some(k) => k,
+            None => {
+                let terrain = self.terrains.read().get(&key).cloned();
+                match terrain.as_deref() {
+                    Some(t) if (omsi_geometry::terrain_height(t, lx, ly) - z as f32).abs() <= SURFACE_TERRAIN_TOL => SurfaceKind::Soft,
+                    _ => SurfaceKind::Unknown,
+                }
+            }
+        };
+        let wetness = f32::from_bits(self.wetness.load(Ordering::Relaxed));
+        let water = if road.is_some() && wetness > 0.0 { crate::puddles::water_at(x, y, wetness).puddle } else { 0.0 };
+        omsi_geometry::Surface { kind, water }
     }
 
     /// The tiles under the vehicle are looked up once per step, not twice for every one of
@@ -2915,6 +2962,7 @@ impl World {
             object_dups: Mutex::new(HashMap::new()),
             terrains: Arc::new(RwLock::new(HashMap::new())),
             surfaces: Arc::new(RwLock::new(HashMap::new())),
+            road_wetness: Arc::new(AtomicU32::new(0f32.to_bits())),
             vehicle_gpu: Mutex::new(HashMap::new()),
             vehicle_textures: Default::default(),
             vehicle_meshes: Default::default(),
@@ -3276,7 +3324,8 @@ impl World {
                 let dirs = texture_dirs(&self.root, &dir);
                 let dirs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
                 let surf = def.textures.iter().map(|t| surf_map(&t.file, &dirs)).collect();
-                Arc::new(SplineType { dir, def, surf })
+                let classes = def.textures.iter().map(|t| surface_class(&t.file)).collect();
+                Arc::new(SplineType { dir, def, surf, classes })
             });
         self.spline_types
             .lock()
@@ -4051,7 +4100,7 @@ impl World {
                 let hp = omsi_geometry::build_height_profile_mesh(&st.def, &curve, s.mirror, origin);
                 if !hp.is_empty() {
                     let b = mesh_bounds(&hp, &Mat4::IDENTITY, origin);
-                    out.drive.push((hp, b, None));
+                    out.drive.push((hp, b, None, None));
                 }
             }
             let mesh = build_spline_mesh(&st.def, &curve, s.mirror, origin);
@@ -4129,7 +4178,12 @@ impl World {
                 };
                 // (every spline the game draws: Omsi.exe asks them all, roads or not)
                 if !heightprofile_ground() {
-                    out.drive.push((shape.clone(), bounds, omsi_geometry::SurfFaces::of(&mesh, &st.surf)));
+                    out.drive.push((
+                        shape.clone(),
+                        bounds,
+                        omsi_geometry::SurfFaces::of(&mesh, &st.surf),
+                        FaceClasses::of(&mesh, &st.classes),
+                    ));
                 }
                 let drivable = st.def.paths.iter().any(|pd| pd.kind == 0 || pd.kind == 1);
                 let overlay = !st.def.profiles.is_empty()
@@ -5510,11 +5564,12 @@ impl World {
                         );
                     }
                     // what the wheels roll on: the splines' height profiles
-                    for (hp, b, surf) in &q.drive {
+                    for (hp, b, surf, classes) in &q.drive {
                         if !outside(b) {
                             ts.add_spline_drive(
                                 hp,
                                 surf.as_ref(),
+                                classes.as_ref(),
                                 q.origin,
                                 tx,
                                 ty,
@@ -5612,6 +5667,8 @@ impl World {
                                 let dirs = ot.texture_dirs(&self.root);
                                 let dirs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
                                 let maps: Vec<_> = ot.meshes.get(k).map(|m| m.1.iter().map(|m| surf_map(&m.texture, &dirs)).collect()).unwrap_or_default();
+                                // (and what its textures are pictures of: the yard's grip)
+                                let classes: Vec<_> = ot.meshes.get(k).map(|m| m.1.iter().map(|m| surface_class(&m.texture)).collect()).unwrap_or_default();
                                 ts.add_drive_mesh_surf(
                                     mesh,
                                     &pose.rot,
@@ -5619,6 +5676,7 @@ impl World {
                                     tx,
                                     ty,
                                     omsi_geometry::SurfFaces::of(mesh, &maps).as_ref(),
+                                    FaceClasses::of(mesh, &classes).as_ref(),
                                 );
                                 wheel_meshes += 1;
                             }
@@ -13735,19 +13793,19 @@ mod tests {
             textures: vec![SplineTexture { file: file.into(), ..Default::default() }],
             ..Default::default()
         };
-        let ty = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::new(), surf: Vec::new() });
-        let other = Arc::new(SplineType { def: def("other.dds"), dir: PathBuf::new(), surf: Vec::new() });
-        let other_dir = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::from("another_pack"), surf: Vec::new() });
+        let ty = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::new(), surf: Vec::new(), classes: Vec::new() });
+        let other = Arc::new(SplineType { def: def("other.dds"), dir: PathBuf::new(), surf: Vec::new(), classes: Vec::new() });
+        let other_dir = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::from("another_pack"), surf: Vec::new(), classes: Vec::new() });
         let mut tested = def("curb.dds");
         tested.textures[0].alpha = 1;
-        let tested = Arc::new(SplineType { def: tested, dir: PathBuf::new(), surf: Vec::new() });
+        let tested = Arc::new(SplineType { def: tested, dir: PathBuf::new(), surf: Vec::new(), classes: Vec::new() });
         let mut blended = def("curb.dds");
         blended.textures[0].alpha = 2;
-        let blended = Arc::new(SplineType { def: blended, dir: PathBuf::new(), surf: Vec::new() });
+        let blended = Arc::new(SplineType { def: blended, dir: PathBuf::new(), surf: Vec::new(), classes: Vec::new() });
         let mut compatible = def("curb.dds");
         compatible.path = PathBuf::from("another_profile.sli");
         compatible.textures.push(SplineTexture { file: "unused-grass.dds".into(), ..Default::default() });
-        let compatible = Arc::new(SplineType { def: compatible, dir: PathBuf::new(), surf: Vec::new() });
+        let compatible = Arc::new(SplineType { def: compatible, dir: PathBuf::new(), surf: Vec::new(), classes: Vec::new() });
         let mesh = |x: f32, length: f32| Arc::new(MeshData {
             positions: vec![glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::new(x + length, 0.0, 0.0), glam::Vec3::new(x, 1.0, 0.0)],
             normals: vec![glam::Vec3::Z; 3],
@@ -14660,6 +14718,92 @@ pub struct NavigationMap {
     pub places: HashMap<i64, DVec3>,
     /// Street name signs: where, the object's heading and the name on it.
     pub signs: Vec<(DVec3, f64, String)>,
+}
+
+/// The tokens of a texture or asset file's stem, lower-cased: the words its author put in
+/// the name, split at anything that is not a letter or digit (`Str_2spur_6m` is `str`,
+/// `2spur`, `6m`). Kept apart from [`road_surface_name`]'s own split so both read alike.
+fn name_tokens(file: &str) -> Vec<String> {
+    let base = file.replace('\\', "/").rsplit('/').next().unwrap_or("").to_lowercase();
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(&base);
+    stem.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+/// What a texture is a picture of, read off its file name: the [`SurfaceKind`] of the faces
+/// drawn with it. OMSI's content has no surface attribute at all (one friction for the whole
+/// world, `StreetCond`), only the names its authors gave the textures, in German and English
+/// by turns (`Bordstein`, `pflaster_grau`, `asphalt_rough`, `gras_dunkel`). The checks go
+/// from the specific to the general - a kerb stone's texture often names the road it edges
+/// (`bordstein_asphalt`), cobbles name the street they pave (`pflaster_strasse`) - and a word
+/// that fits nothing is `Unknown`, which takes the road's own grip (a manhole cover is as
+/// good as the asphalt round it). Whole tokens, or a token's start where the word is a stem
+/// (`asph`, `gras`): `street` inside `streetlight` is no road, but a lamp's texture draws
+/// nothing a tyre stands on anyway.
+pub fn surface_class(texture_file: &str) -> SurfaceKind {
+    let tokens = name_tokens(texture_file);
+    let has = |words: &[&str]| tokens.iter().any(|t| words.contains(&t.as_str()));
+    let starts = |stems: &[&str]| tokens.iter().any(|t| stems.iter().any(|s| t.starts_with(s)));
+    // the kerb first: its texture names what it edges
+    if starts(&["bord", "kerb", "curb", "randstein"]) || has(&["kante", "kanten"]) {
+        return SurfaceKind::Kerb;
+    }
+    // then the paving: cobbles are laid on a street, slabs on a pavement, and the name says so
+    if starts(&["pflaster", "kopfstein", "cobble", "paving", "gehweg", "sidewalk", "pavement", "fliese", "mosaik", "platte"])
+        || has(&["sett", "setts", "slab", "slabs", "tile", "tiles"])
+    {
+        return SurfaceKind::Paving;
+    }
+    // the ground beside the road ("weg" alone is left out: a path, but as often a lane)
+    if starts(&["gras", "grass", "wiese", "rasen", "erde", "earth", "soil", "sand", "kies", "gravel", "schotter", "acker", "boden", "dreck", "lehm", "wald", "forest", "gruen", "grün", "beet"])
+        || has(&["feld", "mud", "dirt"])
+    {
+        return SurfaceKind::Soft;
+    }
+    if starts(&["beton", "concrete"]) {
+        return SurfaceKind::Concrete;
+    }
+    // (the street's name whole: `streetlight` and `strassenbahn` draw nothing a tyre stands on)
+    if starts(&["asph", "fahrbahn", "teer", "tarmac", "bitumen", "markierung", "marking"])
+        || has(&["str", "strasse", "straße", "street", "road", "roads", "line", "lines"])
+    {
+        return SurfaceKind::Asphalt;
+    }
+    SurfaceKind::Unknown
+}
+
+#[cfg(test)]
+mod surface_class_tests {
+    use super::surface_class;
+    use omsi_geometry::SurfaceKind::*;
+
+    #[test]
+    fn stock_texture_names() {
+        for (file, kind) in [
+            ("Texture/asphalt_rough.bmp", Asphalt),
+            ("Str_2spur_6m.bmp", Asphalt),
+            ("Splines\\Roads\\texture\\Str_1spur_3m_night.dds", Asphalt),
+            ("Fahrbahn_markierung.dds", Asphalt),
+            ("road_line_white.png", Asphalt),
+            ("Bordstein.bmp", Kerb),
+            ("bordstein_asphalt.bmp", Kerb),
+            ("Kerb_grey.dds", Kerb),
+            ("pflaster_grau.dds", Paving),
+            ("pflaster_strasse.bmp", Paving),
+            ("Gehweg_Platten.bmp", Paving),
+            ("cobbles.bmp", Paving),
+            ("gras_dunkel.bmp", Soft),
+            ("Wiese_01.dds", Soft),
+            ("gravel_path.png", Soft),
+            ("Schotter_hell.bmp", Soft),
+            ("Beton_hell.jpg", Concrete),
+            ("concrete_slab_old.dds", Paving),
+            ("Kanaldeckel.bmp", Unknown),
+            ("Streetlight_01.bmp", Unknown),
+            ("", Unknown),
+        ] {
+            assert_eq!(surface_class(file), kind, "{file}");
+        }
+    }
 }
 
 /// Whether an asset name describes a road surface. Match whole filename tokens so objects

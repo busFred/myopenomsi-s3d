@@ -1019,6 +1019,18 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   sin(x)/x a step, x = 1.5 sqrt(sum springs / mass) dt (0x7e4f55); no yaw damping.
   `cargo run --release -p omsi-sim --example handling -- <file.bus>...` prints yaw response,
   side slip, roll, roll frequency and settling per file.
+  *Grip per tyre* (grip-1): OMSI's tyres know one road - ode.dll gets one `mu` for the world
+  from `StreetCond`. Here every face a wheel can stand on carries a `SurfaceKind` read off its
+  texture's file name (`omsi-geometry::SurfaceKind`, `scene::surface_class`: asphalt, concrete,
+  paving, kerb, soft ground; height profiles and collision meshes stay `Unknown`), the
+  `DriveGrid` keeps it per triangle (`class_at`), and `Ground::surface` answers once a slice per
+  wheel under the hub what the tyre stands on and how deep in a puddle it is
+  (`puddles::water_at`, the renderer's own mask). `RigidBody::tyre_grip` scales the weather's
+  `road_grip` by it (setts 0.8 dry / 0.65 wet, grass 0.55 / 0.4, a kerb 0.9, towards 0.35 at
+  the heart of a puddle) and every use of the friction in the step - the longitudinal clamp,
+  the slip and lock of the wheel, the lateral cap and the holding threshold - takes the
+  tyre's own. `OMSI_UNIFORM_GRIP=1` gives all tyres the road's one friction again. Bare
+  terrain is `Soft` whatever is painted on it (the ground paint lives on the GPU).
 * **Mouse steering** (0x6f4284): the window's full width is the full lock, divided by
   max(1, km/h / 10); a one-second ease-in after switching on; the mouse owns the wheel (a
   steering key's leftover no longer takes over when the cursor passes the middle). The speed
