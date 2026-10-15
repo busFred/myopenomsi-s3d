@@ -3095,6 +3095,7 @@ impl Traffic {
             std::sync::Arc::new(crate::scene::DriveGround {
                 terrains: world.terrains.clone(),
                 surfaces: world.surfaces.clone(),
+                wetness: world.road_wetness.clone(),
             }) as std::sync::Arc<dyn omsi_sim::rigid::Ground>
         });
         vehicle.apply_paint_vars(scheme);

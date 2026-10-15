@@ -1269,12 +1269,43 @@ mod tests {
         // (the drive mesh keeps only the shape, as the tile loader stages it)
         let shape = MeshData { positions: mesh.positions.clone(), indices: mesh.indices.clone(), ..Default::default() };
         let mut ts = TileSurface::new(64);
-        ts.add_spline_drive(&shape, Some(&surf), DVec3::ZERO, 0, 0);
+        ts.add_spline_drive(&shape, Some(&surf), None, DVec3::ZERO, 0, 0);
         ts.finish();
         let at = |x: f32| ts.drive.probe(x, 1.0, 2.0).below.unwrap();
         assert!((at(2.5) - 1.02).abs() < 1e-4);
         assert!((at(0.1) - 0.98).abs() < 2e-3);
         assert!((at(22.5) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn face_classes_follow_the_material_slots_into_the_grid() {
+        // two faces in two slots: cobbles in slot 2, asphalt in slot 0 (slot 1 is a
+        // spline's wall tops, which the wheels never stand on)
+        let mesh = MeshData {
+            positions: vec![
+                Vec3::new(0.0, 0.0, 1.0), Vec3::new(10.0, 0.0, 1.0), Vec3::new(0.0, 10.0, 1.0),
+                Vec3::new(20.0, 0.0, 1.0), Vec3::new(30.0, 0.0, 1.0), Vec3::new(20.0, 10.0, 1.0),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+            ranges: vec![(0, 3, 2), (3, 3, 0)],
+            ..Default::default()
+        };
+        assert!(FaceClasses::of(&mesh, &[SurfaceKind::Unknown; 3]).is_none());
+        let classes = FaceClasses::of(&mesh, &[SurfaceKind::Asphalt, SurfaceKind::Unknown, SurfaceKind::Paving]).unwrap();
+        assert_eq!(classes.face(0), SurfaceKind::Paving);
+        assert_eq!(classes.face(1), SurfaceKind::Asphalt);
+        assert_eq!(classes.face(7), SurfaceKind::Unknown);
+        // a spline's drive mesh and a surface object's mesh both carry them to the wheels
+        let mut ts = TileSurface::new(64);
+        ts.add_spline_drive(&mesh, None, Some(&classes), DVec3::ZERO, 0, 0);
+        ts.add_drive_mesh_surf(&mesh, &Mat4::from_translation(Vec3::new(40.0, 0.0, 0.0)), DVec3::ZERO, 0, 0, None, Some(&classes));
+        ts.finish();
+        assert_eq!(ts.drive.class_at(2.5, 1.0, 1.0, 0.03), Some(SurfaceKind::Paving));
+        assert_eq!(ts.drive.class_at(22.5, 1.0, 1.0, 0.03), Some(SurfaceKind::Asphalt));
+        assert_eq!(ts.drive.class_at(42.5, 1.0, 1.0, 0.03), Some(SurfaceKind::Paving));
+        // too far off the face's height, or beside it: no road face there
+        assert_eq!(ts.drive.class_at(2.5, 1.0, 1.5, 0.03), None);
+        assert_eq!(ts.drive.class_at(15.0, 1.0, 1.0, 0.03), None);
     }
 
     #[test]
@@ -2020,14 +2051,97 @@ impl SurfFaces {
     }
 }
 
+/// The [`SurfaceKind`] of each material slot of a mesh, kept beside the mesh like
+/// [`SurfFaces`] (a spline's drive mesh keeps only its shape; its ranges tell which texture
+/// drew which face). Built from the textures' names by `omsi-app`'s `surface_class`.
+#[derive(Debug, Clone, Default)]
+pub struct FaceClasses {
+    pub ranges: Vec<(u32, u32, u32)>,
+    pub classes: Vec<SurfaceKind>,
+}
+
+impl FaceClasses {
+    /// Only where some texture was classified: a mesh of nothing but `Unknown` carries no
+    /// classes at all, and costs no lookup per face.
+    pub fn of(mesh: &MeshData, classes: &[SurfaceKind]) -> Option<FaceClasses> {
+        classes
+            .iter()
+            .any(|&c| c != SurfaceKind::Unknown)
+            .then(|| FaceClasses { ranges: mesh.ranges.clone(), classes: classes.to_vec() })
+    }
+
+    /// The kind of face `j`: that of the material slot whose range holds its first index
+    /// (`Unknown` past the end of the classes, or outside every range).
+    pub fn face(&self, j: usize) -> SurfaceKind {
+        let first = (j * 3) as u32;
+        self.ranges
+            .iter()
+            .find(|r| first >= r.0 && first < r.0 + r.1)
+            .and_then(|r| self.classes.get(r.2 as usize).copied())
+            .unwrap_or_default()
+    }
+
+    /// Bytes held on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.ranges.capacity() * 12 + self.classes.capacity()
+    }
+}
+
 /// A triangle without a `.surf` map in [`DriveGrid`].
 const NO_BUMP: u32 = u32::MAX;
+
+/// What a tyre stands on, told by the texture the face under it is drawn with (the map's
+/// `.sli` and `.sco` name their textures; `omsi-app`'s `surface_class` reads the kind off
+/// the file name). OMSI knows one road: its tyres get one friction for the whole world from
+/// `StreetCond`, inside ode.dll. Here each tyre asks the face under it, so that a bus with
+/// two wheels on the verge brakes crooked and one driven wheel on the cobbles spins first.
+/// `Unknown` is a face nobody classified (a height profile, a collision mesh): it takes the
+/// road's own grip.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceKind {
+    #[default]
+    Unknown = 0,
+    Asphalt = 1,
+    Concrete = 2,
+    /// Cobbles, setts and paving slabs.
+    Paving = 3,
+    /// A kerb stone or a traffic island's edge.
+    Kerb = 4,
+    /// Grass, earth, sand, gravel: the ground beside the road, and the terrain itself.
+    Soft = 5,
+}
+
+impl SurfaceKind {
+    /// The kind stored as one byte (see [`DriveGrid`]).
+    pub fn from_code(c: u8) -> SurfaceKind {
+        match c {
+            1 => SurfaceKind::Asphalt,
+            2 => SurfaceKind::Concrete,
+            3 => SurfaceKind::Paving,
+            4 => SurfaceKind::Kerb,
+            5 => SurfaceKind::Soft,
+            _ => SurfaceKind::Unknown,
+        }
+    }
+}
+
+/// The ground under one tyre as the tyre model wants it: the kind of face and the standing
+/// water on it (0 none .. 1 well inside a puddle; `omsi-app`'s `puddles::water_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Surface {
+    pub kind: SurfaceKind,
+    pub water: f32,
+}
 
 /// Upward-facing triangles of one tile (tile-local x/y in metres, absolute z), bucketed on a
 /// coarse grid so that a wheel asks only the few faces around it.
 #[derive(Debug, Clone, Default)]
 pub struct DriveGrid {
     pub tris: Vec<[Vec3; 3]>,
+    /// Per triangle: its [`SurfaceKind`] as a byte (`SurfaceKind::Unknown` where the face
+    /// came in through [`DriveGrid::push`] / [`DriveGrid::push_surf`] without one).
+    class: Vec<u8>,
     /// Per triangle: a wall top ([`is_wall_top`]), never stood on - a wall where it stands
     /// over the ground (see [`DriveGrid::probe_walls`]).
     pub ridge: Vec<bool>,
@@ -2051,7 +2165,7 @@ impl DriveGrid {
 
     /// Bytes the grid holds on the heap.
     pub fn heap_bytes(&self) -> usize {
-        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.ridge.capacity() + self.bump_of.capacity() * 4 + self.bumps.capacity() * std::mem::size_of::<(u32, [Vec2; 3])>() + self.start.capacity() * 4 + self.items.capacity() * 4 + self.reach.capacity() * 16
+        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.class.capacity() + self.ridge.capacity() + self.bump_of.capacity() * 4 + self.bumps.capacity() * std::mem::size_of::<(u32, [Vec2; 3])>() + self.start.capacity() * 4 + self.items.capacity() * 4 + self.reach.capacity() * 16
     }
 
     /// Add a triangle; walls (faces steeper than about 70°) are left out, they are nothing
@@ -2062,12 +2176,18 @@ impl DriveGrid {
 
     /// Add a triangle, a wall top or not.
     pub fn push_kind(&mut self, p: [Vec3; 3], ridge: bool) -> bool {
+        self.push_kind_class(p, ridge, SurfaceKind::Unknown)
+    }
+
+    /// Add a triangle, a wall top or not, of a known [`SurfaceKind`].
+    pub fn push_kind_class(&mut self, p: [Vec3; 3], ridge: bool, kind: SurfaceKind) -> bool {
         let nrm = (p[1] - p[0]).cross(p[2] - p[0]);
         let len = nrm.length();
         if len < 1e-6 || nrm.z.abs() / len < 0.3 {
             return false;
         }
         self.tris.push(p);
+        self.class.push(kind as u8);
         self.ridge.push(ridge);
         self.bump_of.push(NO_BUMP);
         true
@@ -2076,7 +2196,12 @@ impl DriveGrid {
     /// Add a triangle drawn with a texture that has a `.surf` map, with the texture
     /// coordinates of its corners.
     pub fn push_surf(&mut self, p: [Vec3; 3], uv: [Vec2; 3], map: &std::sync::Arc<HeightMap>) {
-        if !self.push_kind(p, false) {
+        self.push_surf_class(p, uv, map, SurfaceKind::Unknown);
+    }
+
+    /// [`DriveGrid::push_surf`] of a face of a known [`SurfaceKind`].
+    pub fn push_surf_class(&mut self, p: [Vec3; 3], uv: [Vec2; 3], map: &std::sync::Arc<HeightMap>, kind: SurfaceKind) {
+        if !self.push_kind_class(p, false, kind) {
             return;
         }
         let m = match self.maps.iter().position(|m| std::sync::Arc::ptr_eq(m, map)) {
@@ -2101,9 +2226,11 @@ impl DriveGrid {
         let mut keep = Vec::with_capacity(self.tris.len());
         let mut keep_ridge = Vec::with_capacity(self.tris.len());
         let mut keep_bump = Vec::with_capacity(self.tris.len());
+        let mut keep_class = Vec::with_capacity(self.tris.len());
         self.ridge.resize(self.tris.len(), false);
         self.bump_of.resize(self.tris.len(), NO_BUMP);
-        for ((t, r), b) in self.tris.iter().zip(self.ridge.iter()).zip(self.bump_of.iter()) {
+        self.class.resize(self.tris.len(), SurfaceKind::Unknown as u8);
+        for (((t, r), b), c) in self.tris.iter().zip(self.ridge.iter()).zip(self.bump_of.iter()).zip(self.class.iter()) {
             // (bucketed with the seam tolerance round it: a point that close is on it)
             let e = SEAM_TOLERANCE;
             let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x) - e, t[0].x.max(t[1].x).max(t[2].x) + e);
@@ -2111,16 +2238,18 @@ impl DriveGrid {
             if hi_x < 0.0 || hi_y < 0.0 || lo_x > tile || lo_y > tile {
                 continue;
             }
-            let c = |v: f32| ((v / self.cell).floor().max(0.0) as usize).min(n - 1);
-            ranges.push((c(lo_x), c(hi_x), c(lo_y), c(hi_y)));
+            let cell = |v: f32| ((v / self.cell).floor().max(0.0) as usize).min(n - 1);
+            ranges.push((cell(lo_x), cell(hi_x), cell(lo_y), cell(hi_y)));
             keep.push(*t);
             keep_ridge.push(*r);
             keep_bump.push(*b);
+            keep_class.push(*c);
         }
         self.reach = keep.iter().map(|t| plan_reach(t[0], t[1], t[2], SEAM_TOLERANCE)).collect();
         self.tris = keep;
         self.ridge = keep_ridge;
         self.bump_of = keep_bump;
+        self.class = keep_class;
         let mut count = vec![0u32; n * n + 1];
         for &(x0, x1, y0, y1) in &ranges {
             for y in y0..=y1 {
@@ -2211,6 +2340,37 @@ impl DriveGrid {
             }
         }
         n
+    }
+
+    /// The kind of the face a tyre stands on at tile-local (x, y): the highest face (wall
+    /// tops left out) whose height there lies within `tol` of `z`, the height the wheel
+    /// model settled on. None where no face comes that close - the wheel stands on the
+    /// terrain, or on nothing.
+    pub fn class_at(&self, x: f32, y: f32, z: f32, tol: f32) -> Option<SurfaceKind> {
+        if self.cells == 0 || x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let (cx, cy) = ((x / self.cell) as usize, (y / self.cell) as usize);
+        if cx >= self.cells || cy >= self.cells {
+            return None;
+        }
+        let k = cy * self.cells + cx;
+        let mut best: Option<(f32, SurfaceKind)> = None;
+        for &i in &self.items[self.start[k] as usize..self.start[k + 1] as usize] {
+            if self.ridge.get(i as usize).copied().unwrap_or(false) || !self.reaches(i, x, y) {
+                continue;
+            }
+            let [a, b, c] = self.tris[i as usize];
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
+            let mut zf = l1 * a.z + l2 * b.z + l3 * c.z;
+            if let Some(&(m, uv)) = self.bump_of.get(i as usize).and_then(|&b| self.bumps.get(b as usize)) {
+                zf += self.maps[m as usize].lift(uv[0] * l1 + uv[1] * l2 + uv[2] * l3);
+            }
+            if (zf - z).abs() <= tol && best.is_none_or(|(old, _)| zf > old) {
+                best = Some((zf, SurfaceKind::from_code(self.class.get(i as usize).copied().unwrap_or(0))));
+            }
+        }
+        best.map(|(_, k)| k)
     }
 
     #[inline]
@@ -2460,12 +2620,22 @@ impl TileSurface {
     /// object with a `[collision_mesh]` (a traffic island) that cuts no ground. The probe
     /// takes the highest face below the axle, so a bridge deck overhead is never picked.
     pub fn add_drive_mesh(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32) {
-        self.add_drive_mesh_surf(mesh, transform, origin, tx, ty, None);
+        self.add_drive_mesh_surf(mesh, transform, origin, tx, ty, None, None);
     }
 
-    /// [`TileSurface::add_drive_mesh`] with the `.surf` maps of the mesh's textures: the
-    /// faces drawn with one carry it.
-    pub fn add_drive_mesh_surf(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32, surf: Option<&SurfFaces>) {
+    /// [`TileSurface::add_drive_mesh`] with the `.surf` maps of the mesh's textures (the
+    /// faces drawn with one carry it) and their [`SurfaceKind`]s (`Unknown` without any), so
+    /// that a tyre on a cobbled yard both shakes and slips.
+    pub fn add_drive_mesh_surf(
+        &mut self,
+        mesh: &MeshData,
+        transform: &Mat4,
+        origin: DVec3,
+        tx: i32,
+        ty: i32,
+        surf: Option<&SurfFaces>,
+        classes: Option<&FaceClasses>,
+    ) {
         let ident = *transform == Mat4::IDENTITY;
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
         for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
@@ -2474,9 +2644,12 @@ impl TileSurface {
                 let v = mesh.positions[tri[k] as usize];
                 p[k] = (if ident { v } else { transform.transform_point3(v) }) + off;
             }
+            let kind = classes.map_or(SurfaceKind::Unknown, |c| c.face(j));
             match surf.and_then(|s| s.face(j, tri)) {
-                Some((m, uv)) => self.drive.push_surf(p, uv, m),
-                None => self.drive.push(p),
+                Some((m, uv)) => self.drive.push_surf_class(p, uv, m, kind),
+                None => {
+                    self.drive.push_kind_class(p, false, kind);
+                }
             }
         }
     }
@@ -2484,20 +2657,30 @@ impl TileSurface {
     /// Add a spline's height profiles ([`build_height_profile_mesh`]): its wall tops (the
     /// range of material 1) go in as walls.
     pub fn add_height_profiles(&mut self, mesh: &MeshData, origin: DVec3, tx: i32, ty: i32) {
-        self.add_spline_drive(mesh, None, origin, tx, ty);
+        self.add_spline_drive(mesh, None, None, origin, tx, ty);
     }
 
     /// [`TileSurface::add_height_profiles`] for a spline's drawn mesh, with the `.surf` maps
-    /// of its textures where it has any.
-    pub fn add_spline_drive(&mut self, mesh: &MeshData, surf: Option<&SurfFaces>, origin: DVec3, tx: i32, ty: i32) {
+    /// of its textures where it has any and the [`SurfaceKind`] each texture's name tells
+    /// (`Unknown` without any: a height profile has no texture to read).
+    pub fn add_spline_drive(
+        &mut self,
+        mesh: &MeshData,
+        surf: Option<&SurfFaces>,
+        classes: Option<&FaceClasses>,
+        origin: DVec3,
+        tx: i32,
+        ty: i32,
+    ) {
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
         let ridge_from = mesh.ranges.iter().find(|r| r.2 == 1).map(|r| r.0 as usize).unwrap_or(usize::MAX);
         for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let p = [0, 1, 2].map(|k| mesh.positions[tri[k] as usize] + off);
+            let kind = classes.map_or(SurfaceKind::Unknown, |c| c.face(j));
             match surf.and_then(|s| s.face(j, tri)) {
-                Some((m, uv)) => self.drive.push_surf(p, uv, m),
+                Some((m, uv)) => self.drive.push_surf_class(p, uv, m, kind),
                 None => {
-                    self.drive.push_kind(p, j * 3 >= ridge_from);
+                    self.drive.push_kind_class(p, j * 3 >= ridge_from, kind);
                 }
             }
         }

@@ -22,6 +22,7 @@
 
 use crate::collision::Obb;
 use glam::{DVec2, DVec3, Quat, Vec2, Vec3};
+pub use omsi_geometry::{Surface, SurfaceKind};
 use omsi_vehicle::Vehicle;
 
 /// How far a wheel may hang below its unloaded position (m).
@@ -47,6 +48,27 @@ fn omsi_suspension() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_TYRE_SUSPENSION").is_none())
 }
+
+/// `OMSI_UNIFORM_GRIP=1`: every tyre gets the road's one friction, as Omsi.exe's do (A/B).
+fn uniform_grip_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_UNIFORM_GRIP").is_some())
+}
+
+/// Grip of a tyre on each kind of ground, as a share of the road's own (`road_grip`: dry
+/// asphalt 0.85, wet 0.6, snow 0.3, ice 0.12). Concrete holds like asphalt; setts and slabs
+/// are polished by the traffic and take about four fifths of it dry and less wet (the
+/// Kreuzberg cobbles in rain); a kerb stone is concrete the tyre only brushes; grass and
+/// earth give a little over half of the asphalt dry and go to mud wet. Standing water takes
+/// the rest away towards the film's grip - a third of it at the heart of a puddle, before
+/// any aquaplaning, which this model has not got.
+const GRIP_CONCRETE: f32 = 1.0;
+const GRIP_PAVING: f32 = 0.8;
+const GRIP_PAVING_WET: f32 = 0.65;
+const GRIP_KERB: f32 = 0.9;
+const GRIP_SOFT: f32 = 0.55;
+const GRIP_SOFT_WET: f32 = 0.4;
+const GRIP_PUDDLE: f32 = 0.35;
 
 /// What is left of the body's pitch and roll rate after `dt` seconds of OMSI's damping.
 fn body_damping(body_freq: f32, dt: f32) -> f32 {
@@ -121,6 +143,13 @@ pub trait Ground: Send + Sync {
     /// it looked up (the tiles under the vehicle) until it is dropped.
     fn session(&self) -> Box<dyn Fn(f64, f64, f64) -> GroundProbe + '_> {
         Box::new(move |x, y, top| self.probe(x, y, top))
+    }
+
+    /// What the face at world (x, y, z) - the one a tyre settled on - is made of, and the
+    /// water standing on it (see [`Surface`]). A ground that does not know says `Unknown`,
+    /// and the tyre takes the road's own grip (`RigidBody::friction`).
+    fn surface(&self, _x: f64, _y: f64, _z: f64) -> Surface {
+        Surface::default()
     }
 }
 
@@ -211,6 +240,10 @@ pub struct RigidWheel {
     pub walls: Vec<WallFace>,
     /// Horizontal push (N) of a step the tyre climbs or a wall it stands against.
     pub step_force: f32,
+    /// What the tyre stands on this step (asked of the ground once a slice, under the hub)
+    /// and the friction coefficient it gets from it (see [`RigidBody::tyre_grip`]).
+    pub surface: Surface,
+    pub mu: f32,
 }
 
 fn sign(x: f32) -> f32 {
@@ -329,6 +362,8 @@ struct Contact {
     /// What the brake (and the rolling resistance) can hold.
     brake: f32,
     grip: f32,
+    /// The friction coefficient of this tyre on what it stands on ([`RigidBody::tyre_grip`]).
+    mu: f32,
     v_long: f32,
     /// Takes side forces (a coupled part's joint does not).
     lateral: bool,
@@ -423,7 +458,15 @@ pub struct RigidBody {
     pub rolling_resistance: f32,
     /// Body-frame acceleration of the last step (m/s²), for `A_Trans_*`.
     pub accel_body: Vec3,
+    /// The road's grip as the weather sets it (`road_grip`): what a tyre on plain asphalt
+    /// gets, and the whole of what every tyre gets with `uniform_grip`.
     pub friction: f32,
+    /// `StreetCond` (0 dry, 1 wet, 2 snow): the rolling resistance of soft ground and snow.
+    pub street_cond: f32,
+    /// One friction for all tyres whatever they stand on, as Omsi.exe has it (its tyres know
+    /// no surfaces, ode.dll gets one `mu`); `OMSI_UNIFORM_GRIP=1`, and the default of a
+    /// body whose ground reports no surface.
+    pub uniform_grip: bool,
     /// Wheels a face stopped during the last step, one entry per wheel.
     pub wheel_impacts: Vec<Impact>,
     /// The parts coupled behind (see [`CoupledPart`]); `drive_torque` is shared by their
@@ -479,7 +522,7 @@ impl RigidBody {
             let tyre_c = TYRE_C * (tyre_k / TYRE_K).sqrt();
             for side in [-1.0f32, 1.0] {
                 let inertia_inv = if a.inertia_inv > 0.0 { a.inertia_inv } else { DEFAULT_INERTIA_INV };
-                wheels.push(RigidWheel { spin: 0.0, slipping: false, locked: false, inertia_inv, attach: Vec3::new(side * inner, a.long, z), lever: side * (outer - inner), radius: r, driven: a.driven, steered: (a.long - front_long).abs() < 0.01, steer: 0.0, tyre_k, tyre_c, spring: k, damper: c, max_force, spring_factor: 1.0, rest_load: 0.0, compression: 0.0, compression_rate: 0.0, touch: None, on_ground: true, rotation_deg: 0.0, rpm: 0.0, load: 0.0, ground_z: 0.0, ground_seen: false, walls: Vec::new(), step_force: 0.0 });
+                wheels.push(RigidWheel { spin: 0.0, slipping: false, locked: false, inertia_inv, attach: Vec3::new(side * inner, a.long, z), lever: side * (outer - inner), radius: r, driven: a.driven, steered: (a.long - front_long).abs() < 0.01, steer: 0.0, tyre_k, tyre_c, spring: k, damper: c, max_force, spring_factor: 1.0, rest_load: 0.0, compression: 0.0, compression_rate: 0.0, touch: None, on_ground: true, rotation_deg: 0.0, rpm: 0.0, load: 0.0, ground_z: 0.0, ground_seen: false, walls: Vec::new(), step_force: 0.0, surface: Surface::default(), mu: 0.85 });
                 wheel_axle.push(ai);
             }
         }
@@ -494,7 +537,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, street_cond: 0.0, uniform_grip: uniform_grip_default(), wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
     }
 
     /// [ROLLBACK payload-121] Carry `kg` of passengers whose centre is at `at` (the model's frame): the body's
@@ -556,6 +599,8 @@ impl RigidBody {
         n.holding = self.holding;
         n.accel_body = self.accel_body;
         n.friction = self.friction;
+        n.street_cond = self.street_cond;
+        n.uniform_grip = self.uniform_grip;
         n.wheel_impacts = self.wheel_impacts.clone();
         n.coupled = self.coupled.clone();
         n.spawned_inside = self.spawned_inside.clone();
@@ -639,6 +684,27 @@ impl RigidBody {
         self.velocity.dot(self.orientation.mul_vec3(Vec3::Y))
     }
 
+    /// The friction coefficient of a tyre on `s`: the road's own (`friction`, the weather's)
+    /// on asphalt and on ground nobody classified, scaled for what else it stands on, and cut
+    /// towards a water film's by the standing water. With `uniform_grip` every tyre gets the
+    /// road's own, as in Omsi.exe.
+    pub fn tyre_grip(&self, s: Surface) -> f32 {
+        if self.uniform_grip {
+            return self.friction;
+        }
+        let wet = self.street_cond.clamp(0.0, 1.0);
+        let scale = match s.kind {
+            SurfaceKind::Unknown | SurfaceKind::Asphalt => 1.0,
+            SurfaceKind::Concrete => GRIP_CONCRETE,
+            SurfaceKind::Paving => GRIP_PAVING + (GRIP_PAVING_WET - GRIP_PAVING) * wet,
+            SurfaceKind::Kerb => GRIP_KERB,
+            SurfaceKind::Soft => GRIP_SOFT + (GRIP_SOFT_WET - GRIP_SOFT) * wet,
+        };
+        let mu = self.friction * scale;
+        let water = if s.water.is_finite() { s.water.clamp(0.0, 1.0) } else { 0.0 };
+        mu + (self.friction * GRIP_PUDDLE - mu).min(0.0) * water
+    }
+
     pub fn kinetic_energy(&self) -> f32 {
         0.5 * self.mass * self.velocity.length_squared() + 0.5 * (self.inertia * self.omega * self.omega).element_sum()
     }
@@ -695,7 +761,15 @@ impl RigidBody {
 
     /// One step. `drive_torque` (N m at the driven wheels, from `M_Wheel`), `brake` per
     /// wheel (N), `steer` −1..1, `probe(x, y, z_top)` the ground at a point.
+    /// [`RigidBody::step_on`] over a ground that reports no surfaces: every tyre gets the
+    /// road's own grip (`friction`).
     pub fn step(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe) {
+        self.step_on(dt, drive_torque, brake, steer, probe, &|_, _, _| Surface::default());
+    }
+
+    /// One frame: `probe` is the ground's heights ([`Ground::probe`]), `surface` what the
+    /// face a tyre settled on is made of ([`Ground::surface`], asked once a slice per wheel).
+    pub fn step_on(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe, surface: &dyn Fn(f64, f64, f64) -> Surface) {
         // a long frame (below 20 fps) is stepped in slices of at most 50 ms, so that the
         // body covers the whole frame the clock, the odometer and the scripts count (it was
         // cut to 50 ms: at 10 fps the bus went half as far as the time went on)
@@ -719,7 +793,7 @@ impl RigidBody {
         let slices = (dt / 0.05).ceil().max(1.0) as usize;
         let mut impacts = Vec::new();
         for _ in 0..slices {
-            self.step_slice(dt / slices as f32, drive_torque, brake, steer, probe);
+            self.step_slice(dt / slices as f32, drive_torque, brake, steer, probe, surface);
             // OMSI damps the body's pitch and roll - never its yaw - by sin(x)/x each frame,
             // x = 1.5 x sqrt(springs / mass) x frame (Omsi.exe 0x7e4f55..0x7e50b0). Its
             // frames are OMSI's (its options.cfg caps them at 30 a second): taken per frame
@@ -755,7 +829,32 @@ impl RigidBody {
         }
     }
 
-    fn step_slice(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe) {
+    fn step_slice(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe, surface: &dyn Fn(f64, f64, f64) -> Surface) {
+        // What each tyre stands on, asked once a slice (≤ 50 ms) under the hub at the height
+        // the wheel settled on in the last substep: the faces do not change within a slice,
+        // and a lookup per substep (16 of them) would cost more than the tyre model itself.
+        // Before the first contact (`place`) a wheel knows no ground and keeps `Unknown`.
+        {
+            let rot = self.orientation;
+            let up = rot.mul_vec3(Vec3::Z);
+            let (position, cog) = (self.position, self.cog);
+            let uniform = self.uniform_grip;
+            let friction = self.friction;
+            let mut grips = Vec::with_capacity(self.wheels.len());
+            for w in &self.wheels {
+                let s = if uniform || !w.ground_seen {
+                    Surface::default()
+                } else {
+                    let hub = position + rot.mul_vec3(w.attach - cog).as_dvec3() + (up * w.compression.max(-DROOP)).as_dvec3();
+                    surface(hub.x, hub.y, w.ground_z)
+                };
+                grips.push((s, if uniform { friction } else { self.tyre_grip(s) }));
+            }
+            for (w, (s, mu)) in self.wheels.iter_mut().zip(grips) {
+                w.surface = s;
+                w.mu = if mu.is_finite() { mu.max(0.0) } else { friction };
+            }
+        }
         // The steering sets the curvature the bus turns on (`steer` 1 = the full lock of
         // `[inv_min_turnradius]`) and every axle points at the centre of that turn on the
         // `[rot_pnt_long]` line, as OMSI does it. How fast the curvature may change is the
@@ -1062,6 +1161,7 @@ impl RigidBody {
                     drive: if w.driven { drive_torque / r / driven } else { 0.0 },
                     brake: brake.get(i).copied().unwrap_or(0.0).max(0.0) + self.rolling_resistance / n_wheels,
                     grip,
+                    mu: w.mu,
                     v_long,
                     lateral: true,
                     wheel: Some(i),
@@ -1083,6 +1183,7 @@ impl RigidBody {
                     drive: drive * share,
                     brake: d.brake.max(0.0) * share,
                     grip: d.load,
+                    mu: self.friction,
                     v_long: (self.velocity + omega_world.cross(r_world)).dot(body_fwd),
                     lateral: false,
                     wheel: None,
@@ -1101,7 +1202,7 @@ impl RigidBody {
                 // a slipping wheel passes on the sliding friction, whichever way the tyre
                 // slides over the road (the wheel's own speed against the ground's)
                 if let Some(w) = c.wheel.map(|i| &self.wheels[i]).filter(|w| w.slipping) {
-                    let mu_n = self.friction * c.grip;
+                    let mu_n = c.mu * c.grip;
                     let slide = w.spin * w.radius - c.v_long;
                     rolling_long[k] = mu_n * sign(slide);
                     outer += c.fwd * rolling_long[k];
@@ -1128,12 +1229,12 @@ impl RigidBody {
                     Some(si) => c.drive + hold_long[si],
                     None => rolling_long[k],
                 };
-                let max_f = self.friction * c.grip;
+                let max_f = c.mu * c.grip;
                 f_long = f_long.clamp(-max_f, max_f);
                 let f_world = c.base + c.fwd * f_long;
                 long_sum += f_long * c.fwd.dot(body_fwd);
                 if let Some(i) = c.wheel {
-                    self.wheels[i].advance_spin(c, f_long, self.friction, h);
+                    self.wheels[i].advance_spin(c, f_long, c.mu, h);
                 }
                 force += f_world;
                 torque += rot.inverse().mul_vec3(c.r).cross(rot.inverse().mul_vec3(f_world));
@@ -1181,7 +1282,7 @@ impl RigidBody {
                     .collect();
                 // holding: the bend's pull against the grip of all tyres (0x7e4dee), and
                 // no wheel spinning or locked (0x7e3c3b)
-                let grip_all: f32 = lat.iter().map(|&k| self.friction * contacts[k].grip).sum();
+                let grip_all: f32 = lat.iter().map(|&k| contacts[k].mu * contacts[k].grip).sum();
                 let v_fwd = self.velocity.dot(body_fwd);
                 let kappa = (self.steer_deg.to_radians().tan() / (self.wheels.iter().map(|w| w.attach.y).fold(f32::MIN, f32::max) - self.rot_pnt_long).abs().max(0.5)).abs();
                 let slipping = self.wheels.iter().any(|w| w.slipping && w.on_ground);
@@ -1198,7 +1299,7 @@ impl RigidBody {
                     for (q, &k) in lat.iter().enumerate() {
                         let c = &contacts[k];
                         let v_lat = (v + rot.mul_vec3(w).cross(c.r)).dot(c.right);
-                        let cap = self.friction * c.grip * h * reach;
+                        let cap = c.mu * c.grip * h * reach;
                         let before = j[q];
                         j[q] = (before - v_lat / arms[q].1).clamp(-cap, cap);
                         let dj = j[q] - before;
@@ -2512,4 +2613,43 @@ mod tests {
         assert!(rb.position.is_finite() && (rb.position - at).length() < 1e-9, "{:?}", rb.position);
         assert_eq!(rb.velocity, Vec3::ZERO);
     }
+
+    /// A body braked to a slide with `kind` under its left tyres and asphalt under the
+    /// right: what it loses in a second (m/s).
+    fn slide_decel(uniform: bool, left: SurfaceKind) -> (f32, Vec<RigidWheel>) {
+        let g = road(1e9, 0.0);
+        let mut rb = RigidBody::from_definition(&bus(), &[]);
+        rb.uniform_grip = uniform;
+        rb.place(DVec3::ZERO, 0.0);
+        run(&mut rb, 1.0, 0.0, 0.0, &g);
+        rb.velocity = rb.orientation.mul_vec3(Vec3::Y) * 15.0;
+        let s = move |x: f64, _y: f64, _z: f64| Surface { kind: if x < 0.0 { left } else { SurfaceKind::Asphalt }, water: 0.0 };
+        let v0 = rb.forward_speed();
+        let brakes = vec![rb.mass * 9.81; 4];
+        for _ in 0..60 {
+            rb.step_on(1.0 / 60.0, 0.0, &brakes, 0.0, &g, &s);
+        }
+        (v0 - rb.forward_speed(), rb.wheels.clone())
+    }
+
+    /// Every tyre has the grip of what it stands on: the verge (`Soft`) a little over half
+    /// the asphalt's, so a bus sliding on locked wheels with its left tyres on the grass
+    /// stops between what it would on either alone - and with `uniform_grip`, Omsi.exe's
+    /// one friction for the world, as on asphalt.
+    #[test]
+    fn a_tyre_on_the_verge_has_the_verges_grip() {
+        let g = 9.81;
+        let (asphalt, _) = slide_decel(false, SurfaceKind::Asphalt);
+        let (split, wheels) = slide_decel(false, SurfaceKind::Soft);
+        let (soft, _) = slide_decel(false, SurfaceKind::Soft);
+        let (uniform, _) = slide_decel(true, SurfaceKind::Soft);
+        assert!((asphalt - 0.85 * g).abs() < 0.1 * g, "asphalt {asphalt}");
+        assert!((split - 0.7 * g).abs() < 0.1 * g, "split {split}");
+        assert!(split < asphalt - 0.5 && split > 0.55 * g, "split {split} asphalt {asphalt} soft {soft}");
+        assert!((uniform - asphalt).abs() < 0.05 * g, "uniform {uniform} asphalt {asphalt}");
+        // (left, right per axle)
+        assert!(wheels[0].mu < 0.6 * wheels[1].mu && wheels[2].mu < 0.6 * wheels[3].mu, "{} {} {} {}", wheels[0].mu, wheels[1].mu, wheels[2].mu, wheels[3].mu);
+        assert!(wheels.iter().all(|w| w.locked), "every wheel locked under a brake of the body's weight");
+    }
+
 }
