@@ -813,6 +813,12 @@ impl Viewer {
 /// How far from the player cars are kept (m) and how far out of sight one may be before it
 /// is taken off (m); in plain view a car stays until it is too small to see.
 const DESPAWN_FACTOR: f64 = 1.6;
+/// [ROLLBACK appearfar-1] Further off than this (m) a random car may appear in plain view.
+const APPEAR_IN_VIEW_BEYOND: f64 = 300.0;
+
+fn rel_len(p: DVec3, center: DVec3) -> f64 {
+    (p - center).length()
+}
 
 /// A random car out of the player's range: still on the map and still driving, but without
 /// a body, a script or a picture - a few numbers. It comes back as the same car (type,
@@ -2797,13 +2803,22 @@ impl Traffic {
             // plain view, and a map whose boulevard is a short stub in sight of the player
             // (BeijingCity) had no traffic on it at all until something drove in from the
             // side streets
+            // [ROLLBACK appearfar-1] and beyond APPEAR_IN_VIEW_BEYOND in plain view: within
+            // 350 m a car may appear only behind a building, and at a wide junction with the
+            // view down the road nine attempts in ten found no such place (BeijingCity,
+            // Ditan: 5 500 of 6 000 a pass; 70-100 cars about the player against a target of
+            // 490; 200-260 with this, as measured headless with the player's view settings).
+            // OMSI puts its cars down anywhere, at any distance.
             if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
                 let source = self.net.prev.get(lane).is_some_and(|q| q.is_empty());
-                if !source {
+                let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(rel_len(p, center));
+                if !source && from_eye <= APPEAR_IN_VIEW_BEYOND {
                     continue;
                 }
-                s = s.min(30.0);
-                p = self.net.lanes[lane].at(s).0;
+                if source {
+                    s = s.min(30.0);
+                    p = self.net.lanes[lane].at(s).0;
+                }
             }
             let rel = p - center;
             if rel.length() < 40.0 {
