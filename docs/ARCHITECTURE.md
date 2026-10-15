@@ -1047,6 +1047,12 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   soft ground 3, snow up to 4 by `StreetCond`), `RigidBody::rolling_force`; the coupled parts
   the same with their own `crr`. The file's value comes back exactly for the unladen bus at
   rest; passengers, a grade's extra axle load and speed add theirs.
+  *Friction circle* (circle-1): OMSI keeps a tyre's grip across whole whatever its brake or
+  drive takes along it, so a bus braked to a slide with two wheels on the grass stopped
+  crooked in its deceleration but dead straight in its heading. The lateral constraint's cap
+  is now sqrt((mu N)² - F_long²): a locked or spinning tyre holds nothing across (a puck),
+  the split-grip slide pulls towards the asphalt side, and wheelspin lets the back step out.
+  `OMSI_NO_FRICTION_CIRCLE=1` keeps the two apart as Omsi.exe does.
 * **Mouse steering** (0x6f4284): the window's full width is the full lock, divided by
   max(1, km/h / 10); a one-second ease-in after switching on; the mouse owns the wheel (a
   steering key's leftover no longer takes over when the cursor passes the middle). The speed

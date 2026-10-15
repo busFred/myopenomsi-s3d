@@ -55,6 +55,13 @@ fn uniform_grip_default() -> bool {
     *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_UNIFORM_GRIP").is_some())
 }
 
+/// `OMSI_NO_FRICTION_CIRCLE=1`: a tyre's grip across is the full mu x load whatever it spends
+/// along itself, as Omsi.exe has it (A/B; see the lateral constraint in `step_slice`).
+fn friction_circle_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_NO_FRICTION_CIRCLE").is_none())
+}
+
 /// `OMSI_NO_DIFF=1`: every driven wheel takes its fixed share of `M_Wheel` whatever its
 /// partner across the axle does (the old split; A/B).
 fn open_diff_default() -> bool {
@@ -521,6 +528,9 @@ pub struct RigidBody {
     /// An open differential on every driven axle (`OMSI_NO_DIFF=1` gives each driven wheel
     /// its fixed share whatever its partner does, as before). See `step_slice`.
     pub open_diff: bool,
+    /// The friction circle: a tyre's grip across is what its grip leaves after the force
+    /// along it (`OMSI_NO_FRICTION_CIRCLE=1` keeps the two apart, as Omsi.exe does).
+    pub friction_circle: bool,
     /// Wheels a face stopped during the last step, one entry per wheel.
     pub wheel_impacts: Vec<Impact>,
     /// The parts coupled behind (see [`CoupledPart`]); `drive_torque` is shared by their
@@ -591,7 +601,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, street_cond: 0.0, uniform_grip: uniform_grip_default(), open_diff: open_diff_default(), wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, street_cond: 0.0, uniform_grip: uniform_grip_default(), open_diff: open_diff_default(), friction_circle: friction_circle_default(), wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
     }
 
     /// [ROLLBACK payload-121] Carry `kg` of passengers whose centre is at `at` (the model's frame): the body's
@@ -656,6 +666,7 @@ impl RigidBody {
         n.street_cond = self.street_cond;
         n.uniform_grip = self.uniform_grip;
         n.open_diff = self.open_diff;
+        n.friction_circle = self.friction_circle;
         n.wheel_impacts = self.wheel_impacts.clone();
         n.coupled = self.coupled.clone();
         n.spawned_inside = self.spawned_inside.clone();
@@ -1334,6 +1345,8 @@ impl RigidBody {
             let hold_long = hold(body_fwd, self.mass + towed, &|c| c.brake);
             // (the tyres' pull along the body, for the pitch lever below)
             let mut long_sum = 0.0f32;
+            // (what each tyre spends along itself, for the friction circle across)
+            let mut long_used = vec![0.0f32; contacts.len()];
             for (k, c) in contacts.iter().enumerate() {
                 let mut f_long = match standing.iter().position(|&j| j == k) {
                     Some(si) => c.drive + hold_long[si],
@@ -1341,6 +1354,7 @@ impl RigidBody {
                 };
                 let max_f = c.mu * c.grip;
                 f_long = f_long.clamp(-max_f, max_f);
+                long_used[k] = f_long;
                 let f_world = c.base + c.fwd * f_long;
                 long_sum += f_long * c.fwd.dot(body_fwd);
                 if let Some(i) = c.wheel {
@@ -1409,7 +1423,16 @@ impl RigidBody {
                     for (q, &k) in lat.iter().enumerate() {
                         let c = &contacts[k];
                         let v_lat = (v + rot.mul_vec3(w).cross(c.r)).dot(c.right);
-                        let cap = c.mu * c.grip * h * reach;
+                        // The friction circle: what the tyre spends along itself it has not
+                        // got across. A locked or spinning tyre (its whole grip along) holds
+                        // nothing sideways - a puck - so a bus braked to a slide with its left
+                        // tyres on the grass turns towards the asphalt side, and wheelspin
+                        // lets the back step out. Omsi.exe has the two apart (the full mu x
+                        // load across whatever the brake takes); `friction_circle` off gives
+                        // that back.
+                        let whole = c.mu * c.grip;
+                        let circle = if self.friction_circle { (whole * whole - long_used[k] * long_used[k]).max(0.0).sqrt() } else { whole };
+                        let cap = circle * h * reach;
                         let before = j[q];
                         j[q] = (before - v_lat / arms[q].1).clamp(-cap, cap);
                         let dj = j[q] - before;
@@ -2823,4 +2846,33 @@ mod tests {
         let laden: f32 = rb.wheels.iter().map(|w| w.rolling).sum();
         assert!((laden - 1000.0 * 13.2 / 10.2).abs() < 80.0, "{laden}");
     }
+
+    /// The friction circle: a tyre sliding on a locked wheel spends its whole grip along
+    /// itself and holds nothing across, so the side with more grip brakes harder and turns
+    /// the body towards it - the pull a bus feels braking with two wheels on the verge.
+    /// Omsi.exe keeps the full grip across whatever the brake takes (no pull), and so does
+    /// `friction_circle` off.
+    #[test]
+    fn braking_with_the_left_tyres_on_the_grass_pulls_towards_the_asphalt() {
+        let g = road(1e9, 0.0);
+        let yaw = |circle: bool| {
+            let mut rb = RigidBody::from_definition(&bus(), &[]);
+            rb.friction_circle = circle;
+            rb.place(DVec3::ZERO, 0.0);
+            run(&mut rb, 1.0, 0.0, 0.0, &g);
+            rb.velocity = rb.orientation.mul_vec3(Vec3::Y) * 15.0;
+            let s = |x: f64, _y: f64, _z: f64| Surface { kind: if x < 0.0 { SurfaceKind::Soft } else { SurfaceKind::Asphalt }, water: 0.0 };
+            let brakes = vec![rb.mass * 9.81; 4];
+            for _ in 0..120 {
+                rb.step_on(1.0 / 60.0, 0.0, &brakes, 0.0, &g, &s);
+            }
+            let (heading, _, _) = rb.heading_pitch_bank();
+            if heading > 180.0 { heading - 360.0 } else { heading }
+        };
+        let with = yaw(true);
+        let without = yaw(false);
+        assert!(with > 2.0, "turns towards the asphalt on its right: {with} deg");
+        assert!(without.abs() < 0.5, "kept straight by the full grip across: {without} deg");
+    }
+
 }
