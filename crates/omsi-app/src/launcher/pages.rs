@@ -1067,6 +1067,10 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, 
     sel_setting(ui, s, dirty, "s-unsched", c.row(), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
     sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Max timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
     sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_parked_pct", &[("0", "None"), ("25", "25% of spaces"), ("50", "50% of spaces"), ("75", "75% of spaces"), ("90", "90% of spaces"), ("100", "Every space")]);
+    // the people on the pavements: a per cent of the half of the AI people OMSI lets walk
+    sel_setting(ui, s, dirty, "s-peds", c.row(), "Pedestrians", "ped_density", &[("0", "None"), ("50", "50%"), ("100", "100%"), ("150", "150%"), ("200", "200%"), ("300", "300%")]);
+    // OMSI's [AIMaxCountRandom] second line: the people waiting, walking and riding, in all
+    sel_setting(ui, s, dirty, "s-maxhumans", c.row(), "People (AI humans)", "ai_max_humans", &[("50", "50"), ("100", "100"), ("200", "200 (OMSI default)"), ("400", "400"), ("800", "800")]);
     let left = c.used();
     // OMSI's own options (options.cfg)
     let mut c = Col::new(ui, cols[1], "Simulation");
@@ -2775,7 +2779,7 @@ mod settings_tests {
         // (the radio stations: one, see `frame`)
         let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "radio-name-0", "radio-url-0", "radio-del-0", "radio-add"];
         let gameplay = vec![
-            "set-start-passengers", "s-board", "set-exact_fare", "set-pax_greet", "set-pax_ticket", "set-pax_complain", "set-trip_summary", "s-pax", "set-skip_petrol_check", "s-start-traffic", "s-unsched", "s-maxsched", "s-maxpark",
+            "set-start-passengers", "s-board", "set-exact_fare", "set-pax_greet", "set-pax_ticket", "set-pax_complain", "set-trip_summary", "s-pax", "set-skip_petrol_check", "s-start-traffic", "s-unsched", "s-maxsched", "s-maxpark", "s-peds", "s-maxhumans",
             "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
