@@ -1847,9 +1847,14 @@ impl VehicleInstance {
                         .v_brakes
                         .iter()
                         .map(|&id| self.get(id).max(0.0))
-                        .sum::<f32>()
-                        + def.rolling_resistance.max(0.0),
+                        .sum::<f32>(),
                     load: (0..def.axles.len()).map(wheel_load).sum::<f32>() + carried * 9.81,
+                    // its `[rollwiderstand]` over its own unladen weight: the rigid body
+                    // rolls it against its load and speed like the front section's tyres
+                    crr: {
+                        let dry = if def.mass < 100.0 { def.mass * 1000.0 } else { def.mass }.max(500.0);
+                        def.rolling_resistance.max(0.0) / (dry * 9.81)
+                    },
                 }
             })
             .collect()

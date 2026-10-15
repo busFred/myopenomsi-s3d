@@ -1036,6 +1036,12 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   side's sliding friction and nothing while its partner is in the air (`step_slice`, before
   the tyre forces). `OMSI_NO_DIFF=1` restores the fixed shares. `Velocity` and `n_Wheel`
   stay the mean of the driven wheels, so a spinning wheel still shows to the ASR scripts.
+  *Rolling resistance* (rolling-1): `[rollwiderstand]` was a constant split evenly over the
+  wheels; it is now the unladen vehicle's value on asphalt, standing, and each tyre rolls
+  against its coefficient x its load x (1 + v / 30 m/s) x its ground (setts 1.3, a kerb 1.2,
+  soft ground 3, snow up to 4 by `StreetCond`), `RigidBody::rolling_force`; the coupled parts
+  the same with their own `crr`. The file's value comes back exactly for the unladen bus at
+  rest; passengers, a grade's extra axle load and speed add theirs.
 * **Mouse steering** (0x6f4284): the window's full width is the full lock, divided by
   max(1, km/h / 10); a one-second ease-in after switching on; the mouse owns the wheel (a
   steering key's leftover no longer takes over when the cursor passes the middle). The speed
