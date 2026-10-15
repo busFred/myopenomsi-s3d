@@ -5421,12 +5421,14 @@ impl Traffic {
         let v = st.speed;
         let mut stop = None;
         let mut amber = car.amber;
-        // [ROLLBACK amber-1] a car that has come to a stand loses its "goes whatever comes
-        // next": the mark was set within three metres of the line on green and kept while
-        // the car stood behind another through the red, and when the queue moved it drove
-        // over the line into a plain red (BeijingCity: nine of twelve red entries in ten
-        // minutes). Only a car still rolling over the line as the light changes keeps it.
-        if v < 0.3 {
+        // [ROLLBACK amber-1] a car that has stood for two seconds loses its "goes whatever
+        // comes next": the mark was set within three metres of the line on green and kept
+        // while the car stood behind another through the red, and when the queue moved it
+        // drove over the line into a plain red (BeijingCity: nine of twelve red entries in
+        // ten minutes). Not at any stand: the car at the line that a one-second green sets
+        // off is still under 0.1 m/s when the red comes, and cleared then it never went -
+        // nobody got through those lights (13 cars in ten minutes against 318).
+        if car.stopped > 2.0 {
             amber = None;
         }
         // [ROLLBACK lights-130] standing in a queue (a car close ahead, itself hardly moving):
