@@ -2789,15 +2789,25 @@ impl Traffic {
             attempts += 1;
             let x = self.rand_f() as f32 * total_w;
             let lane = candidates[cumulative.partition_point(|&c| c < x).min(candidates.len() - 1)].0;
-            let s = (self.rand_f() * (self.net.lanes[lane].length() as f64 - 6.0)) as f32 + 3.0;
-            let (p, _) = self.net.lanes[lane].at(s);
+            let mut s = (self.rand_f() * (self.net.lanes[lane].length() as f64 - 6.0)) as f32 + 3.0;
+            let (mut p, _) = self.net.lanes[lane].at(s);
+            // nobody may see it appear (the first population is the world as it loads) -
+            // [ROLLBACK source-1] except near the start of a lane that nothing leads into: a
+            // road the map begins out of nothing is where its cars come from, in OMSI in
+            // plain view, and a map whose boulevard is a short stub in sight of the player
+            // (BeijingCity) had no traffic on it at all until something drove in from the
+            // side streets
+            if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
+                let source = self.net.prev.get(lane).is_some_and(|q| q.is_empty());
+                if !source {
+                    continue;
+                }
+                s = s.min(30.0);
+                p = self.net.lanes[lane].at(s).0;
+            }
             let rel = p - center;
             if rel.length() < 40.0 {
                 continue; // not right next to the player
-            }
-            // nobody may see it appear (the first population is the world as it loads)
-            if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
-                continue;
             }
             if self
                 .cars
