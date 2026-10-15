@@ -2126,6 +2126,81 @@ impl SurfaceKind {
     }
 }
 
+/// What the ground brush painted on one tile, as the tyres read it: one [`SurfaceKind`]
+/// per texel of a coarse square raster over the tile (128 x 128 is 16 KB, a texel 2.3 m on
+/// a 300 m tile - a car park, not a kerb). OMSI's maps put asphalt under a car park or
+/// cobbles on a side street by painting a further `[groundtex]` over the terrain through
+/// an alpha mask (`texture/map/<tile>.map.<layer>.dds`), and the bare terrain under such a
+/// tyre is no grass. The masks themselves are the GPU's; this is their sum, classed, kept
+/// beside the tile's `Terrain` for as long as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundPaint {
+    /// Texels along one edge (the raster is square).
+    size: usize,
+    /// Row-major, row 0 at the tile's south edge (y = 0), the [`SurfaceKind`] as its byte.
+    kinds: Box<[u8]>,
+}
+
+/// The mask alpha from which a painted layer covers a texel (the shader blends the layer in
+/// by the alpha; past half, more of the picture is the layer than what lies under it).
+const PAINT_COVER: u8 = 128;
+
+impl GroundPaint {
+    /// Build the raster from the tile's painted layers in painting order, each the kind of
+    /// its texture and its 8-bit alpha mask (`width * height` bytes, row 0 at the south
+    /// edge: the loader has already turned the picture's rows over), the whole tile `base`
+    /// to start with. A texel takes a layer's kind where the mask's alpha reaches
+    /// [`PAINT_COVER`] anywhere in the texel's footprint - the max, not the nearest sample,
+    /// so a strip of asphalt one mask texel wide is not lost between two raster texels, at
+    /// the price of every painted patch growing by up to one raster texel - and a layer of
+    /// kind `Unknown` (a texture the classifier has no word for) leaves what was under it,
+    /// like an unclassified face keeps the road's grip. A mask smaller than the raster is
+    /// read by its nearest texel.
+    pub fn build(size: usize, base: SurfaceKind, layers: &[(SurfaceKind, &[u8], usize, usize)]) -> GroundPaint {
+        let size = size.max(1);
+        let mut kinds = vec![base as u8; size * size].into_boxed_slice();
+        for &(kind, alpha, w, h) in layers {
+            if kind == SurfaceKind::Unknown || w == 0 || h == 0 || alpha.len() < w * h {
+                continue;
+            }
+            // the footprint of raster texel i over a mask of n texels: [lo, hi), never empty
+            let span = |i: usize, n: usize| {
+                let lo = i * n / size;
+                let hi = ((i + 1) * n / size).max(lo + 1).min(n);
+                (lo, hi)
+            };
+            for j in 0..size {
+                let (y0, y1) = span(j, h);
+                for i in 0..size {
+                    let (x0, x1) = span(i, w);
+                    let covered = (y0..y1).any(|y| alpha[y * w + x0..y * w + x1].iter().any(|&a| a >= PAINT_COVER));
+                    if covered {
+                        kinds[j * size + i] = kind as u8;
+                    }
+                }
+            }
+        }
+        GroundPaint { size, kinds }
+    }
+
+    /// The painted kind at tile-local (`lx`, `ly`) in metres on a tile `tile` metres wide
+    /// (points off the tile read its nearest edge texel).
+    pub fn kind_at(&self, lx: f32, ly: f32, tile: f32) -> SurfaceKind {
+        let texel = |v: f32| ((v / tile * self.size as f32).floor().max(0.0) as usize).min(self.size - 1);
+        SurfaceKind::from_code(self.kinds[texel(ly) * self.size + texel(lx)])
+    }
+
+    /// Texels along one edge.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Bytes held on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.kinds.len()
+    }
+}
+
 /// The ground under one tyre as the tyre model wants it: the kind of face and the standing
 /// water on it (0 none .. 1 well inside a puddle; `omsi-app`'s `puddles::water_at`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -3184,5 +3259,71 @@ mod winding_transform_tests {
         assert_eq!(positive_det_faces_forward(&mesh), Some(false));
         assert!(!turns_round(&mesh));
         assert_eq!(mesh_from_o3d(&mesh).indices[..3], [0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod ground_paint_tests {
+    use super::{GroundPaint, SurfaceKind};
+
+    /// A 16 x 16 alpha mask, opaque inside the rectangle [x0, x1) x [y0, y1) (row 0 south).
+    fn mask(x0: usize, x1: usize, y0: usize, y1: usize) -> Vec<u8> {
+        let mut m = vec![0u8; 16 * 16];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                m[y * 16 + x] = 255;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn painted_layers_overwrite_the_base_in_order_and_unknown_leaves_what_is_under_it() {
+        // base grass; asphalt in the north-east quarter; an unclassified texture painted
+        // over the eastern half of that quarter (and a little grass beyond it)
+        let asphalt = mask(8, 16, 8, 16);
+        let unknown = mask(12, 16, 4, 16);
+        let paint = GroundPaint::build(
+            8,
+            SurfaceKind::Soft,
+            &[(SurfaceKind::Asphalt, &asphalt, 16, 16), (SurfaceKind::Unknown, &unknown, 16, 16)],
+        );
+        let tile = 300.0;
+        // the south-west is still grass, the north-east asphalt
+        assert_eq!(paint.kind_at(10.0, 10.0, tile), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(290.0, 10.0, tile), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(10.0, 290.0, tile), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(160.0, 160.0, tile), SurfaceKind::Asphalt);
+        // the unknown texture changed nothing, over the asphalt or over the grass
+        assert_eq!(paint.kind_at(290.0, 290.0, tile), SurfaceKind::Asphalt);
+        assert_eq!(paint.kind_at(290.0, 100.0, tile), SurfaceKind::Soft);
+        // row 0 of the mask is the south edge: the asphalt is north (large y), not south
+        assert_eq!(paint.kind_at(290.0, 10.0, tile), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(290.0, 290.0, tile), SurfaceKind::Asphalt);
+        // points off the tile read the nearest edge texel
+        assert_eq!(paint.kind_at(-5.0, -5.0, tile), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(305.0, 305.0, tile), SurfaceKind::Asphalt);
+    }
+
+    #[test]
+    fn a_thin_strip_survives_the_downsample_and_half_alpha_counts() {
+        // one mask texel wide along x = 9 of 16, full height: at 8 raster texels across it
+        // lands in raster column 4 (footprint 8..10) and is kept by the max
+        let mut strip = mask(9, 10, 0, 16);
+        strip.iter_mut().for_each(|a| if *a > 0 { *a = 128 });
+        let paint = GroundPaint::build(8, SurfaceKind::Soft, &[(SurfaceKind::Paving, &strip, 16, 16)]);
+        assert_eq!(paint.kind_at(160.0, 150.0, 300.0), SurfaceKind::Paving);
+        assert_eq!(paint.kind_at(120.0, 150.0, 300.0), SurfaceKind::Soft);
+        // under half alpha the layer is not there
+        let faint = vec![100u8; 16 * 16];
+        let paint = GroundPaint::build(8, SurfaceKind::Soft, &[(SurfaceKind::Paving, &faint, 16, 16)]);
+        assert_eq!(paint.kind_at(150.0, 150.0, 300.0), SurfaceKind::Soft);
+        // a mask coarser than the raster is read by its nearest texel
+        let coarse = [255u8, 0, 0, 0];
+        let paint = GroundPaint::build(8, SurfaceKind::Soft, &[(SurfaceKind::Concrete, &coarse, 2, 2)]);
+        assert_eq!(paint.kind_at(10.0, 10.0, 300.0), SurfaceKind::Concrete);
+        assert_eq!(paint.kind_at(140.0, 140.0, 300.0), SurfaceKind::Concrete);
+        assert_eq!(paint.kind_at(160.0, 10.0, 300.0), SurfaceKind::Soft);
+        assert_eq!(paint.kind_at(10.0, 160.0, 300.0), SurfaceKind::Soft);
     }
 }

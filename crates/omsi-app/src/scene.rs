@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use glam::{DVec2, DVec3, Mat4};
 use hashbrown::HashMap;
 use omsi_geometry::{
-    build_spline_mesh, build_terrain_mesh, mesh_from_o3d, object_rotation, FaceClasses, MeshData,
-    SplineCurve, SurfaceKind, TileSurface,
+    build_spline_mesh, build_terrain_mesh, mesh_from_o3d, object_rotation, FaceClasses, GroundPaint,
+    MeshData, SplineCurve, SurfaceKind, TileSurface,
 };
 use omsi_map::{tile_size, GlobalCfg, Terrain};
 use omsi_model::{MaterialDef, MeshDef, Model};
@@ -1991,6 +1991,9 @@ pub struct World {
     pub terrains: Arc<RwLock<HashMap<(i32, i32), Arc<Terrain>>>>,
     /// Surface rasters (roads) by tile coordinate.
     pub surfaces: Arc<RwLock<HashMap<(i32, i32), Arc<TileSurface>>>>,
+    /// What the ground brush painted on each tile, classed for the tyres ([`GroundPaint`],
+    /// [`Self::ground_paint_of`]), inserted and dropped with the tile's entry in `terrains`.
+    pub ground_paint: Arc<RwLock<HashMap<(i32, i32), Arc<GroundPaint>>>>,
     /// The wetness the renderer draws the puddles with this frame (`puddles::road_wetness`:
     /// 0..1, 0 under snow), an f32 as its bits, written where the spray reads it and read by
     /// every [`DriveGround`] under a tyre - the tyres and the picture agree on the water.
@@ -2580,6 +2583,9 @@ const WALL_TOP_STEP: f32 = 0.3;
 pub struct DriveGround {
     pub terrains: Arc<RwLock<HashMap<(i32, i32), Arc<Terrain>>>>,
     pub surfaces: Arc<RwLock<HashMap<(i32, i32), Arc<TileSurface>>>>,
+    /// [`World::ground_paint`]: what the ground brush painted on each tile, so that a tyre
+    /// on bare terrain finds the car park's asphalt and not the meadow under it.
+    pub paint: Arc<RwLock<HashMap<(i32, i32), Arc<GroundPaint>>>>,
     /// [`World::road_wetness`]: how wet the roads are drawn (f32 bits), so that a tyre in a
     /// drawn puddle finds the water the picture shows there.
     pub wetness: Arc<AtomicU32>,
@@ -2591,6 +2597,9 @@ const SURFACE_FACE_TOL: f32 = 0.03;
 /// The same for the terrain, whose height is read off a raster the tyre only nearly agrees
 /// with (its samples are bilinear, the wheel model's own are the triangles).
 const SURFACE_TERRAIN_TOL: f32 = 0.08;
+/// Texels along one edge of a tile's [`GroundPaint`] raster: 2.3 m on a 300 m tile, 16 KB a
+/// tile - a car park's edge to the nearest car, which is what a tyre's grip can tell.
+const GROUND_PAINT_TEXELS: usize = 128;
 
 type TileRefs = ((i32, i32), Option<Arc<TileSurface>>, Option<Arc<Terrain>>);
 
@@ -2600,13 +2609,15 @@ impl omsi_sim::rigid::Ground for DriveGround {
     }
 
     /// The face under a tyre at (x, y, z), the height the wheel model settled on: the kind
-    /// of the road face there (within `SURFACE_FACE_TOL`), else `Soft` where the terrain is
-    /// that height (the verge, a field), else `Unknown` (a face nobody classified, or the
-    /// tyre is off the ground). Standing water only on a road face, and only where the
-    /// renderer's puddle mask puts it (the shader's noise on the CPU, `puddles::water_at`):
-    /// a puddle never lies on bare terrain, and a dry or snowy road has none. Called a few
-    /// times per wheel per frame: one map lock per call, one grid cell of faces, no
-    /// allocation.
+    /// of the road face there (within `SURFACE_FACE_TOL`), else what the ground brush painted
+    /// where the terrain is that height ([`GroundPaint::kind_at`]: a car park's asphalt, a
+    /// side street's cobbles, and `Soft` for the verge and the field, or for a tile whose
+    /// paint is not in yet), else `Unknown` (a face nobody classified, or the tyre is off
+    /// the ground). Standing water only on a sealed surface - a road face, or terrain painted
+    /// asphalt, concrete or paving; grass drinks its rain - and only where the renderer's
+    /// puddle mask puts it (the shader's noise on the CPU, `puddles::water_at`): a dry or
+    /// snowy road has none. Called a few times per wheel per frame: one map lock per lookup,
+    /// one grid cell of faces, no allocation.
     fn surface(&self, x: f64, y: f64, z: f64) -> omsi_geometry::Surface {
         let key = tile_key(x, y);
         let lx = (x - key.0 as f64 * tile_size()) as f32;
@@ -2618,13 +2629,17 @@ impl omsi_sim::rigid::Ground for DriveGround {
             None => {
                 let terrain = self.terrains.read().get(&key).cloned();
                 match terrain.as_deref() {
-                    Some(t) if (omsi_geometry::terrain_height(t, lx, ly) - z as f32).abs() <= SURFACE_TERRAIN_TOL => SurfaceKind::Soft,
+                    Some(t) if (omsi_geometry::terrain_height(t, lx, ly) - z as f32).abs() <= SURFACE_TERRAIN_TOL => {
+                        let paint = self.paint.read().get(&key).cloned();
+                        paint.map_or(SurfaceKind::Soft, |p| p.kind_at(lx, ly, tile_size() as f32))
+                    }
                     _ => SurfaceKind::Unknown,
                 }
             }
         };
+        let sealed = road.is_some() || matches!(kind, SurfaceKind::Asphalt | SurfaceKind::Concrete | SurfaceKind::Paving);
         let wetness = f32::from_bits(self.wetness.load(Ordering::Relaxed));
-        let water = if road.is_some() && wetness > 0.0 { crate::puddles::water_at(x, y, wetness).puddle } else { 0.0 };
+        let water = if sealed && wetness > 0.0 { crate::puddles::water_at(x, y, wetness).puddle } else { 0.0 };
         omsi_geometry::Surface { kind, water }
     }
 
@@ -2813,6 +2828,29 @@ impl World {
         out
     }
 
+    /// The tyres' reading of one tile's ground paint ([`load_ground_paint`]'s masks, rows
+    /// already south first): the base `[groundtex]` everywhere - a map's base ground is grass
+    /// or earth, so one the classifier has no word for is `Soft` - then each painted layer's
+    /// kind ([`surface_class`] of its texture) where its mask covers, in painting order, on
+    /// a [`GROUND_PAINT_TEXELS`]-square raster. The masks are RGBA (the GPU's format); only
+    /// the alpha is the paint.
+    fn ground_paint_of(&self, masks: &[(usize, Image)]) -> GroundPaint {
+        let class = |layer: usize| self.global.ground_textures.get(layer).map_or(SurfaceKind::Unknown, |gt| surface_class(&gt.texture));
+        let base = match class(0) {
+            SurfaceKind::Unknown => SurfaceKind::Soft,
+            k => k,
+        };
+        let alphas: Vec<(SurfaceKind, Vec<u8>, usize, usize)> = masks
+            .iter()
+            .map(|(layer, img)| {
+                let alpha = img.rgba.iter().skip(3).step_by(4).copied().collect();
+                (class(*layer), alpha, img.width as usize, img.height as usize)
+            })
+            .collect();
+        let layers: Vec<(SurfaceKind, &[u8], usize, usize)> = alphas.iter().map(|(k, a, w, h)| (*k, a.as_slice(), *w, *h)).collect();
+        GroundPaint::build(GROUND_PAINT_TEXELS, base, &layers)
+    }
+
     /// Height for somebody on foot: the top of whatever is here - a pavement, a platform,
     /// a painted yard - and the bare ground where there is nothing. [`ground_height`] is
     /// the wheels' answer instead: it picks the drivable surface, which is the road *under*
@@ -2962,6 +3000,7 @@ impl World {
             object_dups: Mutex::new(HashMap::new()),
             terrains: Arc::new(RwLock::new(HashMap::new())),
             surfaces: Arc::new(RwLock::new(HashMap::new())),
+            ground_paint: Arc::new(RwLock::new(HashMap::new())),
             road_wetness: Arc::new(AtomicU32::new(0f32.to_bits())),
             vehicle_gpu: Mutex::new(HashMap::new()),
             vehicle_textures: Default::default(),
@@ -4901,6 +4940,9 @@ impl World {
         let first_load = self.seeded.lock().insert(key);
         let terrain: &Terrain = &res.terrain;
         self.terrains.write().insert(key, res.terrain.clone());
+        // (and what is painted on it, for the tyres: in and out with the terrain)
+        let paint_masks = self.load_ground_paint(&st.path);
+        self.ground_paint.write().insert(key, Arc::new(self.ground_paint_of(&paint_masks)));
         let ground_at = |x: f64, y: f64| -> f64 {
             let lx = (x - st.origin.x).clamp(0.0, tile_size()) as f32;
             let ly = (y - st.origin.y).clamp(0.0, tile_size()) as f32;
@@ -5466,7 +5508,7 @@ impl World {
             ty,
             terrain: Some(build_terrain_mesh(terrain)),
             hole_walls: MeshData::default(),
-            paint_masks: self.load_ground_paint(&st.path),
+            paint_masks,
             paint: Vec::new(),
             wall_paint: Vec::new(),
             water: st.water,
@@ -8202,6 +8244,7 @@ impl World {
         let freed = self.gpu.lock().release_tile(renderer, scene, state.gpu);
         self.drop_scripted(key, audio);
         self.terrains.write().remove(&key);
+        self.ground_paint.write().remove(&key);
         self.surfaces.write().remove(&key);
         freed > 0
     }
