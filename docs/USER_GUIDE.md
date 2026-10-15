@@ -364,6 +364,14 @@ the riders aboard still get off at their stops.
 player's bus (its `[boundingbox]`), and heavy rain darkens the day enough for the saloon
 lights to matter.
 
+`ped_density` (*Pedestrians* under Settings → Gameplay, 100 % by default; the pause menu's
+Options has a *Pedestrians* slider that applies at once) is how many people stroll the
+pavements: a share of the half of the AI people OMSI lets walk, scaled by the map's
+passenger curve for the hour, and fewer where there is little pavement. *People (AI humans)*
+(`ai_max_humans`, the second line of OMSI's `[AIMaxCountRandom]`, 200 by default) is that
+pool - everybody waiting at a stop, on the pavements or riding from them - so raising it
+allows more of all three.
+
 `detail_textures` lays procedural (fractal) grain over the ground and the roads up close,
 in vanilla and enhanced alike. `enhanced=1` (or `--enhanced`) switches to its own
 physically based renderer: high-range lighting with energy-conserving diffuse and GGX
