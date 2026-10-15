@@ -2728,51 +2728,37 @@ impl Traffic {
         };
         let nearby = self.net.lanes_starting_near(center, radius);
         // candidate lanes of this kind near the centre
-        let pick = |through: bool| -> Vec<(usize, f32)> {
-            nearby.iter().copied()
-                .map(|i| (i, &self.net.lanes[i]))
-                .filter(|(_, l)| {
-                    l.kind == kind
-                        && l.length() > 8.0
-                        && (l.start() - center).truncate().length() < radius
-                })
-                // lanes the map keeps clear of cars, and those whose [rule] trafficdensity is
-                // zero, are not spawned on at all; a lower density makes a lane that much less
-                // likely to be picked
-                .filter(|(_, l)| !l.no_cars && l.density > 0.0)
-                // nor, where there are others, lanes that end the network just ahead (the car
-                // would only drive into the end and wait there to be taken away)
-                .filter(|(i, _)| {
-                    !through
-                        || kind != LaneKind::Street
-                        || self
-                            .net
-                            .reach
-                            .get(*i)
-                            .map(|r| *r >= omsi_sim::traffic::DEAD_END)
-                            .unwrap_or(true)
-                })
-                // as many cars on a lane as metres of it (times its density): counted per
-                // lane, the many short lanes of a junction drew the cars into the town's
-                // tangles and left the long roads between them empty
-                // [ROLLBACK crowd-96] and the nearer the player, the likelier: a low target
-                // went out over the whole 400 m round and left the streets about the player
-                // empty
-                .map(|(i, l)| {
-                    let near = if kind == LaneKind::Street {
-                        let d = ((l.start() - center).truncate().length() / 150.0) as f32;
-                        1.0 / (1.0 + d * d)
-                    } else {
-                        1.0
-                    };
-                    (i, l.length() * l.density.clamp(0.05, 4.0) * near)
-                })
-                .collect::<Vec<(usize, f32)>>()
-        };
-        let mut candidates = pick(true);
-        if candidates.is_empty() {
-            candidates = pick(false);
-        }
+        // (every lane of the kind, dead-end stubs included: a map maker leaves an open-ended
+        // road on purpose and sets its [rule] trafficdensity, and OMSI spawns on it like any
+        // other; a car that runs off the end of the network is taken away there, see `at_end`
+        // in `populate_seen`)
+        let candidates: Vec<(usize, f32)> = nearby.iter().copied()
+            .map(|i| (i, &self.net.lanes[i]))
+            .filter(|(_, l)| {
+                l.kind == kind
+                    && l.length() > 8.0
+                    && (l.start() - center).truncate().length() < radius
+            })
+            // lanes the map keeps clear of cars, and those whose [rule] trafficdensity is
+            // zero, are not spawned on at all; a lower density makes a lane that much less
+            // likely to be picked
+            .filter(|(_, l)| !l.no_cars && l.density > 0.0)
+            // as many cars on a lane as metres of it (times its density): counted per
+            // lane, the many short lanes of a junction drew the cars into the town's
+            // tangles and left the long roads between them empty
+            // [ROLLBACK crowd-96] and the nearer the player, the likelier: a low target
+            // went out over the whole 400 m round and left the streets about the player
+            // empty
+            .map(|(i, l)| {
+                let near = if kind == LaneKind::Street {
+                    let d = ((l.start() - center).truncate().length() / 150.0) as f32;
+                    1.0 / (1.0 + d * d)
+                } else {
+                    1.0
+                };
+                (i, l.length() * l.density.clamp(0.05, 4.0) * near)
+            })
+            .collect();
         if candidates.is_empty() {
             return;
         }
