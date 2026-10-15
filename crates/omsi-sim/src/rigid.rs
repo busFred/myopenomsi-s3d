@@ -76,6 +76,43 @@ const GRIP_KERB: f32 = 0.9;
 const GRIP_SOFT: f32 = 0.55;
 const GRIP_SOFT_WET: f32 = 0.4;
 const GRIP_PUDDLE: f32 = 0.35;
+/// Rolling resistance of a tyre on each kind of ground, as a multiple of its coefficient on
+/// asphalt: setts a third more (the tread works into the joints), concrete the same, a kerb a
+/// little more, grass and earth three times (the ground gives under the tyre), and snow on
+/// anything from twice (packed, `StreetCond` 1.3) to four times (fresh, 2.0).
+const ROLL_CONCRETE: f32 = 1.0;
+const ROLL_PAVING: f32 = 1.3;
+const ROLL_KERB: f32 = 1.2;
+const ROLL_SOFT: f32 = 3.0;
+const ROLL_SNOW_MAX: f32 = 4.0;
+/// The speed (m/s) at which a tyre's rolling resistance has doubled: the textbook
+/// Crr(v) = Crr0 (1 + v / 30 m/s) of a truck tyre - the stock files' `[rollwiderstand]` is
+/// its value standing, and a bus at 100 km/h rolls against nearly twice that.
+const ROLL_SPEED: f32 = 30.0;
+
+/// The rolling resistance (N) of a tyre with coefficient `crr` on asphalt (see
+/// [`RigidBody::rolling_force`]) carrying `load` N at `v_long` m/s on `kind` of ground.
+fn rolling_force_of(crr: f32, street_cond: f32, uniform: bool, kind: SurfaceKind, load: f32, v_long: f32) -> f32 {
+    crr * load.max(0.0) * (1.0 + v_long.abs() / ROLL_SPEED) * rolling_scale_of(street_cond, uniform, kind)
+}
+
+/// What `kind` of ground does to the rolling resistance, snow (`StreetCond` over 1) on top.
+fn rolling_scale_of(street_cond: f32, uniform: bool, kind: SurfaceKind) -> f32 {
+    let ground = if uniform {
+        1.0
+    } else {
+        match kind {
+            SurfaceKind::Unknown | SurfaceKind::Asphalt => 1.0,
+            SurfaceKind::Concrete => ROLL_CONCRETE,
+            SurfaceKind::Paving => ROLL_PAVING,
+            SurfaceKind::Kerb => ROLL_KERB,
+            SurfaceKind::Soft => ROLL_SOFT,
+        }
+    };
+    let cond = if street_cond.is_finite() { street_cond } else { 0.0 };
+    let snow = (cond.clamp(1.0, 2.0) - 1.0) * (ROLL_SNOW_MAX - 1.0);
+    ground * (1.0 + snow)
+}
 
 /// What is left of the body's pitch and roll rate after `dt` seconds of OMSI's damping.
 fn body_damping(body_freq: f32, dt: f32) -> f32 {
@@ -251,6 +288,9 @@ pub struct RigidWheel {
     /// and the friction coefficient it gets from it (see [`RigidBody::tyre_grip`]).
     pub surface: Surface,
     pub mu: f32,
+    /// The rolling resistance this tyre put up in the last substep (N, see
+    /// [`RigidBody::rolling_force`]).
+    pub rolling: f32,
 }
 
 fn sign(x: f32) -> f32 {
@@ -424,10 +464,11 @@ pub struct CoupledPart {
     pub driven_wheels: usize,
     pub radius: f32,
     pub driven_load: f32,
-    /// What its brakes and its rolling resistance hold (N), and the static load on all its
-    /// wheels (N).
+    /// What its brakes hold (N), and the static load on all its wheels (N).
     pub brake: f32,
     pub load: f32,
+    /// Its `[rollwiderstand]` as a coefficient of its weight (see [`RigidBody::rolling_force`]).
+    pub crr: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +503,9 @@ pub struct RigidBody {
     /// the grip of all its tyres and no wheel spins or locks - or sliding, each tyre giving
     /// at most its own grip until the sideways speed at every tyre is under 0.1 m/s again.
     pub holding: bool,
+    /// `[rollwiderstand]` (N): what the file's whole vehicle rolls against, unladen on
+    /// asphalt. The tyres share it by their loads and it grows with speed (see
+    /// [`RigidBody::rolling_force`]).
     pub rolling_resistance: f32,
     /// Body-frame acceleration of the last step (m/s²), for `A_Trans_*`.
     pub accel_body: Vec3,
@@ -532,7 +576,7 @@ impl RigidBody {
             let tyre_c = TYRE_C * (tyre_k / TYRE_K).sqrt();
             for side in [-1.0f32, 1.0] {
                 let inertia_inv = if a.inertia_inv > 0.0 { a.inertia_inv } else { DEFAULT_INERTIA_INV };
-                wheels.push(RigidWheel { spin: 0.0, slipping: false, locked: false, inertia_inv, attach: Vec3::new(side * inner, a.long, z), lever: side * (outer - inner), radius: r, driven: a.driven, steered: (a.long - front_long).abs() < 0.01, steer: 0.0, tyre_k, tyre_c, spring: k, damper: c, max_force, spring_factor: 1.0, rest_load: 0.0, compression: 0.0, compression_rate: 0.0, touch: None, on_ground: true, rotation_deg: 0.0, rpm: 0.0, load: 0.0, ground_z: 0.0, ground_seen: false, walls: Vec::new(), step_force: 0.0, surface: Surface::default(), mu: 0.85 });
+                wheels.push(RigidWheel { spin: 0.0, slipping: false, locked: false, inertia_inv, attach: Vec3::new(side * inner, a.long, z), lever: side * (outer - inner), radius: r, driven: a.driven, steered: (a.long - front_long).abs() < 0.01, steer: 0.0, tyre_k, tyre_c, spring: k, damper: c, max_force, spring_factor: 1.0, rest_load: 0.0, compression: 0.0, compression_rate: 0.0, touch: None, on_ground: true, rotation_deg: 0.0, rpm: 0.0, load: 0.0, ground_z: 0.0, ground_seen: false, walls: Vec::new(), step_force: 0.0, surface: Surface::default(), mu: 0.85, rolling: 0.0 });
                 wheel_axle.push(ai);
             }
         }
@@ -714,6 +758,22 @@ impl RigidBody {
         let mu = self.friction * scale;
         let water = if s.water.is_finite() { s.water.clamp(0.0, 1.0) } else { 0.0 };
         mu + (self.friction * GRIP_PUDDLE - mu).min(0.0) * water
+    }
+
+    /// The rolling resistance (N) of a tyre of `kind` carrying `load` N at `v_long` m/s:
+    /// `[rollwiderstand]` is the whole vehicle's standing on asphalt, unladen, so each tyre's
+    /// coefficient is that over the dry weight, times what it rolls on, and it grows with
+    /// speed. The file's own value comes back exactly for the whole unladen vehicle at rest
+    /// on asphalt (the loads sum to the weight); passengers and a grade's extra load on an
+    /// axle add theirs, snow and soft ground more. The share by load is the road's own
+    /// doing: an axle that carries nothing (lifted, in the air) rolls against nothing.
+    pub fn rolling_force(&self, kind: SurfaceKind, load: f32, v_long: f32) -> f32 {
+        rolling_force_of(self.rolling_crr(), self.street_cond, self.uniform_grip, kind, load, v_long)
+    }
+
+    /// `[rollwiderstand]` over the unladen weight: the tyres' rolling coefficient on asphalt.
+    fn rolling_crr(&self) -> f32 {
+        self.rolling_resistance.max(0.0) / (self.dry.0 * 9.81).max(1.0)
     }
 
     pub fn kinetic_energy(&self) -> f32 {
@@ -912,7 +972,6 @@ impl RigidBody {
             // the towed mass moves with the body along its length
             let body_fwd = rot.mul_vec3(Vec3::Y);
             let towed: f32 = self.coupled.iter().map(|d| d.mass).sum();
-            let n_wheels = self.wheels.len().max(1) as f32;
             // tyre plane (forward turned by the wheel's steering angle), the hub with the
             // spring unloaded and where it is now
             let (position, cog) = (self.position, self.cog);
@@ -992,6 +1051,8 @@ impl RigidBody {
                 }
             }
             let omega_world = rot.mul_vec3(self.omega);
+            let (roll_crr, roll_cond, roll_uniform) = (self.rolling_crr(), self.street_cond, self.uniform_grip);
+            let rolling_of = |kind: SurfaceKind, load: f32, v: f32| rolling_force_of(roll_crr, roll_cond, roll_uniform, kind, load, v);
             let mut contacts: Vec<Contact> = Vec::with_capacity(self.wheels.len());
             for (i, w) in self.wheels.iter_mut().enumerate() {
                 let (fwd, right, fwd_h, hub0, hub) = tyre(w);
@@ -1164,13 +1225,17 @@ impl RigidBody {
                 // its bump stop is not grip, and fed into the side force it spun a bus round
                 // on a verge
                 let grip = tyre_f.min(w.max_force);
+                // the rolling resistance is the tyre's own: by its load, its speed and what
+                // it rolls on (`rolling_force`); it holds a standing wheel like a brake does
+                let rolling = rolling_of(w.surface.kind, grip, v_long);
+                w.rolling = rolling;
                 contacts.push(Contact {
                     r: r_world,
                     fwd,
                     right,
                     base: f_world + up * n + step,
                     drive: if w.driven { drive_torque / r / driven } else { 0.0 },
-                    brake: brake.get(i).copied().unwrap_or(0.0).max(0.0) + self.rolling_resistance / n_wheels,
+                    brake: brake.get(i).copied().unwrap_or(0.0).max(0.0) + rolling,
                     grip,
                     mu: w.mu,
                     v_long,
@@ -1186,16 +1251,20 @@ impl RigidBody {
                 let r_world = rot.mul_vec3(d.point - self.cog);
                 let cap = self.friction * d.driven_load;
                 let drive = if d.driven_wheels > 0 { (drive_torque / d.radius.max(0.1) / driven * d.driven_wheels as f32).clamp(-cap, cap) } else { 0.0 };
+                let v_long = (self.velocity + omega_world.cross(r_world)).dot(body_fwd);
+                // (the part's tyres roll on ground nobody asked: the road's own, by its
+                // weight and speed like the body's tyres)
+                let rolling = rolling_force_of(d.crr.max(0.0), roll_cond, roll_uniform, SurfaceKind::Unknown, d.load, v_long);
                 contacts.push(Contact {
                     r: r_world,
                     fwd: body_fwd,
                     right: Vec3::ZERO,
                     base: body_fwd * (-9.81 * d.mass * body_fwd.z),
                     drive: drive * share,
-                    brake: d.brake.max(0.0) * share,
+                    brake: (d.brake.max(0.0) + rolling) * share,
                     grip: d.load,
                     mu: self.friction,
-                    v_long: (self.velocity + omega_world.cross(r_world)).dot(body_fwd),
+                    v_long,
                     lateral: false,
                     wheel: None,
                 });
@@ -2054,7 +2123,7 @@ mod tests {
     fn pusher_front_section_is_pushed_through_the_joint() {
         let mut def = bus();
         def.axles.iter_mut().for_each(|a| a.driven = false);
-        let rear = CoupledPart { point: Vec3::new(0.0, -4.456, 0.503), dir: Vec3::Y, mass: 0.0, driven_wheels: 2, radius: 0.47, driven_load: 70_000.0, brake: 0.0, load: 70_000.0 };
+        let rear = CoupledPart { point: Vec3::new(0.0, -4.456, 0.503), dir: Vec3::Y, mass: 0.0, driven_wheels: 2, radius: 0.47, driven_load: 70_000.0, brake: 0.0, load: 70_000.0, crr: 0.0 };
         let g = road(1e9, 0.0);
         let start = |def: &Vehicle, parts: Vec<CoupledPart>| {
             let mut rb = RigidBody::from_definition(def, &[]);
@@ -2116,7 +2185,7 @@ mod tests {
         let mut def = bus();
         def.axles.iter_mut().for_each(|a| a.driven = false);
         let g = ramp(0.08);
-        let part = CoupledPart { point: Vec3::new(0.0, -4.456, 0.503), dir: Vec3::Y, mass: 7000.0, driven_wheels: 0, radius: 0.47, driven_load: 0.0, brake: 0.0, load: 70_000.0 };
+        let part = CoupledPart { point: Vec3::new(0.0, -4.456, 0.503), dir: Vec3::Y, mass: 7000.0, driven_wheels: 0, radius: 0.47, driven_load: 0.0, brake: 0.0, load: 70_000.0, crr: 0.0 };
         let mut rb = RigidBody::from_definition(&def, &[]);
         rb.coupled = vec![CoupledPart { brake: 40_000.0, ..part }];
         rb.place(DVec3::new(0.0, 50.0, 4.0), 0.0);
@@ -2725,5 +2794,33 @@ mod tests {
     /// The ground speed under the rear right tyre (the body's, for a straight run).
     fn rb_speed(w: &[RigidWheel]) -> f32 {
         w[3].spin * w[3].radius
+    }
+
+    /// `[rollwiderstand]` is what the whole unladen vehicle rolls against standing on
+    /// asphalt: the tyres' shares sum to it there, and grow with the load, the speed, the
+    /// ground and the snow.
+    #[test]
+    fn rolling_resistance_is_the_files_at_rest_and_grows_with_load_and_speed() {
+        let g = road(1e9, 0.0);
+        let mut rb = RigidBody::from_definition(&bus(), &[]);
+        rb.place(DVec3::ZERO, 0.0);
+        run(&mut rb, 3.0, 0.0, 0.0, &g);
+        let total: f32 = rb.wheels.iter().map(|w| w.rolling).sum();
+        assert!((total - 1000.0).abs() < 50.0, "{total}");
+        let n = rb.wheels[0].load;
+        let f0 = rb.rolling_force(SurfaceKind::Asphalt, n, 0.0);
+        assert!(f0 > 100.0, "{f0}");
+        assert!((rb.rolling_force(SurfaceKind::Asphalt, n, 30.0) - 2.0 * f0).abs() < 1e-3 * f0, "doubled at 30 m/s");
+        assert!((rb.rolling_force(SurfaceKind::Asphalt, 2.0 * n, 0.0) - 2.0 * f0).abs() < 1e-3 * f0, "with the load");
+        assert!(rb.rolling_force(SurfaceKind::Soft, n, 0.0) > 2.5 * f0, "soft ground");
+        assert!(rb.rolling_force(SurfaceKind::Paving, n, 0.0) > 1.2 * f0, "setts");
+        rb.street_cond = 2.0;
+        assert!((rb.rolling_force(SurfaceKind::Asphalt, n, 0.0) - 4.0 * f0).abs() < 1e-3 * f0, "fresh snow");
+        rb.street_cond = 0.0;
+        // passengers aboard: the same coefficient on more weight
+        rb.set_payload(3000.0, Vec3::new(0.0, 0.0, 1.2));
+        run(&mut rb, 3.0, 0.0, 0.0, &g);
+        let laden: f32 = rb.wheels.iter().map(|w| w.rolling).sum();
+        assert!((laden - 1000.0 * 13.2 / 10.2).abs() < 80.0, "{laden}");
     }
 }
