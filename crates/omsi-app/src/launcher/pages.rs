@@ -297,6 +297,25 @@ fn sel_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect,
     }
 }
 
+/// [ROLLBACK numfield-1] A number typed in: the setting is kept as the text typed (the
+/// writer reads a number out of it, and falls back to the default for anything else).
+fn num_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect, label: &str, key: &str, placeholder: &str) {
+    ui.label(Rect::new(r.x, r.y, r.w * 0.45, r.h), label);
+    let mut cur = match get(s, key) {
+        Value::String(x) => x.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    };
+    if ui.text_input(name, Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55, r.h), &mut cur, placeholder, None) {
+        cur.retain(|c| c.is_ascii_digit());
+        s[key] = match cur.parse::<i64>() {
+            Ok(n) => json!(n),
+            Err(_) => json!(cur),
+        };
+        *dirty = 0.3;
+    }
+}
+
 fn toggle_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect, label: &str, key: &str) {
     let mut v = get(s, key).as_bool().unwrap_or(false);
     if ui.toggle(&format!("set-{key}"), r, &mut v, label) {
@@ -1068,9 +1087,9 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, 
     sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Max timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
     sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_parked_pct", &[("0", "None"), ("25", "25% of spaces"), ("50", "50% of spaces"), ("75", "75% of spaces"), ("90", "90% of spaces"), ("100", "Every space")]);
     // the people on the pavements about the player (within the pool below)
-    sel_setting(ui, s, dirty, "s-peds", c.row(), "Pedestrians", "pedestrians", &[("0", "None"), ("25", "25"), ("50", "50"), ("100", "100"), ("200", "200"), ("300", "300"), ("400", "400")]);
+    num_setting(ui, s, dirty, "s-peds", c.row(), "Pedestrians about you", "pedestrians", "100");
     // OMSI's [AIMaxCountRandom] second line: the people waiting, walking and riding, in all
-    sel_setting(ui, s, dirty, "s-maxhumans", c.row(), "People (AI humans)", "ai_max_humans", &[("50", "50"), ("100", "100"), ("200", "200 (OMSI default)"), ("400", "400"), ("800", "800")]);
+    num_setting(ui, s, dirty, "s-maxhumans", c.row(), "People (AI humans, in all)", "ai_max_humans", "200");
     let left = c.used();
     // OMSI's own options (options.cfg)
     let mut c = Col::new(ui, cols[1], "Simulation");
