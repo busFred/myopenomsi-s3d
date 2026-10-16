@@ -5476,10 +5476,20 @@ impl Traffic {
                     }
                 }
                 Some(jn) => {
+                    // [ROLLBACK junctionexit-1] the exit, where the car must find room before
+                    // it goes in, is the first lane after the conflict - not the first lane of
+                    // another object: a crossing object that reaches 100-200 m past its box
+                    // (BeijingCity) had its "exit" far up the road, empty, while the paths just
+                    // past the box stood full, and the cars went in and stood in the box
+                    if jn.exit.is_none() && !has(l) {
+                        jn.exit = Some((l, d));
+                    }
                     if object(l).is_some() && object(l) == object(jn.lanes[0].0) {
                         jn.lanes.push((l, d));
                     } else {
-                        jn.exit = Some((l, d));
+                        if jn.exit.is_none() {
+                            jn.exit = Some((l, d));
+                        }
                         break;
                     }
                 }
@@ -5871,13 +5881,24 @@ impl Traffic {
         let mut exit_full = false;
         if !jn.inside {
             if let Some((e, de)) = jn.exit {
-                let room = on_lane
-                    .get(&e)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
+                let cars = &self.cars;
+                // [ROLLBACK junctionexit-1] the room is measured along the way from the exit
+                // on, over the lanes within 40 m of it (the exit lane alone was looked at: a
+                // short piece of path, empty, with the queue standing on the piece after it)
+                let room = way
                     .iter()
-                    .filter(|x| !x.3 && x.0 != i)
-                    .map(|&(j, sj, _, _)| (sj - self.cars[j].state.rear, self.cars[j].state.speed))
+                    .skip_while(|&&(l, _)| l != e)
+                    .take_while(|&&(_, dl)| dl - de < 40.0)
+                    .flat_map(|&(l, dl)| {
+                        on_lane
+                            .get(&l)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(move |x| !x.3 && x.0 != i)
+                            .map(move |&(j, sj, _, _)| ((dl - de) + sj - cars[j].state.rear, cars[j].state.speed))
+                    })
+                    .filter(|&(space, _)| space > -st.length)
                     .fold(None::<(f32, f32)>, |acc, x| {
                         if acc.map(|a| x.0 < a.0).unwrap_or(true) {
                             Some(x)
