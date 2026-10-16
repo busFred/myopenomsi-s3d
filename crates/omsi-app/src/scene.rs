@@ -14530,6 +14530,128 @@ mod terrain_mapping_tests;
 #[path = "scene/crossing_deformation_tests.rs"]
 mod crossing_deformation_tests;
 
+/// Real BeijingCity content (read from `OMSI_ROOT`, skipped when it is unset or the files are
+/// missing): the traffic model's bindings on the lanes the builders make from it.
+#[cfg(test)]
+mod beijing_tests {
+    use super::*;
+    use omsi_traffic::{is_open, Junctions, VehicleClass};
+
+    fn root() -> Option<PathBuf> {
+        let r = std::env::var_os("OMSI_ROOT").map(PathBuf::from);
+        if r.is_none() {
+            eprintln!("skipped: set OMSI_ROOT to an OMSI 2 install with BeijingCity");
+        }
+        r
+    }
+
+    fn present(p: &Path) -> bool {
+        if !p.is_file() {
+            eprintln!("skipped: {} is missing", p.display());
+        }
+        p.is_file()
+    }
+
+    /// AndingR with the rules of tile_1_-1's spline 288: the cycle lane beyond the green strip
+    /// (path 9) has no neighbour, the two carriageway lanes (paths 3, 5) are neighbours, the
+    /// bus lane (path 7, density 0 for group 0) is closed to a normal car and path 5 is open.
+    #[test]
+    fn anding_road_lanes_are_bound_by_edges_and_rules() {
+        let Some(root) = root() else { return };
+        let sli = root.join("Splines/Beijing_splines/AndingR.sli");
+        let map = root.join("maps/BeijingCity/tile_1_-1.map");
+        if !present(&sli) || !present(&map) {
+            return;
+        }
+        let def = Spline::load(&sli).expect("AndingR.sli");
+        let tile = omsi_map::Tile::load(&map).expect("tile_1_-1.map");
+        let Some(real) = tile.splines.iter().find(|s| s.id == 288) else {
+            eprintln!("skipped: spline 288 is not in {}", map.display());
+            return;
+        };
+        let mut sp = real.clone();
+        sp.pos = [0.0, 0.0, 0.0];
+        sp.heading = 0.0;
+        sp.length = 200.0;
+        sp.radius = 0.0;
+        sp.grad_start = 0.0;
+        sp.grad_end = 0.0;
+        sp.delta_h = None;
+        sp.cant_start = 0.0;
+        sp.cant_end = 0.0;
+        sp.skew_start = 0.0;
+        sp.skew_end = 0.0;
+        sp.mirror = false;
+        let curve = SplineCurve::from_map(&sp, DVec2::ZERO);
+        let lanes = spline_lanes(&def, &sp, &curve, (1, -1));
+        let mut net = omsi_sim::traffic::Network { lanes, ..Default::default() };
+        net.link(1.5);
+        net.compute_conflicts();
+        let of = |path: u16| -> Vec<usize> {
+            net.lanes.iter().enumerate().filter(|(_, l)| l.key.is_some_and(|k| k.path == path)).map(|(i, _)| i).collect()
+        };
+        for (i, l) in net.lanes.iter().enumerate() {
+            if let Some(k) = l.key {
+                eprintln!(
+                    "lane {i}: path {} off {:+.1} w {:.1} {:?} rev {} left {:?} right {:?} dens {} groups {:?}",
+                    k.path, l.offset, l.width, l.kind, l.reversed, l.left, l.right, l.density, l.group_density
+                );
+            }
+        }
+        let (p3, p5, p7, p9) = (of(3), of(5), of(7), of(9));
+        assert!(!p3.is_empty() && !p5.is_empty() && !p7.is_empty() && !p9.is_empty(), "paths 3/5/7/9 exist");
+        for &i in &p9 {
+            assert_eq!((net.lanes[i].left, net.lanes[i].right), (None, None), "cycle lane (path 9) has no neighbour");
+            assert!(!net.lanes.iter().any(|l| l.left == Some(i) || l.right == Some(i)), "nobody has the cycle lane as neighbour");
+        }
+        let next_to = |a: usize, b: usize| net.lanes[a].left == Some(b) || net.lanes[a].right == Some(b);
+        assert!(
+            p3.iter().any(|&a| p5.iter().any(|&b| next_to(a, b))) && p5.iter().any(|&b| p3.iter().any(|&a| next_to(b, a))),
+            "paths 3 and 5 are neighbours of each other"
+        );
+        let car = |lane: usize| {
+            let mut st = omsi_sim::traffic::AiState::new(lane, 0.0, 1);
+            st.veh_type = 0;
+            omsi_traffic::Vehicle::new(1, VehicleClass::Car, st, 0.9, 1)
+        };
+        for &i in &p7 {
+            assert!(!is_open(&net.lanes[i], &car(i)), "path 7 is closed to a normal car");
+        }
+        assert!(p5.iter().any(|&i| is_open(&net.lanes[i], &car(i))), "path 5 is open to a normal car");
+    }
+
+    /// The Anwai Dajie crossing, compiled as one junction with its lights bound.
+    #[test]
+    fn anwai_dajie_cross_compiles_with_lights_and_foes() {
+        let Some(root) = root() else { return };
+        let sco_path = root.join("Sceneryobjects/BEIJINGCITY/AnwaiDajieCross.sco");
+        if !present(&sco_path) {
+            return;
+        }
+        let sco = SceneryObject::load(&sco_path).expect("AnwaiDajieCross.sco");
+        let lanes = object_lanes(&sco, DVec3::ZERO, [0.0, 0.0, 0.0], Some(0), (0, 0), 1, &[]);
+        let mut net = omsi_sim::traffic::Network { lanes, ..Default::default() };
+        net.link(1.5);
+        net.compute_conflicts();
+        let js = Junctions::compile(&net);
+        assert_eq!(js.nodes.len(), 1, "one crossing object, one junction");
+        let j = &js.nodes[0];
+        let lit_crossings = j.crossings.iter().filter(|c| c.light.is_some()).count();
+        eprintln!("AnwaiDajieCross: {} movements, {} crossings, {} lit crossings", j.movements.len(), j.crossings.len(), lit_crossings);
+        assert!(j.movements.len() >= 20, "{} movements", j.movements.len());
+        assert!(j.movements.iter().any(|m| m.light == Some((0, 0))), "a movement is governed by light (0, 0)");
+        assert!(!j.crossings.is_empty(), "the sidewalk paths make crossings");
+        assert!(lit_crossings >= 1, "a crossing carries a light");
+        let left: Vec<_> = j.movements.iter().filter(|m| net.lanes[m.lane].turn == 2).collect();
+        eprintln!("AnwaiDajieCross: {} left-turn movements", left.len());
+        assert!(!left.is_empty(), "there are left-turn movements");
+        assert!(left.iter().any(|m| m.foes.iter().any(|f| f.yields)), "a left turn gives way to a foe");
+        let foeless = left.iter().filter(|m| m.foes.is_empty()).count();
+        eprintln!("AnwaiDajieCross: {} of {} left-turn movements have no foe", foeless, left.len());
+        assert!(foeless < left.len(), "not every left turn is without foes");
+    }
+}
+
 #[cfg(test)]
 mod material_tests {
     use super::*;

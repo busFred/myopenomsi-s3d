@@ -215,7 +215,8 @@ impl Junctions {
             .map(|&lane| {
                 let l = &net.lanes[lane];
                 let entries: Vec<usize> = net.prev.get(lane).map(|p| p.iter().copied().filter(|&p| !inside(p)).collect()).unwrap_or_default();
-                let continues: Vec<usize> = l.next.iter().copied().filter(|&n| inside(n)).collect();
+                // (as movement indices: the lanes are the movements, in this order)
+                let continues: Vec<usize> = l.next.iter().filter_map(|&n| lanes.iter().position(|&x| x == n)).collect();
                 // exits: the first lanes outside, through at most a few inner pieces
                 let mut exits: Vec<usize> = Vec::new();
                 let mut frontier: Vec<usize> = vec![lane];
@@ -263,14 +264,50 @@ impl Junctions {
             // (a movement that continues into another inner piece is in the way of
             // everything that piece is in the way of, as far as the queue behind the stop
             // line is concerned: the continuation's foes are reached later along the way)
-            foes.sort_by(|a, b| a.mine.0.total_cmp(&b.mine.0));
-            let (start, end) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
             movements[mi].foes = foes;
+        }
+        // A way through built from several pieces (a lead-in, the turn, the way out:
+        // BeijingCity's objects chain them) meets its foes on the later pieces. The first
+        // piece carries them too, at their distance along the whole way, so that the
+        // driver decides before entering and not once committed on the lead-in; 15 of
+        // AnwaiDajieCross's 26 left turns have no conflict on their own piece.
+        let own: Vec<Vec<Foe>> = movements.iter().map(|m| m.foes.clone()).collect();
+        for mi in 0..movements.len() {
+            let mut offset = net.lanes[movements[mi].lane].length();
+            let mut cur = mi;
+            let mut chained: Vec<Foe> = Vec::new();
+            for _ in 0..5 {
+                let Some(&n) = movements[cur].continues.first() else { break };
+                for f in &own[n] {
+                    chained.push(Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + offset, f.mine.1 + offset), theirs: f.theirs, yields: f.yields });
+                }
+                offset += net.lanes[movements[n].lane].length();
+                cur = n;
+            }
+            movements[mi].foes.extend(chained);
+            movements[mi].foes.sort_by(|a, b| a.mine.0.total_cmp(&b.mine.0));
+            let (start, end) = movements[mi].foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
             movements[mi].conflict_start = start;
             movements[mi].conflict_end = end;
         }
         let crossings = Self::crossings(net, &movements);
         Junction { key, movements, crossings }
+    }
+
+    /// The pieces a claim for movement `m` stands for: `m` and the pieces it continues
+    /// into, each with how far along the whole way its start lies.
+    pub fn chain(&self, net: &Network, j: usize, m: usize) -> Vec<(usize, f32)> {
+        let node = &self.nodes[j];
+        let mut out = vec![(m, 0.0)];
+        let mut offset = net.lanes[node.movements[m].lane].length();
+        let mut cur = m;
+        for _ in 0..5 {
+            let Some(&n) = node.movements[cur].continues.first() else { break };
+            out.push((n, offset));
+            offset += net.lanes[node.movements[n].lane].length();
+            cur = n;
+        }
+        out
     }
 
     /// The pedestrian crossings of the object: every footpath lane that cuts a way through

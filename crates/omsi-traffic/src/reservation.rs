@@ -66,6 +66,8 @@ pub struct Grant {
 /// Seconds a vehicle inside the junction keeps as its margin before a foe may follow it
 /// into the meeting place.
 const CLEAR_MARGIN: f32 = 0.6;
+/// Impatience at which a driver goes first in front of a foe that stands and waits too.
+const HALF_FED_UP: f32 = 0.5;
 
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
 /// the driver's own figure for a foe that stands or crawls, twice that for one rolling,
@@ -96,7 +98,7 @@ fn window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
 /// the two would arrive together).
 pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
     let plain = decide(js, net, claims, None);
-    if claims.iter().all(|c| c.impatience.claims_after().is_none()) {
+    if claims.iter().all(|c| c.impatience.claims_after().is_none() && c.impatience.value < HALF_FED_UP) {
         return plain;
     }
     decide(js, net, claims, Some(&plain))
@@ -106,6 +108,14 @@ pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
 /// squeeze in.
 fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant]>) -> Vec<Grant> {
     let mut out: Vec<Grant> = Vec::with_capacity(claims.len());
+    // a claim stands for the whole way through: the piece it names and the pieces that
+    // one continues into, each as far along as its start lies (claim, piece, shift)
+    let mut expanded: Vec<(usize, usize, f32)> = Vec::new();
+    for (k, c) in claims.iter().enumerate() {
+        for (m, off) in js.chain(net, c.junction, c.movement) {
+            expanded.push((k, m, off));
+        }
+    }
     for c in claims {
         let node = &js.nodes[c.junction];
         let me = &node.movements[c.movement];
@@ -123,7 +133,11 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
-            for (ok, o) in claims.iter().enumerate().filter(|(_, o)| o.junction == c.junction && o.movement == foe.movement && o.vehicle != c.vehicle) {
+            for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle) {
+                // the foe as it stands on this piece of its way
+                let mut shifted = claims[ok];
+                shifted.s -= shift;
+                let o = &shifted;
                 // a foe that has left the meeting place
                 if o.s - o.rear > foe.theirs.1 {
                     continue;
@@ -166,7 +180,12 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // slow or still well away, not across one doing town speed 35 m off. A
                 // turner facing a green stream waits for it to stop at its red.)
                 let far_enough = their_in > after_for(o.speed, squeeze);
-                let take_anyway = squeeze.is_some() && far_enough && !their_inside && !o.committed && !goes_now && !(o.impatience.claims_after().is_some() && o.vehicle < c.vehicle);
+                // (four cars arriving together at an unmarked junction all give way to
+                // the right: when the foe stands and waits as well, half the patience is
+                // enough to go first, as a nod across the junction settles it in life)
+                let mutual_wait = plain.is_some() && c.impatience.value >= HALF_FED_UP && o.speed < 0.3 && !their_inside && !o.committed;
+                let fed_up = (squeeze.is_some() && far_enough) || mutual_wait;
+                let take_anyway = fed_up && !their_inside && !o.committed && !goes_now && !(o.impatience.value >= HALF_FED_UP && o.vehicle < c.vehicle);
                 if theirs_first && !take_anyway {
                     // the right of way is theirs: I need my gap after they are gone, or
                     // before they come

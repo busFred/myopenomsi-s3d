@@ -572,13 +572,17 @@ impl Simulation {
             if !j.inside && j.entry - st.front > decide {
                 continue;
             }
-            // committed: inside, or too close to the line to stop before it even braking
-            // hard (a driver who can still stop, if not comfortably, gives way as the
-            // rules say: two cars arriving together at an unmarked junction both took
-            // themselves for committed and met in the middle)
-            let room = j.entry - st.front - 0.6;
-            let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
-            let committed = j.inside || cannot_stop;
+            // committed: past the first meeting place of the way through, or too close to
+            // it to stop before it even braking hard. A driver who can still stop, if not
+            // comfortably, gives way as the rules say (two cars arriving together at an
+            // unmarked junction both took themselves for committed and met in the middle);
+            // one on the lead-in piece of a long object is inside but not yet committed.
+            // (at the line a driver stops hard if it must; one already inside does not
+            // slam on in the middle of the junction, it goes on unless it can stop gently)
+            let room = j.conflict_start - st.front - 0.6;
+            let brake = if j.inside { st.decel * 1.5 } else { omsi_sim::traffic::MAX_BRAKE * 0.7 };
+            let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
+            let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one
             let (light_red, until_go) = match p.signal {
@@ -662,7 +666,9 @@ impl Simulation {
                 continue;
             }
             let v = p.speed.max(0.0);
-            let room = -s_on - p.half_len - 0.6;
+            let cs = self.junctions.nodes[j].movements[m].conflict_start;
+            let cs = if cs.is_finite() { cs } else { net.lanes[self.junctions.nodes[j].movements[m].lane].length() };
+            let room = cs - s_on - p.half_len - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             claims.push(Claim {
                 light_red: false,
@@ -677,7 +683,7 @@ impl Simulation {
                 front: p.half_len,
                 rear: p.half_len,
                 gap: 4.0,
-                committed: s_on >= 0.0 || cannot_stop,
+                committed: cs - s_on - p.half_len <= 0.5 || cannot_stop,
                 exit_room: true,
                 impatience: Impatience::default(),
                 absolute: p.priority,

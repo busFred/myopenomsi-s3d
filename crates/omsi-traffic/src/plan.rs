@@ -198,11 +198,21 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 3. the junction
     if let (Some(j), Some(g)) = (p.junction, grant) {
-        if !j.inside && !g.go {
-            out.hold = g.hold;
-            out.wait_for = g.wait_for;
-            let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };
-            min_stop(&mut out.stop, &mut out.why, Some(j.entry - 0.3), w);
+        if !g.go {
+            // at the line, or, already on the lead-in piece of a long object, short of
+            // the first meeting place of the way through
+            // (a line too near to stop at gently any more is no stop either: the car
+            // creeps on to the meeting place and stops short of that, as the claim counts
+            // it; a line the bumper is already over drew an emergency stop for a frame)
+            let at_line = j.entry - 0.3;
+            let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
+            let at = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
+            if at > st.front - 0.3 {
+                out.hold = g.hold;
+                out.wait_for = g.wait_for;
+                let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };
+                min_stop(&mut out.stop, &mut out.why, Some(at), w);
+            }
         }
     }
 

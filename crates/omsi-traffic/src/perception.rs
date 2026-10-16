@@ -90,6 +90,9 @@ pub struct JunctionView {
     /// Distance from the origin to the start of the movement's lane (negative inside).
     pub entry: f32,
     pub inside: bool,
+    /// Distance from the origin to the first meeting place on the way through (the end
+    /// of the piece when the way has no foe).
+    pub conflict_start: f32,
     /// Room past the junction's conflicts for this vehicle, measured along its own way.
     pub exit_room: bool,
 }
@@ -375,9 +378,13 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
         if (p.pos - me.pos).truncate().length() > 180.0 || (p.pos.z - me.pos.z).abs() > 4.0 {
             continue;
         }
-        let horizon = if p.priority { 5.0 } else { 1.5 };
+        // The box as it is; a vehicle with the right of way (`TrafficPriority`) crossing
+        // the way also claims the five seconds of road ahead of it. (For any other player
+        // the junction grants settle who goes first: a box stretched a second and a half
+        // ahead swept over the car's way as the bus went by and drew an emergency stop
+        // from a car that was rightly waiting behind.)
         let same_way = omsi_sim::traffic::wrap_deg(p.heading - me.heading).abs() < 60.0;
-        let ahead = if same_way || p.speed.abs() < 0.5 { 0.0 } else { (p.speed.abs() * horizon) as f64 };
+        let ahead = if p.priority && !same_way && p.speed.abs() > 0.5 { (p.speed.abs() * 5.0) as f64 } else { 0.0 };
         let b = p.obb(ahead, 0.5);
         if let Some(d) = way.hit(&b, me.half_width as f64, look) {
             let gap = d - st.front;
@@ -560,8 +567,10 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let node = &js.nodes[j];
         let mv = &node.movements[m];
         let piece_len = net.lanes[l].length();
-        // where the conflicts end, in my way's distances
-        let clear_from = d0 + if mv.conflict_end > 0.0 { mv.conflict_end.min(piece_len) } else { piece_len };
+        // where the conflicts of the whole way through begin and end, in my way's
+        // distances (they may lie on the pieces after this one)
+        let conflict_start = d0 + if mv.conflict_start.is_finite() { mv.conflict_start } else { piece_len };
+        let clear_from = d0 + if mv.conflict_end > 0.0 { mv.conflict_end } else { piece_len };
         let need = me.length() + me.state.min_gap;
         let mut room = f32::INFINITY;
         for &(wl, wd) in &way[k..] {
@@ -586,7 +595,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
             }
         }
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, exit_room: room >= need });
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, conflict_start, exit_room: room >= need });
     }
     None
 }
