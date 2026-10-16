@@ -96,7 +96,7 @@ impl DriverParams {
             lc_strategic: 1.0,
             lc_speed_gain: 0.6,
             lc_cooperate: 0.5,
-            lc_keep_right: 0.3,
+            lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
             yellow_brake: 2.5,
@@ -139,7 +139,9 @@ impl DriverParams {
             reaction: j(p.reaction, -0.5),
             gap_accept: j(p.gap_accept, -0.3),
             lc_gap: j(p.lc_gap, -0.3),
-            lc_speed_gain: j(p.lc_speed_gain, 0.5),
+            // (jittered a little only: the desire has to clear the planner's threshold
+            // for every driver, or a slow driver sits behind a crawler for ever)
+            lc_speed_gain: j(p.lc_speed_gain, 0.2),
             impatience_rate: j(p.impatience_rate, 0.5),
             ..p
         }

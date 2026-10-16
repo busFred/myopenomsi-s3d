@@ -117,7 +117,7 @@ impl Junctions {
         // (an object whose lanes were extended with reverse twins: compiled again whole)
         let mut keys: Vec<_> = by_object.keys().copied().collect();
         keys.sort_unstable();
-        for key in keys {
+        for &key in &keys {
             let mut lanes = by_object.remove(&key).unwrap_or_default();
             if let Some(old) = self.nodes.iter().position(|n| n.key == key) {
                 for m in &self.nodes[old].movements {
@@ -131,6 +131,18 @@ impl Junctions {
             } else {
                 lanes.sort_unstable();
                 self.nodes.push(Self::build(net, key, &lanes));
+            }
+        }
+        // the old junctions' ways in and out may lie on the new lanes
+        let old_keys: Vec<((i32, i32), i64)> = self.nodes.iter().filter(|n| !keys.contains(&n.key)).map(|n| n.key).collect();
+        for key in old_keys {
+            let Some(idx) = self.nodes.iter().position(|n| n.key == key) else { continue };
+            let lanes: Vec<usize> = self.nodes[idx].movements.iter().map(|m| m.lane).collect();
+            let fresh = Self::build(net, key, &lanes);
+            for (m, f) in self.nodes[idx].movements.iter_mut().zip(fresh.movements) {
+                m.entries = f.entries;
+                m.exits = f.exits;
+                m.continues = f.continues;
             }
         }
         self.compiled = net.lanes.len();

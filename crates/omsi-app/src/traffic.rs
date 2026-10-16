@@ -1674,7 +1674,7 @@ impl Traffic {
         let far = self.spawn_radius * DESPAWN_FACTOR;
         self.advance_dormant();
         // the cars somebody stands behind
-        let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.lead_car.and_then(|j| self.cars.get(j)).map(|o| o.id)).collect();
+        let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.lead_id).collect();
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -2975,13 +2975,13 @@ impl Traffic {
         let me = &self.cars[i];
         let Some(my_stop) = me.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id) else { return (false, false) };
         let stop_of = |c: &AiCar| c.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id);
-        let lead_close = match (me.ai.last.lead_seen, me.ai.last.lead) {
-            (Some(Seen::Player(_)), Some(l)) => l.gap < 9.0 && player.is_some_and(|p| p.4.abs() < 0.3),
-            (Some(Seen::Vehicle(j)), Some(l)) => l.gap < 9.0 && self.cars.get(j).is_some_and(|o| o.ai.state.speed.abs() < 0.3 && o.at_stop() && stop_of(o) == Some(my_stop)),
+        let lead_close = match (me.ai.last.lead_seen, me.ai.last.lead_id, me.ai.last.lead) {
+            (Some(Seen::Player(_)), _, Some(l)) => l.gap < 9.0 && player.is_some_and(|p| p.4.abs() < 0.3),
+            (_, Some(id), Some(l)) => l.gap < 9.0 && self.cars.iter().find(|o| o.id == id).is_some_and(|o| o.ai.state.speed.abs() < 0.3 && o.at_stop() && stop_of(o) == Some(my_stop)),
             _ => false,
         };
         let follower_close = self.cars.iter().enumerate().any(|(j, o)| {
-            j != i && matches!(o.ai.last.lead_seen, Some(Seen::Vehicle(k)) if k == i) && o.ai.last.lead.is_some_and(|l| l.gap < 40.0) && stop_of(o) == Some(my_stop)
+            j != i && o.ai.last.lead_id == Some(me.id) && o.ai.last.lead.is_some_and(|l| l.gap < 40.0) && stop_of(o) == Some(my_stop)
         });
         (lead_close, follower_close)
     }
@@ -3262,7 +3262,7 @@ impl Traffic {
                     last.why.name(),
                     last.stop.map(|s| (s * 10.0).round() / 10.0),
                     last.lead.map(|l| (l.gap * 10.0).round() / 10.0),
-                    last.wait_for.and_then(|j| self.cars.get(j)).map(|o| o.id),
+                    last.wait_for,
                     c.ai.impatience.value,
                     c.ai.blinker_shown.0,
                     st.lane,
@@ -3559,6 +3559,7 @@ impl Traffic {
         let n = new.len();
         if n > 0 {
             let added = self.net.extend(new, 1.5);
+            self.sim.network_grew(&self.net, added.start);
             log::debug!("traffic: {n} lanes added for timetable routes that drive a one-way path the other way ({:?})", added);
         }
         n
@@ -3605,6 +3606,7 @@ impl Traffic {
         l.density = 0.0;
         l.no_cars = true;
         let added = self.net.extend(vec![l], 1.5);
+        self.sim.network_grew(&self.net, added.start);
         log::debug!("traffic: a {len:.0} m connector lane {} from lane {a} to lane {b} for a timetable route", added.start);
         Some(added.start)
     }
@@ -4165,6 +4167,7 @@ impl Traffic {
         let mut added = self.net.lanes.len()..self.net.lanes.len();
         if n > 0 {
             added = self.net.extend(new, 1.5);
+            self.sim.network_grew(&self.net, added.start);
             self.street_weight += self.net.lanes[added.clone()].iter().filter_map(street_lane_weight).sum::<f64>();
             log::debug!(
                 "traffic: {} lanes added ({} in all)",

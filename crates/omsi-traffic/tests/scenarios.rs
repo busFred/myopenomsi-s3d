@@ -404,8 +404,10 @@ fn a_car_stops_for_a_person_on_a_crossing_and_goes_on_when_they_are_gone() {
 fn a_car_keeps_the_junction_clear_while_the_exit_is_blocked() {
     let net = priority_junction();
     let mut sim = Simulation::new(&net, vec![]);
-    // a car stands just past the junction on the east exit (lane 2)
-    let mut blocker = car(9, 2, 5.0, 0.0);
+    // a car stands inside the main-road piece just past its conflict with the side road
+    // (the piece runs to 30 m, the meeting place ends near 18 m): no room for another
+    // car to wait there clear of the conflict, so the next one has to hold at the line
+    let mut blocker = car(9, 1, 24.0, 0.0);
     blocker.external.stop_at = Some(2.1);
     let mut cars = vec![blocker, car(1, 0, 140.0, 12.0)];
     let mut frames = 0;

@@ -940,23 +940,24 @@ pub(crate) fn marks(
                         line(&mut out, a, b, [255, 230, 60, 255], 2.2);
                         label_at(&mut out, b, [255, 230, 60, 255], 4.0, format!("{} {:.1} m", last.why.name(), d));
                     }
-                    let id_of = |j: usize| t.cars.get(j).map(|o| o.id);
-                    if let (Some(j), Some(l)) = (c.ai.lead_car, last.lead) {
-                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
+                    if let (Some(id), Some(l)) = (c.ai.lead_id, last.lead) {
+                        if let Some(q) = by_id.get(&id) {
                             line(&mut out, pos + lift, *q + lift, [60, 160, 255, 255], 1.6);
-                            label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{}, gap {:.1} m", id_of(j).unwrap_or(0), l.gap));
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{id}, gap {:.1} m", l.gap));
                         }
                     }
-                    if let Some(j) = last.body_block {
-                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
+                    if let Some(id) = last.body_block {
+                        if let Some(q) = by_id.get(&id) {
                             line(&mut out, pos + lift, *q + lift, [255, 60, 255, 255], 1.8);
-                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 60, 255, 255], 3.0, format!("body of #{} in the way", id_of(j).unwrap_or(0)));
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 60, 255, 255], 3.0, format!("body of #{id} in the way"));
                         }
                     }
-                    if let Some(j) = last.wait_for {
-                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
+                    if let Some(id) = last.wait_for {
+                        if let Some(q) = by_id.get(&id) {
                             line(&mut out, pos + lift, *q + lift, [255, 170, 40, 255], 1.6);
-                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 170, 40, 255], 3.0, format!("waits for #{}", id_of(j).unwrap_or(0)));
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 170, 40, 255], 3.0, format!("waits for #{id}"));
+                        } else if id >= omsi_traffic::sim::PLAYER_ID_BASE {
+                            label_at(&mut out, pos + DVec3::new(0.0, 0.0, 2.1), [255, 170, 40, 255], 3.0, format!("#{}: waits for a player", c.id));
                         }
                     }
                     let mut flags: Vec<String> = Vec::new();

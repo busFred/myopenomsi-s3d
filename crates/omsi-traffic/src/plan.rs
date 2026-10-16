@@ -69,8 +69,12 @@ pub struct Plan {
     /// Held by something (the start reaction applies when it clears).
     pub held: bool,
     pub hold: Option<Hold>,
+    /// The claim index of the vehicle waited for at a junction (a player: `usize::MAX - k`).
     pub wait_for: Option<usize>,
-    pub body_block: Option<usize>,
+    /// Id of the vehicle whose body across the way holds this one.
+    pub body_block: Option<u64>,
+    /// At the line on green or yellow: the driver goes through whatever it turns to.
+    pub amber: bool,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -82,12 +86,25 @@ fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
     }
 }
 
+/// Is the gap in the lane beside accepted: the follower there must not have to brake
+/// hard, and there is room to settle ahead.
+fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
+    let (st, dp) = (&me.state, &me.params);
+    let v = st.speed;
+    let ok_behind = nb.behind.map(|(g, vb)| g > 2.0 + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)).unwrap_or(true);
+    let ok_ahead = nb.ahead.map(|(g, va)| g > 2.0 + (v - va).max(0.0) * 1.5).unwrap_or(true);
+    ok_behind && ok_ahead && !nb.foreign
+}
+
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
 /// accepted (LMRS: the route, a standing obstacle, speed gain, keeping to the side).
 fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, bool) {
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
+    if !nb.allowed {
+        return (0.0, false);
+    }
     let mut desire = 0.0f32;
     // a turn lane is never left within 150 m of its junction, and a turn ahead is taken
     // from the lane that leads into it
@@ -103,7 +120,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     }
     // behind something standing: round it
     if let Some(l) = p.leader {
-        let standing = l.standing_for > 4.0 && l.speed < 0.3 && l.gap < 25.0;
+        let standing = l.standing_obstacle() && l.gap < 25.0;
         if standing && me.stopped >= 4.0 && nb.ahead.map(|a| a.0 > l.gap + l.length + 6.0).unwrap_or(true) {
             desire = desire.max(0.8);
         }
@@ -118,14 +135,10 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     if nb.dir == keep_side && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > 200.0 {
         desire = desire.max(dp.lc_keep_right);
     }
-    if nb.runs_on < 40.0 || nb.foreign {
+    if nb.runs_on < 40.0 {
         return (0.0, false);
     }
-    // the gap: behind, the follower must not have to brake hard; ahead, room to settle
-    let v = st.speed;
-    let ok_behind = nb.behind.map(|(g, vb)| g > 2.0 + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)).unwrap_or(true);
-    let ok_ahead = nb.ahead.map(|(g, va)| g > 2.0 + (v - va).max(0.0) * 1.5).unwrap_or(true);
-    (desire, ok_behind && ok_ahead)
+    (desire, gap_accepted(me, nb))
 }
 
 /// Decide for vehicle `i`.
@@ -151,8 +164,20 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let possible = v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8);
         let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
         let go = match sig.aspect {
-            Aspect::Green | Aspect::GreenYellow | Aspect::Dark => true,
-            Aspect::Yellow => me.amber || (gap < comfortable && !queued),
+            Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
+                // at the line on green: through, whatever it turns to in a moment
+                if gap < 3.0 && !queued && v > 1.0 {
+                    out.amber = true;
+                }
+                true
+            }
+            Aspect::Yellow => {
+                let go = me.amber || (gap < comfortable && !queued);
+                if go && gap < comfortable {
+                    out.amber = true;
+                }
+                go
+            }
             Aspect::Red | Aspect::RedYellow => (me.amber && gap < comfortable && !queued) || gap < possible - 0.5,
         };
         if !go {
@@ -183,10 +208,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         min_stop(&mut out.stop, &mut out.why, Some(st.front + (d - 1.0).max(0.0)), Why::LetOut);
     }
 
-    // 6. a route's lane change: now if the gap is there, else wait at the lane's end
+    // 6. a route's lane change: now if the gap is there, else wait at the lane's end (a
+    //    route may lead into a lane the path's rules close to the vehicle's class: only
+    //    the gap counts)
     if let Some((to, dir)) = p.route_change {
         let nb = if dir == 1 { p.left } else { p.right };
-        let ok = nb.map(|n| change_desire(net, sim, me, p, &n).1).unwrap_or(true);
+        let ok = nb.map(|n| gap_accepted(me, &n)).unwrap_or(true);
         if ok && st.change.is_none() && st.change_cooldown <= 0.0 {
             out.start = Some(Start::RouteChange { to, dir });
         } else if st.change.is_none() {
@@ -205,10 +232,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 best = Some((d, nb));
             }
         }
-        let threshold = 0.5 - 0.2 * me.impatience.value;
-        if let Some((d, nb)) = best.filter(|b| b.0 >= threshold) {
-            let standing = p.leader.map(|l| l.standing_for > 4.0 && l.speed < 0.3 && l.gap < 25.0).unwrap_or(false);
-            let _ = d;
+        let threshold = 0.4 - 0.2 * me.impatience.value;
+        if let Some((_, nb)) = best.filter(|b| b.0 >= threshold) {
+            let standing = p.leader.map(|l| l.standing_obstacle() && l.gap < 25.0).unwrap_or(false);
             out.start = Some(if standing && v < 1.0 { Start::Bypass { to: nb.lane, dir: nb.dir } } else { Start::Change { to: nb.lane, dir: nb.dir } });
         }
     }
@@ -251,18 +277,28 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // a bus does not pass what stands at its own next stop
         let own_stop = me.external.stop_at.map(|s| s < l.gap + l.length + st.front + 15.0).unwrap_or(false);
         // how far the car has to swing out: past the thing inside the lane if the lane
-        // leaves room, else onto the oncoming lane
+        // leaves room beside where it stands, else onto the oncoming lane
         let need = me.half_width + l.half_width + 0.35;
-        let lane_room = lane.width.max(3.0) * 0.5 + 0.5;
-        let squeeze = need <= lane_room && !player_out;
-        let side = if squeeze { need * sim.oncoming_sign() } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
+        let towards_middle = sim.oncoming_sign();
+        let squeeze_side = if l.lateral * towards_middle > 0.3 { l.lateral - towards_middle * need } else { l.lateral + towards_middle * need };
+        let squeeze = squeeze_side.abs() + me.half_width <= lane.width.max(3.0) * 0.5 + 0.3 && !player_out;
+        let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
-        // keep back: room to pull out again
+        // keep back: room to pull out again, where the car can still stop there gently
         let room = out_len + 1.0;
         if !(me.is_bus() && l.at_stop) && l.gap > room + 0.5 {
-            min_stop(&mut out.stop, &mut out.why, Some(st.front + l.gap - room), Why::Lead);
+            let dist = l.gap - room;
+            let need_brake = v * v / (2.0 * dist.max(0.1));
+            if need_brake <= dp.comfort_brake * 1.5 {
+                min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);
+            }
         }
-        if can_pass && !own_stop && !player_out && (me.stopped >= 3.0 || matches!(l.what, Seen::Parked)) && l.gap >= room - 1.0 {
+        // (a car that ended up too close - the thing stopped in front of it - pulls out
+        // over what room it has once it has stood a while, rather than for ever)
+        let too_close = l.gap < room - 1.0;
+        let ready = (me.stopped >= 3.0 || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
+        if can_pass && !own_stop && !player_out && ready {
+            let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
             let real = l.gap + if player { 0.5 } else { 0.0 };
             let obstacle_len = l.length;
             let pass_len = real + obstacle_len + st.front + st.rear + 6.0;

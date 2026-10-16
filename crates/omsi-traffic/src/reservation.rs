@@ -36,6 +36,9 @@ pub struct Claim {
     pub impatience: Impatience,
     /// A train, or anything else that never gives way.
     pub absolute: bool,
+    /// Standing, held by something of its own (a lead, a full exit): it is not about to
+    /// move off, whatever its arrival time says.
+    pub held: bool,
 }
 
 /// Why a vehicle waits.
@@ -107,8 +110,13 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 if o.s - o.rear > foe.theirs.1 {
                     continue;
                 }
-                let (their_in, their_out) = window(o, foe.theirs.0, foe.theirs.1);
+                let (their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
                 let their_inside = o.s + o.front >= foe.theirs.0;
+                // standing in the meeting place, held by its own lead: it is not leaving
+                // on the schedule its acceleration would give it
+                if their_inside && o.held && o.speed < 0.3 {
+                    their_out = f32::INFINITY;
+                }
                 let i_am_first = my_out + CLEAR_MARGIN <= their_in;
                 let they_are_first = their_out + CLEAR_MARGIN <= my_in;
                 // the two are clear of each other in time whatever the rules say
@@ -178,7 +186,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false }
     }
 
     #[test]

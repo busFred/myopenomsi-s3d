@@ -12,7 +12,7 @@ use crate::reservation::{self, Claim, Grant, Hold};
 use glam::{DVec2, DVec3};
 use hashbrown::HashMap;
 use omsi_sim::collision::Obb;
-use omsi_sim::traffic::{AiState, Lead, Network, TrafficLightController};
+use omsi_sim::traffic::{AiState, LaneKind, Lead, Network, TrafficLightController};
 
 /// A player's (or another LAN player's) vehicle as the traffic sees it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,20 +128,26 @@ pub struct External {
     pub priority: bool,
 }
 
-/// The last decision, kept for consumers and the debug overlay.
+/// The last decision, kept for consumers and the debug overlay. Other vehicles are named
+/// by id: the caller may take vehicles off the road between frames.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Decision {
     pub why: Why,
     pub lead: Option<Lead>,
     pub lead_seen: Option<Seen>,
+    /// The vehicle followed (its id).
+    pub lead_id: Option<u64>,
     pub stop: Option<f32>,
     pub held: bool,
     pub hold: Option<Hold>,
-    /// Vehicle index waited for at a junction.
-    pub wait_for: Option<usize>,
-    /// Another vehicle's body (not on the way) that held this one.
-    pub body_block: Option<usize>,
+    /// Vehicle id waited for at a junction (a player: `PLAYER_ID_BASE` + its id).
+    pub wait_for: Option<u64>,
+    /// Another vehicle's body (not on the way) that held this one (its id).
+    pub body_block: Option<u64>,
 }
+
+/// Ids of the players in `Decision::wait_for`, above any vehicle's.
+pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
 /// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
 #[derive(Debug, Clone)]
@@ -167,17 +173,15 @@ pub struct Vehicle {
     pub amber: bool,
     pub external: External,
     pub last: Decision,
-    /// Index of the vehicle followed last frame.
-    pub lead_car: Option<usize>,
-    /// (vehicle, time until) a lead is ignored to break a mutual wait.
-    pub ignore_lead: Option<(usize, f64)>,
+    /// Id of the vehicle followed last frame.
+    pub lead_id: Option<u64>,
+    /// (vehicle id, time until) a lead is ignored to break a mutual wait.
+    pub ignore_lead: Option<(u64, f64)>,
     /// Indicator shown, and since when (debounced).
     pub blinker_shown: (i32, f64),
     /// World position of the origin and heading (degrees), from the way.
     pub pos: DVec3,
     pub heading: f32,
-    /// Seconds in a row the lane change planner started one.
-    pub change_streak: u8,
 }
 
 impl Vehicle {
@@ -201,13 +205,17 @@ impl Vehicle {
             amber: false,
             external: External::default(),
             last: Decision::default(),
-            lead_car: None,
+            lead_id: None,
             ignore_lead: None,
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
-            change_streak: 0,
         }
+    }
+
+    /// An empty vehicle to stand in while one is lent out.
+    pub fn placeholder() -> Vehicle {
+        Vehicle::new(0, VehicleClass::Car, AiState::new(0, 0.0, 0), 0.0, 0)
     }
 
     pub fn length(&self) -> f32 {
@@ -243,6 +251,13 @@ pub struct Occupant {
     pub foreign: bool,
 }
 
+/// Grid cell size of the vehicle and people grids (m).
+const GRID: f64 = 50.0;
+
+fn cell(p: DVec3) -> (i32, i32) {
+    ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
+}
+
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
@@ -257,6 +272,12 @@ pub struct Simulation {
     pub walkers: Vec<(usize, f32)>,
     pub parked: HashMap<usize, Vec<Parked>>,
     pub occupancy: HashMap<usize, Vec<Occupant>>,
+    /// Vehicles and people by 50 m cell, as of this frame.
+    vehicle_grid: HashMap<(i32, i32), Vec<usize>>,
+    people_grid: HashMap<(i32, i32), Vec<usize>>,
+    /// Lane changes begun this frame: (lane changed onto, distance along it). The vehicles
+    /// still to plan see them, so two do not move into one gap at once.
+    pub changes_started: Vec<(usize, f32)>,
     pub left_hand: bool,
     /// Vehicles that reached a dead end this frame (indices, descending).
     pub removed: Vec<usize>,
@@ -277,6 +298,9 @@ impl Simulation {
             walkers: Vec::new(),
             parked: HashMap::new(),
             occupancy: HashMap::new(),
+            vehicle_grid: HashMap::new(),
+            people_grid: HashMap::new(),
+            changes_started: Vec::new(),
             left_hand: net.left_hand,
             removed: Vec::new(),
             held_at_red: 0,
@@ -307,6 +331,36 @@ impl Simulation {
         }
     }
 
+    /// Indices of the vehicles within `r` metres of `p` (by grid cell: a few more).
+    pub fn vehicles_near(&self, p: DVec3, r: f64) -> Vec<usize> {
+        let (cx, cy) = cell(p);
+        let n = (r / GRID).ceil() as i32;
+        let mut out = Vec::new();
+        for dx in -n..=n {
+            for dy in -n..=n {
+                if let Some(v) = self.vehicle_grid.get(&(cx + dx, cy + dy)) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Indices of the people within `r` metres of `p` (by grid cell: a few more).
+    pub fn people_near(&self, p: DVec3, r: f64) -> Vec<usize> {
+        let (cx, cy) = cell(p);
+        let n = (r / GRID).ceil() as i32;
+        let mut out = Vec::new();
+        for dx in -n..=n {
+            for dy in -n..=n {
+                if let Some(v) = self.people_grid.get(&(cx + dx, cy + dy)) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+        out
+    }
+
     /// Place every vehicle on the ground from its way.
     pub fn update_positions(&self, net: &Network, vehicles: &mut [Vehicle]) {
         for v in vehicles.iter_mut() {
@@ -326,13 +380,17 @@ impl Simulation {
         }
     }
 
-    /// Which vehicle is where on which lane.
+    /// Which vehicle is where on which lane, and the grids.
     pub fn build_occupancy(&mut self, net: &Network, vehicles: &[Vehicle]) {
         self.occupancy.clear();
+        self.vehicle_grid.clear();
+        self.people_grid.clear();
         for (i, v) in vehicles.iter().enumerate() {
             let st = &v.state;
-            let Some(lane) = net.lanes.get(st.lane) else { continue };
-            let _ = lane;
+            if net.lanes.get(st.lane).is_none() {
+                continue;
+            }
+            self.vehicle_grid.entry(cell(v.pos)).or_default().push(i);
             self.occupancy.entry(st.lane).or_default().push(Occupant { vehicle: i, s: st.s, lateral: st.lateral, foreign: false });
             if let Some(p) = st.prev_lane {
                 if st.s < st.rear + 1.0 && st.change.is_none() {
@@ -357,6 +415,9 @@ impl Simulation {
         for occ in self.occupancy.values_mut() {
             occ.sort_by(|a, b| a.s.total_cmp(&b.s));
         }
+        for (k, p) in self.people.iter().enumerate() {
+            self.people_grid.entry(cell(p.pos)).or_default().push(k);
+        }
     }
 
     /// Lanes starting just ahead of a player, and the ones after them, within `within`
@@ -366,7 +427,7 @@ impl Simulation {
         let mut out: Vec<(usize, f32)> = Vec::new();
         for l in net.lanes_starting_near(p.pos, 25.0) {
             let lane = &net.lanes[l];
-            if lane.kind != omsi_sim::traffic::LaneKind::Street {
+            if lane.kind != LaneKind::Street {
                 continue;
             }
             let rel = (lane.start() - p.pos).truncate();
@@ -397,6 +458,13 @@ impl Simulation {
         out
     }
 
+    /// The lane a player's vehicle is on: (lane, distance along it), a street lane within
+    /// 6 m heading the same way.
+    fn player_lane(&self, net: &Network, p: &PlayerView) -> Option<(usize, f32)> {
+        let (l, s, _) = net.lane_along(p.pos, p.heading as f64, LaneKind::Street, 6.0, 45.0)?;
+        Some((l, s))
+    }
+
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
         for c in &mut self.lights {
             c.request.iter_mut().for_each(|r| *r = false);
@@ -424,16 +492,31 @@ impl Simulation {
                 }
             }
         }
+        // a walker presses the button of a lit pedestrian lane they stand on or at the end
+        // of (the lanes before and after theirs too: a crossing's lit stub is short)
+        let press = |lights: &mut Vec<TrafficLightController>, ctl: usize, li: usize, dist: f32| {
+            if let Some(c) = lights.get_mut(ctl) {
+                if dist <= c.approach_dist(li).min(10.0) {
+                    if let Some(r) = c.request.get_mut(li) {
+                        *r = true;
+                    }
+                }
+            }
+        };
         for &(l, s) in &self.walkers {
             let Some(lane) = net.lanes.get(l) else { continue };
+            let to_end = (lane.length() - s).max(0.0);
             if let Some((ctl, li)) = lane.traffic_light {
-                if let Some(c) = self.lights.get_mut(ctl) {
-                    let reach = c.approach_dist(li).min(10.0);
-                    if lane.length() - s <= reach || s <= reach {
-                        if let Some(r) = c.request.get_mut(li) {
-                            *r = true;
-                        }
-                    }
+                press(&mut self.lights, ctl, li, to_end.min(s.max(0.0)));
+            }
+            for &n in &lane.next {
+                if let Some((ctl, li)) = net.lanes[n].traffic_light {
+                    press(&mut self.lights, ctl, li, to_end);
+                }
+            }
+            for &p in net.prev.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if let Some((ctl, li)) = net.lanes[p].traffic_light {
+                    press(&mut self.lights, ctl, li, s.max(0.0));
                 }
             }
         }
@@ -448,6 +531,7 @@ impl Simulation {
         self.time += dt as f64;
         self.day_time += dt as f64 * self.time_scale;
         self.removed.clear();
+        self.changes_started.clear();
         self.held_at_red = 0;
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
@@ -490,6 +574,59 @@ impl Simulation {
                 exit_room: j.exit_room,
                 impatience: v.impatience,
                 absolute: v.is_rail() || v.external.priority,
+                held: st.speed < 0.3 && v.last.held,
+            });
+        }
+        // the players' vehicles claim their way like anybody else (their grants are not
+        // read: the player drives)
+        for (k, p) in self.players.iter().enumerate() {
+            let Some((lane, s)) = self.player_lane(net, p) else { continue };
+            let len = net.lanes[lane].length();
+            let (j, m, s_on) = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
+                (j, m, s)
+            } else if let Some(entries) = self.junctions.entries.get(&lane) {
+                // the way through chosen by the indicator, else the straightest
+                let pick = entries
+                    .iter()
+                    .copied()
+                    .min_by_key(|&(j, m)| {
+                        let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
+                        let want = p.blinker as i32;
+                        if want != 0 && turn == want {
+                            0
+                        } else if turn == 0 {
+                            1
+                        } else {
+                            2
+                        }
+                    });
+                let Some((j, m)) = pick else { continue };
+                (j, m, s - len)
+            } else {
+                continue;
+            };
+            if s_on < -70.0 {
+                continue;
+            }
+            let v = p.speed.max(0.0);
+            let room = -s_on - p.half_len - 0.6;
+            let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            claims.push(Claim {
+                vehicle: usize::MAX - k,
+                junction: j,
+                movement: m,
+                s: s_on,
+                speed: v,
+                accel: 1.2,
+                v_max: 14.0,
+                front: p.half_len,
+                rear: p.half_len,
+                gap: 4.0,
+                committed: s_on >= 0.0 || cannot_stop,
+                exit_room: true,
+                impatience: Impatience::default(),
+                absolute: p.priority,
+                held: p.still > 2.0,
             });
         }
         let grants: Vec<Grant> = reservation::resolve(&self.junctions, net, &claims);
@@ -504,29 +641,50 @@ impl Simulation {
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
-        let v = &mut vehicles[i];
         let now = self.time;
-        v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for: plan.wait_for, body_block: plan.body_block };
-        v.lead_car = match plan.lead_seen {
-            Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => Some(j),
+        let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + (usize::MAX - k) as u64 } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
+        let lead_id = match plan.lead_seen {
+            Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
+        let v = &mut vehicles[i];
+        v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
+        v.lead_id = lead_id;
         if plan.why == Why::Light && v.state.speed < 0.5 {
             self.held_at_red += 1;
+        }
+        if plan.amber {
+            v.amber = true;
         }
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
+        // a lane change begins only when nobody started one into the same stretch this
+        // frame (the perception was taken before anybody moved)
+        let mut change_into = |to: usize, s_to: f32| -> bool {
+            if self.changes_started.iter().any(|&(l, s)| l == to && (s - s_to).abs() < 25.0) {
+                return false;
+            }
+            self.changes_started.push((to, s_to));
+            true
+        };
         match plan.start {
             Some(Start::Change { to, dir }) => {
-                v.state.start_change(net, to, dir);
-                v.change_streak = v.change_streak.saturating_add(1);
+                if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
+                    v.state.start_change(net, to, dir);
+                }
             }
             Some(Start::Bypass { to, dir }) => {
-                v.state.start_bypass(net, to, dir);
-                v.stopped = 0.0;
+                if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
+                    v.state.start_bypass(net, to, dir);
+                    v.stopped = 0.0;
+                }
             }
-            Some(Start::RouteChange { to, dir }) => v.state.start_route_change(net, to, dir),
+            Some(Start::RouteChange { to, dir }) => {
+                if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
+                    v.state.start_route_change(net, to, dir);
+                }
+            }
             Some(Start::Pass(p)) => {
                 v.passing = Some(p);
                 v.state.lateral_curve = p.curve(v.state.odometer, v.state.lateral);
@@ -601,7 +759,7 @@ impl Simulation {
         // a random car that stands for ever asks to be taken away when nobody looks
         if !v.is_bus() && !v.is_rail() && plan.why != Why::Light {
             let stood = v.stopped.max(v.progress.1);
-            if (stood > 60.0 && plan.why != Why::Junction) || stood > 150.0 {
+            if (stood > 60.0 && !matches!(plan.why, Why::Junction | Why::ExitFull)) || stood > 150.0 {
                 v.gone = true;
             }
         }
@@ -622,10 +780,7 @@ impl Simulation {
         if allowed && want != shown {
             v.blinker_shown = (want, now);
         }
-        if v.state.change.is_none() {
-            v.change_streak = 0;
-        }
-        if !alive || v.change_streak >= 12 {
+        if !alive {
             self.removed.push(i);
         }
     }
