@@ -180,11 +180,13 @@ fn a_median_is_not_a_neighbour_and_a_cycle_lane_across_it_is_no_lane_to_pass_on(
         (went_out, cars[0].state.s + cars[0].state.front)
     };
     assert!(blocked(3.5, 3.0).0, "control: the car passes on a normal oncoming lane");
-    for (offset, width) in [(5.6, 1.0), (3.5, 1.0)] {
-        let (went_out, front) = blocked(offset, width);
-        assert!(!went_out, "the car went out on the {width} m lane {offset} m away");
-        assert!(front < 197.8, "the car waits behind the parked one: front at {front:.1}");
-    }
+    // (a 1 m path right beside the lane is a lane drawn narrow, as Spandau draws its
+    // full lanes: a car passes on it; one beyond a 5.6 m strip is a cycle lane behind a
+    // median, whatever its width)
+    assert!(blocked(3.5, 1.0).0, "control: a narrow path right beside the lane is still the oncoming lane");
+    let (went_out, front) = blocked(5.6, 1.0);
+    assert!(!went_out, "the car went out on the lane beyond the median");
+    assert!(front < 197.8, "the car waits behind the parked one: front at {front:.1}");
 }
 
 // 3 -----------------------------------------------------------------------------------

@@ -16,8 +16,6 @@ pub enum Closed {
     Rules,
     /// No random traffic of this vehicle's group drives here (`trafficdensity 0`).
     Density,
-    /// Narrower than the vehicle (a cycle lane).
-    Width,
 }
 
 /// Is `lane` open to `v` for driving along? A timetable vehicle on its route is open
@@ -39,17 +37,22 @@ pub fn open_to(lane: &Lane, v: &Vehicle) -> Result<(), Closed> {
     // a scheduled bus goes where its route goes; everybody else needs the lane to carry
     // traffic of their group
     if st.route.is_empty() {
+        // (a vehicle of no group is a normal car: where the path names its groups, the
+        // first group's share counts, not the most any group gets - `density` is the
+        // greatest over all groups, so that a lane stays open to whoever is asked for)
         let density = match st.traffic_pool.as_ref() {
             Some((pool, defaults)) => lane.pool_density(defaults, *pool),
-            None => lane.density,
+            None if lane.group_density.is_empty() => lane.density,
+            None => lane.pool_density(&[1], 0),
         };
         if density <= 0.0 {
             return Err(Closed::Density);
         }
     }
-    if lane.kind == LaneKind::Street && lane.width > 0.5 && lane.width + 0.2 < v.half_width * 2.0 {
-        return Err(Closed::Width);
-    }
+    // (no test on the path's width: a tenth of the stock maps' street paths are drawn a
+    // metre wide where the lane is a full one - Spandau's ten-lane Altstädter Ring is
+    // all 1 m paths - and BeijingCity's bus lane is as wide as its cycle lane. What keeps
+    // a car off a cycle lane beyond a strip is the strip: `Lane::beside_each_other`.)
     Ok(())
 }
 
@@ -94,10 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_lane_is_too_narrow_for_a_car_and_a_route_opens_anything() {
+    fn a_narrow_path_is_still_a_lane_and_a_route_opens_a_closed_one() {
+        // (Spandau draws full lanes as 1 m paths)
         let l = lane(1.0);
         let mut c = car();
-        assert_eq!(open_to(&l, &c), Err(Closed::Width));
+        assert_eq!(open_to(&l, &c), Ok(()));
         c.state.route = vec![0];
         let mut closed = lane(3.0);
         closed.density = 0.0;

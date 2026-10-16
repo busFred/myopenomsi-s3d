@@ -5466,9 +5466,13 @@ impl Humans {
         // Re-deciding at every 2 m piece, people stood in the road for a gap in the next
         // lane while the light went red, and then crossed "on red".
         let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
-        // (the lane's own light, or that of the crossing it is a piece of: the pieces
-        // beyond the lit stub at the kerb are governed by the same light)
-        if let (Some((c, li)), Some(t)) = (traffic.and_then(|t| t.crossing_light(next.lane)), traffic) {
+        // (the lane's own light, or, stepping off the kerb, that of the crossing it is a
+        // piece of: the pieces beyond the lit stub are governed by the same light. Once
+        // off the kerb only a lit piece - a median - holds again, see above: the light
+        // turning red mid-crossing must not freeze anybody in the road)
+        let lane = &net.lanes[next.lane];
+        let light = lane.traffic_light.or_else(|| if mid_crossing { None } else { traffic.and_then(|t| t.crossing_light(next.lane)) });
+        if let (Some((c, li)), Some(t)) = (light, traffic) {
             if let Some((state, left)) = t.light_state(c, li) {
                 if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
                     return Err("red light");

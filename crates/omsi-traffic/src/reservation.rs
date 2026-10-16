@@ -11,8 +11,11 @@ use crate::junction::{FoeKind, Junctions};
 use omsi_sim::traffic::{arrival_time, Network};
 
 /// A vehicle asking for its way through a junction this frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
+    /// The pieces of the junction the way runs through, each with how far along the way
+    /// its start lies (`Junctions::chain_along`): the claim stands for all of them.
+    pub chain: Vec<(usize, f32)>,
     /// The caller's index of the vehicle (echoed in the grant).
     pub vehicle: usize,
     pub junction: usize,
@@ -112,13 +115,14 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
     // one continues into, each as far along as its start lies (claim, piece, shift)
     let mut expanded: Vec<(usize, usize, f32)> = Vec::new();
     for (k, c) in claims.iter().enumerate() {
-        for (m, off) in js.chain(net, c.junction, c.movement) {
+        for &(m, off) in &c.chain {
             expanded.push((k, m, off));
         }
     }
+    let _ = net;
     for c in claims {
         let node = &js.nodes[c.junction];
-        let me = &node.movements[c.movement];
+        let my_foes = js.foes_along(c.junction, &c.chain);
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         if c.committed || c.absolute {
             out.push(Grant { vehicle: c.vehicle, go: true, wait_for: None, hold: None });
@@ -129,13 +133,13 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
             continue;
         }
         let mut wait_for: Option<(usize, f32)> = None;
-        for foe in &me.foes {
+        for foe in &my_foes {
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
             for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle) {
                 // the foe as it stands on this piece of its way
-                let mut shifted = claims[ok];
+                let mut shifted = claims[ok].clone();
                 shifted.s -= shift;
                 let o = &shifted;
                 // a foe that has left the meeting place
@@ -160,7 +164,11 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 if their_inside && o.held && o.speed < 0.3 {
                     their_out = f32::INFINITY;
                 }
-                let i_am_first = my_out + CLEAR_MARGIN <= their_in;
+                // (one who has to give way is "first" only by the gap it accepts, not by
+                // the margin a vehicle with the right of way keeps: a side-road car that
+                // crossed 0.6 s ahead of the main road had the main road braking hard)
+                let margin = if foe.yields && !c.absolute { c.gap.max(CLEAR_MARGIN) } else { CLEAR_MARGIN };
+                let i_am_first = my_out + margin <= their_in;
                 let they_are_first = their_out + CLEAR_MARGIN <= my_in;
                 // the two are clear of each other in time whatever the rules say
                 if !their_inside && i_am_first && !o.committed {
@@ -238,7 +246,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)] }
     }
 
     #[test]
@@ -250,8 +258,8 @@ mod tests {
         assert!(g[0].go);
         assert!(!g[1].go);
         assert_eq!(g[1].wait_for, Some(1));
-        // the main road car is 80 m out: the gap is enough to cross
-        let g = resolve(&js, &net, &[claim(1, main, -80.0, 10.0), claim(2, side, -1.0, 0.0)]);
+        // the main road car is 120 m out: the gap (its own, plus the time to clear) is enough to cross
+        let g = resolve(&js, &net, &[claim(1, main, -120.0, 10.0), claim(2, side, -1.0, 0.0)]);
         assert!(g[1].go);
         // no main road car at all
         let g = resolve(&js, &net, &[claim(2, side, -1.0, 0.0)]);
@@ -283,7 +291,7 @@ mod tests {
         let main = js.nodes[0].movement_of(0).unwrap();
         let mut c = claim(1, main, -1.0, 0.0);
         c.exit_room = false;
-        let g = resolve(&js, &net, &[c]);
+        let g = resolve(&js, &net, &[c.clone()]);
         assert_eq!(g[0].hold, Some(Hold::ExitFull));
         let p = DriverParams::preset(VehicleClass::Car);
         for _ in 0..1000 {

@@ -181,15 +181,20 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             Aspect::Yellow => {
                 // the dilemma zone: through when stopping is no longer comfortable; a
                 // driver who took the line on green just before goes a little further
-                // out ("had the mark" alone let a car two places back in a queue go)
+                // out ("had the mark" alone let a car two places back in a queue go).
+                // One already braking for the light stays on the brake: slowing, it
+                // came within "comfortable" of the line again and set off across on red.
                 let marked = me.amber == Some((sig.ctl, sig.light));
-                let go = !queued && (gap < comfortable || (marked && gap < comfortable + 6.0));
+                let stopping = me.last.why == Why::Light && me.last.stop.is_some();
+                let go = !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
                 if go {
                     out.amber = Some((sig.ctl, sig.light));
                 }
                 go
             }
-            Aspect::Red | Aspect::RedYellow => (me.amber == Some((sig.ctl, sig.light)) && gap < comfortable && !queued) || gap < possible - 0.5,
+            // (a car standing with its bumper over the line waits like one behind it: at a
+            // standstill nothing is "too late to stop")
+            Aspect::Red | Aspect::RedYellow => (me.amber == Some((sig.ctl, sig.light)) && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5),
         };
         if !go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);
@@ -197,7 +202,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // 3. the junction
-    if let (Some(j), Some(g)) = (p.junction, grant) {
+    if let (Some(j), Some(g)) = (p.junction.as_ref(), grant) {
         if !g.go {
             // at the line, or, already on the lead-in piece of a long object, short of
             // the first meeting place of the way through
@@ -246,7 +251,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
-        let near_junction = p.junction.map(|j| !j.inside && j.entry < 40.0).unwrap_or(false);
+        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.entry < 40.0).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok) = change_desire(net, sim, me, p, &nb, near_junction);
@@ -328,7 +333,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
             let zone = if player { 60.0 } else { 25.0 };
             let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
-            let junction_near = p.junction.map(|j| j.entry < real + st.front + obstacle_len + zone && !matches!(l.what, Seen::Parked)).unwrap_or(false);
+            let junction_near = p.junction.as_ref().map(|j| j.entry < real + st.front + obstacle_len + zone && !matches!(l.what, Seen::Parked)).unwrap_or(false);
             let road_ok = p.road_left > pass_len + real + 30.0;
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
             if real >= 0.3 && !light_near && !junction_near && road_ok {

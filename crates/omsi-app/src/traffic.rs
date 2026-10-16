@@ -2053,6 +2053,9 @@ impl Traffic {
             // zero, are not spawned on at all; a lower density makes a lane that much less
             // likely to be picked
             .filter(|(_, l)| !l.no_cars && l.density > 0.0)
+            // nor on a lane with a stop line (a car put down past the line went through
+            // the junction on red), nor on a piece of a junction that meets other ways
+            .filter(|(i, l)| l.traffic_light.is_none() && !self.sim.junctions.movement(*i).is_some_and(|(_, m)| !m.foes.is_empty()))
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
@@ -3032,8 +3035,19 @@ impl Traffic {
             // how long somebody has stood right behind this bus (a roadside layover gives
             // way to the traffic it holds up)
             let queue_behind_secs = if self.cars[i].bus.is_some() {
-                let me = self.cars[i].id;
-                self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me) && o.ai.state.speed < 0.3).map(|o| o.ai.stopped).fold(0.0f32, f32::max)
+                let me = &self.cars[i];
+                let cars = self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me.id) && o.ai.state.speed < 0.3).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
+                // the player's bus standing close behind it, heading the same way, counts too
+                let player_behind = player.filter(|p| p.4.abs() < 0.3).map_or(0.0, |p| {
+                    let h = (me.ai.heading as f64).to_radians();
+                    let fwd = DVec2::new(h.sin(), h.cos());
+                    let rel = (p.0 - me.ai.pos).truncate();
+                    let behind = -rel.dot(fwd) as f32 - me.ai.state.rear - p.2;
+                    let beside = rel.perp_dot(fwd).abs() as f32;
+                    let same_way = ((p.1 - me.ai.heading as f64 + 180.0).rem_euclid(360.0) - 180.0).abs() < 45.0;
+                    if same_way && (0.0..15.0).contains(&behind) && beside < 2.5 { self.player_still } else { 0.0 }
+                });
+                cars.max(player_behind)
             } else {
                 0.0
             };

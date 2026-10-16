@@ -83,15 +83,18 @@ pub struct SignalView {
     pub until_go: Option<f32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JunctionView {
     pub junction: usize,
     pub movement: usize,
     /// Distance from the origin to the start of the movement's lane (negative inside).
     pub entry: f32,
     pub inside: bool,
+    /// The pieces of the junction the way runs through, each with how far along the way
+    /// through its start lies (`Junctions::chain_along`).
+    pub chain: Vec<(usize, f32)>,
     /// Distance from the origin to the first meeting place on the way through (the end
-    /// of the piece when the way has no foe).
+    /// of the way through when it has no foe).
     pub conflict_start: f32,
     /// Room past the junction's conflicts for this vehicle, measured along its own way.
     pub exit_room: bool,
@@ -523,7 +526,7 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
 
 /// The next light on the way within 150 m. A second light of the same junction object on a
 /// straight run holds nobody: the car has passed its line.
-fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)]) -> Option<SignalView> {
+fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
     let mut seen_object: Option<(((i32, i32), i64), f32)> = None;
     for &(l, d0) in way {
         if d0 > 150.0 {
@@ -542,8 +545,9 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)]) -> Option
                 seen_object = Some((k, lane.start_heading()));
             }
         }
-        if d0 < -0.5 {
-            // past the line already
+        if d0 < -(rear + 0.5) {
+            // the whole car is past the line (one standing half over it waits like one
+            // behind it: put down there, it drove through the junction on red)
             continue;
         }
         let Some(c) = sim.lights.get(ctl) else { continue };
@@ -564,13 +568,14 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         }
         let Some(&(j, m)) = js.of_lane.get(&l) else { continue };
         let inside = d0 <= 0.0;
-        let node = &js.nodes[j];
-        let mv = &node.movements[m];
-        let piece_len = net.lanes[l].length();
-        // where the conflicts of the whole way through begin and end, in my way's
-        // distances (they may lie on the pieces after this one)
-        let conflict_start = d0 + if mv.conflict_start.is_finite() { mv.conflict_start } else { piece_len };
-        let clear_from = d0 + if mv.conflict_end > 0.0 { mv.conflict_end } else { piece_len };
+        // the pieces my way takes through the object, and where their meeting places
+        // begin and end in my way's distances (they may lie on the pieces after this one)
+        let chain = js.chain_along(j, &way[k..]);
+        let foes = js.foes_along(j, &chain);
+        let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[js.nodes[j].movements[mm].lane].length()).sum();
+        let (first, last) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
+        let conflict_start = d0 + if first.is_finite() { first } else { way_len };
+        let clear_from = d0 + if last > 0.0 { last } else { way_len };
         let need = me.length() + me.state.min_gap;
         let mut room = f32::INFINITY;
         for &(wl, wd) in &way[k..] {
@@ -595,7 +600,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
             }
         }
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, conflict_start, exit_room: room >= need });
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need });
     }
     None
 }
@@ -667,10 +672,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     lane_users(nb, 0.0, &mut note);
     // behind, on the lanes leading in (within 80 m)
     for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
-        let len = net.lanes[p].length();
-        if len - s_b < 80.0 + len {
-            lane_users(p, -len, &mut note);
-        }
+        lane_users(p, -net.lanes[p].length(), &mut note);
     }
     // ahead, on the first lane after
     if let Some(&n) = lane.next.first() {
@@ -701,12 +703,12 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
     let st = &me.state;
     let (opp, os, side) = net.opposite(st.lane, st.s)?;
     let ol = &net.lanes[opp];
-    // a lane the car could not drive on anyway (a footpath, a cycle lane narrower than
-    // the car), or one beyond a strip wider than two lanes' edges ever are, is no lane to
+    // a lane the car could not drive on anyway (a footpath, a bus lane closed to its
+    // group), or one beyond a strip wider than two lanes' edges ever are, is no lane to
     // pass on
     let my_lane = &net.lanes[st.lane];
     let edge_gap = side.abs() - (my_lane.width.max(2.0) + ol.width.max(2.0)) * 0.5;
-    if matches!(crate::access::open_to(ol, me), Err(crate::access::Closed::Kind) | Err(crate::access::Closed::Width)) || edge_gap > omsi_sim::traffic::NEIGHBOUR_EDGE_GAP {
+    if crate::access::open_to(ol, me).is_err() || edge_gap > omsi_sim::traffic::NEIGHBOUR_EDGE_GAP {
         return None;
     }
     let limit = ol.speed_limit_kmh / 3.6;
@@ -828,7 +830,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.leader = Headway::nearer(p.leader, parked);
         p.kerb_swerve = swerve;
         p.people_stop = people_ahead(sim, me, &way);
-        p.signal = signal_ahead(net, sim, &p.way);
+        p.signal = signal_ahead(net, sim, &p.way, st.rear);
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
         p.zebra_stop = zebra_ahead(net, sim, st, &p.way);
         p.letting_out = letting_out(sim, me);

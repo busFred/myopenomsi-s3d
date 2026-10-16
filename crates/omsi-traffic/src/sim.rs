@@ -566,10 +566,13 @@ impl Simulation {
         let mut claims: Vec<Claim> = Vec::new();
         let mut claim_of: Vec<Option<usize>> = vec![None; vehicles.len()];
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
-            let Some(j) = p.junction else { continue };
+            let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
-            let decide = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 12.0).clamp(20.0, 70.0);
-            if !j.inside && j.entry - st.front > decide {
+            // a claim is filed from eight seconds before the meeting place (at least 60 m,
+            // at most 220 m): the drivers who give way to this one see it coming in time
+            // to stop, not only once it is a braking distance from its own line
+            let horizon = (8.0 * st.speed + 30.0).clamp(60.0, 220.0);
+            if !j.inside && j.conflict_start - st.front > horizon {
                 continue;
             }
             // committed: past the first meeting place of the way through, or too close to
@@ -591,6 +594,7 @@ impl Simulation {
             };
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
+                chain: j.chain.clone(),
                 light_red,
                 until_go,
                 vehicle: i,
@@ -671,6 +675,7 @@ impl Simulation {
             let room = cs - s_on - p.half_len - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             claims.push(Claim {
+                chain: vec![(m, 0.0)],
                 light_red: false,
                 until_go: None,
                 vehicle: usize::MAX - k,
