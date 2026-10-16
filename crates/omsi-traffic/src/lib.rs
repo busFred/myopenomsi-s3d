@@ -12,6 +12,14 @@
 
 pub mod driver;
 pub mod junction;
+pub mod perception;
+pub mod plan;
+pub mod reservation;
+pub mod sim;
 
 pub use driver::{DriverParams, Impatience, VehicleClass};
 pub use junction::{Foe, FoeKind, Junction, Junctions, Movement};
+pub use perception::{Headway, JunctionView, NeighbourView, Perception, Seen, SignalView};
+pub use plan::{Plan, Start, Why};
+pub use reservation::{Claim, Grant, Hold};
+pub use sim::{Decision, External, Parked, Passing, Person, PlayerView, Simulation, Vehicle};
