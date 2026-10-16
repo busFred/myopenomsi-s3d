@@ -32,6 +32,10 @@ pub struct Walker {
     /// Passes through other walkers for a moment: the way out of a deadlock in a doorway
     /// or a narrow aisle (two people who have pushed against each other for seconds).
     pub ghost: bool,
+    /// [ROLLBACK solidcars-1] Vehicles are solid to this walker even as a ghost: a ghost
+    /// passes through people, never through a car (people walked into the cars in front
+    /// of them).
+    pub solid: bool,
     /// Keeps to within `.2` of the segment `.0`-`.1` (an aisle): avoidance may move a walker
     /// sideways, never into the seats.
     pub corridor: Option<(DVec2, DVec2, f64)>,
@@ -39,7 +43,7 @@ pub struct Walker {
 
 impl Walker {
     pub fn new(pos: DVec2, radius: f64, space: u64) -> Walker {
-        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, corridor: None }
+        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, solid: false, corridor: None }
     }
 }
 
@@ -200,8 +204,9 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
                 }
             }
         }
-        // (a ghost goes through vehicles too: the last way out of a jam)
-        if me.space == 0 && !me.ghost {
+        // (a ghost goes through vehicles too - the last way out of a jam - unless they are
+        // solid to it)
+        if me.space == 0 && (!me.ghost || me.solid) {
             for b in blocks {
                 if !b.near(me.pos, params.sense) {
                     continue;
@@ -631,7 +636,7 @@ mod tests {
     use super::*;
 
     fn walker(x: f64, y: f64, want: DVec2) -> Walker {
-        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, corridor: None }
+        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, solid: false, corridor: None }
     }
 
     #[test]

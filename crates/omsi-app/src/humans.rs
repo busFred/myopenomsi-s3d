@@ -1669,6 +1669,10 @@ const DOOR_OPENING_GRACE: f64 = 3.0;
 
 /// [ROLLBACK nocoll-93] Whether people on foot collide with anything at all (false: none).
 const NPC_COLLISIONS: bool = false;
+/// [ROLLBACK solidcars-1] ... except vehicles, which are solid to people on the ground:
+/// somebody with a car in front of them stops (and waits, then goes round it) instead of
+/// walking into it. People still pass through each other and the scenery as before.
+const VEHICLE_COLLISIONS: bool = true;
 
 /// How far (m) from where they stand somebody left standing looks for a pavement to walk on.
 const STANDING_REACH: f64 = 10.0; // [ROLLBACK reach-93] was 30.0
@@ -5024,7 +5028,7 @@ impl Humans {
         // a standing vehicle in the way: wait, then go round it
         for i in 0..self.people.len() {
             let p = &self.people[i];
-            if !NPC_COLLISIONS || remove.contains(&i) || p.puppet.is_some() || p.remote || !matches!(p.state, State::Strolling(_)) || p.step_out.is_some() {
+            if !VEHICLE_COLLISIONS || remove.contains(&i) || p.puppet.is_some() || p.remote || !matches!(p.state, State::Strolling(_)) || p.step_out.is_some() {
                 continue;
             }
             let want = wants[i].vel;
@@ -5097,6 +5101,7 @@ impl Humans {
                 // [ROLLBACK nocoll-93] people on foot touch nothing: not each other, not the
                 // scenery, not the bus (they only hindered)
                 ghost: !NPC_COLLISIONS || p.ghost > 0.0,
+                solid: VEHICLE_COLLISIONS,
                 corridor: if p.detour > 0.0 { None } else { w.corridor },
             });
             who.push(i);
