@@ -3491,6 +3491,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omsi-traffic"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "hashbrown 0.17.1",
+ "log",
+ "omsi-sim",
+]
+
+[[package]]
 name = "omsi-ui"
 version = "0.1.0"
 dependencies = [

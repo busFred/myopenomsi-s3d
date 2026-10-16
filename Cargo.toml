@@ -14,6 +14,7 @@ members = [
     "crates/omsi-geometry",
     "crates/omsi-render",
     "crates/omsi-sim",
+    "crates/omsi-traffic",
     "crates/omsi-audio",
     "crates/omsi-net",
     "crates/omsi-plugin",

@@ -1,0 +1,12 @@
+[package]
+name = "omsi-traffic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI road traffic: compiled junctions, driver model, perception/plan/act pipeline, population"
+
+[dependencies]
+omsi-sim = { path = "../omsi-sim" }
+glam.workspace = true
+log.workspace = true
+hashbrown.workspace = true
