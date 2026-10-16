@@ -2031,10 +2031,9 @@ pub struct Humans {
     duty: Option<(Arc<DutyTrip>, usize, bool)>,
     /// Buses whose validator somebody used since the app last looked (`take_stamped`).
     stamped: Vec<BusId>,
-    /// How many people stroll the pavements (the `ped_density` setting, 1 = 100 %): a share
-    /// of the half of `max_people` OMSI lets walk, scaled by `density` and by how much
-    /// pavement is around.
-    pub ped_density: f32,
+    /// How many people to keep strolling the pavements about the player (the `pedestrians`
+    /// setting), scaled by `density` and by how much pavement is around, within the pool.
+    pub pedestrians: usize,
     /// Omsi.exe's people (`[AIMaxCountRandom]`'s second line, the `ai_max_humans` setting):
     /// it makes that many at the start (0x709274) and draws everybody waiting at a stop,
     /// walking the pavements or riding from them - never more; at most half of them walk
@@ -2287,7 +2286,7 @@ impl Humans {
             ride_minutes: None,
             duty: None,
             stamped: Vec::new(),
-            ped_density: settings.ped_density,
+            pedestrians: settings.pedestrians as usize,
             max_people: settings.ai_max_humans.max(1) as usize,
             stroll_timer: 0.0,
             exact_fare: true,
@@ -3305,9 +3304,10 @@ impl Humans {
         _dt: f32,
     ) {
         let center = self.center;
-        // strollers: OMSI lets up to half of its people pool walk the pavements (0x62463c);
-        // the share of that half here is `ped_density` times the hour's passenger curve,
-        // scaled down (never up) where there is little pavement around
+        // strollers: as many as the `pedestrians` setting asks for, times the hour's
+        // passenger curve, scaled down (never up) where there is little pavement around,
+        // and never past the people pool (`ai_max_humans`; OMSI lets at most half of its
+        // pool walk, 0x62463c, which the setting's default of 100 for a pool of 200 keeps)
         let lanes: Vec<usize> = ped
             .ends
             .keys()
@@ -3319,10 +3319,9 @@ impl Humans {
             })
             .collect();
         let pavement = (lanes.len() as f32 / 120.0).clamp(0.3, 1.0);
-        let target = (self.max_people as f32 * 0.5 * self.ped_density * self.density.clamp(0.0, 3.0) * pavement).round() as usize;
-        // (0x62463c: walking the pavements only while fewer than half the pool do, and never
-        // past the pool)
-        let target = target.min(self.max_people / 2).min((self.max_people + self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count()).saturating_sub(self.pool_used()));
+        let target = (self.pedestrians as f32 * self.density.clamp(0.0, 3.0) * pavement).round() as usize;
+        // (never past the pool)
+        let target = target.min((self.max_people + self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count()).saturating_sub(self.pool_used()));
         let have = self
             .people
             .iter()

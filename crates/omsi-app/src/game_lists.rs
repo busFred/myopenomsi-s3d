@@ -472,8 +472,8 @@ fn hof_label(p: &std::path::Path) -> String {
 const SPEEDS: [f64; 5] = [1.0, 2.0, 4.0, 8.0, 15.0];
 pub(crate) const TRAFFIC: [usize; 7] = [0, 10, 20, 30, 50, 80, 120];
 const PAX: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
-/// The share of the people pool strolling the pavements (`ped_density`).
-const PEDESTRIANS: [f32; 7] = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
+/// People strolling the pavements about the player (`pedestrians`).
+const PEDESTRIANS: [f32; 9] = [0.0, 25.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0];
 /// [ROLLBACK seatpick-69] Passengers' wish to sit (0: the original's random place).
 const PAX_SIT: [f32; 7] = [0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const VOLUME: [f32; 6] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
@@ -1547,7 +1547,7 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "speed" => s.time_speed as f32,
         "traffic" => app.traffic.as_ref()?.target as f32,
         "pax" => s.pax_density,
-        "pedestrians" => s.ped_density,
+        "pedestrians" => s.pedestrians as f32,
         "pax_sit" => s.pax_sit,
         "volume" => s.volume,
         "led_glow" => s.led_glow as f32,
@@ -1649,12 +1649,13 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             Some(("pax_density", v.to_string()))
         }
         "pedestrians" => {
-            app.settings.ped_density = v;
+            let n = v.round().max(0.0) as u32;
+            app.settings.pedestrians = n;
             // (the next population pass, within a second, follows it)
             if let Some(h) = app.humans.as_mut() {
-                h.ped_density = v;
+                h.pedestrians = n as usize;
             }
-            Some(("ped_density", v.to_string()))
+            Some(("pedestrians", n.to_string()))
         }
         "pax_sit" => {
             app.settings.pax_sit = v;
@@ -2680,7 +2681,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         pick("ai_unsched_factor", "Random traffic", later),
         pick("ai_max_scheduled", "Max timetable vehicles", later),
         pick("ai_parked_pct", "Parked cars", later),
-        slider_row(app, "pedestrians", "Pedestrians", "How many people stroll the pavements, as a share of the half of the AI people OMSI lets walk", &pct),
+        slider_row(app, "pedestrians", "Pedestrians", "How many people stroll the pavements about you (within the AI people pool, see the launcher's People setting)", &|v: f32| format!("{v:.0}")),
     ]
         .into_iter()
         .flatten()

@@ -1882,7 +1882,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     // [ROLLBACK rtlock-1] ray tracing is locked (off) until the launcher's Ctrl+Alt+R unlocks it
     v["rt_unlocked"] = json!(false);
     // OMSI's own options
-    for (k, d) in [("maintenance", json!(0)), ("ai_unsched_factor", json!(100)), ("ai_max_scheduled", json!(0)), ("ai_max_parked", json!(0)), ("ai_parked_pct", json!(75)), ("ai_max_humans", json!(200)), ("ped_density", json!(100)), ("use_real_time", json!(false)), ("use_real_date", json!(false)), ("use_real_year", json!(false)), ("collision_vehicles", json!(true)), ("collision_objects", json!(true)), ("collision_pedestrians", json!(true)), ("head_movement", json!(true)), ("driverview_smooth", json!(true)), ("hands_in_cab", json!(false)), ("alt_view", json!(true)), ("precision_zoom", json!(false))] {
+    for (k, d) in [("maintenance", json!(0)), ("ai_unsched_factor", json!(100)), ("ai_max_scheduled", json!(0)), ("ai_max_parked", json!(0)), ("ai_parked_pct", json!(75)), ("ai_max_humans", json!(200)), ("pedestrians", json!(100)), ("use_real_time", json!(false)), ("use_real_date", json!(false)), ("use_real_year", json!(false)), ("collision_vehicles", json!(true)), ("collision_objects", json!(true)), ("collision_pedestrians", json!(true)), ("head_movement", json!(true)), ("driverview_smooth", json!(true)), ("hands_in_cab", json!(false)), ("alt_view", json!(true)), ("precision_zoom", json!(false))] {
         v[k] = d;
     }
     // openOMSI's own: what passengers say, OMSI's route arrows, getting up from the seat
@@ -1935,9 +1935,10 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             // [ROLLBACK parkedpct-98] the share of the car park spaces that hold a car
             "ai_parked_pct" => v[&k] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| x.clamp(0.0, 100.0) as i64).unwrap_or(75)),
             "ai_max_humans" => v[&k] = json!(val.parse::<f64>().map(|x| x.max(1.0) as i64).unwrap_or(200)),
-            // (people strolling the pavements, a per cent of the half of `ai_max_humans` OMSI lets walk;
-            // the game also reads a fraction, so a hand-written `1` is 100)
-            "ped_density" => v[&k] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.clamp(0.0, 300.0).round() as i64).unwrap_or(100)),
+            // (people strolling the pavements about the player)
+            "pedestrians" => v[&k] = json!(val.parse::<f64>().map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
+            // (the per cent of before: 1 = 100 %, read as 100 people)
+            "ped_density" => v["pedestrians"] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
             "drive_keys" | "navigator_corner" | "boarding" | "render_scale" | "pax_voices" => v[&k] = json!(val),
             "ctrl_off" => v[&k] = json!(val),
             "rt_reflections" => {
@@ -2239,14 +2240,14 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
     // OMSI's own options (options.cfg): maintenance ([wear_lifespan]), the AI counts and
     // the share of random traffic, the real clock and calendar, collisions, head movement
     let text = format!(
-        "{text}maintenance={}\nai_unsched_factor={}\nai_max_scheduled={}\nai_max_parked={}\nai_parked_pct={}\nai_max_humans={}\nped_density={}\nuse_real_time={}\nuse_real_date={}\nuse_real_year={}\ncollision_vehicles={}\ncollision_objects={}\ncollision_pedestrians={}\nhead_movement={}\ndriverview_smooth={}\nhands_in_cab={}\nalt_view={}\nprecision_zoom={}\n",
+        "{text}maintenance={}\nai_unsched_factor={}\nai_max_scheduled={}\nai_max_parked={}\nai_parked_pct={}\nai_max_humans={}\npedestrians={}\nuse_real_time={}\nuse_real_date={}\nuse_real_year={}\ncollision_vehicles={}\ncollision_objects={}\ncollision_pedestrians={}\nhead_movement={}\ndriverview_smooth={}\nhands_in_cab={}\nalt_view={}\nprecision_zoom={}\n",
         n("maintenance", 0).clamp(0, 4),
         n("ai_unsched_factor", 100).clamp(0, 300),
         n("ai_max_scheduled", 0).max(0),
         n("ai_max_parked", 0).max(-1),
         n("ai_parked_pct", 75).clamp(0, 100),
         n("ai_max_humans", 200).max(1),
-        n("ped_density", 100).clamp(0, 300),
+        n("pedestrians", 100).clamp(0, 2000),
         b("use_real_time", false),
         b("use_real_date", false),
         b("use_real_year", false),
@@ -2880,20 +2881,21 @@ mod tests {
         assert_eq!(packs, vec!["Other".to_string()]);
     }
 
-    /// The pedestrian share is a per cent in the launcher (the page's select), written as
-    /// one; a fraction by hand (the game's own form) is read as the per cent it means.
+    /// The pedestrian count is a number; the old per cent (fraction or per cent) is read as
+    /// that many; it survives a save.
     #[test]
-    fn the_pedestrian_share_is_a_per_cent_that_survives_a_save() {
-        assert_eq!(settings_from_text(None)["ped_density"], json!(100));
-        assert_eq!(settings_from_text(Some("ped_density=1.5\n"))["ped_density"], json!(150));
-        assert_eq!(settings_from_text(Some("ped_density=900\n"))["ped_density"], json!(300));
+    fn the_pedestrian_count_survives_a_save() {
+        assert_eq!(settings_from_text(None)["pedestrians"], json!(100));
+        assert_eq!(settings_from_text(Some("ped_density=1.5\n"))["pedestrians"], json!(150));
+        assert_eq!(settings_from_text(Some("ped_density=200\n"))["pedestrians"], json!(200));
+        assert_eq!(settings_from_text(Some("pedestrians=9000\n"))["pedestrians"], json!(2000));
         let mut v = settings_from_text(None);
-        v["ped_density"] = json!(50);
+        v["pedestrians"] = json!(50);
         let text = settings_to_text(&v, None);
-        assert!(text.contains("ped_density=50\n"), "{text}");
-        assert_eq!(settings_from_text(Some(&text))["ped_density"], json!(50));
-        v["ped_density"] = json!("200");
-        assert!(settings_to_text(&v, None).contains("ped_density=200\n"));
+        assert!(text.contains("pedestrians=50\n"), "{text}");
+        assert_eq!(settings_from_text(Some(&text))["pedestrians"], json!(50));
+        v["pedestrians"] = json!("300");
+        assert!(settings_to_text(&v, None).contains("pedestrians=300\n"));
     }
 
     #[test]

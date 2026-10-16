@@ -1067,8 +1067,8 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, 
     sel_setting(ui, s, dirty, "s-unsched", c.row(), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
     sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Max timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
     sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_parked_pct", &[("0", "None"), ("25", "25% of spaces"), ("50", "50% of spaces"), ("75", "75% of spaces"), ("90", "90% of spaces"), ("100", "Every space")]);
-    // the people on the pavements: a per cent of the half of the AI people OMSI lets walk
-    sel_setting(ui, s, dirty, "s-peds", c.row(), "Pedestrians", "ped_density", &[("0", "None"), ("50", "50%"), ("100", "100%"), ("150", "150%"), ("200", "200%"), ("300", "300%")]);
+    // the people on the pavements about the player (within the pool below)
+    sel_setting(ui, s, dirty, "s-peds", c.row(), "Pedestrians", "pedestrians", &[("0", "None"), ("25", "25"), ("50", "50"), ("100", "100"), ("200", "200"), ("300", "300"), ("400", "400")]);
     // OMSI's [AIMaxCountRandom] second line: the people waiting, walking and riding, in all
     sel_setting(ui, s, dirty, "s-maxhumans", c.row(), "People (AI humans)", "ai_max_humans", &[("50", "50"), ("100", "100"), ("200", "200 (OMSI default)"), ("400", "400"), ("800", "800")]);
     let left = c.used();
