@@ -72,6 +72,12 @@ const BODY_OUTSIDE: f64 = 0.28;
 /// [ROLLBACK around-86] Blocked this long (seconds) wanting to go on, somebody passes through
 /// everything - others, vehicles, walls - for `GHOST_FOR` seconds: the way out of any jam.
 const STUCK_AFTER: f32 = 4.0;
+/// [ROLLBACK pedhold-1] A stroller pressed against something that does not move (a car
+/// standing on the crossing) steps past it sooner.
+const STUCK_AFTER_STROLL: f32 = 1.5;
+/// [ROLLBACK pedhold-1] How far off their pavement (m) a stroller is still drawn back onto
+/// it (`OFF_PATH` for everybody else: the people off a bus must not slide to the kerb).
+const STROLL_BAND: f64 = 2.0;
 const GHOST_FOR: f32 = 1.0;
 
 /// [ROLLBACK around-86] The two corners (world) to walk through to get round the box `b` from
@@ -1746,6 +1752,8 @@ pub struct Person {
     /// Seconds without getting nearer the goal while wanting to move; seconds left
     /// passing through others.
     stuck: f32,
+    /// [ROLLBACK pedhold-1] Seconds standing still (under 0.05 m/s).
+    still: f32,
     ghost: f32,
     /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
     /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
@@ -1834,7 +1842,15 @@ const OFF_PATH: f64 = 0.1;
 /// into it at up to 0.6 m/s (twice a step) on top of walking there, the people getting off
 /// a bus slid sideways from its door to the pavement at twice their pace (#1033, #1079).
 fn path_corridor(pos: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Option<(DVec2, DVec2, f64)> {
-    corridor.filter(|&(a, b, dev)| (crowd::clamp_to_corridor(pos, a, b, dev) - pos).length() <= OFF_PATH)
+    path_corridor_band(pos, corridor, OFF_PATH)
+}
+
+/// [ROLLBACK pedhold-1] `path_corridor` with the band given: a stroller nudged off the
+/// pavement by the others (three abreast at a kerb) is drawn back from up to `STROLL_BAND`
+/// away; at 0.1 m they walked on along the kerb line in the carriageway, and a car stood
+/// behind them for good.
+fn path_corridor_band(pos: DVec2, corridor: Option<(DVec2, DVec2, f64)>, band: f64) -> Option<(DVec2, DVec2, f64)> {
+    corridor.filter(|&(a, b, dev)| (crowd::clamp_to_corridor(pos, a, b, dev) - pos).length() <= band)
 }
 
 fn arrive(from: DVec2, to: DVec2, pace: f64) -> DVec2 {
@@ -2574,13 +2590,13 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position, p.vel, waiting)
+                (p.position, p.vel, waiting, p.still)
             })
             .collect()
     }
@@ -2818,6 +2834,7 @@ impl Humans {
 
             age,
             stuck: 0.0,
+            still: 0.0,
             ghost: 0.0,
             step_out: None,
             car_wait: 0.0,
@@ -5389,7 +5406,7 @@ impl Humans {
                 (width * 0.5 - side).max(0.35) + bow,
             )
         });
-        let corridor = path_corridor(pos2, corridor);
+        let corridor = path_corridor_band(pos2, corridor, STROLL_BAND);
         if self.people[i].why != "queueing behind somebody" {
             self.people[i].why = "";
         }
@@ -5490,6 +5507,11 @@ impl Humans {
         let time = self.time;
         let p = &mut self.people[i];
         let speed = w.vel.length();
+        if speed < 0.05 {
+            p.still += dt;
+        } else {
+            p.still = 0.0;
+        }
         // somebody pressed against somebody else for seconds slips past them
         if want.vel.length() > 0.2 && speed < 0.08 {
             p.stuck += dt;
@@ -5499,7 +5521,7 @@ impl Humans {
         p.detour = (p.detour - dt).max(0.0);
         if p.ghost > 0.0 {
             p.ghost -= dt;
-        } else if p.stuck > STUCK_AFTER {
+        } else if p.stuck > if matches!(p.state, State::Strolling(_)) { STUCK_AFTER_STROLL } else { STUCK_AFTER } {
             p.ghost = GHOST_FOR;
             p.stuck = 0.0;
             if debug_pax() {

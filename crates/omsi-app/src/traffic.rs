@@ -953,10 +953,10 @@ pub struct Traffic {
     /// Pedestrians on the footpaths: (lane, distance along it), for giving way at crossings
     /// and for the pedestrian lights' request buttons.
     pub walkers: Vec<(usize, f32)>,
-    /// Everybody on foot on the ground: position, velocity and whether they are waiting
-    /// at a stop (set every frame) - the cars stop for anybody in their way, not only on
-    /// a crossing.
-    pub people: Vec<(DVec3, DVec2, bool)>,
+    /// Everybody on foot on the ground: position, velocity, whether they are waiting at a
+    /// stop, and for how long they have stood still (set every frame) - the cars stop for
+    /// anybody in their way, not only on a crossing.
+    pub people: Vec<(DVec3, DVec2, bool, f32)>,
     /// No car has been placed yet: the first population may fill the view.
     initial: bool,
     /// Seconds of the last tick (the lamp scripts run in `sync`).
@@ -5342,10 +5342,10 @@ impl Traffic {
         // as far as the car needs to stop without a jolt, and never less than a car length
         let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
         let origin = car.vehicle.position.truncate();
-        let near: Vec<&(DVec3, DVec2, bool)> = self
+        let near: Vec<&(DVec3, DVec2, bool, f32)> = self
             .people
             .iter()
-            .filter(|(p, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
+            .filter(|(p, _, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
             .collect();
         if near.is_empty() {
             return None;
@@ -5370,7 +5370,7 @@ impl Traffic {
                 let c = q.truncate() + right * lat;
                 // when the car's front gets here, at most two seconds on
                 let t = (((d - st.front).max(0.0)) / v.max(1.0)).min(2.0) as f64;
-                for (p, pv, waiting) in &near {
+                for (p, pv, waiting, still) in &near {
                     // on the same level only: somebody on a footbridge over the road, in a
                     // subway under it or on a platform above it is in nobody's way here (a
                     // car would stand in front of nothing anybody could see)
@@ -5382,6 +5382,12 @@ impl Traffic {
                     } else {
                         car.half_width as f64 + 0.3
                     };
+                    // [ROLLBACK pedhold-1] somebody who has stood still at the edge of the
+                    // strip for seconds while the car stands does not hold it: three people
+                    // at a kerb line held a car, which held them (its body in their way)
+                    if v < 0.3 && *still > 3.0 && (p.truncate() - c).dot(right).abs() > half - 0.9 {
+                        continue;
+                    }
                     for at in [p.truncate(), p.truncate() + *pv * t] {
                         let rel = at - c;
                         if rel.dot(fwd).abs() <= 0.55 && rel.dot(right).abs() < half {
