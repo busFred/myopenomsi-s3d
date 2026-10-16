@@ -74,7 +74,7 @@ pub struct Plan {
     /// Id of the vehicle whose body across the way holds this one.
     pub body_block: Option<u64>,
     /// At the line on green or yellow: the driver goes through whatever it turns to.
-    pub amber: bool,
+    pub amber: Option<(usize, usize)>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -167,18 +167,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
                 // at the line on green: through, whatever it turns to in a moment
                 if gap < 3.0 && !queued && v > 1.0 {
-                    out.amber = true;
+                    out.amber = Some((sig.ctl, sig.light));
                 }
                 true
             }
             Aspect::Yellow => {
-                let go = me.amber || (gap < comfortable && !queued);
+                let go = me.amber == Some((sig.ctl, sig.light)) || (gap < comfortable && !queued);
                 if go && gap < comfortable {
-                    out.amber = true;
+                    out.amber = Some((sig.ctl, sig.light));
                 }
                 go
             }
-            Aspect::Red | Aspect::RedYellow => (me.amber && gap < comfortable && !queued) || gap < possible - 0.5,
+            Aspect::Red | Aspect::RedYellow => (me.amber == Some((sig.ctl, sig.light)) && gap < comfortable && !queued) || gap < possible - 0.5,
         };
         if !go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);

@@ -130,7 +130,7 @@ fn cars_stop_at_a_red_light_and_go_on_green() {
             if c.state.lane == 0 && c.state.speed < 0.3 && c.last.why == Why::Light {
                 stood_at_red = true;
             }
-            if red && c.state.lane == 1 && c.state.s < 3.0 && c.state.speed > 2.0 && !c.amber {
+            if red && c.state.lane == 1 && c.state.s < 3.0 && c.state.speed > 2.0 && c.amber.is_none() {
                 crossed_on_red = true;
             }
         }
@@ -483,7 +483,7 @@ fn the_side_road_goes_on_its_green_while_the_main_road_is_red() {
             if c.state.lane == 0 && c.state.speed < 0.3 && c.last.why == Why::Light {
                 main_stood_at_red = true;
             }
-            if in_junction && c.state.s < 3.0 && c.state.speed > 2.0 && red && !c.amber {
+            if in_junction && c.state.s < 3.0 && c.state.speed > 2.0 && red && c.amber.is_none() {
                 crossed_on_red = true;
             }
             if c.state.lane == 4 && !red {

@@ -170,7 +170,7 @@ pub struct Vehicle {
     pub pull_out: f32,
     pub passing: Option<Passing>,
     /// Past the line on green/yellow: goes through on red too.
-    pub amber: bool,
+    pub amber: Option<(usize, usize)>,
     pub external: External,
     pub last: Decision,
     /// Id of the vehicle followed last frame.
@@ -202,7 +202,7 @@ impl Vehicle {
             fresh: 1.5,
             pull_out: 0.0,
             passing: None,
-            amber: false,
+            amber: None,
             external: External::default(),
             last: Decision::default(),
             lead_id: None,
@@ -275,8 +275,9 @@ pub struct Simulation {
     /// Vehicles and people by 50 m cell, as of this frame.
     vehicle_grid: HashMap<(i32, i32), Vec<usize>>,
     people_grid: HashMap<(i32, i32), Vec<usize>>,
-    /// Lane changes begun this frame: (lane changed onto, distance along it). The vehicles
-    /// still to plan see them, so two do not move into one gap at once.
+    /// Lane changes begun this frame: (lane changed onto, distance along it). A change
+    /// into the same stretch later in the same frame is refused (`act`): the perceptions
+    /// were taken before anybody moved, so two cars would move into one gap at once.
     pub changes_started: Vec<(usize, f32)>,
     pub left_hand: bool,
     /// Vehicles that reached a dead end this frame (indices, descending).
@@ -578,33 +579,57 @@ impl Simulation {
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
-        // read: the player drives)
+        // read: the player drives): the junction on the lane under the vehicle, or on the
+        // lanes ahead of it within the deciding distance
         for (k, p) in self.players.iter().enumerate() {
-            let Some((lane, s)) = self.player_lane(net, p) else { continue };
-            let len = net.lanes[lane].length();
-            let (j, m, s_on) = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
-                (j, m, s)
-            } else if let Some(entries) = self.junctions.entries.get(&lane) {
-                // the way through chosen by the indicator, else the straightest
-                let pick = entries
-                    .iter()
-                    .copied()
-                    .min_by_key(|&(j, m)| {
-                        let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
-                        let want = p.blinker as i32;
-                        if want != 0 && turn == want {
-                            0
-                        } else if turn == 0 {
-                            1
-                        } else {
-                            2
-                        }
-                    });
-                let Some((j, m)) = pick else { continue };
-                (j, m, s - len)
-            } else {
-                continue;
+            // the way through chosen by the indicator, else the straightest
+            let pick = |entries: &Vec<(usize, usize)>| {
+                entries.iter().copied().min_by_key(|&(j, m)| {
+                    let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
+                    let want = p.blinker as i32;
+                    if want != 0 && turn == want {
+                        0
+                    } else if turn == 0 {
+                        1
+                    } else {
+                        2
+                    }
+                })
             };
+            // candidate lanes: (lane, distance from the vehicle's origin to the lane's start)
+            let mut lanes: Vec<(usize, f32)> = Vec::new();
+            if let Some((lane, s)) = self.player_lane(net, p) {
+                lanes.push((lane, -s));
+                let mut d = net.lanes[lane].length() - s;
+                let mut cur = lane;
+                for _ in 0..6 {
+                    if d > 80.0 {
+                        break;
+                    }
+                    let Some(&n) = net.lanes[cur].next.first() else { break };
+                    lanes.push((n, d));
+                    d += net.lanes[n].length();
+                    cur = n;
+                }
+            }
+            lanes.extend(self.lanes_ahead_of(net, p, 80.0).into_iter().map(|(l, d)| (l, d - p.half_len)));
+            let mut found: Option<(usize, usize, f32)> = None;
+            for (lane, d0) in lanes {
+                let len = net.lanes[lane].length();
+                let hit = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
+                    Some((j, m, -d0))
+                } else if let Some(entries) = self.junctions.entries.get(&lane) {
+                    pick(entries).map(|(j, m)| (j, m, -(d0 + len)))
+                } else {
+                    None
+                };
+                if let Some(h) = hit {
+                    if found.map(|f| h.2 > f.2).unwrap_or(true) {
+                        found = Some(h);
+                    }
+                }
+            }
+            let Some((j, m, s_on)) = found else { continue };
             if s_on < -70.0 {
                 continue;
             }
@@ -642,7 +667,7 @@ impl Simulation {
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
-        let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + (usize::MAX - k) as u64 } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
+        let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
@@ -653,8 +678,8 @@ impl Simulation {
         if plan.why == Why::Light && v.state.speed < 0.5 {
             self.held_at_red += 1;
         }
-        if plan.amber {
-            v.amber = true;
+        if let Some(light) = plan.amber {
+            v.amber = Some(light);
         }
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
@@ -738,7 +763,7 @@ impl Simulation {
             v.impatience.update(&v.params, dt, held);
         }
         if v.stopped > 2.0 {
-            v.amber = false;
+            v.amber = None;
         }
         // a pass runs its course: the bent way brings the car back by itself
         if let Some(p) = v.passing {

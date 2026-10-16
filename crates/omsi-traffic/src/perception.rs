@@ -661,12 +661,6 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             note(lane.length() - s_b + occ.s, &vehicles[occ.vehicle], occ.foreign);
         }
     }
-    // a change started into this lane this frame by a car the perception did not see
-    for &(l, s) in &sim.changes_started {
-        if l == nb && (s - s_b).abs() < 25.0 {
-            foreign = true;
-        }
-    }
     let runs_on = net.reach.get(nb).copied().unwrap_or(lane.length()) - s_b;
     // a turn the lane leads into within 150 m
     let mut turn = lane.turn;
