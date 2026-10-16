@@ -1393,8 +1393,16 @@ impl PedNet {
                 continue;
             }
             self.ends.insert(i, (a, b));
+            // [ROLLBACK pedoneway-1] a one-way pavement path with a light, or one that
+            // crosses a carriageway, is walked its way only: the lit stub at the kerb is then
+            // the only way onto its crossing, and nobody steps onto the unlit pieces from
+            // the far kerb or from the side and crosses on red (every path was walkable
+            // both ways; the ordinary pavements still are)
+            let keeps_way = l.one_way && (l.traffic_light.is_some() || !self.crossings(net, i).is_empty());
             self.out[a].push((i, true));
-            self.out[b].push((i, false));
+            if !keeps_way {
+                self.out[b].push((i, false));
+            }
             let mut seen: Vec<(i32, i32)> = Vec::new();
             for p in &l.points {
                 let c = ((p.x / 50.0).floor() as i32, (p.y / 50.0).floor() as i32);
