@@ -5313,6 +5313,7 @@ impl Humans {
                 cars,
                 pace,
                 walk.held,
+                self.people[i].on_crossing,
             ) {
                 Ok(()) => {
                     if walk.held > 0.0 && debug_pax() {
@@ -5449,11 +5450,17 @@ impl Humans {
         cars: &[(DVec2, DVec2, f64, bool)],
         pace: f64,
         held: f32,
+        mid_crossing: bool,
     ) -> Result<(), &'static str> {
         if !next.from_end(net) {
             return Ok(());
         }
         let lane = &net.lanes[next.lane];
+        // [ROLLBACK pedcross-1] off the kerb, the crossing is one decision: at an unlit piece
+        // of it nobody waits for a gap again (the cars of the lanes ahead stop for somebody
+        // on the crossing), only for a car too fast to stop; a lit median still holds.
+        // Re-deciding at every 2 m piece, people stood in the road for a gap in the next
+        // lane while the light went red, and then crossed "on red".
         let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
         if let (Some((c, li)), Some(t)) = (lane.traffic_light, traffic) {
             if let Some((state, left)) = t.light_state(c, li) {
@@ -5480,7 +5487,7 @@ impl Humans {
         // takes, never less): a steady stream does not hold them for ever, but nobody walks
         // out in front of a car that is about to be there (after 45 s they used to ignore
         // the cars altogether)
-        let margin = if held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { 2.5 };
+        let margin = if mid_crossing || held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { 2.5 };
         for x in ped.crossings(net, next.lane) {
             for (p, v, half, yielding) in cars {
                 // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
@@ -5494,11 +5501,14 @@ impl Humans {
                 if dist > 90.0 {
                     continue;
                 }
-                if dist < half + 1.5 {
+                let speed = v.length();
+                // [ROLLBACK pedcross-1] a vehicle standing on the crossing holds them for a
+                // few seconds only; then they step round it (a car held in a queue on the
+                // zebra and the people waiting for it to move stood for each other for good)
+                if dist < half + 1.5 && (speed >= 0.5 || held < 5.0) {
                     return Err("a vehicle stands on the crossing");
                 }
-                let speed = v.length();
-                if speed < 0.5 {
+                if speed < if mid_crossing { 2.0 } else { 0.5 } {
                     continue;
                 }
                 let dir = *v / speed;
