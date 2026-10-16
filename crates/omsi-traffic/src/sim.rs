@@ -15,7 +15,7 @@ use omsi_sim::collision::Obb;
 use omsi_sim::traffic::{AiState, LaneKind, Lead, Network, TrafficLightController};
 
 /// A player's (or another LAN player's) vehicle as the traffic sees it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlayerView {
     pub id: u32,
     pub pos: DVec3,
@@ -50,7 +50,7 @@ impl PlayerView {
 }
 
 /// A person on or by the road.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Person {
     pub pos: DVec3,
     pub vel: DVec2,
@@ -63,7 +63,7 @@ pub struct Person {
 }
 
 /// A parked car beside a lane.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Parked {
     pub s: f32,
     /// Lateral offset of its middle from the lane (m, + right).
@@ -73,7 +73,7 @@ pub struct Parked {
 }
 
 /// Overtaking on the oncoming lane, or squeezing past something inside the lane.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Passing {
     /// The oncoming lane used, None when the car stays in its own lane.
     pub lane: Option<usize>,
@@ -112,7 +112,7 @@ impl Passing {
 }
 
 /// What the app tells the planner about this vehicle this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
@@ -130,7 +130,7 @@ pub struct External {
 
 /// The last decision, kept for consumers and the debug overlay. Other vehicles are named
 /// by id: the caller may take vehicles off the road between frames.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Decision {
     pub why: Why,
     pub lead: Option<Lead>,
@@ -150,7 +150,7 @@ pub struct Decision {
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
 /// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vehicle {
     pub id: u64,
     pub class: VehicleClass,

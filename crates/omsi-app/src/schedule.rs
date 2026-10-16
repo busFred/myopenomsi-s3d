@@ -2193,6 +2193,7 @@ impl Schedule {
                 // (it may have stood waiting at the end of what it had)
                 car.ai.state.planned_next = None;
                 car.ai.state.plan_next(&traffic.net);
+                traffic.note_vehicle_changed(ci);
             }
             run.next += n;
             if run.next < run.steps.len() {

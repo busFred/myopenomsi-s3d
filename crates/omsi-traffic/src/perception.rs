@@ -14,7 +14,7 @@ use omsi_sim::collision::Obb;
 use omsi_sim::traffic::{arrival_time, AiState, Aspect, LaneKind, Network, TrafficLightController};
 
 /// What a headway is to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Seen {
     /// Another AI vehicle on the way (index, this frame only).
     Vehicle(usize),

@@ -1770,6 +1770,9 @@ pub struct Person {
     /// a carriageway, past its first steps): the cars of the lanes still ahead stop for
     /// them as for somebody stepping in.
     on_crossing: bool,
+    /// The last decision at a kerb (`may_cross`): "go", or why they wait - for the traffic
+    /// recording, which shows why somebody froze.
+    last_decision: Option<&'static str>,
     ghost: f32,
     /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
     /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
@@ -2617,6 +2620,38 @@ impl Humans {
             .collect()
     }
 
+    /// `on_foot` (same people, same order) with what they do besides: their task, the
+    /// footpath leg they walk (lane, distance along it, the leg's length) and their last
+    /// decision at a kerb - for the traffic recording.
+    pub fn records(&self) -> Vec<omsi_traffic::record::PersonRecord> {
+        use std::borrow::Cow;
+        self.people
+            .iter()
+            .filter(|p| p.place == Place::Ground)
+            .map(|p| {
+                let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
+                let state: Cow<'static, str> = match &p.state {
+                    State::Pax(x) => Cow::Owned(format!("{} ({})", p.state.name(), if x.inside.is_some() { "aboard" } else { "waiting" })),
+                    s => Cow::Borrowed(s.name()),
+                };
+                let leg = match &p.state {
+                    State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| (leg.lane, leg.dist(walk.s), leg.len())),
+                    _ => None,
+                };
+                omsi_traffic::record::PersonRecord {
+                    pos: p.position,
+                    vel: p.vel,
+                    state,
+                    still: p.still,
+                    on_crossing: p.on_crossing,
+                    waiting_for_bus: waiting,
+                    leg,
+                    decision: p.last_decision.map(Cow::Borrowed),
+                }
+            })
+            .collect()
+    }
+
     pub fn strollers(&self) -> Vec<(usize, f32)> {
         self.people
             .iter()
@@ -2852,6 +2887,7 @@ impl Humans {
             stuck: 0.0,
             still: 0.0,
             on_crossing: false,
+            last_decision: None,
             ghost: 0.0,
             step_out: None,
             car_wait: 0.0,
@@ -5321,6 +5357,7 @@ impl Humans {
                 self.people[i].on_crossing,
             ) {
                 Ok(()) => {
+                    self.people[i].last_decision = Some("go");
                     if walk.held > 0.0 && debug_pax() {
                         let light = net.lanes[next.lane].traffic_light.and_then(|(c, li)| {
                             traffic
@@ -5345,6 +5382,7 @@ impl Humans {
                 Err(why) => {
                     walk.held += dt;
                     self.people[i].why = why;
+                    self.people[i].last_decision = Some(why);
                     // a light that stays red (nobody crosses on red any more): a stroller
                     // gives up after three minutes and walks back the way they came
                     if walk.roam && why == "red light" && walk.held > 180.0 {

@@ -249,6 +249,37 @@ pub(crate) fn clear_ai_traffic(app: &mut App) {
     }
 }
 
+/// Start (`on`) or end recording the traffic into `~/.openomsi/traffic/<map>-<HHMMSS>.rec`
+/// (see `omsi_traffic::record`; replayed headless by `omsi_traffic::replay`).
+pub(crate) fn record_traffic(app: &mut App, on: bool) {
+    let Some(t) = app.traffic.as_mut() else { return };
+    if !on {
+        let file = t.recorder.recording().map(file_name);
+        t.recorder.stop_full();
+        if let Some(f) = file {
+            app.service_msg = Some((format!("Traffic recorded to {f}"), 4.0));
+        }
+        return;
+    }
+    app.service_msg = Some(match t.start_recording_new() {
+        Ok(p) => (format!("Recording the traffic to {}", file_name(&p)), 4.0),
+        Err(e) => (format!("The traffic cannot be recorded: {e}"), 4.0),
+    });
+}
+
+/// Save the last minute of traffic (`~/.openomsi/traffic/<map>-<HHMMSS>-manual.rec`).
+pub(crate) fn save_traffic_minute(app: &mut App) {
+    let Some(t) = app.traffic.as_mut() else { return };
+    app.service_msg = Some(match t.save_last_minute("manual") {
+        Ok(p) => (format!("The last minute of traffic is saved: {}", file_name(&p)), 5.0),
+        Err(e) => (format!("The traffic cannot be saved: {e}"), 4.0),
+    });
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
 /// A player's id (the argument of an action).
 fn who_id(arg: &str) -> Option<u32> {
     arg.trim().parse::<u32>().ok()

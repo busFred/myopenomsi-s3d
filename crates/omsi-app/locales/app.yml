@@ -78,6 +78,9 @@ _version: 2
   zh-tw: "從道路上移除目前的 AI 車輛；隨機交通會自動恢復。"
   pt: "Remover os carros de IA atuais da via; o tráfego aleatório voltará automaticamente."
   pt-pt: "Remover os carros de IA atuais da estrada; o tráfego aleatório regressará automaticamente."
+"Record the traffic: on": {}
+"Record the traffic: off": {}
+"Save the last minute of traffic": {}
 "Radio stations":
   ca: "Emissores de ràdio"
   zh-tw: "廣播電台"

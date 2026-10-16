@@ -10,7 +10,7 @@ use crate::sim::{Passing, Simulation, Vehicle};
 use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network};
 
 /// Why the car holds back, the nearest reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Why {
     #[default]
     None,

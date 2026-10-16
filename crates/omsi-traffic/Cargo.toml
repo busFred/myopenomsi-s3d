@@ -9,4 +9,8 @@ description = "AI road traffic: compiled junctions, driver model, perception/pla
 omsi-sim = { path = "../omsi-sim" }
 glam.workspace = true
 log.workspace = true
-hashbrown.workspace = true
+hashbrown = { workspace = true, features = ["serde"] }
+serde.workspace = true
+# (exact floats: a replay reads back the very numbers the game had)
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+flate2.workspace = true

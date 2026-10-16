@@ -3302,6 +3302,14 @@ impl App {
                 self.close_game_menu();
                 crate::admin::clear_ai_traffic(self);
             }
+            "recordai" => {
+                let on = !self.traffic.as_ref().is_some_and(|t| t.recorder.is_recording());
+                crate::admin::record_traffic(self, on);
+            }
+            "saveai" => {
+                self.close_game_menu();
+                crate::admin::save_traffic_minute(self);
+            }
             "load" => {
                 self.game_menu = None;
                 if self.load_quicksave() {
@@ -4991,7 +4999,11 @@ impl crate::App {
         if self.traffic.is_some() && !client && !on_server(&self.args) {
             if let Some(q) = v.iter().position(|x| x.0 == "vehicle") {
                 v.insert(q + 1, ("clearai", "Clear AI traffic"));
-                at = at.max(q + 2);
+                // recording the traffic for a replay of a jam (omsi_traffic::record)
+                let recording = self.traffic.as_ref().is_some_and(|t| t.recorder.is_recording());
+                v.insert(q + 2, ("recordai", if recording { "Record the traffic: on" } else { "Record the traffic: off" }));
+                v.insert(q + 3, ("saveai", "Save the last minute of traffic"));
+                at = at.max(q + 4);
             }
         }
         let host = self.lan.as_ref().map(|l| l.role == omsi_net::Role::Host).unwrap_or(false);

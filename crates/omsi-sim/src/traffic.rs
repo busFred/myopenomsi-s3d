@@ -9,7 +9,7 @@
 use glam::{DVec2, DVec3};
 use hashbrown::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LaneKind {
     Street,
     Sidewalk,
@@ -31,7 +31,7 @@ impl LaneKind {
 
 /// Identity of a lane in map terms: the tile, the spline/object id and the `[path]` index.
 /// Timetable tracks reference lanes this way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LaneKey {
     pub tile: (i32, i32),
     pub id: i64,
@@ -39,7 +39,7 @@ pub struct LaneKey {
 }
 
 /// A sampled lane: points with headings, in world coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Lane {
     pub key: Option<LaneKey>,
     /// True for the backwards lane of a two-way path.
@@ -419,7 +419,7 @@ pub const REACH_MAX: f32 = 600.0;
 pub const DEAD_END: f32 = 500.0;
 
 /// Where two lanes of a junction meet.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Crossing {
     pub other: usize,
     /// Distance along this lane and along the other one to the meeting point.
@@ -1516,7 +1516,7 @@ mod extend_tests {
 /// phase when no bus is waiting, the depot gates jump over their phases when nothing comes.
 /// Without it the condition is "somebody is asking": a gate stays green while buses keep
 /// coming, a barrier stays closed while the train is still there.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LightStop {
     pub light: usize,
     pub time: f32,
@@ -1538,7 +1538,7 @@ pub const UNLINKED_PHASE: i32 = 0;
 /// Traffic light program of a crossing object instance (`TAmpelGroup`): its lights'
 /// phases and one cycle clock that runs on game time. The clock is state, not a function
 /// of the time of day, because the program may wait at a stop point or jump.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrafficLightController {
     /// Per light: phases (state, duration).
     pub lights: Vec<Vec<(i32, f32)>>,
@@ -1840,7 +1840,7 @@ const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
 /// going. The body that follows this way is `ai_motion::AiBody`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AiState {
     pub traffic_pool: Option<(usize, std::sync::Arc<Vec<i32>>)>,
     /// The vehicle's `[ai_veh_type]` (0 car, 1 taxi, 2 bus, 3 truck; -1 a timetable bus):
@@ -1927,7 +1927,7 @@ pub struct AiState {
 
 /// What a car keeps its distance to: the gap from its front bumper to the thing (m), how
 /// fast that is moving along the car's way (m/s) and how it is speeding up (m/s²).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Lead {
     pub gap: f32,
     pub speed: f32,
@@ -1995,7 +1995,7 @@ const STOP_LINE_GAP: f32 = 0.6;
 /// A lane change: the car moves over from its lane to `to` along `length` metres of road
 /// (by distance, not by time: a car that has to stop halfway stands still, and so does its
 /// way).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct LaneChange {
     pub to: usize,
     /// Progress 0..1.

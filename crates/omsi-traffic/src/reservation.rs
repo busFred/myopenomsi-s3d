@@ -49,7 +49,7 @@ pub struct Claim {
 }
 
 /// Why a vehicle waits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Hold {
     /// A foe with the right of way is coming (or is in the junction).
     Foe,

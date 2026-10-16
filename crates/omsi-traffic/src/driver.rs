@@ -6,7 +6,7 @@
 use omsi_sim::traffic::AiState;
 
 /// What kind of vehicle the driver is in: sets the preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VehicleClass {
     Car,
     Taxi,
@@ -46,7 +46,7 @@ impl VehicleClass {
 }
 
 /// Everything about how a driver drives, in one place. Units: metres, seconds, m/s².
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DriverParams {
     /// Time gap kept to the car ahead (IDM `tau`).
     pub tau: f32,
@@ -163,7 +163,7 @@ impl DriverParams {
 /// How long a driver has been held, turned into willingness to push: 0 fresh, 1 fed up.
 /// SUMO's `impatience`: it scales the accepted gaps and lets a driver who has waited for
 /// ever take a turn they would otherwise give.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Impatience {
     pub value: f32,
     /// Seconds standing in the current hold.

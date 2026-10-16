@@ -9,12 +9,20 @@
 //! the car-following model and the lane geometry). Cross-vehicle state is written in one
 //! place only, the junction [`reservation`]s. Nothing here renders, loads a vehicle or
 //! touches the GPU, so the whole thing runs headless in the scenario tests.
+//!
+//! [`record`] writes what a frame reads from outside, frame by frame, and [`replay`] runs
+//! such a recording again headless: a jam seen in the game becomes a test. [`export`]
+//! writes the network and its junctions out for other tools.
 
 pub mod access;
 pub mod driver;
+pub mod export;
+pub mod finite;
 pub mod junction;
 pub mod perception;
 pub mod plan;
+pub mod record;
+pub mod replay;
 pub mod reservation;
 pub mod sim;
 

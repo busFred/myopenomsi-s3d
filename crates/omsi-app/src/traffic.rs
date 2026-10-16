@@ -585,6 +585,38 @@ pub struct Traffic {
     /// [ROLLBACK clockjump-traffic-1] The clock as of the last `note_clock` (NaN before the
     /// first), for telling a time set by hand from the clock running.
     clock_seen: f64,
+    /// The traffic recorder (`omsi_traffic::record`): the last minute in memory always, a
+    /// file while a recording runs (`OMSI_TRAFFIC_RECORD=<file>`, or the game menu).
+    pub recorder: omsi_traffic::record::Recorder,
+    /// What the people on foot do, in the order of `people` (set with it every frame), for
+    /// the recording.
+    pub people_records: Vec<omsi_traffic::record::PersonRecord>,
+    /// The map's folder name: recordings and network dumps are named after it.
+    pub map_name: String,
+    /// Cars whose standing too long has been saved already (each once).
+    stuck_saved: hashbrown::HashSet<u64>,
+    /// The minutes saved by themselves this session, and when the last was (`time`): at
+    /// most `AUTO_SAVES`, a minute apart.
+    auto_saves: (u32, f32),
+    /// When the cars were last looked over for two inside each other (`time`).
+    overlap_checked: f32,
+}
+
+/// At most this many minutes of traffic are saved by themselves in a session (a car stuck,
+/// two cars inside each other); a jam of many would fill the disk otherwise.
+const AUTO_SAVES: u32 = 3;
+
+/// The folder recordings go to: `~/.openomsi/traffic` (made when missing).
+pub fn recordings_dir() -> Option<std::path::PathBuf> {
+    let dir = crate::settings::Settings::path()?.parent()?.join("traffic");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The local time as `HHMMSS`, for naming a recording.
+fn hhmmss() -> String {
+    let s = crate::real_time::now().map(|n| n.secs as u32).unwrap_or(0);
+    format!("{:02}{:02}{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
 /// `[boundingbox]` of a vehicle that gives none.
@@ -1130,8 +1162,20 @@ impl Traffic {
             count_near: None,
             lan_centers: Vec::new(),
             clock_seen: f64::NAN,
+            recorder: omsi_traffic::record::Recorder::new(),
+            people_records: Vec::new(),
+            map_name: world.map_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "map".into()),
+            stuck_saved: Default::default(),
+            auto_saves: (0, 0.0),
+            overlap_checked: 0.0,
         };
         t.sort_parked(parked_cars, lanes);
+        if let Ok(path) = omsi_cfg::env::var("OMSI_TRAFFIC_RECORD") {
+            if let Err(e) = t.start_recording(Path::new(&path)) {
+                log::warn!("traffic: cannot record to {path}: {e}");
+            }
+        }
+        t.dump_network();
         Ok(t)
     }
 
@@ -3117,7 +3161,19 @@ impl Traffic {
         }
         // the drivers
         let placeholder = || AiVehicle::new(0, VehicleClass::Car, AiState::new(0, 0.0, 0), 0.0, 0);
+        // (what the bus services and the parking plans set on the ways themselves, for the
+        // recording)
+        let steer: Vec<(u64, omsi_traffic::record::Steer)> = self.cars.iter().filter(|c| c.bus.is_some() || c.park.is_some()).map(|c| (c.id, omsi_traffic::record::Steer::of(&c.ai.state))).collect();
         let mut drivers: Vec<AiVehicle> = self.cars.iter_mut().map(|c| std::mem::replace(&mut c.ai, placeholder())).collect();
+        // the frame's inputs into the recording (the people's extras beside the very
+        // values the frame sees)
+        if self.people_records.len() == self.sim.people.len() {
+            for (r, p) in self.people_records.iter_mut().zip(&self.sim.people) {
+                r.set_person(p);
+            }
+        }
+        let cars = &self.cars;
+        self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &|i| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default());
         self.sim.tick(&self.net, dt, &mut drivers);
         for (c, v) in self.cars.iter_mut().zip(drivers) {
             c.ai = v;
@@ -3262,9 +3318,11 @@ impl Traffic {
                 let _ = writeln!(f, "{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.2},{},{},{:.2},{:.2},{},{:.2},{},{},{},{:.2},{:.2},{:.2},{},{},{:.1},{:?},{:.3}", self.time, c.id, v.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), v.position.x, v.position.y, v.position.z, v.heading, v.pitch, v.bank, fr.steer_deg, st.speed, st.lane, st.s, fr.blinker, self.net.lanes[st.lane].turn, lane_heading, st.lateral, c.at_station() as i32, st.acc, (last.why == Why::Junction) as i32, (last.why == Why::Light) as i32, c.ai.passing.is_some() as i32, st.front, st.rear, c.half_width, c.is_bus() as i32, last.why.name(), last.stop.map(|s| s - st.front).unwrap_or(999.0).min(999.0), c.bus.as_ref().map(|b| b.phase), self.net.lanes[st.lane].at(st.s).0.z);
             }
         }
+        let mut overlaps = 0;
         if omsi_cfg::env::var_os("OMSI_CHECK_OVERLAP").is_some() {
-            self.check_overlaps(player, &others);
+            overlaps = self.check_overlaps(player, &others);
         }
+        self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
             self.orphan_sounds.extend(c.sounds);
@@ -3303,7 +3361,113 @@ impl Traffic {
             .collect()
     }
 
-    fn check_overlaps(&mut self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) {
+    /// Record the traffic into `path` from now on (see `omsi_traffic::record`).
+    pub fn start_recording(&mut self, path: &Path) -> std::io::Result<()> {
+        self.recorder.start_full(path, &self.net, &self.sim, &self.map_name)
+    }
+
+    /// Record into a new file in `recordings_dir`; returns it.
+    pub fn start_recording_new(&mut self) -> std::io::Result<std::path::PathBuf> {
+        let dir = recordings_dir().ok_or_else(|| std::io::Error::other("no folder for the recordings"))?;
+        let path = dir.join(format!("{}-{}.rec", self.map_name, hhmmss()));
+        self.start_recording(&path)?;
+        Ok(path)
+    }
+
+    /// Save the last minute of traffic to a new file in `recordings_dir`; returns it.
+    pub fn save_last_minute(&mut self, trigger: &str) -> std::io::Result<std::path::PathBuf> {
+        let dir = recordings_dir().ok_or_else(|| std::io::Error::other("no folder for the recordings"))?;
+        let path = dir.join(format!("{}-{}-{trigger}.rec", self.map_name, hhmmss()));
+        self.recorder.note(self.sim.time, &format!("saved: {trigger}"));
+        self.recorder.dump_ring(&self.net, &self.sim, &self.map_name, &path, trigger)
+    }
+
+    /// The game changed car `ci`'s way between frames (a timetable bus given its next trip,
+    /// let go, its route extended): into the recording.
+    pub fn note_vehicle_changed(&mut self, ci: usize) {
+        if let Some(c) = self.cars.get(ci) {
+            self.recorder.vehicle_changed(self.sim.time, &c.ai);
+        }
+    }
+
+    /// Save the last minute by itself when something went wrong: a car that has stood for
+    /// a minute held by nothing that lets it go by itself (not a light, not its stop), two
+    /// cars inside each other (`overlap`: seen by `check_overlaps`; else looked for every
+    /// two seconds here).
+    fn save_on_trouble(&mut self, overlap: bool) {
+        let mut trigger: Option<&str> = None;
+        let stuck: Vec<u64> = self.cars.iter().filter(|c| c.ai.stopped > 60.0 && !c.at_stop() && c.ai.last.why != Why::Light && !self.stuck_saved.contains(&c.id)).map(|c| c.id).collect();
+        if !stuck.is_empty() {
+            let report = self.stuck_report();
+            for id in &stuck {
+                self.stuck_saved.insert(*id);
+                let me = format!("car {id} ");
+                for line in report.iter().filter(|l| l.starts_with(&me)) {
+                    self.recorder.note(self.sim.time, line);
+                }
+            }
+            trigger = Some("stuck");
+        }
+        let mut overlap = overlap;
+        if !overlap && self.time - self.overlap_checked >= 2.0 {
+            self.overlap_checked = self.time;
+            if let Some((a, b)) = self.overlapping_pair() {
+                self.recorder.note(self.sim.time, &format!("car {a} and car {b} are inside each other"));
+                overlap = true;
+            }
+        }
+        if overlap {
+            trigger = Some("overlap");
+        }
+        let Some(trigger) = trigger else { return };
+        let (n, last) = self.auto_saves;
+        if n >= AUTO_SAVES || (n > 0 && self.time - last < omsi_traffic::record::RING_SECS as f32) {
+            return;
+        }
+        self.auto_saves = (n + 1, self.time);
+        match self.save_last_minute(trigger) {
+            Ok(p) => log::info!("traffic: {trigger}: the last minute of traffic goes to {}", p.display()),
+            Err(e) => log::warn!("traffic: {trigger}: the last minute could not be saved: {e}"),
+        }
+    }
+
+    /// Two AI cars whose bodies are inside each other by more than 20 cm (their ids).
+    fn overlapping_pair(&self) -> Option<(u64, u64)> {
+        for (i, c) in self.cars.iter().enumerate() {
+            let a = c.ai.obb();
+            for j in self.sim.vehicles_near(c.ai.pos, 10.0) {
+                let Some(o) = self.cars.get(j).filter(|_| j > i) else { continue };
+                if (c.ai.pos.z - o.ai.pos.z).abs() > 3.0 || (c.ai.pos - o.ai.pos).truncate().length() > 30.0 {
+                    continue;
+                }
+                if a.separation(&o.ai.obb()) < -0.2 {
+                    return Some((c.id, o.id));
+                }
+            }
+        }
+        None
+    }
+
+    /// `OMSI_TRAFFIC_NETWORK_DUMP=<folder>`: the network and its junctions as
+    /// `<map>-network.json` and `.geojson` there (written again whenever lanes come).
+    fn dump_network(&self) {
+        let Ok(dir) = omsi_cfg::env::var("OMSI_TRAFFIC_NETWORK_DUMP") else { return };
+        let dir = Path::new(&dir);
+        let _ = std::fs::create_dir_all(dir);
+        let base = dir.join(format!("{}-network", self.map_name));
+        let out = [("json", omsi_traffic::export::network_json(&self.net, &self.sim.junctions)), ("geojson", omsi_traffic::export::network_geojson(&self.net, &self.sim.junctions))];
+        for (ext, text) in out {
+            let path = base.with_extension(ext);
+            match std::fs::write(&path, text) {
+                Ok(()) => log::info!("traffic: the network ({} lanes) written to {}", self.net.lanes.len(), path.display()),
+                Err(e) => log::warn!("traffic: {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// Log every two bodies inside each other (each pair once in ten seconds); returns how
+    /// many new ones there were.
+    fn check_overlaps(&mut self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) -> usize {
         static SEEN: std::sync::OnceLock<parking_lot::Mutex<HashMap<(u64, u64), f32>>> = std::sync::OnceLock::new();
         let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
         let feet = self.footprints();
@@ -3317,6 +3481,7 @@ impl Traffic {
             })
             .collect();
         let why = |c: &AiCar| format!("{} v {:.1} lane {} s {:.1} lat {:.2} why {:?} passing {} change {}", c.vehicle.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), c.ai.state.speed, c.ai.state.lane, c.ai.state.s, c.ai.state.lateral, c.ai.last.why, c.ai.passing.is_some(), c.ai.state.change.is_some());
+        let found = std::cell::Cell::new(0usize);
         for (a, fa) in feet.iter().enumerate() {
             let ca = &self.cars[fa.car];
             let hit = |other: u64, fb: &Footprint, desc: String| {
@@ -3330,6 +3495,7 @@ impl Traffic {
                 }
                 m.insert(key, self.time);
                 log::info!("t={:.1}: OVERLAP car {} ({}) with {} at ({:.1}, {:.1})", self.time, ca.id, why(ca), desc, fa.center.x, fa.center.y);
+                found.set(found.get() + 1);
             };
             for fb in feet.iter().skip(a + 1) {
                 if fb.car == fa.car {
@@ -3342,6 +3508,7 @@ impl Traffic {
                 hit(*id, fb, format!("player box {} v {:.1}", u64::MAX - id, fb.speed));
             }
         }
+        found.get()
     }
 
     /// `OMSI_DEBUG_LIGHTS`: every change of the lights of the chosen programs, with the
@@ -3588,6 +3755,9 @@ impl Traffic {
         }
         let n = new.len();
         if n > 0 {
+            if self.recorder.is_recording() {
+                self.recorder.lanes_added(self.sim.time, self.net.lanes.len(), &new);
+            }
             let added = self.net.extend(new, 1.5);
             self.sim.network_grew(&self.net, added.start);
             log::debug!("traffic: {n} lanes added for timetable routes that drive a one-way path the other way ({:?})", added);
@@ -3635,6 +3805,9 @@ impl Traffic {
         l.name = "(timetable connector)".into();
         l.density = 0.0;
         l.no_cars = true;
+        if self.recorder.is_recording() {
+            self.recorder.lanes_added(self.sim.time, self.net.lanes.len(), std::slice::from_ref(&l));
+        }
         let added = self.net.extend(vec![l], 1.5);
         self.sim.network_grew(&self.net, added.start);
         log::debug!("traffic: a {len:.0} m connector lane {} from lane {a} to lane {b} for a timetable route", added.start);
@@ -3657,6 +3830,8 @@ impl Traffic {
         car.ai.state.ahead.clear();
         car.ai.state.plan_next(net);
         car.ai.gone = false;
+        self.note_vehicle_changed(ci);
+        let car = &mut self.cars[ci];
         let stops = stops.into_iter().map(crate::bus_service::Stop::from_tuple).collect();
         match car.bus.as_mut() {
             Some(b) => b.restart(stops, layover),
@@ -3683,6 +3858,7 @@ impl Traffic {
             b.restart(Vec::new(), false);
         }
         car.ai.gone = true;
+        self.note_vehicle_changed(ci);
     }
 
     /// Take all random AI cars off the road now, keeping timetable buses. Returns how many
@@ -4203,6 +4379,9 @@ impl Traffic {
         let n = new.len();
         let mut added = self.net.lanes.len()..self.net.lanes.len();
         if n > 0 {
+            if self.recorder.is_recording() {
+                self.recorder.lanes_added(self.sim.time, self.net.lanes.len(), &new);
+            }
             added = self.net.extend(new, 1.5);
             self.sim.network_grew(&self.net, added.start);
             self.street_weight += self.net.lanes[added.clone()].iter().filter_map(street_lane_weight).sum::<f64>();
@@ -4222,10 +4401,15 @@ impl Traffic {
         let lights = world.traffic_lights.lock();
         if lights.len() > self.sim.lights.len() {
             let from = self.sim.lights.len();
+            self.recorder.lights_added(self.sim.time, from, &lights[from..]);
             self.sim.lights.extend(lights[from..].iter().cloned());
             self.light_prev
                 .extend(lights[from..].iter().map(|c| vec![-100; c.lights.len()]));
             self.controller_of_object = world.controller_of_object.lock().clone();
+        }
+        drop(lights);
+        if n > 0 {
+            self.dump_network();
         }
         n
     }

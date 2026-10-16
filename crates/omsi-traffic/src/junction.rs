@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 use omsi_sim::traffic::{LaneKind, Network};
 
 /// How two movements of a junction meet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FoeKind {
     /// The lanes cross each other.
     Cross,
@@ -23,7 +23,7 @@ pub enum FoeKind {
 }
 
 /// A movement that is in the way of another one.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Foe {
     /// Index into the junction's `movements`.
     pub movement: usize,
@@ -38,7 +38,7 @@ pub struct Foe {
 }
 
 /// One way through a junction: one of its lanes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Movement {
     /// The lane in the network.
     pub lane: usize,
@@ -65,7 +65,7 @@ pub struct Movement {
 }
 
 /// Where a pedestrian crossing cuts a way through the junction.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cut {
     /// Index into the junction's `movements`.
     pub movement: usize,
@@ -80,7 +80,7 @@ pub struct Cut {
 /// (the lit stub at the kerb, the pieces over each lane, a median) and where they cut the
 /// ways through. The light is the one any of its pieces carries; the pieces without one
 /// are governed by it too (BeijingCity lights a 1 m stub at the kerb and nothing else).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PedCrossing {
     pub foot_lanes: Vec<usize>,
     pub cuts: Vec<Cut>,
@@ -89,7 +89,7 @@ pub struct PedCrossing {
 }
 
 /// A crossing object as a node of the traffic network.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Junction {
     /// Tile and object id of the crossing object.
     pub key: ((i32, i32), i64),
@@ -105,7 +105,7 @@ impl Junction {
 }
 
 /// All junctions of a network, with lookups by lane.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Junctions {
     pub nodes: Vec<Junction>,
     /// Lane inside a junction → (junction, movement).
