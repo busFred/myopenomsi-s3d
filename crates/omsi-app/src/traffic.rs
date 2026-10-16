@@ -3029,6 +3029,14 @@ impl Traffic {
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
+            // how long somebody has stood right behind this bus (a roadside layover gives
+            // way to the traffic it holds up)
+            let queue_behind_secs = if self.cars[i].bus.is_some() {
+                let me = self.cars[i].id;
+                self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me) && o.ai.state.speed < 0.3).map(|o| o.ai.stopped).fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
             let net = &self.net;
@@ -3036,7 +3044,14 @@ impl Traffic {
             let mut ext = External { at_stop: car.at_stop(), standing_for: car.standing_for(day_time), priority: car.vehicle.var("TrafficPriority").unwrap_or(0.0) > 0.5, ..Default::default() };
             if let Some(service) = car.bus.as_mut() {
                 let wanted = stop_wishes.as_ref().map(|(alighting, waiting)| alighting.contains(&car.id) || service.stops.front().is_some_and(|s| waiting.contains(&s.id)));
+                // a stop on a through lane (random traffic runs there) with no bay: the bus
+                // at it blocks the lane
+                let roadside = service.stops.front().is_some_and(|s| {
+                    s.bay.abs() < 0.3 && car.ai.state.route.get(s.ri).and_then(|&l| net.lanes.get(l)).is_some_and(|l| l.density > 0.0)
+                });
                 let ctx = crate::bus_service::Ctx {
+                    roadside,
+                    queue_behind_secs,
                     wanted,
                     net,
                     way: &way,
@@ -3552,6 +3567,7 @@ impl Traffic {
             t.name = o.name.clone();
             t.invisible = o.invisible;
             t.priority = o.priority;
+            t.no_overtaking = o.no_overtaking;
             t.density = 0.0;
             t.no_cars = true;
             new.push(t);
@@ -3743,6 +3759,13 @@ impl Traffic {
     /// Seconds until light `li` of controller `c` lets traffic go (0 while it does).
     pub fn light_until_go(&self, c: usize, li: usize) -> Option<f32> {
         self.sim.lights.get(c)?.time_until_go(li)
+    }
+
+    /// The light that governs footpath lane `lane`: its own, else the light of the
+    /// pedestrian crossing it is a piece of (the unlit pieces over the lanes beyond the lit
+    /// stub at the kerb, BeijingCity).
+    pub fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
+        self.sim.crossing_light(&self.net, lane)
     }
 
     /// Tell a scheduled bus's script who wants in or out (`PAX_Entry<i>_Req`,

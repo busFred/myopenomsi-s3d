@@ -64,12 +64,37 @@ pub struct Movement {
     pub conflict_start: f32,
 }
 
+/// Where a pedestrian crossing cuts a way through the junction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cut {
+    /// Index into the junction's `movements`.
+    pub movement: usize,
+    /// Distance along the movement's lane.
+    pub at: f32,
+    /// The footpath lane that cuts it, and the distance along it.
+    pub foot_lane: usize,
+    pub foot_at: f32,
+}
+
+/// A pedestrian crossing of the junction: the footpath pieces across the carriageway
+/// (the lit stub at the kerb, the pieces over each lane, a median) and where they cut the
+/// ways through. The light is the one any of its pieces carries; the pieces without one
+/// are governed by it too (BeijingCity lights a 1 m stub at the kerb and nothing else).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PedCrossing {
+    pub foot_lanes: Vec<usize>,
+    pub cuts: Vec<Cut>,
+    /// (controller, light index), None for a zebra or an unlit crossing.
+    pub light: Option<(usize, usize)>,
+}
+
 /// A crossing object as a node of the traffic network.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Junction {
     /// Tile and object id of the crossing object.
     pub key: ((i32, i32), i64),
     pub movements: Vec<Movement>,
+    pub crossings: Vec<PedCrossing>,
 }
 
 impl Junction {
@@ -88,6 +113,8 @@ pub struct Junctions {
     /// Lane that leads into a junction → the junctions and movements it enters (a lane
     /// may fork into several movements: straight on and a turn).
     pub entries: HashMap<usize, Vec<(usize, usize)>>,
+    /// Footpath lane of a pedestrian crossing → (junction, crossing).
+    pub of_foot_lane: HashMap<usize, (usize, usize)>,
     /// How many lanes of the network were compiled; `extend` carries on from there.
     compiled: usize,
 }
@@ -144,6 +171,7 @@ impl Junctions {
                 m.exits = f.exits;
                 m.continues = f.continues;
             }
+            self.nodes[idx].crossings = fresh.crossings;
         }
         self.compiled = net.lanes.len();
         self.rebuild_lookups();
@@ -152,6 +180,7 @@ impl Junctions {
     fn rebuild_lookups(&mut self) {
         self.of_lane.clear();
         self.entries.clear();
+        self.of_foot_lane.clear();
         for (ji, j) in self.nodes.iter().enumerate() {
             for (mi, m) in j.movements.iter().enumerate() {
                 self.of_lane.insert(m.lane, (ji, mi));
@@ -159,7 +188,24 @@ impl Junctions {
                     self.entries.entry(e).or_default().push((ji, mi));
                 }
             }
+            for (ci, c) in j.crossings.iter().enumerate() {
+                for &f in &c.foot_lanes {
+                    self.of_foot_lane.insert(f, (ji, ci));
+                }
+            }
         }
+    }
+
+    /// The pedestrian crossing footpath lane `lane` is a piece of.
+    pub fn crossing_of(&self, lane: usize) -> Option<&PedCrossing> {
+        let &(j, c) = self.of_foot_lane.get(&lane)?;
+        self.nodes.get(j)?.crossings.get(c)
+    }
+
+    /// The light that governs footpath lane `lane`: its own, else that of the crossing it
+    /// is a piece of (the unlit pieces over the lanes beyond the lit stub at the kerb).
+    pub fn crossing_light(&self, net: &Network, lane: usize) -> Option<(usize, usize)> {
+        net.lanes.get(lane)?.traffic_light.or_else(|| self.crossing_of(lane)?.light)
     }
 
     fn build(net: &Network, key: ((i32, i32), i64), lanes: &[usize]) -> Junction {
@@ -223,7 +269,55 @@ impl Junctions {
             movements[mi].conflict_start = start;
             movements[mi].conflict_end = end;
         }
-        Junction { key, movements }
+        let crossings = Self::crossings(net, &movements);
+        Junction { key, movements, crossings }
+    }
+
+    /// The pedestrian crossings of the object: every footpath lane that cuts a way through
+    /// it, chained with the short pieces linked before and after it (the lit stub at the
+    /// kerb, the piece over the next lane, a median piece), one crossing per chain.
+    fn crossings(net: &Network, movements: &[Movement]) -> Vec<PedCrossing> {
+        let mut cuts: Vec<Cut> = Vec::new();
+        for (mi, m) in movements.iter().enumerate() {
+            if m.kind != LaneKind::Street {
+                continue;
+            }
+            for &(w, sa, sw) in net.walks.get(m.lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+                cuts.push(Cut { movement: mi, at: sa, foot_lane: w, foot_at: sw });
+            }
+        }
+        // chains: from each cutting footpath lane, along prev/next through the short
+        // pieces (a pavement along the kerb is long and is not part of the crossing)
+        let joins = |l: usize, o: usize| -> bool {
+            let (a, b) = (&net.lanes[l], &net.lanes[o]);
+            let short = b.length() <= 4.0 || cuts.iter().any(|c| c.foot_lane == o);
+            b.kind == LaneKind::Sidewalk && short && (a.next.contains(&o) || b.next.contains(&l))
+        };
+        let mut out: Vec<PedCrossing> = Vec::new();
+        let mut taken: Vec<usize> = Vec::new();
+        for c in &cuts {
+            if taken.contains(&c.foot_lane) {
+                continue;
+            }
+            let mut chain = vec![c.foot_lane];
+            let mut k = 0;
+            while k < chain.len() && chain.len() < 16 {
+                let l = chain[k];
+                let lane = &net.lanes[l];
+                let around: Vec<usize> = lane.next.iter().copied().chain(net.prev.get(l).map(|v| v.iter().copied()).into_iter().flatten()).collect();
+                for o in around {
+                    if !chain.contains(&o) && joins(l, o) {
+                        chain.push(o);
+                    }
+                }
+                k += 1;
+            }
+            taken.extend(chain.iter().copied());
+            let light = chain.iter().find_map(|&l| net.lanes[l].traffic_light);
+            let mine: Vec<Cut> = cuts.iter().copied().filter(|x| chain.contains(&x.foot_lane)).collect();
+            out.push(PedCrossing { foot_lanes: chain, cuts: mine, light });
+        }
+        out
     }
 
     /// The junction and movement that lane `lane` is part of.

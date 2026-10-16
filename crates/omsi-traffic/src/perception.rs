@@ -578,6 +578,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                     room = room.min(tail - clear_from);
                 }
             }
+            for &(k, s, _) in sim.player_occupancy.get(&wl).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let p = &sim.players[k];
+                let tail = wd + s - p.half_len;
+                if p.speed.abs() < 1.5 && tail > clear_from - 0.5 {
+                    room = room.min(tail - clear_from);
+                }
+            }
         }
         return Some(JunctionView { junction: j, movement: m, entry: d0, inside, exit_room: room >= need });
     }
@@ -612,54 +619,53 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let me = &vehicles[i];
     let st = &me.state;
     let lane = net.lanes.get(nb)?;
-    let allowed = !lane.no_cars && lane.allows(st.veh_type);
+    let allowed = crate::access::is_open(lane, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
     let mut behind: Option<(f32, f32)> = None;
     let mut foreign = false;
-    let mut note = |d_rel: f32, o: &Vehicle, occ_foreign: bool| {
+    // (d_rel: the other's origin relative to the place beside me; front/rear its extents)
+    let mut note = |d_rel: f32, front: f32, rear: f32, speed: f32, occ_foreign: bool| {
         if occ_foreign {
             foreign = true;
         }
         if d_rel >= 0.0 {
-            let gap = d_rel - o.state.rear - st.front;
+            let gap = d_rel - rear - st.front;
             if ahead.map(|a| gap < a.0).unwrap_or(true) {
-                ahead = Some((gap, o.state.speed));
+                ahead = Some((gap, speed));
             }
         } else {
-            let gap = -d_rel - o.state.front - st.rear;
+            let gap = -d_rel - front - st.rear;
             if behind.map(|b| gap < b.0).unwrap_or(true) {
-                behind = Some((gap, o.state.speed));
+                behind = Some((gap, speed));
             }
         }
     };
-    for occ in sim.occupancy.get(&nb).map(|v| v.as_slice()).unwrap_or(&[]) {
-        if occ.vehicle == i {
-            continue;
-        }
-        note(occ.s - s_b, &vehicles[occ.vehicle], occ.foreign);
-    }
-    // behind, on the lanes leading in (within 80 m)
-    for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
-        let pl = &net.lanes[p];
-        for occ in sim.occupancy.get(&p).map(|v| v.as_slice()).unwrap_or(&[]) {
+    let lane_users = |l: usize, offset: f32, note: &mut dyn FnMut(f32, f32, f32, f32, bool)| {
+        for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             if occ.vehicle == i {
                 continue;
             }
-            let d_rel = occ.s - pl.length() - s_b;
-            if d_rel > -80.0 {
-                note(d_rel, &vehicles[occ.vehicle], occ.foreign);
-            }
+            let o = &vehicles[occ.vehicle];
+            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign);
+        }
+        // the players' vehicles are there like anybody else
+        for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let p = &sim.players[k];
+            note(s + offset - s_b, p.half_len, p.half_len, p.speed, false);
+        }
+    };
+    lane_users(nb, 0.0, &mut note);
+    // behind, on the lanes leading in (within 80 m)
+    for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
+        let len = net.lanes[p].length();
+        if len - s_b < 80.0 + len {
+            lane_users(p, -len, &mut note);
         }
     }
     // ahead, on the first lane after
     if let Some(&n) = lane.next.first() {
-        for occ in sim.occupancy.get(&n).map(|v| v.as_slice()).unwrap_or(&[]) {
-            if occ.vehicle == i {
-                continue;
-            }
-            note(lane.length() - s_b + occ.s, &vehicles[occ.vehicle], occ.foreign);
-        }
+        lane_users(n, lane.length(), &mut note);
     }
     let runs_on = net.reach.get(nb).copied().unwrap_or(lane.length()) - s_b;
     // a turn the lane leads into within 150 m
@@ -686,40 +692,55 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
     let st = &me.state;
     let (opp, os, side) = net.opposite(st.lane, st.s)?;
     let ol = &net.lanes[opp];
+    // a lane the car could not drive on anyway (a footpath, a cycle lane narrower than
+    // the car), or one beyond a strip wider than two lanes' edges ever are, is no lane to
+    // pass on
+    let my_lane = &net.lanes[st.lane];
+    let edge_gap = side.abs() - (my_lane.width.max(2.0) + ol.width.max(2.0)) * 0.5;
+    if matches!(crate::access::open_to(ol, me), Err(crate::access::Closed::Kind) | Err(crate::access::Closed::Width)) || edge_gap > omsi_sim::traffic::NEIGHBOUR_EDGE_GAP {
+        return None;
+    }
     let limit = ol.speed_limit_kmh / 3.6;
     let look = (limit.clamp(8.0, 20.0) * 12.0 + 20.0).min(300.0);
     let mut clear_for = f32::INFINITY;
     let mut blocked = false;
     let behind_me = os + st.rear + 1.0;
+    // (pos, speed, accel, held at a red light)
+    let mut note = |pos: f32, speed: f32, accel: f32, at_red: bool| {
+        // past me already
+        if pos > behind_me {
+            return;
+        }
+        // standing in or just beyond the stretch the pass uses: in the way, not coming
+        if speed < 0.5 && pos > os - pass_len - 15.0 {
+            blocked = true;
+            clear_for = 0.0;
+            return;
+        }
+        // not yet level: the distance it still has to me
+        let dist = (os - pos).max(0.0);
+        let mut t = arrival_time(dist, speed, accel, limit);
+        // a car standing at a red light with time to go: counts from when it goes
+        if at_red && speed < 0.5 {
+            t += 5.0;
+        }
+        // inside the stretch I will use: no time at all
+        if pos > os - pass_len {
+            t = 0.0;
+        }
+        clear_for = clear_for.min(t);
+    };
     for (l, off, _) in net.upstream(opp, os, look, 48) {
         for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             if occ.vehicle == i {
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            let pos = occ.s + off;
-            // past me already
-            if pos > behind_me {
-                continue;
-            }
-            // standing in or just beyond the stretch the pass uses: in the way, not coming
-            if o.state.speed < 0.5 && pos > os - pass_len - 15.0 {
-                blocked = true;
-                clear_for = 0.0;
-                continue;
-            }
-            // not yet level: the distance it still has to me
-            let dist = (os - pos).max(0.0);
-            let mut t = arrival_time(dist, o.state.speed, o.state.accel, limit);
-            // a car standing at a red light with time to go: counts from when it goes
-            if o.last.why == crate::plan::Why::Light && o.state.speed < 0.5 {
-                t += 5.0;
-            }
-            // inside the stretch I will use: no time at all
-            if pos > os - pass_len {
-                t = 0.0;
-            }
-            clear_for = clear_for.min(t);
+            note(occ.s + off, o.state.speed, o.state.accel, o.last.why == crate::plan::Why::Light);
+        }
+        for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let p = &sim.players[k];
+            note(s + off, p.speed.max(0.0), 1.2, false);
         }
     }
     if sim.parked.get(&opp).map(|v| v.iter().any(|p| p.lateral.abs() <= 1.6 && p.s > os - pass_len - 10.0 && p.s < os + 10.0)).unwrap_or(false) {

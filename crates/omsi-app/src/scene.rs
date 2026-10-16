@@ -13256,6 +13256,43 @@ fn path_densities(rules: &[omsi_map::MapRule], path: usize) -> (f32, Vec<(u16, f
     (density, per)
 }
 
+/// Whether the mapper drew a solid line on this path (`[rule] overtaking_prohib`, the value
+/// is always 0): traffic may not pass on it. A `[kill_rule]` is no line, like for the
+/// other kinds.
+fn path_no_overtaking(rules: &[omsi_map::MapRule], path: usize) -> bool {
+    rules.iter().any(|r| {
+        r.path_index == path as i32 && r.kind.eq_ignore_ascii_case("overtaking_prohib") && !r.kill
+    })
+}
+
+/// Say once per kind that a map uses a `[rule]` the lane builders do not read, so a new
+/// kind in some map shows up in the log instead of being dropped without a word. The set
+/// lives for the whole run: a kind is reported on the first map that has it, not again for
+/// every spline, object or map reload after.
+fn warn_unknown_rule_kinds(rules: &[omsi_map::MapRule]) {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    for r in rules {
+        let k = r.kind.to_ascii_lowercase();
+        let known = matches!(
+            k.as_str(),
+            "trafficdensity" | "speedlimit" | "no_cars" | "bus" | "trucks" | "priority" | "overtaking_prohib"
+        ) || k.contains("unsched");
+        if known {
+            continue;
+        }
+        let fresh = SEEN.get_or_init(Default::default).lock().insert(k);
+        if fresh {
+            log::warn!(
+                "map rule kind {:?} is not understood (path {}, value {})",
+                r.kind,
+                r.path_index,
+                r.value
+            );
+        }
+    }
+}
+
 /// Lanes of one map spline: every `[path]` of the spline type runs along the curve at its
 /// lateral offset; `direction` 1 runs backwards, 2 both ways (two lanes).
 ///
@@ -13272,6 +13309,7 @@ fn spline_lanes(
     tile: (i32, i32),
 ) -> Vec<Lane> {
     let mut out = Vec::new();
+    warn_unknown_rule_kinds(&s.rules);
     let side = if s.mirror { -1.0 } else { 1.0 };
     let curve = &curve.with_sli(def);
     for (pi, p) in def.paths.iter().enumerate() {
@@ -13318,6 +13356,7 @@ fn spline_lanes(
         let no_unsched = s.rules.iter().any(|r| r.path_index == pi as i32 && r.kind.to_ascii_lowercase().contains("unsched") && !r.kill)
             || p.params.first().is_some_and(|x| *x == 1.0);
         let no_cars = no_cars || no_unsched;
+        let no_overtaking = path_no_overtaking(&s.rules, pi);
         // (`bus` and `trucks` are switches that open the path to those AI vehicles, see
         // `Lane::allows`; `bus` does not close it to cars)
         let rule_bus = rule_of("bus").is_some();
@@ -13334,6 +13373,7 @@ fn spline_lanes(
             l.density = density;
             l.group_density = group_density.clone();
             l.no_cars = no_cars;
+            l.no_overtaking = no_overtaking;
             l.no_unsched = no_unsched;
             l.rule_bus = rule_bus;
             l.rule_trucks = rule_trucks;
@@ -13397,6 +13437,7 @@ fn object_lanes(
     rules: &[omsi_map::MapRule],
 ) -> Vec<Lane> {
     let mut out = Vec::new();
+    warn_unknown_rule_kinds(rules);
     let heading = rot[0];
     let h = heading.to_radians();
     let (sh, ch) = (h.sin(), h.cos());
@@ -13458,6 +13499,7 @@ fn object_lanes(
             || v.get(12).is_some_and(|x| *x == 1.0)
             || v.get(13).is_some_and(|x| *x == 1.0);
         let no_cars = no_cars || no_unsched;
+        let no_overtaking = path_no_overtaking(rules, pi);
         let rule_bus = rule_of("bus").is_some();
         let rule_trucks = rule_of("trucks").is_some();
         // who goes first where this path meets another (`Network::must_yield`)
@@ -13474,6 +13516,7 @@ fn object_lanes(
             l.density = density;
             l.group_density = group_density.clone();
             l.no_cars = no_cars;
+            l.no_overtaking = no_overtaking;
             l.no_unsched = no_unsched;
             l.rule_bus = rule_bus;
             l.rule_trucks = rule_trucks;
@@ -14077,6 +14120,30 @@ mod tests {
         assert_eq!(path_densities(&rules, 1), (2.0, vec![(0, 2.0)]));
         assert_eq!(path_densities(&[rule(2, 0.3, 4.0)], 2), (1.0, vec![(4, 0.3)]));
         assert_eq!(path_densities(&[], 0), (1.0, vec![]));
+    }
+
+    /// A solid line (`overtaking_prohib`) marks its own path only, and a path that has just a
+    /// `[kill_rule]` for it has none.
+    #[test]
+    fn overtaking_prohib_marks_a_solid_line() {
+        let rule = |path: i32, kind: &str, kill: bool| omsi_map::MapRule {
+            path_index: path,
+            kind: kind.into(),
+            kill,
+            ..Default::default()
+        };
+        let rules = [
+            rule(0, "overtaking_prohib", false),
+            rule(1, "overtaking_prohib", true),
+            rule(2, "no_cars", false),
+        ];
+        assert!(path_no_overtaking(&rules, 0));
+        assert!(!path_no_overtaking(&rules, 1));
+        assert!(!path_no_overtaking(&rules, 2));
+        assert!(!path_no_overtaking(&[rule(0, "Overtaking_Prohib", true)], 0));
+        assert!(path_no_overtaking(&[rule(0, "Overtaking_Prohib", false)], 0));
+        // an unknown kind only logs; it must not panic or change anything
+        warn_unknown_rule_kinds(&[rule(0, "some_new_kind", false), rule(0, "some_new_kind", false)]);
     }
 
     /// A wire strung 5.5 m over its spline is no ground; a wall standing on it, or a

@@ -98,11 +98,18 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
 
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
 /// accepted (LMRS: the route, a standing obstacle, speed gain, keeping to the side).
-fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, bool) {
+/// `near_junction`: within the last stretch before a junction, where the lines are solid
+/// and only the turn lane and a standing obstacle are reasons to move over.
+fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool) -> (f32, bool) {
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
     if !nb.allowed {
+        return (0.0, false);
+    }
+    // the solid line (`[rule] overtaking_prohib`) on either lane, and the pieces of a
+    // junction object: no change of the driver's own
+    if lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 {
         return (0.0, false);
     }
     let mut desire = 0.0f32;
@@ -126,13 +133,13 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
         }
         // a faster lane
         let slow = l.speed < 0.7 * p.v_want && l.gap < 45.0 && l.gap > 8.0 && l.speed < st.speed + 1.0;
-        if slow && st.speed >= 4.0 && nb.ahead.map(|a| a.0 > 50.0).unwrap_or(true) {
+        if slow && !near_junction && st.speed >= 4.0 && nb.ahead.map(|a| a.0 > 50.0).unwrap_or(true) {
             desire = desire.max(dp.lc_speed_gain);
         }
     }
     // keep to the side when the road is clear
     let keep_side = if sim.left_hand { 1 } else { 2 };
-    if nb.dir == keep_side && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > 200.0 {
+    if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > 200.0 {
         desire = desire.max(dp.lc_keep_right);
     }
     if nb.runs_on < 40.0 {
@@ -172,8 +179,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 true
             }
             Aspect::Yellow => {
-                let go = me.amber == Some((sig.ctl, sig.light)) || (gap < comfortable && !queued);
-                if go && gap < comfortable {
+                // the dilemma zone: through when stopping is no longer comfortable; a
+                // driver who took the line on green just before goes a little further
+                // out ("had the mark" alone let a car two places back in a queue go)
+                let marked = me.amber == Some((sig.ctl, sig.light));
+                let go = !queued && (gap < comfortable || (marked && gap < comfortable + 6.0));
+                if go {
                     out.amber = Some((sig.ctl, sig.light));
                 }
                 go
@@ -225,9 +236,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
+        let near_junction = p.junction.map(|j| !j.inside && j.entry < 40.0).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
-            let (d, ok) = change_desire(net, sim, me, p, &nb);
+            let (d, ok) = change_desire(net, sim, me, p, &nb, near_junction);
             if ok && d > 0.0 && best.map(|b| d > b.0).unwrap_or(true) {
                 best = Some((d, nb));
             }
@@ -271,7 +283,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
         }
     } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle()) {
+        // (not across a solid line: a pass there stays a squeeze within the lane)
         let can_pass = !me.is_rail() && me.class != VehicleClass::Air && st.change.is_none() && out.start.is_none() && lane.left.is_none() && lane.right.is_none();
+        let solid = lane.no_overtaking;
         let player = matches!(l.what, Seen::Player(_));
         let player_out = player && sim.players.iter().any(|pl| pl.blinker as i32 == out_side && pl.signalling < 1.0);
         // a bus does not pass what stands at its own next stop
@@ -310,7 +324,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if real >= 0.3 && !light_near && !junction_near && road_ok {
                 if squeeze {
                     out.start = Some(Start::Pass(Passing { lane: None, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0 }));
-                } else if let Some(o) = p.oncoming.filter(|o| o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked) {
+                } else if let Some(o) = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked) {
                     let v_cap = (p.v_want).clamp(4.0, 14.0);
                     let t_need = arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5;
                     if o.clear_for > t_need {

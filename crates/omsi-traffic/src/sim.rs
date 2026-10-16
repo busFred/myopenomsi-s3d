@@ -272,6 +272,10 @@ pub struct Simulation {
     pub walkers: Vec<(usize, f32)>,
     pub parked: HashMap<usize, Vec<Parked>>,
     pub occupancy: HashMap<usize, Vec<Occupant>>,
+    /// The players' vehicles on the lanes, as of this frame: per lane, (player index,
+    /// distance along it, lateral offset). The lanes beside, the room past a junction and
+    /// the oncoming lane see them as they see any vehicle.
+    pub player_occupancy: HashMap<usize, Vec<(usize, f32, f32)>>,
     /// Vehicles and people by 50 m cell, as of this frame.
     vehicle_grid: HashMap<(i32, i32), Vec<usize>>,
     people_grid: HashMap<(i32, i32), Vec<usize>>,
@@ -299,6 +303,7 @@ impl Simulation {
             walkers: Vec::new(),
             parked: HashMap::new(),
             occupancy: HashMap::new(),
+            player_occupancy: HashMap::new(),
             vehicle_grid: HashMap::new(),
             people_grid: HashMap::new(),
             changes_started: Vec::new(),
@@ -419,6 +424,22 @@ impl Simulation {
         for (k, p) in self.people.iter().enumerate() {
             self.people_grid.entry(cell(p.pos)).or_default().push(k);
         }
+        self.player_occupancy.clear();
+        for k in 0..self.players.len() {
+            let p = self.players[k];
+            let Some((lane, s)) = self.player_lane(net, &p) else { continue };
+            let (q, h) = net.lanes[lane].at(s.min(net.lanes[lane].length()));
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            let lateral = (p.pos - q).truncate().dot(right) as f32;
+            self.player_occupancy.entry(lane).or_default().push((k, s, lateral));
+        }
+    }
+
+    /// The light that governs footpath lane `lane`: its own, else that of the pedestrian
+    /// crossing it is a piece of.
+    pub fn crossing_light(&self, net: &Network, lane: usize) -> Option<(usize, usize)> {
+        self.junctions.crossing_light(net, lane)
     }
 
     /// Lanes starting just ahead of a player, and the ones after them, within `within`
@@ -559,8 +580,15 @@ impl Simulation {
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             let committed = j.inside || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
+            // the light at this junction's line, if the driver is held by one
+            let (light_red, until_go) = match p.signal {
+                Some(sig) if sig.dist <= j.entry + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
+                _ => (false, None),
+            };
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
+                light_red,
+                until_go,
                 vehicle: i,
                 junction: j.junction,
                 movement: j.movement,
@@ -637,6 +665,8 @@ impl Simulation {
             let room = -s_on - p.half_len - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             claims.push(Claim {
+                light_red: false,
+                until_go: None,
                 vehicle: usize::MAX - k,
                 junction: j,
                 movement: m,

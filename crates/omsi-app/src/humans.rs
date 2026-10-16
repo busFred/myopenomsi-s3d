@@ -5460,14 +5460,15 @@ impl Humans {
         if !next.from_end(net) {
             return Ok(());
         }
-        let lane = &net.lanes[next.lane];
         // [ROLLBACK pedcross-1] off the kerb, the crossing is one decision: at an unlit piece
         // of it nobody waits for a gap again (the cars of the lanes ahead stop for somebody
         // on the crossing), only for a car too fast to stop; a lit median still holds.
         // Re-deciding at every 2 m piece, people stood in the road for a gap in the next
         // lane while the light went red, and then crossed "on red".
         let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
-        if let (Some((c, li)), Some(t)) = (lane.traffic_light, traffic) {
+        // (the lane's own light, or that of the crossing it is a piece of: the pieces
+        // beyond the lit stub at the kerb are governed by the same light)
+        if let (Some((c, li)), Some(t)) = (traffic.and_then(|t| t.crossing_light(next.lane)), traffic) {
             if let Some((state, left)) = t.light_state(c, li) {
                 if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
                     return Err("red light");

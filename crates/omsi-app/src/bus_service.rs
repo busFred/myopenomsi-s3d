@@ -71,6 +71,9 @@ pub struct BusService {
     pub layover: bool,
     /// [ROLLBACK aiparked-73] The wait at this stop is a long one (`PARKED_WAIT`): the engine stops.
     long_wait: bool,
+    /// This stop is a layover on a through lane: the doors are open for the whole wait, and
+    /// the bus goes early when a queue builds up behind it.
+    roadside_layover: bool,
     /// The timetable still carries the route on as tiles bring their lanes: at the end of
     /// what it has, it waits for more.
     pub route_open: bool,
@@ -140,6 +143,11 @@ const TRIP_DONE_PARK: f32 = 20.0;
 const BOARDING_MAX: f32 = 120.0;
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
+/// A layover bus on a through lane leaves early once a vehicle has stood behind it this
+/// long (s), if its departure is more than `ROADSIDE_EARLY_MIN` away: the queue costs the
+/// town more than a few minutes' lead on the timetable.
+const ROADSIDE_QUEUE: f32 = 20.0;
+const ROADSIDE_EARLY_MIN: f64 = 30.0;
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
 /// 30 m unless its object strings say otherwise (Omsi.exe 0x620058, string 4; the bus
 /// moves over once it is that near, 0x7dac5e).
@@ -181,6 +189,11 @@ pub struct Ctx<'a> {
     /// nobody knows - no passengers run - and every stop is served).
     pub wanted: Option<bool>,
     pub debug: bool,
+    /// The front stop lies on a through lane (random traffic runs on it) with no bay: a bus
+    /// standing there blocks the lane.
+    pub roadside: bool,
+    /// Seconds a vehicle has stood right behind this bus (0 when none does).
+    pub queue_behind_secs: f32,
 }
 
 impl BusService {
@@ -195,6 +208,7 @@ impl BusService {
             delay: 0.0,
             layover: false,
             long_wait: false,
+            roadside_layover: false,
             route_open: false,
             terminus: String::new(),
             near_d: f32::INFINITY,
@@ -275,6 +289,7 @@ impl BusService {
         self.boarding = 0.0;
         self.boarded = false;
         self.layover = layover;
+        self.roadside_layover = false;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -312,9 +327,12 @@ impl BusService {
         self.long_wait = wait >= PARKED_WAIT;
         self.boarding = boarding_time(ctx.id);
         self.boarded = false;
-        // a layover opens the doors for the last minute only; anywhere else people get off
-        // straight away
-        if layover && wait > LAYOVER_BOARDING + 10.0 {
+        // a layover opens the doors for the last minute only (out of the way, at a terminus
+        // or in a depot); anywhere else people get off straight away. At a roadside stop on
+        // a through lane the doors open at once: people wait outside, and the bus blocks the
+        // lane whatever it does, so it may as well serve them
+        self.roadside_layover = layover && ctx.roadside;
+        if layover && !ctx.roadside && wait > LAYOVER_BOARDING + 10.0 {
             self.set_phase(Phase::Waiting);
         } else {
             self.set_phase(Phase::Boarding);
@@ -373,6 +391,38 @@ impl BusService {
         }
     }
 
+    /// One frame at a stop with the doors shut: they open for the last minute.
+    fn wait(&mut self, ctx: &Ctx) {
+        let board_at = self.leave_at - LAYOVER_BOARDING;
+        if !self.boarded && ctx.day_time >= board_at {
+            self.boarded = true;
+            self.boarding = self.boarding.max((self.leave_at - ctx.day_time) as f32 - 3.0);
+            self.set_phase(Phase::Boarding);
+        } else if self.boarded && ctx.day_time >= self.leave_at {
+            self.set_phase(Phase::Closing);
+        }
+    }
+
+    /// One frame at a stop with the doors open.
+    fn board(&mut self, ctx: &Ctx) {
+        self.boarding -= ctx.dt;
+        // a layover on a through lane with a queue behind it gives up the rest of its wait;
+        // the closing sequence below then runs as usual
+        if self.roadside_layover && ctx.queue_behind_secs > ROADSIDE_QUEUE && self.leave_at - ctx.day_time > ROADSIDE_EARLY_MIN {
+            self.leave_at = ctx.day_time;
+        }
+        // an early bus waits for its departure with the doors open, as drivers do
+        // (shut, it stood at the stop for half a minute for no reason anyone could
+        // see); the doors close when it is time to go
+        if self.boarding <= 0.0 && ctx.day_time >= self.leave_at {
+            self.set_phase(Phase::Closing);
+        } else if ctx.day_time >= self.leave_at && self.phase_t > BOARDING_MAX {
+            // [ROLLBACK stopstuck-130] somebody always said to be at the doors (a
+            // passenger who never gets in) kept the bus at its stop for good
+            self.set_phase(Phase::Closing);
+        }
+    }
+
     /// One frame of the service: where the bus has to stop (distance from its origin along
     /// its way), if anywhere; it also sets its blinker and its place across the lane.
     pub fn step(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) -> Option<f32> {
@@ -381,28 +431,11 @@ impl BusService {
         match self.phase {
             Phase::TripDone => here,
             Phase::Waiting => {
-                let board_at = self.leave_at - LAYOVER_BOARDING;
-                if !self.boarded && ctx.day_time >= board_at {
-                    self.boarded = true;
-                    self.boarding = self.boarding.max((self.leave_at - ctx.day_time) as f32 - 3.0);
-                    self.set_phase(Phase::Boarding);
-                } else if self.boarded && ctx.day_time >= self.leave_at {
-                    self.set_phase(Phase::Closing);
-                }
+                self.wait(ctx);
                 here
             }
             Phase::Boarding => {
-                self.boarding -= ctx.dt;
-                // an early bus waits for its departure with the doors open, as drivers do
-                // (shut, it stood at the stop for half a minute for no reason anyone could
-                // see); the doors close when it is time to go
-                if self.boarding <= 0.0 && ctx.day_time >= self.leave_at {
-                    self.set_phase(Phase::Closing);
-                } else if ctx.day_time >= self.leave_at && self.phase_t > BOARDING_MAX {
-                    // [ROLLBACK stopstuck-130] somebody always said to be at the doors (a
-                    // passenger who never gets in) kept the bus at its stop for good
-                    self.set_phase(Phase::Closing);
-                }
+                self.board(ctx);
                 here
             }
             Phase::Closing => {
@@ -630,6 +663,106 @@ mod tests {
         s.serve_early = vec![2];
         assert!(!s.must_serve(&stop(2, 200.0), 190.0));
         assert!(s.must_serve(&stop(2, 200.0), 170.0));
+    }
+
+    /// A bus that has just arrived at its first stop 200 s before its departure (the layover).
+    fn layover_bus(roadside: bool, queue_behind_secs: f32) -> (BusService, Ctx<'static>) {
+        let net: &'static Network = Box::leak(Box::default());
+        let stop = Stop { ri: 0, s: 0.0, bay: 0.0, depart: 300.0, id: 7, side: 0.0 };
+        let mut s = BusService::new(vec![stop]);
+        s.layover = true;
+        let ctx = Ctx {
+            net,
+            way: &[],
+            day_time: 100.0,
+            dt: 0.1,
+            id: 1,
+            stopped: 0.0,
+            passing: false,
+            kerb_swerve: None,
+            lead_close: false,
+            follower_close: false,
+            wanted: None,
+            debug: false,
+            roadside,
+            queue_behind_secs,
+        };
+        s.arrive(&ctx, 300.0, 7, (0, 0.0));
+        (s, ctx)
+    }
+
+    #[test]
+    fn a_layover_off_the_road_waits_with_its_doors_shut() {
+        let (mut s, mut ctx) = layover_bus(false, 0.0);
+        assert_eq!(s.phase, Phase::Waiting);
+        assert!(!s.boarded);
+        assert!(!s.at_station());
+        assert_eq!(s.leave_at, 300.0);
+        // a queue behind it changes nothing: it is out of the way
+        ctx.queue_behind_secs = 60.0;
+        s.wait(&ctx);
+        assert_eq!(s.phase, Phase::Waiting);
+        assert_eq!(s.leave_at, 300.0);
+        // the doors open 45 s before the departure
+        ctx.day_time = 254.0;
+        s.wait(&ctx);
+        assert_eq!(s.phase, Phase::Waiting);
+        ctx.day_time = 255.0;
+        s.wait(&ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+    }
+
+    #[test]
+    fn a_layover_on_a_through_lane_opens_its_doors_at_once() {
+        let (mut s, mut ctx) = layover_bus(true, 0.0);
+        assert_eq!(s.phase, Phase::Boarding);
+        assert!(s.boarded);
+        assert!(s.at_station());
+        // it leaves on time, not before
+        assert_eq!(s.leave_at, 300.0);
+        ctx.day_time = 200.0;
+        s.board(&ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+        ctx.day_time = 300.0;
+        s.boarding = 0.0;
+        s.board(&ctx);
+        assert_eq!(s.phase, Phase::Closing);
+    }
+
+    #[test]
+    fn a_layover_on_a_through_lane_leaves_early_for_a_queue_behind_it() {
+        // a short queue: it stays
+        let (mut s, mut ctx) = layover_bus(true, 0.0);
+        ctx.queue_behind_secs = 10.0;
+        s.board(&ctx);
+        assert_eq!(s.leave_at, 300.0);
+        // a long one: the departure is now, and once the people are in the doors close
+        ctx.queue_behind_secs = 25.0;
+        s.board(&ctx);
+        assert_eq!(s.leave_at, ctx.day_time);
+        assert_eq!(s.phase, Phase::Boarding);
+        s.boarding = 0.0;
+        s.board(&ctx);
+        assert_eq!(s.phase, Phase::Closing);
+        // with the departure under 30 s away it just waits it out
+        let (mut s, mut ctx) = layover_bus(true, 25.0);
+        ctx.day_time = 275.0;
+        s.board(&ctx);
+        assert_eq!(s.leave_at, 300.0);
+    }
+
+    #[test]
+    fn a_later_stop_is_not_a_roadside_layover() {
+        let (mut s, ctx) = layover_bus(true, 25.0);
+        assert!(s.roadside_layover);
+        let stop = Stop { ri: 0, s: 0.0, bay: 0.0, depart: 500.0, id: 8, side: 0.0 };
+        s.restart(vec![stop], false);
+        s.wait_stops = vec![8];
+        s.arrive(&ctx, 500.0, 8, (0, 0.0));
+        assert!(!s.roadside_layover);
+        s.board(&ctx);
+        // 20 s before its time, as any stop where the timetable holds a bus
+        assert_eq!(s.leave_at, 480.0);
     }
 
     #[test]

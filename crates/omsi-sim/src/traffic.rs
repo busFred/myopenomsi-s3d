@@ -104,10 +104,17 @@ pub struct Lane {
     /// Other `[path]`s of its object this lane blocks while taken (`[blockpath]`), beyond
     /// the places where they cross.
     pub blocks: Vec<u16>,
+    /// `[rule] overtaking_prohib`: the solid line. No lane change of the driver's own out of
+    /// or into this lane, and no passing on the oncoming lane beside it (a timetable route
+    /// still moves over where it must).
+    pub no_overtaking: bool,
 }
 
 /// Priority of a path without a `[rule] priority`.
 pub const DEFAULT_PRIORITY: f32 = 128.0;
+
+/// At most this much between the painted edges of two lanes that are next to each other (m).
+pub const NEIGHBOUR_EDGE_GAP: f32 = 2.0;
 
 /// How much of `unsched_vehgroups.txt` group `pool`'s traffic a path carries: its `[rule]
 /// trafficdensity` for the group (`rules`, see `Lane::group_density`: the last rule of a
@@ -130,6 +137,18 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
 }
 
 impl Lane {
+    /// Are two same-direction paths of one spline next to each other, so that a vehicle
+    /// may change between them? By their edges, not by their middles: ordinary lanes are
+    /// 3 to 4 m apart middle to middle with their painted widths 0.6 to 1.8 m apart at the
+    /// edges, while a cycle lane beyond a green strip lies 5 to 8 m out with 4 m or more of
+    /// strip between the edges (BeijingCity). The strip itself is only drawn, by a spline
+    /// without paths, so the edge gap is the one cue the path data gives.
+    pub fn beside_each_other(a: &Lane, b: &Lane) -> bool {
+        let gap = (b.offset - a.offset).abs();
+        let edge = gap - (a.width.max(2.0) + b.width.max(2.0)) * 0.5;
+        gap > 1.0 && edge <= NEIGHBOUR_EDGE_GAP
+    }
+
     /// May an AI vehicle of `[ai_veh_type]` `veh_type` drive here (Omsi.exe 0x71d714, by
     /// the path's rules): a car (0) where there is no `no_cars`, a taxi (1) also where
     /// `bus` or `trucks` opens a no_cars path, a bus (2) only where `bus` and a truck (3)
@@ -290,7 +309,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new() }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -916,8 +935,7 @@ impl Network {
             list.sort_by(|a, b| self.lanes[*a].offset.total_cmp(&self.lanes[*b].offset));
             for w in list.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                let gap = self.lanes[b].offset - self.lanes[a].offset;
-                if gap > 1.5 && gap < 6.0 {
+                if Lane::beside_each_other(&self.lanes[a], &self.lanes[b]) {
                     // b lies at the larger offset: to the right when driving along the spline
                     if neighbours == 0 {
                         let p = self.lanes[a].start();
@@ -1228,8 +1246,7 @@ impl Network {
             list.sort_by(|a, b| self.lanes[*a].offset.total_cmp(&self.lanes[*b].offset));
             for w in list.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                let gap = self.lanes[b].offset - self.lanes[a].offset;
-                if gap > 1.5 && gap < 6.0 {
+                if Lane::beside_each_other(&self.lanes[a], &self.lanes[b]) {
                     if self.lanes[a].reversed {
                         self.lanes[a].left = Some(b);
                         self.lanes[b].right = Some(a);

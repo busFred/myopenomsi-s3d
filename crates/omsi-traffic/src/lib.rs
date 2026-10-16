@@ -10,6 +10,7 @@
 //! place only, the junction [`reservation`]s. Nothing here renders, loads a vehicle or
 //! touches the GPU, so the whole thing runs headless in the scenario tests.
 
+pub mod access;
 pub mod driver;
 pub mod junction;
 pub mod perception;
@@ -17,8 +18,9 @@ pub mod plan;
 pub mod reservation;
 pub mod sim;
 
+pub use access::{is_open, open_to, Closed};
 pub use driver::{DriverParams, Impatience, VehicleClass};
-pub use junction::{Foe, FoeKind, Junction, Junctions, Movement};
+pub use junction::{Cut, Foe, FoeKind, Junction, Junctions, Movement, PedCrossing};
 pub use perception::{Headway, JunctionView, NeighbourView, Perception, Seen, SignalView};
 pub use plan::{Plan, Start, Why};
 pub use reservation::{Claim, Grant, Hold};

@@ -39,6 +39,10 @@ pub struct Claim {
     /// Standing, held by something of its own (a lead, a full exit): it is not about to
     /// move off, whatever its arrival time says.
     pub held: bool,
+    /// Held at this junction's line by a red light, and the seconds until it shows green
+    /// (None: not within a cycle).
+    pub light_red: bool,
+    pub until_go: Option<f32>,
 }
 
 /// Why a vehicle waits.
@@ -62,6 +66,20 @@ pub struct Grant {
 /// Seconds a vehicle inside the junction keeps as its margin before a foe may follow it
 /// into the meeting place.
 const CLEAR_MARGIN: f32 = 0.6;
+
+/// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
+/// the driver's own figure for a foe that stands or crawls, twice that for one rolling,
+/// and never one at town speed or more.
+fn after_for(foe_speed: f32, squeeze: Option<f32>) -> f32 {
+    let base = squeeze.unwrap_or(f32::INFINITY);
+    if foe_speed < 2.0 {
+        base
+    } else if foe_speed < 8.0 {
+        base * 2.0
+    } else {
+        f32::INFINITY
+    }
+}
 
 /// When the claimant enters and leaves its stretch (from, to) along its lane.
 fn window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
@@ -110,8 +128,19 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 if o.s - o.rear > foe.theirs.1 {
                     continue;
                 }
-                let (their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
+                let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
                 let their_inside = o.s + o.front >= foe.theirs.0;
+                // a foe standing at its red light is not coming before its light goes:
+                // the left-turner on its arrow turns in front of the oncoming queue
+                if o.light_red && o.speed < 0.5 && !their_inside {
+                    match o.until_go {
+                        Some(t) => {
+                            their_in += t;
+                            their_out += t;
+                        }
+                        None => continue,
+                    }
+                }
                 // standing in the meeting place, held by its own lead: it is not leaving
                 // on the schedule its acceleration would give it
                 if their_inside && o.held && o.speed < 0.3 {
@@ -133,7 +162,11 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // junction became fed up and went at once, into each other. The one with the
                 // lower index takes it first, the other waits for it.)
                 let goes_now = o.speed < 1.0 && plain.map(|p| p[ok].go).unwrap_or(false);
-                let take_anyway = squeeze.map(|after| their_in > after && !their_inside && !o.committed && !goes_now && !(o.impatience.claims_after().is_some() && o.vehicle < c.vehicle)).unwrap_or(false);
+                // (never into a stream: a fed-up driver squeezes in front of a foe that is
+                // slow or still well away, not across one doing town speed 35 m off. A
+                // turner facing a green stream waits for it to stop at its red.)
+                let far_enough = their_in > after_for(o.speed, squeeze);
+                let take_anyway = squeeze.is_some() && far_enough && !their_inside && !o.committed && !goes_now && !(o.impatience.claims_after().is_some() && o.vehicle < c.vehicle);
                 if theirs_first && !take_anyway {
                     // the right of way is theirs: I need my gap after they are gone, or
                     // before they come
@@ -186,7 +219,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None }
     }
 
     #[test]
