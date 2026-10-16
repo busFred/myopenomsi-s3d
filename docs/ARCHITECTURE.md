@@ -324,20 +324,26 @@ time, each merge saying which side of a conflict was kept and why. By area:
   smoothed lanes, with Ackermann steering, per-wheel rolling and a body on its springs
   over the blended road surface (`omsi-sim::ai_motion`); trains ride on their outer axles
   and aircraft fly their paths.
-* **AI traffic: rules.** Light programs run on a cycle clock with the stock state codes,
-  stop and jump points and requests; following is IDM with gentle stop-line braking; right
-  of way comes from `[rule]` priority and right-before-left over meeting places, with gap
-  acceptance, patience, junctions kept clear and deadlocks broken. A vehicle standing in
-  the lane (the player's bus, a bus at its stop, a parked car, a LAN player's bus) is
-  passed on the oncoming lane: everyone stops as far behind it as its own steering needs
-  (`pull_out_room`), a pull-out starts only when the body driven along the S-curve with
-  its real lock and steering rate clears the obstacle's corner by 0.25 m
-  (`AiBody::sweep_clearance`), and the oncoming traffic is looked for by time back through
-  the junctions before it (`Network::upstream`). The population is kept out of sight, and
-  runs repeat because the lanes are sorted by map identity. Spandau, the user's scenario,
-  six runs: mean AI speed 21.1 → 25.0 km/h, standing share 28 → 20 %, buses standing over
-  a minute at stops 51 → 12, vehicles stuck elsewhere 6 → 0; standing-bus runs: cars stuck
-  over a minute 31 → 0, braking over 4 m/s² 15 → 0.
+* **AI traffic: rules (`omsi-traffic`).** Light programs run on a cycle clock with the
+  stock state codes, stop and jump points and requests; following is IDM with gentle
+  stop-line braking. Every crossing object is compiled once into a junction with a foe
+  table (`junction.rs`: for each way through it, which other ways are in its way, over
+  which stretch of both lanes, who gives way by `[rule]` priority, right-before-left or a
+  train first). The frame is three pure stages per vehicle: `perception.rs` (the lead and
+  its gap, the next light, the junction and the room past it, the lanes beside, people in
+  the strip ahead, the oncoming lane's clear time via `Network::upstream`), the junction
+  grants (`reservation.rs`, the only cross-vehicle write: claims resolved against the foe
+  table with arrival times and gap acceptance), then `plan.rs` (one lead, one stop point,
+  a lateral target, at most one manoeuvre) and `AiState::drive`. Drivers are
+  `DriverParams` per class with a seeded personality; `Impatience` is the one escape
+  hatch. Lane changes are one desire (route, obstacle, speed gain, keep side) with one gap
+  rule; a pass keeps back enough room, then drives a bent way (`lateral_curve`) out and
+  back, aborting when the oncoming traffic comes. The app (`omsi-app/src/traffic.rs`)
+  keeps the vehicles, bodies, population, bus services and LAN mirror, feeds the frame's
+  inputs (players, people, parked cars, services) and calls `Simulation::tick`. Fifteen
+  headless scenarios with a fixed step and seed (`crates/omsi-traffic/tests`) are the
+  regression gate. The population is kept out of sight, and runs repeat because the lanes
+  are sorted by map identity.
 * **Physics.** Rigid-body vehicles with impulse collisions, wheels on the splines'
   `[heightprofile]` and the surface objects' collision meshes, a tyre envelope that climbs
   kerbs and stops at walls, ride height from each vehicle's own springs, and body-level
