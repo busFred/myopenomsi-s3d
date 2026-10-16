@@ -139,6 +139,11 @@ struct Wheel {
 /// How far over an AI car's wheel its ground is looked for (m): Omsi.exe casts the ray of its
 /// ground query from 3 m over the point (0x7c40c8) and takes the highest face under that.
 pub const AI_RAY_UP: f64 = 3.0;
+/// [ROLLBACK aistepup-1] How far over its lane (m) a face still counts as the ground under
+/// an AI wheel: a kerb, a junction plate or a road drawn up to a metre over its paths (a
+/// map had 0.9 m); not a bridge deck, which passes higher than that wherever a road runs
+/// under it.
+pub const AI_STEP_UP: f64 = 1.0;
 /// A face this far under the wheel's lane is not this wheel's ground (m): the road under the
 /// bridge the lane crosses, or the ground beyond the edge of the road, which the wheel hangs
 /// over on its spring rather than drops onto (the lane stays its height there).
@@ -415,7 +420,7 @@ impl AiBody {
         // per wheel: no face near its lane's height, and the face found deeper down
         let mut hung: Vec<bool> = Vec::with_capacity(self.wheels.len());
         let mut low: Vec<Option<f64>> = Vec::with_capacity(self.wheels.len());
-        for (k, w) in self.wheels.iter().enumerate() {
+        for w in self.wheels.iter() {
             if axle_z[w.axle].is_nan() {
                 axle_z[w.axle] = way(w.long).z;
             }
@@ -434,14 +439,19 @@ impl AiBody {
             // under the drawn road drove through it with only its roof showing.) The ray
             // starts over the wheel's last contact, or over the lane where it has none yet.
             // Without the world's faces, the plain height sampler.
-            let last = self.contact_z[k];
-            let from = if last.is_finite() && (last - path_z).abs() < AI_RAY_UP { last.max(path_z) } else { path_z };
+            // [ROLLBACK aistepup-1] The ray starts `AI_STEP_UP` over the lane, not 3 m over
+            // the wheel's last contact: from 3 m up it met the deck of a bridge wherever
+            // the deck passed less than 3 m over the lower road (its ramps and abutments),
+            // the car was lifted onto the deck and came down again where the deck rose
+            // out of reach (BeijingCity, Andingmennei). A kerb's height over the lane is
+            // still ground (a junction plate drawn a little over its paths); the reach
+            // down stays 3 m (`deeper`).
             let (drawn, deeper) = match contact {
                 Some(c) => {
-                    let below = c.probe(p.x, p.y, from + AI_RAY_UP).below;
+                    let below = c.probe(p.x, p.y, path_z + AI_STEP_UP).below;
                     (below.filter(|g| *g >= path_z - AI_DROP), below.filter(|g| *g < path_z - AI_DROP && *g > path_z - AI_RAY_UP))
                 }
-                None => (ground.and_then(|g| g(p.x, p.y)).filter(|g| (*g - path_z).abs() < AI_RAY_UP), None),
+                None => (ground.and_then(|g| g(p.x, p.y)).filter(|g| *g > path_z - AI_RAY_UP && *g <= path_z + AI_STEP_UP), None),
             };
             low.push(deeper);
             contacts.push((w.lat, w.long, drawn.unwrap_or(path_z)));
@@ -808,7 +818,8 @@ mod tests {
     }
 
     /// Every wheel stands on the face drawn under it, as Omsi.exe's ground query stands an
-    /// AI car's (the highest face under a ray from 3 m over the wheel): a road drawn 8 cm
+    /// AI car's (the highest face under a ray from over the wheel; here from `AI_STEP_UP`
+    /// over the lane, Omsi.exe's 3 m lifted the cars onto bridge decks): a road drawn 8 cm
     /// over the lane and cambered across it carries each wheel at its own height, and a lane
     /// laid 0.9 m under its road has the car on the road, not inside it.
     #[test]
