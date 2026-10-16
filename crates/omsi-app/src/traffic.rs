@@ -5770,6 +5770,19 @@ impl Traffic {
                             && o.wait_at
                                 .map(|w| w - 0.6 <= dj - c.other_before)
                                 .unwrap_or(false));
+                    // [ROLLBACK insidefirst-1] whoever is already in the box on a crossing
+                    // path gets out first: a left-turner standing inside for a gap had stood
+                    // over 4 s, so it "never arrived" and the cross traffic's green drove up
+                    // to it and locked it in. A car not yet inside stops for one that is on
+                    // the crossing lane short of the meeting place (within 18 m), standing or
+                    // not - until it has stood a gridlock's while, when the box is dead anyway.
+                    if is_on && !jn.inside && theirs > 0.3 && theirs < 18.0 && o.stopped < GRIDLOCK_WAIT {
+                        hard = true;
+                        if explain {
+                            why.push(format!("car {} already in the box, {theirs:.1} m short of the crossing of lanes {l}/{m}", o.id));
+                        }
+                        continue;
+                    }
                     // (it arrives in `t_j` seconds)
                     let t_j = crossing_arrival(&o.state, theirs, claimed, waits_short, stalled);
                     if is_on && theirs <= 0.3 {
