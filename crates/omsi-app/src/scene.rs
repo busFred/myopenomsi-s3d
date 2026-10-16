@@ -13361,6 +13361,11 @@ fn spline_lanes(
             (1, false) | (0, true) => push(pts.iter().rev().copied().collect(), true),
             _ => push(pts, false),
         }
+        if p.direction != 2 {
+            if let Some(l) = out.last_mut() {
+                l.one_way = true;
+            }
+        }
     }
     out
 }
@@ -13500,6 +13505,11 @@ fn object_lanes(
                 push(true);
             }
             _ => push(false),
+        }
+        if p.direction != 2 {
+            if let Some(l) = out.last_mut() {
+                l.one_way = true;
+            }
         }
     }
     out

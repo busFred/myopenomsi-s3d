@@ -593,9 +593,14 @@ impl ApplicationHandler for App {
                     if let Some(s) = self.schedule.as_mut().filter(|_| self.args.schedule) {
                         if s.note_clock(t.day_time, dt as f64, self.settings.time_speed) {
                             s.time_jumped(w, t, r, scene, &self.clock);
-                            self.first_populate = true;
-                            self.populate_t = 0.0;
                         }
+                    }
+                    // [ROLLBACK clockjump-traffic-1] ... and the random traffic is filled up as at
+                    // load, with or without a timetable
+                    if t.note_clock(dt as f64, self.settings.time_speed) {
+                        t.clock_jumped();
+                        self.first_populate = true;
+                        self.populate_t = 0.0;
                     }
                     self.populate_t -= dt;
                     if self.populate_t <= 0.0 && !self.paused {

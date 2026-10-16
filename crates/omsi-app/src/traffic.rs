@@ -813,6 +813,15 @@ impl Viewer {
 /// How far from the player cars are kept (m) and how far out of sight one may be before it
 /// is taken off (m); in plain view a car stays until it is too small to see.
 const DESPAWN_FACTOR: f64 = 1.6;
+/// [ROLLBACK jamguard-1] See `Traffic::jammed`.
+const JAM_MIN_CARS: usize = 15;
+const JAM_SHARE: f32 = 0.35;
+/// [ROLLBACK appearfar-1] Further off than this (m) a random car may appear in plain view.
+const APPEAR_IN_VIEW_BEYOND: f64 = 300.0;
+
+fn rel_len(p: DVec3, center: DVec3) -> f64 {
+    (p - center).length()
+}
 
 /// A random car out of the player's range: still on the map and still driving, but without
 /// a body, a script or a picture - a few numbers. It comes back as the same car (type,
@@ -944,10 +953,10 @@ pub struct Traffic {
     /// Pedestrians on the footpaths: (lane, distance along it), for giving way at crossings
     /// and for the pedestrian lights' request buttons.
     pub walkers: Vec<(usize, f32)>,
-    /// Everybody on foot on the ground: position, velocity and whether they are waiting
-    /// at a stop (set every frame) - the cars stop for anybody in their way, not only on
-    /// a crossing.
-    pub people: Vec<(DVec3, DVec2, bool)>,
+    /// Everybody on foot on the ground: position, velocity, whether they are waiting at a
+    /// stop, and for how long they have stood still (set every frame) - the cars stop for
+    /// anybody in their way, not only on a crossing.
+    pub people: Vec<(DVec3, DVec2, bool, f32)>,
     /// No car has been placed yet: the first population may fill the view.
     initial: bool,
     /// Seconds of the last tick (the lamp scripts run in `sync`).
@@ -1028,6 +1037,9 @@ pub struct Traffic {
     count_near: Option<(DVec3, f64)>,
     /// LAN play: where the other players are (host): the traffic is kept around them too.
     pub lan_centers: Vec<DVec3>,
+    /// [ROLLBACK clockjump-traffic-1] The clock as of the last `note_clock` (NaN before the
+    /// first), for telling a time set by hand from the clock running.
+    clock_seen: f64,
 }
 
 /// `[boundingbox]` of a vehicle that gives none.
@@ -1475,6 +1487,25 @@ impl Traffic {
     /// Make the population deterministic for a LAN room.  The room's session id is
     /// shared by the host and every client, so the same map/time produces the same
     /// initial cars instead of each process inventing a different world.
+    /// [ROLLBACK clockjump-traffic-1] Note the clock (`day_time`, set before): true when it
+    /// was set to another time by hand - a step of over 90 s beyond what the time speed makes
+    /// in a frame (as `Schedule::note_clock`).
+    pub fn note_clock(&mut self, dt: f64, speed: f64) -> bool {
+        let jumped = self.clock_seen.is_finite() && (self.day_time - self.clock_seen).abs() > 90.0 + dt.max(0.0) * speed.max(1.0) * 5.0;
+        self.clock_seen = self.day_time;
+        jumped
+    }
+
+    /// [ROLLBACK clockjump-traffic-1] The clock was set to another time: the next population
+    /// pass fills the roads up as at load, cars appearing anywhere - the density of the new
+    /// hour came at once, but the cars only where nobody saw them appear, and a jump from the
+    /// early morning into the rush hour left the streets empty for minutes.
+    pub fn clock_jumped(&mut self) {
+        if !self.mirror {
+            self.initial = true;
+        }
+    }
+
     pub fn set_lan_seed(&mut self, seed: u64) {
         self.rng = seed | 1;
     }
@@ -1819,6 +1850,7 @@ impl Traffic {
             mirror: false,
             count_near: None,
             lan_centers: Vec::new(),
+            clock_seen: f64::NAN,
         };
         t.sort_parked(parked_cars, lanes);
         Ok(t)
@@ -2785,24 +2817,59 @@ impl Traffic {
             })
             .count();
         let mut count = unscheduled;
+        // [ROLLBACK jamguard-1] nothing into a jam (see `jammed`)
+        if kind == LaneKind::Street && !self.initial && self.jammed(center) {
+            if self.debug_population {
+                log::info!("population t={:.1}: the road is jammed, no car put down ({} in range)", self.time, unscheduled);
+            }
+            return;
+        }
         while count < target && attempts < target * 12 {
             attempts += 1;
             let x = self.rand_f() as f32 * total_w;
             let lane = candidates[cumulative.partition_point(|&c| c < x).min(candidates.len() - 1)].0;
-            let s = (self.rand_f() * (self.net.lanes[lane].length() as f64 - 6.0)) as f32 + 3.0;
-            let (p, _) = self.net.lanes[lane].at(s);
+            let mut s = (self.rand_f() * (self.net.lanes[lane].length() as f64 - 6.0)) as f32 + 3.0;
+            let (mut p, _) = self.net.lanes[lane].at(s);
+            // nobody may see it appear (the first population is the world as it loads) -
+            // [ROLLBACK source-1] except near the start of a lane that nothing leads into: a
+            // road the map begins out of nothing is where its cars come from, in OMSI in
+            // plain view, and a map whose boulevard is a short stub in sight of the player
+            // (BeijingCity) had no traffic on it at all until something drove in from the
+            // side streets
+            // [ROLLBACK appearfar-1] and beyond APPEAR_IN_VIEW_BEYOND in plain view: within
+            // 350 m a car may appear only behind a building, and at a wide junction with the
+            // view down the road nine attempts in ten found no such place (BeijingCity,
+            // Ditan: 5 500 of 6 000 a pass; 70-100 cars about the player against a target of
+            // 490; 200-260 with this, as measured headless with the player's view settings).
+            // OMSI puts its cars down anywhere, at any distance.
+            if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
+                let source = self.net.prev.get(lane).is_some_and(|q| q.is_empty());
+                let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(rel_len(p, center));
+                if !source && from_eye <= APPEAR_IN_VIEW_BEYOND {
+                    continue;
+                }
+                if source {
+                    s = s.min(30.0);
+                    p = self.net.lanes[lane].at(s).0;
+                }
+            }
             let rel = p - center;
             if rel.length() < 40.0 {
                 continue; // not right next to the player
-            }
-            // nobody may see it appear (the first population is the world as it loads)
-            if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
-                continue;
             }
             if self
                 .cars
                 .iter()
                 .any(|c| (c.vehicle.position - p).length() < 14.0)
+            {
+                continue;
+            }
+            // [ROLLBACK jamguard-1] nor behind a car standing on this lane within 60 m
+            // ahead: a car put down behind a queue only lengthens it
+            if kind == LaneKind::Street
+                && self.cars.iter().any(|c| {
+                    c.state.lane == lane && c.state.s > s && c.state.s - s < 60.0 && c.stopped > 3.0
+                })
             {
                 continue;
             }
@@ -2924,8 +2991,28 @@ impl Traffic {
 
     /// The cars out of range that have come near again take their bodies back - where
     /// nobody sees it happen, up to a little over the number asked for around the player.
+    /// [ROLLBACK jamguard-1] The traffic about `center` is jammed: of the random cars within
+    /// the spawn radius (at least `JAM_MIN_CARS` of them), more than `JAM_SHARE` have stood
+    /// for five seconds. No new car is put down then, and none woken - every one put into a
+    /// jam only lengthens it, and the spawner filled a boulevard bumper to bumper in every
+    /// lane until the junctions locked (BeijingCity, a target of 490 cars).
+    fn jammed(&self, center: DVec3) -> bool {
+        let r = self.spawn_radius;
+        let (mut standing, mut all) = (0usize, 0usize);
+        for c in &self.cars {
+            if c.is_bus() || c.gone || c.at_stop() || (c.vehicle.position - center).length() > r {
+                continue;
+            }
+            all += 1;
+            if c.stopped > 5.0 {
+                standing += 1;
+            }
+        }
+        all >= JAM_MIN_CARS && standing as f32 > JAM_SHARE * all as f32
+    }
+
     fn wake_dormant(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, target: usize) {
-        if self.dormant.is_empty() {
+        if self.dormant.is_empty() || self.jammed(center) {
             return;
         }
         let active = self.cars.iter().filter(|c| !c.is_bus() && !c.gone).count();
@@ -5257,10 +5344,10 @@ impl Traffic {
         // as far as the car needs to stop without a jolt, and never less than a car length
         let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
         let origin = car.vehicle.position.truncate();
-        let near: Vec<&(DVec3, DVec2, bool)> = self
+        let near: Vec<&(DVec3, DVec2, bool, f32)> = self
             .people
             .iter()
-            .filter(|(p, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
+            .filter(|(p, _, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
             .collect();
         if near.is_empty() {
             return None;
@@ -5285,7 +5372,7 @@ impl Traffic {
                 let c = q.truncate() + right * lat;
                 // when the car's front gets here, at most two seconds on
                 let t = (((d - st.front).max(0.0)) / v.max(1.0)).min(2.0) as f64;
-                for (p, pv, waiting) in &near {
+                for (p, pv, waiting, still) in &near {
                     // on the same level only: somebody on a footbridge over the road, in a
                     // subway under it or on a platform above it is in nobody's way here (a
                     // car would stand in front of nothing anybody could see)
@@ -5297,6 +5384,12 @@ impl Traffic {
                     } else {
                         car.half_width as f64 + 0.3
                     };
+                    // [ROLLBACK pedhold-1] somebody who has stood still at the edge of the
+                    // strip for seconds while the car stands does not hold it: three people
+                    // at a kerb line held a car, which held them (its body in their way)
+                    if v < 0.3 && *still > 3.0 && (p.truncate() - c).dot(right).abs() > half - 0.9 {
+                        continue;
+                    }
                     for at in [p.truncate(), p.truncate() + *pv * t] {
                         let rel = at - c;
                         if rel.dot(fwd).abs() <= 0.55 && rel.dot(right).abs() < half {
@@ -5329,7 +5422,20 @@ impl Traffic {
                 break;
             }
             if self.net.lanes[p].traffic_light.is_some() {
-                return None;
+                // [ROLLBACK leftarrow-1] ... unless the way between the two lights runs
+                // straight on: a left-turn lane's lead-in line and its arrow line 15 m
+                // further (BeijingCity, lights "Ld" and "L" of one object) are two stop
+                // lines of one approach, and the second held nobody. A light met after a
+                // turn (over 45 degrees) is the cross traffic's, as before.
+                let turned = {
+                    let a = self.net.lanes[p].start_heading() as f64;
+                    let b = self.net.lanes[l].start_heading() as f64;
+                    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() > 45.0
+                };
+                if turned {
+                    return None;
+                }
+                break;
             }
         }
         Some(light)
@@ -5391,10 +5497,20 @@ impl Traffic {
                     }
                 }
                 Some(jn) => {
+                    // [ROLLBACK junctionexit-1] the exit, where the car must find room before
+                    // it goes in, is the first lane after the conflict - not the first lane of
+                    // another object: a crossing object that reaches 100-200 m past its box
+                    // (BeijingCity) had its "exit" far up the road, empty, while the paths just
+                    // past the box stood full, and the cars went in and stood in the box
+                    if jn.exit.is_none() && !has(l) {
+                        jn.exit = Some((l, d));
+                    }
                     if object(l).is_some() && object(l) == object(jn.lanes[0].0) {
                         jn.lanes.push((l, d));
                     } else {
-                        jn.exit = Some((l, d));
+                        if jn.exit.is_none() {
+                            jn.exit = Some((l, d));
+                        }
                         break;
                     }
                 }
@@ -5413,6 +5529,16 @@ impl Traffic {
         let v = st.speed;
         let mut stop = None;
         let mut amber = car.amber;
+        // [ROLLBACK amber-1] a car that has stood for two seconds loses its "goes whatever
+        // comes next": the mark was set within three metres of the line on green and kept
+        // while the car stood behind another through the red, and when the queue moved it
+        // drove over the line into a plain red (BeijingCity: nine of twelve red entries in
+        // ten minutes). Not at any stand: the car at the line that a one-second green sets
+        // off is still under 0.1 m/s when the red comes, and cleared then it never went -
+        // nobody got through those lights (13 cars in ten minutes against 318).
+        if car.stopped > 2.0 {
+            amber = None;
+        }
         // [ROLLBACK lights-130] standing in a queue (a car close ahead, itself hardly moving):
         // the "at the line on green, goes whatever comes next" and the yellow decision are
         // for the car that is first at the line - the queue's cars that stood within three
@@ -5776,13 +5902,24 @@ impl Traffic {
         let mut exit_full = false;
         if !jn.inside {
             if let Some((e, de)) = jn.exit {
-                let room = on_lane
-                    .get(&e)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
+                let cars = &self.cars;
+                // [ROLLBACK junctionexit-1] the room is measured along the way from the exit
+                // on, over the lanes within 40 m of it (the exit lane alone was looked at: a
+                // short piece of path, empty, with the queue standing on the piece after it)
+                let room = way
                     .iter()
-                    .filter(|x| !x.3 && x.0 != i)
-                    .map(|&(j, sj, _, _)| (sj - self.cars[j].state.rear, self.cars[j].state.speed))
+                    .skip_while(|&&(l, _)| l != e)
+                    .take_while(|&&(_, dl)| dl - de < 40.0)
+                    .flat_map(|&(l, dl)| {
+                        on_lane
+                            .get(&l)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(move |x| !x.3 && x.0 != i)
+                            .map(move |&(j, sj, _, _)| ((dl - de) + sj - cars[j].state.rear, cars[j].state.speed))
+                    })
+                    .filter(|&(space, _)| space > -st.length)
                     .fold(None::<(f32, f32)>, |acc, x| {
                         if acc.map(|a| x.0 < a.0).unwrap_or(true) {
                             Some(x)
