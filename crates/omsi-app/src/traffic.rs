@@ -5420,7 +5420,20 @@ impl Traffic {
                 break;
             }
             if self.net.lanes[p].traffic_light.is_some() {
-                return None;
+                // [ROLLBACK leftarrow-1] ... unless the way between the two lights runs
+                // straight on: a left-turn lane's lead-in line and its arrow line 15 m
+                // further (BeijingCity, lights "Ld" and "L" of one object) are two stop
+                // lines of one approach, and the second held nobody. A light met after a
+                // turn (over 45 degrees) is the cross traffic's, as before.
+                let turned = {
+                    let a = self.net.lanes[p].start_heading() as f64;
+                    let b = self.net.lanes[l].start_heading() as f64;
+                    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() > 45.0
+                };
+                if turned {
+                    return None;
+                }
+                break;
             }
         }
         Some(light)
