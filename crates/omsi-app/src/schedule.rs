@@ -929,7 +929,7 @@ impl Schedule {
         traffic
             .cars
             .iter()
-            .position(|c| c.is_bus() && !c.gone && self.car_departure.get(&c.id) == Some(&k))
+            .position(|c| c.is_bus() && !c.ai.gone && self.car_departure.get(&c.id) == Some(&k))
     }
 
     /// The timetable buses at the end of their trip: each takes its tour's next trip on
@@ -2128,7 +2128,7 @@ impl Schedule {
             let Some(ci) = traffic.cars.iter().position(|c| c.id == run.car) else {
                 continue;
             };
-            let last = traffic.cars[ci].state.route.last().copied();
+            let last = traffic.cars[ci].ai.state.route.last().copied();
             Self::add_twins(traffic, &run.steps[run.next.saturating_sub(1)..]);
             let slots = self.slots(world, traffic, &run.steps[run.next..], last);
             let n = slots
@@ -2158,7 +2158,7 @@ impl Schedule {
                 }
             };
             if !lanes.is_empty() {
-                let base = traffic.cars[ci].state.route.len();
+                let base = traffic.cars[ci].ai.state.route.len();
                 let mut stops = Vec::new();
                 let mut from = 0;
                 for (si, (sid, t_dep)) in run.stations.iter().enumerate() {
@@ -2186,13 +2186,13 @@ impl Schedule {
                     stops.len()
                 );
                 let car = &mut traffic.cars[ci];
-                car.state.route.extend(lanes);
+                car.ai.state.route.extend(lanes);
                 if let Some(b) = car.bus.as_mut() {
                     b.stops.extend(stops.into_iter().map(crate::bus_service::Stop::from_tuple));
                 }
                 // (it may have stood waiting at the end of what it had)
-                car.state.planned_next = None;
-                car.state.plan_next(&traffic.net);
+                car.ai.state.planned_next = None;
+                car.ai.state.plan_next(&traffic.net);
             }
             run.next += n;
             if run.next < run.steps.len() {
@@ -2400,8 +2400,8 @@ impl Schedule {
                     }
                     _ => {
                         if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
-                            log::info!("trip {trip_name}: train {} would turn round, but its last car at ({:.1}, {:.1}) is not on the trip's way (nearest {:?}); its front at ({:.1}, {:.1}) on lane {}", c.id, tail.x, tail.y, found.map(|f| (f.0, f.1, f.2, f.3)), c.vehicle.position.x, c.vehicle.position.y, c.state.lane);
-                            for &l in section.iter().take(4).chain(std::iter::once(&c.state.lane)) {
+                            log::info!("trip {trip_name}: train {} would turn round, but its last car at ({:.1}, {:.1}) is not on the trip's way (nearest {:?}); its front at ({:.1}, {:.1}) on lane {}", c.id, tail.x, tail.y, found.map(|f| (f.0, f.1, f.2, f.3)), c.vehicle.position.x, c.vehicle.position.y, c.ai.state.lane);
+                            for &l in section.iter().take(4).chain(std::iter::once(&c.ai.state.lane)) {
                                 let ln = &net.lanes[l];
                                 log::info!("  lane {l} {:?} len {:.1} ({:.1}, {:.1}) -> ({:.1}, {:.1}) next {:?} rev {}", ln.key, ln.length(), ln.start().x, ln.start().y, ln.end().x, ln.end().y, ln.next, ln.reversed);
                             }
@@ -2414,7 +2414,7 @@ impl Schedule {
             // the tour's bus that has just finished its trip takes this one on from where
             // it stands: the section itself when it stands on it, else the shortest way
             // from its lane onto one of the section's first lanes (round a terminal loop)
-            let (lane0, s0) = (traffic.cars[ci].state.lane, traffic.cars[ci].state.s);
+            let (lane0, s0) = (traffic.cars[ci].ai.state.lane, traffic.cars[ci].ai.state.s);
             let net = &traffic.net;
             let (prefix, from) = match tour_entry(&section, lane0) {
                 Some(r) => (Vec::new(), r),
@@ -2597,7 +2597,7 @@ impl Schedule {
             && traffic
             .cars
             .iter()
-            .any(|c| c.is_bus() && !c.gone && (c.vehicle.position - at_pos).length() < 50.0)
+            .any(|c| c.is_bus() && !c.ai.gone && (c.vehicle.position - at_pos).length() < 50.0)
         {
             log::debug!(
                 "trip {trip_name}: its stand is taken, the bus comes at its departure time"
@@ -2657,8 +2657,8 @@ impl Schedule {
         }
         if train.is_some() {
             log::info!("train: {}", std::iter::once(traffic.cars[ci].vehicle.ty.def.path.file_stem().unwrap_or_default().to_string_lossy().to_string()).chain(traffic.cars[ci].vehicle.trailers.iter().map(|t| format!("{}{}", t.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), if t.reversed { " (turned)" } else { "" }))).collect::<Vec<_>>().join(" + "));
-            traffic.cars[ci].state.max_speed_kmh = 90.0;
-            traffic.cars[ci].state.length = 20.0 * (1 + traffic.cars[ci].vehicle.trailers.len()) as f32;
+            traffic.cars[ci].ai.state.max_speed_kmh = 90.0;
+            traffic.cars[ci].ai.state.length = 20.0 * (1 + traffic.cars[ci].vehicle.trailers.len()) as f32;
         }
         let names = self.trip_stop_names(self.departures[i].trip);
         let names: Vec<&str> = names.iter().map(String::as_str).collect();

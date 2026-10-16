@@ -81,7 +81,7 @@ fn kind_person(id: u32) -> bool {
 /// for a long ride, much more for an elderly one, a little for a child less; fewer seats left
 /// make the short rider stand, an empty bus makes even them sit; `bias` (the setting) scales
 /// the odds.
-fn sit_wish(ride_min: f32, age: f32, free_seats: usize, seats: usize, bias: f32) -> f32 {
+pub(crate) fn sit_wish(ride_min: f32, age: f32, free_seats: usize, seats: usize, bias: f32) -> f32 {
     let long = longness(ride_min);
     let free = if seats == 0 {
         0.0
@@ -286,7 +286,7 @@ fn party_places(
 }
 
 /// One of `list` by the weights `w`; `r` in 0..1.
-fn pick_weighted(list: &[usize], w: &[f32], r: f64) -> usize {
+pub(crate) fn pick_weighted(list: &[usize], w: &[f32], r: f64) -> usize {
     let sum: f32 = w.iter().sum();
     let mut t = r as f32 * sum;
     for (k, wk) in list.iter().zip(w) {

@@ -68,12 +68,27 @@ fn window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
 }
 
 /// Decide every claim. Claims of different junctions do not interact.
+///
+/// Two passes when somebody is fed up: the first with the rules only, the second lets the
+/// fed-up drivers squeeze in, but not in front of a foe the first pass lets go and that
+/// stands at its line (it moves off this very frame: equally far from the meeting place,
+/// the two would arrive together).
 pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
+    let plain = decide(js, net, claims, None);
+    if claims.iter().all(|c| c.impatience.claims_after().is_none()) {
+        return plain;
+    }
+    decide(js, net, claims, Some(&plain))
+}
+
+/// One pass over the claims; `plain` is the first pass's answer when fed-up drivers may
+/// squeeze in.
+fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant]>) -> Vec<Grant> {
     let mut out: Vec<Grant> = Vec::with_capacity(claims.len());
     for c in claims {
         let node = &js.nodes[c.junction];
         let me = &node.movements[c.movement];
-        let squeeze = c.impatience.claims_after();
+        let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         if c.committed || c.absolute {
             out.push(Grant { vehicle: c.vehicle, go: true, wait_for: None, hold: None });
             continue;
@@ -87,7 +102,7 @@ pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
-            for o in claims.iter().filter(|o| o.junction == c.junction && o.movement == foe.movement && o.vehicle != c.vehicle) {
+            for (ok, o) in claims.iter().enumerate().filter(|(_, o)| o.junction == c.junction && o.movement == foe.movement && o.vehicle != c.vehicle) {
                 // a foe that has left the meeting place
                 if o.s - o.rear > foe.theirs.1 {
                     continue;
@@ -106,7 +121,11 @@ pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
                 let theirs_first = o.absolute
                     || (foe.yields && !c.absolute)
                     || (!foe.yields && !node.movements[foe.movement].foes.iter().any(|f| f.movement == c.movement && f.yields) && their_in < my_in);
-                let take_anyway = squeeze.map(|after| their_in > after && !their_inside && !o.committed).unwrap_or(false);
+                // (two fed-up drivers must not squeeze in on each other: all four at an equal
+                // junction became fed up and went at once, into each other. The one with the
+                // lower index takes it first, the other waits for it.)
+                let goes_now = o.speed < 1.0 && plain.map(|p| p[ok].go).unwrap_or(false);
+                let take_anyway = squeeze.map(|after| their_in > after && !their_inside && !o.committed && !goes_now && !(o.impatience.claims_after().is_some() && o.vehicle < c.vehicle)).unwrap_or(false);
                 if theirs_first && !take_anyway {
                     // the right of way is theirs: I need my gap after they are gone, or
                     // before they come

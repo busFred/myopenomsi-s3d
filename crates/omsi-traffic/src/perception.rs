@@ -468,7 +468,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle) -> Option<f32> {
                     if !p.on_crossing && v < 0.3 && p.still > 3.0 && (across as f32) > half - 0.9 {
                         continue;
                     }
-                    let stop = d - 1.5;
+                    // (the probe steps 1 m, so `d` alone made the stop point jump 1 m nearer
+                    // every metre the car drove: the last jump came at walking pace, inside the
+                    // stopping margin, and the model slammed on at 8 m/s². `along` is where
+                    // the person really is relative to the probe, which makes the stop smooth.)
+                    let stop = d + along as f32 - 1.5;
                     if best.map(|b| stop < b).unwrap_or(true) {
                         best = Some(stop);
                     }

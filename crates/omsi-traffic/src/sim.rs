@@ -466,8 +466,13 @@ impl Simulation {
             if !j.inside && j.entry - st.front > decide {
                 continue;
             }
-            let cannot_stop = st.speed > 1.0 && (j.entry - st.front) < st.speed * st.speed / (2.0 * st.decel * 1.5);
-            let committed = j.inside || cannot_stop || (v.last.hold.is_none() && v.last.why == Why::Junction && false);
+            // committed: inside, or too close to the line to stop before it even braking
+            // hard (a driver who can still stop, if not comfortably, gives way as the
+            // rules say: two cars arriving together at an unmarked junction both took
+            // themselves for committed and met in the middle)
+            let room = j.entry - st.front - 0.6;
+            let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            let committed = j.inside || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
@@ -566,7 +571,14 @@ impl Simulation {
             v.progress.1 += dt;
         }
         let held = standing && plan.held;
-        v.impatience.update(&v.params, dt, held);
+        // A driver who is let go but has hardly rolled yet (the start reaction takes a moment,
+        // then the car creeps off) keeps the impatience that earned the go. It used to cool
+        // the moment the hold lifted for a frame, which took the squeeze away again before
+        // the car was committed, so four cars at an equal junction held each other for
+        // ever, each in turn fed up for one frame (and then creeping and stopping again).
+        if !(v.state.speed < 2.0 && !plan.held) {
+            v.impatience.update(&v.params, dt, held);
+        }
         if v.stopped > 2.0 {
             v.amber = false;
         }

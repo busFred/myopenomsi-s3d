@@ -883,10 +883,10 @@ pub(crate) fn marks(
                 if (pos - cam.position).length() > 160.0 {
                     continue;
                 }
-                let held = c.held || c.light_hold || c.yielding;
+                let held = c.ai.last.held;
                 if view.aicars {
                     // the lanes ahead: this one from where it is, then the ones chosen
-                    let st = &c.state;
+                    let st = &c.ai.state;
                     let mut lanes = vec![st.lane];
                     if st.route.is_empty() {
                         lanes.extend(st.planned_next);
@@ -932,118 +932,72 @@ pub(crate) fn marks(
                     }
                     // what it sees ahead: the nearest constraint, as far as it reports it
                     let front = o.center + f * o.half.y;
-                    if !c.why.0.is_empty() {
-                        let end = front + f * (c.why.1.clamp(0.0, 60.0) as f64);
+                    let last = &c.ai.last;
+                    let why_dist = last.stop.map(|s| s - c.ai.state.front).or(last.lead.map(|l| l.gap));
+                    if let Some(d) = why_dist.filter(|_| last.why != omsi_traffic::Why::None) {
+                        let end = front + f * (d.clamp(0.0, 60.0) as f64);
                         let (a, b) = (DVec3::new(front.x, front.y, z), DVec3::new(end.x, end.y, z));
                         line(&mut out, a, b, [255, 230, 60, 255], 2.2);
-                        label_at(&mut out, b, [255, 230, 60, 255], 4.0, format!("{} {:.1} m", c.why.0, c.why.1));
+                        label_at(&mut out, b, [255, 230, 60, 255], 4.0, format!("{} {:.1} m", last.why.name(), d));
                     }
-                    if let Some((id, gap)) = c.lead_info {
-                        if let Some(q) = by_id.get(&id) {
+                    let id_of = |j: usize| t.cars.get(j).map(|o| o.id);
+                    if let (Some(j), Some(l)) = (c.ai.lead_car, last.lead) {
+                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
                             line(&mut out, pos + lift, *q + lift, [60, 160, 255, 255], 1.6);
-                            label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{id}, gap {gap:.1} m"));
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{}, gap {:.1} m", id_of(j).unwrap_or(0), l.gap));
                         }
                     }
-                    if let Some(id) = c.geo_block {
-                        if let Some(q) = by_id.get(&id) {
+                    if let Some(j) = last.body_block {
+                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
                             line(&mut out, pos + lift, *q + lift, [255, 60, 255, 255], 1.8);
-                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 60, 255, 255], 3.0, format!("body of #{id} in the way"));
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 60, 255, 255], 3.0, format!("body of #{} in the way", id_of(j).unwrap_or(0)));
                         }
                     }
-                    if let Some(id) = c.squeeze {
-                        if let Some(q) = by_id.get(&id) {
+                    if let Some(j) = last.wait_for {
+                        if let Some(q) = id_of(j).and_then(|id| by_id.get(&id)) {
                             line(&mut out, pos + lift, *q + lift, [255, 170, 40, 255], 1.6);
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 170, 40, 255], 3.0, format!("waits for #{}", id_of(j).unwrap_or(0)));
                         }
                     }
                     let mut flags: Vec<String> = Vec::new();
-                    if c.held {
+                    if last.held {
                         flags.push("held".into());
                     }
-                    if c.light_hold {
+                    if last.why == omsi_traffic::Why::Light {
                         flags.push("red light".into());
                     }
-                    if c.yielding {
+                    if last.why == omsi_traffic::Why::Junction {
                         flags.push("yielding".into());
                     }
-                    if c.stopped > 2.0 {
-                        flags.push(format!("stopped {:.0} s", c.stopped));
+                    if last.why == omsi_traffic::Why::ExitFull {
+                        flags.push("junction exit full".into());
                     }
-                    if let Some(h) = &c.holding {
-                        flags.push(h.clone());
+                    if c.ai.stopped > 2.0 {
+                        flags.push(format!("stopped {:.0} s", c.ai.stopped));
+                    }
+                    if c.ai.impatience.value > 0.05 {
+                        flags.push(format!("impatience {:.2}", c.ai.impatience.value));
+                    }
+                    if let Some(p) = c.ai.passing {
+                        flags.push(if p.aborted { "pass aborted".into() } else if p.lane.is_some() { "passing on the oncoming lane".into() } else { "squeezing past".into() });
+                    }
+                    if c.ai.state.change.is_some() {
+                        flags.push("changing lane".into());
                     }
                     if !flags.is_empty() {
                         label_at(&mut out, pos + DVec3::new(0.0, 0.0, 1.6), body, 3.0, format!("#{}: {}", c.id, flags.join(", ")));
                     }
-                    // [ROLLBACK avoiddbg-102] how the car goes round what stands in its way: which
-                    // fallback it uses (correction within the lane, or the overtake on the
-                    // oncoming lane), why the other did not start, the way it tried and the
-                    // ground it probed (green fine, red kerb, yellow drop, magenta no asphalt)
-                    let passing = c.passing.map(|p| !p.aborted).unwrap_or(false);
-                    if passing
-                        || c.squeeze_p.is_some()
-                        || c.stopped > 1.0
-                        || !c.avoid.cands.is_empty()
-                    {
-                        let (mode, rgba) = if passing {
-                            ("FALLBACK: OVERTAKE (oncoming lane)", [255, 150, 60, 255])
-                        } else if c.squeeze_p.is_some() {
-                            ("FALLBACK: CORRECTION (in the lane)", [90, 255, 120, 255])
-                        } else {
-                            ("FALLBACK: none yet", [255, 90, 90, 255])
-                        };
-                        let av = &c.avoid;
-                        // [ROLLBACK corridor-104] the correction's text in lines of 70 characters ([ROLLBACK deform-105]: the bend of the way)
-                        let (head, rest) = match av.squeeze.split_once("scanned") {
-                            Some((a, b)) => (
-                                a.trim_end_matches(|c| c == ' ' || c == ';').to_string(),
-                                format!("scanned{b}"),
-                            ),
-                            None => (av.squeeze.clone(), String::new()),
-                        };
-                        let mut lines = vec![
-                            mode.to_string(),
-                            format!("vehicle on the lane: {:.0} % of its width", av.frac * 100.0),
-                            format!("correction: {head}"),
-                        ];
-                        let mut row = String::new();
-                        for word in rest.split(' ') {
-                            if row.len() + word.len() > 70 && !row.is_empty() {
-                                lines.push(format!("  {row}"));
-                                row.clear();
-                            }
-                            if !row.is_empty() {
-                                row.push(' ');
-                            }
-                            row.push_str(word);
-                        }
-                        if !row.is_empty() {
-                            lines.push(format!("  {row}"));
-                        }
-                        lines.push(format!("overtake: {}", av.pass));
-                        stack(&mut out, pos + DVec3::new(0.0, 0.0, 3.6), rgba, &lines);
-                        // every sideways move it tried: the one chosen thick and bright green,
-                        // the others possible pale green, the vehicle in the way grey, bad ground
-                        // red, traffic orange
-                        for (verdict, pts) in &av.cands {
-                            let (col, width) = match verdict {
-                                0 => ([60, 255, 90, 255], 3.2),
-                                1 => ([150, 230, 160, 200], 1.2),
-                                2 => ([150, 150, 150, 150], 1.0),
-                                3 => ([255, 60, 60, 200], 1.2),
-                                _ => ([255, 160, 40, 220], 1.2),
-                            };
-                            for w in pts.windows(2) {
-                                line(&mut out, w[0] + lift, w[1] + lift, col, width);
-                            }
-                        }
-                        for (q, code) in &av.marks {
-                            let verdicts = [
-                                [90, 255, 120, 255],
-                                [255, 60, 60, 255],
-                                [255, 230, 60, 255],
-                                [255, 60, 255, 255],
-                            ];
-                            dot(&mut out, *q, verdicts[(*code as usize).min(3)], 3.0);
+                    // a pass in progress: the bent way the car drives, as the planner laid it out
+                    if let Some(p) = c.ai.passing {
+                        let st = &c.ai.state;
+                        let rgba = if p.aborted { [255, 90, 90, 255] } else { [255, 150, 60, 255] };
+                        let mut prev = st.way_point(&t.net, 0.0) + lift;
+                        let mut d = 2.0f32;
+                        while d < (p.until + p.back_len - st.odometer).max(0.0) + 4.0 && d < 120.0 {
+                            let q = st.way_point(&t.net, d) + lift;
+                            line(&mut out, prev, q, rgba, 2.4);
+                            prev = q;
+                            d += 2.0;
                         }
                     }
                 }

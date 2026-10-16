@@ -663,7 +663,7 @@ impl LanWorld {
                         descs.push(d);
                     }
                     let q = quant(p.x, p.y, p.z, c.vehicle.heading);
-                    let speed = c.state.speed;
+                    let speed = c.ai.state.speed;
                     let due = match view.sent.get(&key) {
                         None => true,
                         Some((last, age)) => {
@@ -684,8 +684,8 @@ impl LanWorld {
                         bank: c.vehicle.bank as f32,
                         speed,
                         steer: c.body.steer,
-                        blinker: c.state.blinker.clamp(0, 3) as u8,
-                        brake: c.state.braking,
+                        blinker: c.ai.state.blinker.clamp(0, 3) as u8,
+                        brake: c.ai.state.braking,
                         lights: t.night,
                         at_station: if c.at_station() {
                             1
@@ -1173,9 +1173,9 @@ impl LanWorld {
                 car.vehicle.heading = c.heading as f64;
                 car.vehicle.pitch = c.pitch;
                 car.vehicle.bank = c.bank;
-                car.state.speed = c.speed;
-                car.state.blinker = c.blinker as i32;
-                car.state.braking = c.brake;
+                car.ai.state.speed = c.speed;
+                car.ai.state.blinker = c.blinker as i32;
+                car.ai.state.braking = c.brake;
                 if let Some(b) = car.bus.as_mut() {
                     b.phase = if c.at_station == 1 {
                         crate::bus_service::Phase::Boarding

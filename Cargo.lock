@@ -3235,6 +3235,7 @@ dependencies = [
  "omsi-sim",
  "omsi-texture",
  "omsi-timetable",
+ "omsi-traffic",
  "omsi-ui",
  "omsi-vehicle",
  "openxr",

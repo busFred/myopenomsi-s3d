@@ -1305,7 +1305,7 @@ pub(crate) fn run_offscreen(
             .count();
         // a car that is stopped where nothing is holding it, or one sitting inside another,
         // is a traffic bug: report both so they can be counted rather than guessed at
-        let stuck = t.cars.iter().filter(|c| c.stopped > 60.0).count();
+        let stuck = t.cars.iter().filter(|c| c.ai.stopped > 60.0).count();
         let mut overlapping = 0;
         for (i, a) in t.cars.iter().enumerate() {
             for b in t.cars.iter().skip(i + 1) {
@@ -1334,26 +1334,26 @@ pub(crate) fn run_offscreen(
                 "traffic health: {stuck} stuck for over a minute, {overlapping} pairs overlapping"
             );
             if omsi_cfg::env::var_os("OMSI_DEBUG_STUCK").is_some() {
-                for c in t.cars.iter().filter(|c| c.stopped > 30.0) {
-                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.stopped, c.id, c.vehicle.ty.def.type_name, c.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.lead_car, c.why.0, c.why.1, c.junction_why);
+                for c in t.cars.iter().filter(|c| c.ai.stopped > 30.0) {
+                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.ai.stopped, c.id, c.vehicle.ty.def.type_name, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.ai.lead_car.and_then(|j| t.cars.get(j)).map(|o| o.id).unwrap_or(0), c.ai.last.why.name(), c.ai.last.stop.unwrap_or(0.0), c.ai.last.wait_for.and_then(|j| t.cars.get(j)).map(|o| o.id).unwrap_or(0));
                 }
             }
-            for c in t.cars.iter().filter(|c| c.stopped > 60.0).take(4) {
+            for c in t.cars.iter().filter(|c| c.ai.stopped > 60.0).take(4) {
                 log::info!(
                     "  stuck {:.0} s at ({:.0}, {:.0}) on lane {} of {} ({}): {}",
-                    c.stopped,
+                    c.ai.stopped,
                     c.vehicle.position.x,
                     c.vehicle.position.y,
-                    c.state.lane,
+                    c.ai.state.lane,
                     t.net.lanes.len(),
                     c.vehicle.ty.def.type_name,
-                    c.holding.as_deref().unwrap_or("-")
+                    c.ai.last.why.name()
                 );
             }
         }
-        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.held_at_red, t.cars.iter().map(|c| c.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
+        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
         for c in t.cars.iter().filter(|c| c.is_bus()) {
-            log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
+            log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
             if omsi_cfg::env::var_os("OMSI_DEBUG_PROPS").is_some() {
                 for v in [
                     "Matrix_Nr",
@@ -1378,7 +1378,7 @@ pub(crate) fn run_offscreen(
                     c.vehicle.host.fonts.entries.len()
                 );
             }
-            let st = &c.state;
+            let st = &c.ai.state;
             let lane = &t.net.lanes[st.lane];
             log::info!("  lane {} (key {:?} len {:.1}) s={:.1} route_index {} of {} planned_next {:?} next stop {:?} light {:?}", st.lane, lane.key, lane.length(), st.s, st.route_index, st.route.len(), st.planned_next, c.next_stop(), st.planned_next.and_then(|n| t.net.lanes[n].traffic_light));
         }

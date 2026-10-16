@@ -3870,7 +3870,7 @@ impl Humans {
                 let Some(cabin) = self.cabin_for(&c.vehicle) else {
                     continue;
                 };
-                let speed = c.state.speed as f64;
+                let speed = c.ai.state.speed as f64;
                 let stop = if c.at_station() && speed.abs() < 0.3 {
                     serving(c.vehicle.position, c.vehicle.heading, 18.0)
                 } else {
@@ -3922,7 +3922,7 @@ impl Humans {
                         .and_then(|bus| bus.stops.front())
                         .and_then(|stop| {
                             let position = c
-                                .state
+                                .ai.state
                                 .route
                                 .get(stop.ri)
                                 .and_then(|lane| t.net.lanes.get(*lane))
@@ -4987,15 +4987,15 @@ impl Humans {
                 let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
                 // [ROLLBACK pedyield-1] (and whether it is stopping for somebody on foot:
                 // a car that yields is no threat to the one it yields to)
-                cars.push((c.vehicle.position.truncate(), fwd * c.state.speed as f64, bb[1] as f64 * 0.5, c.why.0 == "people"));
+                cars.push((c.vehicle.position.truncate(), fwd * c.ai.state.speed as f64, bb[1] as f64 * 0.5, c.ai.last.why == omsi_traffic::Why::People));
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
                     let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
-                    blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.state.speed as f64 });
+                    blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.ai.state.speed as f64 });
                     for t in &c.vehicle.trailers {
                         let tb = t.ty.def.bounding_box.unwrap_or([2.5, 7.0, 3.0, 0.0, 0.0, 1.5]);
                         let o = omsi_sim::collision::Obb::from_box(tb, t.position, t.heading);
                         let th = t.heading.to_radians();
-                        blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::new(th.sin(), th.cos()) * c.state.speed as f64 });
+                        blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::new(th.sin(), th.cos()) * c.ai.state.speed as f64 });
                     }
                 }
             }
