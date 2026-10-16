@@ -364,8 +364,8 @@ the riders aboard still get off at their stops.
 player's bus (its `[boundingbox]`), and heavy rain darkens the day enough for the saloon
 lights to matter.
 
-`pedestrians` (*Pedestrians* under Settings → Gameplay, 100 by default; the pause menu's
-Options has a *Pedestrians* slider that applies at once) is how many people stroll the
+`pedestrians` (*Pedestrians* under Settings → Gameplay, 100 by default; read when the
+session starts, like *People*) is how many people stroll the
 pavements about you, scaled by the map's passenger curve for the hour, and fewer where
 there is little pavement. They come out of the AI people pool, *People (AI humans)*
 (`ai_max_humans`, the second line of OMSI's `[AIMaxCountRandom]`, 200 by default) - everybody
