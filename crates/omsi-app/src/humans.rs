@@ -1762,6 +1762,10 @@ pub struct Person {
     stuck: f32,
     /// [ROLLBACK pedhold-1] Seconds standing still (under 0.05 m/s).
     still: f32,
+    /// [ROLLBACK pedyield-1] On a crossing, off the kerb (a stroller on a path that crosses
+    /// a carriageway, past its first steps): the cars of the lanes still ahead stop for
+    /// them as for somebody stepping in.
+    on_crossing: bool,
     ghost: f32,
     /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
     /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
@@ -2598,13 +2602,13 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position, p.vel, waiting, p.still)
+                (p.position, p.vel, waiting, p.still, p.on_crossing)
             })
             .collect()
     }
@@ -2843,6 +2847,7 @@ impl Humans {
             age,
             stuck: 0.0,
             still: 0.0,
+            on_crossing: false,
             ghost: 0.0,
             step_out: None,
             car_wait: 0.0,
@@ -4966,7 +4971,7 @@ impl Humans {
         self.pax_frame(dt, world, &buses, &bus_ix, &at_stops, bus, renderer, scene, &mut taken_ticket, &mut remove);
         stage!("passengers");
         // the pedestrians: a crowd on the pavements
-        let mut cars: Vec<(DVec2, DVec2, f64)> = Vec::new();
+        let mut cars: Vec<(DVec2, DVec2, f64, bool)> = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         if let Some(t) = traffic {
             for c in &t.cars {
@@ -4976,7 +4981,9 @@ impl Humans {
                 let h = c.vehicle.heading.to_radians();
                 let fwd = DVec2::new(h.sin(), h.cos());
                 let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
-                cars.push((c.vehicle.position.truncate(), fwd * c.state.speed as f64, bb[1] as f64 * 0.5));
+                // [ROLLBACK pedyield-1] (and whether it is stopping for somebody on foot:
+                // a car that yields is no threat to the one it yields to)
+                cars.push((c.vehicle.position.truncate(), fwd * c.state.speed as f64, bb[1] as f64 * 0.5, c.why.0 == "people"));
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
                     let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
                     blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.state.speed as f64 });
@@ -4995,10 +5002,10 @@ impl Humans {
             }
         }
         if let Some(pb) = bus_ix.get(&BusId::Player).map(|&i| &buses[i]) {
-            cars.push((pb.pos.truncate(), pb.fwd() * pb.speed, pb.half.y));
+            cars.push((pb.pos.truncate(), pb.fwd() * pb.speed, pb.half.y, false));
             for t in &pb.trailers {
                 let h = t.heading.to_radians();
-                cars.push((t.pos.truncate(), DVec2::new(h.sin(), h.cos()) * pb.speed, t.half.y));
+                cars.push((t.pos.truncate(), DVec2::new(h.sin(), h.cos()) * pb.speed, t.half.y, false));
             }
             blocks.extend(pb.blocks());
         }
@@ -5138,7 +5145,7 @@ impl Humans {
         world: &World,
         net: Option<&Network>,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64)],
+        cars: &[(DVec2, DVec2, f64, bool)],
         remove: &mut Vec<usize>,
     ) -> Want {
         let state = self.people[i].state.clone();
@@ -5230,7 +5237,7 @@ impl Humans {
         walk: &mut PedWalk,
         net: &Network,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64)],
+        cars: &[(DVec2, DVec2, f64, bool)],
         dt: f32,
     ) -> Want {
         let mut ped = self.ped.take();
@@ -5247,7 +5254,7 @@ impl Humans {
         walk: &mut PedWalk,
         net: &Network,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64)],
+        cars: &[(DVec2, DVec2, f64, bool)],
         dt: f32,
     ) -> Want {
         let pos2 = self.people[i].position.truncate();
@@ -5378,16 +5385,17 @@ impl Humans {
         let (p, h) = leg.at(net, (walk.s + 1.3).min(len));
         let lane = &net.lanes[leg.lane];
         let width = (lane.width as f64).max(1.0);
-        let crossing = lane.traffic_light.is_some()
-            || ped
-                .as_ref()
-                .map(|p| {
-                    p.crossings
-                        .get(&leg.lane)
-                        .map(|x| !x.is_empty())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+        let crosses = ped
+            .as_ref()
+            .map(|p| {
+                p.crossings
+                    .get(&leg.lane)
+                    .map(|x| !x.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let crossing = lane.traffic_light.is_some() || crosses;
+        self.people[i].on_crossing = crosses && walk.s > 0.3;
         // keep to the right of the pavement (less so on a crossing) - the left where the
         // traffic drives on the left
         let side = if crossing {
@@ -5438,7 +5446,7 @@ impl Humans {
         net: &Network,
         next: &Leg,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64)],
+        cars: &[(DVec2, DVec2, f64, bool)],
         pace: f64,
         held: f32,
     ) -> Result<(), &'static str> {
@@ -5474,7 +5482,13 @@ impl Humans {
         // the cars altogether)
         let margin = if held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { 2.5 };
         for x in ped.crossings(net, next.lane) {
-            for (p, v, half) in cars {
+            for (p, v, half, yielding) in cars {
+                // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
+                // the pedestrian passes (a child and a taxi stood for each other for minutes,
+                // the child waiting for the taxi's creep, the taxi for the child)
+                if *yielding {
+                    continue;
+                }
                 let rel = *x - *p;
                 let dist = rel.length();
                 if dist > 90.0 {

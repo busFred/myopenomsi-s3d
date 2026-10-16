@@ -956,7 +956,7 @@ pub struct Traffic {
     /// Everybody on foot on the ground: position, velocity, whether they are waiting at a
     /// stop, and for how long they have stood still (set every frame) - the cars stop for
     /// anybody in their way, not only on a crossing.
-    pub people: Vec<(DVec3, DVec2, bool, f32)>,
+    pub people: Vec<(DVec3, DVec2, bool, f32, bool)>,
     /// No car has been placed yet: the first population may fill the view.
     initial: bool,
     /// Seconds of the last tick (the lamp scripts run in `sync`).
@@ -5342,10 +5342,10 @@ impl Traffic {
         // as far as the car needs to stop without a jolt, and never less than a car length
         let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
         let origin = car.vehicle.position.truncate();
-        let near: Vec<&(DVec3, DVec2, bool, f32)> = self
+        let near: Vec<&(DVec3, DVec2, bool, f32, bool)> = self
             .people
             .iter()
-            .filter(|(p, _, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
+            .filter(|(p, _, _, _, _)| (p.truncate() - origin).length() < (st.front + reach) as f64 + 6.0)
             .collect();
         if near.is_empty() {
             return None;
@@ -5370,14 +5370,20 @@ impl Traffic {
                 let c = q.truncate() + right * lat;
                 // when the car's front gets here, at most two seconds on
                 let t = (((d - st.front).max(0.0)) / v.max(1.0)).min(2.0) as f64;
-                for (p, pv, waiting, still) in &near {
+                for (p, pv, waiting, still, crossing) in &near {
                     // on the same level only: somebody on a footbridge over the road, in a
                     // subway under it or on a platform above it is in nobody's way here (a
                     // car would stand in front of nothing anybody could see)
                     if (p.z - q.z).abs() > PEOPLE_LEVEL {
                         continue;
                     }
-                    let half = if *waiting && car.is_bus() {
+                    // [ROLLBACK pedyield-1] somebody already on the crossing, off the kerb,
+                    // is about to step into this lane too: a wider strip, and no letting
+                    // them stand (a child waited in the first lane for the second lane's
+                    // cars, which did not stop for somebody standing still beside it)
+                    let half = if *crossing {
+                        car.half_width as f64 + 1.5
+                    } else if *waiting && car.is_bus() {
                         car.half_width as f64 - 0.3
                     } else {
                         car.half_width as f64 + 0.3
@@ -5385,7 +5391,7 @@ impl Traffic {
                     // [ROLLBACK pedhold-1] somebody who has stood still at the edge of the
                     // strip for seconds while the car stands does not hold it: three people
                     // at a kerb line held a car, which held them (its body in their way)
-                    if v < 0.3 && *still > 3.0 && (p.truncate() - c).dot(right).abs() > half - 0.9 {
+                    if !*crossing && v < 0.3 && *still > 3.0 && (p.truncate() - c).dot(right).abs() > half - 0.9 {
                         continue;
                     }
                     for at in [p.truncate(), p.truncate() + *pv * t] {
@@ -5534,7 +5540,11 @@ impl Traffic {
         // ten minutes). Not at any stand: the car at the line that a one-second green sets
         // off is still under 0.1 m/s when the red comes, and cleared then it never went -
         // nobody got through those lights (13 cars in ten minutes against 318).
-        if car.stopped > 2.0 {
+        // [ROLLBACK amber-2] ... and a car creeping under 1 m/s for two seconds has stood as
+        // good as still: a queue that crept at 0.3-1 m/s never "stood" and every car in it
+        // kept the mark it took within 3 m of the line on green, then crossed on red one
+        // after another as the queue moved (the standing timer alone missed them)
+        if car.crawl > 2.0 {
             amber = None;
         }
         // [ROLLBACK lights-130] standing in a queue (a car close ahead, itself hardly moving):
