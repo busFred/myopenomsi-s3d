@@ -312,3 +312,81 @@ fn a_recording_from_the_game_replays() {
     }
     println!("worst {:?}, {} missing", r.worst(), r.missing.len());
 }
+
+/// A free run keeps its own vehicles at later keyframes (and still measures how far they
+/// are from the recorded ones); a normal replay goes back to the recorded ones.
+#[test]
+fn a_free_run_keeps_its_vehicles_at_keyframes() {
+    let net = priority_junction();
+    let cars = vec![car(10, 0, 150.0, 13.0), car(11, 0, 100.0, 13.0), car(1, 3, 150.0, 10.0)];
+    let path = temp("free");
+    let mut hook = |t: f32, _: &mut Network, sim: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
+        if (t - 8.0).abs() < DT * 0.5 {
+            cars.push(car(20, 3, 60.0, 8.0));
+        }
+        sim.players = vec![PlayerView { id: 0, pos: DVec3::new(6.0, -40.0, 0.0), heading: 180.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: t, blinker: 0, signalling: 0.0, priority: false }];
+    };
+    record(net, vec![], cars, 20.0, &path, &mut hook);
+    let base = Replay::load(&path).expect("the recording reads");
+    let _ = std::fs::remove_file(&path);
+    // the game had car 11 five metres further on at the second keyframe
+    let mut records = base.records.clone();
+    let second = records.iter().enumerate().filter(|(_, r)| matches!(r, omsi_traffic::record::Record::Keyframe { .. })).nth(1).map(|(i, _)| i).expect("two keyframes");
+    let kt = records[second].time();
+    if let omsi_traffic::record::Record::Keyframe { vehicles, .. } = &mut records[second] {
+        vehicles.iter_mut().find(|v| v.id == 11).expect("car 11").state.s += 5.0;
+    }
+    let run = |free: bool| {
+        let mut r = Replay::new(base.header.clone(), records.clone(), Vec::new(), false);
+        r.free_run = free;
+        assert!(r.at(0));
+        r.run_until(kt + 0.05);
+        let s = r.vehicles.iter().find(|v| v.id == 11).expect("car 11 is on the road").state.s;
+        let worst = r.divergence.first().copied().expect("the keyframe was compared");
+        (s, worst, r)
+    };
+    let (s_reset, d_reset, _) = run(false);
+    let (s_free, d_free, mut r) = run(true);
+    assert!((d_reset.1 - 5.0).abs() < 0.1 && d_reset.2 == 11, "{d_reset:?}");
+    assert!((d_free.1 - 5.0).abs() < 0.1 && d_free.2 == 11, "{d_free:?}");
+    assert!((s_reset - s_free - 5.0).abs() < 0.5, "reset {s_reset}, free {s_free}");
+    // the spawn at 8 s did not duplicate anything, and the run goes on to the end
+    while r.step() {}
+    assert_eq!(r.vehicles.iter().filter(|v| v.id == 20).count(), 1);
+    // switches are kept across `at`
+    r.set_switches(omsi_traffic::sim::Switches::from_list("pass_room,kerb_wait").unwrap());
+    assert!(r.at(0));
+    assert_eq!(r.sim.switches.list(), "pass_room,kerb_wait");
+}
+
+/// The recordings made in the game: `OMSI_TRAFFIC_FIXTURES` or `~/.openomsi/traffic/viz`.
+fn fixture(name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("OMSI_TRAFFIC_FIXTURES").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".openomsi/traffic/viz")))?;
+    let p = dir.join(name);
+    p.exists().then_some(p)
+}
+
+/// Free run with every rule as recorded must be the recording: the first 30 s of the
+/// smallest fixture (`cargo test --release -p omsi-traffic --test replay free_run --
+/// --nocapture`; skipped when the fixtures are not on this machine).
+#[test]
+fn a_free_run_without_switches_reproduces_a_game_recording() {
+    let Some(path) = fixture("case01-0814.rec") else {
+        eprintln!("no fixture case01-0814.rec: skipped");
+        return;
+    };
+    let mut r = Replay::load(&path).expect("the fixture reads");
+    r.free_run = true;
+    r.set_switches(Default::default());
+    assert!(r.at(0));
+    let t0 = r.sim.time;
+    r.run_until(t0 + 30.0);
+    assert!(r.divergence.len() >= 5, "{} keyframes compared", r.divergence.len());
+    let worst = r.divergence.iter().map(|d| d.1).fold(0.0f32, f32::max);
+    println!("free run, first 30 s of case01: {} keyframes, worst {:.4} m, {} vehicles missing", r.divergence.len(), worst, r.missing.len());
+    for (t, ds, id) in &r.divergence {
+        println!("  {:6.1} s: {ds:.4} m (vehicle {id})", t - t0);
+    }
+    assert!(worst < 0.01, "the free run drifted {worst:.3} m from the game in 30 s: {:?}", r.worst());
+    assert!(r.missing.is_empty(), "{:?}", r.missing.first());
+}

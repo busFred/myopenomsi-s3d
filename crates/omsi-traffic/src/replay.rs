@@ -15,7 +15,7 @@
 
 use crate::junction::Junctions;
 use crate::record::{read_lines, write_file, Frame, Header, Record};
-use crate::sim::{External, Simulation, Vehicle};
+use crate::sim::{External, Simulation, Switches, Vehicle};
 use hashbrown::HashMap;
 use omsi_sim::traffic::Network;
 use std::io;
@@ -45,6 +45,15 @@ pub struct Replay {
     pub divergence: Vec<(f64, f32, u64)>,
     /// Vehicles of a keyframe the replay did not have (or had and the keyframe did not).
     pub missing: Vec<(f64, u64)>,
+    /// Free run: after the starting keyframe the replay no longer goes back to the recorded
+    /// vehicles at later keyframes. They are still compared (`divergence`, `missing`), and
+    /// the replay goes on with its own. `Spawn` adds a vehicle whose id is not on the road,
+    /// `Remove` takes one off, the frame's inputs apply as always. This is how a rule
+    /// change is tried: what the recording does differently with it is not undone by the
+    /// next keyframe.
+    pub free_run: bool,
+    /// The rule changes under test; kept across `at`, which builds the simulation anew.
+    pub switches: Switches,
     /// Indices of the keyframes in `records`.
     keyframes: Vec<usize>,
 }
@@ -75,7 +84,13 @@ impl Replay {
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), keyframes }
+        Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, switches: Switches::default(), keyframes }
+    }
+
+    /// Set the rule changes under test (now, and after every `at`).
+    pub fn set_switches(&mut self, switches: Switches) {
+        self.switches = switches;
+        self.sim.switches = switches;
     }
 
     pub fn keyframe_count(&self) -> usize {
@@ -95,6 +110,7 @@ impl Replay {
         let (net, sim) = build(&self.header);
         self.net = net;
         self.sim = sim;
+        self.sim.switches = self.switches;
         self.types.clear();
         self.divergence.clear();
         self.missing.clear();
@@ -151,12 +167,16 @@ impl Replay {
             Record::Frame(f) => self.frame(f),
             Record::Keyframe { time, vehicles } => {
                 self.compare(*time, vehicles);
-                self.vehicles = vehicles.clone();
+                if !self.free_run {
+                    self.vehicles = vehicles.clone();
+                }
             }
             Record::Spawn { vehicle, type_name, .. } => {
                 self.types.insert(vehicle.id, type_name.clone());
                 let v = vehicle.clone();
                 match self.vehicles.iter_mut().find(|o| o.id == v.id) {
+                    // (a free run keeps the one it has)
+                    Some(_) if self.free_run => {}
                     Some(o) => *o = v,
                     None => self.vehicles.push(v),
                 }
