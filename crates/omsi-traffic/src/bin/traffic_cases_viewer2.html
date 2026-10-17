@@ -1,0 +1,159 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>__TITLE__</title>
+<style>
+:root{color-scheme:light;--fg:#182536;--mut:#506176;--bd:#c8d2df;--cd:#ffffff;--ac:#075daf;--bg:#f2f5f9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);padding:28px 24px 40px}
+.tc{font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);max-width:1200px;margin:auto}
+.tc h1{font-size:clamp(22px,2.5vw,30px);line-height:1.25;letter-spacing:-.025em;margin:0 0 12px}
+.tc a{color:var(--ac);text-underline-offset:3px}
+.tc a:hover{color:#03467f}
+.tc a.vid{font-weight:650;text-decoration:none;border-bottom:1px dotted var(--ac);padding:1px 2px}
+.tc .row{display:grid;grid-template-columns:minmax(0,700px) minmax(280px,1fr);gap:16px;align-items:start}
+.tc canvas{display:block;width:100%;height:auto;aspect-ratio:700/520;border:1px solid #9cacc0;border-radius:10px;background:#1d2126;cursor:crosshair}
+.tc .side{min-width:0;border:1px solid var(--bd);border-radius:10px;background:var(--cd);padding:18px;max-height:520px;overflow:auto;scrollbar-color:#9cacc0 var(--cd)}
+.tc .ctl{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:20px 0 14px;padding:14px;border:1px solid var(--bd);border-radius:10px;background:var(--cd)}
+.tc .ctl input[type=range]{flex:1;min-width:120px;accent-color:#075daf;cursor:pointer;height:32px}
+.tc button,.tc select,.tc input[type=text]{font:inherit;color:var(--fg);background:#edf2f8;border:1px solid #9cacc0;border-radius:6px;padding:7px 12px;min-height:40px}
+.tc button{cursor:pointer;font-weight:600}
+.tc button:hover,.tc select:hover{background:#dce9f7;border-color:#075daf}
+.tc :is(button,select,input,a,summary):focus-visible{outline:3px solid #075daf;outline-offset:3px}
+.tc #play{background:#075daf;color:#ffffff;border-color:#075daf;min-width:76px}
+.tc #play:hover{background:#03467f}
+.tc input[type=text]{width:164px;min-width:0}
+.tc input::placeholder{color:#596b80;opacity:1}
+.tc .mut{color:var(--mut)}
+.tc #sub{margin-bottom:20px;max-width:100ch}
+.tc table{border-collapse:collapse;width:100%;margin:12px 0;font-variant-numeric:tabular-nums}
+.tc td{padding:6px 5px;border-bottom:1px solid var(--bd);vertical-align:top;overflow-wrap:anywhere}
+.tc td:first-child{color:var(--mut);white-space:nowrap;width:38%}
+.tc .lg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;margin:20px 0 12px;padding-top:16px;border-top:1px solid var(--bd);font-size:13px}
+.tc .sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tc .note{font-size:14px;line-height:1.65;color:var(--mut);white-space:pre-wrap;overflow-wrap:anywhere}
+.tc .t{font:600 17px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;min-width:84px;color:#182536}
+.tc details{border:1px solid var(--bd);border-radius:10px;margin:14px 0;padding:14px 18px;background:var(--cd)}
+.tc summary{cursor:pointer;font-weight:650;color:#233e5d}
+.tc details[open]>summary{margin-bottom:12px}
+.tc .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:14px;margin-top:12px}
+.tc .shots a{display:block;background:#e9eef5;border-radius:8px}
+.tc .shots img{display:block;width:100%;height:auto;max-height:300px;object-fit:contain;border:1px solid var(--bd);border-radius:8px}
+.tc .roots div{margin:12px 0;padding:4px 0 4px 14px;border-left:3px solid #075daf;overflow-wrap:anywhere}
+.tc .roots b{color:#075daf}
+.tc .chains{max-height:360px;overflow:auto;font-size:14px;scrollbar-color:#9cacc0 var(--cd)}
+.tc .car{margin:0 0 14px;padding-bottom:14px;border-bottom:1px solid var(--bd);overflow-wrap:anywhere}
+.tc .hop{padding-left:18px;color:var(--mut)}
+.tc .hop.term{color:var(--fg)}
+.tc .cars{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+.tc .cars button{padding:6px 9px;font-size:13px;min-height:34px;font-variant-numeric:tabular-nums}
+.tc .cars button.on{background:#075daf;color:#ffffff;border-color:#075daf;outline:2px solid #075daf;outline-offset:2px}
+.tc .msg{color:#b42332;font-weight:600;margin-bottom:10px}
+@media(max-width:1050px){.tc .row{grid-template-columns:minmax(0,700px);justify-content:center}.tc .side{max-height:none}.tc .lg{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){body{padding:18px 12px 28px}.tc .ctl{gap:10px;padding:12px}.tc .ctl input[type=range]{order:1;flex-basis:100%}.tc input[type=text]{flex:1;width:120px}.tc .side,.tc details{padding:14px}.tc .lg{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.tc{max-width:1500px}
+.tc .panes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.tc .pane h2{font-size:17px;line-height:1.3;margin:0 0 6px;overflow-wrap:anywhere}
+.tc .stats{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:13px;margin-top:6px;padding:7px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--cd);font-variant-numeric:tabular-nums}
+.tc .stats b{font-size:15px}
+.tc .pinbox{margin-top:16px;border:1px solid var(--bd);border-radius:10px;background:var(--cd);padding:16px 18px}
+.tc table.two th{text-align:left;font-size:13px;color:var(--mut);padding:4px 5px;border-bottom:1px solid var(--bd)}
+.tc table.two td:first-child{width:22%}
+.tc table.two tr.d td{background:#fff3cf}
+.tc .cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.tc #warn{display:none;margin:0 0 12px;padding:10px 14px;border:1px solid #b42332;border-radius:8px;color:#b42332;font-weight:600;background:#fff}
+.tc .lg{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media(max-width:900px){.tc .panes{grid-template-columns:minmax(0,1fr)}.tc .cols2{grid-template-columns:minmax(0,1fr)}.tc .lg{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body>
+<div class="tc">
+<h1>__TITLE__</h1>
+<div class="mut" id="sub"></div>
+<div id="warn"></div>
+<div class="ctl"><button id="play">Play</button><select id="spd" aria-label="Playback speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span class="t" id="time"></span><input type="range" id="scrub" aria-label="Timeline" min="0" value="0"><button id="fit" title="reset the view">Fit</button><input type="text" id="find" aria-label="Find vehicle id" placeholder="find vehicle id" title="type a vehicle id, Enter: pinned in both panes"></div>
+<div class="panes">
+<div class="pane"><h2 id="ll">__LEFT_LABEL__</h2><canvas id="cvl" width="700" height="520"></canvas><div class="stats" id="sl"></div></div>
+<div class="pane"><h2 id="rl">__RIGHT_LABEL__</h2><canvas id="cvr" width="700" height="520"></canvas><div class="stats" id="sr"></div></div>
+</div>
+<div class="pinbox"><div id="pin"></div></div>
+<div class="lg" id="legend"></div>
+</div>
+<script id="ldata" type="application/json">__LEFT__</script>
+<script id="rdata" type="application/json">__RIGHT__</script>
+<script>
+__PANE_JS__
+(function(){
+const DL=JSON.parse(document.getElementById('ldata').textContent);
+const DR=JSON.parse(document.getElementById('rdata').textContent);
+const V={};                       // one view for both panes: zoom and pan are shared
+const cvL=document.getElementById('cvl'),cvR=document.getElementById('cvr');
+const L=makePane(cvL,DL,{view:V,chain:false});
+const R=makePane(cvR,DR,{view:V,chain:false});
+const PANES=[L,R];
+const M=L.M,F=L.F;               // the timeline is the left trace's frames; the right pane shows the frame nearest in time
+document.getElementById('legend').innerHTML=legendHTML();
+const sameC=(a,b)=>a&&b&&Math.abs(a[0]-b[0])<0.5&&Math.abs(a[1]-b[1])<0.5&&Math.abs((DL.meta.radius||0)-(DR.meta.radius||0))<0.5;
+const mm=(D)=>D.mode?`${D.mode}${D.switches?' ['+D.switches+']':''}`:'';
+const LEFTL=document.getElementById('ll').textContent,RIGHTL=document.getElementById('rl').textContent;
+document.getElementById('sub').textContent=`${M.map} · ${M.fixture} · window middle ${M.mid_hms} · centre (${M.center}) · radius ${M.radius} m · ${F.length} frames left / ${R.F.length} right`+((mm(DL)||mm(DR))?` · left: ${mm(DL)||'?'} · right: ${mm(DR)||'?'}`:'');
+if(!sameC(DL.meta.center,DR.meta.center)){const w=document.getElementById('warn');w.textContent=`Warning: the two traces have different centres/radii (${DL.meta.center} r${DL.meta.radius} / ${DR.meta.center} r${DR.meta.radius}): the panes are not aligned.`;w.style.display='block';}
+let fi=0,playing=false,speed=1,lastTs=null,acc=0;
+const stL={pinned:null,pinP:null,msg:'',flashUntil:0},stR={pinned:null,pinP:null,msg:'',flashUntil:0};
+const STS=[stL,stR];
+const scrub=document.getElementById('scrub');scrub.max=F.length-1;
+function ri(){return R.frameAt(F[fi].t);}
+function stats(P,i,el){const f=P.F[i];let stand=0,hold=0,n=0;for(const r of Object.values(f.v)){n++;if(r[4]<0.3)stand++;if(r[5]==='yield')hold++;}
+ el.innerHTML=`<span>in view <b>${n}</b></span><span>standing (&lt;0.3 m/s) <b>${stand}</b></span><span>holding (yield) <b>${hold}</b></span><span class="mut">${hms(f.t)}</span>`;}
+function draw(){
+ const j=ri();
+ L.draw(fi,stL);R.draw(j,stR);
+ stats(L,fi,document.getElementById('sl'));stats(R,j,document.getElementById('sr'));
+ document.getElementById('time').textContent=hms(F[fi].t);scrub.value=fi;
+ panel(j);
+}
+function panel(j){const el=document.getElementById('pin');const msg=stL.msg?`<div class="msg">${esc(stL.msg)}</div>`:'';
+ const pin=stL.pinned;
+ if(pin!=null){
+  const a=F[fi].v[pin],b=R.F[j].v[pin];
+  const info=L.VI[pin]||R.VI[pin]||[];
+  const fa=a?vehFields(a):null,fb=b?vehFields(b):null;
+  const names=(fa||fb||vehFields(new Array(15).fill(null))).map(x=>x[0]);
+  let h=msg+`<b>vehicle ${pin}</b> <span class="mut">${info[3]||''} ${info[4]||''}</span>`;
+  if(!a&&!b){el.innerHTML=h+' <span class="mut">(not in view in either pane at this time)</span>';return;}
+  h+=`<table class="two"><tr><th></th><th>${esc(LEFTL)}</th><th>${esc(RIGHTL)}</th></tr>`;
+  if(!a||!b)h+=`<tr><td></td><td>${a?'':'<span class="mut">not in view at this time</span>'}</td><td>${b?'':'<span class="mut">not in view at this time</span>'}</td></tr>`;
+  names.forEach((k,x)=>{const va=fa?fa[x][1]:null,vb=fb?fb[x][1]:null;const diff=fa&&fb&&String(va)!==String(vb);
+   h+=`<tr${diff?' class="d"':''}><td>${k}</td><td>${fa?(va==null?'<span class="mut">-</span>':va):''}</td><td>${fb?(vb==null?'<span class="mut">-</span>':vb):''}</td></tr>`;});
+  el.innerHTML=h+'</table>';return;}
+ if(stL.pinP||stR.pinP){
+  el.innerHTML=msg+`<div class="cols2"><div><div class="mut">${esc(LEFTL)}</div>${stL.pinP?L.pinHTML(fi,stL):'<span class="mut">-</span>'}</div><div><div class="mut">${esc(RIGHTL)}</div>${stR.pinP?R.pinHTML(j,stR):'<span class="mut">-</span>'}</div></div>`;return;}
+ el.innerHTML=msg+'<span class="mut">Click a vehicle or a pedestrian in either pane (or type an id above) to compare it in both. Drag to pan, wheel to zoom: both panes follow.</span>';}
+function tick(ts){if(!playing){lastTs=null;return;}if(lastTs!=null){acc+=(ts-lastTs)/1000*speed;}lastTs=ts;
+ while(fi<F.length-1&&acc>=F[fi+1].t-F[fi].t){acc-=F[fi+1].t-F[fi].t;fi++;}
+ if(fi>=F.length-1){playing=false;document.getElementById('play').textContent='Play';}draw();requestAnimationFrame(tick);}
+function flashLoop(){if(playing)return;draw();if(performance.now()<stL.flashUntil)requestAnimationFrame(flashLoop);else draw();}
+function setPin(id){for(const s of STS){s.pinned=id;s.pinP=null;s.msg='';}}
+// pin vehicle `id` (optionally at time `t`, HH:MM:SS) in both panes, centre on it, flash it
+function go(id,t,zoom){id=+id;if(!Number.isFinite(id))return;setPin(id);
+ if(t){fi=F.reduce((b,f,i)=>Math.abs(f.t-secs(t))<Math.abs(F[b].t-secs(t))?i:b,0);}
+ const has=i=>F[i].v[id]||R.F[R.frameAt(F[i].t)].v[id];
+ if(!has(fi)){let b=-1;for(let i=0;i<F.length;i++)if(has(i)&&(b<0||Math.abs(i-fi)<Math.abs(b-fi)))b=i;
+  if(b<0)stL.msg=`vehicle ${id} is in neither trace (outside the ${M.radius} m area)`;else{stL.msg=`vehicle ${id} is in the area only from ${hms(F[b].t)}: shown then`;fi=b;}}
+ if(zoom)V.scale=+zoom;const r=F[fi].v[id]||R.F[ri()].v[id];if(r){V.ox=r[1];V.oy=r[2];}
+ acc=0;for(const s of STS)s.flashUntil=performance.now()+4000;requestAnimationFrame(flashLoop);
+ const want=`pin=${id}&t=${hms(F[fi].t)}&zoom=${zoom||V.scale.toFixed(1)}`;if(location.hash.slice(1)!==want)history.replaceState(null,'','#'+want);}
+function applyHash(){const h=new URLSearchParams(location.hash.slice(1));if(h.get('pin'))go(h.get('pin'),h.get('t'),h.get('zoom'));}
+window.addEventListener('hashchange',applyHash);
+document.getElementById('find').onkeydown=e=>{if(e.key!=='Enter')return;const id=e.target.value.replace(/[^0-9]/g,'');if(!id)return;go(id,null,2);};
+document.getElementById('play').onclick=()=>{playing=!playing;document.getElementById('play').textContent=playing?'Pause':'Play';if(playing){if(fi>=F.length-1)fi=0;acc=0;requestAnimationFrame(tick);}};
+document.getElementById('spd').onchange=e=>{speed=+e.target.value;};
+document.getElementById('fit').onclick=()=>{L.fit();draw();};
+scrub.oninput=()=>{fi=+scrub.value;acc=0;draw();};
+PANES.forEach((P,k)=>P.bind({fi:()=>k?ri():fi,redraw:draw,click:h=>{
+ for(const s of STS){s.msg='';s.pinned=null;s.pinP=null;}
+ if(h.ped)STS[k].pinP=h.ped;else if(h.veh!=null)setPin(h.veh);
+ draw();}}));
+window.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type==='text')return;if(e.key===' '){e.preventDefault();document.getElementById('play').click();}else if(e.key==='ArrowRight'){fi=Math.min(F.length-1,fi+1);draw();}else if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);draw();}});
+// start at the window's middle; #pin=<vehicle id>&t=HH:MM:SS&zoom=<px per m> opens a vehicle pinned in both
+fi=L.frameAt(M.mid);
+draw();applyHash();if(stL.pinned!=null)setTimeout(()=>cvL.scrollIntoView({block:'center'}),50);
+})();
+</script></body></html>

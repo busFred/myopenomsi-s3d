@@ -3,13 +3,27 @@
 //! ```text
 //! traffic_cases info <rec>
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
-//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--on switches]
+//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--on switches] [--free] [--all-people]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
 //! traffic_cases heads <fixture> [--radius 200] [--free] [--on name,name]
 //! traffic_cases ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
+//! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
+//! traffic_cases compare <dir> --on <switches> [--left-on <switches>] [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
 //! traffic_cases index <out_dir>
 //! ```
+//!
+//! `trace` normally replays in reset-at-keyframe mode (what the recording shows, vehicles put back
+//! where the game had them at every keyframe); `--free` runs on from the first keyframe with no
+//! resets, so the trace shows what the simulation does by itself with the `--on` switches. The
+//! trace JSON says which (`"mode": "recorded"|"free"`, `"switches": "<the --on list>"`).
+//!
+//! `viewer2` makes one page of two traces side by side (one clock, one view, one pin); `compare`
+//! does it for every `caseNN-HHMM.rec` of a directory: left = recorded (with `--left-on`), right =
+//! free run with `--on`; writes `caseNN-HHMM-{left,right}.json`, `caseNN-HHMM-ab.html` and
+//! `ab-index.html` (into `--out`, default the directory; titles from `titles.txt`, lines
+//! `NN<TAB>title`; the centre and radius from the player's path: bounding-box middle, farthest
+//! point + 150 m).
 //!
 //! `info` and `cut` stream the recording once (a session recording does not fit in
 //! memory parsed); `trace` and `diagnose` replay a cut fixture headless.
@@ -49,10 +63,17 @@ fn main() {
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
+        Some("viewer2") if args.len() >= 5 => viewer2(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+            &args[5..],
+        ),
+        Some("compare") if args.len() >= 3 => compare(Path::new(&args[2]), &args[3..]),
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|viewer|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|viewer|viewer2|compare|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -692,6 +713,9 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         .unwrap_or(400);
     let mut r = Replay::load(fixture)?;
     r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    // (`--free`: no reset at the keyframes, the simulation runs on by itself from the first one)
+    let free = args.iter().any(|a| a == "--free");
+    r.free_run = free;
     let mid = window_mid(fixture, &r);
     let (cx, cy) = match opt(args, "--center") {
         Some(c) => {
@@ -1127,6 +1151,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             .cloned()
             .collect();
         let doc = json!({
+            "mode": if free { "free" } else { "recorded" },
+            "switches": opt(args, "--on").unwrap_or(""),
             "meta": {
                 "fixture": fixture.file_name().and_then(|s| s.to_str()),
                 "map": r.header.map,
@@ -2494,6 +2520,15 @@ fn viewer(trace_path: &Path, out: &Path, args: &[String]) -> Res<()> {
     Ok(())
 }
 
+/// The index page template with its title, intro, table head and rows filled in.
+fn index_page(title: &str, intro: &str, head: &str, rows: &str) -> String {
+    include_str!("traffic_cases_index.html")
+        .replace("__TITLE__", title)
+        .replace("__INTRO__", intro)
+        .replace("__HEAD__", head)
+        .replace("__ROWS__", rows)
+}
+
 fn index(dir: &Path) -> Res<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -2568,10 +2603,276 @@ fn index(dir: &Path) -> Res<()> {
             std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0
         );
     }
-    let html = include_str!("traffic_cases_index.html").replace("__ROWS__", &rows);
+    let html = index_page(
+        "Traffic cases",
+        "Vehicle ids open the case's viewer with that vehicle pinned at the start of its stand.",
+        "<tr><th>Case</th><th>Size</th><th>Root causes (diagnose)</th><th>Report</th></tr>",
+        &rows,
+    );
     let out = dir.join("index.html");
     std::fs::write(&out, html)?;
     println!("{}: {} cases", out.display(), entries.len());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// viewer2 and compare: two traces of one fixture side by side
+
+const VIEWER2_HTML: &str = include_str!("traffic_cases_viewer2.html");
+
+/// The drawing code of the single-pane viewer (between its PANE markers): viewer2 uses the same.
+fn pane_js() -> Res<&'static str> {
+    let end = "// ==PANE-END==";
+    let a = VIEWER_HTML
+        .find("// ==PANE-BEGIN==")
+        .ok_or("the viewer template has no PANE-BEGIN marker")?;
+    let b = VIEWER_HTML
+        .find(end)
+        .ok_or("the viewer template has no PANE-END marker")?
+        + end.len();
+    Ok(&VIEWER_HTML[a..b])
+}
+
+fn viewer2(left: &Path, right: &Path, out: &Path, args: &[String]) -> Res<()> {
+    let ltext = std::fs::read_to_string(left)?;
+    let rtext = std::fs::read_to_string(right)?;
+    let ldoc: Value = serde_json::from_str(&ltext)?;
+    let rdoc: Value = serde_json::from_str(&rtext)?;
+    let (lm, rm) = (&ldoc["meta"], &rdoc["meta"]);
+    if lm["center"] != rm["center"] || lm["radius"] != rm["radius"] {
+        eprintln!(
+            "warning: the traces differ in centre/radius ({} r{} / {} r{}): the panes will not line up",
+            lm["center"], lm["radius"], rm["center"], rm["radius"]
+        );
+    }
+    let stem = |p: &Path| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("trace")
+            .to_string()
+    };
+    let title = opt(args, "--title")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{} vs {}", stem(left), stem(right)));
+    let left_label = opt(args, "--left-label")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "recorded".to_string());
+    let right_label = opt(args, "--right-label")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let sw = rdoc["switches"].as_str().unwrap_or("");
+            format!("replayed ({})", if sw.is_empty() { "no switches" } else { sw })
+        });
+    // (the JSON goes into a script element: no "</" may appear in it)
+    let ltext = ltext.replace("</", "<\\/");
+    let rtext = rtext.replace("</", "<\\/");
+    let (pre, rest) = VIEWER2_HTML
+        .split_once("__LEFT__")
+        .ok_or("the viewer2 template has no __LEFT__")?;
+    let (mid, post) = rest
+        .split_once("__RIGHT__")
+        .ok_or("the viewer2 template has no __RIGHT__")?;
+    let fill = |t: &str| -> Res<String> {
+        Ok(t.replace("__TITLE__", &esc_html(&title))
+            .replace("__LEFT_LABEL__", &esc_html(&left_label))
+            .replace("__RIGHT_LABEL__", &esc_html(&right_label))
+            .replace("__PANE_JS__", pane_js()?))
+    };
+    let mut html = String::with_capacity(VIEWER2_HTML.len() + ltext.len() + rtext.len() + 16384);
+    html.push_str(&fill(pre)?);
+    html.push_str(&ltext);
+    html.push_str(&fill(mid)?);
+    html.push_str(&rtext);
+    html.push_str(&fill(post)?);
+    std::fs::write(out, &html)?;
+    println!("{}: {:.0} KB", out.display(), html.len() as f64 / 1024.0);
+    Ok(())
+}
+
+/// The bounding-box middle of every player position in a recording, and the farthest point from it.
+fn player_path(rec: &Path) -> Res<(f64, f64, f64)> {
+    #[derive(serde::Deserialize)]
+    struct Line {
+        #[serde(rename = "Frame")]
+        frame: LFrame,
+    }
+    #[derive(serde::Deserialize)]
+    struct LFrame {
+        players: Vec<LPlayer>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LPlayer {
+        pos: Vec<f64>,
+    }
+    let mut lines = Lines::open(rec)?;
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    while lines.next() {
+        if !lines.buf.starts_with(b"{\"Frame\"") {
+            continue;
+        }
+        if let Ok(l) = serde_json::from_slice::<Line>(&lines.buf) {
+            pts.extend(
+                l.frame
+                    .players
+                    .iter()
+                    .filter(|p| p.pos.len() >= 2)
+                    .map(|p| (p.pos[0], p.pos[1])),
+            );
+        }
+    }
+    if pts.is_empty() {
+        return Err(format!("{}: no player position in any frame", rec.display()).into());
+    }
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(x, y) in &pts {
+        x0 = x0.min(x);
+        x1 = x1.max(x);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let rmax = pts
+        .iter()
+        .map(|&(x, y)| (x - cx).hypot(y - cy))
+        .fold(0.0, f64::max);
+    Ok((cx, cy, rmax))
+}
+
+fn compare(dir: &Path, args: &[String]) -> Res<()> {
+    let on = opt(args, "--on")
+        .ok_or("compare needs --on <switches for the right pane>")?
+        .to_string();
+    let left_on = opt(args, "--left-on").unwrap_or("").to_string();
+    for list in [&on, &left_on] {
+        omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?;
+    }
+    let fps: f64 = opt(args, "--fps")
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(5.0);
+    let all_people = args.iter().any(|a| a == "--all-people");
+    let out_dir = opt(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.to_path_buf());
+    std::fs::create_dir_all(&out_dir)?;
+    let only: Option<Vec<u32>> = opt(args, "--only")
+        .map(|s| {
+            s.split(',')
+                .filter(|x| !x.trim().is_empty())
+                .map(|x| x.trim().parse::<u32>())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    // titles.txt: `NN<TAB>title`
+    let mut titles: HashMap<u32, String> = HashMap::new();
+    if let Ok(t) = std::fs::read_to_string(dir.join("titles.txt")) {
+        for line in t.lines() {
+            if let Some((n, title)) = line.split_once('\t') {
+                if let Ok(n) = n.trim().parse::<u32>() {
+                    titles.insert(n, title.trim().to_string());
+                }
+            }
+        }
+    }
+    // the cases: caseNN-HHMM.rec
+    let mut cases: Vec<(u32, String, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(stem) = name.strip_suffix(".rec") else { continue };
+        let Some((case, hhmm)) = stem.split_once('-') else { continue };
+        let Some(num) = case.strip_prefix("case").filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) else { continue };
+        if hhmm.len() != 4 || !hhmm.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let n: u32 = num.parse()?;
+        if only.as_ref().map(|o| !o.contains(&n)).unwrap_or(false) {
+            continue;
+        }
+        cases.push((n, stem.to_string(), p));
+    }
+    cases.sort();
+    if cases.is_empty() {
+        return Err(format!("no caseNN-HHMM.rec in {}", dir.display()).into());
+    }
+    let left_label = if left_on.is_empty() {
+        "recorded".to_string()
+    } else {
+        format!("recorded ({left_on})")
+    };
+    let right_label = format!("replayed ({})", if on.is_empty() { "no switches" } else { &on });
+    let mut rows = String::new();
+    for (n, stem, rec) in &cases {
+        let hhmm = &stem[stem.len() - 4..];
+        let title = titles
+            .get(n)
+            .cloned()
+            .unwrap_or_else(|| format!("Case {n:02} {}:{}", &hhmm[..2], &hhmm[2..]));
+        let (cx, cy, rmax) = player_path(rec)?;
+        let (cx, cy) = (r1(cx), r1(cy));
+        let radius = (rmax + 150.0).ceil();
+        println!("{stem}: centre ({cx}, {cy}), player path reaches {rmax:.1} m, radius {radius} m");
+        let mut common: Vec<String> = ["--center", &format!("{cx},{cy}"), "--radius", &format!("{radius}"), "--fps", &format!("{fps}"), "--max-kb", "100000"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if all_people {
+            common.push("--all-people".into());
+        }
+        let mut largs = common.clone();
+        largs.extend(["--on".to_string(), left_on.clone()]);
+        let mut rargs = common;
+        rargs.extend(["--on".to_string(), on.clone(), "--free".to_string()]);
+        let lj = out_dir.join(format!("{stem}-left.json"));
+        let rj = out_dir.join(format!("{stem}-right.json"));
+        let html = out_dir.join(format!("{stem}-ab.html"));
+        // (the two replays are independent: side by side on two threads)
+        let (lr, rr) = std::thread::scope(|s| {
+            let h = s.spawn(|| trace(rec, &lj, &largs).map_err(|e| e.to_string()));
+            let right = trace(rec, &rj, &rargs).map_err(|e| e.to_string());
+            (h.join().unwrap_or_else(|_| Err("the left trace panicked".into())), right)
+        });
+        lr.map_err(|e| format!("{stem} left: {e}"))?;
+        rr.map_err(|e| format!("{stem} right: {e}"))?;
+        viewer2(
+            &lj,
+            &rj,
+            &html,
+            &[
+                "--title".into(),
+                title.clone(),
+                "--left-label".into(),
+                left_label.clone(),
+                "--right-label".into(),
+                right_label.clone(),
+            ],
+        )?;
+        let kb = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0;
+        let hname = format!("{stem}-ab.html");
+        let _ = writeln!(
+            rows,
+            "<tr><td><a href=\"{hname}\">{}</a></td><td>{:.0} KB</td><td class=\"rc\">left <b>{}</b><br>right <b>{}</b><br>centre ({cx}, {cy}), radius {radius} m, {fps} fps</td><td><a href=\"{stem}-left.json\">left</a> ({:.0} KB) &middot; <a href=\"{stem}-right.json\">right</a> ({:.0} KB)</td></tr>",
+            esc_html(&title),
+            kb(&html),
+            esc_html(&left_label),
+            esc_html(&right_label),
+            kb(&lj),
+            kb(&rj)
+        );
+    }
+    let page = index_page(
+        "Traffic cases: recorded and replayed side by side",
+        &format!(
+            "Left: {}. Right: {} from the window's first keyframe, no resets. One clock, one view and one pinned vehicle drive both panes.",
+            esc_html(&left_label),
+            esc_html(&right_label)
+        ),
+        "<tr><th>Case</th><th>Size</th><th>Panes</th><th>Traces</th></tr>",
+        &rows,
+    );
+    let idx = out_dir.join("ab-index.html");
+    std::fs::write(&idx, page)?;
+    println!("{}: {} cases", idx.display(), cases.len());
     Ok(())
 }
 
