@@ -5,7 +5,8 @@
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
 //! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
-//! traffic_cases heads <fixture> [--radius 200]
+//! traffic_cases heads <fixture> [--radius 200] [--free] [--on name,name]
+//! traffic_cases ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases index <out_dir>
 //! ```
@@ -44,13 +45,14 @@ fn main() {
         }
         Some("diagnose") if args.len() >= 3 => diagnose(Path::new(&args[2]), &args[3..]),
         Some("heads") if args.len() >= 3 => heads(Path::new(&args[2]), &args[3..]),
+        Some("ab") if args.len() >= 3 => ab(&args[2..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|diagnose|viewer|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|viewer|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -2745,6 +2747,11 @@ struct HeadSample {
     red: Option<(usize, usize)>,
     stopped_field: f32,
     standing: f64,
+    /// Where the vehicle it waits for is (AHEAD, BEHIND, BESIDE), its distance, and whether
+    /// that one stands at a red light itself.
+    wait_rel: Option<&'static str>,
+    wait_dist: f64,
+    wait_red: bool,
 }
 
 type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
@@ -2752,6 +2759,9 @@ type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
 fn heads(fixture: &Path, args: &[String]) -> Res<()> {
     let radius: f64 = opt(args, "--radius").map(|s| s.parse()).transpose()?.unwrap_or(200.0);
     let mut r = Replay::load(fixture)?;
+    // (`--free` runs on from its own vehicles at the keyframes, `--on` with rule switches)
+    r.free_run = args.iter().any(|a| a == "--free");
+    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
     }
@@ -3217,6 +3227,8 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
         }
     };
     let mut wait_rel: Option<&'static str> = None;
+    let mut wait_dist = 0.0f64;
+    let mut wait_red = false;
     let mut wait_body: Option<Body> = None;
     if let Some(w) = d.wait_for {
         match find_id(w) {
@@ -3225,6 +3237,8 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 wait_rel = Some(wh);
                 wait_body = Some(o);
                 let dist = (body_obb(r, o).center - v.pos.truncate()).length();
+                wait_dist = dist;
+                wait_red = matches!(o, Body::V(k) if r.vehicles[k].state.speed < 0.3 && r.vehicles[k].last.why == Why::Light);
                 let extra = match o {
                     Body::V(k) => {
                         let ov = &r.vehicles[k];
@@ -3572,5 +3586,358 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
         what
     };
     let red = if verdict == "red light" { light_red } else { None };
-    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing }
+    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing, wait_rel, wait_dist, wait_red }
+}
+
+// ---------------------------------------------------------------------------------------
+// ab: replay the fixtures free-running (with rule switches on) and score the result
+
+/// The score of one free run.
+#[derive(Default, Clone, Debug)]
+struct Score {
+    name: String,
+    /// Samples taken (one per second of the window).
+    seconds: u64,
+    /// Vehicle-seconds standing (speed < 0.3, not at a stop) within the radius.
+    standing_vs: f64,
+    /// Head-seconds (heads that stayed head >= `min_head` s) whose verdict is a junction hold
+    /// with nobody conflicting, a junction hold for a vehicle behind/beside, or a ring.
+    unjust_hold_s: f64,
+    /// Head-seconds waiting for a vehicle that is behind.
+    wait_behind_s: f64,
+    /// Head-seconds waiting for a vehicle beside it that stands at a red light.
+    wait_beside_red_s: f64,
+    /// Head-seconds waiting for a vehicle > 30 m away that stands at a red light.
+    wait_far_red_s: f64,
+    /// Vehicles that crossed the start of a lit lane while its light was red.
+    red_cross: u64,
+    /// All crossings of the start of a lit lane (any colour): what `red_cross` is a part of.
+    lit_cross: u64,
+    /// Vehicle-seconds in which an AI vehicle's box overlaps another's.
+    overlap_s: f64,
+    /// Vehicle-seconds standing with why=End.
+    dead_end_s: f64,
+    /// Head-seconds of "person in front".
+    people_wait_s: f64,
+    /// Distinct vehicles whose odometer grew by more than 20 m within the radius.
+    throughput: u64,
+    /// The largest keyframe divergence (m).
+    divergence: f64,
+    /// Vehicles of keyframes the run did not have, or had and the keyframe did not.
+    missing: u64,
+    /// All head-seconds counted (of the runs >= `min_head` s).
+    head_s: f64,
+}
+
+/// (header, text of the value) of the columns of the table, in order.
+fn score_columns(s: &Score) -> Vec<(&'static str, String)> {
+    let n = |x: f64| format!("{x:.0}");
+    vec![
+        ("standing_vs", n(s.standing_vs)),
+        ("unjust_hold_s", n(s.unjust_hold_s)),
+        ("wait_behind_s", n(s.wait_behind_s)),
+        ("wait_beside_red_s", n(s.wait_beside_red_s)),
+        ("wait_far_red_s", n(s.wait_far_red_s)),
+        ("red_cross", s.red_cross.to_string()),
+        ("overlap_s", n(s.overlap_s)),
+        ("dead_end_s", n(s.dead_end_s)),
+        ("people_wait_s", n(s.people_wait_s)),
+        ("throughput", s.throughput.to_string()),
+        ("divergence", format!("{:.3}", s.divergence)),
+    ]
+}
+
+fn score_json(s: &Score) -> Value {
+    let fin = |x: f64| if x.is_finite() { x } else { 1e9 };
+    json!({
+        "case": s.name,
+        "seconds": s.seconds,
+        "standing_vs": s.standing_vs,
+        "unjust_hold_s": s.unjust_hold_s,
+        "wait_behind_s": s.wait_behind_s,
+        "wait_beside_red_s": s.wait_beside_red_s,
+        "wait_far_red_s": s.wait_far_red_s,
+        "red_cross": s.red_cross,
+        "lit_cross": s.lit_cross,
+        "overlap_s": s.overlap_s,
+        "dead_end_s": s.dead_end_s,
+        "people_wait_s": s.people_wait_s,
+        "throughput": s.throughput,
+        "divergence": fin(s.divergence),
+        "missing": s.missing,
+        "head_s": s.head_s,
+    })
+}
+
+/// What a head second counts for in the score.
+#[derive(Clone, Copy)]
+struct HeadTally {
+    unjust: bool,
+    behind: bool,
+    beside_red: bool,
+    far_red: bool,
+    person: bool,
+}
+
+impl HeadTally {
+    fn of(h: &HeadSample) -> HeadTally {
+        let v = h.verdict.as_str();
+        HeadTally {
+            unjust: v.starts_with("junction hold with nobody conflicting") || v.starts_with("junction hold for a vehicle behind/beside") || v.starts_with("deadlock ring"),
+            behind: h.wait_rel == Some("BEHIND"),
+            beside_red: h.wait_rel == Some("BESIDE") && h.wait_red,
+            far_red: h.wait_dist > 30.0 && h.wait_red,
+            person: v.starts_with("person in front"),
+        }
+    }
+}
+
+/// The standing vehicles near the player (not at a stop), and of them the heads: those
+/// with no standing body within 12 m ahead in their 2.5 m corridor. Same test as `heads`.
+fn standing_and_heads(r: &Replay, near: &dyn Fn(DVec3) -> bool) -> (Vec<usize>, Vec<usize>) {
+    let standing: Vec<Body> = all_bodies(r).into_iter().filter(|b| body_speed(r, *b).abs() < 0.3).collect();
+    let mut all = Vec::new();
+    let mut heads = Vec::new();
+    for (i, v) in r.vehicles.iter().enumerate() {
+        if v.state.speed >= 0.3 || !near(v.pos) || v.external.at_stop {
+            continue;
+        }
+        all.push(i);
+        let blocked = standing.iter().any(|&b| {
+            if b == Body::V(i) {
+                return false;
+            }
+            let (lo, hi, ac) = rel_body(r, v, b);
+            hi > 0.0 && lo < 12.0 && ac.abs() < 2.5
+        });
+        if !blocked {
+            heads.push(i);
+        }
+    }
+    (all, heads)
+}
+
+/// Replay one fixture free-running from its first keyframe to the end and score it.
+fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
+    let mut r = Replay::load(fixture)?;
+    r.set_switches(switches);
+    r.free_run = free_run;
+    if !r.at(0) {
+        return Err("the fixture has no keyframe".into());
+    }
+    let mut sc = Score { name: fixture.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(), ..Default::default() };
+    let mut next = r.sim.time;
+    // (lookups only: nothing iterated here depends on a hash map's order)
+    let mut open: BTreeMap<u64, Vec<HeadTally>> = BTreeMap::new();
+    let mut prev_odo: HashMap<u64, f32> = HashMap::new();
+    let mut gain: BTreeMap<u64, f32> = BTreeMap::new();
+    let mut approaching: HashSet<(u64, usize)> = HashSet::new();
+    let mut crossed: HashSet<(u64, usize, usize)> = HashSet::new();
+    let close = |sc: &mut Score, run: Vec<HeadTally>| {
+        if run.len() < min_head {
+            return;
+        }
+        for h in run {
+            sc.head_s += 1.0;
+            sc.unjust_hold_s += h.unjust as u8 as f64;
+            sc.wait_behind_s += h.behind as u8 as f64;
+            sc.wait_beside_red_s += h.beside_red as u8 as f64;
+            sc.wait_far_red_s += h.far_red as u8 as f64;
+            sc.people_wait_s += h.person as u8 as f64;
+        }
+    };
+    while r.step() {
+        let ppos = r.sim.players.first().map(|p| p.pos);
+        let near = |pos: DVec3| ppos.map(|pp| dist2(pos, pp.x, pp.y) <= radius).unwrap_or(true);
+        // ---- every frame: the odometers and the lit lanes' starts
+        for v in &r.vehicles {
+            let st = &v.state;
+            if let Some(&p) = prev_odo.get(&v.id) {
+                let d = st.odometer - p;
+                if near(v.pos) && d > 0.0 && d < 10.0 {
+                    *gain.entry(v.id).or_default() += d;
+                }
+            }
+            prev_odo.insert(v.id, st.odometer);
+            if !near(v.pos) {
+                continue;
+            }
+            for (l, d0) in way_lanes(&r.net, st, st.front + 5.0) {
+                let Some((c, li)) = r.net.lanes[l].traffic_light else { continue };
+                if d0 - st.front > 0.0 {
+                    approaching.insert((v.id, l));
+                } else if approaching.contains(&(v.id, l)) && crossed.insert((v.id, c, li)) {
+                    // (the light's state this frame is the one the vehicle moved by)
+                    sc.lit_cross += 1;
+                    if r.sim.lights.get(c).is_some_and(|ctl| matches!(ctl.state(li), 0..=5)) {
+                        sc.red_cross += 1;
+                    }
+                }
+            }
+        }
+        // ---- every second
+        if r.sim.time + 1e-6 < next {
+            continue;
+        }
+        while next <= r.sim.time + 1e-6 {
+            next += 1.0;
+        }
+        sc.seconds += 1;
+        let t = r.sim.time;
+        let day = r.sim.day_time;
+        r.sim.update_positions(&r.net, &mut r.vehicles);
+        let (standing, heads) = standing_and_heads(&r, &near);
+        sc.standing_vs += standing.len() as f64;
+        sc.dead_end_s += standing.iter().filter(|&&i| r.vehicles[i].last.why == Why::End).count() as f64;
+        // vehicles whose box overlaps another vehicle's (more than 10 cm deep, same level)
+        let nearv: Vec<usize> = (0..r.vehicles.len()).filter(|&i| near(r.vehicles[i].pos)).collect();
+        let boxes: Vec<omsi_sim::collision::Obb> = nearv.iter().map(|&i| r.vehicles[i].obb()).collect();
+        let mut hit = vec![false; nearv.len()];
+        for a in 0..nearv.len() {
+            for b in a + 1..nearv.len() {
+                if (r.vehicles[nearv[a]].pos.z - r.vehicles[nearv[b]].pos.z).abs() > 3.0 {
+                    continue;
+                }
+                if boxes[a].separation(&boxes[b]) < -0.1 {
+                    hit[a] = true;
+                    hit[b] = true;
+                }
+            }
+        }
+        sc.overlap_s += hit.iter().filter(|h| **h).count() as f64;
+        // heads: runs of consecutive seconds; a run counts once it is `min_head` s long
+        let ids: HashSet<u64> = heads.iter().map(|&i| r.vehicles[i].id).collect();
+        let closing: Vec<u64> = open.keys().copied().filter(|id| !ids.contains(id)).collect();
+        for id in closing {
+            if let Some(run) = open.remove(&id) {
+                close(&mut sc, run);
+            }
+        }
+        for &i in &heads {
+            let hs = head_sample(&r, i, t, day, ppos, 0.0);
+            open.entry(r.vehicles[i].id).or_default().push(HeadTally::of(&hs));
+        }
+    }
+    for (_, run) in std::mem::take(&mut open) {
+        close(&mut sc, run);
+    }
+    sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
+    sc.divergence = r.divergence.iter().map(|d| d.1 as f64).fold(0.0, f64::max);
+    sc.missing = r.missing.len() as u64;
+    Ok(sc)
+}
+
+/// `ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10]
+/// [--reset] [--jobs N]`: free-run every fixture and print the score table. `--reset`
+/// replays as `heads` does (back to the recorded vehicles at every keyframe), for
+/// comparison.
+fn ab(args: &[String]) -> Res<()> {
+    let with_value = ["--on", "--radius", "--json", "--min-head", "--jobs"];
+    let mut fixtures: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a.starts_with("--") {
+            i += if with_value.contains(&a) { 2 } else { 1 };
+        } else {
+            fixtures.push(PathBuf::from(a));
+            i += 1;
+        }
+    }
+    if fixtures.is_empty() {
+        return Err("no fixture given".into());
+    }
+    let radius: f64 = opt(args, "--radius").map(|s| s.parse()).transpose()?.unwrap_or(200.0);
+    let min_head: usize = opt(args, "--min-head").map(|s| s.parse()).transpose()?.unwrap_or(10);
+    let jobs: usize = opt(args, "--jobs").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
+    let free_run = !args.iter().any(|a| a == "--reset");
+    let switches = omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?;
+
+    // (each fixture on its own: the order of the rows is the order given)
+    let results: std::sync::Mutex<Vec<Option<Result<Score, String>>>> = std::sync::Mutex::new((0..fixtures.len()).map(|_| None).collect());
+    let nextjob = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(fixtures.len()) {
+            scope.spawn(|| loop {
+                let k = nextjob.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(path) = fixtures.get(k) else { break };
+                let t0 = std::time::Instant::now();
+                let res = ab_run(path, switches, radius, min_head, free_run).map_err(|e| format!("{}: {e}", path.display()));
+                eprintln!("ab: {} done in {:.1} s", path.display(), t0.elapsed().as_secs_f64());
+                if let Ok(mut g) = results.lock() {
+                    g[k] = Some(res);
+                }
+            });
+        }
+    });
+    let mut scores: Vec<Score> = Vec::new();
+    for r in results.into_inner().map_err(|_| "a worker panicked")? {
+        match r {
+            Some(Ok(s)) => scores.push(s),
+            Some(Err(e)) => return Err(e.into()),
+            None => return Err("a worker panicked".into()),
+        }
+    }
+
+    let mut total = Score { name: "TOTAL".into(), ..Default::default() };
+    for s in &scores {
+        total.seconds += s.seconds;
+        total.standing_vs += s.standing_vs;
+        total.unjust_hold_s += s.unjust_hold_s;
+        total.wait_behind_s += s.wait_behind_s;
+        total.wait_beside_red_s += s.wait_beside_red_s;
+        total.wait_far_red_s += s.wait_far_red_s;
+        total.red_cross += s.red_cross;
+        total.lit_cross += s.lit_cross;
+        total.overlap_s += s.overlap_s;
+        total.dead_end_s += s.dead_end_s;
+        total.people_wait_s += s.people_wait_s;
+        total.throughput += s.throughput;
+        total.divergence = total.divergence.max(s.divergence);
+        total.missing += s.missing;
+        total.head_s += s.head_s;
+    }
+    let mut rows: Vec<(String, Vec<(&'static str, String)>)> = scores.iter().map(|s| (s.name.clone(), score_columns(s))).collect();
+    rows.push((total.name.clone(), score_columns(&total)));
+    let headers: Vec<&str> = rows[0].1.iter().map(|c| c.0).collect();
+    let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
+    let widths: Vec<usize> = (0..headers.len()).map(|k| rows.iter().map(|r| r.1[k].1.len()).max().unwrap_or(0).max(headers[k].len())).collect();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "AB switches [{}] radius {radius:.0} m, {} run, heads counted from {min_head} s, {} fixtures, {} s sampled",
+        switches.list(),
+        if free_run { "free" } else { "reset-at-keyframes" },
+        scores.len(),
+        total.seconds
+    );
+    let _ = write!(out, "{:<name_w$}", "case");
+    for (k, h) in headers.iter().enumerate() {
+        let _ = write!(out, "  {:>w$}", h, w = widths[k]);
+    }
+    out.push('\n');
+    for (n, (name, cols)) in rows.iter().enumerate() {
+        if n + 1 == rows.len() {
+            let _ = writeln!(out, "{}", "-".repeat(name_w + widths.iter().map(|w| w + 2).sum::<usize>()));
+        }
+        let _ = write!(out, "{name:<name_w$}");
+        for (k, c) in cols.iter().enumerate() {
+            let _ = write!(out, "  {:>w$}", c.1, w = widths[k]);
+        }
+        out.push('\n');
+    }
+    let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {})", total.missing);
+    print!("{out}");
+    if let Some(path) = opt(args, "--json") {
+        let doc = json!({
+            "switches": switches.list(),
+            "radius": radius,
+            "min_head": min_head,
+            "free_run": free_run,
+            "cases": scores.iter().map(score_json).collect::<Vec<_>>(),
+            "total": score_json(&total),
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")?;
+    }
+    Ok(())
 }
