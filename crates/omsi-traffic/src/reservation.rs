@@ -134,6 +134,10 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
         }
         let mut wait_for: Option<(usize, f32)> = None;
         for foe in &my_foes {
+            // (a piece of my own way through is no foe of mine)
+            if c.chain.iter().any(|&(m, _)| m == foe.movement) {
+                continue;
+            }
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
@@ -142,6 +146,12 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 let mut shifted = claims[ok].clone();
                 shifted.s -= shift;
                 let o = &shifted;
+                // (one queued behind me on my own way is no foe: it follows me, and the
+                // head of a queue gave way to its own follower for ever)
+                let behind_me = claims[ok].chain.iter().any(|&(m, off)| m == c.movement && claims[ok].s - off < c.s);
+                if behind_me {
+                    continue;
+                }
                 // a foe that has left the meeting place
                 if o.s - o.rear > foe.theirs.1 {
                     continue;

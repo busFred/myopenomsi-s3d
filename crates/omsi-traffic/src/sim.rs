@@ -587,9 +587,12 @@ impl Simulation {
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
             let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
-            // the light at this junction's line, if the driver is held by one
+            // the light before this junction's first meeting place, if the driver is held
+            // by one (BeijingCity puts the stop line 2 to 44 m inside the crossing object:
+            // measured at the object's entry, a car waiting at such a line was "about to
+            // come" for everyone on the crossing green, who waited for it)
             let (light_red, until_go) = match p.signal {
-                Some(sig) if sig.dist <= j.entry + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
+                Some(sig) if sig.dist <= j.conflict_start + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
                 _ => (false, None),
             };
             claim_of[i] = Some(claims.len());
