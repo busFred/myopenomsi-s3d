@@ -51,6 +51,17 @@ pub struct Claim {
     pub lead: Option<usize>,
     /// Counted standing at its last claim (`competitor_filter`): see [`Claim::standing`].
     pub was_standing: bool,
+    /// Standing, held there by something other than a junction's answer: its lead, people,
+    /// a zebra, a light (`competitor_filter`). It cannot move off before that lets it go,
+    /// whatever the junction says.
+    pub blocked: bool,
+    /// (signal_foes) Standing as of its last claim (`was_standing`): creeping to its red
+    /// under 1 m/s it is still held there (its claim shifted by `until_go`).
+    pub red_hysteresis: bool,
+    /// The vehicle's lanes from the one it is on: (lane, distance from its origin to the
+    /// lane's start; the first is minus its place along it). Empty: not known (a player off
+    /// the lanes). (`competitor_filter`: a car behind me in my own lane.)
+    pub lanes: Vec<(usize, f32)>,
 }
 
 impl Claim {
@@ -85,6 +96,10 @@ pub struct Grant {
 const CLEAR_MARGIN: f32 = 0.6;
 /// Impatience at which a driver goes first in front of a foe that stands and waits too.
 const HALF_FED_UP: f32 = 0.5;
+/// (competitor_filter) Seconds a driver held by its lead, people or a light takes to move
+/// off once let go: a foe held so is waited for only when it could be in the meeting place,
+/// from rest after this, before the claimant is out of it.
+const START_DELAY: f32 = 1.5;
 
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
 /// the driver's own figure for a foe that stands or crawls, twice that for one rolling,
@@ -267,6 +282,37 @@ fn behind_on_my_way(c: &Claim, o: &Claim) -> bool {
     })
 }
 
+/// (competitor_filter) `o` is behind `c` in `c`'s own lane: on the lane `c` is on, or on
+/// a lane of its way that leads into it, its front at least a metre behind `c`'s rear. It
+/// can only come after me, whatever its speed and wherever its way goes on (case03: cars
+/// rolling up behind the head of their own queue, "committed" to the merge of the lead-in
+/// with its own stub, held the head at green).
+fn behind_in_my_lane(c: &Claim, o: &Claim) -> bool {
+    let Some(&(my_lane, my_start)) = c.lanes.first() else { return false };
+    // (my origin is `-my_start` along my lane; theirs `-d` where their way reaches it)
+    let Some(&(_, d)) = o.lanes.iter().find(|&&(l, _)| l == my_lane) else { return false };
+    -d + o.front <= -my_start - c.rear - 1.0
+}
+
+/// (competitor_filter) `o` comes into my way at the merge `foe` behind me: along the
+/// merged way its front is at least a metre behind my rear, and it cannot be at the merge's
+/// end before my rear is past it (with the margin). A car merging in behind me follows me,
+/// whether or not my front has reached a piece both ways share.
+fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
+    if foe.kind != FoeKind::Merge {
+        return false;
+    }
+    // (positions along the merged way, 0 at the merge's end)
+    let my_rear = (c.s - c.rear) - foe.mine.1;
+    let their_front = (o.s + o.front) - foe.theirs.1;
+    if their_front > my_rear - 1.0 {
+        return false;
+    }
+    let my_out = arrival_time(-my_rear, c.speed, c.accel, c.v_max);
+    let their_at = arrival_time(-their_front, o.speed, o.accel, o.v_max);
+    o.speed < 0.3 || their_at >= my_out + CLEAR_MARGIN
+}
+
 /// One pass over the claims; `plain` is the first pass's answer when fed-up drivers may
 /// squeeze in. `filter` (the `competitor_filter` switch) drops followers and those behind
 /// on the same way; `standing` (its second pass) drops standing refused foes, the
@@ -328,6 +374,11 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                     shifted.committed = false;
                 }
                 let o = &shifted;
+                // (competitor_filter) behind me in my own lane, or merging in behind me: it
+                // comes after me at any speed, committed or not
+                if filter && (behind_in_my_lane(c, &claims[ok]) || (!their_inside && merging_behind(c, o, foe))) {
+                    continue;
+                }
                 let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
                 // (competitor_filter) my own follower, or one behind me on a piece both our
                 // ways take, comes after me whatever the table says; one already in the
@@ -340,7 +391,9 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 }
                 // a foe standing at its red light is not coming before its light goes:
                 // the left-turner on its arrow turns in front of the oncoming queue
-                if o.light_red && o.speed < 0.5 && !their_inside {
+                // (signal_foes: creeping up to its line under 1 m/s after a stand counts as
+                // standing there, `Claim::red_hysteresis`)
+                if o.light_red && (o.speed < 0.5 || (o.red_hysteresis && o.speed <= 1.0)) && !their_inside {
                     match o.until_go {
                         Some(t) => {
                             their_in += t;
@@ -348,6 +401,15 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                         }
                         None => continue,
                     }
+                }
+                // (competitor_filter) a foe standing outside the meeting place, held there by
+                // something other than a junction (its lead, people, a zebra, a light), is not
+                // coming: not waited for when I am out of the meeting place before it could be
+                // in it from rest after its start (`START_DELAY`), moving or not. (Not when I am
+                // held so myself: my window is no more real than its, and two such would let
+                // each other go; I am not going anywhere before my own lead lets me.)
+                if filter && o.blocked && !c.blocked && !c.light_red && o.standing() && !their_inside && !o.committed && my_out + CLEAR_MARGIN <= their_in + START_DELAY {
+                    continue;
                 }
                 // standing in the meeting place, held by its own lead: it is not leaving
                 // on the schedule its acceleration would give it
@@ -358,8 +420,15 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // the margin a vehicle with the right of way keeps: a side-road car that
                 // crossed 0.6 s ahead of the main road had the main road braking hard)
                 let margin = if foe.yields && !c.absolute { c.gap.max(CLEAR_MARGIN) } else { CLEAR_MARGIN };
-                let i_am_first = my_out + margin <= their_in;
-                let they_are_first = their_out + CLEAR_MARGIN <= my_in;
+                // (competitor_filter) one held by its lead, people or a light outside the
+                // meeting place is not through it before the other comes on the strength of a
+                // start from rest now: it starts when what holds it lets it. Not "first" myself
+                // when I am held so, nor the foe when it is (a side road car went behind one
+                // standing a metre from the meeting place, once the other main road car it
+                // waited for was dropped; a car held by its lead, "first" by a start it could
+                // not make, went past the contender before it in the order)
+                let i_am_first = my_out + margin <= their_in && !(filter && c.blocked);
+                let they_are_first = their_out + CLEAR_MARGIN <= my_in && !(filter && o.blocked && !their_inside);
                 // the two are clear of each other in time whatever the rules say
                 if !their_inside && i_am_first && !o.committed {
                     continue;
@@ -462,7 +531,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new() }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -1032,5 +1101,270 @@ mod tests {
             }
         }
         eprintln!("fuzz: {cases} cases, pairs released into a meeting place: old {old_pairs}, new-only {new_pairs}");
+    }
+
+    // ---- round 3: competitor_filter and signal_foes widened ----
+
+    /// The main road car (right of way) stands `dist` m out, held by `blocked` (its lead,
+    /// people, a light: not by the junction); the side road car rolls up at `speed`.
+    fn held_main_road_foe(dist: f32, speed: f32, blocked: bool) -> (Network, Junctions, Vec<Claim>) {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let me = claim(1, side, 2.0, speed);
+        let mut foe = claim(2, main, mine0 - dist - 2.0, 0.0);
+        foe.held = true;
+        foe.blocked = blocked;
+        (net, js, vec![me, foe])
+    }
+
+    #[test]
+    fn competitor_filter_a_foe_standing_behind_its_lead_far_off_does_not_hold_a_moving_claimant() {
+        // (case10: a bus held after green by a queue member 61 m away)
+        let (net, js, claims) = held_main_road_foe(30.0, 3.0, true);
+        let old = resolve_with(&js, &net, &claims, false);
+        assert_eq!(grant_of(&old, 1).wait_for, Some(2), "the old rules wait for it: {old:?}");
+        let g = resolve_with(&js, &net, &claims, true);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // ... and standing at the line myself, not refused
+        let mut standing = claims.clone();
+        standing[0].speed = 0.0;
+        assert!(grant_of(&resolve_with(&js, &net, &standing, true), 1).go);
+        // held by my own lead as well: not my call yet
+        let mut both = claims.clone();
+        both[0].speed = 0.0;
+        both[0].held = true;
+        both[0].blocked = true;
+        assert_eq!(grant_of(&resolve_with(&js, &net, &both, true), 1).wait_for, Some(2));
+    }
+
+    #[test]
+    fn competitor_filter_a_held_foe_that_could_be_there_before_i_am_out_still_counts() {
+        // 1 m out: from rest after its start it is in the meeting place before I am out
+        let (net, js, claims) = held_main_road_foe(1.0, 3.0, true);
+        let g = resolve_with(&js, &net, &claims, true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // refused by the junction rather than held (it moves off as soon as it is let go):
+        // the order of the second pass decides, not the timing
+        let (net, js, claims) = held_main_road_foe(30.0, 3.0, false);
+        let g = resolve_with(&js, &net, &claims, true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // rolling (not standing): it is coming
+        let (net, js, mut claims) = held_main_road_foe(30.0, 3.0, true);
+        claims[1].speed = 6.0;
+        claims[1].held = false;
+        claims[1].blocked = false;
+        let g = resolve_with(&js, &net, &claims, true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    #[test]
+    fn competitor_filter_a_car_behind_me_in_my_own_lane_is_no_foe_at_any_speed() {
+        // one lane forks inside the object: the straight way (0) and the left turn (1),
+        // which gives way to it at the start; both cars on the entry lane 10 before it
+        let (net, js) = object(&[(&[(-10.0, 0.0), (10.0, 0.0)], 0), (&[(-10.0, 0.0), (-4.0, 0.0), (0.0, 4.0), (0.0, 10.0)], 1)]);
+        let mut turner = claim(1, 1, -1.0, 0.0);
+        turner.lanes = vec![(10, -30.0), (net.lanes.len(), 1.0)];
+        // the straight car rolls up behind it at 6 m/s, committed (it cannot stop before
+        // the merge of the lead-in with its stub, case03), its front 8 m behind my rear
+        let mut behind = claim(2, 0, -11.0, 6.0);
+        behind.committed = true;
+        behind.lanes = vec![(10, -20.0), (99, 10.0)];
+        let claims = [turner, behind];
+        let old = resolve_with(&js, &net, &claims, false);
+        assert_eq!(grant_of(&old, 1).wait_for, Some(2), "the old rules: {old:?}");
+        let g = resolve_with(&js, &net, &claims, true);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // on a lane before mine that leads into it: behind me too
+        let mut back = claims.clone();
+        back[1].lanes = vec![(11, -20.0), (10, 2.0)];
+        back[1].s = -33.0;
+        assert!(grant_of(&resolve_with(&js, &net, &back, true), 1).go);
+        // ahead of me in my lane (it is the one in front): it counts
+        let mut ahead = claims.clone();
+        ahead[1].lanes = vec![(10, -34.0)];
+        ahead[1].committed = false;
+        ahead[1].s = 3.0;
+        ahead[1].speed = 0.0;
+        let g = resolve_with(&js, &net, &ahead, true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    #[test]
+    fn competitor_filter_a_car_merging_in_behind_me_is_no_foe_before_my_front_reaches_the_shared_piece() {
+        // A (0) and B (1) merge into the exit; A gives way to B. No piece of the object is
+        // on both ways (the exit lies outside it): the merge itself says who is behind.
+        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0)]);
+        assert!(js.nodes[0].movements[0].foes[0].yields && js.nodes[0].movements[0].foes[0].kind == FoeKind::Merge);
+        let on_a = claim(1, 0, 7.0, 3.0);
+        // B's front 14 m from the merge's end, at 5.8 m/s (case02 #4788)
+        let on_b = claim(2, 1, -6.0, 5.8);
+        let claims = [on_a, on_b];
+        let old = resolve_with(&js, &net, &claims, false);
+        assert_eq!(grant_of(&old, 1).wait_for, Some(2), "the old rules: {old:?}");
+        let g = resolve_with(&js, &net, &claims, true);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        assert!(!grant_of(&g, 2).go, "B comes in behind A: {g:?}");
+        // fast, it would be at the merge's end before my rear is past: it counts
+        let mut fast = claims.clone();
+        fast[1].speed = 13.0;
+        let g = resolve_with(&js, &net, &fast, true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // level with me: not behind
+        let mut level = claims.clone();
+        level[1].s = 5.0;
+        level[1].speed = 3.0;
+        assert_eq!(grant_of(&resolve_with(&js, &net, &level, true), 1).wait_for, Some(2));
+    }
+
+    #[test]
+    fn signal_foes_a_foe_creeping_to_its_red_after_a_stand_is_not_coming() {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let me = claim(1, side, 2.0, 0.0);
+        // the main road car creeps up to its red at 0.8 m/s, 6 m out, 30 s to go
+        let mut red = claim(2, main, mine0 - 6.0 - 2.0, 0.8);
+        red.light_red = true;
+        red.until_go = Some(30.0);
+        red.was_standing = true;
+        for filter in [false, true] {
+            let g = resolve_with(&js, &net, &[me.clone(), red.clone()], filter);
+            assert_eq!(grant_of(&g, 1).wait_for, Some(2), "without the switch: {g:?}");
+            let mut on = red.clone();
+            on.red_hysteresis = true;
+            let g = resolve_with(&js, &net, &[me.clone(), on], filter);
+            assert!(grant_of(&g, 1).go, "filter {filter}: {g:?}");
+        }
+        // rolling at 0.8 m/s without having stood: coming
+        let mut rolling = red.clone();
+        rolling.was_standing = false;
+        rolling.red_hysteresis = false;
+        assert_eq!(grant_of(&resolve_with(&js, &net, &[me, rolling], true), 1).wait_for, Some(2));
+    }
+
+    /// Pairs both let go into one meeting place whose windows overlap, a claimant held by
+    /// its lead (`blocked`) counted from rest after its start (`START_DELAY`): it does not
+    /// move before that, whatever its grant says.
+    fn round3_both_released(js: &Junctions, claims: &[Claim], g: &[Grant]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let win = |c: &Claim, from: f32, to: f32, shift: f32| -> Option<(f32, f32)> {
+            let mut x = c.clone();
+            x.s -= shift;
+            let (mut i, mut o) = window(&x, from, to);
+            if c.blocked {
+                i += START_DELAY;
+                o += START_DELAY;
+            }
+            if c.light_red && (c.speed < 0.5 || (c.red_hysteresis && c.speed <= 1.0)) {
+                return c.until_go.map(|t| (i + t, o + t));
+            }
+            Some((i, o))
+        };
+        for a in 0..claims.len() {
+            for b in a + 1..claims.len() {
+                if !(g[a].go && g[b].go) || claims[a].committed || claims[b].committed {
+                    continue;
+                }
+                let foes = js.foes_along(claims[a].junction, &claims[a].chain);
+                let meet = foes.iter().any(|f| {
+                    claims[b].chain.iter().any(|&(m, off)| {
+                        m == f.movement
+                            && claims[b].s - off + claims[b].front < f.theirs.0
+                            && claims[a].s + claims[a].front < f.mine.0
+                            && match (win(&claims[a], f.mine.0, f.mine.1, 0.0), win(&claims[b], f.theirs.0, f.theirs.1, off)) {
+                                (Some((ai, ao)), Some((bi, bo))) => ai < bo + CLEAR_MARGIN && bi < ao + CLEAR_MARGIN,
+                                _ => false,
+                            }
+                    })
+                });
+                if meet {
+                    out.push((claims[a].vehicle, claims[b].vehicle));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn competitor_filter_fuzz_held_foes_never_release_two_claimants_into_each_other() {
+        // random standing/rolling claimants, some held by their lead (`blocked`), some
+        // creeping to their red after a stand, on crossing-only objects: no pair let go into
+        // one meeting place that `competitor_filter` as it was did not let go
+        let objects: Vec<(Network, Junctions)> = vec![review_cross(), triangle(), four_way(128.0, 128.0), four_way(192.0, 64.0)];
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut cases, mut dropped, mut new_pairs, mut held_pairs) = (0, 0, 0, 0);
+        for _ in 0..100_000 {
+            let (net, js) = &objects[(rnd() * objects.len() as f64) as usize % objects.len()];
+            let nm = js.nodes[0].movements.len();
+            let n = 2 + (rnd() * 4.0) as usize;
+            let mut claims: Vec<Claim> = Vec::new();
+            for v in 0..n {
+                let m = (rnd() * nm as f64) as usize % nm;
+                let first = js.nodes[0].movements[m].foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+                if !first.is_finite() {
+                    continue;
+                }
+                let dist = [0.2f32, 1.0, 3.0, 6.0, 15.0, 40.0, 70.0][(rnd() * 7.0) as usize % 7];
+                let speed = [0.0f32, 0.0, 0.0, 0.2, 0.8, 2.0, 6.0, 10.0][(rnd() * 8.0) as usize % 8];
+                let mut c = claim(10 + v, m, first - dist - 2.0, speed);
+                let room = dist - 0.6;
+                c.committed = dist <= 0.5 || (speed > 1.0 && room < speed * speed / (2.0 * 8.0 * 0.7));
+                c.exit_room = rnd() > 0.15;
+                c.was_standing = speed <= 1.0 && rnd() < 0.5;
+                c.held = speed < 0.3 && rnd() < 0.6;
+                c.blocked = c.held && rnd() < 0.7;
+                if rnd() < 0.15 {
+                    c.light_red = true;
+                    c.until_go = if rnd() < 0.5 { Some((rnd() * 5.0) as f32) } else { None };
+                    c.red_hysteresis = c.was_standing;
+                }
+                if claims.iter().any(|o| o.movement == m && (o.s - c.s).abs() < 6.0) {
+                    continue;
+                }
+                claims.push(c);
+            }
+            if claims.len() < 2 {
+                continue;
+            }
+            cases += 1;
+            // (the rules before round 3: the same claims without what they read)
+            let before: Vec<Claim> = claims.iter().map(|c| Claim { blocked: false, red_hysteresis: false, ..c.clone() }).collect();
+            let old = resolve_with(js, net, &before, true);
+            let g = resolve_with(js, net, &claims, true);
+            dropped += old.iter().zip(&g).filter(|(o, n)| !o.go && n.go).count();
+            let po = round3_both_released(js, &claims, &old);
+            // (a claimant let go while held by its lead or standing at its red does not move
+            // on its grant: it claims again, moving, the frame it can; such a pair is counted
+            // apart)
+            let idx = |v: usize| claims.iter().position(|c| c.vehicle == v).unwrap();
+            let can_move = |k: usize| {
+                let c = &claims[k];
+                !(c.blocked || (c.light_red && (c.speed < 0.5 || (c.red_hysteresis && c.speed <= 1.0))))
+            };
+            for p in round3_both_released(js, &claims, &g) {
+                if !po.contains(&p) {
+                    let (a, b) = (idx(p.0), idx(p.1));
+                    let moved = [a, b].iter().any(|&k| !old[k].go && g[k].go && can_move(k));
+                    if !moved {
+                        held_pairs += 1;
+                        continue;
+                    }
+                    new_pairs += 1;
+                    if new_pairs <= 4 {
+                        eprintln!("NEW PAIR {p:?}\n  claims {:?}\n  old {old:?}\n  new {g:?}", claims.iter().map(|c| (c.vehicle, c.movement, c.s, c.speed, c.committed, c.held, c.blocked, c.light_red, c.until_go)).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+        eprintln!("round3 fuzz: {cases} cases, claimants let go that the rules before held {dropped}, new pairs released into each other {new_pairs} (and {held_pairs} let go while still held by their lead or light)");
+        assert!(dropped > 0);
+        assert_eq!(new_pairs, 0);
     }
 }
