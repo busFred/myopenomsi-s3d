@@ -3609,9 +3609,9 @@ struct Score {
     wait_beside_red_s: f64,
     /// Head-seconds waiting for a vehicle > 30 m away that stands at a red light.
     wait_far_red_s: f64,
-    /// Vehicles that crossed the start of a lit lane while its light was red.
+    /// Vehicles whose front crossed a lit lane's stop line (its start) while the light was red.
     red_cross: u64,
-    /// All crossings of the start of a lit lane (any colour): what `red_cross` is a part of.
+    /// All such crossings (any colour), counted once per vehicle and light: what `red_cross` is a part of.
     lit_cross: u64,
     /// Vehicle-seconds in which an AI vehicle's box overlaps another's.
     overlap_s: f64,
@@ -3623,6 +3623,8 @@ struct Score {
     throughput: u64,
     /// The largest keyframe divergence (m).
     divergence: f64,
+    /// One line per red crossing (printed with `--events`).
+    red_events: Vec<String>,
     /// Vehicles of keyframes the run did not have, or had and the keyframe did not.
     missing: u64,
     /// All head-seconds counted (of the runs >= `min_head` s).
@@ -3717,6 +3719,30 @@ fn standing_and_heads(r: &Replay, near: &dyn Fn(DVec3) -> bool) -> (Vec<usize>, 
     (all, heads)
 }
 
+/// The stop line of a lit lane: a segment through the lane's start, across it, as wide as
+/// the lane and 1 m more each side.
+struct StopLine {
+    p0: glam::DVec2,
+    fwd: glam::DVec2,
+    right: glam::DVec2,
+    half: f64,
+    light: (usize, usize),
+    lane: usize,
+}
+
+fn stop_lines(net: &Network) -> Vec<StopLine> {
+    net.lanes
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.kind == LaneKind::Street && l.traffic_light.is_some() && !l.points.is_empty())
+        .map(|(i, l)| {
+            let (p, h) = l.at(0.0);
+            let h = (h as f64).to_radians();
+            StopLine { p0: p.truncate(), fwd: glam::DVec2::new(h.sin(), h.cos()), right: glam::DVec2::new(h.cos(), -h.sin()), half: l.width as f64 * 0.5 + 1.0, light: l.traffic_light.unwrap_or((0, 0)), lane: i }
+        })
+        .collect()
+}
+
 /// Replay one fixture free-running from its first keyframe to the end and score it.
 fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
     let mut r = Replay::load(fixture)?;
@@ -3731,7 +3757,9 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
     let mut open: BTreeMap<u64, Vec<HeadTally>> = BTreeMap::new();
     let mut prev_odo: HashMap<u64, f32> = HashMap::new();
     let mut gain: BTreeMap<u64, f32> = BTreeMap::new();
-    let mut approaching: HashSet<(u64, usize)> = HashSet::new();
+    let mut prev_front: HashMap<u64, glam::DVec2> = HashMap::new();
+    let mut lit: Vec<StopLine> = Vec::new();
+    let mut lit_lanes = 0;
     let mut crossed: HashSet<(u64, usize, usize)> = HashSet::new();
     let close = |sc: &mut Score, run: Vec<HeadTally>| {
         if run.len() < min_head {
@@ -3747,9 +3775,15 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
         }
     };
     while r.step() {
+        if r.net.lanes.len() != lit_lanes {
+            lit_lanes = r.net.lanes.len();
+            lit = stop_lines(&r.net);
+        }
+        // (the frame placed the bodies before it moved them: place them where they are)
+        r.sim.update_positions(&r.net, &mut r.vehicles);
         let ppos = r.sim.players.first().map(|p| p.pos);
         let near = |pos: DVec3| ppos.map(|pp| dist2(pos, pp.x, pp.y) <= radius).unwrap_or(true);
-        // ---- every frame: the odometers and the lit lanes' starts
+        // ---- every frame: the odometers and the stop lines
         for v in &r.vehicles {
             let st = &v.state;
             if let Some(&p) = prev_odo.get(&v.id) {
@@ -3762,15 +3796,35 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
             if !near(v.pos) {
                 continue;
             }
-            for (l, d0) in way_lanes(&r.net, st, st.front + 5.0) {
-                let Some((c, li)) = r.net.lanes[l].traffic_light else { continue };
-                if d0 - st.front > 0.0 {
-                    approaching.insert((v.id, l));
-                } else if approaching.contains(&(v.id, l)) && crossed.insert((v.id, c, li)) {
-                    // (the light's state this frame is the one the vehicle moved by)
-                    sc.lit_cross += 1;
-                    if r.sim.lights.get(c).is_some_and(|ctl| matches!(ctl.state(li), 0..=5)) {
-                        sc.red_cross += 1;
+            // the front point crossing a stop line (the lit lane's start) between two frames
+            let h = (v.heading as f64).to_radians();
+            let now = v.pos.truncate() + glam::DVec2::new(h.sin(), h.cos()) * st.front as f64;
+            if let Some(before) = prev_front.insert(v.id, now) {
+                if (now - before).length() < 10.0 {
+                    for ll in &lit {
+                        let (d0, d1) = ((before - ll.p0).dot(ll.fwd), (now - ll.p0).dot(ll.fwd));
+                        if !(d0 < 0.0 && d1 >= 0.0) {
+                            continue;
+                        }
+                        let k = d0 / (d0 - d1);
+                        if ((before + (now - before) * k) - ll.p0).dot(ll.right).abs() > ll.half {
+                            continue;
+                        }
+                        // (a way that leaves through another lane starting at the line, one
+                        // not under this light, is a branch the light does not govern)
+                        let unlit_branch = way_lanes(&r.net, st, 40.0).iter().any(|&(w, _)| {
+                            let wl = &r.net.lanes[w];
+                            w != ll.lane && wl.traffic_light != Some(ll.light) && wl.points.first().is_some_and(|p| (p.truncate() - ll.p0).length() < 0.5)
+                        });
+                        if unlit_branch || !crossed.insert((v.id, ll.light.0, ll.light.1)) {
+                            continue;
+                        }
+                        sc.lit_cross += 1;
+                        // (the light's state this frame is the one the vehicle moved by)
+                        if r.sim.lights.get(ll.light.0).is_some_and(|ctl| matches!(ctl.state(ll.light.1), 0..=5)) {
+                            sc.red_cross += 1;
+                            sc.red_events.push(format!("{} t={:.1} (day {}) #{} crosses the stop line of lane {} (light {}.{}), way {:?}", sc.name, r.sim.time, hms(r.sim.day_time), v.id, ll.lane, ll.light.0, ll.light.1, way_lanes(&r.net, st, 40.0).iter().map(|w| format!("{}{}@{:.1}m", w.0, r.net.lanes[w.0].traffic_light.map(|(c, l)| format!("[lit {c}.{l}]")).unwrap_or_default(), (r.net.lanes[w.0].points[0].truncate() - ll.p0).length())).collect::<Vec<_>>()));
+                        }
                     }
                 }
             }
@@ -3785,7 +3839,6 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
         sc.seconds += 1;
         let t = r.sim.time;
         let day = r.sim.day_time;
-        r.sim.update_positions(&r.net, &mut r.vehicles);
         let (standing, heads) = standing_and_heads(&r, &near);
         sc.standing_vs += standing.len() as f64;
         sc.dead_end_s += standing.iter().filter(|&&i| r.vehicles[i].last.why == Why::End).count() as f64;
@@ -3928,6 +3981,13 @@ fn ab(args: &[String]) -> Res<()> {
     }
     let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {})", total.missing);
     print!("{out}");
+    if args.iter().any(|a| a == "--events") {
+        for s in &scores {
+            for e in &s.red_events {
+                println!("RED {e}");
+            }
+        }
+    }
     if let Some(path) = opt(args, "--json") {
         let doc = json!({
             "switches": switches.list(),
