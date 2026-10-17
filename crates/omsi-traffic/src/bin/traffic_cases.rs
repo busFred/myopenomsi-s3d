@@ -7,6 +7,7 @@
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
 //! traffic_cases heads <fixture> [--radius 200] [--free] [--on name,name]
 //! traffic_cases ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
+//! traffic_cases stubs <fixture>... [--all]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases index <out_dir>
 //! ```
@@ -46,13 +47,14 @@ fn main() {
         Some("diagnose") if args.len() >= 3 => diagnose(Path::new(&args[2]), &args[3..]),
         Some("heads") if args.len() >= 3 => heads(Path::new(&args[2]), &args[3..]),
         Some("ab") if args.len() >= 3 => ab(&args[2..]),
+        Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|viewer|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|stubs|viewer|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -3627,6 +3629,16 @@ struct Score {
     divergence: f64,
     /// One line per red crossing (printed with `--events`).
     red_events: Vec<String>,
+    /// One line per keyframe that found the run off the recording (printed with `--drift`).
+    drift_events: Vec<String>,
+    /// One line per pair of vehicles whose boxes first overlapped (printed with `--overlaps`).
+    overlap_events: Vec<String>,
+    /// Pair-seconds, whole map, of two vehicles waiting for each other at a junction
+    /// (`wait_for` both ways), and of them those with both standing.
+    mutual_s: u64,
+    mutual_standing_s: u64,
+    /// One line per such pair-second with both standing (printed with `--mutual`).
+    mutual_events: Vec<String>,
     /// Vehicles of keyframes the run did not have, or had and the keyframe did not.
     missing: u64,
     /// Spawns of the recording put off because their place was taken, and of them those
@@ -3769,6 +3781,7 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
     let mut lit: Vec<StopLine> = Vec::new();
     let mut lit_lanes = 0;
     let mut crossed: HashSet<(u64, usize, usize)> = HashSet::new();
+    let mut touching: HashSet<(u64, u64)> = HashSet::new();
     let close = |sc: &mut Score, run: Vec<HeadTally>| {
         if run.len() < min_head {
             return;
@@ -3846,6 +3859,20 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
         }
         sc.seconds += 1;
         let t = r.sim.time;
+        {
+            let by_id: HashMap<u64, usize> = r.vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+            for v in &r.vehicles {
+                let Some(o) = v.last.wait_for.and_then(|w| by_id.get(&w)).map(|&k| &r.vehicles[k]) else { continue };
+                if v.id < o.id && o.last.wait_for == Some(v.id) {
+                    sc.mutual_s += 1;
+                    if v.state.speed < 0.3 && o.state.speed < 0.3 {
+                        sc.mutual_standing_s += 1;
+                        let d = |v: &Vehicle| format!("#{} lane {} s {:.1} v {:.2} why {} hold {:?}", v.id, v.state.lane, v.state.s, v.state.speed, why_name(v.last.why), hold_name(v.last.hold));
+                        sc.mutual_events.push(format!("{} t={t:.1}: {} <-> {}", sc.name, d(v), d(o)));
+                    }
+                }
+            }
+        }
         let day = r.sim.day_time;
         let (standing, heads) = standing_and_heads(&r, &near);
         sc.standing_vs += standing.len() as f64;
@@ -3862,6 +3889,12 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
                 if boxes[a].separation(&boxes[b]) < -0.1 {
                     hit[a] = true;
                     hit[b] = true;
+                    let (va, vb) = (&r.vehicles[nearv[a]], &r.vehicles[nearv[b]]);
+                    let key = (va.id.min(vb.id), va.id.max(vb.id));
+                    if touching.insert(key) {
+                        let d = |v: &Vehicle| format!("#{} lane {} s {:.1} v {:.1} why {} wf {:?}", v.id, v.state.lane, v.state.s, v.state.speed, why_name(v.last.why), v.last.wait_for);
+                        sc.overlap_events.push(format!("{} t={:.1} depth {:.2}: {} / {}", sc.name, t, -boxes[a].separation(&boxes[b]), d(va), d(vb)));
+                    }
                 }
             }
         }
@@ -3884,6 +3917,9 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
     }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
     sc.divergence = r.divergence.iter().map(|d| d.1 as f64).fold(0.0, f64::max);
+    for &(t, d, id) in r.divergence.iter().filter(|d| d.1 > 0.0005) {
+        sc.drift_events.push(format!("{} t={t:.1} {d:.3} m (vehicle #{id})", sc.name));
+    }
     sc.missing = r.missing.len() as u64;
     sc.deferred_spawns = r.deferred_spawns;
     sc.dropped_spawns = r.dropped_spawns;
@@ -3891,9 +3927,12 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
 }
 
 /// `ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10]
-/// [--reset] [--jobs N]`: free-run every fixture and print the score table. `--reset`
-/// replays as `heads` does (back to the recorded vehicles at every keyframe), for
-/// comparison.
+/// [--reset] [--jobs N] [--events] [--drift] [--overlaps] [--mutual]`: free-run every fixture and print
+/// the score table. `--reset` replays as `heads` does (back to the recorded vehicles at every
+/// keyframe), for comparison; `--events` lists the red crossings, `--drift` the keyframes
+/// the run was off the recording at, `--overlaps` the pairs of vehicles whose boxes overlap
+/// (once per pair, as first sampled), `--mutual` the seconds two vehicles stand waiting for
+/// each other.
 fn ab(args: &[String]) -> Res<()> {
     let with_value = ["--on", "--radius", "--json", "--min-head", "--jobs"];
     let mut fixtures: Vec<PathBuf> = Vec::new();
@@ -3961,6 +4000,8 @@ fn ab(args: &[String]) -> Res<()> {
         total.deferred_spawns += s.deferred_spawns;
         total.dropped_spawns += s.dropped_spawns;
         total.head_s += s.head_s;
+        total.mutual_s += s.mutual_s;
+        total.mutual_standing_s += s.mutual_standing_s;
     }
     let mut rows: Vec<(String, Vec<(&'static str, String)>)> = scores.iter().map(|s| (s.name.clone(), score_columns(s))).collect();
     rows.push((total.name.clone(), score_columns(&total)));
@@ -3993,10 +4034,32 @@ fn ab(args: &[String]) -> Res<()> {
     }
     let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {}; spawns deferred: {}, dropped: {})", total.missing, total.deferred_spawns, total.dropped_spawns);
     print!("{out}");
+    println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     if args.iter().any(|a| a == "--events") {
         for s in &scores {
             for e in &s.red_events {
                 println!("RED {e}");
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--mutual") {
+        for s in &scores {
+            for e in &s.mutual_events {
+                println!("MUTUAL {e}");
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--overlaps") {
+        for s in &scores {
+            for e in &s.overlap_events {
+                println!("OVERLAP {e}");
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--drift") {
+        for s in &scores {
+            for e in &s.drift_events {
+                println!("DRIFT {e}");
             }
         }
     }
@@ -4011,5 +4074,187 @@ fn ab(args: &[String]) -> Res<()> {
         });
         std::fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// stubs: what the `stub_links` switch changes in a fixture's network
+
+/// The recording's network grown with every `LanesAdded` record, switches as given.
+fn grown(fixture: &Path, switches: omsi_traffic::sim::Switches) -> Res<(Replay, usize)> {
+    let mut r = Replay::load(fixture)?;
+    r.set_switches(switches);
+    let header_lanes = r.net.lanes.len();
+    let records = std::mem::take(&mut r.records);
+    for rec in &records {
+        if let Record::LanesAdded { lanes, .. } = rec {
+            let added = r.net.extend(lanes.clone(), 1.5);
+            r.sim.network_grew(&r.net, added.start);
+        }
+    }
+    r.records = records;
+    Ok((r, header_lanes))
+}
+
+/// `stubs <fixture>... [--all]`: the links and meeting places `stub_links` drops from each
+/// fixture's network (the header's lanes and those added later), each checked against the
+/// rule's patterns, and the junction movements whose first meeting place moved.
+fn stubs(args: &[String]) -> Res<()> {
+    let all = args.iter().any(|a| a == "--all");
+    let fixtures: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let on = omsi_traffic::sim::Switches { stub_links: true, ..Default::default() };
+    let (mut t_links, mut t_pairs, mut t_bad) = (0usize, 0usize, 0usize);
+    for f in fixtures {
+        let path = Path::new(f);
+        let (r0, header_lanes) = grown(path, Default::default())?;
+        let (r1, _) = grown(path, on)?;
+        let (n0, n1) = (&r0.net, &r1.net);
+        let where_ = |i: usize| if i < header_lanes { "header" } else { "added" };
+        let mut lines: Vec<String> = Vec::new();
+        // links
+        let (mut links, mut bad) = (0usize, 0usize);
+        let (mut links_h, mut links_a) = (0usize, 0usize);
+        for a in 0..n0.lanes.len() {
+            for &b in &n0.lanes[a].next {
+                if n1.lanes[a].next.contains(&b) {
+                    continue;
+                }
+                links += 1;
+                if a < header_lanes { links_h += 1 } else { links_a += 1 }
+                // the stub it went round, as the rule has it (on the network without the switch)
+                let st = n0.stub_bypasses(a).into_iter().find(|&(x, _)| x == b).map(|(_, st)| st);
+                let ok = st.is_some_and(|st| n1.lanes[a].next.contains(&st) && n1.lanes[st].next.contains(&b));
+                if !ok {
+                    bad += 1;
+                }
+                if all || !ok {
+                    let txt = match st {
+                        Some(st) => {
+                            let (ls, lb) = (&n0.lanes[st], &n0.lanes[b]);
+                            format!(
+                                "link {a} -> {b} dropped ({}): stub {st} {:.2} m lit {:?}, {b} starts {:.2} m from its end, heading {:+.1}; {a}.next now {:?}{}",
+                                where_(a),
+                                ls.length(),
+                                ls.traffic_light,
+                                (lb.start() - ls.end()).truncate().length(),
+                                omsi_sim::traffic::wrap_deg(lb.start_heading() - ls.end_heading()),
+                                n1.lanes[a].next,
+                                if ok { "" } else { "  UNEXPECTED: the way is not a -> stub -> b" }
+                            )
+                        }
+                        None => format!("link {a} -> {b} dropped ({}) UNEXPECTED: no lit stub found", where_(a)),
+                    };
+                    lines.push(txt);
+                }
+            }
+            for &b in &n1.lanes[a].next {
+                if !n0.lanes[a].next.contains(&b) {
+                    bad += 1;
+                    lines.push(format!("link {a} -> {b} ADDED (UNEXPECTED)"));
+                }
+            }
+        }
+        // meeting places
+        let mut pairs = 0usize;
+        let (mut consec, mut sibling) = (0usize, 0usize);
+        for i in 0..n0.lanes.len() {
+            for c in &n0.crossings[i] {
+                let j = c.other;
+                let kept = n1.crossings[i].iter().any(|d| d == c);
+                if kept || j < i {
+                    continue;
+                }
+                pairs += 1;
+                let (a, b) = (&n1.lanes[i], &n1.lanes[j]);
+                // (one leads into the other within three links, as linked without the
+                // switch: the lead-in and its stub, or a piece after its stub that merged
+                // with it through the lane after both, a link the switch dropped)
+                let after = |net: &Network, from: usize, to: usize| -> bool {
+                    let mut at = vec![from];
+                    for _ in 0..3 {
+                        at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+                        if at.contains(&to) {
+                            return true;
+                        }
+                    }
+                    false
+                };
+                let follows = after(n0, i, j) || after(n0, j, i);
+                let sib = !follows && n1.one_way_pieces(i, j);
+                if follows {
+                    consec += 1;
+                } else if sib {
+                    sibling += 1;
+                }
+                let ok = c.merge && (follows || sib);
+                if !ok {
+                    bad += 1;
+                }
+                if all || !ok {
+                    lines.push(format!(
+                        "meeting {i} ({:.1} m{}) / {j} ({:.1} m{}) dropped ({}): {} at {:.2}/{:.2}, from {:.2} on {i}; {}{}",
+                        a.length(),
+                        a.traffic_light.map(|l| format!(" lit {}.{}", l.0, l.1)).unwrap_or_default(),
+                        b.length(),
+                        b.traffic_light.map(|l| format!(" lit {}.{}", l.0, l.1)).unwrap_or_default(),
+                        where_(i.max(j)),
+                        if c.merge { "merge" } else { "crossing" },
+                        c.at,
+                        c.other_at,
+                        c.at - c.before,
+                        if follows { "pieces of one way" } else if sib { "sibling stubs" } else { "neither" },
+                        if ok { "" } else { "  UNEXPECTED" }
+                    ));
+                }
+            }
+            for c in &n1.crossings[i] {
+                if !n0.crossings[i].iter().any(|d| d == c) && c.other > i {
+                    bad += 1;
+                    lines.push(format!("meeting {i} / {} ADDED (UNEXPECTED)", c.other));
+                }
+            }
+        }
+        // junctions: movements whose first meeting place moved, and lit ones among them
+        let (j0, j1) = (&r0.sim.junctions, &r1.sim.junctions);
+        let (mut moved, mut lit_moved) = (0usize, 0usize);
+        for (lane, &(ja, ma)) in j0.of_lane.iter().map(|(l, v)| (*l, v)).collect::<BTreeMap<usize, &(usize, usize)>>().into_iter().map(|(l, v)| (l, v)) {
+            let Some(&(jb, mb)) = j1.of_lane.get(&lane) else { continue };
+            let (a, b) = (&j0.nodes[ja].movements[ma], &j1.nodes[jb].movements[mb]);
+            if a.conflict_start != b.conflict_start {
+                moved += 1;
+                // a lead-in feeding a lit stub
+                let feeds_lit = n1.lanes[lane].next.iter().any(|&n| n1.is_lit_stub(n));
+                if feeds_lit {
+                    lit_moved += 1;
+                }
+                if all {
+                    lines.push(format!("movement lane {lane}: first meeting place {:.2} -> {:.2}{}", a.conflict_start, b.conflict_start, if feeds_lit { " (feeds a lit stub)" } else { "" }));
+                }
+            }
+        }
+        // the recorded junction table against one compiled from the recorded network (the
+        // replay takes the recorded one; with the switch on it compiles its own)
+        // (of the header's network: the lanes added later are compiled as the game did,
+        // `Junctions::extend`; nodes compared by their object, whatever their order)
+        let fresh = Replay::load(path)?;
+        let compiled = omsi_traffic::Junctions::compile(&fresh.net);
+        let recorded = &fresh.sim.junctions;
+        let differing = recorded.nodes.iter().filter(|n| !compiled.nodes.iter().any(|c| c == *n)).count();
+        let same = differing == 0 && compiled.nodes.len() == recorded.nodes.len();
+        let j0_len = recorded.nodes.len();
+        println!(
+            "{}: links dropped {links} (header {links_h}, added {links_a}); meetings dropped {pairs} (consecutive {consec}, sibling stubs {sibling}); movements whose first meeting place moved {moved} (lead-ins of a lit stub {lit_moved}); unexpected {bad}; junctions compiled from the header's network {} the recorded ones{}",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
+            if same { "equal" } else { "differ from" },
+            if same { String::new() } else { format!(" ({differing} of {j0_len} nodes, {} vs {j0_len})", compiled.nodes.len()) }
+        );
+        for l in lines {
+            println!("  {l}");
+        }
+        t_links += links;
+        t_pairs += pairs;
+        t_bad += bad;
+    }
+    println!("TOTAL links dropped {t_links}, meetings dropped {t_pairs}, unexpected {t_bad}");
     Ok(())
 }
