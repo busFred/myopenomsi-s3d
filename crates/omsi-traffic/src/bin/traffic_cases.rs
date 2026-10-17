@@ -687,6 +687,10 @@ struct VSample {
     x: f64,
     y: f64,
     row: Vec<Value>,
+    /// The planned way: up to 6 lane ids after the current one, and the turn flag of the
+    /// first lane (the current one included) that turns (0 straight, 1 left, 2 right).
+    intent: Vec<usize>,
+    intent_turn: i32,
 }
 
 struct Sample {
@@ -694,7 +698,7 @@ struct Sample {
     vehicles: Vec<VSample>,
     /// (x, y, state, decision, still, on_crossing)
     people: Vec<(f64, f64, String, Option<String>, f64, bool)>,
-    players: Vec<[f64; 4]>,
+    players: Vec<[f64; 5]>,
     lights: Vec<(usize, usize, i32)>,
     /// Every light's state, per controller.
     all_lights: Vec<Vec<i32>>,
@@ -758,6 +762,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
     };
     let all_people = args.iter().any(|a| a == "--all-people");
     let mut road: Option<RoadGrid> = None;
+    let mut planned: HashSet<usize> = HashSet::new();
     while r.step() {
         let t = r.sim.day_time;
         if t + 1e-6 < next_t {
@@ -811,12 +816,34 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 json!(r1(v.state.s as f64)),
                 json!(d.held as u8),
                 hold_name(d.hold).map(|h| json!(h)).unwrap_or(Value::Null),
+                // the indicator shown (0 off, 1 left, 2 right, 3 hazard)
+                json!(omsi_traffic::sim::Simulation::blinker(v).clamp(0, 3)),
+                // the planned way: filled in when written (clipped to the lane table)
+                Value::Null,
             ];
+            // the way ahead: a scheduled bus follows its route, the others their plan
+            let st = &v.state;
+            let ahead: Vec<usize> = if !st.route.is_empty() && st.route_index + 1 < st.route.len() {
+                st.route[st.route_index + 1..].iter().copied().take(12).collect()
+            } else {
+                st.upcoming().take(12).collect()
+            };
+            let intent_turn = std::iter::once(st.lane)
+                .chain(ahead.iter().copied())
+                .filter_map(|l| r.net.lanes.get(l))
+                .map(|l| l.turn)
+                .find(|&t| t != 0)
+                .unwrap_or(0);
+            for &l in ahead.iter().take(6) {
+                planned.insert(l);
+            }
             vs.push(VSample {
                 id: v.id,
                 x: v.pos.x,
                 y: v.pos.y,
                 row,
+                intent: ahead.into_iter().take(6).collect(),
+                intent_turn,
             });
         }
         let mut ps = Vec::new();
@@ -859,6 +886,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                     r1(p.pos.y - cy),
                     p.heading.round() as f64,
                     r1(p.speed as f64),
+                    (p.blinker.min(3)) as f64,
                 ]
             })
             .collect();
@@ -888,7 +916,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             LaneKind::Sidewalk => foot_of_crossing.contains(&l) || lane.traffic_light.is_some(),
             _ => false,
         };
-        if keep && near_lane(net, l, radius + 50.0) {
+        // (the lanes some vehicle plans to drive are kept further out, for the viewer's intent line)
+        if keep && (near_lane(net, l, radius + 50.0) || (planned.contains(&l) && near_lane(net, l, radius + 120.0))) {
             lane_set.push(l);
         }
     }
@@ -948,7 +977,9 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
     let lanes_json = |rad: f64| -> Vec<Value> {
         lane_set
             .iter()
-            .filter(|&&l| near_lane(net, l, rad + 50.0))
+            .filter(|&&l| {
+                near_lane(net, l, rad + 50.0) || (planned.contains(&l) && near_lane(net, l, rad + 120.0))
+            })
             .map(|&l| {
                 let lane = &net.lanes[l];
                 let pts: Vec<(f64, f64)> =
@@ -1031,6 +1062,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         let mut prev_people: Vec<String> = Vec::new();
         let mut prev_lights: HashMap<(usize, usize), i32> = HashMap::new();
         let mut vids: BTreeMap<u64, Value> = BTreeMap::new();
+        let lanes = lanes_json(rad);
+        let lanes_in: HashSet<u64> = lanes.iter().filter_map(|l| l[0].as_u64()).collect();
         for s in samples.iter().step_by(step) {
             let mut v = Vec::new();
             let mut k = Vec::new();
@@ -1043,10 +1076,26 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 let mut mask = 0u32;
                 let mut vals = Vec::new();
                 let prev = prev_rows.get(&vs.id);
-                for f in 1..vs.row.len() {
-                    if prev.map(|p| p[f] != vs.row[f]).unwrap_or(true) {
+                // the planned way, cut at the first lane the trace does not have:
+                // [turn, lane, ...] or null
+                let mut row = vs.row.clone();
+                let way: Vec<usize> = vs
+                    .intent
+                    .iter()
+                    .copied()
+                    .take_while(|&l| lanes_in.contains(&(l as u64)))
+                    .collect();
+                row[16] = if way.is_empty() {
+                    Value::Null
+                } else {
+                    let mut a = vec![json!(vs.intent_turn)];
+                    a.extend(way.iter().map(|&l| json!(l)));
+                    Value::Array(a)
+                };
+                for f in 1..row.len() {
+                    if prev.map(|p| p[f] != row[f]).unwrap_or(true) {
                         mask |= 1 << (f - 1);
-                        vals.push(vs.row[f].clone());
+                        vals.push(row[f].clone());
                     }
                 }
                 if mask == 0 {
@@ -1058,7 +1107,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 }
                 vids.entry(vs.id)
                     .or_insert_with(|| vinfo.get(&vs.id).cloned().unwrap_or(Value::Null));
-                now_rows.insert(vs.id, vs.row.clone());
+                now_rows.insert(vs.id, row);
             }
             prev_rows = now_rows;
             // people: [x, y, state, decision, standing since (day time, 0 walking), on_crossing];
@@ -1130,8 +1179,6 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             }
             frames.push(Value::Object(fr));
         }
-        let lanes = lanes_json(rad);
-        let lanes_in: HashSet<u64> = lanes.iter().filter_map(|l| l[0].as_u64()).collect();
         let cr: Vec<Value> = crossings
             .iter()
             .filter(|c| {
@@ -1170,9 +1217,9 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 "end": samples.last().map(|s| s.t),
                 "notes": notes,
                 "fields": {
-                    "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
+                    "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null, blinker (0 off, 1 left, 2 right, 3 hazard as shown), intent [turn, lane, lane, ...]|null (the planned way: up to 6 lane ids after the current lane, cut at the first lane missing from \"lanes\"; turn = the turn flag of the first lane on the way, the current one included, that turns: 0 straight, 1 left, 2 right)], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
                     "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
-                    "pl": "[x, y, heading_deg, speed]",
+                    "pl": "[x, y, heading_deg, speed, blinker]",
                     "l": "[ctl, light, state] when it changed (state: 0-2 red, 3-5 red+yellow, 6-8 green, 9-11 yellow)",
                     "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points]",
                     "vinfo": "id: [front, rear, half_width, class, type]",

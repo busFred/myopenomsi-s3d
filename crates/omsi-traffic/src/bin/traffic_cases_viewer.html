@@ -77,7 +77,9 @@ function secs(s){const [h,mi,se]=s.split(':').map(Number);return h*3600+mi*60+(s
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function row(k,v){return `<tr><td>${k}</td><td>${v==null?'<span class="mut">-</span>':v}</td></tr>`;}
 // the fields of one vehicle row, as [name, html]
-function vehFields(r){return [['lane / s',r[11]+' / '+r[12]],['speed',r[4]+' m/s'],['why','<b style="color:'+(WHY[r[5]]||'')+'">'+r[5]+'</b>'],['stop',r[6]],['lead_id',r[7]],['wait_for',r[8]],['impatience',r[9]],['held',r[13]?'yes':'no'],['hold',r[14]],['passing',r[10]?'yes':'no'],['heading',r[3]+'°']];}
+const TURN=['straight','left','right'],BLK=['off','left','right','hazard'];
+function vehFields(r){const it=r[16],ln=it&&it.length>1?it.slice(1):null;
+ return [['lane / s',r[11]+' / '+r[12]],['speed',r[4]+' m/s'],['why','<b style="color:'+(WHY[r[5]]||'')+'">'+r[5]+'</b>'],['stop',r[6]],['lead_id',r[7]],['wait_for',r[8]],['impatience',r[9]],['held',r[13]?'yes':'no'],['hold',r[14]],['passing',r[10]?'yes':'no'],['heading',r[3]+'°'],['indicator',BLK[r[15]||0]],['intends',ln?TURN[it[0]]+' via lanes '+ln.join(' → '):'no planned way']];}
 // One canvas showing one trace. `o.view` is the {scale,ox,oy} the pane draws with (several panes may share one),
 // `o.cars` the diagnosed vehicles by id, `o.chain` false leaves the wait chain of the pinned vehicle out.
 // The caller owns the state: draw(fi, st) with st = {pinned, pinP, msg, flashUntil}.
@@ -90,12 +92,22 @@ function makePane(cv,D,o){
  // frames: full rows per frame (k = ids unchanged since the previous frame)
  const F=[];let prev={},lights={},prevP=[];
  for(const f of D.frames){const cur={};
-  for(const e of f.v){const id=e[0],m=e[1],o=prev[id];const r=o?o.slice():new Array(15).fill(null);r[0]=id;let j=2;for(let b=0;b<14;b++)if(m&(1<<b))r[b+1]=e[j++];cur[id]=r;}
+  for(const e of f.v){const id=e[0],m=e[1],o=prev[id];const r=o?o.slice():new Array(17).fill(null);r[0]=id;let j=2;for(let b=0;b<16;b++)if(m&(1<<b))r[b+1]=e[j++];cur[id]=r;}
   if(f.k)for(const id of f.k){if(prev[id])cur[id]=prev[id];}
   if(f.l){lights=Object.assign({},lights);for(const [c,li,st] of f.l)lights[c+'/'+li]=st;}
   const P=(f.pk||[]).map(i=>prevP[i]).filter(Boolean).concat(f.p||[]);
   F.push({t:f.t,v:cur,p:P.map(q=>[q[0],q[1],q[2],q[3],q[4]?Math.max(0,Math.round(f.t-q[4])):0,q[5]]),pl:f.pl,l:lights});prev=cur;prevP=P;}
  const cross=new Set();for(const c of D.crossings)for(const l of c.lanes)cross.add(l);
+ const LI={};for(const L of D.lanes)LI[L[0]]=L;
+ // the lamps of an indicator state (1 left, 2 right, 3 hazard) at the front corners of a box already translated and rotated to the vehicle
+ function lamps(b,fr,hw,scale,on){if(!b||!on)return;const rad=Math.max(2.5,0.45*scale);cx.fillStyle='#ffb000';cx.strokeStyle='#3a2600';cx.lineWidth=1;
+  for(const side of [-1,1]){if(!(b===3||b===(side<0?1:2)))continue;cx.beginPath();cx.arc(side*(hw*scale-rad*0.3),-fr*scale+rad*0.3,rad,0,7);cx.fill();cx.stroke();}}
+ // the planned way of vehicle row r: from the vehicle along the rest of its lane and the planned lanes, as screen points
+ function wayPts(r){const it=r[16];if(!it||it.length<2)return null;const out=[[sx(r[1]),sy(r[2])]];const cur=LI[r[11]];
+  if(cur&&cur[8]&&cur[8].length>1){const p=cur[8];let bi=0,bd=1e18;for(let i=0;i<p.length-1;i++){const ax=p[i][0],ay=p[i][1],dx=p[i+1][0]-ax,dy=p[i+1][1]-ay,l2=dx*dx+dy*dy||1e-9;const t=Math.max(0,Math.min(1,((r[1]-ax)*dx+(r[2]-ay)*dy)/l2));const d=Math.hypot(ax+dx*t-r[1],ay+dy*t-r[2]);if(d<bd){bd=d;bi=i;}}
+   if(bd<8)for(let i=bi+1;i<p.length;i++)out.push([sx(p[i][0]),sy(p[i][1])]);}
+  for(let k=1;k<it.length;k++){const L=LI[it[k]];if(!L||!L[8])break;for(const q of L[8])out.push([sx(q[0]),sy(q[1])]);}
+  return out.length>1?out:null;}
  const fitScale=()=>250/((M.radius||150)*0.6);
  function fit(){V.scale=fitScale();V.ox=0;V.oy=0;}
  if(V.scale==null)fit();
@@ -120,18 +132,20 @@ function makePane(cv,D,o){
   // people [x,y,state,decision,still,on_crossing]
   for(const p of f.p){cx.fillStyle=stateCol(p[2]);cx.beginPath();cx.arc(sx(p[0]),sy(p[1]),Math.max(2.5,0.4*scale),0,7);cx.fill();
    if(p[3]!=null){cx.strokeStyle=S[p[3]]==='go'?'#3fb950':'#ff7b72';cx.lineWidth=1.5;cx.beginPath();cx.arc(sx(p[0]),sy(p[1]),Math.max(5,0.8*scale),0,7);cx.stroke();}}
-  // vehicles
+  // vehicles (indicators blink at 1 Hz on the page clock, so they show when paused too)
+  const blinkOn=Math.floor(performance.now()/500)%2===0;
   for(const r of Object.values(f.v)){const inf=VI[r[0]]||[2.2,2.2,0.9];const fr=inf[0],re=inf[1],hw=inf[2];const h=r[3]*Math.PI/180;
    cx.save();cx.translate(sx(r[1]),sy(r[2]));cx.rotate(h);
    cx.fillStyle=WHY[r[5]]||'#8b949e';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);
    cx.fillStyle='rgba(0,0,0,0.45)';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,Math.min(1,fr+re)*scale);
    if(r[10]){cx.strokeStyle='#ffd33d';cx.lineWidth=2;cx.strokeRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);}
+   lamps(r[15],fr,hw,scale,blinkOn);
    if(pinned===r[0]){cx.strokeStyle='#fff';cx.lineWidth=2;cx.setLineDash([3,2]);cx.strokeRect(-hw*scale-3,-fr*scale-3,2*hw*scale+6,(fr+re)*scale+6);cx.setLineDash([]);}
    cx.restore();
    if(scale>5||CARS[r[0]]&&scale>3.5||r[0]===pinned){cx.fillStyle=CARS[r[0]]?'#ffd33d':'#c9d1d9';cx.font='10px system-ui';cx.fillText(r[0],sx(r[1])+hw*scale+2,sy(r[2])-2);}}
   // players [x,y,h,speed]
   for(const p of f.pl){const h=p[2]*Math.PI/180;cx.save();cx.translate(sx(p[0]),sy(p[1]));cx.rotate(h);cx.fillStyle='#ffffff';cx.strokeStyle='#000';cx.lineWidth=1;
-   cx.fillRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.strokeRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.fillStyle='#e5534b';cx.fillRect(-1.25*scale,-6*scale,2.5*scale,Math.min(1,12)*scale);cx.restore();}
+   cx.fillRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.strokeRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.fillStyle='#e5534b';cx.fillRect(-1.25*scale,-6*scale,2.5*scale,Math.min(1,12)*scale);lamps(p[4],6,1.25,scale,blinkOn);cx.restore();}
   // wait chain from the pinned vehicle
   if(chain&&pinned!=null&&f.v[pinned]){let cur=f.v[pinned];const seen=new Set();cx.lineWidth=2.5;
    for(let k=0;k<25&&cur;k++){seen.add(cur[0]);let nx=null,col='#4f8ef7';
@@ -141,6 +155,11 @@ function makePane(cv,D,o){
     cx.strokeStyle=col;cx.beginPath();cx.moveTo(sx(cur[1]),sy(cur[2]));cx.lineTo(sx(tx),sy(ty));cx.stroke();
     cx.fillStyle=col;cx.beginPath();cx.arc(sx(tx),sy(ty),4,0,7);cx.fill();
     if(typeof nx==='string'||seen.has(nx))break;cur=f.v[nx];}}
+  // the intended way of the pinned vehicle, along the planned lanes' centrelines
+  if(pinned!=null&&f.v[pinned]){const w=wayPts(f.v[pinned]);
+   if(w){cx.strokeStyle='#00e5ff';cx.lineWidth=3;cx.beginPath();w.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.stroke();
+    let a=w[w.length-1],b=null;for(let i=w.length-2;i>=0;i--){if(Math.hypot(a[0]-w[i][0],a[1]-w[i][1])>3){b=w[i];break;}}
+    if(b){const ang=Math.atan2(a[1]-b[1],a[0]-b[0]);cx.save();cx.translate(a[0],a[1]);cx.rotate(ang);cx.fillStyle='#00e5ff';cx.beginPath();cx.moveTo(6,0);cx.lineTo(-7,-6);cx.lineTo(-7,6);cx.closePath();cx.fill();cx.restore();}}}
   // the flash round a vehicle just looked up
   const now=performance.now();
   if(pinned!=null&&f.v[pinned]&&now<st.flashUntil){const r=f.v[pinned],ph=(now/350)%1;
@@ -152,7 +171,7 @@ function makePane(cv,D,o){
   if(st.pinned!=null){const r=f.v[st.pinned];const inf=VI[st.pinned]||[];const c=CARS[st.pinned];
    const dg=c?`<div class="mut">diagnosed: stood ${c.stood} s from ${c.start}; why ${esc(c.why)}</div>`:'';
    if(!r)return m+`<b>vehicle ${st.pinned}</b> <span class="mut">(not in view at this time)</span>`+dg;
-   return m+`<b>vehicle ${r[0]}</b> <span class="mut">${inf[3]||''} ${inf[4]||''}</span>`+dg+`<table>`+vehFields(r).map(([k,v])=>row(k,v)).join('')+'</table><div class="mut">chain: blue = lead, orange = wait_for</div>';}
+   return m+`<b>vehicle ${r[0]}</b> <span class="mut">${inf[3]||''} ${inf[4]||''}</span>`+dg+`<table>`+vehFields(r).map(([k,v])=>row(k,v)).join('')+'</table><div class="mut">chain: blue = lead, orange = wait_for, cyan = intended way</div>';}
   if(st.pinP){const p=f.p.reduce((b,q)=>{const d=Math.hypot(q[0]-st.pinP[0],q[1]-st.pinP[1]);return !b||d<b[0]?[d,q]:b;},null);
    if(!p||p[0]>3)return '<span class="mut">the pedestrian is not near the pinned place now</span>';const q=p[1];st.pinP=[q[0],q[1]];
    return '<b>pedestrian</b><table>'+row('state',S[q[2]])+row('decision',q[3]==null?null:S[q[3]])+row('still',q[4]+' s')+row('on crossing',q[5]?'yes':'no')+row('at',q[0]+', '+q[1])+'</table>';}
@@ -242,6 +261,7 @@ P.bind({fi:()=>fi,redraw:draw,click:h=>{st.msg='';
 window.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type==='text')return;if(e.key===' '){e.preventDefault();document.getElementById('play').click();}else if(e.key==='ArrowRight'){fi=Math.min(F.length-1,fi+1);draw();}else if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);draw();}});
 // start at the window's middle; #pin=<vehicle id>&t=HH:MM:SS&zoom=<px per m> opens a vehicle pinned
 let m=0;for(let i=0;i<F.length;i++)if(Math.abs(F[i].t-M.mid)<Math.abs(F[m].t-M.mid))m=i;fi=m;
+setInterval(()=>{if(!playing&&!document.hidden)P.draw(fi,st);},250);
 draw();applyHash();if(st.pinned!=null)setTimeout(()=>cv.scrollIntoView({block:'center'}),50);
 })();
 </script></body></html>
