@@ -714,7 +714,10 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(400);
     let mut r = Replay::load(fixture)?;
-    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    // (without --on the recording keeps the switches its header names)
+    if let Some(list) = opt(args, "--on") {
+        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    }
     // (`--free`: no reset at the keyframes, the simulation runs on by itself from the first one)
     let free = args.iter().any(|a| a == "--free");
     r.free_run = free;
@@ -1154,7 +1157,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             .collect();
         let doc = json!({
             "mode": if free { "free" } else { "recorded" },
-            "switches": opt(args, "--on").unwrap_or(""),
+            "switches": r.switches.list(),
             "meta": {
                 "fixture": fixture.file_name().and_then(|s| s.to_str()),
                 "map": r.header.map,
@@ -1691,7 +1694,10 @@ fn diagnose(fixture: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(15.0);
     let mut r = Replay::load(fixture)?;
-    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    // (without --on the recording keeps the switches its header names)
+    if let Some(list) = opt(args, "--on") {
+        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    }
     let mid = window_mid(fixture, &r);
     let c = player_at(&r, mid).ok_or("no player")?;
     let (cx, cy) = (c.x, c.y);
@@ -3066,7 +3072,10 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
     let mut r = Replay::load(fixture)?;
     // (`--free` runs on from its own vehicles at the keyframes, `--on` with rule switches)
     r.free_run = args.iter().any(|a| a == "--free");
-    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    // (without --on the recording keeps the switches its header names)
+    if let Some(list) = opt(args, "--on") {
+        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
+    }
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
     }
@@ -4065,9 +4074,11 @@ fn stop_lines(net: &Network) -> Vec<StopLine> {
 }
 
 /// Replay one fixture free-running from its first keyframe to the end and score it.
-fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
+fn ab_run(fixture: &Path, switches: Option<omsi_traffic::sim::Switches>, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
     let mut r = Replay::load(fixture)?;
-    r.set_switches(switches);
+    if let Some(sw) = switches {
+        r.set_switches(sw);
+    }
     r.free_run = free_run;
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
@@ -4254,7 +4265,8 @@ fn ab(args: &[String]) -> Res<()> {
     let min_head: usize = opt(args, "--min-head").map(|s| s.parse()).transpose()?.unwrap_or(10);
     let jobs: usize = opt(args, "--jobs").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     let free_run = !args.iter().any(|a| a == "--reset");
-    let switches = omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?;
+    // (without --on every fixture keeps the switches its header names)
+    let switches: Option<omsi_traffic::sim::Switches> = opt(args, "--on").map(|l| omsi_traffic::sim::Switches::from_list(l)).transpose().map_err(|e| -> Box<dyn Error> { e.into() })?;
 
     // (each fixture on its own: the order of the rows is the order given)
     let results: std::sync::Mutex<Vec<Option<Result<Score, String>>>> = std::sync::Mutex::new((0..fixtures.len()).map(|_| None).collect());
@@ -4313,7 +4325,7 @@ fn ab(args: &[String]) -> Res<()> {
     let _ = writeln!(
         out,
         "AB switches [{}] radius {radius:.0} m, {} run, heads counted from {min_head} s, {} fixtures, {} s sampled",
-        switches.list(),
+        switches.map(|s| s.list()).unwrap_or_else(|| "as recorded".to_string()),
         if free_run { "free" } else { "reset-at-keyframes" },
         scores.len(),
         total.seconds
@@ -4366,7 +4378,7 @@ fn ab(args: &[String]) -> Res<()> {
     }
     if let Some(path) = opt(args, "--json") {
         let doc = json!({
-            "switches": switches.list(),
+            "switches": switches.map(|s| s.list()).unwrap_or_else(|| "as recorded".to_string()),
             "radius": radius,
             "min_head": min_head,
             "free_run": free_run,
