@@ -426,9 +426,24 @@ const STUB_JOINT: f64 = 0.5;
 /// ... heading as the stub ends, within this many degrees.
 const STUB_HEADING: f32 = 20.0;
 
-/// `stub_links` named in `OMSI_TRAFFIC_SWITCHES` (or `all`).
+/// The traffic switches' names (`omsi_traffic::sim::Switches`), here so that the network
+/// reads `OMSI_TRAFFIC_SWITCHES` as the simulation does.
+pub const SWITCH_NAMES: [&str; 7] = ["competitor_filter", "signal_foes", "stub_links", "pass_room", "dead_end", "corner_clearance", "kerb_wait"];
+
+/// `stub_links` named in the switch list `list` (or `all`); false when the list names a switch
+/// that does not exist, as `Switches::from_list` then turns none on (a typo must not give
+/// the network its switch and the simulation none).
+pub fn stub_links_in(list: &str) -> bool {
+    let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+    if names.iter().any(|n| *n != "all" && !SWITCH_NAMES.contains(n)) {
+        return false;
+    }
+    names.iter().any(|n| *n == "stub_links" || *n == "all")
+}
+
+/// `stub_links_in` of `OMSI_TRAFFIC_SWITCHES`.
 pub fn stub_links_from_env() -> bool {
-    omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES").map(|l| l.split(',').map(str::trim).any(|n| n == "stub_links" || n == "all")).unwrap_or(false)
+    omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES").map(|l| stub_links_in(&l)).unwrap_or(false)
 }
 
 /// `Network::reach` is counted up to this far (m).
@@ -985,16 +1000,21 @@ impl Network {
     }
 
     /// (`stub_links`) Lanes `i` and `j` are pieces of one way, not two ways that meet: one
-    /// leads into the other, directly or over at most two short pieces (`STUB_MAX`: a
+    /// leads into the other (and no other stream's way runs through the piece, `fed_past`),
+    /// directly or over at most two short pieces (`STUB_MAX`: a
     /// lead-in and its stub, whose ends lie a metre apart; a lead-in and the 0.4 m piece
     /// after its stub), or both are short stubs side by side from one place (a lit stub and
     /// an unlit one of 0.3 m at the end of one lead-in: a fork).
     pub fn one_way_pieces(&self, i: usize, j: usize) -> bool {
-        if self.leads_into(i, j) || self.leads_into(j, i) {
+        let (a, b) = (&self.lanes[i], &self.lanes[j]);
+        if a.length() <= STUB_MAX && b.length() <= STUB_MAX && !a.points.is_empty() && !b.points.is_empty() && (a.start() - b.start()).truncate().length() <= STUB_JOINT {
             return true;
         }
-        let (a, b) = (&self.lanes[i], &self.lanes[j]);
-        a.length() <= STUB_MAX && b.length() <= STUB_MAX && !a.points.is_empty() && !b.points.is_empty() && (a.start() - b.start()).truncate().length() <= STUB_JOINT
+        // (not when the piece is another stream's way too, `fed_past`)
+        if self.leads_into(i, j) {
+            return !self.fed_past(i, j);
+        }
+        self.leads_into(j, i) && !self.fed_past(j, i)
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -1008,6 +1028,25 @@ impl Network {
         }
         let h = (la.end_heading() as f64).to_radians();
         (lb.end() - la.end()).truncate().dot(DVec2::new(h.sin(), h.cos())) > 0.1
+    }
+
+    /// The piece `y` that lane `x` leads into is also the way of another stream that `x`
+    /// can drive past: a feeder of `y` that is not one of `x`'s own pieces nor a stub beside
+    /// `y` from the same place, while `x` links past `y` into a lane after it (case07
+    /// 5229/5230: 5231 feeds the 1.1 m piece 5230 and 5229 links past it into 5228; the
+    /// merge 5229/5230 is where the two streams meet). The merge stays.
+    fn fed_past(&self, x: usize, y: usize) -> bool {
+        let (lx, ly) = (&self.lanes[x], &self.lanes[y]);
+        let skips = lx.next.iter().any(|&m| m != y && ly.next.contains(&m));
+        if !skips || ly.points.is_empty() {
+            return false;
+        }
+        self.prev.get(y).is_some_and(|feeders| {
+            feeders.iter().any(|&k| {
+                let lk = &self.lanes[k];
+                k != x && !self.leads_into(x, k) && !lk.points.is_empty() && (lk.start() - ly.start()).truncate().length() > STUB_JOINT
+            })
+        })
     }
 
     /// Lane `from` leads into `to`: `to` goes on from its end (`continues`), or from the end
@@ -1780,7 +1819,21 @@ mod stub_links_tests {
             net.link(1.5);
             assert!(net.lanes[2].next.contains(&1), "linked back to the other way's last piece");
             assert!(merges(&net, 1, 2), "stub_links {on}: {:?}", net.crossings[1]);
+            // (review4) the first way links past its last piece into the exit too, and the
+            // other way's stream runs through that piece: their meeting place stays
+            assert!(net.lanes[0].next.contains(&3) && net.lanes[0].next.contains(&1));
+            assert!(merges(&net, 0, 1), "stub_links {on}: {:?}", net.crossings[0]);
         }
+    }
+
+    #[test]
+    fn stub_links_is_read_from_the_switch_list_as_the_simulation_reads_it() {
+        assert!(stub_links_in("competitor_filter,stub_links"));
+        assert!(stub_links_in(" all "));
+        assert!(!stub_links_in("competitor_filter,signal_foes"));
+        // a name that is no switch: the simulation turns none on, nor does the network
+        assert!(!stub_links_in("stub_links,signal_foe"));
+        assert!(!stub_links_in(""));
     }
 
     #[test]

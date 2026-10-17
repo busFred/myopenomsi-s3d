@@ -287,16 +287,21 @@ fn behind_on_my_way(c: &Claim, o: &Claim) -> bool {
 /// can only come after me, whatever its speed and wherever its way goes on (case03: cars
 /// rolling up behind the head of their own queue, "committed" to the merge of the lead-in
 /// with its own stub, held the head at green).
-fn behind_in_my_lane(c: &Claim, o: &Claim) -> bool {
+/// Only where its way reaches my lane before its meeting place with me (`their_at`: the
+/// distance from its origin to that meeting place): a way that comes back round into my
+/// lane after crossing mine is no proof of anything.
+fn behind_in_my_lane(c: &Claim, o: &Claim, their_at: f32) -> bool {
     let Some(&(my_lane, my_start)) = c.lanes.first() else { return false };
     // (my origin is `-my_start` along my lane; theirs `-d` where their way reaches it)
     let Some(&(_, d)) = o.lanes.iter().find(|&&(l, _)| l == my_lane) else { return false };
-    -d + o.front <= -my_start - c.rear - 1.0
+    d < their_at && -d + o.front <= -my_start - c.rear - 1.0
 }
 
 /// (competitor_filter) `o` comes into my way at the merge `foe` behind me: along the
 /// merged way its front is at least a metre behind my rear, and it cannot be at the merge's
-/// end before my rear is past it (with the margin). A car merging in behind me follows me,
+/// end before my rear is past it, with the margin: the gap I accept when it has the right of
+/// way (a side car went in front of a main road car at 13.5 m/s 65 m off on the 0.6 s
+/// margin, and the main road car braked 4.5 m/s²). A car merging in behind me follows me,
 /// whether or not my front has reached a piece both ways share.
 fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
     if foe.kind != FoeKind::Merge {
@@ -310,7 +315,8 @@ fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
     }
     let my_out = arrival_time(-my_rear, c.speed, c.accel, c.v_max);
     let their_at = arrival_time(-their_front, o.speed, o.accel, o.v_max);
-    o.speed < 0.3 || their_at >= my_out + CLEAR_MARGIN
+    let margin = if foe.yields && !c.absolute { c.gap.max(CLEAR_MARGIN) } else { CLEAR_MARGIN };
+    their_at >= my_out + margin
 }
 
 /// One pass over the claims; `plain` is the first pass's answer when fed-up drivers may
@@ -376,7 +382,7 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 let o = &shifted;
                 // (competitor_filter) behind me in my own lane, or merging in behind me: it
                 // comes after me at any speed, committed or not
-                if filter && (behind_in_my_lane(c, &claims[ok]) || (!their_inside && merging_behind(c, o, foe))) {
+                if filter && (behind_in_my_lane(c, &claims[ok], foe.theirs.0 - o.s) || (!their_inside && merging_behind(c, o, foe))) {
                     continue;
                 }
                 let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
@@ -1192,19 +1198,21 @@ mod tests {
 
     #[test]
     fn competitor_filter_a_car_merging_in_behind_me_is_no_foe_before_my_front_reaches_the_shared_piece() {
-        // A (0) and B (1) merge into the exit; A gives way to B. No piece of the object is
-        // on both ways (the exit lies outside it): the merge itself says who is behind.
-        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0)]);
-        assert!(js.nodes[0].movements[0].foes[0].yields && js.nodes[0].movements[0].foes[0].kind == FoeKind::Merge);
+        // A (0) and B (1) merge into the exit; B (from the left) gives way to A. No piece of
+        // the object is on both ways (the exit lies outside it): the merge says who is behind.
+        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, 6.0), (0.0, 0.0)], 0)]);
+        let f = js.nodes[0].movements[0].foes[0];
+        assert!(!f.yields && f.kind == FoeKind::Merge, "{f:?}");
         let on_a = claim(1, 0, 7.0, 3.0);
-        // B's front 14 m from the merge's end, at 5.8 m/s (case02 #4788)
-        let on_b = claim(2, 1, -6.0, 5.8);
+        // B rolls up behind at 5.8 m/s, its front 14 m from the merge's end, too close to
+        // stop before its meeting place (committed: the old rules let it out first)
+        let mut on_b = claim(2, 1, -6.0, 5.8);
+        on_b.committed = true;
         let claims = [on_a, on_b];
         let old = resolve_with(&js, &net, &claims, false);
         assert_eq!(grant_of(&old, 1).wait_for, Some(2), "the old rules: {old:?}");
         let g = resolve_with(&js, &net, &claims, true);
         assert!(grant_of(&g, 1).go, "{g:?}");
-        assert!(!grant_of(&g, 2).go, "B comes in behind A: {g:?}");
         // fast, it would be at the merge's end before my rear is past: it counts
         let mut fast = claims.clone();
         fast[1].speed = 13.0;
@@ -1215,6 +1223,12 @@ mod tests {
         level[1].s = 5.0;
         level[1].speed = 3.0;
         assert_eq!(grant_of(&resolve_with(&js, &net, &level, true), 1).wait_for, Some(2));
+        // (review4) giving way, I keep my accepted gap, not the 0.6 s margin: B with the
+        // right of way 14 m from the merge's end at 5.8 m/s is waited for
+        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0)]);
+        assert!(js.nodes[0].movements[0].foes[0].yields);
+        let claims = [claim(1, 0, 7.0, 3.0), claim(2, 1, -6.0, 5.8)];
+        assert_eq!(grant_of(&resolve_with(&js, &net, &claims, true), 1).wait_for, Some(2));
     }
 
     #[test]
@@ -1366,5 +1380,62 @@ mod tests {
         eprintln!("round3 fuzz: {cases} cases, claimants let go that the rules before held {dropped}, new pairs released into each other {new_pairs} (and {held_pairs} let go while still held by their lead or light)");
         assert!(dropped > 0);
         assert_eq!(new_pairs, 0);
+    }
+
+    // ---- review4: counter-examples to round 3 ----
+
+    /// (C2) `merging_behind` replaces the yielding driver's accepted gap (`Claim::gap`, 4 s
+    /// here) by `CLEAR_MARGIN` (0.6 s): a side car standing at the merge goes in front of a
+    /// main road car at 14 m/s whose front is 40.5 m from the merge end. At the moment the
+    /// side car's rear clears the merge end the main car is 8.4 m behind it, closing at
+    /// ~10 m/s: it must brake ~4-6 m/s² (with/without a 2 m standstill gap) for a car that
+    /// had to give way to it.
+    #[test]
+    fn review4_merging_behind_bypasses_the_accepted_gap_at_14_ms() {
+        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0)]);
+        let f = js.nodes[0].movements[0].foes[0];
+        assert!(f.yields && f.kind == FoeKind::Merge, "A gives way to B at the merge");
+        let side = claim(1, 0, 7.5, 0.0); // front 0.5 m before the merge end, rear 4.5 m
+        let mut main = claim(2, 1, f.theirs.1 - 40.5 - 2.0, 14.0);
+        main.v_max = 14.0;
+        let my_out = arrival_time(4.5, 0.0, 1.8, 13.0);
+        let their_at = arrival_time(40.5, 14.0, 1.8, 14.0);
+        let claims = [side, main];
+        let old = resolve_with(&js, &net, &claims, false);
+        assert_eq!(grant_of(&old, 1).wait_for, Some(2), "old rules: wait for the gap");
+        let g = resolve_with(&js, &net, &claims, true);
+        let gap_at_clear = 14.0 * (their_at - my_out);
+        let v_side = 1.8 * my_out;
+        let need = (14.0 - v_side).powi(2) / (2.0 * gap_at_clear) - 1.8;
+        let need_2m = (14.0 - v_side).powi(2) / (2.0 * (gap_at_clear - 2.0)) - 1.8;
+        assert!(
+            !grant_of(&g, 1).go,
+            "side car let go {:.2} s before a 14 m/s main car (accepted gap {:.1} s): main car {:.1} m behind at clear, closing {:.1} m/s, must brake {:.1} m/s² ({:.1} with a 2 m gap)",
+            their_at - my_out,
+            claims[0].gap,
+            gap_at_clear,
+            14.0 - v_side,
+            need,
+            need_2m
+        );
+    }
+
+    /// (C1) `behind_in_my_lane` takes the first lane of the foe's way that is mine and does
+    /// not ask whether the foe passes the meeting place before it gets there: a main road
+    /// car (right of way) 15 m out at 10 m/s whose 150 m way comes back round into my
+    /// lane (a block loop, a turning circle) is "behind me in my lane".
+    #[test]
+    fn review4_behind_in_my_lane_ignores_where_the_foe_reaches_my_lane() {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let mut me = claim(1, side, -1.0, 0.0);
+        me.lanes = vec![(1, 1.0)];
+        let mut foe = claim(2, main, mine0 - 15.0 - 2.0, 10.0);
+        foe.lanes = vec![(0, -foe.s), (50, 20.0), (51, 60.0), (1, 120.0)];
+        let claims = [me, foe];
+        assert_eq!(grant_of(&resolve_with(&js, &net, &claims, false), 1).wait_for, Some(2));
+        let g = resolve_with(&js, &net, &claims, true);
+        assert!(!grant_of(&g, 1).go, "the side car goes in front of a 10 m/s main road car 15 m out: {g:?}");
     }
 }

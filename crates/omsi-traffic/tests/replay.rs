@@ -217,7 +217,7 @@ fn lights_people_parked_cars_and_new_lanes_replay_too() {
 #[test]
 fn a_header_reads_back_as_it_was_written() {
     let (net, lights) = signalled_junction();
-    let h = Header { version: omsi_traffic::record::VERSION, map: "test".into(), left_hand: false, lanes: net.lanes.clone(), lights, started_day_time: 8.0 * 3600.0, trigger: None, derived: None };
+    let h = Header { version: omsi_traffic::record::VERSION, map: "test".into(), left_hand: false, lanes: net.lanes.clone(), lights, started_day_time: 8.0 * 3600.0, trigger: None, derived: None, switches: None };
     let text = serde_json::to_string(&h).expect("written");
     let back: Header = serde_json::from_str(&text).expect("read");
     assert_eq!(serde_json::to_string(&back).expect("written again"), text);
@@ -561,4 +561,38 @@ fn a_vehicle_without_the_standing_mark_reads_as_not_standing() {
     json.as_object_mut().unwrap().remove("claim_standing");
     let old: Vehicle = serde_json::from_value(json).unwrap();
     assert!(!old.claim_standing);
+}
+
+/// The header keeps the switches the game ran with (stub_links as its network was linked);
+/// the replay runs with them, lanes added later linked the same way, unless told otherwise.
+#[test]
+fn the_recording_keeps_its_switches_and_the_replay_runs_with_them() {
+    let mut net = priority_junction();
+    net.stub_links = true;
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.switches.competitor_filter = true;
+    let path = temp("switches");
+    let mut rec = Recorder::new();
+    rec.start_full(&path, &net, &sim, "test").expect("the recording starts");
+    let mut cars = vec![car(10, 0, 100.0, 12.0)];
+    for _ in 0..200 {
+        rec.frame(&sim, DT, &cars, &[], &[], &|i| format!("car {}", cars[i].id));
+        sim.tick(&net, DT, &mut cars);
+    }
+    rec.stop_full();
+    rec.flush();
+    let r = Replay::load(&path).expect("the recording reads");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(r.header.switches.as_deref(), Some("competitor_filter,stub_links"));
+    assert_eq!(r.switches.list(), "competitor_filter,stub_links");
+    assert!(r.net.stub_links, "lanes added later are linked with stub_links");
+    // told otherwise
+    let mut off = Replay::new(r.header.clone(), r.records.clone(), Vec::new(), false);
+    off.set_switches(Default::default());
+    assert!(off.at(0));
+    assert!(!off.net.stub_links && off.sim.switches.list().is_empty());
+    // a recording without them (format 1): all off
+    let mut h = r.header.clone();
+    h.switches = None;
+    assert_eq!(Replay::new(h, Vec::new(), Vec::new(), false).switches.list(), "");
 }

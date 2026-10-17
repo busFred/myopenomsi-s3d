@@ -111,7 +111,23 @@ impl Replay {
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, switches: Switches::default(), keyframes }
+        // (the switches the game ran with, as the header has them: `set_switches` overrides)
+        let recorded = header.switches.as_deref().map(|l| {
+            Switches::from_list(l).unwrap_or_else(|e| {
+                log::warn!("replay: the recording's switches are not read: {e}");
+                Switches::default()
+            })
+        });
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, switches: Switches::default(), keyframes };
+        if let Some(sw) = recorded {
+            r.set_switches(sw);
+        }
+        r
+    }
+
+    /// The switches the recording was made with (the header's; none recorded: all off).
+    pub fn recorded_switches(&self) -> Switches {
+        self.header.switches.as_deref().and_then(|l| Switches::from_list(l).ok()).unwrap_or_default()
     }
 
     /// Set the rule changes under test (now, and after every `at`).

@@ -61,6 +61,11 @@ pub struct Header {
     /// takes the game's own. Without it (a fixture written by hand) it is worked out.
     #[serde(default)]
     pub derived: Option<Derived>,
+    /// (format 2) The rule switches the game ran with (`Switches::list`; `stub_links` as the
+    /// network was linked). The replay runs with them unless told otherwise, and links the
+    /// lanes added later as the game did. None: not recorded (all off).
+    #[serde(default)]
+    pub switches: Option<String>,
 }
 
 /// The network's and the junction table's derived data (see [`Header::derived`]).
@@ -517,13 +522,16 @@ impl Recorder {
                 text
             }
         };
+        let mut switches = sim.switches;
+        switches.stub_links = net.stub_links;
         format!(
-            "{{\"version\":{VERSION},\"map\":{},\"left_hand\":{},\"lights\":{},\"started_day_time\":{},\"trigger\":{},{}}}",
+            "{{\"version\":{VERSION},\"map\":{},\"left_hand\":{},\"lights\":{},\"started_day_time\":{},\"trigger\":{},\"switches\":{},{}}}",
             json(&map),
             net.left_hand,
             json(&sim.lights),
             json(&sim.day_time),
             json(&trigger),
+            json(&switches.list()),
             net_part
         )
     }

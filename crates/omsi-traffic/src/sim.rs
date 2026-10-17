@@ -289,7 +289,7 @@ pub struct Switches {
 }
 
 impl Switches {
-    pub const NAMES: [&'static str; 7] = ["competitor_filter", "signal_foes", "stub_links", "pass_room", "dead_end", "corner_clearance", "kerb_wait"];
+    pub const NAMES: [&'static str; 7] = omsi_sim::traffic::SWITCH_NAMES;
 
     /// Switches from a comma-separated list of names (`all` for every one). Unknown names
     /// are returned in the error.
