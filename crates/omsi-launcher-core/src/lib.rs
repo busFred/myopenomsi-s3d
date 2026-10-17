@@ -1901,6 +1901,8 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     let mut version = 0;
     let mut graphics: Option<&str> = None;
     let mut rt_seen = (false, false);
+    // (the current `pedestrians` key wins over an old `ped_density` line wherever it stands)
+    let has_pedestrians = t.lines().any(|l| l.trim().split_once('=').is_some_and(|(k, _)| setting_key(k) == "pedestrians"));
     for line in t.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with(';') {
@@ -1938,7 +1940,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             // (people strolling the pavements about the player)
             "pedestrians" => v[&k] = json!(val.parse::<f64>().map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
             // (the per cent of before: 1 = 100 %, read as 100 people)
-            "ped_density" => v["pedestrians"] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
+            "ped_density" if !has_pedestrians => v["pedestrians"] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
             "drive_keys" | "navigator_corner" | "boarding" | "render_scale" | "pax_voices" => v[&k] = json!(val),
             "ctrl_off" => v[&k] = json!(val),
             "rt_reflections" => {
@@ -2362,7 +2364,9 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
             continue;
         }
         match t.split_once('=') {
-            Some((k, _)) if !written.contains(&setting_key(k)) => {
+            // (superseded keys are dropped, not carried: an old `ped_density` line read after
+            // `pedestrians` reset the count on every start)
+            Some((k, _)) if !written.contains(&setting_key(k)) && setting_key(k) != "ped_density" => {
                 text.push_str(t);
                 text.push('\n');
             }
@@ -2886,6 +2890,12 @@ mod tests {
     #[test]
     fn the_pedestrian_count_survives_a_save() {
         assert_eq!(settings_from_text(None)["pedestrians"], json!(100));
+        // an old `ped_density` line after the current key neither wins nor survives a save
+        let old = "pedestrians=500\nfoo=1\nped_density=200\n";
+        assert_eq!(settings_from_text(Some(old))["pedestrians"], json!(500));
+        let saved = settings_to_text(&settings_from_text(Some(old)), Some(old));
+        assert!(saved.lines().any(|l| l == "pedestrians=500"), "{saved}");
+        assert!(!saved.lines().any(|l| l.starts_with("ped_density=")), "{saved}");
         assert_eq!(settings_from_text(Some("ped_density=1.5\n"))["pedestrians"], json!(150));
         assert_eq!(settings_from_text(Some("ped_density=200\n"))["pedestrians"], json!(200));
         assert_eq!(settings_from_text(Some("pedestrians=9000\n"))["pedestrians"], json!(2000));
