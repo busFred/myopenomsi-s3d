@@ -698,13 +698,6 @@ impl Network {
                     if same_path || (a.kind == LaneKind::Rail && b.kind == LaneKind::Rail) {
                         continue;
                     }
-                    // one way through built from two pieces (a lead-in and the turn it goes
-                    // on into, BeijingCity) is no conflict with itself: a short piece after
-                    // a long one ended within a metre and a half of it and was taken for a
-                    // merge, and the car on the lead-in gave way to the car queued behind it
-                    if a.next.contains(&j) || b.next.contains(&i) {
-                        continue;
-                    }
                     // one runs into the other: the same end, or ends a car's width apart that
                     // lead into the same lane (two turns converging on one exit)
                     let ends = (a.end() - b.end()).truncate().length();
