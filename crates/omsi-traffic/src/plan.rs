@@ -4,7 +4,7 @@
 //! grant.
 
 use crate::driver::VehicleClass;
-use crate::perception::{NeighbourView, Perception, Seen};
+use crate::perception::{NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
 use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network};
@@ -148,6 +148,53 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     (desire, gap_accepted(me, nb))
 }
 
+/// What the driver does about the light ahead this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightCall {
+    /// Over the line now (no stop for the light).
+    pub go: bool,
+    /// The light's mark is set (`Vehicle::amber`): the driver took the line on green or yellow.
+    pub mark: bool,
+    /// Holding the mark close to the line: it goes through as soon as nothing else holds
+    /// it (a queue it stands in), whatever the light shows by then.
+    pub marked_through: bool,
+}
+
+/// The driver's call at the light: through on green, the dilemma zone on yellow, on red
+/// only with the mark close to the line or too late to stop.
+pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
+    let st = &me.state;
+    let dp = &me.params;
+    let v = st.speed;
+    let gap = sig.dist - st.front;
+    let comfortable = v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0;
+    let possible = v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8);
+    let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
+    let marked = me.amber == Some((sig.ctl, sig.light));
+    match sig.aspect {
+        Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
+            // at the line on green: through, whatever it turns to in a moment
+            LightCall { go: true, mark: gap < 3.0 && !queued && v > 1.0, marked_through: marked && gap < comfortable }
+        }
+        Aspect::Yellow => {
+            // the dilemma zone: through when stopping is no longer comfortable; a
+            // driver who took the line on green just before goes a little further
+            // out ("had the mark" alone let a car two places back in a queue go).
+            // One already braking for the light stays on the brake: slowing, it
+            // came within "comfortable" of the line again and set off across on red.
+            let stopping = me.last.why == Why::Light && me.last.stop.is_some();
+            let go = !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
+            LightCall { go, mark: go, marked_through: marked && gap < comfortable + 6.0 }
+        }
+        // (a car standing with its bumper over the line waits like one behind it: at a
+        // standstill nothing is "too late to stop")
+        Aspect::Red | Aspect::RedYellow => {
+            let go = (marked && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
+            LightCall { go, mark: false, marked_through: marked && gap < comfortable }
+        }
+    }
+}
+
 /// Decide for vehicle `i`.
 pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: &Perception, grant: Option<Grant>) -> Plan {
     let me = &vehicles[i];
@@ -166,37 +213,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 2. lights
     if let Some(sig) = p.signal {
-        let gap = sig.dist - st.front;
-        let comfortable = v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0;
-        let possible = v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8);
-        let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
-        let go = match sig.aspect {
-            Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
-                // at the line on green: through, whatever it turns to in a moment
-                if gap < 3.0 && !queued && v > 1.0 {
-                    out.amber = Some((sig.ctl, sig.light));
-                }
-                true
-            }
-            Aspect::Yellow => {
-                // the dilemma zone: through when stopping is no longer comfortable; a
-                // driver who took the line on green just before goes a little further
-                // out ("had the mark" alone let a car two places back in a queue go).
-                // One already braking for the light stays on the brake: slowing, it
-                // came within "comfortable" of the line again and set off across on red.
-                let marked = me.amber == Some((sig.ctl, sig.light));
-                let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-                let go = !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
-                if go {
-                    out.amber = Some((sig.ctl, sig.light));
-                }
-                go
-            }
-            // (a car standing with its bumper over the line waits like one behind it: at a
-            // standstill nothing is "too late to stop")
-            Aspect::Red | Aspect::RedYellow => (me.amber == Some((sig.ctl, sig.light)) && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5),
-        };
-        if !go {
+        let call = light_call(me, p, &sig);
+        if call.mark {
+            out.amber = Some((sig.ctl, sig.light));
+        }
+        if !call.go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);
         }
     }

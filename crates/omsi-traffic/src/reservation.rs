@@ -49,6 +49,17 @@ pub struct Claim {
     /// The vehicle this one follows this frame (the caller's index), if any: a claimant
     /// does not wait for its own follower (`competitor_filter`).
     pub lead: Option<usize>,
+    /// Counted standing at its last claim (`competitor_filter`): see [`Claim::standing`].
+    pub was_standing: bool,
+}
+
+impl Claim {
+    /// Standing, with hysteresis: under 0.3 m/s, or still under 1 m/s after standing at the
+    /// last claim (a car let go that creeps off is not refused again by the ordinary rules
+    /// the moment it passes 0.3 m/s, to be let go again once it has stopped).
+    pub fn standing(&self) -> bool {
+        self.speed < 0.3 || (self.was_standing && self.speed <= 1.0)
+    }
 }
 
 /// Why a vehicle waits.
@@ -160,7 +171,7 @@ fn standing_order(js: &Junctions, claims: &[Claim], plain: &[Grant]) -> Vec<Stan
     // contenders by junction (sorted by vehicle index within each)
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for (k, c) in claims.iter().enumerate() {
-        if plain[k].go || c.speed >= 0.3 || c.committed || c.absolute || is_player(c.vehicle) {
+        if plain[k].go || !c.standing() || c.committed || c.absolute || is_player(c.vehicle) {
             continue;
         }
         if plain[k].hold == Some(Hold::ExitFull) && c.impatience.claims_after().is_none() {
@@ -245,11 +256,14 @@ fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain:
 /// behind one already into the common piece comes in behind it.) A foe that stands is
 /// behind me on a common piece as soon as it is further back along it than I am, before my
 /// front reaches it: two cars in one queue before the object, whose ways part on a piece of
-/// a fraction of a metre that merges back, are foes of each other by the table.
+/// a fraction of a metre that merges back, are foes of each other by the table. Behind
+/// means its front at least a metre behind my rear (its whole length and a metre more
+/// behind my rear): two cars level at a merge, centimetres apart, are not one behind the
+/// other, and both went.
 fn behind_on_my_way(c: &Claim, o: &Claim) -> bool {
     c.chain.iter().any(|&(piece, my_off)| {
         let mine = c.s - my_off;
-        (mine + c.front >= 0.0 || o.speed < 0.3) && o.chain.iter().any(|&(their_piece, their_off)| their_piece == piece && o.s - their_off < mine)
+        (mine + c.front >= 0.0 || o.speed < 0.3) && o.chain.iter().any(|&(their_piece, their_off)| their_piece == piece && o.s - their_off + o.front <= mine - c.rear - 1.0)
     })
 }
 
@@ -318,7 +332,10 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // (competitor_filter) my own follower, or one behind me on a piece both our
                 // ways take, comes after me whatever the table says; one already in the
                 // meeting place or committed to it is never dropped
-                if filter && !their_inside && !o.committed && (claims[ok].lead == Some(c.vehicle) || behind_on_my_way(c, &claims[ok]) || (o.speed < 0.3 && held_by(claims, &claim_of, plain, ok, c.vehicle))) {
+                // (the follower only while it stands: a lead is one frame's perception and
+                // flickers between two cars side by side into a merge; one rolling at 3 m/s
+                // 2 m from the meeting place was dropped on it, and the two touched)
+                if filter && !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < 0.3 && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle)))) {
                     continue;
                 }
                 // a foe standing at its red light is not coming before its light goes:
@@ -373,9 +390,11 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // waits for me if I go, one before me that stays refused does not go.
                 // Only a contender before me that goes this pass holds me.
                 if let Some(Standing::Rank(mine)) = standing.map(|st| st[k]) {
-                    if o.speed < 0.3 && !their_inside && !o.committed {
+                    if o.standing() && !their_inside && !o.committed {
                         match standing.map(|st| st[ok]) {
-                            Some(Standing::Hard) => continue,
+                            // refused for a full exit: not coming while its exit is full
+                            // this frame (it counts again the frame its exit has room)
+                            Some(Standing::Hard) if !o.exit_room => continue,
                             Some(Standing::Rank(theirs)) => {
                                 let me_inside = c.s + c.front >= foe.mine.0;
                                 let ahead_goes = theirs < mine && out[ok].map(|g| g.go).unwrap_or(false);
@@ -443,7 +462,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -571,7 +590,7 @@ mod tests {
         let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
         let mut on_a = claim(1, 0, -3.0, 0.0);
         on_a.chain = vec![(0, 0.0), (2, 10.0)];
-        let mut on_b = claim(2, 1, -5.0, 0.0);
+        let mut on_b = claim(2, 1, -9.0, 0.0);
         on_b.chain = vec![(1, 0.0), (2, 10.0)];
         let claims = [on_a, on_b];
         let g = resolve_with(&js, &net, &claims, false);
@@ -731,5 +750,287 @@ mod tests {
         let g = resolve(&js, &net, &[claim(1, main, -1.0, 0.0), train]);
         assert!(!g[0].go);
         assert!(g[1].go);
+    }
+
+    // ---- review2 counter-examples (adversarial review of competitor_filter / signal_foes) ----
+
+    /// Pairs of claimants that both go, are foes at some meeting place, and neither of
+    /// which is inside it: released into each other unless something else (car-following)
+    /// keeps them apart.
+    fn review_both_released(js: &Junctions, claims: &[Claim], g: &[Grant]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for a in 0..claims.len() {
+            for b in a + 1..claims.len() {
+                if !(g[a].go && g[b].go) || claims[a].committed || claims[b].committed {
+                    continue;
+                }
+                let foes = js.foes_along(claims[a].junction, &claims[a].chain);
+                // and their windows there overlap (each from its own state; a car standing at
+                // its red counts from its green, or not at all)
+                let win = |c: &Claim, from: f32, to: f32, shift: f32| -> Option<(f32, f32)> {
+                    let mut x = c.clone();
+                    x.s -= shift;
+                    let (i, o) = window(&x, from, to);
+                    if c.light_red && c.speed < 0.5 {
+                        return c.until_go.map(|t| (i + t, o + t));
+                    }
+                    Some((i, o))
+                };
+                let meet = foes.iter().any(|f| {
+                    claims[b].chain.iter().any(|&(m, off)| {
+                        m == f.movement
+                            && claims[b].s - off + claims[b].front < f.theirs.0
+                            && claims[a].s + claims[a].front < f.mine.0
+                            && match (win(&claims[a], f.mine.0, f.mine.1, 0.0), win(&claims[b], f.theirs.0, f.theirs.1, off)) {
+                                (Some((ai, ao)), Some((bi, bo))) => ai < bo + CLEAR_MARGIN && bi < ao + CLEAR_MARGIN,
+                                _ => false,
+                            }
+                    })
+                });
+                if meet {
+                    out.push((claims[a].vehicle, claims[b].vehicle));
+                }
+            }
+        }
+        out
+    }
+
+    /// Four straight ways of an unmarked cross, right-hand traffic, equal priorities.
+    fn review_cross() -> (Network, Junctions) {
+        object(&[
+            (&[(-20.0, -2.0), (20.0, -2.0)], 0), // eastbound
+            (&[(20.0, 2.0), (-20.0, 2.0)], 0),   // westbound
+            (&[(2.0, -20.0), (2.0, 20.0)], 0),   // northbound
+            (&[(-2.0, 20.0), (-2.0, -20.0)], 0), // southbound
+        ])
+    }
+
+    #[test]
+    fn review_two_crossing_standing_both_refused_exactly_one_goes_either_index_order() {
+        let (net, js) = four_way(128.0, 128.0);
+        let (east, north) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        for (ve, vn) in [(1usize, 2usize), (2, 1)] {
+            let claims = [claim(ve, east, -1.0, 0.0), claim(vn, north, -1.0, 0.0)];
+            let refused = |v| Grant { vehicle: v, go: false, wait_for: None, hold: Some(Hold::Foe) };
+            let plain = [refused(ve), refused(vn)];
+            let st = standing_order(&js, &claims, &plain);
+            let g = decide(&js, &net, &claims, Some(&plain), true, Some(&st));
+            assert_eq!(g.iter().filter(|g| g.go).count(), 1, "{ve}/{vn}: {g:?}");
+            let goer = g.iter().find(|g| g.go).unwrap().vehicle;
+            assert!(g.iter().filter(|g| !g.go).all(|g| g.wait_for == Some(goer)), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn review_three_ring_permuted_indices_and_one_member_far_back() {
+        let (net, js) = triangle();
+        for ids in [[30usize, 10, 20], [20, 30, 10], [10, 20, 30]] {
+            for far in [None, Some(0usize), Some(1), Some(2)] {
+                let claims: Vec<Claim> = (0..3)
+                    .map(|m| {
+                        let s = if far == Some(m) { -12.0 } else { -1.0 };
+                        let mut c = claim(ids[m], m, s, 0.0);
+                        c.gap = 8.0;
+                        c
+                    })
+                    .collect();
+                let g = resolve_with(&js, &net, &claims, true);
+                assert!(g.iter().any(|g| g.go), "{ids:?} far {far:?}: nobody goes {g:?}");
+                assert!(review_both_released(&js, &claims, &g).is_empty(), "{ids:?} far {far:?}: {g:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_four_ring_equal_priority_no_crossing_pair_released() {
+        let (net, js) = review_cross();
+        let yields: usize = (0..4).map(|m| js.nodes[0].movements[m].foes.iter().filter(|f| f.yields).count()).sum();
+        let claims: Vec<Claim> = (0..4).map(|m| claim(10 + m, m, -1.0, 0.0)).collect();
+        let old = resolve_with(&js, &net, &claims, false);
+        let g = resolve_with(&js, &net, &claims, true);
+        eprintln!("4-ring: yields in table {yields}; old {old:?}; new {g:?}");
+        assert!(g.iter().any(|g| g.go), "{g:?}");
+        assert!(review_both_released(&js, &claims, &g).is_empty(), "{g:?}");
+        for p in [[3usize, 1, 0, 2], [1, 0, 3, 2], [2, 3, 1, 0]] {
+            let claims: Vec<Claim> = (0..4).map(|m| claim(10 + p[m], m, -1.0, 0.0)).collect();
+            let g = resolve_with(&js, &net, &claims, true);
+            assert!(g.iter().any(|g| g.go), "{p:?} {g:?}");
+            assert!(review_both_released(&js, &claims, &g).is_empty(), "{p:?} {g:?}");
+        }
+    }
+
+    #[test]
+    fn review_standing_refused_foe_5m_out_is_still_first_once_it_moves() {
+        // triangle: me gives way to the foe, the foe gives way to Z (rolling in fast), Z to me
+        let (net, js) = triangle();
+        let yields = |a: usize, b: usize| js.nodes[0].movements[a].foes.iter().any(|f| f.movement == b && f.yields);
+        let (mut me_m, mut foe_m, mut z_m) = (0, 0, 0);
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    if a != b && b != c && a != c && yields(a, b) && yields(b, c) {
+                        (me_m, foe_m, z_m) = (a, b, c);
+                    }
+                }
+            }
+        }
+        let mp = |m: usize, other: usize| js.nodes[0].movements[m].foes.iter().find(|f| f.movement == other).unwrap().mine.0;
+        // my front 40 m from my meeting place with the foe; the foe's front 5 m from its first
+        let me = claim(1, me_m, mp(me_m, foe_m) - 40.0 - 2.0, 0.0);
+        let foe = claim(2, foe_m, mp(foe_m, me_m).min(mp(foe_m, z_m)) - 5.0 - 2.0, 0.0);
+        let z = claim(3, z_m, mp(z_m, foe_m) - 2.0 - 15.0, 10.0);
+        let claims = [me.clone(), foe.clone(), z.clone()];
+        let old = resolve_with(&js, &net, &claims, false);
+        let g = resolve_with(&js, &net, &claims, true);
+        eprintln!("frame 1 old {old:?}\nframe 1 new {g:?}");
+        assert!(!grant_of(&g, 2).go, "the foe is held by Z: {g:?}");
+        // frame 2: Z is gone; I have rolled off at 0.5 m/s. The foe must be first.
+        let mut me2 = me.clone();
+        me2.s += 0.3;
+        me2.speed = 0.5;
+        let g = resolve_with(&js, &net, &[me2.clone(), foe.clone()], true);
+        assert!(grant_of(&g, 2).go, "{g:?}");
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "frame 2: I wait for the foe once it goes: {g:?}");
+        // ... and standing still at 40 m myself: same
+        let g = resolve_with(&js, &net, &[me.clone(), foe.clone()], true);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    #[test]
+    fn review_foe_at_red_with_1s_to_go_counts_as_coming_in_1s() {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let me = claim(1, side, 4.0, 0.0);
+        let mut red = claim(2, main, 1.0, 0.0);
+        red.light_red = true;
+        red.until_go = Some(1.0);
+        for filter in [false, true] {
+            let g = resolve_with(&js, &net, &[me.clone(), red.clone()], filter);
+            assert_eq!(grant_of(&g, 1).wait_for, Some(2), "filter {filter}: {g:?}");
+        }
+        // the same foe refused for a full exit (Hard): the second pass skips it outright,
+        // whatever its light, though its exit may clear within the second
+        let mut hard = red.clone();
+        hard.exit_room = false;
+        let old = resolve_with(&js, &net, &[me.clone(), hard.clone()], false);
+        let g = resolve_with(&js, &net, &[me.clone(), hard.clone()], true);
+        eprintln!("exit-full foe at red, 1 s to go: old {old:?} new {g:?}");
+    }
+
+    #[test]
+    fn review_moving_foe_10ms_40m_out_counts() {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let me = claim(1, side, 4.0, 0.0);
+        let mover = claim(2, main, mine0 - 40.0 - 2.0, 10.0);
+        for filter in [false, true] {
+            let g = resolve_with(&js, &net, &[me.clone(), mover.clone()], filter);
+            assert_eq!(grant_of(&g, 1).wait_for, Some(2), "filter {filter}: {g:?}");
+        }
+    }
+
+    #[test]
+    fn review_lead_is_me_drops_a_rolling_foe_2m_from_the_meeting_place() {
+        // the main road car (right of way) rolls at 3 m/s, its front 2 m from the meeting
+        // place, and names me (the side road car) as its lead
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let me = claim(1, side, 4.0, 0.0);
+        let mut foe = claim(2, main, mine0 - 2.0 - 2.0, 3.0);
+        foe.lead = Some(1);
+        let old = resolve_with(&js, &net, &[me.clone(), foe.clone()], false);
+        assert_eq!(grant_of(&old, 1).wait_for, Some(2), "old rules wait: {old:?}");
+        let g = resolve_with(&js, &net, &[me.clone(), foe.clone()], true);
+        // (was: dropped on the strength of `lead` alone, both went) a rolling follower is
+        // a foe: exactly one goes
+        assert_eq!(g.iter().filter(|g| g.go).count(), 1, "{g:?}");
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        assert!(review_both_released(&js, &[me, foe], &g).is_empty());
+    }
+
+    #[test]
+    fn review_merge_both_standing_6cm_apart_both_released() {
+        // A (0) and B (1) merge where C (2) begins; A gives way to B. Both stand short of
+        // the merge, B 6 cm further back along the common way (cf. case10 #30596/#30816)
+        let (net, js) = object(&[(&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(-8.0, -6.0), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
+        let mut on_a = claim(1, 0, -3.0, 0.0);
+        on_a.chain = vec![(0, 0.0), (2, 10.0)];
+        let mut on_b = claim(2, 1, -3.06, 0.0);
+        on_b.chain = vec![(1, 0.0), (2, 10.0)];
+        let claims = [on_a, on_b];
+        let old = resolve_with(&js, &net, &claims, false);
+        let g = resolve_with(&js, &net, &claims, true);
+        eprintln!("merge 6 cm: old {old:?} new {g:?}");
+        assert_eq!(old.iter().filter(|g| g.go).count(), 1, "old: exactly one goes {old:?}");
+        // (was: both went, 6 cm apart, into one merge) level cars are not one behind the other
+        assert_eq!(g.iter().filter(|g| g.go).count(), 1, "new: exactly one goes: {g:?}");
+        assert!(review_both_released(&js, &claims, &g).is_empty(), "{g:?}");
+    }
+
+    #[test]
+    fn review_fuzz_no_new_pair_released_without_lead_or_shared_piece() {
+        // random standing/rolling claimants on crossing-only objects (no shared pieces, no
+        // leads): any pair both let go into one meeting place that the old rules did not
+        // let go is a counter-example to "no pair is released into each other"
+        let objects: Vec<(Network, Junctions)> = vec![review_cross(), triangle(), four_way(128.0, 128.0), four_way(192.0, 64.0)];
+        let mut seed: u64 = 0x2545F4914F6CDD1D;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut new_pairs, mut old_pairs, mut cases) = (0, 0, 0);
+        let mut shown = 0;
+        for _ in 0..200_000 {
+            let (net, js) = &objects[(rnd() * objects.len() as f64) as usize % objects.len()];
+            let nm = js.nodes[0].movements.len();
+            let n = 2 + (rnd() * 4.0) as usize;
+            let mut claims: Vec<Claim> = Vec::new();
+            for v in 0..n {
+                let m = (rnd() * nm as f64) as usize % nm;
+                let first = js.nodes[0].movements[m].foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+                if !first.is_finite() {
+                    continue;
+                }
+                let dist = [0.2f32, 1.0, 3.0, 6.0, 15.0, 40.0][(rnd() * 6.0) as usize % 6];
+                let speed = [0.0f32, 0.0, 0.0, 0.2, 2.0, 6.0, 10.0][(rnd() * 7.0) as usize % 7];
+                let mut c = claim(10 + v, m, first - dist - 2.0, speed);
+                let room = dist - 0.6;
+                c.committed = dist <= 0.5 || (speed > 1.0 && room < speed * speed / (2.0 * 8.0 * 0.7));
+                c.exit_room = rnd() > 0.15;
+                c.held = speed < 0.3 && rnd() < 0.3;
+                if rnd() < 0.15 {
+                    c.light_red = true;
+                    c.until_go = if rnd() < 0.5 { Some((rnd() * 5.0) as f32) } else { None };
+                }
+                // same movement twice: keep the queue physical (no two at one place)
+                if claims.iter().any(|o| o.movement == m && (o.s - c.s).abs() < 6.0) {
+                    continue;
+                }
+                claims.push(c);
+            }
+            if claims.len() < 2 {
+                continue;
+            }
+            cases += 1;
+            let old = resolve_with(js, net, &claims, false);
+            let g = resolve_with(js, net, &claims, true);
+            let po = review_both_released(js, &claims, &old);
+            let pn = review_both_released(js, &claims, &g);
+            old_pairs += po.len();
+            for p in &pn {
+                if !po.contains(p) {
+                    new_pairs += 1;
+                    if shown < 6 {
+                        shown += 1;
+                        eprintln!("NEW PAIR {p:?}\n  claims {:?}\n  old {old:?}\n  new {g:?}", claims.iter().map(|c| (c.vehicle, c.movement, c.s, c.speed, c.committed, c.exit_room, c.held, c.light_red, c.until_go)).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+        eprintln!("fuzz: {cases} cases, pairs released into a meeting place: old {old_pairs}, new-only {new_pairs}");
     }
 }

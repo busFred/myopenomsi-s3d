@@ -358,6 +358,9 @@ pub struct Simulation {
     pub removed: Vec<usize>,
     /// Vehicles counted standing at a red light this frame (diagnostics).
     pub held_at_red: usize,
+    /// (competitor_filter) ids of the claimants standing as of their last claim: standing
+    /// from under 0.3 m/s until over 1 m/s.
+    pub standing_ids: hashbrown::HashSet<u64>,
 }
 
 impl Simulation {
@@ -381,6 +384,7 @@ impl Simulation {
             left_hand: net.left_hand,
             removed: Vec::new(),
             held_at_red: 0,
+            standing_ids: hashbrown::HashSet::new(),
         }
     }
 
@@ -677,7 +681,21 @@ impl Simulation {
                 j.entry
             };
             let (light_red, until_go) = match p.signal {
-                Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
+                Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                    // (signal_foes) not held by a light it goes through: the plan's own
+                    // call (too late to stop, the yellow it takes), or the mark of one
+                    // that took the line on green or yellow and is close to it (queued
+                    // there, it goes on as soon as its leader moves, whatever the light)
+                    let through = self.switches.signal_foes && {
+                        let call = plan::light_call(v, p, &sig);
+                        call.go || call.marked_through
+                    };
+                    if through {
+                        (false, None)
+                    } else {
+                        (true, sig.until_go)
+                    }
+                }
                 _ => (false, None),
             };
             // (signal_foes) standing at its red short of the first meeting place with
@@ -685,9 +703,21 @@ impl Simulation {
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
             let committed = committed && !(self.switches.signal_foes && light_red && st.speed < 0.5 && light_line - st.front > 0.5);
+            // (competitor_filter) standing, with hysteresis (`Claim::standing`): from under
+            // 0.3 m/s until over 1 m/s, remembered from one claim to the next
+            let was_standing = self.switches.competitor_filter && {
+                let was = self.standing_ids.contains(&v.id);
+                if st.speed < 0.3 || (was && st.speed <= 1.0) {
+                    self.standing_ids.insert(v.id);
+                } else if was {
+                    self.standing_ids.remove(&v.id);
+                }
+                was
+            };
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
                 chain: j.chain.clone(),
+                was_standing,
                 light_red,
                 until_go,
                 lead: match p.leader.map(|l| l.what) {
@@ -773,6 +803,7 @@ impl Simulation {
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             claims.push(Claim {
                 chain: vec![(m, 0.0)],
+                was_standing: false,
                 light_red: false,
                 until_go: None,
                 lead: None,
