@@ -101,7 +101,21 @@ fn run(net: &Network, sim: &mut Simulation, cars: &mut [Vehicle], secs: f32, mut
 /// south went green, the second west car waited for the south car once it was green, the
 /// south car ran its red).
 fn foe_at_a_red_on_a_stub(signal_foes: bool) -> (f32, bool, bool, bool) {
-    let net = beijing_junction(128.0, 128.0);
+    foe_at_a_red_on_a_stub_in(beijing_junction(128.0, 128.0), signal_foes)
+}
+
+/// `beijing_junction` with an unlit 0.3 m stub (10) beside the south lit stub, from the
+/// same place at the end of the lead-in (BeijingCity case04 1102/1409/1410, case07
+/// 5233/5109/5110): the lead-in merges with it a few metres before the light.
+fn beijing_junction_with_a_sibling_stub() -> Network {
+    let mut net = beijing_junction(128.0, 128.0);
+    net.lanes.push(piece((0.0, -12.0), (0.0, -11.7), 6, 128.0));
+    net.link(0.5);
+    net.compute_conflicts();
+    net
+}
+
+fn foe_at_a_red_on_a_stub_in(net: Network, signal_foes: bool) -> (f32, bool, bool, bool) {
     let js = omsi_traffic::Junctions::compile(&net);
     let (_, across) = js.movement(3).unwrap();
     assert!(across.foes.iter().any(|f| f.yields), "west gives way to south");
@@ -114,6 +128,9 @@ fn foe_at_a_red_on_a_stub(signal_foes: bool) -> (f32, bool, bool, bool) {
     let mut late = car(3, 0, 0.0, 8.0);
     late.state.max_speed_kmh = 30.0;
     let mut cars = vec![car(1, SOUTH_IN, 5.5, 0.0), car(2, 0, 140.0, 10.0), late];
+    // (the south car's way is through the lit stub)
+    cars[0].state.planned_next = Some(SOUTH_STUB);
+    cars[0].state.ahead = vec![SOUTH_THROUGH, 9];
     let (mut waited, mut crossed_on_red, mut waited_on_green, mut ran_red) = (0.0f32, false, false, false);
     run(&net, &mut sim, &mut cars, red + 12.0, |t, sim, cars| {
         let south_red = sim.lights[0].state(1) < 3;
@@ -144,6 +161,22 @@ fn signal_foes_a_foe_at_its_red_on_a_stub_inside_the_object_does_not_hold_a_gree
     assert!(waited < 1.0, "the west car waited {waited:.1} s for a car standing at its red");
     assert!(crossed, "the west car did not get across while south was red");
     assert!(waited_on_green, "once its light is green the south car counts again");
+}
+
+#[test]
+fn signal_foes_an_unlit_sibling_stub_at_the_lead_in_end_does_not_hide_the_light() {
+    let net = beijing_junction_with_a_sibling_stub();
+    // the lead-in merges with the sibling before the light
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, lead_in) = js.movement(SOUTH_IN).unwrap();
+    assert!(lead_in.conflict_start < 7.0, "{:?}", lead_in.foes);
+    let (waited, crossed, waited_on_green, ran_red) = foe_at_a_red_on_a_stub_in(net, true);
+    assert!(!ran_red, "the south car ran its red");
+    assert!(waited < 1.0, "the west car waited {waited:.1} s for a car standing at its red");
+    assert!(crossed && waited_on_green);
+    // without the switch the sibling's merge is the line, and the light is not seen there
+    let (waited, crossed, _, _) = foe_at_a_red_on_a_stub_in(beijing_junction_with_a_sibling_stub(), false);
+    assert!(waited > 10.0 && !crossed, "off: waited {waited:.1} s");
 }
 
 #[test]
@@ -197,4 +230,62 @@ fn the_stub_lanes_are_where_the_test_says() {
     assert_eq!(net.lanes[SOUTH_STUB].traffic_light, Some((0, 1)));
     assert_eq!(net.lanes[WEST_IN].next, vec![WEST_STUB]);
     assert_eq!(net.lanes[SOUTH_IN].next, vec![SOUTH_STUB]);
+}
+
+/// `beijing_junction` linked as the game links (1.5 m): the lead-in reaches past its 1 m
+/// stub into the piece across too, unless `stub_links` is on.
+fn beijing_junction_as_linked(stub_links: bool) -> Network {
+    let mut net = beijing_junction(128.0, 128.0);
+    net.stub_links = stub_links;
+    net.link(1.5);
+    net
+}
+
+/// West is red for 40 s; a west car comes up at 10 m/s. Returns, over 24 drivers (each its
+/// own random pick at the fork), how many drove into the piece across on red, and how
+/// many stood at the line (why=Light, the front within a metre of the stub).
+fn red_runners(stub_links: bool) -> (usize, usize) {
+    let net = beijing_junction_as_linked(stub_links);
+    let (mut ran, mut at_line) = (0, 0);
+    for id in 1..=24u64 {
+        let ctl = TrafficLightController::new(vec![vec![(0, 40.0), (6, 20.0)], vec![(6, 60.0)]], 60.0);
+        let mut sim = Simulation::new(&net, vec![ctl]);
+        sim.switches.stub_links = stub_links;
+        let mut cars = vec![car(id, 0, 100.0, 10.0)];
+        let mut crossed = false;
+        run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+            if cars[0].state.lane == 3 {
+                crossed = true;
+            }
+        });
+        let c = &cars[0];
+        ran += crossed as usize;
+        let to_stub = if c.state.lane == WEST_IN { net.lanes[WEST_IN].length() - c.state.s - c.state.front } else { f32::INFINITY };
+        at_line += (c.state.speed < 0.3 && c.last.why == Why::Light && to_stub.abs() < 1.0) as usize;
+    }
+    (ran, at_line)
+}
+
+#[test]
+fn stub_links_off_drivers_that_take_the_way_past_the_stub_run_the_red() {
+    let net = beijing_junction_as_linked(false);
+    assert_eq!(net.lanes[WEST_IN].next, vec![WEST_STUB, 3]);
+    let (ran, at_line) = red_runners(false);
+    assert!(ran > 0, "the way round the stub never taken");
+    assert_eq!(ran + at_line, 24, "ran {ran}, at the line {at_line}");
+}
+
+#[test]
+fn stub_links_every_driver_stands_at_its_red() {
+    let net = beijing_junction_as_linked(true);
+    assert_eq!(net.lanes[WEST_IN].next, vec![WEST_STUB]);
+    // the lead-in is no merge of its own stub: its first meeting place is the crossing
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, lead_in) = js.movement(WEST_IN).unwrap();
+    assert!(lead_in.conflict_start.is_infinite(), "{:?}", lead_in.foes);
+    let off = omsi_traffic::Junctions::compile(&beijing_junction_as_linked(false));
+    assert!(off.movement(WEST_IN).unwrap().1.conflict_start < 8.0, "off: the lead-in merges with its stub before the light");
+    let (ran, at_line) = red_runners(true);
+    assert_eq!(ran, 0);
+    assert_eq!(at_line, 24);
 }

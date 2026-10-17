@@ -118,6 +118,23 @@ impl Replay {
     pub fn set_switches(&mut self, switches: Switches) {
         self.switches = switches;
         self.sim.switches = switches;
+        if switches.stub_links && !self.net.stub_links {
+            self.stub_links();
+        } else if !switches.stub_links && self.net.stub_links {
+            // (the links dropped are not put back: the network as the header has it)
+            let (net, sim) = build(&self.header);
+            self.net = net;
+            self.sim = sim;
+            self.sim.switches = switches;
+        }
+    }
+
+    /// `stub_links` on the recorded network: the links round the lit stubs and the merges
+    /// of one way's pieces dropped, the junctions compiled from what is left (lanes added
+    /// later are linked and compiled with it on, `Network::extend`).
+    fn stub_links(&mut self) {
+        self.net.apply_stub_links();
+        self.sim.junctions = Junctions::compile(&self.net);
     }
 
     pub fn keyframe_count(&self) -> usize {
@@ -138,6 +155,9 @@ impl Replay {
         self.net = net;
         self.sim = sim;
         self.sim.switches = self.switches;
+        if self.switches.stub_links {
+            self.stub_links();
+        }
         self.types.clear();
         self.divergence.clear();
         self.missing.clear();
@@ -199,7 +219,9 @@ impl Replay {
             Record::Keyframe { time, vehicles } => {
                 self.compare(*time, vehicles);
                 if !self.free_run {
-                    self.vehicles = vehicles.clone();
+                    let mut vs = vehicles.clone();
+                    self.keep_standing(&mut vs);
+                    self.vehicles = vs;
                 }
             }
             Record::Spawn { time, vehicle, type_name } => {
@@ -213,7 +235,13 @@ impl Replay {
                     return;
                 }
                 match self.vehicles.iter_mut().find(|o| o.id == v.id) {
-                    Some(o) => *o = v,
+                    Some(o) => {
+                        let mut v = v;
+                        if self.header.version < 2 {
+                            v.claim_standing = o.claim_standing;
+                        }
+                        *o = v
+                    }
                     None => self.vehicles.push(v),
                 }
             }
@@ -235,7 +263,13 @@ impl Replay {
                     return;
                 }
                 match self.vehicles.iter_mut().find(|o| o.id == v.id) {
-                    Some(o) => *o = v,
+                    Some(o) => {
+                        let mut v = v;
+                        if self.header.version < 2 {
+                            v.claim_standing = o.claim_standing;
+                        }
+                        *o = v
+                    }
                     None => self.vehicles.push(v),
                 }
             }
@@ -253,6 +287,21 @@ impl Replay {
             }
             Record::Parked { parked, .. } => self.sim.parked = parked.clone(),
             Record::Note { .. } => {}
+        }
+    }
+
+    /// A recording before format 2 has no `claim_standing` in its vehicles (the game kept it
+    /// in the simulation, where it lived on over keyframes and changed ways): the vehicles
+    /// put back keep the replay's own.
+    fn keep_standing(&self, vs: &mut [Vehicle]) {
+        if self.header.version >= 2 {
+            return;
+        }
+        let here: HashMap<u64, bool> = self.vehicles.iter().map(|v| (v.id, v.claim_standing)).collect();
+        for v in vs {
+            if let Some(&s) = here.get(&v.id) {
+                v.claim_standing = s;
+            }
         }
     }
 
@@ -328,6 +377,13 @@ impl Replay {
             v.external = ext.get(&v.id).copied().unwrap_or_default();
             if let Some(s) = steer.get(&v.id) {
                 s.apply(&mut v.state);
+            }
+        }
+        // (stub_links) the recorded vehicles planned their ways on the network as the game
+        // linked it: the ways round the lit stubs take the stubs
+        if self.net.stub_links {
+            for v in &mut self.vehicles {
+                v.state.route_through_stubs(&self.net);
             }
         }
         for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {

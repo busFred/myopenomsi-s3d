@@ -501,3 +501,64 @@ fn a_free_run_without_switches_reproduces_a_game_recording() {
     assert!(worst < 0.01, "the free run drifted {worst:.3} m from the game in 30 s: {:?}", r.worst());
     assert!(r.missing.is_empty(), "{:?}", r.missing.first());
 }
+
+/// The standing hysteresis of `competitor_filter` (`Vehicle::claim_standing`) is the
+/// vehicle's: a replay started at any keyframe has it as the game had it, and drives on
+/// as the game did. (It lived in the simulation, and a replay started at a keyframe began
+/// with nobody standing: a car creeping off at 0.76 m/s after a stand was taken for a
+/// moving one; viz2 case07 drifted 20 m by the next keyframe.)
+#[test]
+fn the_claim_standing_hysteresis_is_kept_with_the_vehicle_across_keyframes() {
+    let net = priority_junction();
+    // a queue on the side road at the main road, a stream on the main road
+    let mut cars = Vec::new();
+    for k in 0..5 {
+        cars.push(car(10 + k, 0, 170.0 - 25.0 * k as f32, 12.0));
+    }
+    for k in 0..4 {
+        cars.push(car(30 + k, 3, 182.0 - 7.0 * k as f32, 0.0));
+    }
+    let path = temp("standing");
+    let mut hook = |t: f32, _: &mut Network, sim: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
+        sim.switches.competitor_filter = true;
+        if (t - 9.0).abs() < DT * 0.5 {
+            cars.push(car(20, 0, 60.0, 12.0));
+        }
+    };
+    record(net, vec![], cars, 40.0, &path, &mut hook);
+    let base = Replay::load(&path).expect("the recording reads");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(base.header.version, omsi_traffic::record::VERSION);
+    // the keyframes carry the mark
+    let marked = |rec: &omsi_traffic::record::Record| matches!(rec, omsi_traffic::record::Record::Keyframe { vehicles, .. } if vehicles.iter().any(|v| v.claim_standing));
+    assert!(base.records.iter().any(marked), "nobody was standing at a claim");
+    // (and somebody creeps off with it at a keyframe: where it matters)
+    let creeping = |rec: &omsi_traffic::record::Record| matches!(rec, omsi_traffic::record::Record::Keyframe { vehicles, .. } if vehicles.iter().any(|v| v.claim_standing && v.state.speed >= 0.3));
+    assert!(base.records.iter().any(creeping), "nobody creeps off at a keyframe");
+    // started at every keyframe in turn, a replay drives as the game did up to the next one
+    let n = base.keyframe_count();
+    assert!(n >= 6, "{n} keyframes");
+    for k in 0..n - 1 {
+        let mut r = Replay::new(base.header.clone(), base.records.clone(), Vec::new(), false);
+        r.free_run = true;
+        r.set_switches(omsi_traffic::sim::Switches { competitor_filter: true, ..Default::default() });
+        assert!(r.at(k));
+        r.run_until(base.keyframe_time(k + 1).unwrap() + 0.01);
+        let d = r.divergence.first().copied().expect("the next keyframe was compared");
+        assert!(d.1 == 0.0, "started at keyframe {k}: {d:?}");
+    }
+}
+
+/// A vehicle written before `claim_standing` existed reads as not standing.
+#[test]
+fn a_vehicle_without_the_standing_mark_reads_as_not_standing() {
+    let mut v = car(5, 0, 10.0, 0.5);
+    v.claim_standing = true;
+    let mut json: serde_json::Value = serde_json::to_value(&v).unwrap();
+    assert_eq!(json["claim_standing"], serde_json::Value::Bool(true));
+    let back: Vehicle = serde_json::from_value(json.clone()).unwrap();
+    assert!(back.claim_standing);
+    json.as_object_mut().unwrap().remove("claim_standing");
+    let old: Vehicle = serde_json::from_value(json).unwrap();
+    assert!(!old.claim_standing);
+}

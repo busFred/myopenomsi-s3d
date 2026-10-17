@@ -30,8 +30,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-/// The format's version (the header's first field).
-pub const VERSION: u32 = 1;
+/// The format's version (the header's first field). 2: vehicles carry their claim
+/// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it.
+pub const VERSION: u32 = 2;
 /// The memory keeps this many seconds (and the keyframe before them).
 pub const RING_SECS: f64 = 60.0;
 /// A keyframe of every vehicle this often (s): a replay starts at one, and a replay that

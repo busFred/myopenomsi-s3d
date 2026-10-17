@@ -182,6 +182,11 @@ pub struct Vehicle {
     /// World position of the origin and heading (degrees), from the way.
     pub pos: DVec3,
     pub heading: f32,
+    /// (competitor_filter) standing as of its last claim at a junction, with hysteresis:
+    /// from under 0.3 m/s until over 1 m/s (`Claim::standing`). Kept with the vehicle, so a
+    /// keyframe restores it (recordings before format 2 lack it: false).
+    #[serde(default)]
+    pub claim_standing: bool,
 }
 
 impl Vehicle {
@@ -210,6 +215,7 @@ impl Vehicle {
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
+            claim_standing: false,
         }
     }
 
@@ -358,9 +364,6 @@ pub struct Simulation {
     pub removed: Vec<usize>,
     /// Vehicles counted standing at a red light this frame (diagnostics).
     pub held_at_red: usize,
-    /// (competitor_filter) ids of the claimants standing as of their last claim: standing
-    /// from under 0.3 m/s until over 1 m/s.
-    pub standing_ids: hashbrown::HashSet<u64>,
 }
 
 impl Simulation {
@@ -384,7 +387,6 @@ impl Simulation {
             left_hand: net.left_hand,
             removed: Vec::new(),
             held_at_red: 0,
-            standing_ids: hashbrown::HashSet::new(),
         }
     }
 
@@ -640,6 +642,9 @@ impl Simulation {
         // claims and grants at the junctions
         let mut claims: Vec<Claim> = Vec::new();
         let mut claim_of: Vec<Option<usize>> = vec![None; vehicles.len()];
+        // (competitor_filter) the claimants' standing hysteresis as of this claim, written
+        // back once all claims are filed
+        let mut standing_now: Vec<(usize, bool)> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
@@ -670,8 +675,14 @@ impl Simulation {
             // held by it). (The lead-in and its own stub end 1 m apart and compile as a
             // merge of each other: a meeting place of the way with itself, before the
             // light, which is no meeting with anybody else's way.)
+            // (and not with a piece forking from where one of my own pieces starts: an unlit
+            // 0.3 m stub beside the lit one at the end of the lead-in, which merged with the
+            // lead-in a few metres before the light, put the line before the light)
             let light_line = if self.switches.signal_foes {
-                let first = self.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| !j.chain.iter().any(|&(m, _)| m == f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+                let node = &self.junctions.nodes[j.junction];
+                let starts: Vec<glam::DVec3> = j.chain.iter().filter_map(|&(m, _)| net.lanes.get(node.movements[m].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
+                let fork = |m: usize| net.lanes.get(node.movements[m].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
+                let first = self.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| !j.chain.iter().any(|&(m, _)| m == f.movement) && !fork(f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
                 if first.is_finite() {
                     j.entry + first
                 } else {
@@ -703,15 +714,11 @@ impl Simulation {
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
             let committed = committed && !(self.switches.signal_foes && light_red && st.speed < 0.5 && light_line - st.front > 0.5);
-            // (competitor_filter) standing, with hysteresis (`Claim::standing`): from under
-            // 0.3 m/s until over 1 m/s, remembered from one claim to the next
-            let was_standing = self.switches.competitor_filter && {
-                let was = self.standing_ids.contains(&v.id);
-                if st.speed < 0.3 || (was && st.speed <= 1.0) {
-                    self.standing_ids.insert(v.id);
-                } else if was {
-                    self.standing_ids.remove(&v.id);
-                }
+            // (competitor_filter, signal_foes) standing, with hysteresis (`Claim::standing`):
+            // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
+            let was_standing = (self.switches.competitor_filter || self.switches.signal_foes) && {
+                let was = v.claim_standing;
+                standing_now.push((i, st.speed < 0.3 || (was && st.speed <= 1.0)));
                 was
             };
             claim_of[i] = Some(claims.len());
@@ -739,6 +746,11 @@ impl Simulation {
                 impatience: v.impatience,
                 absolute: v.is_rail() || v.external.priority,
                 held: st.speed < 0.3 && v.last.held,
+                // (held by its lead, people, a zebra, a light, ... rather than by a junction's
+                // answer or a full exit)
+                blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                red_hysteresis: self.switches.signal_foes && was_standing,
+                lanes: if self.switches.competitor_filter { perception::way_lanes(net, st, 150.0) } else { Vec::new() },
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -822,7 +834,13 @@ impl Simulation {
                 impatience: Impatience::default(),
                 absolute: p.priority,
                 held: p.still > 2.0,
+                blocked: false,
+                red_hysteresis: false,
+                lanes: Vec::new(),
             });
+        }
+        for (i, standing) in standing_now {
+            vehicles[i].claim_standing = standing;
         }
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, self.switches.competitor_filter);
 

@@ -411,6 +411,24 @@ pub struct Network {
     /// The map drives on the left (`global.cfg` `[lht]`): priority to the left, the
     /// oncoming lane on the right, turning right across the oncoming traffic.
     pub left_hand: bool,
+    /// The traffic switch `stub_links` (see `omsi_traffic::sim::Switches`): an approach
+    /// lane is not linked past its short lit stub into the lane after it, and two pieces of
+    /// one way (one leading into the other, or two short stubs side by side at one place)
+    /// are no merge of each other (`Network::apply_stub_links`). `link` takes it from
+    /// `OMSI_TRAFFIC_SWITCHES` too, so the game needs no word of it.
+    pub stub_links: bool,
+}
+
+/// `stub_links`: a stub that carries a light is at most this long (m).
+pub const STUB_MAX: f32 = 1.5;
+/// `stub_links`: the lane after a stub starts within this distance of the stub's end (m)...
+const STUB_JOINT: f64 = 0.5;
+/// ... heading as the stub ends, within this many degrees.
+const STUB_HEADING: f32 = 20.0;
+
+/// `stub_links` named in `OMSI_TRAFFIC_SWITCHES` (or `all`).
+pub fn stub_links_from_env() -> bool {
+    omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES").map(|l| l.split(',').map(str::trim).any(|n| n == "stub_links" || n == "all")).unwrap_or(false)
 }
 
 /// `Network::reach` is counted up to this far (m).
@@ -702,7 +720,10 @@ impl Network {
                     // lead into the same lane (two turns converging on one exit)
                     let ends = (a.end() - b.end()).truncate().length();
                     let joint = ends < 1.5 || (ends < MEET_DIST && a.next.iter().any(|n| b.next.contains(n)));
-                    let merge = joint && (a.start() - b.start()).truncate().length() > 3.0;
+                    // (stub_links) a lead-in and its own stub end a metre apart and start
+                    // far apart: two pieces of one way, not two ways running into one
+                    let pieces = self.stub_links && self.one_way_pieces(i, j);
+                    let merge = joint && (a.start() - b.start()).truncate().length() > 3.0 && !pieces;
                     let place = if merge { Some((a.length(), b.length())) } else { polyline_crossing(a, b) };
                     // `[blockpath]`: the object says the two are in each other's way even
                     // where their lines do not cross - the whole of both is the meeting place
@@ -912,6 +933,137 @@ impl Network {
         out
     }
 
+    /// (`stub_links`) Lane `s` is a short lit stub: at most `STUB_MAX` long, under a light.
+    pub fn is_lit_stub(&self, s: usize) -> bool {
+        self.lanes.get(s).is_some_and(|l| l.traffic_light.is_some() && l.length() <= STUB_MAX)
+    }
+
+    /// (`stub_links`) The links of lane `a` that go round one of its short lit stubs: `b` in
+    /// `a`'s `next` together with a lit stub `s` (`is_lit_stub`) that leads into `b`, with
+    /// `b` starting within half a metre of the stub's end and heading as the stub ends. The
+    /// way is `a` → `s` → `b`; `a` → `b` (the 1.5 m linking distance reaches past a 1 m
+    /// stub) drives past the light. Returns (b, s) pairs.
+    pub fn stub_bypasses(&self, a: usize) -> Vec<(usize, usize)> {
+        let Some(la) = self.lanes.get(a) else { return Vec::new() };
+        let mut out = Vec::new();
+        for &st in la.next.iter().filter(|&&n| n != a && self.is_lit_stub(n)) {
+            let ls = &self.lanes[st];
+            for &b in &la.next {
+                if b == st || b == a || !ls.next.contains(&b) {
+                    continue;
+                }
+                let lb = &self.lanes[b];
+                if lb.points.is_empty() || (lb.start() - ls.end()).truncate().length() > STUB_JOINT || wrap_deg(lb.start_heading() - ls.end_heading()).abs() > STUB_HEADING {
+                    continue;
+                }
+                if !out.iter().any(|&(x, _)| x == b) {
+                    out.push((b, st));
+                }
+            }
+        }
+        out
+    }
+
+    /// (`stub_links`) Drop the links of `lanes` that go round a lit stub (`stub_bypasses`),
+    /// with their `prev` entries. Returns the links dropped, (from, to).
+    fn drop_stub_bypasses(&mut self, lanes: &[usize]) -> Vec<(usize, usize)> {
+        let mut dropped = Vec::new();
+        for &a in lanes {
+            let by: Vec<usize> = self.stub_bypasses(a).into_iter().map(|(b, _)| b).collect();
+            if by.is_empty() {
+                continue;
+            }
+            self.lanes[a].next.retain(|n| !by.contains(n));
+            for b in by {
+                if let Some(p) = self.prev.get_mut(b) {
+                    p.retain(|&x| x != a);
+                }
+                dropped.push((a, b));
+            }
+        }
+        dropped
+    }
+
+    /// (`stub_links`) Lanes `i` and `j` are pieces of one way, not two ways that meet: one
+    /// leads into the other, directly or over at most two short pieces (`STUB_MAX`: a
+    /// lead-in and its stub, whose ends lie a metre apart; a lead-in and the 0.4 m piece
+    /// after its stub), or both are short stubs side by side from one place (a lit stub and
+    /// an unlit one of 0.3 m at the end of one lead-in: a fork).
+    pub fn one_way_pieces(&self, i: usize, j: usize) -> bool {
+        if self.leads_into(i, j) || self.leads_into(j, i) {
+            return true;
+        }
+        let (a, b) = (&self.lanes[i], &self.lanes[j]);
+        a.length() <= STUB_MAX && b.length() <= STUB_MAX && !a.points.is_empty() && !b.points.is_empty() && (a.start() - b.start()).truncate().length() <= STUB_JOINT
+    }
+
+    /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
+    /// does. (The 1.5 m linking distance also links a lane to a short piece that starts a
+    /// metre before its end and ends where it ends: the last piece of another way running
+    /// into the same place, a merge, not the way on.)
+    fn continues(&self, a: usize, b: usize) -> bool {
+        let (la, lb) = (&self.lanes[a], &self.lanes[b]);
+        if la.points.is_empty() || lb.points.is_empty() {
+            return false;
+        }
+        let h = (la.end_heading() as f64).to_radians();
+        (lb.end() - la.end()).truncate().dot(DVec2::new(h.sin(), h.cos())) > 0.1
+    }
+
+    /// Lane `from` leads into `to`: `to` goes on from its end (`continues`), or from the end
+    /// of a short piece (`STUB_MAX`) that goes on from it, two such pieces at most.
+    fn leads_into(&self, from: usize, to: usize) -> bool {
+        let mut at = vec![from];
+        for step in 0..3 {
+            let mut on = Vec::new();
+            for &l in &at {
+                for &n in self.lanes[l].next.iter().filter(|&&n| self.continues(l, n)) {
+                    if n == to {
+                        return true;
+                    }
+                    if step < 2 && n != from && self.lanes.get(n).is_some_and(|x| x.length() <= STUB_MAX) && !on.contains(&n) {
+                        on.push(n);
+                    }
+                }
+            }
+            if on.is_empty() {
+                return false;
+            }
+            at = on;
+        }
+        false
+    }
+
+    /// Switch `stub_links` on for a network linked without it (a recording's): drop the
+    /// links round the lit stubs and the merges of two pieces of one way (`one_way_pieces`)
+    /// from the meeting places. The rest of what was derived (`prev`, `reach`, the other
+    /// meeting places) stays as it was. Returns (links dropped, merge pairs dropped, each
+    /// pair once with the lower index first).
+    pub fn apply_stub_links(&mut self) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        self.stub_links = true;
+        let all: Vec<usize> = (0..self.lanes.len()).collect();
+        let links = self.drop_stub_bypasses(&all);
+        let mut pairs = Vec::new();
+        for i in 0..self.crossings.len().min(self.lanes.len()) {
+            let gone: Vec<usize> = self.crossings[i].iter().filter(|c| c.merge && c.other < self.lanes.len() && self.one_way_pieces(i, c.other)).map(|c| c.other).collect();
+            if gone.is_empty() {
+                continue;
+            }
+            self.crossings[i].retain(|c| !(c.merge && gone.contains(&c.other)));
+            for o in gone {
+                if !self.crossings[i].iter().any(|c| c.other == o) {
+                    if let Some(c) = self.conflicts.get_mut(i) {
+                        c.retain(|&x| x != o);
+                    }
+                }
+                if i < o {
+                    pairs.push((i, o));
+                }
+            }
+        }
+        (links, pairs)
+    }
+
     /// Connect lane ends to lane starts that lie within `tol` metres with a compatible heading.
     pub fn link(&mut self, tol: f64) {
         self.by_key.clear();
@@ -1007,6 +1159,15 @@ impl Network {
             }
             links += found.len();
             self.lanes[i].next = found;
+        }
+        if !self.stub_links {
+            self.stub_links = stub_links_from_env();
+        }
+        if self.stub_links {
+            let all: Vec<usize> = (0..self.lanes.len()).collect();
+            let dropped = self.drop_stub_bypasses(&all);
+            links -= dropped.len();
+            log::info!("path network (stub_links): {} links past a lit stub dropped", dropped.len());
         }
         log::info!("path network: {} lanes, {} links", self.lanes.len(), links);
         self.prev = vec![Vec::new(); self.lanes.len()];
@@ -1298,6 +1459,15 @@ impl Network {
             }
         }
         self.prev.resize(end, Vec::new());
+        if self.stub_links {
+            // (the new lanes and the old ones linked to them: a stub and the lane past it
+            // may come in one batch, or the lane past it later than the stub)
+            let mut touched: Vec<usize> = added.iter().map(|&(a, _)| a).collect();
+            touched.sort_unstable();
+            touched.dedup();
+            let dropped = self.drop_stub_bypasses(&touched);
+            added.retain(|p| !dropped.contains(p));
+        }
         for (from, to) in added {
             if !self.prev[to].contains(&from) {
                 self.prev[to].push(from);
@@ -1505,6 +1675,174 @@ mod extend_tests {
         whole.link(1.5);
         assert_eq!(grown.reach, whole.reach);
         assert_eq!(grown.reach[2], distant_reach);
+    }
+}
+
+#[cfg(test)]
+mod stub_links_tests {
+    use super::*;
+
+    /// A path of crossing object 9 (`source` 2) along y.
+    fn piece(x: f64, y0: f64, y1: f64, path: u16) -> Lane {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(x, y0, 0.0), DVec3::new(x, y1, 0.0)], LaneKind::Street, 3.0);
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+        l.source = 2;
+        l
+    }
+
+    /// BeijingCity's way through a signalled crossing: a 20 m lead-in (0), the 1 m stub
+    /// with the light (1), the piece across (2) starting where the stub ends; beside it a
+    /// second lead-in (3) whose lit stub (4) has an unlit 0.3 m sibling (5) from the same
+    /// place, which leads into a turn (6); the straight piece (7) after the lit stub.
+    fn crossing() -> Vec<Lane> {
+        let mut lanes = vec![piece(0.0, 0.0, 20.0, 0)];
+        let mut stub = piece(0.0, 20.0, 21.0, 1);
+        stub.traffic_light = Some((0, 0));
+        lanes.push(stub);
+        lanes.push(piece(0.0, 21.0, 51.0, 2));
+        lanes.push(piece(3.0, 0.0, 20.0, 3));
+        let mut stub = piece(3.0, 20.0, 21.0, 4);
+        stub.traffic_light = Some((0, 0));
+        lanes.push(stub);
+        lanes.push(piece(3.0, 20.0, 20.3, 5));
+        let mut turn = LaneBuilder::polyline(vec![DVec3::new(3.0, 20.3, 0.0), DVec3::new(3.6, 22.0, 0.0), DVec3::new(6.0, 24.0, 0.0), DVec3::new(10.0, 25.0, 0.0)], LaneKind::Street, 3.0);
+        turn.key = Some(LaneKey { tile: (0, 0), id: 9, path: 6 });
+        turn.source = 2;
+        lanes.push(turn);
+        lanes.push(piece(3.0, 21.0, 51.0, 7));
+        lanes
+    }
+
+    fn linked(on: bool) -> Network {
+        let mut net = Network { lanes: crossing(), stub_links: on, ..Default::default() };
+        net.link(1.5);
+        net
+    }
+
+    fn merges(net: &Network, a: usize, b: usize) -> bool {
+        net.crossings[a].iter().any(|c| c.other == b && c.merge)
+    }
+
+    #[test]
+    fn stub_links_off_the_lead_in_is_linked_past_its_lit_stub_and_merges_with_it() {
+        let net = linked(false);
+        assert_eq!(net.lanes[0].next, vec![1, 2], "the 1.5 m linking distance reaches past the 1 m stub");
+        assert!(net.lanes[3].next.contains(&7));
+        assert!(merges(&net, 0, 1), "a lead-in and its own stub end a metre apart: a merge");
+        assert!(merges(&net, 3, 5), "and the unlit sibling stub");
+    }
+
+    #[test]
+    fn stub_links_the_lead_in_leads_through_its_lit_stub_only() {
+        let net = linked(true);
+        assert_eq!(net.lanes[0].next, vec![1]);
+        assert_eq!(net.lanes[1].next, vec![2]);
+        assert_eq!(net.prev[2], vec![1]);
+        // the lead-in with the sibling: the lit stub, the 0.3 m unlit stub, and the turn
+        // after it (an unlit stub carries no light to be driven round)
+        assert!(!net.lanes[3].next.contains(&7), "{:?}", net.lanes[3].next);
+        assert!(net.lanes[3].next.contains(&4) && net.lanes[3].next.contains(&5));
+        // no merge of a way with its own pieces, nor of the two stubs side by side
+        for (a, b) in [(0, 1), (3, 4), (3, 5), (4, 5), (0, 2), (3, 7)] {
+            assert!(!merges(&net, a, b) && !merges(&net, b, a), "{a}/{b}: {:?}", net.crossings[a]);
+        }
+        assert!(net.one_way_pieces(4, 5), "sibling stubs are a fork");
+        assert!(net.one_way_pieces(0, 2), "through a short stub");
+        assert!(!net.one_way_pieces(0, 3));
+    }
+
+    #[test]
+    fn stub_links_two_ways_into_one_lane_are_still_a_merge() {
+        // two lead-ins converge on one exit: the same end, starts 6 m apart
+        let lanes = vec![piece(0.0, 0.0, 20.0, 0), {
+            let mut l = LaneBuilder::polyline(vec![DVec3::new(6.0, 0.0, 0.0), DVec3::new(0.0, 20.0, 0.0)], LaneKind::Street, 3.0);
+            l.key = Some(LaneKey { tile: (0, 0), id: 9, path: 1 });
+            l.source = 2;
+            l
+        }, piece(0.0, 20.0, 40.0, 2)];
+        for on in [false, true] {
+            let mut net = Network { lanes: lanes.clone(), stub_links: on, ..Default::default() };
+            net.link(1.5);
+            assert!(merges(&net, 0, 1), "stub_links {on}");
+        }
+        // (BeijingCity case07 5229/5230/5231) one way's last piece is 1.1 m long and ends
+        // where the other way ends; the other is linked to that piece too (it starts 1.1 m
+        // before its end): no way on, the two ways' meeting place
+        let slant = |x0: f64, y0: f64, x1: f64, y1: f64, path: u16| {
+            let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, y0, 0.0), DVec3::new(x1, y1, 0.0)], LaneKind::Street, 3.0);
+            l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+            l.source = 2;
+            l
+        };
+        let lanes = vec![slant(-2.3, 0.0, -0.12, 10.9, 0), slant(-0.12, 10.9, 0.0, 12.0, 1), slant(0.0, 0.0, 0.0, 12.0, 2), piece(0.0, 12.0, 20.0, 3)];
+        for on in [false, true] {
+            let mut net = Network { lanes: lanes.clone(), stub_links: on, ..Default::default() };
+            net.link(1.5);
+            assert!(net.lanes[2].next.contains(&1), "linked back to the other way's last piece");
+            assert!(merges(&net, 1, 2), "stub_links {on}: {:?}", net.crossings[1]);
+        }
+    }
+
+    #[test]
+    fn stub_links_unlit_or_long_stubs_and_lanes_further_off_keep_their_links() {
+        let mut lanes = crossing();
+        lanes[1].traffic_light = None;
+        let mut net = Network { lanes, stub_links: true, ..Default::default() };
+        net.link(1.5);
+        assert_eq!(net.lanes[0].next, vec![1, 2], "an unlit stub: nothing to drive round");
+        // a lit piece of 2 m is no stub
+        let mut lanes = crossing();
+        lanes[1] = piece(0.0, 20.0, 22.0, 1);
+        lanes[1].traffic_light = Some((0, 0));
+        lanes[2] = piece(0.0, 21.0, 51.0, 2);
+        let a = Network { lanes: lanes.clone(), stub_links: true, ..Default::default() };
+        assert!(!a.is_lit_stub(1));
+    }
+
+    #[test]
+    fn stub_links_lanes_added_later_are_linked_with_it() {
+        let all = crossing();
+        let mut whole = Network { lanes: all.clone(), stub_links: true, ..Default::default() };
+        whole.link(1.5);
+        // the lead-ins first, the stubs and the pieces after them with a later tile (as
+        // `LanesAdded` brings them: unlinked); and the other way round
+        for split in [3, 1, 2, 5, 7] {
+            let mut grown = Network { lanes: all[..split].to_vec(), stub_links: true, ..Default::default() };
+            grown.link(1.5);
+            grown.extend(all[split..].to_vec(), 1.5);
+            for i in 0..all.len() {
+                let (mut g, mut w) = (grown.lanes[i].next.clone(), whole.lanes[i].next.clone());
+                g.sort_unstable();
+                w.sort_unstable();
+                assert_eq!(g, w, "split {split}, lane {i}");
+                let (mut g, mut w) = (grown.prev[i].clone(), whole.prev[i].clone());
+                g.sort_unstable();
+                w.sort_unstable();
+                assert_eq!(g, w, "split {split}, prev of lane {i}");
+            }
+            for (a, b) in [(0, 1), (3, 4), (3, 5)] {
+                assert!(!merges(&grown, a, b) && !merges(&grown, b, a), "split {split}: {a}/{b}");
+            }
+        }
+    }
+
+    #[test]
+    fn stub_links_applied_to_a_linked_network_is_linking_with_it() {
+        let mut net = linked(false);
+        let (links, pairs) = net.apply_stub_links();
+        let on = linked(true);
+        for i in 0..net.lanes.len() {
+            assert_eq!(net.lanes[i].next, on.lanes[i].next, "lane {i}");
+            assert_eq!(net.prev[i], on.prev[i], "prev of lane {i}");
+            assert_eq!(net.crossings[i], on.crossings[i], "crossings of lane {i}");
+        }
+        // (the 0.3 m sibling is linked to the lit stub beside it, which starts 0.3 m back,
+        // and past it to the straight piece: round the light too)
+        assert_eq!(links, vec![(0, 2), (3, 7), (5, 7)]);
+        assert!(pairs.contains(&(0, 1)) && pairs.contains(&(3, 5)), "{pairs:?}");
+        // off, the network is linked as before
+        let off = linked(false);
+        assert_eq!(off.lanes[0].next, vec![1, 2]);
     }
 }
 
@@ -2211,6 +2549,48 @@ impl AiState {
                 None => break,
             }
         }
+    }
+
+    /// (`stub_links`) A way planned on a network linked without it (a recorded vehicle's
+    /// route and plan) takes the lit stubs it went round: where one lane of it is no longer
+    /// linked to the next and a lit stub between them is, the stub goes in. Returns whether
+    /// anything changed.
+    pub fn route_through_stubs(&mut self, net: &Network) -> bool {
+        let through = |way: &mut Vec<usize>, keep: Option<&mut usize>| -> bool {
+            let mut changed = false;
+            let mut k = 0;
+            let mut keep = keep;
+            while k + 1 < way.len() {
+                let (a, b) = (way[k], way[k + 1]);
+                if let Some(la) = net.lanes.get(a) {
+                    if !la.next.contains(&b) {
+                        if let Some(&st) = la.next.iter().find(|&&st| net.is_lit_stub(st) && net.lanes[st].next.contains(&b)) {
+                            way.insert(k + 1, st);
+                            if let Some(i) = keep.as_deref_mut() {
+                                if *i > k {
+                                    *i += 1;
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                k += 1;
+            }
+            changed
+        };
+        let mut route = std::mem::take(&mut self.route);
+        let mut ri = self.route_index;
+        let mut changed = through(&mut route, Some(&mut ri));
+        self.route = route;
+        self.route_index = ri;
+        let mut plan: Vec<usize> = std::iter::once(self.lane).chain(self.upcoming()).collect();
+        if through(&mut plan, None) {
+            changed = true;
+            self.planned_next = plan.get(1).copied();
+            self.ahead = plan.into_iter().skip(2).collect();
+        }
+        changed
     }
 
     /// Put the car on a fixed route starting at its first lane.
