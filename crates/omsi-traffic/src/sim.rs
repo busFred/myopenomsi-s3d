@@ -658,16 +658,42 @@ impl Simulation {
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
             let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
-            // the light at this junction's line, if the driver is held by one
+            // the light at this junction's line, if the driver is held by one. With
+            // `signal_foes`: any light on the way before the first meeting place with
+            // another way, wherever the object begins (BeijingCity lights a 1 m stub
+            // inside the crossing object, past its lead-in piece: the old test, the light
+            // within 1 m of the object's entry, never saw a car standing at that red as
+            // held by it). (The lead-in and its own stub end 1 m apart and compile as a
+            // merge of each other: a meeting place of the way with itself, before the
+            // light, which is no meeting with anybody else's way.)
+            let light_line = if self.switches.signal_foes {
+                let first = self.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| !j.chain.iter().any(|&(m, _)| m == f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+                if first.is_finite() {
+                    j.entry + first
+                } else {
+                    j.conflict_start
+                }
+            } else {
+                j.entry
+            };
             let (light_red, until_go) = match p.signal {
-                Some(sig) if sig.dist <= j.entry + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
+                Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => (true, sig.until_go),
                 _ => (false, None),
             };
+            // (signal_foes) standing at its red short of the first meeting place with
+            // another way, a car is committed to nothing: the merge of the lead-in with its
+            // own stub put its "first meeting place" behind its bumper, and the foes took
+            // the car waiting at its red for one already on its way across
+            let committed = committed && !(self.switches.signal_foes && light_red && st.speed < 0.5 && light_line - st.front > 0.5);
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
                 chain: j.chain.clone(),
                 light_red,
                 until_go,
+                lead: match p.leader.map(|l| l.what) {
+                    Some(Seen::Vehicle(o)) | Some(Seen::Body(o)) => Some(o),
+                    _ => None,
+                },
                 vehicle: i,
                 junction: j.junction,
                 movement: j.movement,
@@ -749,6 +775,7 @@ impl Simulation {
                 chain: vec![(m, 0.0)],
                 light_red: false,
                 until_go: None,
+                lead: None,
                 vehicle: usize::MAX - k,
                 junction: j,
                 movement: m,
@@ -766,7 +793,7 @@ impl Simulation {
                 held: p.still > 2.0,
             });
         }
-        let grants: Vec<Grant> = reservation::resolve(&self.junctions, net, &claims);
+        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, self.switches.competitor_filter);
 
         // plan and act, one vehicle at a time
         for i in 0..vehicles.len() {
