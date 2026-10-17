@@ -1,48 +1,61 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>__TITLE__</title>
 <style>
-:root{--fg:var(--foreground,#1f2328);--mut:var(--muted-foreground,#6b7280);--bd:var(--border,#d0d7de);--cd:var(--card,transparent);--ac:var(--accent,#2563eb)}
-.tc{font:12px/1.35 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);max-width:1000px}
-.tc h1{font-size:15px;margin:0 0 6px}
-.tc a{color:var(--ac)}
-.tc a.vid{font-weight:600;text-decoration:none;border-bottom:1px dotted var(--ac)}
-.tc .row{display:flex;gap:10px;align-items:flex-start}
-.tc canvas{width:700px;height:520px;border:1px solid var(--bd);border-radius:6px;background:#1d2126;cursor:crosshair;flex:none}
-.tc .side{width:270px;border:1px solid var(--bd);border-radius:6px;background:var(--cd);padding:8px;height:504px;overflow:auto;flex:none}
-.tc .ctl{display:flex;gap:8px;align-items:center;margin:6px 0;width:980px}
-.tc .ctl input[type=range]{flex:1}
-.tc button,.tc select,.tc input[type=text]{font:inherit;color:var(--fg);background:var(--cd);border:1px solid var(--bd);border-radius:4px;padding:2px 8px}
-.tc button{cursor:pointer}
-.tc input[type=text]{width:110px}
+:root{color-scheme:light;--fg:#182536;--mut:#506176;--bd:#c8d2df;--cd:#ffffff;--ac:#075daf;--bg:#f2f5f9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);padding:28px 24px 40px}
+.tc{font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);max-width:1200px;margin:auto}
+.tc h1{font-size:clamp(22px,2.5vw,30px);line-height:1.25;letter-spacing:-.025em;margin:0 0 12px}
+.tc a{color:var(--ac);text-underline-offset:3px}
+.tc a:hover{color:#03467f}
+.tc a.vid{font-weight:650;text-decoration:none;border-bottom:1px dotted var(--ac);padding:1px 2px}
+.tc .row{display:grid;grid-template-columns:minmax(0,700px) minmax(280px,1fr);gap:16px;align-items:start}
+.tc canvas{display:block;width:100%;height:auto;aspect-ratio:700/520;border:1px solid #9cacc0;border-radius:10px;background:#1d2126;cursor:crosshair}
+.tc .side{min-width:0;border:1px solid var(--bd);border-radius:10px;background:var(--cd);padding:18px;max-height:520px;overflow:auto;scrollbar-color:#9cacc0 var(--cd)}
+.tc .ctl{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:20px 0 14px;padding:14px;border:1px solid var(--bd);border-radius:10px;background:var(--cd)}
+.tc .ctl input[type=range]{flex:1;min-width:120px;accent-color:#075daf;cursor:pointer;height:32px}
+.tc button,.tc select,.tc input[type=text]{font:inherit;color:var(--fg);background:#edf2f8;border:1px solid #9cacc0;border-radius:6px;padding:7px 12px;min-height:40px}
+.tc button{cursor:pointer;font-weight:600}
+.tc button:hover,.tc select:hover{background:#dce9f7;border-color:#075daf}
+.tc :is(button,select,input,a,summary):focus-visible{outline:3px solid #075daf;outline-offset:3px}
+.tc #play{background:#075daf;color:#ffffff;border-color:#075daf;min-width:76px}
+.tc #play:hover{background:#03467f}
+.tc input[type=text]{width:164px;min-width:0}
+.tc input::placeholder{color:#596b80;opacity:1}
 .tc .mut{color:var(--mut)}
-.tc table{border-collapse:collapse;width:100%}
-.tc td{padding:1px 4px;border-bottom:1px solid var(--bd);vertical-align:top}
-.tc td:first-child{color:var(--mut);white-space:nowrap}
-.tc .lg{display:grid;grid-template-columns:repeat(2,1fr);gap:2px 8px;margin:6px 0}
-.tc .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-.tc .note{font-size:11px;color:var(--mut);white-space:pre-wrap;word-break:break-word}
-.tc .t{font-variant-numeric:tabular-nums;font-weight:600;min-width:64px}
-.tc details{border:1px solid var(--bd);border-radius:6px;margin:6px 0;padding:4px 8px;background:var(--cd)}
-.tc summary{cursor:pointer;font-weight:600}
-.tc .shots{display:flex;flex-direction:column;gap:6px;margin-top:6px}
-.tc .shots img{width:100%;height:auto;border:1px solid var(--bd);border-radius:4px}
-.tc .roots div{margin:3px 0;padding-left:8px;border-left:3px solid var(--bd);word-break:break-word}
-.tc .roots b{font-variant:small-caps}
-.tc .chains{max-height:300px;overflow:auto;font-size:11px}
-.tc .car{margin:4px 0 6px;word-break:break-word}
-.tc .hop{padding-left:14px;color:var(--mut)}
+.tc #sub{margin-bottom:20px;max-width:100ch}
+.tc table{border-collapse:collapse;width:100%;margin:12px 0;font-variant-numeric:tabular-nums}
+.tc td{padding:6px 5px;border-bottom:1px solid var(--bd);vertical-align:top;overflow-wrap:anywhere}
+.tc td:first-child{color:var(--mut);white-space:nowrap;width:38%}
+.tc .lg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;margin:20px 0 12px;padding-top:16px;border-top:1px solid var(--bd);font-size:13px}
+.tc .sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tc .note{font-size:14px;line-height:1.65;color:var(--mut);white-space:pre-wrap;overflow-wrap:anywhere}
+.tc .t{font:600 17px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;min-width:84px;color:#182536}
+.tc details{border:1px solid var(--bd);border-radius:10px;margin:14px 0;padding:14px 18px;background:var(--cd)}
+.tc summary{cursor:pointer;font-weight:650;color:#233e5d}
+.tc details[open]>summary{margin-bottom:12px}
+.tc .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:14px;margin-top:12px}
+.tc .shots a{display:block;background:#e9eef5;border-radius:8px}
+.tc .shots img{display:block;width:100%;height:auto;max-height:300px;object-fit:contain;border:1px solid var(--bd);border-radius:8px}
+.tc .roots div{margin:12px 0;padding:4px 0 4px 14px;border-left:3px solid #075daf;overflow-wrap:anywhere}
+.tc .roots b{color:#075daf}
+.tc .chains{max-height:360px;overflow:auto;font-size:14px;scrollbar-color:#9cacc0 var(--cd)}
+.tc .car{margin:0 0 14px;padding-bottom:14px;border-bottom:1px solid var(--bd);overflow-wrap:anywhere}
+.tc .hop{padding-left:18px;color:var(--mut)}
 .tc .hop.term{color:var(--fg)}
-.tc .cars{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
-.tc .cars button{padding:1px 5px;font-size:11px}
-.tc .cars button.on{outline:2px solid var(--ac)}
-.tc .msg{color:#d1242f;font-weight:600}
+.tc .cars{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+.tc .cars button{padding:6px 9px;font-size:13px;min-height:34px;font-variant-numeric:tabular-nums}
+.tc .cars button.on{background:#075daf;color:#ffffff;border-color:#075daf;outline:2px solid #075daf;outline-offset:2px}
+.tc .msg{color:#b42332;font-weight:600;margin-bottom:10px}
+@media(max-width:1050px){.tc .row{grid-template-columns:minmax(0,700px);justify-content:center}.tc .side{max-height:none}.tc .lg{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){body{padding:18px 12px 28px}.tc .ctl{gap:10px;padding:12px}.tc .ctl input[type=range]{order:1;flex-basis:100%}.tc input[type=text]{flex:1;width:120px}.tc .side,.tc details{padding:14px}.tc .lg{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body>
 <div class="tc">
 <h1>__TITLE__</h1>
 <div class="mut" id="sub"></div>
 __SHOTS__
 <div id="diag"></div>
-<div class="ctl"><button id="play">Play</button><select id="spd"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span class="t" id="time"></span><input type="range" id="scrub" min="0" value="0"><button id="fit" title="reset the view">Fit</button><input type="text" id="find" placeholder="find vehicle id" title="type a vehicle id, Enter"></div>
+<div class="ctl"><button id="play">Play</button><select id="spd" aria-label="Playback speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span class="t" id="time"></span><input type="range" id="scrub" aria-label="Timeline" min="0" value="0"><button id="fit" title="reset the view">Fit</button><input type="text" id="find" aria-label="Find vehicle id" placeholder="find vehicle id" title="type a vehicle id, Enter"></div>
 <div class="row"><canvas id="cv" width="700" height="520"></canvas>
 <div class="side"><div id="pin"><span class="mut">Click a vehicle or a pedestrian. Drag to pan, wheel to zoom.</span></div>
 <div id="carlist"></div>
@@ -182,12 +195,14 @@ document.getElementById('play').onclick=()=>{playing=!playing;document.getElemen
 document.getElementById('spd').onchange=e=>{speed=+e.target.value;};
 document.getElementById('fit').onclick=()=>{fit();draw();};
 scrub.oninput=()=>{fi=+scrub.value;acc=0;draw();};
+// Convert CSS pixels to the canvas coordinates, including when the layout shrinks.
+function canvasPoint(e){const b=cv.getBoundingClientRect();return [(e.clientX-b.left-cv.clientLeft)*W/cv.clientWidth,(e.clientY-b.top-cv.clientTop)*H/cv.clientHeight];}
 let drag=null,moved=false;
-cv.onmousedown=e=>{drag=[e.offsetX,e.offsetY,ox,oy];moved=false;};
+cv.onmousedown=e=>{drag=[...canvasPoint(e),ox,oy];moved=false;};
 window.addEventListener('mouseup',()=>{drag=null;});
-cv.onmousemove=e=>{if(!drag)return;const dx=e.offsetX-drag[0],dy=e.offsetY-drag[1];if(Math.abs(dx)+Math.abs(dy)>3)moved=true;ox=drag[2]-dx/scale;oy=drag[3]+dy/scale;draw();};
-cv.onwheel=e=>{e.preventDefault();const wx=(e.offsetX-W/2)/scale+ox,wy=-(e.offsetY-H/2)/scale+oy;scale*=e.deltaY<0?1.2:1/1.2;scale=Math.max(0.3,Math.min(40,scale));ox=wx-(e.offsetX-W/2)/scale;oy=wy+(e.offsetY-H/2)/scale;draw();};
-cv.onclick=e=>{if(moved)return;const wx=(e.offsetX-W/2)/scale+ox,wy=-(e.offsetY-H/2)/scale+oy;const f=F[fi];msg='';
+cv.onmousemove=e=>{if(!drag)return;const [x,y]=canvasPoint(e),dx=x-drag[0],dy=y-drag[1];if(Math.abs(dx)+Math.abs(dy)>3)moved=true;ox=drag[2]-dx/scale;oy=drag[3]+dy/scale;draw();};
+cv.onwheel=e=>{e.preventDefault();const [x,y]=canvasPoint(e);const wx=(x-W/2)/scale+ox,wy=-(y-H/2)/scale+oy;scale*=e.deltaY<0?1.2:1/1.2;scale=Math.max(0.3,Math.min(40,scale));ox=wx-(x-W/2)/scale;oy=wy+(y-H/2)/scale;draw();};
+cv.onclick=e=>{if(moved)return;const [x,y]=canvasPoint(e);const wx=(x-W/2)/scale+ox,wy=-(y-H/2)/scale+oy;const f=F[fi];msg='';
  let best=null;for(const r of Object.values(f.v)){const d=Math.hypot(r[1]-wx,r[2]-wy);if(d<Math.max(3,10/scale)&&(!best||d<best[0]))best=[d,r[0]];}
  let bp=null;for(const p of f.p){const d=Math.hypot(p[0]-wx,p[1]-wy);if(d<Math.max(1.5,8/scale)&&(!bp||d<bp[0]))bp=[d,p];}
  if(bp&&(!best||bp[0]<best[0]*0.5)){pinP=[bp[1][0],bp[1][1]];pinned=null;}else if(best){pinned=best[1];pinP=null;}else{pinned=null;pinP=null;}draw();};

@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Traffic cases</title>
+<style>
+:root{color-scheme:light;--fg:#182536;--mut:#506176;--bd:#c8d2df;--cd:#ffffff;--ac:#075daf;--bg:#f2f5f9}
+*{box-sizing:border-box}
+body{font:16px/1.65 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);background:var(--bg);margin:0;padding:36px max(20px,calc((100% - 1280px)/2)) 56px}
+h2{font-size:32px;line-height:1.2;letter-spacing:-.03em;margin:0 0 14px}
+p{color:var(--mut);margin:0 0 28px;max-width:78ch}
+table{border-collapse:separate;border-spacing:0;width:100%;border:1px solid var(--bd);border-radius:12px;overflow:hidden;background:var(--cd)}
+td,th{padding:20px;vertical-align:top;text-align:left;border-bottom:1px solid var(--bd)}
+th{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#405773;background:#edf2f8}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:#f0f6ff}
+td:first-child{min-width:260px}
+td:first-child>a{font-weight:650;font-size:17px;line-height:1.5}
+td:nth-child(2){white-space:nowrap;font:14px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--mut)}
+a{color:var(--ac);text-decoration-thickness:1px;text-underline-offset:4px}
+a:hover{color:#03467f}
+a:focus-visible{outline:3px solid #075daf;outline-offset:4px;border-radius:2px}
+a.vid{font-weight:650;text-decoration:none;border-bottom:1px dotted}
+.rc{font-size:15px;line-height:1.75;max-width:700px;overflow-wrap:anywhere;color:#405269}
+.rc b{color:#182536}
+.th{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.th:empty{display:none}
+.th a{display:block;line-height:0;border-radius:7px}
+.th img{display:block;width:200px;max-width:100%;height:auto;border:1px solid #9cacc0;border-radius:7px}
+.th a:hover img{border-color:#075daf}
+@media(max-width:800px){body{padding:24px 14px 36px}table,tbody{display:block}tr{display:flex;flex-wrap:wrap;padding:16px;border-bottom:1px solid var(--bd);gap:12px}tr:first-child{display:none}tr:last-child{border:0}td{display:block;padding:0;border:0}td:first-child{width:100%;min-width:0}td.rc{width:100%;order:1}.th img{width:180px}}
+</style></head><body><h2>Traffic cases</h2><p>Vehicle ids open the case's viewer with that vehicle pinned at the start of its stand.</p><table><tr><th>Case</th><th>Size</th><th>Root causes (diagnose)</th><th>Report</th></tr>
+__ROWS__</table></body></html>

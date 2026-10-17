@@ -5,6 +5,7 @@
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
 //! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
+//! traffic_cases heads <fixture> [--radius 200]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases index <out_dir>
 //! ```
@@ -42,6 +43,7 @@ fn main() {
             trace(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
         Some("diagnose") if args.len() >= 3 => diagnose(Path::new(&args[2]), &args[3..]),
+        Some("heads") if args.len() >= 3 => heads(Path::new(&args[2]), &args[3..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
@@ -2562,11 +2564,867 @@ fn index(dir: &Path) -> Res<()> {
             std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0
         );
     }
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Traffic cases</title><style>body{{font:13px/1.4 system-ui,sans-serif;color:var(--foreground,#222);margin:16px}}table{{border-collapse:collapse}}td,th{{border:1px solid var(--border,#ccc);padding:4px 8px;vertical-align:top;text-align:left}}a{{color:var(--accent,#2563eb)}}a.vid{{font-weight:600;text-decoration:none;border-bottom:1px dotted}}.rc{{font-size:12px;color:var(--muted-foreground,#555);max-width:700px;word-break:break-word}}.th img{{margin:4px 4px 0 0;border:1px solid var(--border,#ccc);border-radius:3px}}</style></head><body><h2>Traffic cases</h2><p>Vehicle ids open the case's viewer with that vehicle pinned at the start of its stand.</p><table><tr><th>case</th><th>size</th><th>root causes (diagnose)</th><th></th></tr>\n{rows}</table></body></html>"
-    );
+    let html = include_str!("traffic_cases_index.html").replace("__ROWS__", &rows);
     let out = dir.join("index.html");
     std::fs::write(&out, html)?;
     println!("{}: {} cases", out.display(), entries.len());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// heads: the queue heads near the player, checked against the geometry
+
+/// A box relative to a vehicle: (gap from its front bumper along its heading to the
+/// nearest part of the box, to the far part, the box's middle across, + right).
+fn rel_box(h: &Vehicle, corners: &[glam::DVec2], center: glam::DVec2) -> (f64, f64, f64) {
+    let hd = (h.heading as f64).to_radians();
+    let f = glam::DVec2::new(hd.sin(), hd.cos());
+    let rt = glam::DVec2::new(hd.cos(), -hd.sin());
+    let o = h.pos.truncate();
+    let fr = h.state.front as f64;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for c in corners {
+        let a = (*c - o).dot(f) - fr;
+        lo = lo.min(a);
+        hi = hi.max(a);
+    }
+    (lo, hi, (center - o).dot(rt))
+}
+
+fn rel_point(h: &Vehicle, p: glam::DVec2) -> (f64, f64) {
+    let hd = (h.heading as f64).to_radians();
+    let f = glam::DVec2::new(hd.sin(), hd.cos());
+    let rt = glam::DVec2::new(hd.cos(), -hd.sin());
+    let d = p - h.pos.truncate();
+    (d.dot(f) - h.state.front as f64, d.dot(rt))
+}
+
+/// Something with a body: an AI vehicle (index) or a player (index).
+#[derive(Clone, Copy, PartialEq)]
+enum Body {
+    V(usize),
+    P(usize),
+}
+
+fn body_obb(r: &Replay, b: Body) -> omsi_sim::collision::Obb {
+    match b {
+        Body::V(i) => r.vehicles[i].obb(),
+        Body::P(i) => r.sim.players[i].obb(0.0, 0.0),
+    }
+}
+
+fn body_speed(r: &Replay, b: Body) -> f32 {
+    match b {
+        Body::V(i) => r.vehicles[i].state.speed,
+        Body::P(i) => r.sim.players[i].speed,
+    }
+}
+
+fn body_name(r: &Replay, b: Body) -> String {
+    match b {
+        Body::V(i) => format!("#{}", r.vehicles[i].id),
+        Body::P(i) => format!("PLAYER{}", r.sim.players[i].id),
+    }
+}
+
+fn all_bodies(r: &Replay) -> Vec<Body> {
+    (0..r.vehicles.len()).map(Body::V).chain((0..r.sim.players.len()).map(Body::P)).collect()
+}
+
+/// (gap, far, across) of a body relative to the head.
+fn rel_body(r: &Replay, h: &Vehicle, b: Body) -> (f64, f64, f64) {
+    let o = body_obb(r, b);
+    rel_box(h, &o.corners(), o.center)
+}
+
+/// Where a lane sits relative to the head's way.
+fn lane_relation(r: &Replay, h: &Vehicle, lane: usize) -> String {
+    if lane == h.state.lane {
+        return "same lane".into();
+    }
+    if let Some((_, d)) = way_lanes(&r.net, &h.state, 200.0).into_iter().find(|(l, _)| *l == lane) {
+        return format!("on its way (lane starts {:+.1} m)", d);
+    }
+    let hl = &r.net.lanes[h.state.lane];
+    let ol = &r.net.lanes[lane];
+    let same_obj = match (hl.key, ol.key) {
+        (Some(a), Some(b)) => a.tile == b.tile && a.id == b.id,
+        _ => false,
+    };
+    let jn = r.sim.junctions.of_lane.contains_key(&lane);
+    format!(
+        "OTHER lane {} ({}{}src {})",
+        lane,
+        if same_obj { "same object, " } else { "" },
+        if jn { "junction piece, " } else { "" },
+        ol.source
+    )
+}
+
+struct HeadSample {
+    t: f64,
+    day: f64,
+    dist_player: f64,
+    fields: String,
+    block: String,
+    verdict: String,
+    tags: Vec<String>,
+    /// The light ahead (ctl, li) whose red is the verdict's reason.
+    red: Option<(usize, usize)>,
+    stopped_field: f32,
+    standing: f64,
+}
+
+type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
+
+fn heads(fixture: &Path, args: &[String]) -> Res<()> {
+    let radius: f64 = opt(args, "--radius").map(|s| s.parse()).transpose()?.unwrap_or(200.0);
+    let mut r = Replay::load(fixture)?;
+    if !r.at(0) {
+        return Err("the fixture has no keyframe".into());
+    }
+    let t_start = r.sim.time;
+    let mut next = t_start;
+    let mut light_hist: Vec<LightSample> = Vec::new();
+    let mut counts: Vec<(f64, usize, usize, usize)> = Vec::new();
+    let mut open: HashMap<u64, Vec<HeadSample>> = HashMap::new();
+    let mut done: Vec<(u64, Vec<HeadSample>)> = Vec::new();
+    let mut standing_secs: HashMap<u64, f64> = HashMap::new();
+    let mut player_still: Vec<(f64, f32, f32)> = Vec::new();
+    while r.step() {
+        if r.sim.time + 1e-6 < next {
+            continue;
+        }
+        while next <= r.sim.time + 1e-6 {
+            next += 1.0;
+        }
+        let t = r.sim.time - t_start;
+        let day = r.sim.day_time;
+        // (the frame placed the bodies before it moved them: place them where they are)
+        r.sim.update_positions(&r.net, &mut r.vehicles);
+        let player = r.sim.players.first().copied();
+        let ppos = player.map(|p| p.pos);
+        light_hist.push((
+            t,
+            day,
+            ppos,
+            r.sim.lights.iter().map(|c| ((0..c.lights.len()).map(|li| c.state(li)).collect(), c.held)).collect(),
+        ));
+        if let Some(p) = player {
+            player_still.push((t, p.speed, p.still));
+        }
+        let near = |pos: DVec3| ppos.map(|pp| dist2(pos, pp.x, pp.y) <= radius).unwrap_or(true);
+        let standing: Vec<Body> = all_bodies(&r).into_iter().filter(|b| body_speed(&r, *b).abs() < 0.3).collect();
+        let (mut n_stand, mut n_long, mut n_stop) = (0, 0, 0);
+        let mut now_heads: Vec<usize> = Vec::new();
+        for (i, v) in r.vehicles.iter().enumerate() {
+            if v.state.speed >= 0.3 || !near(v.pos) {
+                continue;
+            }
+            if v.external.at_stop {
+                n_stop += 1;
+                continue;
+            }
+            n_stand += 1;
+            if v.stopped > 30.0 {
+                n_long += 1;
+            }
+            *standing_secs.entry(v.id).or_default() += 1.0;
+            let blocked = standing.iter().any(|&b| {
+                if b == Body::V(i) {
+                    return false;
+                }
+                let (lo, hi, ac) = rel_body(&r, v, b);
+                hi > 0.0 && lo < 12.0 && ac.abs() < 2.5
+            });
+            if !blocked {
+                now_heads.push(i);
+            }
+        }
+        if counts.last().map(|c| t - c.0 >= 9.99).unwrap_or(true) {
+            counts.push((t, n_stand, n_long, n_stop));
+        }
+        let ids: HashSet<u64> = now_heads.iter().map(|&i| r.vehicles[i].id).collect();
+        let closing: Vec<u64> = open.keys().copied().filter(|id| !ids.contains(id)).collect();
+        for id in closing {
+            let s = open.remove(&id).unwrap();
+            done.push((id, s));
+        }
+        for &i in &now_heads {
+            let hs = head_sample(&r, i, t, day, ppos, *standing_secs.get(&r.vehicles[i].id).unwrap_or(&0.0));
+            open.entry(r.vehicles[i].id).or_default().push(hs);
+        }
+    }
+    for (id, s) in open.drain() {
+        done.push((id, s));
+    }
+    let t_end = light_hist.last().map(|l| l.0).unwrap_or(0.0);
+
+    // ---- output
+    let name = fixture.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "HEADS {} window {} .. {} ({:.0} s), radius {:.0} m",
+        name,
+        hms(light_hist.first().map(|l| l.1).unwrap_or(0.0)),
+        hms(light_hist.last().map(|l| l.1).unwrap_or(0.0)),
+        t_end,
+        radius
+    );
+    let _ = writeln!(out, "(t = seconds from window start; along = gap from the head's front bumper, across + = right of it)");
+
+    // light table: lights whose lit lane starts within 150 m of the player at mid-window
+    let midk = light_hist.len() / 2;
+    let mid = light_hist.get(midk).and_then(|l| l.2);
+    let _ = writeln!(out, "\nLIGHT TABLE (lit lanes starting within 150 m of the player at t={:.0}; states by t):", light_hist.get(midk).map(|l| l.0).unwrap_or(0.0));
+    let mut lights: BTreeMap<(usize, usize), (f64, Vec<usize>)> = BTreeMap::new();
+    if let Some(m) = mid {
+        for (li, l) in r.net.lanes.iter().enumerate() {
+            if let (Some(tl), Some(p0)) = (l.traffic_light, l.points.first()) {
+                let d = dist2(*p0, m.x, m.y);
+                if d <= 150.0 {
+                    let e = lights.entry(tl).or_insert((d, Vec::new()));
+                    e.0 = e.0.min(d);
+                    e.1.push(li);
+                }
+            }
+        }
+    }
+    for ((c, li), (d, lanes)) in &lights {
+        let mut runs: Vec<(String, f64, f64)> = Vec::new();
+        let mut held_any = false;
+        for (t, _, _, st) in &light_hist {
+            let Some((states, held)) = st.get(*c) else { continue };
+            held_any |= *held;
+            let a = states.get(*li).map(|s| aspect_name(*s)).unwrap_or("?").to_string();
+            match runs.last_mut() {
+                Some(rn) if rn.0 == a => rn.2 = *t,
+                _ => runs.push((a, *t, *t)),
+            }
+        }
+        let txt: Vec<String> = runs.iter().map(|(a, t0, t1)| format!("{a} {t0:.0}-{t1:.0}")).collect();
+        let foot = lanes.iter().filter(|l| r.net.lanes[**l].kind == LaneKind::Sidewalk).count();
+        let shown: Vec<String> = lanes.iter().take(4).map(|l| l.to_string()).collect();
+        let _ = writeln!(
+            out,
+            "  light {c}.{li} {d:.0} m, lanes [{}{}]{}{}: {}",
+            shown.join(","),
+            if lanes.len() > 4 { ",.." } else { "" },
+            if foot > 0 { format!(" ({foot} foot)") } else { String::new() },
+            if held_any { " CLOCK HELD at times" } else { "" },
+            txt.join(" | ")
+        );
+    }
+
+    let _ = writeln!(out, "\nSTANDING within radius, every 10 s (t: standing not at a stop / of them stopped > 30 s / at a stop):");
+    let line: Vec<String> = counts.iter().map(|c| format!("{:.0}:{}/{}/{}", c.0, c.1, c.2, c.3)).collect();
+    let _ = writeln!(out, "  {}", line.join("  "));
+    let pl: Vec<String> = player_still.iter().step_by(10).map(|p| format!("{:.0}:{:.1}m/s,still {:.0}", p.0, p.1, p.2)).collect();
+    let _ = writeln!(out, "  player: {}", pl.join("  "));
+
+    // resolve "never turns green" and pick the reported heads
+    let mut long: Vec<(u64, Vec<HeadSample>)> = done.into_iter().filter(|(_, s)| s.len() >= 10).collect();
+    for (_, ss) in long.iter_mut() {
+        for s in ss.iter_mut() {
+            if let Some((c, li)) = s.red {
+                let green_later = light_hist
+                    .iter()
+                    .filter(|l| l.0 >= s.t)
+                    .any(|l| l.3.get(c).and_then(|x| x.0.get(li)).map(|st| TrafficLightController::allows_go(*st)).unwrap_or(false));
+                s.verdict = if green_later {
+                    format!("red light (ordinary) (light {c}.{li})")
+                } else {
+                    format!("red light that never turns green in window (light {c}.{li}, {:.0} s left)", t_end - s.t)
+                };
+            }
+        }
+    }
+    long.sort_by(|a, b| a.1[0].t.total_cmp(&b.1[0].t).then(a.1[0].dist_player.total_cmp(&b.1[0].dist_player)));
+
+    let _ = writeln!(out, "\nSUMMARY: heads that stayed head >= 10 s (t span, distance to the player at the snapshot, verdicts by seconds):");
+    let mut tag_count: BTreeMap<String, (usize, HashSet<u64>)> = BTreeMap::new();
+    for (id, ss) in &long {
+        let mut vc: BTreeMap<String, usize> = BTreeMap::new();
+        for s in ss {
+            let key = s.verdict.split(" (").next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+            *vc.entry(key).or_default() += 1;
+            for tg in &s.tags {
+                let e = tag_count.entry(tg.clone()).or_insert((0, HashSet::new()));
+                e.0 += 1;
+                e.1.insert(*id);
+            }
+        }
+        let mut vcs: Vec<(String, usize)> = vc.into_iter().collect();
+        vcs.sort_by(|a, b| b.1.cmp(&a.1));
+        let vtxt: Vec<String> = vcs.iter().map(|(k, n)| format!("{k} x{n}")).collect();
+        let snap = &ss[9.min(ss.len() - 1)];
+        let _ = writeln!(out, "  #{id} t {:.0}-{:.0} ({} s) {:.0} m from player: {}", ss[0].t, ss.last().unwrap().t, ss.len(), snap.dist_player, vtxt.join("; "));
+    }
+
+    for (id, ss) in &long {
+        let s = &ss[9.min(ss.len() - 1)];
+        let _ = writeln!(
+            out,
+            "\n==== HEAD #{id}: head t {:.0}-{:.0} ({} s), snapshot t={:.0} ({}), standing {:.0} s in window by then, stopped field {:.0} s, {:.0} m from player",
+            ss[0].t,
+            ss.last().unwrap().t,
+            ss.len(),
+            s.t,
+            hms(s.day),
+            s.standing,
+            s.stopped_field,
+            s.dist_player
+        );
+        out.push_str(&s.block);
+        let _ = writeln!(out, "  VERDICT: {}", s.verdict);
+        let _ = writeln!(out, "  fields over the head time (when they or the verdict change):");
+        let mut last = String::new();
+        let mut lastv = String::new();
+        for x in ss {
+            if x.fields != last || x.verdict != lastv {
+                let _ = writeln!(out, "    t={:>3.0}: {}  => {}", x.t, x.fields, x.verdict);
+                last = x.fields.clone();
+                lastv = x.verdict.clone();
+            }
+        }
+        let mut tags: BTreeMap<&str, usize> = BTreeMap::new();
+        for x in ss {
+            for tg in &x.tags {
+                *tags.entry(tg.as_str()).or_default() += 1;
+            }
+        }
+        if !tags.is_empty() {
+            let tt: Vec<String> = tags.iter().map(|(k, n)| format!("{k} [{n} s]")).collect();
+            let _ = writeln!(out, "  DISAGREEMENTS: {}", tt.join("; "));
+        }
+    }
+    let _ = writeln!(out, "\nDISAGREEMENT COUNTS (head-seconds, distinct heads):");
+    for (k, (n, ids)) in &tag_count {
+        let _ = writeln!(out, "  DIS {k}: {n} s, {} heads", ids.len());
+    }
+    print!("{out}");
+    Ok(())
+}
+
+/// The fields and the geometry of head `i` now.
+fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, standing: f64) -> HeadSample {
+    let net = &r.net;
+    let v = &r.vehicles[i];
+    let d = &v.last;
+    let st = &v.state;
+    let lane = &net.lanes[st.lane];
+    let mut b = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    let front = st.front as f64;
+    let jn = r.sim.junctions.of_lane.get(&st.lane).copied();
+    let _ = writeln!(
+        b,
+        "  {} {:?} '{}' | lane {} {:?} src {}{} light {:?} len {:.1} '{}' | s {:.1} speed {:.2}",
+        fmt_id(v.id),
+        v.class,
+        r.types.get(&v.id).map(|s| s.as_str()).unwrap_or("?"),
+        st.lane,
+        lane.kind,
+        lane.source,
+        jn.map(|(j, m)| format!(" junction piece j{j} m{m}")).unwrap_or_default(),
+        lane.traffic_light,
+        lane.length(),
+        lane.name.rsplit(['\\', '/']).next().unwrap_or(""),
+        st.s,
+        st.speed
+    );
+    let fields = format!(
+        "why={} stop={} lead={} wait_for={} hold={} body_block={} held={}",
+        why_name(d.why),
+        d.stop.map(|s| format!("{:.1}(front+{:.1})", s, s - st.front)).unwrap_or("-".into()),
+        match (d.lead, d.lead_id) {
+            (Some(l), id) => format!(
+                "{:.1}m/{}{}",
+                l.gap,
+                id.map(fmt_id).unwrap_or("?".into()),
+                d.lead_seen.map(|s| format!("/{:?}", s)).unwrap_or_default()
+            ),
+            (None, Some(id)) => format!("none(id {})", fmt_id(id)),
+            _ => "none".into(),
+        },
+        d.wait_for.map(fmt_id).unwrap_or("-".into()),
+        hold_name(d.hold).unwrap_or("-"),
+        d.body_block.map(fmt_id).unwrap_or("-".into()),
+        d.held
+    );
+    let _ = writeln!(
+        b,
+        "  FIELDS: {} | impatience {:.2} (waited {:.0} s) amber {:?} passing {} at_stop {} stop_at {:?}",
+        fields,
+        v.impatience.value,
+        v.impatience.waited,
+        v.amber,
+        v.passing.map(|p| format!("lane {:?} side {:.1} aborted {}", p.lane, p.side, p.aborted)).unwrap_or("-".into()),
+        v.external.at_stop,
+        v.external.stop_at
+    );
+
+    // ---- geometry
+    let bodies = all_bodies(r);
+    let mut ahead: Option<(Body, f64, f64)> = None;
+    let mut strip_hit: Option<(Body, f64, f64)> = None;
+    let hd = (v.heading as f64).to_radians();
+    let f = glam::DVec2::new(hd.sin(), hd.cos());
+    let strip = omsi_sim::collision::Obb {
+        center: v.pos.truncate() + f * (front + 12.5),
+        half: glam::DVec2::new(v.half_width as f64, 12.5),
+        heading: hd,
+        z0: f64::MIN,
+        z1: f64::MAX,
+        velocity: glam::DVec2::ZERO,
+        mass: 0.0,
+        pole: None,
+        id: -1,
+    };
+    for &o in &bodies {
+        if o == Body::V(i) {
+            continue;
+        }
+        let (lo, hi, ac) = rel_body(r, v, o);
+        if hi > 0.0 && lo < 25.0 && ac.abs() < 2.5 && ahead.map(|a| lo.max(0.0) < a.1).unwrap_or(true) {
+            ahead = Some((o, lo.max(0.0), ac));
+        }
+        if body_obb(r, o).overlaps_plan(&strip) && strip_hit.map(|a| lo.max(0.0) < a.1).unwrap_or(true) {
+            strip_hit = Some((o, lo.max(0.0), ac));
+        }
+    }
+    let describe = |o: Body, al: f64, ac: f64| -> String {
+        let rel = match o {
+            Body::V(k) => {
+                let ov = &r.vehicles[k];
+                format!("{}, its why={} speed {:.1}", lane_relation(r, v, ov.state.lane), why_name(ov.last.why), ov.state.speed)
+            }
+            Body::P(k) => format!("player bus, speed {:.1}", r.sim.players[k].speed),
+        };
+        format!("{} along {:.1} across {:+.1} ({})", body_name(r, o), al, ac, rel)
+    };
+    let _ = writeln!(b, "  GEOM nearest ahead <=25 m (|across|<2.5): {}", ahead.map(|(o, al, ac)| describe(o, al, ac)).unwrap_or("nothing".into()));
+    let _ = writeln!(b, "  GEOM nearest box in the 25 m forward strip: {}", strip_hit.map(|(o, al, ac)| describe(o, al, ac)).unwrap_or("nothing".into()));
+    // the corridor along its own way (curved through the junction): the first body on it
+    let mut path_hit: Option<(Body, f64, f64)> = None;
+    {
+        let mut dd = st.front + 0.5;
+        'walk: while dd <= st.front + 40.0 {
+            let p = st.way_point(net, dd);
+            let probe = omsi_sim::collision::Obb::point(p, v.half_width as f64 * 0.9);
+            for &o in &bodies {
+                if o != Body::V(i) && body_obb(r, o).overlaps_plan(&probe) {
+                    let (_, _, ac) = rel_body(r, v, o);
+                    path_hit = Some((o, (dd - st.front) as f64, ac));
+                    break 'walk;
+                }
+            }
+            dd += 1.0;
+        }
+    }
+    let _ = writeln!(b, "  GEOM first body on its way's corridor (40 m): {}", path_hit.map(|(o, al, ac)| describe(o, al, ac)).unwrap_or("nothing".into()));
+    // people near the front
+    let people = frame_people(r);
+    let fp = v.pos.truncate() + f * front;
+    let mut near_people: Vec<(f64, f64, f64, &PersonRecord)> = people
+        .iter()
+        .filter_map(|p| {
+            let dd = (p.pos.truncate() - fp).length();
+            (dd <= 8.0).then(|| {
+                let (al, ac) = rel_point(v, p.pos.truncate());
+                (dd, al, ac, p)
+            })
+        })
+        .collect();
+    near_people.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if near_people.is_empty() {
+        let _ = writeln!(b, "  GEOM people within 8 m of the front: none");
+    } else {
+        for (dd, al, ac, p) in near_people.iter().take(4) {
+            let _ = writeln!(
+                b,
+                "  GEOM person {:.1} m from front: along {:+.1} across {:+.1} state '{}' decision {:?} still {:.0} s on_crossing {} speed {:.1}",
+                dd,
+                al,
+                ac,
+                p.state,
+                p.decision,
+                p.still,
+                p.on_crossing,
+                p.vel.length()
+            );
+        }
+    }
+    // the player
+    for (k, p) in r.sim.players.iter().enumerate() {
+        let (lo, hi, ac) = rel_body(r, v, Body::P(k));
+        if hi > 0.0 && lo < 25.0 && ac.abs() < 4.0 {
+            let _ = writeln!(b, "  GEOM player bus ahead: along {:.1} across {:+.1} speed {:.1} still {:.0} s", lo.max(0.0), ac, p.speed, p.still);
+        }
+    }
+    // the light on the way
+    let wl = way_lanes(net, st, 150.0);
+    let lit = wl
+        .iter()
+        .find(|(l, d0)| net.lanes[*l].traffic_light.is_some() && *d0 >= -(st.rear + 0.5))
+        .map(|(l, d0)| (*l, *d0, net.lanes[*l].traffic_light.unwrap()));
+    let mut light_red: Option<(usize, usize)> = None;
+    let mut light_green = false;
+    if let Some((l, d0, (c, li))) = lit {
+        if let Some(ctl) = r.sim.lights.get(c) {
+            let s0 = ctl.state(li);
+            light_green = TrafficLightController::allows_go(s0);
+            if !light_green {
+                light_red = Some((c, li));
+            }
+            let _ = writeln!(
+                b,
+                "  GEOM light {c}.{li} on lane {l}, line {:.1} m ahead of the front: {} now, changes in {}, go in {}{}",
+                d0 - st.front,
+                aspect_name(s0),
+                ctl.time_to_change(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
+                ctl.time_until_go(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
+                if ctl.held { " (clock HELD)" } else { "" }
+            );
+        }
+    } else {
+        let _ = writeln!(b, "  GEOM no lit lane within 150 m on its way");
+    }
+
+    // wait_for
+    let find_id = |id: u64| -> Option<Body> {
+        if id >= PLAYER_ID_BASE {
+            r.sim.players.iter().position(|p| p.id as u64 == id - PLAYER_ID_BASE).map(Body::P)
+        } else {
+            r.vehicles.iter().position(|o| o.id == id).map(Body::V)
+        }
+    };
+    let place = |o: Body| -> (f64, f64, &'static str) {
+        let (lo, hi, ac) = rel_body(r, v, o);
+        let len = (st.front + st.rear) as f64;
+        if lo > 0.0 {
+            (lo, ac, "AHEAD")
+        } else if hi < -len {
+            (hi + len, ac, "BEHIND")
+        } else {
+            (0.0, ac, "BESIDE")
+        }
+    };
+    let mut wait_rel: Option<&'static str> = None;
+    let mut wait_body: Option<Body> = None;
+    if let Some(w) = d.wait_for {
+        match find_id(w) {
+            Some(o) => {
+                let (al, ac, wh) = place(o);
+                wait_rel = Some(wh);
+                wait_body = Some(o);
+                let dist = (body_obb(r, o).center - v.pos.truncate()).length();
+                let extra = match o {
+                    Body::V(k) => {
+                        let ov = &r.vehicles[k];
+                        format!(
+                            "its why={} speed {:.1} wait_for {} lead {}, {}",
+                            why_name(ov.last.why),
+                            ov.state.speed,
+                            ov.last.wait_for.map(fmt_id).unwrap_or("-".into()),
+                            ov.last.lead_id.map(fmt_id).unwrap_or("-".into()),
+                            lane_relation(r, v, ov.state.lane)
+                        )
+                    }
+                    Body::P(k) => format!("player speed {:.1}", r.sim.players[k].speed),
+                };
+                let _ = writeln!(b, "  WAIT_FOR {}: {} along {:.1} across {:+.1}, {:.0} m centre to origin; {}", fmt_id(w), wh, al, ac, dist, extra);
+                if wh != "AHEAD" {
+                    tags.push(format!("wait_for points at a vehicle {}", wh.to_lowercase()));
+                }
+                if dist > 60.0 {
+                    tags.push("wait_for points at a vehicle > 60 m away".into());
+                }
+            }
+            None => {
+                let _ = writeln!(b, "  WAIT_FOR {}: NOT on the road", fmt_id(w));
+                tags.push("wait_for names a vehicle not on the road".into());
+            }
+        }
+    }
+
+    // a ring: wait_for, else lead, else body_block, vehicle to vehicle
+    let mut chain: Vec<u64> = vec![v.id];
+    let mut ring = false;
+    let mut cur = v.id;
+    for _ in 0..40 {
+        let Some(cv) = r.vehicles.iter().find(|o| o.id == cur) else { break };
+        let Some(n) = cv.last.wait_for.or(cv.last.lead_id).or(cv.last.body_block) else { break };
+        chain.push(n);
+        if n == v.id {
+            ring = true;
+            break;
+        }
+        if chain[..chain.len() - 1].contains(&n) || n >= PLAYER_ID_BASE {
+            break;
+        }
+        cur = n;
+    }
+    if chain.len() > 1 {
+        let _ = writeln!(
+            b,
+            "  CHAIN (wait_for, else lead, else body_block): {}{}",
+            chain.iter().map(|x| fmt_id(*x)).collect::<Vec<_>>().join(" -> "),
+            if ring { "  RING" } else { "" }
+        );
+    }
+
+    // the junction ahead: foes physically in the conflict stretches, and coming
+    let mut foe_in: Vec<String> = Vec::new();
+    let mut foe_coming: Vec<String> = Vec::new();
+    let mut exit_txt = String::new();
+    // the junction pieces on the way ahead (a way through may be several pieces), up to
+    // the first lane outside the junction after them
+    let mut jms: Vec<(usize, usize, usize, f32)> = Vec::new();
+    let mut exit: Option<(usize, f32)> = None;
+    for &(l, d0) in &wl {
+        match r.sim.junctions.of_lane.get(&l) {
+            Some(&(j, m)) => jms.push((j, m, l, d0)),
+            None if !jms.is_empty() => {
+                exit = Some((l, d0));
+                break;
+            }
+            None => {}
+        }
+        if d0 > st.front + 80.0 {
+            break;
+        }
+    }
+    if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull)) {
+        let mut foes_n = 0;
+        for &(j, m, ml, md) in &jms {
+            let mv = &r.sim.junctions.nodes[j].movements[m];
+            let mlane = &net.lanes[ml];
+            for foe in &mv.foes {
+                // only the stretches not yet behind the front
+                if md + foe.mine.1 < st.front - 1.0 {
+                    continue;
+                }
+                foes_n += 1;
+                let flane = r.sim.junctions.nodes[j].movements[foe.movement].lane;
+                let mut pts = Vec::new();
+                let mut s = foe.mine.0;
+                while s <= foe.mine.1 + 0.01 {
+                    pts.push(mlane.at(s).0);
+                    s += 1.0;
+                }
+                for &o in &bodies {
+                    if o == Body::V(i) {
+                        continue;
+                    }
+                    let ob = body_obb(r, o);
+                    if pts.iter().any(|p| ob.overlaps_plan(&omsi_sim::collision::Obb::point(*p, 0.5))) {
+                        let txt = format!("{} (j{j} m{} {:?} I-yield={} speed {:.1})", body_name(r, o), foe.movement, foe.kind, foe.yields, body_speed(r, o));
+                        if !foe_in.contains(&txt) {
+                            foe_in.push(txt);
+                        }
+                    }
+                    if let Body::V(k) = o {
+                        let ov = &r.vehicles[k];
+                        if ov.state.speed > 0.5 {
+                            if let Some((_, dd)) = way_lanes(net, &ov.state, 60.0).into_iter().find(|(l, _)| *l == flane) {
+                                let to_conf = dd + foe.theirs.0 - ov.state.front;
+                                if to_conf < 40.0 && to_conf > -5.0 {
+                                    foe_coming.push(format!("#{} j{j} m{} {:.0} m off at {:.1} m/s I-yield={}", ov.id, foe.movement, to_conf, ov.state.speed, foe.yields));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        foe_coming.sort();
+        foe_coming.dedup();
+        if let Some((el, ed)) = exit {
+            let occ: Vec<String> = r
+                .vehicles
+                .iter()
+                .filter(|o| o.state.lane == el && o.id != v.id)
+                .map(|o| (o.state.s - o.state.rear, o))
+                .filter(|(s0, _)| *s0 < 15.0)
+                .map(|(s0, o)| format!("#{} tail at {:.1} m speed {:.1}", o.id, s0, o.state.speed))
+                .collect();
+            exit_txt = format!(
+                "exit lane {} (starts {:.0} m ahead of the front): {}",
+                el,
+                ed - st.front,
+                if occ.is_empty() { "first 15 m free".to_string() } else { occ.join(", ") }
+            );
+        }
+        let pieces: Vec<String> = jms.iter().map(|(j, m, l, d0)| format!("j{j} m{m} lane {l} @{:+.0}", d0 - st.front)).collect();
+        let _ = writeln!(
+            b,
+            "  JUNCTION pieces [{}] ({} foe stretches ahead of the front): in them now: {}; coming within 40 m: {}; {}",
+            pieces.join(", "),
+            foes_n,
+            if foe_in.is_empty() { "NOBODY".into() } else { foe_in.join(", ") },
+            if foe_coming.is_empty() { "nobody".into() } else { foe_coming.join(", ") },
+            exit_txt
+        );
+        // the one waited for: is it where the junction table says the two meet?
+        if let (Some(o), Some(Hold::Foe)) = (wait_body, d.hold) {
+            let name = format!("{} ", body_name(r, o));
+            let inside = foe_in.iter().any(|s| s.starts_with(&name));
+            let coming = foe_coming.iter().any(|s| s.starts_with(&name));
+            if !inside && !coming {
+                let what = match o {
+                    Body::V(k) => {
+                        let ov = &r.vehicles[k];
+                        if ov.state.speed < 0.3 {
+                            format!("standing, its why={}", why_name(ov.last.why))
+                        } else {
+                            "moving".to_string()
+                        }
+                    }
+                    Body::P(_) => "the player".to_string(),
+                };
+                tags.push(format!("wait_for target neither in nor coming to the conflict stretches ({what})"));
+            }
+        }
+    }
+
+    // ---- disagreements between the fields and the geometry
+    let lead_body = d.lead_id.and_then(find_id);
+    let geom_car = [ahead, strip_hit, path_hit.filter(|p| p.1 <= 25.0)].into_iter().flatten().min_by(|a, b| a.1.total_cmp(&b.1));
+    if d.lead.is_none() {
+        if let Some((o, al, _)) = geom_car {
+            let band = if al < 6.0 {
+                "<6"
+            } else if al < 12.0 {
+                "6-12"
+            } else {
+                "12-25"
+            };
+            if let Body::V(k) = o {
+                let rel = lane_relation(r, v, r.vehicles[k].state.lane);
+                let kind = if rel.starts_with("same lane") {
+                    "the same lane"
+                } else if rel.starts_with("on its way") {
+                    "a lane on its way"
+                } else if rel.contains("same object") {
+                    "a sibling piece of the same object"
+                } else {
+                    "another lane"
+                };
+                tags.push(format!("no lead although a vehicle is {band} m ahead on {kind}"));
+            } else {
+                tags.push(format!("no lead although the player bus is {band} m ahead"));
+            }
+        }
+    }
+    if let (Some(l), Some(o)) = (d.lead, lead_body) {
+        let (lo, hi, _) = rel_body(r, v, o);
+        if hi < 0.0 {
+            tags.push("lead_id is behind the head".into());
+        } else if (lo.max(0.0) - l.gap as f64).abs() > 3.0 {
+            tags.push("lead gap differs from the geometric gap by > 3 m".into());
+            let _ = writeln!(b, "  CHECK lead gap field {:.1} vs geometric {:.1}", l.gap, lo.max(0.0));
+        }
+    }
+    if d.lead.is_some() && d.lead_id.is_none() && !matches!(d.lead_seen, Some(Seen::Parked)) {
+        tags.push(format!("lead without id (seen {})", d.lead_seen.map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_string()).unwrap_or("none".into())));
+    }
+    match d.why {
+        Why::Light => {
+            if light_green {
+                tags.push("why=light while the light ahead is green".into());
+            }
+            if lit.is_none() {
+                tags.push("why=light with no lit lane on its way".into());
+            }
+        }
+        Why::People | Why::Zebra => {
+            if near_people.is_empty() {
+                let sp = d.stop.unwrap_or(st.front);
+                let p = st.way_point(net, sp);
+                let any = people.iter().any(|q| (q.pos.truncate() - p.truncate()).length() < 6.0);
+                if !any {
+                    tags.push(format!("why={} with no person within 8 m of the front or 6 m of the stop point", why_name(d.why)));
+                }
+            }
+        }
+        Why::Junction | Why::ExitFull => {
+            if d.hold == Some(Hold::Foe) && foe_in.is_empty() && foe_coming.is_empty() {
+                tags.push("junction hold (foe) with nobody in or coming to the conflict stretches".into());
+            }
+            if d.hold == Some(Hold::ExitFull) && exit_txt.contains("first 15 m free") {
+                tags.push("exit-full hold with the exit's first 15 m free".into());
+            }
+            if d.hold.is_none() {
+                tags.push("why=yield without a hold".into());
+            }
+        }
+        Why::None => {
+            if d.stop.is_none() && d.lead.is_none() {
+                tags.push("standing with no reason in the fields (why none, no stop, no lead)".into());
+            }
+        }
+        _ => {}
+    }
+    if let Some(sp) = d.stop {
+        let g = sp - st.front;
+        if g > 3.0 && d.why != Why::Lead {
+            tags.push(format!("standing although the stop is > 3 m ahead of the front (why={})", why_name(d.why)));
+            let _ = writeln!(b, "  CHECK the stop is {:.1} m ahead of the front but the car stands", g);
+        }
+    }
+    if let Some(bb) = d.body_block {
+        match find_id(bb) {
+            Some(o) => {
+                let (lo, hi, ac) = rel_body(r, v, o);
+                if !(hi > 0.0 && lo < 25.0 && ac.abs() < 4.0) {
+                    tags.push("body_block not within 25 m ahead".into());
+                }
+            }
+            None => tags.push("body_block names a vehicle not on the road".into()),
+        }
+    }
+
+    // ---- verdict
+    let verdict: String = if matches!(d.why, Why::Service | Why::End) {
+        format!("stopped bus at stop/route end (why={})", why_name(d.why))
+    } else if v.passing.map(|p| p.lane.is_some()).unwrap_or(false) {
+        "pass stranded on oncoming lane".into()
+    } else if ring {
+        format!("deadlock ring ({})", chain.iter().map(|x| fmt_id(*x)).collect::<Vec<_>>().join("->"))
+    } else if d.why == Why::Light && light_red.is_some() {
+        "red light".into()
+    } else if matches!(d.why, Why::People | Why::Zebra) && !near_people.is_empty() {
+        let p = near_people[0].3;
+        format!("person in front (state {}, decision {}, still {:.0} s, {:.1} m from front)", p.state, p.decision.as_deref().unwrap_or("-"), p.still, near_people[0].0)
+    } else if d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull) {
+        if matches!(wait_rel, Some("BEHIND") | Some("BESIDE")) {
+            format!("junction hold for a vehicle behind/beside ({} {})", d.wait_for.map(fmt_id).unwrap_or_default(), wait_rel.unwrap().to_lowercase())
+        } else if d.hold == Some(Hold::ExitFull) {
+            format!("exit-full hold ({exit_txt})")
+        } else if foe_in.is_empty() && foe_coming.is_empty() {
+            "junction hold with nobody conflicting".into()
+        } else {
+            format!("yield to a real foe (in the area: {}; coming: {})", foe_in.len(), foe_coming.len())
+        }
+    } else if geom_car.is_some() && d.lead.is_none() {
+        let (o, al, ac) = geom_car.unwrap();
+        format!("car ahead on another lane piece not seen as lead ({} at {:.1} m, across {:+.1})", body_name(r, o), al, ac)
+    } else {
+        let mut what = format!("unknown: {}", fields);
+        if let Some((o, al, _)) = geom_car {
+            let _ = write!(what, "; geom ahead {} at {:.1} m speed {:.1}", body_name(r, o), al, body_speed(r, o));
+        }
+        if d.why == Why::Light && light_green {
+            what.push_str("; the light ahead is green");
+        }
+        if let Some(np) = near_people.first() {
+            let _ = write!(what, "; person {:.1} m from the front", np.0);
+        }
+        what
+    };
+    let red = if verdict == "red light" { light_red } else { None };
+    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing }
 }
