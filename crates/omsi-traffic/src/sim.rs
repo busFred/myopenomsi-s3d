@@ -258,9 +258,79 @@ fn cell(p: DVec3) -> (i32, i32) {
     ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
 }
 
+/// Rule changes under test, each off until its replay score is accepted (then its default
+/// flips on, and once all are in, the switch and the old path go). Set from the game with
+/// `OMSI_TRAFFIC_SWITCHES=name,name` (see [`Switches::from_list`]), from the replay harness
+/// with `traffic_cases ab --on name,name`, and directly in tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Switches {
+    /// A foe counts only if it can compete: not my own follower, not a car behind me on a
+    /// merging piece, not one standing outside the meeting place that is itself refused.
+    pub competitor_filter: bool,
+    /// Signals are part of the right of way: a foe at its red (wherever its light sits) is
+    /// not coming before its light goes.
+    pub signal_foes: bool,
+    /// The approach lane is not linked past a short lit stub straight into the piece after it.
+    pub stub_links: bool,
+    /// A pass of a standing obstacle needs room past it, and a stranded pass is given up.
+    pub pass_room: bool,
+    /// A dead end is driven to at speed and the vehicle taken off as it touches the end.
+    pub dead_end: bool,
+    /// Meeting places are measured with the lanes' widths, not a fixed centre-line distance.
+    pub corner_clearance: bool,
+    /// People wait for their light at the kerb, not in the car lane.
+    pub kerb_wait: bool,
+}
+
+impl Switches {
+    pub const NAMES: [&'static str; 7] = ["competitor_filter", "signal_foes", "stub_links", "pass_room", "dead_end", "corner_clearance", "kerb_wait"];
+
+    /// Switches from a comma-separated list of names (`all` for every one). Unknown names
+    /// are returned in the error.
+    pub fn from_list(list: &str) -> Result<Switches, String> {
+        let mut s = Switches::default();
+        for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !s.set(name, true) {
+                return Err(format!("unknown traffic switch '{name}' (known: {})", Self::NAMES.join(", ")));
+            }
+        }
+        Ok(s)
+    }
+
+    /// Set one switch by name; false when the name is unknown.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "all" => {
+                *self = if on { Switches::all() } else { Switches::default() };
+            }
+            "competitor_filter" => self.competitor_filter = on,
+            "signal_foes" => self.signal_foes = on,
+            "stub_links" => self.stub_links = on,
+            "pass_room" => self.pass_room = on,
+            "dead_end" => self.dead_end = on,
+            "corner_clearance" => self.corner_clearance = on,
+            "kerb_wait" => self.kerb_wait = on,
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn all() -> Switches {
+        Switches { competitor_filter: true, signal_foes: true, stub_links: true, pass_room: true, dead_end: true, corner_clearance: true, kerb_wait: true }
+    }
+
+    /// The switches that are on, as the list `from_list` reads.
+    pub fn list(&self) -> String {
+        let on = [self.competitor_filter, self.signal_foes, self.stub_links, self.pass_room, self.dead_end, self.corner_clearance, self.kerb_wait];
+        Self::NAMES.iter().zip(on).filter(|(_, o)| *o).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
+    }
+}
+
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
+    /// Rule changes under test (see [`Switches`]).
+    pub switches: Switches,
     pub junctions: Junctions,
     pub lights: Vec<TrafficLightController>,
     pub time: f64,
@@ -293,6 +363,7 @@ pub struct Simulation {
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
+            switches: Switches::default(),
             junctions: Junctions::compile(net),
             lights,
             time: 0.0,

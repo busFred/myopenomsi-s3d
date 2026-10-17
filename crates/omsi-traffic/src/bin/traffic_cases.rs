@@ -2592,6 +2592,77 @@ fn rel_box(h: &Vehicle, corners: &[glam::DVec2], center: glam::DVec2) -> (f64, f
     (lo, hi, (center - o).dot(rt))
 }
 
+/// The nearest body ahead of a frame (origin, heading in degrees, front overhang):
+/// (body, gap from the front, across).
+fn nearest_ahead(r: &Replay, o: glam::DVec2, heading: f32, front: f64, skip: Body, max_along: f64, standing_only: bool) -> Option<(Body, f64, f64)> {
+    let hd = (heading as f64).to_radians();
+    let f = glam::DVec2::new(hd.sin(), hd.cos());
+    let rt = glam::DVec2::new(hd.cos(), -hd.sin());
+    let mut best: Option<(Body, f64, f64)> = None;
+    for b in all_bodies(r) {
+        if b == skip || (standing_only && body_speed(r, b).abs() >= 0.3) {
+            continue;
+        }
+        let ob = body_obb(r, b);
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for c in ob.corners() {
+            let a = (c - o).dot(f) - front;
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        let ac = (ob.center - o).dot(rt);
+        if hi > 0.0 && lo < max_along && ac.abs() < 2.5 && best.map(|x| lo.max(0.0) < x.1).unwrap_or(true) {
+            best = Some((b, lo.max(0.0), ac));
+        }
+    }
+    best
+}
+
+/// What stands in front of the standing player: the queue from the bus forward.
+fn player_queue(r: &Replay) -> Option<String> {
+    let p = r.sim.players.first()?;
+    if p.speed.abs() >= 0.3 {
+        return None;
+    }
+    let mut txt = String::new();
+    let mut cur = Body::P(0);
+    let (mut o, mut h, mut fr) = (p.pos.truncate(), p.heading, p.half_len as f64);
+    let mut seen: Vec<u64> = Vec::new();
+    for hop in 0..40 {
+        let lim = if hop == 0 { 30.0 } else { 12.0 };
+        let Some((b, al, ac)) = nearest_ahead(r, o, h, fr, cur, lim, hop > 0) else { break };
+        let Body::V(k) = b else { break };
+        let v = &r.vehicles[k];
+        if seen.contains(&v.id) {
+            break;
+        }
+        seen.push(v.id);
+        let _ = write!(txt, " -> #{} ({:.1} m, across {:+.1}, speed {:.1}, why={})", v.id, al, ac, v.state.speed, why_name(v.last.why));
+        if v.state.speed >= 0.3 {
+            break;
+        }
+        cur = b;
+        o = v.pos.truncate();
+        h = v.heading;
+        fr = v.state.front as f64;
+    }
+    if seen.is_empty() {
+        txt.push_str(" nothing within 30 m ahead");
+    } else if let Some(last) = r.vehicles.iter().find(|v| Some(&v.id) == seen.last()) {
+        let d = &last.last;
+        let _ = write!(
+            txt,
+            " | last: stop={} lead={} wait_for={} hold={}",
+            d.stop.map(|s| format!("front+{:.1}", s - last.state.front)).unwrap_or("-".into()),
+            d.lead_id.map(fmt_id).unwrap_or("-".into()),
+            d.wait_for.map(fmt_id).unwrap_or("-".into()),
+            hold_name(d.hold).unwrap_or("-")
+        );
+    }
+    Some(txt)
+}
+
 fn rel_point(h: &Vehicle, p: glam::DVec2) -> (f64, f64) {
     let hd = (h.heading as f64).to_radians();
     let f = glam::DVec2::new(hd.sin(), hd.cos());
@@ -2692,6 +2763,7 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
     let mut done: Vec<(u64, Vec<HeadSample>)> = Vec::new();
     let mut standing_secs: HashMap<u64, f64> = HashMap::new();
     let mut player_still: Vec<(f64, f32, f32)> = Vec::new();
+    let mut player_q: Vec<String> = Vec::new();
     while r.step() {
         if r.sim.time + 1e-6 < next {
             continue;
@@ -2744,6 +2816,9 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
         }
         if counts.last().map(|c| t - c.0 >= 9.99).unwrap_or(true) {
             counts.push((t, n_stand, n_long, n_stop));
+            if let Some(q) = player_queue(&r) {
+                player_q.push(format!("t={t:.0}:{q}"));
+            }
         }
         let ids: HashSet<u64> = now_heads.iter().map(|&i| r.vehicles[i].id).collect();
         let closing: Vec<u64> = open.keys().copied().filter(|id| !ids.contains(id)).collect();
@@ -2809,12 +2884,14 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
         let shown: Vec<String> = lanes.iter().take(4).map(|l| l.to_string()).collect();
         let _ = writeln!(
             out,
-            "  light {c}.{li} {d:.0} m, lanes [{}{}]{}{}: {}",
+            "  light {c}.{li} {d:.0} m, lanes [{}{}]{}{}: {} (cycle {:.0} s; at the end: go in {})",
             shown.join(","),
             if lanes.len() > 4 { ",.." } else { "" },
             if foot > 0 { format!(" ({foot} foot)") } else { String::new() },
             if held_any { " CLOCK HELD at times" } else { "" },
-            txt.join(" | ")
+            txt.join(" | "),
+            r.sim.lights.get(*c).map(|x| x.cycle_len()).unwrap_or(0.0),
+            r.sim.lights.get(*c).and_then(|x| x.time_until_go(*li)).map(|x| format!("{x:.0} s")).unwrap_or("never".into())
         );
     }
 
@@ -2823,6 +2900,10 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
     let _ = writeln!(out, "  {}", line.join("  "));
     let pl: Vec<String> = player_still.iter().step_by(10).map(|p| format!("{:.0}:{:.1}m/s,still {:.0}", p.0, p.1, p.2)).collect();
     let _ = writeln!(out, "  player: {}", pl.join("  "));
+    let _ = writeln!(out, "\nIN FRONT OF THE STANDING PLAYER (every 10 s; the queue walked forward by geometry):");
+    for q in &player_q {
+        let _ = writeln!(out, "  {q}");
+    }
 
     // resolve "never turns green" and pick the reported heads
     let mut long: Vec<(u64, Vec<HeadSample>)> = done.into_iter().filter(|(_, s)| s.len() >= 10).collect();
@@ -2859,18 +2940,19 @@ fn heads(fixture: &Path, args: &[String]) -> Res<()> {
         let mut vcs: Vec<(String, usize)> = vc.into_iter().collect();
         vcs.sort_by(|a, b| b.1.cmp(&a.1));
         let vtxt: Vec<String> = vcs.iter().map(|(k, n)| format!("{k} x{n}")).collect();
-        let snap = &ss[9.min(ss.len() - 1)];
-        let _ = writeln!(out, "  #{id} t {:.0}-{:.0} ({} s) {:.0} m from player: {}", ss[0].t, ss.last().unwrap().t, ss.len(), snap.dist_player, vtxt.join("; "));
+        let near = ss.iter().min_by(|a, b| a.dist_player.total_cmp(&b.dist_player)).unwrap();
+        let _ = writeln!(out, "  #{id} t {:.0}-{:.0} ({} s) nearest {:.0} m from player at t={:.0}: {}", ss[0].t, ss.last().unwrap().t, ss.len(), near.dist_player, near.t, vtxt.join("; "));
     }
 
     for (id, ss) in &long {
         let s = &ss[9.min(ss.len() - 1)];
         let _ = writeln!(
             out,
-            "\n==== HEAD #{id}: head t {:.0}-{:.0} ({} s), snapshot t={:.0} ({}), standing {:.0} s in window by then, stopped field {:.0} s, {:.0} m from player",
+            "\n==== HEAD #{id}: head t {:.0}-{:.0} ({} s), nearest {:.0} m from player, snapshot t={:.0} ({}), standing {:.0} s in window by then, stopped field {:.0} s, {:.0} m from player",
             ss[0].t,
             ss.last().unwrap().t,
             ss.len(),
+            ss.iter().map(|x| x.dist_player).fold(f64::INFINITY, f64::min),
             s.t,
             hms(s.day),
             s.standing,
@@ -3056,6 +3138,28 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 p.vel.length()
             );
         }
+    }
+    // parked cars on its way
+    let mut parked_ahead: Option<(f64, f64, f32)> = None;
+    for (l, d0) in way_lanes(net, st, 60.0) {
+        if d0 > st.front + 25.0 {
+            break;
+        }
+        let Some(ps) = r.sim.parked.get(&l) else { continue };
+        let pl = &net.lanes[l];
+        for pk in ps {
+            let (pp, ph) = pl.at(pk.s);
+            let hr = (ph as f64).to_radians();
+            let c = pp.truncate() + glam::DVec2::new(hr.cos(), -hr.sin()) * pk.lateral as f64;
+            let ob = omsi_sim::collision::Obb::vehicle(c - glam::DVec2::new(hr.sin(), hr.cos()) * 0.0, ph as f64, pk.half_len as f64, pk.half_len as f64, pk.half_width as f64);
+            let (lo, hi, ac) = rel_box(v, &ob.corners(), ob.center);
+            if hi > 0.0 && lo < 25.0 && parked_ahead.map(|x| lo.max(0.0) < x.0).unwrap_or(true) {
+                parked_ahead = Some((lo.max(0.0), ac, pk.lateral));
+            }
+        }
+    }
+    if let Some((al, ac, lat)) = parked_ahead {
+        let _ = writeln!(b, "  GEOM parked car ahead: along {:.1} across {:+.1} (lateral {:+.1} from its lane){}", al, ac, lat, if ac.abs() < (v.half_width as f64 + 1.2) { " IN ITS WAY" } else { "" });
     }
     // the player
     for (k, p) in r.sim.players.iter().enumerate() {
@@ -3293,6 +3397,42 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     // ---- disagreements between the fields and the geometry
     let lead_body = d.lead_id.and_then(find_id);
     let geom_car = [ahead, strip_hit, path_hit.filter(|p| p.1 <= 25.0)].into_iter().flatten().min_by(|a, b| a.1.total_cmp(&b.1));
+    // the lead and the body block named by the fields: where are they?
+    let corridor_at = |o: Body, upto: f32| -> Option<f32> {
+        let ob = body_obb(r, o);
+        let mut dd = st.front + 0.25;
+        while dd <= st.front + upto {
+            if ob.overlaps_plan(&omsi_sim::collision::Obb::point(st.way_point(net, dd), v.half_width as f64 * 0.9)) {
+                return Some(dd - st.front);
+            }
+            dd += 0.5;
+        }
+        None
+    };
+    for (label, id) in [("LEAD", d.lead_id), ("BODY_BLOCK", d.body_block)] {
+        let Some(id) = id else { continue };
+        let Some(o) = find_id(id) else { continue };
+        let (lo, hi, ac) = rel_body(r, v, o);
+        let lane_txt = match o {
+            Body::V(k) => lane_relation(r, v, r.vehicles[k].state.lane),
+            Body::P(_) => "player".into(),
+        };
+        let cor = corridor_at(o, 40.0);
+        let _ = writeln!(
+            b,
+            "  {label} {}: box along {:.1}..{:.1} across {:+.1}, speed {:.1}, {}; touches its corridor {}",
+            fmt_id(id),
+            lo,
+            hi,
+            ac,
+            body_speed(r, o),
+            lane_txt,
+            cor.map(|x| format!("at {x:.1} m")).unwrap_or("NOWHERE within 40 m".into())
+        );
+        if cor.is_none() && hi > 0.0 && lo < 38.0 {
+            tags.push(format!("{} names a vehicle that does not touch the head's way corridor", label.to_lowercase()));
+        }
+    }
     if d.lead.is_none() {
         if let Some((o, al, _)) = geom_car {
             let band = if al < 6.0 {
@@ -3409,6 +3549,12 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
         } else {
             format!("yield to a real foe (in the area: {}; coming: {})", foe_in.len(), foe_coming.len())
         }
+    } else if matches!(d.lead_seen, Some(Seen::Parked)) {
+        format!(
+            "stands behind a parked car (field gap {:.1} m; geometry {})",
+            d.lead.map(|l| l.gap).unwrap_or(0.0),
+            parked_ahead.map(|(al, ac, _)| format!("along {al:.1} across {ac:+.1}")).unwrap_or("finds none within 25 m".into())
+        )
     } else if geom_car.is_some() && d.lead.is_none() {
         let (o, al, ac) = geom_car.unwrap();
         format!("car ahead on another lane piece not seen as lead ({} at {:.1} m, across {:+.1})", body_name(r, o), al, ac)

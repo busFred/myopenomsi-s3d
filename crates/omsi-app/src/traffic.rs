@@ -1086,7 +1086,16 @@ impl Traffic {
         let light_prev = lights.iter().map(|c| vec![-100; c.lights.len()]).collect();
         let lanes = 0..net.lanes.len();
         let street_weight = net.lanes.iter().filter_map(street_lane_weight).sum();
-        let sim = omsi_traffic::Simulation::new(&net, lights);
+        let mut sim = omsi_traffic::Simulation::new(&net, lights);
+        if let Ok(list) = omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES") {
+            match omsi_traffic::sim::Switches::from_list(&list) {
+                Ok(s) => {
+                    sim.switches = s;
+                    log::info!("traffic: switches on: {}", s.list());
+                }
+                Err(e) => log::warn!("traffic: OMSI_TRAFFIC_SWITCHES ignored: {e}"),
+            }
+        }
         let mut t = Traffic {
             net,
             street_weight,
