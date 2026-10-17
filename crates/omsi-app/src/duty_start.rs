@@ -55,7 +55,7 @@ pub(crate) fn place_on_duty(args: &mut Args) {
     let Ok(mut duty) = sch.player_duty(world, &line, args.tour.as_deref().unwrap_or(""), now, args.trip.as_deref(), args.whole_tour) else { return };
     let map = world.navigation_map();
     duty.learn_places(&map.places);
-    let mut net = omsi_sim::traffic::Network { lanes: map.lanes, ..Default::default() };
+    let mut net = omsi_sim::traffic::Network { lanes: map.lanes, switches_from_env: true, ..Default::default() };
     net.link(1.5);
     // the entry points and where they stand (heading from the object)
     let entries: Vec<(usize, String, DVec3, f64)> = {

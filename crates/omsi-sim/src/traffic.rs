@@ -414,9 +414,13 @@ pub struct Network {
     /// The traffic switch `stub_links` (see `omsi_traffic::sim::Switches`): an approach
     /// lane is not linked past its short lit stub into the lane after it, and two pieces of
     /// one way (one leading into the other, or two short stubs side by side at one place)
-    /// are no merge of each other (`Network::apply_stub_links`). `link` takes it from
-    /// `OMSI_TRAFFIC_SWITCHES` too, so the game needs no word of it.
+    /// are no merge of each other (`Network::apply_stub_links`). The game sets
+    /// `switches_from_env` and `link` takes it from `OMSI_TRAFFIC_SWITCHES` (on without the
+    /// variable: an accepted switch); a replay or a test sets it itself.
     pub stub_links: bool,
+    /// `link` reads `stub_links` from `OMSI_TRAFFIC_SWITCHES` (`stub_links_from_env`) when
+    /// it is not set already: what a game does; a replay keeps the recording's setting.
+    pub switches_from_env: bool,
 }
 
 /// `stub_links`: a stub that carries a light is at most this long (m).
@@ -435,15 +439,16 @@ pub const SWITCH_NAMES: [&str; 7] = ["competitor_filter", "signal_foes", "stub_l
 /// the network its switch and the simulation none).
 pub fn stub_links_in(list: &str) -> bool {
     let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
-    if names.iter().any(|n| *n != "all" && !SWITCH_NAMES.contains(n)) {
+    if names.iter().any(|n| *n != "all" && *n != "none" && !SWITCH_NAMES.contains(n)) {
         return false;
     }
     names.iter().any(|n| *n == "stub_links" || *n == "all")
 }
 
-/// `stub_links_in` of `OMSI_TRAFFIC_SWITCHES`.
+/// `stub_links_in` of `OMSI_TRAFFIC_SWITCHES`; without the variable the accepted switches,
+/// which have it on (`omsi_traffic::sim::Switches::accepted`).
 pub fn stub_links_from_env() -> bool {
-    omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES").map(|l| stub_links_in(&l)).unwrap_or(false)
+    omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES").map(|l| stub_links_in(&l)).unwrap_or(true)
 }
 
 /// `Network::reach` is counted up to this far (m).
@@ -1199,7 +1204,7 @@ impl Network {
             links += found.len();
             self.lanes[i].next = found;
         }
-        if !self.stub_links {
+        if !self.stub_links && self.switches_from_env {
             self.stub_links = stub_links_from_env();
         }
         if self.stub_links {

@@ -570,6 +570,8 @@ fn the_recording_keeps_its_switches_and_the_replay_runs_with_them() {
     let mut net = priority_junction();
     net.stub_links = true;
     let mut sim = Simulation::new(&net, vec![]);
+    // (a game starts with the accepted switches; this one runs with a list of its own)
+    sim.switches = omsi_traffic::sim::Switches::default();
     sim.switches.competitor_filter = true;
     let path = temp("switches");
     let mut rec = Recorder::new();

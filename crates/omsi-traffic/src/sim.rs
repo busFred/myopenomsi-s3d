@@ -309,6 +309,10 @@ impl Switches {
             "all" => {
                 *self = if on { Switches::all() } else { Switches::default() };
             }
+            // (`none`: every switch off, the behaviour before the accepted ones)
+            "none" => {
+                *self = if on { Switches::default() } else { Switches::accepted() };
+            }
             "competitor_filter" => self.competitor_filter = on,
             "signal_foes" => self.signal_foes = on,
             "stub_links" => self.stub_links = on,
@@ -323,6 +327,14 @@ impl Switches {
 
     pub fn all() -> Switches {
         Switches { competitor_filter: true, signal_foes: true, stub_links: true, pass_room: true, dead_end: true, corner_clearance: true, kerb_wait: true }
+    }
+
+    /// The switches accepted after their replay scores and an adversarial review: what a
+    /// game runs with unless `OMSI_TRAFFIC_SWITCHES` says otherwise (`none` for the old
+    /// behaviour). A recording without a switch list in its header replays with none, as it
+    /// was made.
+    pub fn accepted() -> Switches {
+        Switches { competitor_filter: true, signal_foes: true, stub_links: true, ..Switches::default() }
     }
 
     /// The switches that are on, as the list `from_list` reads.
@@ -369,7 +381,7 @@ pub struct Simulation {
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
-            switches: Switches::default(),
+            switches: Switches::accepted(),
             junctions: Junctions::compile(net),
             lights,
             time: 0.0,

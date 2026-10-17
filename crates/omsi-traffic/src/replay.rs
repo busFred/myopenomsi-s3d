@@ -119,9 +119,9 @@ impl Replay {
             })
         });
         let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, switches: Switches::default(), keyframes };
-        if let Some(sw) = recorded {
-            r.set_switches(sw);
-        }
+        // (a recording without a switch list was made before the switches: it replays with
+        // none, whatever a game now starts with)
+        r.set_switches(recorded.unwrap_or_default());
         r
     }
 
