@@ -3,7 +3,7 @@
 //! ```text
 //! traffic_cases info <rec>
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
-//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400]
+//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--on switches]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
 //! traffic_cases heads <fixture> [--radius 200] [--free] [--on name,name]
 //! traffic_cases ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
@@ -691,6 +691,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(400);
     let mut r = Replay::load(fixture)?;
+    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
     let mid = window_mid(fixture, &r);
     let (cx, cy) = match opt(args, "--center") {
         Some(c) => {
@@ -1662,6 +1663,7 @@ fn diagnose(fixture: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(15.0);
     let mut r = Replay::load(fixture)?;
+    r.set_switches(omsi_traffic::sim::Switches::from_list(opt(args, "--on").unwrap_or("")).map_err(|e| -> Box<dyn Error> { e.into() })?);
     let mid = window_mid(fixture, &r);
     let c = player_at(&r, mid).ok_or("no player")?;
     let (cx, cy) = (c.x, c.y);
