@@ -3627,6 +3627,10 @@ struct Score {
     red_events: Vec<String>,
     /// Vehicles of keyframes the run did not have, or had and the keyframe did not.
     missing: u64,
+    /// Spawns of the recording put off because their place was taken, and of them those
+    /// given up after 30 s.
+    deferred_spawns: u64,
+    dropped_spawns: u64,
     /// All head-seconds counted (of the runs >= `min_head` s).
     head_s: f64,
 }
@@ -3668,6 +3672,8 @@ fn score_json(s: &Score) -> Value {
         "divergence": fin(s.divergence),
         "missing": s.missing,
         "head_s": s.head_s,
+        "deferred_spawns": s.deferred_spawns,
+        "dropped_spawns": s.dropped_spawns,
     })
 }
 
@@ -3877,6 +3883,8 @@ fn ab_run(fixture: &Path, switches: omsi_traffic::sim::Switches, radius: f64, mi
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
     sc.divergence = r.divergence.iter().map(|d| d.1 as f64).fold(0.0, f64::max);
     sc.missing = r.missing.len() as u64;
+    sc.deferred_spawns = r.deferred_spawns;
+    sc.dropped_spawns = r.dropped_spawns;
     Ok(sc)
 }
 
@@ -3948,6 +3956,8 @@ fn ab(args: &[String]) -> Res<()> {
         total.throughput += s.throughput;
         total.divergence = total.divergence.max(s.divergence);
         total.missing += s.missing;
+        total.deferred_spawns += s.deferred_spawns;
+        total.dropped_spawns += s.dropped_spawns;
         total.head_s += s.head_s;
     }
     let mut rows: Vec<(String, Vec<(&'static str, String)>)> = scores.iter().map(|s| (s.name.clone(), score_columns(s))).collect();
@@ -3979,7 +3989,7 @@ fn ab(args: &[String]) -> Res<()> {
         }
         out.push('\n');
     }
-    let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {})", total.missing);
+    let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {}; spawns deferred: {}, dropped: {})", total.missing, total.deferred_spawns, total.dropped_spawns);
     print!("{out}");
     if args.iter().any(|a| a == "--events") {
         for s in &scores {

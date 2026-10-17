@@ -359,6 +359,117 @@ fn a_free_run_keeps_its_vehicles_at_keyframes() {
     assert_eq!(r.sim.switches.list(), "pass_room,kerb_wait");
 }
 
+/// A free run that has moved on does not put a spawn onto a vehicle (it waits for room, and
+/// gives up after a while) and does not snap a re-routed vehicle back to where the game had it.
+#[test]
+fn a_free_run_defers_spawns_and_keeps_changed_vehicles_where_they_are() {
+    use omsi_traffic::record::Record;
+    let net = priority_junction();
+    let cars = vec![car(10, 0, 150.0, 13.0), car(1, 3, 150.0, 10.0)];
+    let path = temp("defer");
+    let mut hook = |t: f32, _: &mut Network, sim: &mut Simulation, cars: &mut Vec<Vehicle>, rec: &mut Recorder| {
+        if (t - 8.0).abs() < DT * 0.5 {
+            cars.push(car(20, 3, 60.0, 8.0));
+        }
+        if (t - 10.0).abs() < DT * 0.5 {
+            if let Some(c) = cars.iter_mut().find(|c| c.id == 10) {
+                c.state.max_speed_kmh = 40.0;
+                rec.vehicle_changed(sim.time, c);
+            }
+        }
+        sim.players = vec![PlayerView { id: 0, pos: DVec3::new(6.0, -40.0, 0.0), heading: 180.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: t, blinker: 0, signalling: 0.0, priority: false }];
+    };
+    record(net, vec![], cars, 30.0, &path, &mut hook);
+    let base = Replay::load(&path).expect("the recording reads");
+    let _ = std::fs::remove_file(&path);
+    let mut records = base.records.clone();
+    // the game spawned car 20 at 8 s; here two more spawns at the same moment and place,
+    // cars 30 and 31; car 10's change, as the game had it 50 m further on; and a change of
+    // a vehicle that is not on the road (99)
+    let spawn = records.iter().position(|r| matches!(r, Record::Spawn { vehicle, .. } if vehicle.id == 20)).expect("the spawn");
+    let (time, v20) = match &records[spawn] {
+        Record::Spawn { time, vehicle, .. } => (*time, vehicle.clone()),
+        _ => unreachable!(),
+    };
+    for id in [31, 30] {
+        let mut v = v20.clone();
+        v.id = id;
+        records.insert(spawn + 1, Record::Spawn { time, vehicle: v, type_name: "car".into() });
+    }
+    let changed = records.iter().position(|r| matches!(r, Record::VehicleChanged { .. })).expect("the change");
+    let ct = records[changed].time();
+    let mut far = match &records[changed] {
+        Record::VehicleChanged { vehicle, .. } => vehicle.clone(),
+        _ => unreachable!(),
+    };
+    far.state.s += 50.0;
+    let far_s = far.state.s;
+    let mut v99 = far.clone();
+    v99.id = 99;
+    v99.state.lane = 3;
+    v99.state.s = 30.0;
+    records[changed] = Record::VehicleChanged { time: ct, vehicle: far };
+    records.insert(changed + 1, Record::VehicleChanged { time: ct, vehicle: v99 });
+    // (the game's order of vehicles would take off those it does not know)
+    for rec in &mut records {
+        if let Record::Frame(f) = rec {
+            f.order = None;
+        }
+    }
+    // (and the free run is off from the recording at the keyframe before: car 1 was
+    // further on in the game)
+    let kf = records.iter().position(|r| matches!(r, Record::Keyframe { time, .. } if *time > 4.0 && *time < 6.0)).expect("a keyframe at 5 s");
+    if let Record::Keyframe { vehicles, .. } = &mut records[kf] {
+        vehicles.iter_mut().find(|v| v.id == 1).expect("car 1").state.s += 3.0;
+    }
+    let make = |free: bool, patience: f64| {
+        let mut r = Replay::new(base.header.clone(), records.clone(), Vec::new(), false);
+        r.free_run = free;
+        r.spawn_patience = patience;
+        assert!(r.at(0));
+        r
+    };
+    let has = |r: &Replay, id: u64| r.vehicles.iter().any(|v| v.id == id);
+    let overlaps = |r: &mut Replay| {
+        r.sim.update_positions(&r.net, &mut r.vehicles);
+        (0..r.vehicles.len()).flat_map(|i| (i + 1..r.vehicles.len()).map(move |j| (i, j))).filter(|&(i, j)| r.vehicles[i].obb().overlaps_plan(&r.vehicles[j].obb())).count()
+    };
+    // in step with the recording a free run puts spawns where the recording does
+    let mut r = Replay::new(base.header.clone(), base.records.clone(), Vec::new(), false);
+    r.free_run = true;
+    assert!(r.at(0));
+    r.run_until(time + 0.2);
+    assert!(r.in_sync && r.deferred_spawns == 0);
+    // as before when it is not a free run: everything where the recording says
+    let mut r = make(false, 30.0);
+    r.run_until(time + 0.2);
+    assert!(has(&r, 30) && has(&r, 31));
+    assert_eq!((r.deferred_spawns, r.dropped_spawns), (0, 0));
+    // a free run: 30 and 31 wait for car 20 to drive off, 99 (not on the road) comes at its
+    // place, car 10 stays where it is and takes the new way
+    let mut r = make(true, 30.0);
+    r.run_until(time + 0.2);
+    assert!(has(&r, 20) && !has(&r, 30) && !has(&r, 31), "spawned onto others");
+    assert_eq!(overlaps(&mut r), 0);
+    assert_eq!(r.deferred_spawns, 2);
+    r.run_until(ct + 0.1);
+    assert!(has(&r, 99), "a change of a vehicle not on the road is a spawn");
+    let c10 = r.vehicles.iter().find(|v| v.id == 10).unwrap();
+    assert!(c10.state.s < far_s - 20.0 || c10.state.lane != 0, "car 10 snapped to where the game had it: s {}", c10.state.s);
+    assert!((c10.state.max_speed_kmh - 40.0).abs() < 1e-3, "it took the new way: {}", c10.state.max_speed_kmh);
+    r.run_until(time + 15.0);
+    assert!(has(&r, 30) && has(&r, 31), "30: {}, 31: {}", has(&r, 30), has(&r, 31));
+    assert_eq!(overlaps(&mut r), 0, "30 and 31 were put onto others");
+    while r.step() {}
+    assert_eq!((r.deferred_spawns, r.dropped_spawns), (2, 0));
+    // with no patience they are given up
+    let mut r = make(true, 0.5);
+    while r.step() {}
+    assert!(!has(&r, 30) && !has(&r, 31));
+    assert_eq!((r.deferred_spawns, r.dropped_spawns), (2, 2));
+    assert!(r.pending_spawns.is_empty());
+}
+
 /// The recordings made in the game: `OMSI_TRAFFIC_FIXTURES` or `~/.openomsi/traffic/viz`.
 fn fixture(name: &str) -> Option<PathBuf> {
     let dir = std::env::var_os("OMSI_TRAFFIC_FIXTURES").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".openomsi/traffic/viz")))?;

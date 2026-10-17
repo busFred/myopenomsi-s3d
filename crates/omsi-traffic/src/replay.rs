@@ -24,6 +24,15 @@ use std::path::Path;
 /// How far apart lane ends may be and still link (as the game links them).
 const LINK_TOL: f64 = 1.5;
 
+/// A free run puts a spawn off for this long (s) while its place is taken; then drops it.
+pub const SPAWN_PATIENCE: f64 = 30.0;
+
+/// A free run is where the recording has it when no vehicle is further off than this (m).
+const IN_SYNC: f32 = 0.01;
+
+/// A spawn is put off when a vehicle is this close ahead on its lane (m, bumper to bumper).
+const SPAWN_GAP: f32 = 6.0;
+
 pub struct Replay {
     pub header: Header,
     pub records: Vec<Record>,
@@ -47,11 +56,29 @@ pub struct Replay {
     pub missing: Vec<(f64, u64)>,
     /// Free run: after the starting keyframe the replay no longer goes back to the recorded
     /// vehicles at later keyframes. They are still compared (`divergence`, `missing`), and
-    /// the replay goes on with its own. `Spawn` adds a vehicle whose id is not on the road,
-    /// `Remove` takes one off, the frame's inputs apply as always. This is how a rule
+    /// the replay goes on with its own. `Spawn` adds a vehicle whose id is not on the road
+    /// (when its place is free: else it waits for up to `SPAWN_PATIENCE` s, then is
+    /// dropped), `VehicleChanged` gives a vehicle its new way without moving it (unless it is where the
+    /// game has it), `Remove`
+    /// takes one off, the frame's inputs apply as always. This is how a rule
     /// change is tried: what the recording does differently with it is not undone by the
     /// next keyframe.
     pub free_run: bool,
+    /// Free run: spawns that did not fit on the road as the free run has it (a vehicle
+    /// there already, or one just ahead): (give up at, the vehicle). They are tried again
+    /// every frame at the recorded lane and place.
+    pub pending_spawns: Vec<(f64, Vehicle)>,
+    /// Free run: the last keyframe found the replay where the recording had it (every vehicle
+    /// within `IN_SYNC` metres, none missing or extra). While it does, spawns go where the
+    /// recording puts them, even onto another vehicle (the game does that too); once it has
+    /// drifted, they wait for room. (Known only at keyframes: a drift shows up late.)
+    pub in_sync: bool,
+    /// Free run: how long (s) a spawn waits for its place (`SPAWN_PATIENCE`).
+    pub spawn_patience: f64,
+    /// Free run: spawns put off at least once (they may have been placed later).
+    pub deferred_spawns: u64,
+    /// Free run: spawns given up after `SPAWN_PATIENCE` seconds.
+    pub dropped_spawns: u64,
     /// The rule changes under test; kept across `at`, which builds the simulation anew.
     pub switches: Switches,
     /// Indices of the keyframes in `records`.
@@ -84,7 +111,7 @@ impl Replay {
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, switches: Switches::default(), keyframes }
+        Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, switches: Switches::default(), keyframes }
     }
 
     /// Set the rule changes under test (now, and after every `at`).
@@ -114,6 +141,10 @@ impl Replay {
         self.types.clear();
         self.divergence.clear();
         self.missing.clear();
+        self.pending_spawns.clear();
+        self.in_sync = true;
+        self.deferred_spawns = 0;
+        self.dropped_spawns = 0;
         for i in 0..at {
             match &self.records[i] {
                 Record::LanesAdded { .. } | Record::LightsAdded { .. } | Record::Parked { .. } => self.apply(i),
@@ -171,12 +202,17 @@ impl Replay {
                     self.vehicles = vehicles.clone();
                 }
             }
-            Record::Spawn { vehicle, type_name, .. } => {
+            Record::Spawn { time, vehicle, type_name } => {
                 self.types.insert(vehicle.id, type_name.clone());
                 let v = vehicle.clone();
+                if self.free_run {
+                    // (a free run keeps the one it has, and does not put one onto another)
+                    if !self.vehicles.iter().any(|o| o.id == v.id) {
+                        self.spawn_free(*time, v);
+                    }
+                    return;
+                }
                 match self.vehicles.iter_mut().find(|o| o.id == v.id) {
-                    // (a free run keeps the one it has)
-                    Some(_) if self.free_run => {}
                     Some(o) => *o = v,
                     None => self.vehicles.push(v),
                 }
@@ -184,9 +220,20 @@ impl Replay {
             Record::Remove { id, .. } => {
                 let id = *id;
                 self.vehicles.retain(|v| v.id != id);
+                self.pending_spawns.retain(|p| p.1.id != id);
             }
-            Record::VehicleChanged { vehicle, .. } => {
+            Record::VehicleChanged { time, vehicle } => {
                 let v = vehicle.clone();
+                if self.free_run {
+                    match self.vehicles.iter().position(|o| o.id == v.id) {
+                        // (the way changes, not where the vehicle is; one where the game
+                        // has it is the game's)
+                        Some(i) if !in_step(&self.vehicles[i], &v) => take_way(&mut self.vehicles[i], &v),
+                        Some(i) => self.vehicles[i] = v,
+                        None => self.spawn_free(*time, v),
+                    }
+                    return;
+                }
                 match self.vehicles.iter_mut().find(|o| o.id == v.id) {
                     Some(o) => *o = v,
                     None => self.vehicles.push(v),
@@ -209,7 +256,56 @@ impl Replay {
         }
     }
 
+    /// Free run: put `v` on the road if its place is free, else wait for it.
+    fn spawn_free(&mut self, time: f64, v: Vehicle) {
+        if self.pending_spawns.iter().any(|p| p.1.id == v.id) {
+            return;
+        }
+        if self.in_sync || self.fits(&v) {
+            self.vehicles.push(v);
+        } else {
+            self.deferred_spawns += 1;
+            self.pending_spawns.push((time + self.spawn_patience, v));
+        }
+    }
+
+    /// Free run: try the put-off spawns again; give up on those that waited too long.
+    fn retry_spawns(&mut self, now: f64) {
+        for (deadline, v) in std::mem::take(&mut self.pending_spawns) {
+            if self.vehicles.iter().any(|o| o.id == v.id) {
+                continue;
+            }
+            if self.fits(&v) {
+                self.vehicles.push(v);
+            } else if now > deadline {
+                self.dropped_spawns += 1;
+            } else {
+                self.pending_spawns.push((deadline, v));
+            }
+        }
+    }
+
+    /// Whether `v`, at the lane and place it has, would overlap a vehicle on the road (their
+    /// boxes in the plan, at about the same height) or stand less than `SPAWN_GAP` behind
+    /// one on its lane.
+    fn fits(&mut self, v: &Vehicle) -> bool {
+        let mut v = v.clone();
+        self.sim.update_positions(&self.net, std::slice::from_mut(&mut v));
+        self.sim.update_positions(&self.net, &mut self.vehicles);
+        let b = v.obb();
+        self.vehicles.iter().all(|o| {
+            if (o.pos.z - v.pos.z).abs() <= 3.0 && o.obb().overlaps_plan(&b) {
+                return false;
+            }
+            let ahead = o.state.lane == v.state.lane && o.state.s >= v.state.s && (o.state.s - o.state.rear) - (v.state.s + v.state.front) < SPAWN_GAP;
+            !ahead
+        })
+    }
+
     fn frame(&mut self, f: &Frame) {
+        if self.free_run && !self.pending_spawns.is_empty() {
+            self.retry_spawns(f.time);
+        }
         let sim = &mut self.sim;
         sim.time = f.time;
         sim.day_time = f.day_time;
@@ -250,6 +346,7 @@ impl Replay {
     /// How far the replay is from the recorded keyframe.
     fn compare(&mut self, time: f64, recorded: &[Vehicle]) {
         let mut worst = (0.0f32, 0u64);
+        let missing_before = self.missing.len();
         let here: HashMap<u64, usize> = self.vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         for r in recorded {
             let Some(&i) = here.get(&r.id) else {
@@ -273,6 +370,7 @@ impl Replay {
                 self.missing.push((time, v.id));
             }
         }
+        self.in_sync = worst.0 <= IN_SYNC && self.missing.len() == missing_before;
         self.divergence.push((time, worst.0, worst.1));
     }
 
@@ -296,6 +394,39 @@ impl Replay {
         out_records.extend(self.records[k..].iter().take_while(|r| r.time() <= t1));
         write_file(out, &self.header, &out_records)
     }
+}
+
+/// Whether the vehicle is where the recording has `rec` (same lane, within `IN_SYNC` m).
+fn in_step(o: &Vehicle, rec: &Vehicle) -> bool {
+    o.state.lane == rec.state.lane && (o.state.s - rec.state.s).abs() <= IN_SYNC
+}
+
+/// A free run's vehicle `o` gets the way the game changed (`rec`): the route and where in it
+/// the vehicle is, its class, driver, size and external inputs. It stays where it is: its
+/// place, speed, odometer, lane changes in progress and the lanes it has planned.
+fn take_way(o: &mut Vehicle, rec: &Vehicle) {
+    o.class = rec.class;
+    o.params = rec.params.clone();
+    o.half_width = rec.half_width;
+    o.external = rec.external;
+    let (st, r) = (&mut o.state, &rec.state);
+    st.traffic_pool = r.traffic_pool.clone();
+    st.veh_type = r.veh_type;
+    st.max_speed_kmh = r.max_speed_kmh;
+    st.accel = r.accel;
+    st.decel = r.decel;
+    st.length = r.length;
+    st.front = r.front;
+    st.rear = r.rear;
+    st.desire = r.desire;
+    st.headway = r.headway;
+    st.min_gap = r.min_gap;
+    st.accept_gap = r.accept_gap;
+    st.reaction = r.reaction;
+    st.lat_accel = r.lat_accel;
+    st.route = r.route.clone();
+    // (where it is in the new route: its lane's place in it when it is there)
+    st.route_index = st.route.iter().position(|&l| l == st.lane).unwrap_or(r.route_index);
 }
 
 /// The network and the simulation the header describes.
