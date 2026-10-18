@@ -178,6 +178,38 @@ fn signal_foes_an_unlit_sibling_stub_at_the_lead_in_end_does_not_hide_the_light(
     assert!(crossed && waited_on_green);
 }
 
+/// `beijing_junction` with a second way (10) forking from where the south lead-in starts and
+/// crossing it 4.7 m on, before the light: a way of its own, not a piece of the lead-in's.
+fn beijing_junction_with_a_fork_at_the_lead_in_start() -> Network {
+    let mut net = beijing_junction(128.0, 128.0);
+    let mut fork = LaneBuilder::polyline(vec![DVec3::new(0.0, -20.0, 0.0), DVec3::new(1.5, -17.0, 0.0), DVec3::new(-3.0, -12.0, 0.0)], LaneKind::Street, 3.5);
+    fork.source = 2;
+    fork.key = Some(LaneKey { tile: (0, 0), id: 9, path: 6 });
+    fork.priority = 128.0;
+    net.lanes.push(fork);
+    net.link(0.5);
+    net.compute_conflicts();
+    net
+}
+
+#[test]
+fn signal_foes_a_way_forking_from_the_lead_in_start_does_not_hide_the_light() {
+    let net = beijing_junction_with_a_fork_at_the_lead_in_start();
+    // the fork is there after linking, and meets the lead-in before the light (8 m on):
+    // the lead-in's first meeting place
+    assert!(net.lanes[5].next.contains(&10) && net.lanes[5].next.contains(&SOUTH_IN), "{:?}", net.lanes[5].next);
+    assert!(!net.one_way_pieces(SOUTH_IN, 10));
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, lead_in) = js.movement(SOUTH_IN).unwrap();
+    assert!(lead_in.conflict_start < 7.0, "{:?}", lead_in.foes);
+    // the line is the first meeting place with somebody else's way, not with the fork: the
+    // south car standing at its red is held there by its light
+    let (waited, crossed, waited_on_green, ran_red) = foe_at_a_red_on_a_stub_in(net);
+    assert!(!ran_red, "the south car ran its red");
+    assert!(waited < 1.0, "the west car waited {waited:.1} s for a car standing at its red");
+    assert!(crossed && waited_on_green);
+}
+
 /// The south car gives way (lower priority) and stands at its red on the stub; a west car
 /// crosses in front of it. When the foe is gone the junction lets the south car go, the
 /// light does not.

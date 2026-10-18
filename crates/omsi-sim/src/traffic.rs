@@ -1832,26 +1832,57 @@ mod stub_links_tests {
 
     #[test]
     fn stub_links_applied_to_a_linked_network_is_linking_with_it() {
-        // a network linked round its lit stubs (as a recording from before them has it):
-        // the links past the stubs put back by hand
-        let on = linked();
-        let mut net = linked();
+        // the crossing, and beside it two ways of the same object that run into one exit
+        // (8 and 9: ends together, starts 6 m apart, a merge of two streams)
+        let with_streams = || {
+            let mut lanes = crossing();
+            lanes.push(piece(20.0, 0.0, 20.0, 8));
+            let mut slant = LaneBuilder::polyline(vec![DVec3::new(26.0, 0.0, 0.0), DVec3::new(20.0, 20.0, 0.0)], LaneKind::Street, 3.0);
+            slant.key = Some(LaneKey { tile: (0, 0), id: 9, path: 9 });
+            slant.source = 2;
+            lanes.push(slant);
+            lanes.push(piece(20.0, 20.0, 40.0, 10));
+            let mut net = Network { lanes, ..Default::default() };
+            net.link(1.5);
+            net
+        };
+        let on = with_streams();
+        assert!(merges(&on, 8, 9) && merges(&on, 9, 8), "two streams into one exit: {:?}", on.crossings[8]);
+        // the network as a recording from before the lit stubs has it: linked round them
         // (the 0.3 m sibling is linked to the lit stub beside it, which starts 0.3 m back,
-        // and past it to the straight piece: round the light too)
+        // and past it to the straight piece: round the light too), the lead-in a merge of
+        // its own stub and the other lead-in of its sibling stub; put back by hand
+        let mut net = with_streams();
         for (a, b) in [(0, 2), (3, 7), (5, 7)] {
             net.lanes[a].next.push(b);
             net.prev[b].push(a);
         }
+        for (i, j) in [(0, 1), (3, 5)] {
+            let (li, lj) = (net.lanes[i].length(), net.lanes[j].length());
+            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0 });
+            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0 });
+            net.conflicts[i].push(j);
+            net.conflicts[j].push(i);
+        }
+        assert!(merges(&net, 0, 1) && merges(&net, 3, 5));
         let (links, pairs) = net.apply_stub_links();
+        assert_eq!(links, vec![(0, 2), (3, 7), (5, 7)]);
+        // the lead-in / stub merges go (each pair once), the two streams' merge stays
+        assert_eq!(pairs, vec![(0, 1), (3, 5)]);
+        for (a, b) in [(0, 1), (3, 5)] {
+            assert!(!merges(&net, a, b) && !merges(&net, b, a), "{a}/{b}");
+            assert!(!net.conflicts[a].contains(&b) && !net.conflicts[b].contains(&a), "{a}/{b}");
+        }
+        assert!(merges(&net, 8, 9) && merges(&net, 9, 8) && net.conflicts[8].contains(&9));
+        // and the network is as linked with them
         for i in 0..net.lanes.len() {
             assert_eq!(net.lanes[i].next, on.lanes[i].next, "lane {i}");
             assert_eq!(net.prev[i], on.prev[i], "prev of lane {i}");
             assert_eq!(net.crossings[i], on.crossings[i], "crossings of lane {i}");
+            assert_eq!(net.conflicts[i], on.conflicts[i], "conflicts of lane {i}");
         }
-        assert_eq!(links, vec![(0, 2), (3, 7), (5, 7)]);
-        assert!(pairs.is_empty(), "{pairs:?}");
         // on a network linked with them it does nothing
-        let mut again = linked();
+        let mut again = with_streams();
         assert_eq!(again.apply_stub_links(), (Vec::new(), Vec::new()));
         for i in 0..again.lanes.len() {
             assert_eq!(again.lanes[i].next, on.lanes[i].next, "lane {i}");

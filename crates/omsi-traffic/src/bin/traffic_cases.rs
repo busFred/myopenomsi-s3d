@@ -56,6 +56,9 @@ use std::path::{Path, PathBuf};
 type Res<T> = Result<T, Box<dyn Error>>;
 
 fn main() {
+    // (warnings on stderr, as a recording made under other rules than the current ones;
+    // `RUST_LOG` for more)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(|s| s.as_str()) {
         Some("info") if args.len() >= 3 => info(Path::new(&args[2])),

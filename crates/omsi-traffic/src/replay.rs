@@ -474,7 +474,6 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle) {
     st.route_index = st.route.iter().position(|&l| l == st.lane).unwrap_or(r.route_index);
 }
 
-/// The network and the simulation the header describes.
 /// Why the recording was made under other rules than the current ones ([`RULES`]), if it
 /// was: format 1 (before the rule switches, all off), or a switch list that lacks one of
 /// them. Such a recording does not replay bit-exactly.
@@ -502,6 +501,7 @@ pub fn recorded(h: &Header) -> (Network, Simulation) {
     build(h)
 }
 
+/// The network and the simulation the header describes.
 fn build(h: &Header) -> (Network, Simulation) {
     let mut net = Network { lanes: h.lanes.clone(), left_hand: h.left_hand, ..Default::default() };
     for (i, l) in net.lanes.iter().enumerate() {
