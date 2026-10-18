@@ -4019,6 +4019,9 @@ struct Extra {
     /// width + 0.3 m), and the distinct followers (merging and zipper leads left out).
     phantom_s: u64,
     phantom_vehicles: u64,
+    /// Of them, the viz3 review's: a lead mid-change (t >= 0.5) more than 2 m to the side.
+    phantom_review_s: u64,
+    phantom_review_vehicles: u64,
     /// Seconds a standing vehicle keeps more than 3.5 m beyond its stop behind a standing
     /// lead (the keep-back), all and with a red light or a junction ahead.
     keepback_s: u64,
@@ -4028,10 +4031,14 @@ struct Extra {
     passes: u64,
     passes_unsignalled: u64,
     pass_wrong_side_s: u64,
-    /// Seconds a vehicle stands (> 8 s) with a pass on the oncoming lane under way.
+    /// Seconds a vehicle stands (> 8 s) with a pass on the oncoming lane under way, short of the
+    /// end of what it passes and not at a red light (its way back in blocked).
     pass_stranded_s: u64,
     /// `overlap_s` without the pairs that touched within 3 s of one of them coming on the road.
     overlap_nospawn_s: u64,
+    /// Of `unjust_hold_s`, the head-seconds "for a vehicle behind/beside" that is moving faster
+    /// than 1 m/s (a stream coming alongside).
+    unjust_stream_s: u64,
     /// Mutual holds negotiated: a car eased off for the other (`Vehicle::ease_for`), whole map.
     eases: u64,
     events: Vec<String>,
@@ -4083,6 +4090,9 @@ fn score_json(s: &Score) -> Value {
 #[derive(Clone, Copy)]
 struct HeadTally {
     unjust: bool,
+    /// (unjust by the verdict "for a vehicle behind/beside", that vehicle moving faster than
+    /// 1 m/s: a stream coming alongside on a lane that runs into or beside mine)
+    stream: bool,
     behind: bool,
     beside_red: bool,
     far_red: bool,
@@ -4093,6 +4103,7 @@ impl HeadTally {
     fn of(h: &HeadSample) -> HeadTally {
         let v = h.verdict.as_str();
         HeadTally {
+            stream: false,
             unjust: v.starts_with("junction hold with nobody conflicting") || v.starts_with("junction hold for a vehicle behind/beside") || v.starts_with("deadlock ring"),
             behind: h.wait_rel == Some("BEHIND"),
             beside_red: h.wait_rel == Some("BESIDE") && h.wait_red,
@@ -4182,6 +4193,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     let mut change_since: HashMap<u64, (usize, f32, f64, bool)> = HashMap::new();
     let mut frozen_ids: HashSet<u64> = HashSet::new();
     let mut phantom_ids: HashSet<u64> = HashSet::new();
+    let mut phantom_review_ids: HashSet<u64> = HashSet::new();
     let mut keepback_ids: HashSet<u64> = HashSet::new();
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
@@ -4193,6 +4205,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
         for h in run {
             sc.head_s += 1.0;
             sc.unjust_hold_s += h.unjust as u8 as f64;
+            sc.extra.unjust_stream_s += (h.unjust && h.stream) as u64;
             sc.wait_behind_s += h.behind as u8 as f64;
             sc.wait_beside_red_s += h.beside_red as u8 as f64;
             sc.wait_far_red_s += h.far_red as u8 as f64;
@@ -4339,6 +4352,20 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
         sc.dead_end_s += standing.iter().filter(|&&i| r.vehicles[i].last.why == Why::End).count() as f64;
         // vehicles whose box overlaps another vehicle's (more than 10 cm deep, same level)
         let nearv: Vec<usize> = (0..r.vehicles.len()).filter(|&i| near(r.vehicles[i].pos)).collect();
+        // (pairs that overlap within 3 s of one of them coming on the road, near the player or
+        // not: put down by the recording where the free run had another car, or overlapping in
+        // the keyframe the run starts from)
+        for (i, v) in r.vehicles.iter().enumerate() {
+            if !first_seen.get(&v.id).is_some_and(|&s| t - s < 3.0) {
+                continue;
+            }
+            let b = v.obb();
+            for (k, o) in r.vehicles.iter().enumerate() {
+                if k != i && (o.pos - v.pos).truncate().length() < 20.0 && (o.pos.z - v.pos.z).abs() <= 3.0 && o.obb().separation(&b) < -0.1 {
+                    spawn_pairs.insert((v.id.min(o.id), v.id.max(o.id)));
+                }
+            }
+        }
         let boxes: Vec<omsi_sim::collision::Obb> = nearv.iter().map(|&i| r.vehicles[i].obb()).collect();
         let mut hit = vec![false; nearv.len()];
         // (and leaving out the pairs that touched within 3 s of one of them coming on the road:
@@ -4410,7 +4437,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                         let o = &r.vehicles[j];
                         let merging = o.state.lane != st.lane && o.state.planned_next.is_some() && o.state.planned_next == st.planned_next;
                         let zipper = v.last.wait_for == Some(oid) && v.last.hold.is_some();
-                        if !merging && !zipper && l.gap < 60.0 {
+                        // (one changing into a lane of my way ahead of me: let in, by design)
+                        let coming_in = o.state.change.is_some_and(|c| way_lanes(net, st, 220.0).iter().any(|w| w.0 == c.to));
+                        if !merging && !zipper && !coming_in && l.gap < 60.0 {
                             let ob = o.obb();
                             let [rx, fy] = ob.axes();
                             let w = v.half_width as f64 + 0.3;
@@ -4427,21 +4456,28 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                             }
                             if !touches {
                                 ex.phantom_s += 1;
+                                // (where its middle lies from my way: the nearest sample)
+                                let mut near_d = (0.0f32, f64::INFINITY, 0.0f64);
+                                let mut d = 0.0f32;
+                                while d <= upto + 10.0 {
+                                    let p0 = st.way_point(net, d).truncate();
+                                    let p1 = st.way_point(net, d + 0.5).truncate();
+                                    let f = (p1 - p0).normalize_or_zero();
+                                    let q = ob.center - p0;
+                                    if q.length() < near_d.1 {
+                                        near_d = (d, q.length(), q.dot(glam::DVec2::new(f.y, -f.x)));
+                                    }
+                                    d += 0.5;
+                                }
+                                // (the viz3 review's: one mid-change, t >= 0.5, more than 2 m to the side)
+                                if o.state.change.is_some_and(|c| c.t >= 0.5) && near_d.2.abs() > 2.0 {
+                                    ex.phantom_review_s += 1;
+                                    if phantom_review_ids.insert(v.id) {
+                                        ex.phantom_review_vehicles += 1;
+                                    }
+                                }
                                 if phantom_ids.insert(v.id) {
                                     ex.phantom_vehicles += 1;
-                                    // (where its middle lies from my way: the nearest sample)
-                                    let mut near_d = (0.0f32, f64::INFINITY, 0.0f64);
-                                    let mut d = 0.0f32;
-                                    while d <= upto + 10.0 {
-                                        let p0 = st.way_point(net, d).truncate();
-                                        let p1 = st.way_point(net, d + 0.5).truncate();
-                                        let f = (p1 - p0).normalize_or_zero();
-                                        let q = ob.center - p0;
-                                        if q.length() < near_d.1 {
-                                            near_d = (d, q.length(), q.dot(glam::DVec2::new(f.y, -f.x)));
-                                        }
-                                        d += 0.5;
-                                    }
                                     ex.events.push(format!("PHANTOM {} t={t:.1} #{} lane {} follows #{} lane {} gap {:.1} seen {:?} (its middle {:.1} m from my way at {:.1} m, across {:+.1}; it changes {:?}, passes {})", sc.name, v.id, st.lane, oid, o.state.lane, l.gap, v.last.lead_seen, near_d.1, near_d.0, near_d.2, o.state.change.map(|c| (c.to, c.t)), o.passing.is_some()));
                                 }
                             }
@@ -4471,7 +4507,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                     if !p.aborted && st.lateral.abs() > 1.0 && v.blinker_shown.0 != if p.side > 0.0 { 2 } else { 1 } {
                         ex.pass_wrong_side_s += 1;
                     }
-                    if p.lane.is_some() && !p.aborted && v.stopped > 8.0 {
+                    if p.lane.is_some() && !p.aborted && v.stopped > 8.0 && st.odometer < p.until && v.last.why != Why::Light {
                         ex.pass_stranded_s += 1;
                     }
                 }
@@ -4490,7 +4526,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
         }
         for &i in &heads {
             let hs = head_sample(&r, i, t, day, ppos, 0.0);
-            open.entry(r.vehicles[i].id).or_default().push(HeadTally::of(&hs));
+            let mut tally = HeadTally::of(&hs);
+            if tally.unjust {
+                tally.stream = hs.verdict.starts_with("junction hold for a vehicle behind/beside") && r.vehicles[i].last.wait_for.and_then(|w| r.vehicles.iter().find(|o| o.id == w)).is_some_and(|o| o.state.speed > 1.0);
+            }
+            open.entry(r.vehicles[i].id).or_default().push(tally);
         }
     }
     for (_, run) in std::mem::take(&mut open) {
@@ -4504,6 +4544,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     sc.missing = r.missing.len() as u64;
     sc.deferred_spawns = r.deferred_spawns;
     sc.dropped_spawns = r.dropped_spawns;
+    ex.unjust_stream_s = sc.extra.unjust_stream_s;
     sc.extra = ex;
     Ok(sc)
 }
@@ -4512,10 +4553,12 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
 fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
     vec![
         ("ovl_nospawn", e.overlap_nospawn_s.to_string()),
+        ("unjust_stream", e.unjust_stream_s.to_string()),
         ("close_foe", format!("{}/{}", e.close_foe_pairs, e.close_foe_s)),
         ("close_nofoe", format!("{}/{}", e.close_nofoe_pairs, e.close_nofoe_s)),
         ("frozen", format!("{}/{}/{}", e.frozen_runs, e.frozen_vehicles, e.frozen_s)),
         ("phantom", format!("{}/{}", e.phantom_vehicles, e.phantom_s)),
+        ("phantom_rv", format!("{}/{}", e.phantom_review_vehicles, e.phantom_review_s)),
         ("keepback", format!("{}/{}", e.keepback_blocked_s, e.keepback_s)),
         ("passes", format!("{}/{}", e.passes_unsignalled, e.passes)),
         ("pass_wrong_s", e.pass_wrong_side_s.to_string()),
@@ -4527,6 +4570,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
 fn add_extra(t: &mut Extra, e: &Extra) {
     t.close_foe_s += e.close_foe_s;
     t.overlap_nospawn_s += e.overlap_nospawn_s;
+    t.unjust_stream_s += e.unjust_stream_s;
     t.close_nofoe_s += e.close_nofoe_s;
     t.close_foe_pairs += e.close_foe_pairs;
     t.close_nofoe_pairs += e.close_nofoe_pairs;
@@ -4535,6 +4579,8 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.frozen_s += e.frozen_s;
     t.phantom_s += e.phantom_s;
     t.phantom_vehicles += e.phantom_vehicles;
+    t.phantom_review_s += e.phantom_review_s;
+    t.phantom_review_vehicles += e.phantom_review_vehicles;
     t.keepback_s += e.keepback_s;
     t.keepback_blocked_s += e.keepback_blocked_s;
     t.passes += e.passes;
@@ -5083,6 +5129,13 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         }
         r.sim.update_positions(&r.net, &mut r.vehicles);
         let found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        if args.iter().any(|a| a == "--player") {
+            for p in &r.sim.players {
+                let pb = p.obb(0.0, 0.0);
+                let gaps: Vec<String> = found.iter().map(|&i| format!("#{} {:.2} m", r.vehicles[i].id, r.vehicles[i].obb().separation(&pb))).collect();
+                println!("t={t:.1} player {} ({:.1},{:.1}) hd {:.0} v {:.2} still {:.1} blinker {}; boxes to it: {}", p.id, p.pos.x, p.pos.y, p.heading, p.speed, p.still, p.blinker, gaps.join(", "));
+            }
+        }
         for &i in &found {
             let v = &r.vehicles[i];
             let st = &v.state;
