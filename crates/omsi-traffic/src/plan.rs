@@ -150,6 +150,38 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     (desire, gap_accepted(me, nb))
 }
 
+/// Metres a pass needs past the obstacle besides the car's own length and the way back in
+/// (`obstacle_run`).
+pub const PASS_ROOM: f32 = 4.0;
+/// A pass goes round at most this many metres of things standing one behind the other.
+pub const PASS_MAX_OBSTACLE: f32 = 30.0;
+/// Seconds a pass may stand out there with its way back in blocked before it is given up.
+pub const PASS_STRANDED: f32 = 8.0;
+
+/// The obstacle a pass would go round: the standing `lead` and what stands (or crawls under
+/// 2 m/s) less than `need` beyond it, one after the other, at most `PASS_MAX_OBSTACLE` long;
+/// and whether there is `need` of free lane beyond that (`Perception::ahead`). (Its length, room.)
+fn obstacle_run(p: &Perception, lead: &crate::perception::Headway, need: f32) -> (f32, bool) {
+    let mut end = lead.gap + lead.length;
+    for &(near, far, speed) in &p.ahead {
+        if near <= lead.gap + 0.5 || far <= end {
+            continue;
+        }
+        if speed >= 2.0 {
+            continue;
+        }
+        if near - end >= need {
+            break;
+        }
+        if far - lead.gap > PASS_MAX_OBSTACLE {
+            return (end - lead.gap, false);
+        }
+        end = far;
+    }
+    // (and the road goes on that far)
+    (end - lead.gap, p.road_left > end + need + 2.0)
+}
+
 /// The vehicle `id` passed (a player's: `PLAYER_ID_BASE` + its id): (a bus, indicating out
 /// towards the traffic, moving). None when it is gone.
 fn obstacle_bus(sim: &Simulation, vehicles: &[Vehicle], id: u64) -> Option<(bool, bool, bool)> {
@@ -419,6 +451,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
         }
+        // standing out there with the way back in blocked: given up, back in behind the obstacle
+        // at the gap kept (where it is still behind it), else into the lane where it is, and the
+        // obstacle is a lead again (viz case09 #30816 stood 110 s on the oncoming side)
+        // (not once past it, on its way back in, nor held by a light: that is no blocked return)
+        if !pass.aborted && out.start.is_none() && pass.wait <= 0.0 && me.stopped > PASS_STRANDED && st.odometer < pass.until && out.why != Why::Light {
+            // (beside it or past it already: it stays where it is and steps back in as soon as
+            // its body there touches nobody, `Simulation::sidestep`)
+            let hold = if st.odometer + 0.5 < pass.block { pass.block + st.front + 0.6 - st.min_gap } else { st.odometer };
+            out.start = Some(Start::AbortPass { hold });
+        }
         if pass.aborted {
             min_stop(&mut out.stop, &mut out.why, Some((pass.hold - st.odometer).max(0.0)), Why::Lead);
         } else if pass.wait > 0.0 {
@@ -431,7 +473,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             // the thing being passed no longer holds the car (the bent way clears it)
             if let Some(l) = p.leader {
-                let passing_it = l.standing_obstacle() && st.odometer + l.gap + st.front < pass.until + 1.0;
+                // (not one standing on the line the pass takes: that holds it)
+                let passing_it = l.standing_obstacle() && st.odometer + l.gap + st.front < pass.until + 1.0 && l.lateral.abs() < (l.lateral - pass.side).abs();
                 if passing_it {
                     out.lead = None;
                     out.lead_seen = None;
@@ -467,7 +510,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // `JUNCTION_KEEP` of the front, a junction), the road going on, and the oncoming lane
         // (or the lane's own width) free for it
         let real = l.gap + if player { 0.5 } else { 0.0 };
-        let obstacle_len = l.length;
+        // what stands right behind it is passed with it, and beyond them the lane must have
+        // room to come back in: my length, the way to pull back in and 4 m (`PASS_ROOM`; a car
+        // or player standing or slower than 2 m/s there takes it; viz case09 #30816 pulled out
+        // round two standing cars with three more beyond and stood out there 110 s)
+        let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
         let zone = if player { 60.0 } else { 25.0 };
         let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
@@ -478,7 +525,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
+        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
         // (or round it into the lane beside, `Start::Bypass`)
         let bypass_possible = !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
         // keep back: room to pull out again, where the car can still stop there gently - only

@@ -667,3 +667,104 @@ fn x5_a_pass_of_a_bus_at_its_stop_is_given_up_when_it_indicates_or_moves_off() {
     });
     assert!(!started, "it set out to pass a bus indicating out of its stop");
 }
+
+#[test]
+fn x6_no_pass_round_a_standing_queue_with_no_room_to_come_back_in() {
+    // viz case09 #30816: standing cars one behind the other (2.5 m apart), nowhere to come back
+    // in for 30 m and more: no pass; one car standing alone: passed
+    for (n, expect) in [(6u64, false), (1, true)] {
+        let net = two_way(false);
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(1, 0, 150.0, 8.0)];
+        for k in 0..n {
+            cars.push(broken_down(10 + k, 200.0 + 6.5 * k as f32));
+        }
+        let mut started = false;
+        run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+            started |= cars.iter().find(|c| c.id == 1).unwrap().passing.is_some();
+        });
+        assert_eq!(started, expect, "{n} standing");
+    }
+    // two standing and a gap too short beyond them (12 m: my 4 m, 9 m back in and 4 m need 17)
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 150.0, 8.0), broken_down(10, 200.0), broken_down(11, 206.5), broken_down(12, 222.5)];
+    let mut started = false;
+    run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+        started |= cars.iter().find(|c| c.id == 1).unwrap().passing.is_some();
+    });
+    assert!(!started, "passed two with 12 m beyond");
+}
+
+#[test]
+fn x6_a_pass_comes_back_in_only_where_nobody_is_beside_it() {
+    // out on the oncoming lane past what it passed, about to come back in, with a car in its
+    // lane drawn level with it at its speed (viz3 case11 #28490 came back in on top of one)
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 100.0, 8.0);
+    me.state.max_speed_kmh = 30.0;
+    let odo = me.state.odometer;
+    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo, block: odo - 12.0, out_len: 9.0, back_len: 18.0, aborted: false, hold: 0.0, wait: 0.0, obstacle: None });
+    me.state.lateral = -3.0;
+    me.state.lateral_curve = vec![(odo, -3.0), (odo + 18.0, 0.0)];
+    let mut beside = car(2, 0, 99.0, 8.0);
+    beside.state.max_speed_kmh = 29.0;
+    let mut cars = vec![me, beside];
+    let mut back = false;
+    let min_gap = run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        back |= me.passing.is_none() && me.state.lateral.abs() < 0.05;
+    });
+    assert!(min_gap > 0.2, "came back in on the car beside it: {min_gap:.2} m");
+    assert!(back, "never came back in");
+}
+
+#[test]
+fn x6_a_pass_stranded_out_there_is_given_up_and_the_obstacle_is_the_lead_again() {
+    // as the car pulls out round the car standing at x = 200 (its rear at 198), an oncoming car
+    // stands head-on in its way (lane 3, facing west, its front at x = 195): the car stops
+    // half out, still short of the obstacle, and its way back in past it never opens
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut spare = car(999, 3, 10.0, 0.0);
+    spare.pull_out = 1000.0;
+    let mut cars = vec![car(1, 0, 150.0, 8.0), broken_down(2, 200.0), spare];
+    let (mut out, mut stood_out, mut gave_up_after, mut most) = (None::<f32>, None::<f32>, None::<f32>, 0.0f32);
+    let mut placed = false;
+    let min_gap = run(&net, &mut sim, &mut cars, 45.0, |t, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        if out.is_none() && me.state.lateral < -1.5 {
+            out = Some(t);
+        }
+        if out.is_some() && !placed {
+            placed = true;
+            let mut o = car(3, 3, 600.0 - 197.0, 0.0);
+            o.pull_out = 1000.0;
+            cars_push(cars, o);
+        }
+        most = most.max(-me.state.lateral);
+        if stood_out.is_none() && out.is_some() && me.state.speed < 0.1 && me.passing.is_some() {
+            stood_out = Some(t);
+        }
+        if stood_out.is_some() && gave_up_after.is_none() && me.passing.is_none() {
+            gave_up_after = Some(t - stood_out.unwrap());
+        }
+    });
+    let after = gave_up_after.expect("the stranded pass was never given up");
+    assert!(most > 1.0, "it never got out ({most:.2} m)");
+    assert!(after > 8.0 && after < 16.0, "given up {after:.1} s after it stood out there");
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(me.state.lateral.abs() < 0.1 && me.pos.y.abs() < 0.1, "not back in its lane: lateral {:.2}", me.state.lateral);
+    assert!(me.pos.x < 196.0, "not behind the obstacle: x {:.1}", me.pos.x);
+    assert!(me.last.lead_id == Some(2) || me.last.lead_id == Some(3) || me.last.lead.is_some(), "no lead: {:?}", me.last);
+    assert!(min_gap > 0.2, "bodies {min_gap:.2} m apart");
+}
+
+/// (a vehicle added during a run: the slice of `run` cannot grow, so it is put in for the
+/// first one that is gone; tests that use it keep one spare)
+fn cars_push(cars: &mut [Vehicle], v: Vehicle) {
+    if let Some(slot) = cars.iter_mut().find(|c| c.id == 999) {
+        *slot = v;
+    }
+}

@@ -255,6 +255,11 @@ pub struct Vehicle {
     pub change_still: (f32, f32),
 }
 
+/// An aborted pass standing out there steps back into its lane at this pace (m/s) ...
+pub const SIDESTEP_SPEED: f32 = 0.5;
+/// ... until it is this near its lane's middle (m).
+pub const SIDESTEP_DONE: f32 = 0.05;
+
 /// Seconds a lane change may stand without moving on before it is settled where the car is:
 /// done in place, or given up (`AiState::settle_change`).
 pub const FROZEN_CHANGE: f32 = 5.0;
@@ -992,6 +997,8 @@ impl Simulation {
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
+        let sidestep = self.sidestep(vehicles, i, dt);
+        let return_blocked = self.return_blocked(vehicles, i);
         let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
         let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
@@ -1072,6 +1079,15 @@ impl Simulation {
                 }
             }
         }
+        // coming back in: not into a body beside it - it stays out a metre more (a pass recorded
+        // under way at a fixture's start came back in on top of the car that had drawn level,
+        // viz3 case11 #28490, -1.77 m)
+        if let (true, Some(p)) = (return_blocked, v.passing.as_mut()) {
+            let (odo, lat) = (v.state.odometer, v.state.lateral);
+            p.until = p.until.max(odo + 1.0);
+            let back = (p.back_len * (lat.abs() / p.side.abs().max(0.1))).max(2.0);
+            v.state.lateral_curve = vec![(odo, lat), (odo + 1.0, lat), (odo + 1.0 + back, 0.0)];
+        }
         v.state.accel_cap = plan.accel_cap;
         // a fresh car: no harder braking than its driver likes at the start
         if v.fresh > 0.0 {
@@ -1126,9 +1142,24 @@ impl Simulation {
         // a pass runs its course: the bent way brings the car back by itself
         if let Some(p) = v.passing {
             if p.aborted {
-                if v.state.speed < 0.1 && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
+                // standing out there, it steps back into its lane where it stands, at a walking
+                // pace, while its body there touches nobody (backing up a little and pulling
+                // in: the way bends only as the car drives); once back the pass is over
+                if v.state.speed < 0.1 {
+                    if let Some(lat) = sidestep {
+                        v.state.lateral_curve.clear();
+                        v.state.lateral = lat;
+                        v.state.lateral_target = 0.0;
+                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                    }
+                }
+                if v.state.speed < 0.1 && v.state.lateral.abs() <= SIDESTEP_DONE && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
                     v.passing = None;
+                    // (from where it is: the rest of the way back eases off as it drives on)
+                    let lat = v.state.lateral;
                     v.state.lateral_curve.clear();
+                    v.state.lateral_target = 0.0;
+                    v.state.lateral_ramp = (lat, 0.0, v.state.odometer, 8.0);
                 }
             } else if v.state.odometer >= p.until + p.back_len {
                 v.passing = None;
@@ -1150,9 +1181,15 @@ impl Simulation {
         // (a pass shows the side it moves to from before it pulls out until it is back in its
         // lane: the bent way's offset alone showed the side it would come back to, the right
         // while out on the left, viz3 review: 47 of 47)
-        if let Some(p) = v.passing.filter(|p| !p.aborted) {
-            v.state.signal = p.blinker();
-            v.state.signal_time = 0.25;
+        if let Some(p) = v.passing {
+            if !p.aborted {
+                v.state.signal = p.blinker();
+                v.state.signal_time = 0.25;
+            } else if v.state.lateral.abs() > 0.3 {
+                // (given up: the side back into its lane, while it is out)
+                v.state.signal = if v.state.lateral > 0.0 { 1 } else { 2 };
+                v.state.signal_time = 0.25;
+            }
         }
         v.state.update_blinker(net);
         let want = if v.external.blinker_off { 0 } else { v.state.blinker };
@@ -1201,6 +1238,45 @@ impl Simulation {
         } else {
             None
         }
+    }
+
+    /// A pass coming back into its lane whose bent way would bring its body, 2 m on, within 0.2 m
+    /// of another vehicle (and nearer than it is now): one beside it in the lane.
+    fn return_blocked(&self, vehicles: &[Vehicle], i: usize) -> bool {
+        let v = &vehicles[i];
+        let Some(p) = v.passing.filter(|p| !p.aborted && p.wait <= 0.0) else { return false };
+        let (odo, lat) = (v.state.odometer, v.state.lateral);
+        // (on its way back in, or about to be: where the way puts it 2 m on)
+        let next = v.state.lateral_ahead(2.0);
+        if odo + 2.0 < p.until || (next.abs() >= lat.abs() - 0.01) {
+            return false;
+        }
+        let h = (v.heading as f64).to_radians();
+        let right = DVec2::new(h.cos(), -h.sin());
+        let now = v.obb();
+        let b = Obb::vehicle(v.pos.truncate() + right * (next - lat) as f64, v.heading as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+        // (a body that the move brings nearer than 0.2 m, and nearer than it is now)
+        self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).any(|j| {
+            let o = vehicles[j].obb();
+            (vehicles[j].pos.z - v.pos.z).abs() <= 3.0 && o.separation(&b) < 0.2 && o.separation(&b) < o.separation(&now)
+        })
+    }
+
+    /// An aborted pass standing out there: the lateral offset one step (`SIDESTEP_SPEED` for
+    /// `dt`) back towards its lane, if its body there would come within 0.2 m of nobody.
+    fn sidestep(&self, vehicles: &[Vehicle], i: usize, dt: f32) -> Option<f32> {
+        let v = &vehicles[i];
+        if !v.passing.is_some_and(|p| p.aborted) || v.state.speed >= 0.1 || v.state.lateral.abs() <= SIDESTEP_DONE {
+            return None;
+        }
+        let lat = v.state.lateral;
+        let new = lat - (SIDESTEP_SPEED * dt).min(lat.abs()) * lat.signum();
+        let h = (v.heading as f64).to_radians();
+        let right = DVec2::new(h.cos(), -h.sin());
+        let b = Obb::vehicle(v.pos.truncate() - right * (lat - new) as f64, v.heading as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+        let clear_of_cars = self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).all(|j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || vehicles[j].obb().separation(&b) > 0.2);
+        let clear_of_players = self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || p.obb(0.0, 0.0).separation(&b) > 0.2);
+        (clear_of_cars && clear_of_players).then_some(new)
     }
 
     /// The indicator a vehicle shows now (0 off, 1 left, 2 right).
