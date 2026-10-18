@@ -3,7 +3,8 @@
 //! ```text
 //! traffic_cases info <rec>
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
-//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--free] [--all-people]
+//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--free] [--all-people] [--people-margin 0.5] [--footprints]
+//! traffic_cases mask <fixture> <out.html> [--center x,y] [--radius 100] [--fps 5] [--free] [--all-people] [--title T]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
 //! traffic_cases heads <fixture> [--radius 200] [--free]
 //! traffic_cases ab <fixture>... [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
@@ -22,6 +23,11 @@
 //! resets, so the trace shows what the simulation does by itself. The trace JSON says which
 //! (`"mode": "recorded"|"free"`; `"switches"`: the rules the recording's header names, for
 //! information: a replay always runs with the current rules).
+//!
+//! `mask` is `trace --footprints --people-margin 2.5` (every pavement of the window, everybody
+//! on foot within 2.5 m of a carriageway's edge) and `viewer` in one, with the page's boundary mask on from the start (key M cycles
+//! off / mask / mask+edges): the lanes' footprints as the simulation has them, the
+//! carriageway's edge the people keep off, the crossings' cuts, the stop lines.
 //!
 //! `viewer2` makes one page of two traces side by side (one clock, one view, one pin); `compare`
 //! does it for every `caseNN-HHMM.rec` of a directory: left = recorded (reset at every
@@ -58,6 +64,16 @@ use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
+/// Gap a car leaves before a stop line (`omsi_sim::traffic::STOP_LINE_GAP`, private there).
+const STOP_LINE_GAP: f64 = 0.6;
+/// What the people keep off a carriageway lane's edge, and what a car stops for beside its
+/// own footprint (`perception::KERB_CLEAR`, `humans::on_carriageway`).
+const KERB_CLEAR: f64 = 0.3;
+/// The narrowest a lane counts as for the people's keep-off (`humans::LANE_MIN_WIDTH`).
+const LANE_MIN_WIDTH: f64 = 2.5;
+/// A person's body radius (m), for the viewer's mask.
+const PERSON_RADIUS: f64 = 0.28;
+
 fn main() {
     // (warnings on stderr, as a recording made under other rules than the current ones;
     // `RUST_LOG` for more)
@@ -79,6 +95,7 @@ fn main() {
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
+        Some("mask") if args.len() >= 4 => mask(Path::new(&args[2]), Path::new(&args[3]), &args[4..]),
         Some("viewer2") if args.len() >= 5 => viewer2(
             Path::new(&args[2]),
             Path::new(&args[3]),
@@ -89,7 +106,7 @@ fn main() {
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|stubs|converge|viewer|viewer2|compare|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|mask|diagnose|heads|ab|stubs|converge|viewer|viewer2|compare|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -710,8 +727,8 @@ struct VSample {
 struct Sample {
     t: f64,
     vehicles: Vec<VSample>,
-    /// (x, y, state, decision, still, on_crossing, pace)
-    people: Vec<(f64, f64, String, Option<String>, f64, bool, f64)>,
+    /// (x, y, state, decision, still, on_crossing, pace, at_kerb)
+    people: Vec<(f64, f64, String, Option<String>, f64, bool, f64, bool)>,
     players: Vec<[f64; 5]>,
     lights: Vec<(usize, usize, i32)>,
     /// Every light's state, per controller.
@@ -771,6 +788,11 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         net.lanes[l].points.iter().any(|p| dist2(*p, cx, cy) <= rad)
     };
     let all_people = args.iter().any(|a| a == "--all-people");
+    // (`--people-margin M`: people on foot within M m of a carriageway's edge are kept, 0.5 by
+    // default; the mask page takes 2.5, the pavement's edge against the lane's)
+    let people_margin: f64 = opt(args, "--people-margin").map(|s| s.parse()).transpose()?.unwrap_or(0.5);
+    // (`--footprints`: every pavement of the window too, for the viewer's boundary mask)
+    let footprints = args.iter().any(|a| a == "--footprints");
     let mut road: Option<RoadGrid> = None;
     let mut planned: HashSet<usize> = HashSet::new();
     while r.step() {
@@ -873,7 +895,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             let waiting = p.decision.as_deref().map(|d| d != "go").unwrap_or(false);
             if !all_people
                 && !p.on_crossing
-                && !grid.near(p.pos.x, p.pos.y, if waiting { 2.0 } else { 0.5 })
+                && !grid.near(p.pos.x, p.pos.y, if waiting { 2.0f64.max(people_margin) } else { people_margin })
             {
                 continue;
             }
@@ -885,6 +907,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 p.still as f64,
                 p.on_crossing,
                 p.pace as f64,
+                p.at_kerb,
             ));
         }
         let players = r
@@ -924,7 +947,11 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         let lane = &net.lanes[l];
         let keep = match lane.kind {
             LaneKind::Street | LaneKind::Rail => true,
-            LaneKind::Sidewalk => foot_of_crossing.contains(&l) || lane.traffic_light.is_some(),
+            LaneKind::Sidewalk => {
+                foot_of_crossing.contains(&l)
+                    || lane.traffic_light.is_some()
+                    || (footprints && near_lane(net, l, radius + 20.0))
+            }
             _ => false,
         };
         // (the lanes some vehicle plans to drive are kept further out, for the viewer's intent line)
@@ -941,7 +968,12 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
     for (j, node) in r.sim.junctions.nodes.iter().enumerate() {
         for c in &node.crossings {
             if c.foot_lanes.iter().any(|l| lane_in.contains(l)) {
-                crossings.push(json!({"j": j, "lanes": c.foot_lanes, "light": c.light.map(|(a, b)| json!([a, b]))}));
+                let cuts: Vec<Value> = c
+                    .cuts
+                    .iter()
+                    .map(|q| json!([node.movements[q.movement].lane, r1(q.at as f64), q.foot_lane, r1(q.foot_at as f64)]))
+                    .collect();
+                crossings.push(json!({"j": j, "lanes": c.foot_lanes, "light": c.light.map(|(a, b)| json!([a, b])), "cuts": cuts}));
                 if let Some(li) = c.light {
                     lights.push(li);
                 }
@@ -952,6 +984,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
     lights.dedup();
     let mut stops = Vec::new();
     let mut seen_stop: HashSet<(i64, i64)> = HashSet::new();
+    let mut stop_lanes: HashSet<usize> = HashSet::new();
     for &l in &lane_set {
         let lane = &net.lanes[l];
         if lane.kind != LaneKind::Street {
@@ -972,6 +1005,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             })
             .unwrap_or(false);
         if lane.traffic_light.is_some() || is_mov_start {
+            stop_lanes.insert(l);
             let (p, h) = lane.at(0.0);
             let key = ((p.x * 2.0).round() as i64, (p.y * 2.0).round() as i64);
             if seen_stop.insert(key) {
@@ -1002,6 +1036,12 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                     LaneKind::Rail => "R",
                     LaneKind::Air => "A",
                 };
+                let jm = r.sim.junctions.of_lane.get(&l).copied();
+                let junction = jm.map(|(j, _)| json!(j)).unwrap_or(Value::Null);
+                let foes = jm
+                    .map(|(j, m)| json!(r.sim.junctions.nodes[j].movements[m].foes.len()))
+                    .unwrap_or(Value::Null);
+                let opt_lane = |x: Option<usize>| x.map(|v| json!(v)).unwrap_or(Value::Null);
                 json!([
                     l,
                     kind,
@@ -1013,7 +1053,23 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                     lane.rule_bus as u8,
                     pts.iter()
                         .map(|&(x, y)| json!([r1(x), r1(y)]))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
+                    // the boundary-mask fields (a page made before them has 9 entries)
+                    lane.no_cars as u8,
+                    lane.source,
+                    lane.reversed as u8,
+                    lane.one_way as u8,
+                    if stop_lanes.contains(&l) { json!(-STOP_LINE_GAP) } else { Value::Null },
+                    junction,
+                    foes,
+                    opt_lane(lane.left),
+                    opt_lane(lane.right),
+                    lane.next.clone(),
+                    net.prev.get(l).cloned().unwrap_or_default(),
+                    lane.name.rsplit(['/', '\\']).next().unwrap_or(""),
+                    r1(lane.speed_limit_kmh as f64),
+                    r2(lane.offset as f64),
+                    lane.no_unsched as u8
                 ])
             })
             .collect()
@@ -1139,7 +1195,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                             0
                         },
                         p.5 as u8,
-                        r1(p.6)
+                        r1(p.6),
+                        p.7 as u8
                     ])
                 })
                 .collect();
@@ -1230,13 +1287,19 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 "notes": notes,
                 "fields": {
                     "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null, blinker (0 off, 1 left, 2 right, 3 hazard as shown), intent [turn, lane, lane, ...]|null (the planned way: up to 6 lane ids after the current lane, cut at the first lane missing from \"lanes\"; turn = the turn flag of the first lane on the way, the current one included, that turns: 0 straight, 1 left, 2 right)], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
-                    "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing, pace (m/s, 0 not recorded)]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
+                    "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing, pace (m/s, 0 not recorded), at_kerb]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
                     "pl": "[x, y, heading_deg, speed, blinker]",
                     "l": "[ctl, light, state] when it changed (state: 0-2 red, 3-5 red+yellow, 6-8 green, 9-11 yellow)",
-                    "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points]",
+                    "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points, no_cars, source (1 spline, 2 crossing object), reversed, one_way, stop_line (m from the lane's start where a car's front stops: -0.6 = the gap before the line; null no stop line), junction|null, foes|null, left|null, right|null, next[], prev[], file, speed_kmh, offset, no_unsched] (an older trace stops after points)",
                     "vinfo": "id: [front, rear, half_width, class, type]",
                     "stops": "[x, y, heading_deg, lane, light|null]",
+                    "crossings": "{j, lanes (footpath pieces), light|null, cuts [[street lane, at (m along it), foot lane, foot at]]}",
                 },
+                "footprints": footprints,
+                "person_radius": PERSON_RADIUS,
+                "kerb_clear": KERB_CLEAR,
+                "lane_min_width": LANE_MIN_WIDTH,
+                "stop_line_gap": STOP_LINE_GAP,
             },
             "strs": strs,
             "vinfo": vids,
@@ -2537,11 +2600,15 @@ fn viewer(trace_path: &Path, out: &Path, args: &[String]) -> Res<()> {
         .map(|t| parse_diag(&t));
     // (the JSON goes into a script element: no "</" may appear in it)
     let data = data.replace("</", "<\\/");
+    // the page's options: `--mask` opens it with the boundary mask on (1 mask, 2 mask+edges)
+    let opts = json!({"mask": opt(args, "--mask").map(|m| m.parse::<u8>().unwrap_or(1)).unwrap_or(0)});
+    let opts = serde_json::to_string(&opts)?;
     let page = |g: &str| {
         VIEWER_HTML
             .replace("__TITLE__", &esc_html(&title))
             .replace("__SHOTS__", &shots_html)
             .replace("__DIAG__", g)
+            .replace("__OPTS__", &opts)
             .replace("__DATA__", &data)
     };
     let to_json = |d: &Diag, trimmed: usize| -> String {
@@ -2581,6 +2648,47 @@ fn viewer(trace_path: &Path, out: &Path, args: &[String]) -> Res<()> {
     std::fs::write(out, &html)?;
     println!("{}: {:.0} KB", out.display(), html.len() as f64 / 1024.0);
     Ok(())
+}
+
+/// `mask`: the trace of one window with every pavement and everybody on foot, and its page
+/// with the boundary mask on. The trace JSON goes next to the page (`<out stem>.json`).
+fn mask(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
+    let json = out.with_extension("json");
+    let mut targs: Vec<String> = Vec::new();
+    for k in ["--center", "--radius", "--fps", "--max-kb", "--people-margin"] {
+        if let Some(v) = opt(args, k) {
+            targs.push(k.into());
+            targs.push(v.into());
+        }
+    }
+    if !args.iter().any(|a| a == "--max-kb") {
+        targs.push("--max-kb".into());
+        targs.push("700".into());
+    }
+    if args.iter().any(|a| a == "--free") {
+        targs.push("--free".into());
+    }
+    if args.iter().any(|a| a == "--all-people") {
+        targs.push("--all-people".into());
+    } else if !args.iter().any(|a| a == "--people-margin") {
+        targs.push("--people-margin".into());
+        targs.push("2.5".into());
+    }
+    if !args.iter().any(|a| a == "--radius") {
+        targs.push("--radius".into());
+        targs.push("100".into());
+    }
+    targs.push("--footprints".into());
+    trace(fixture, &json, &targs)?;
+    let title = opt(args, "--title").map(|s| s.to_string()).unwrap_or_else(|| {
+        format!(
+            "{} · boundary mask{}",
+            fixture.file_stem().and_then(|s| s.to_str()).unwrap_or("trace"),
+            if args.iter().any(|a| a == "--free") { " (free run)" } else { "" }
+        )
+    });
+    let vargs: Vec<String> = vec!["--title".into(), title, "--mask".into(), opt(args, "--mask").unwrap_or("1").into()];
+    viewer(&json, out, &vargs)
 }
 
 /// The index page template with its title, intro, table head and rows filled in.

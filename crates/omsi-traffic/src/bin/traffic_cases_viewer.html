@@ -55,7 +55,7 @@ body{margin:0;background:var(--bg);color:var(--fg);padding:28px 24px 40px}
 <div class="mut" id="sub"></div>
 __SHOTS__
 <div id="diag"></div>
-<div class="ctl"><button id="play">Play</button><select id="spd" aria-label="Playback speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span class="t" id="time"></span><input type="range" id="scrub" aria-label="Timeline" min="0" value="0"><button id="fit" title="reset the view">Fit</button><input type="text" id="find" aria-label="Find vehicle id" placeholder="find vehicle id" title="type a vehicle id, Enter"></div>
+<div class="ctl"><button id="play">Play</button><select id="spd" aria-label="Playback speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select><span class="t" id="time"></span><input type="range" id="scrub" aria-label="Timeline" min="0" value="0"><button id="fit" title="reset the view">Fit</button><button id="mask" title="M: off / mask / mask+edges — the lanes' footprints as the simulation has them">Mask: off</button><input type="text" id="find" aria-label="Find vehicle id" placeholder="find vehicle id" title="type a vehicle id, Enter"></div>
 <div class="row"><canvas id="cv" width="700" height="520"></canvas>
 <div class="side"><div id="pin"><span class="mut">Click a vehicle or a pedestrian. Drag to pan, wheel to zoom.</span></div>
 <div id="carlist"></div>
@@ -63,11 +63,17 @@ __SHOTS__
 </div>
 <script id="data" type="application/json">__DATA__</script>
 <script id="diagdata" type="application/json">__DIAG__</script>
+<script id="opts" type="application/json">__OPTS__</script>
 <script>
 // ==PANE-BEGIN== (shared by traffic_cases_viewer.html and traffic_cases_viewer2.html: viewer2 gets this block pasted in by traffic_cases.rs)
 const WHY={none:'#8b949e',lead:'#4f8ef7',light:'#e5534b',yield:'#f0883e',exit:'#f0883e',people:'#b57edc',zebra:'#b57edc',service:'#3fb950',merge:'#2bb5a8',let_out:'#2bb5a8',pull_out:'#8b949e',end:'#8b949e'};
 const LEG=[['none','#8b949e'],['lead','#4f8ef7'],['light','#e5534b'],['yield / exit','#f0883e'],['people / zebra','#b57edc'],['service','#3fb950'],['merge / let_out','#2bb5a8'],['player bus','#ffffff']];
 function legendHTML(){return LEG.map(([n,c])=>`<span><span class="sw" style="background:${c};border:1px solid #555"></span>${n}</span>`).join('')+`<span><span class="sw" style="border:2px solid #ffd33d"></span>passing</span><span><span class="sw" style="border-radius:5px;background:#ccc"></span>person (ring: decision)</span>`;}
+const MASK_NAMES=['off','mask','mask+edges'];
+// the boundary mask's colours: every lane's footprint by what it is to the simulation
+const MC={fwd:'rgba(72,132,224,0.48)',rev:'rgba(52,190,160,0.48)',bus:'rgba(240,160,40,0.52)',rail:'rgba(160,112,70,0.5)',walk:'rgba(190,192,150,0.45)',cross:'rgba(240,240,250,0.42)',stub:'rgba(245,225,60,0.7)'};
+const MLEG=[['street lane (path direction)',MC.fwd],['street lane (reversed twin)',MC.rev],['bus / no_cars / density 0',MC.bus],['rail',MC.rail],['pavement',MC.walk],['crossing piece',MC.cross],['lit stub',MC.stub]];
+function maskLegendHTML(){return MLEG.map(([n,c])=>`<span><span class="sw" style="background:${c};border:1px solid #777"></span>${n}</span>`).join('')+`<span><span class="sw" style="background:repeating-linear-gradient(135deg,#999 0 2px,transparent 2px 5px);border:1px solid #777"></span>junction piece (hatched)</span><span><span class="sw" style="border:1px solid #fff;background:#333"></span>edges: lane ±width/2</span><span><span class="sw" style="border:1px dashed #ff8bd0"></span>people keep-off: max(w,2.5)/2+0.3</span><span><span class="sw" style="border:1px solid #ff4fc8;border-radius:2px"></span>hovered car: its way ±(half width+0.3)</span><span><span class="sw" style="border-radius:5px;background:#ccc;width:8px;height:8px"></span>person r 0.28 (ring: decision, square: at kerb)</span><span><span class="sw" style="background:#ffd33d;transform:rotate(45deg);width:9px;height:9px"></span>kerb (crossing's end)</span><span><span class="sw" style="border-top:3px solid #fff;height:4px"></span>stop line (dashed: the 0.6 m gap)</span><span><span class="sw" style="border-top:2px solid #e6e6ff;height:3px"></span>crossing cut of a lane</span><span><span class="sw" style="border:2px solid #00e5ff"></span>clicked lane's next</span><span><span class="sw" style="border:2px solid #ff00c8"></span>clicked lane's prev</span>`;}
 function lightCol(s){if(s==null||s<0)return '#555';if(s<=2)return '#e5534b';if(s<=5)return '#f0883e';if(s<=7)return '#3fb950';if(s==8)return '#a3d65c';if(s<=11)return '#e3b341';return '#444';}
 function lightName(s){if(s==null||s<0)return '?';if(s<=2)return 'red';if(s<=5)return 'red+yellow';if(s<=7)return 'green';if(s==8)return 'green+yellow';if(s<=11)return 'yellow';return 'dark';}
 const PC=['#e6edf3','#79c0ff','#ffa657','#d2a8ff','#7ee787','#ff7b72','#f2cc60','#56d4dd'];
@@ -85,6 +91,8 @@ function vehFields(r){const it=r[16],ln=it&&it.length>1?it.slice(1):null;
 // The caller owns the state: draw(fi, st) with st = {pinned, pinP, msg, flashUntil}.
 function makePane(cv,D,o){
  o=o||{};const V=o.view||{};const CARS=o.cars||{};const chain=o.chain!==false;
+ // the boundary mask: 0 off, 1 the footprints, 2 footprints and edges; hov = what the pointer is on, sel = the clicked lane
+ let mask=o.mask|0,hov=null,sel=null;
  const M=D.meta,S=D.strs||[],VI=D.vinfo||{};
  const cx=cv.getContext('2d');
  const W=700,H=520;
@@ -99,6 +107,51 @@ function makePane(cv,D,o){
   F.push({t:f.t,v:cur,p:P.map(q=>[q[0],q[1],q[2],q[3],q[4]?Math.max(0,Math.round(f.t-q[4])):0,q[5],q[6]]),pl:f.pl,l:lights});prev=cur;prevP=P;}
  const cross=new Set();for(const c of D.crossings)for(const l of c.lanes)cross.add(l);
  const LI={};for(const L of D.lanes)LI[L[0]]=L;
+ const PR=M.person_radius||0.28,KC=M.kerb_clear||0.3,LMW=M.lane_min_width||2.5,SLG=M.stop_line_gap||0.6;
+ // ---- the boundary mask's geometry (world coordinates, computed once)
+ function laneLen(p){let d=0;for(let i=1;i<p.length;i++)d+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);return d;}
+ // what a lane is to the simulation: the colour class of its footprint
+ function laneClass(L){if(L[1]==='R')return 'rail';if(L[1]==='W'){if(L[3]&&laneLen(L[8])<=1.6)return 'stub';if(cross.has(L[0]))return 'cross';return 'walk';}if(L[9]||L[5]===0)return 'bus';return L[11]?'rev':'fwd';}
+ const CLASS_ORDER={walk:0,rail:1,fwd:2,rev:2,bus:2,cross:3,stub:4};
+ // the centreline offset by ±hw, mitred at the joints (the mitre at most twice hw): {l, r} point lists
+ function offsetPoly(p,hw){p=p.filter((q,i)=>!i||Math.hypot(q[0]-p[i-1][0],q[1]-p[i-1][1])>1e-3);const n=p.length,l=[],r=[];if(n<2)return null;
+  const dir=[];for(let i=0;i<n-1;i++){const dx=p[i+1][0]-p[i][0],dy=p[i+1][1]-p[i][1],d=Math.hypot(dx,dy)||1e-9;dir.push([dx/d,dy/d]);}
+  for(let i=0;i<n;i++){const d0=dir[Math.max(0,i-1)],d1=dir[Math.min(n-2,i)];
+   // the normal to the right of the direction (x east, y north)
+   const n0=[d0[1],-d0[0]],n1=[d1[1],-d1[0]];let mx=n0[0]+n1[0],my=n0[1]+n1[1];const ml=Math.hypot(mx,my);
+   let k=1;if(ml<1e-6){mx=n1[0];my=n1[1];}else{mx/=ml;my/=ml;k=1/Math.max(0.5,mx*n1[0]+my*n1[1]);}
+   l.push([p[i][0]-mx*hw*k,p[i][1]-my*hw*k]);r.push([p[i][0]+mx*hw*k,p[i][1]+my*hw*k]);}
+  return {l,r};}
+ const FP={};// lane id -> {L, cls, hw, poly (closed ring), len, l, r}
+ for(const L of D.lanes){const p=L[8];if(!p||p.length<2)continue;const w=L[2]||(L[1]==='W'?1.5:3);const hw=w/2;const o=offsetPoly(p,hw);if(!o)continue;
+  FP[L[0]]={L,cls:laneClass(L),hw,l:o.l,r:o.r,poly:o.l.concat(o.r.slice().reverse()),len:laneLen(p)};}
+ const MASK_LANES=Object.values(FP).sort((a,b)=>CLASS_ORDER[a.cls]-CLASS_ORDER[b.cls]);
+ function inPoly(q,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const a=poly[i],b=poly[j];if((a[1]>q[1])!==(b[1]>q[1])&&q[0]<(b[0]-a[0])*(q[1]-a[1])/(b[1]-a[1])+a[0])c=!c;}return c;}
+ // the lane whose footprint holds world point q: the top-drawn one (stubs over crossings over streets over pavements)
+ function laneAt(q){let best=null;for(const f of MASK_LANES){if(inPoly(q,f.poly))best=f;}return best;}
+ // the nearest point of polyline p to q: [distance, signed lateral (+ right of the way), along]
+ function nearestOn(p,q){let bd=1e18,bl=0,ba=0,acc=0;for(let i=0;i<p.length-1;i++){const ax=p[i][0],ay=p[i][1],dx=p[i+1][0]-ax,dy=p[i+1][1]-ay,l2=dx*dx+dy*dy||1e-9,len=Math.sqrt(l2);const t=Math.max(0,Math.min(1,((q[0]-ax)*dx+(q[1]-ay)*dy)/l2));const px=ax+dx*t,py=ay+dy*t;const d=Math.hypot(px-q[0],py-q[1]);if(d<bd){bd=d;const cr=(dx*(q[1]-ay)-dy*(q[0]-ax))/len;bl=-cr;ba=acc+t*len;}acc+=len;}return [bd,bl,ba];}
+ // the point and unit direction at distance s along polyline p
+ function alongAt(p,s){let acc=0;for(let i=0;i<p.length-1;i++){const dx=p[i+1][0]-p[i][0],dy=p[i+1][1]-p[i][1],len=Math.hypot(dx,dy)||1e-9;if(acc+len>=s||i===p.length-2){const t=Math.max(0,Math.min(1,(s-acc)/len));return [[p[i][0]+dx*t,p[i][1]+dy*t],[dx/len,dy/len]];}acc+=len;}return null;}
+ // the kerbs of the compiled crossings: the ends of a crossing's chain of pieces no other piece of it joins
+ const KERBS=[];for(const c of D.crossings){const ends=[];for(const id of c.lanes){const L=LI[id];if(!L||!L[8]||L[8].length<2)continue;ends.push(L[8][0],L[8][L[8].length-1]);}
+  ends.forEach((e,i)=>{if(!ends.some((f,j)=>j!==i&&Math.hypot(e[0]-f[0],e[1]-f[1])<0.5))KERBS.push(e);});}
+ // the crossings' cuts of the street lanes: [point, direction, lane width]
+ const CUTS=[];for(const c of D.crossings)for(const q of (c.cuts||[])){const L=LI[q[0]];if(!L||!L[8])continue;const a=alongAt(L[8],q[1]);if(a)CUTS.push([a[0],a[1],L[2]||3,q[0],q[2]]);}
+ let hatch=null;function hatchPat(){if(hatch)return hatch;const c=document.createElement('canvas');c.width=c.height=8;const g=c.getContext('2d');g.strokeStyle='rgba(255,255,255,0.45)';g.lineWidth=1.2;g.beginPath();g.moveTo(-2,10);g.lineTo(10,-2);g.moveTo(-2,2);g.lineTo(2,-2);g.moveTo(6,10);g.lineTo(10,6);g.stroke();hatch=cx.createPattern(c,'repeat');return hatch;}
+ const KIND={S:'street',W:'footpath',R:'rail',A:'air'};
+ // the text of a lane, as [name, value] rows (the mask's tooltip and the side box)
+ function laneRows(f){const L=f.L,ex=L.length>9;const jn=L[14];
+  const rows=[['kind',KIND[L[1]]||L[1],],['class',f.cls+(ex&&L[10]===2?' · junction piece':'')],['width',L[2]+' m (±'+(L[2]/2).toFixed(2)+')'],['length',f.len.toFixed(1)+' m, '+L[8].length+' pts']];
+  if(L[1]==='S')rows.push(['people keep off','±'+(Math.max(L[2],LMW)/2+KC).toFixed(2)+' m of the axis']);
+  rows.push(['density',L[5]],['no_overtaking',L[4]?'yes':'no'],['turn',TURN[L[6]]||L[6]],['rule bus',L[7]?'yes':'no'],['light',L[3]?L[3][0]+'/'+L[3][1]:null]);
+  if(ex)rows.push(['no_cars',L[9]?'yes':'no'],['source',L[10]===1?'1 spline':L[10]===2?'2 crossing object':L[10]],['reversed',L[11]?'yes':'no'],['one_way',L[12]?'yes':'no'],['stop line',L[13]!=null?'front stops '+L[13]+' m from the start':null],['junction',jn!=null?jn+' · '+L[15]+' foes':null],['left / right',(L[16]==null?'-':L[16])+' / '+(L[17]==null?'-':L[17])],['next',(L[18]||[]).join(', ')||'-'],['prev',(L[19]||[]).join(', ')||'-'],['file',L[20]||null],['speed',L[21]!=null?L[21]+' km/h':null],['offset',L[22]!=null?L[22]+' m':null],['no_unsched',L[23]?'yes':null]);
+  return rows.filter(r=>r[1]!=null);}
+ function laneHTML(id){const f=FP[id];if(!f)return '';return '<b>lane '+id+'</b> <span class="mut">(click elsewhere to unpin)</span><table>'+laneRows(f).map(([k,v])=>row(k,esc(String(v)))).join('')+'</table><div class="mut">chain: cyan = next, magenta = prev (6 hops each)</div>';}
+ // a vehicle against its lane: [signed lateral offset, overhang left, overhang right] (m)
+ function vehLat(r){const L=LI[r[11]];if(!L||!L[8])return null;const inf=VI[r[0]]||[2.2,2.2,0.9];const [d,lat]=nearestOn(L[8],[r[1],r[2]]);const hw=inf[2],lw=L[2]/2;return [lat,(-lat+hw)-lw,(lat+hw)-lw,L];}
+ // a person against the nearest street lane: [lane, distance from its axis, inside the keep-off]
+ function pedLat(p){let best=null;for(const f of MASK_LANES){if(f.L[1]!=='S')continue;const [d]=nearestOn(f.L[8],[p[0],p[1]]);if(d<6&&(!best||d<best[1]))best=[f,d];}if(!best)return null;const keep=Math.max(best[0].L[2],LMW)/2+KC;return [best[0].L[0],best[1],best[1]<keep,keep,best[0].hw];}
  // the lamps of an indicator state (1 left, 2 right, 3 hazard) at the front corners of a box already translated and rotated to the vehicle
  function lamps(b,fr,hw,scale,on){if(!b||!on)return;const rad=Math.max(2.5,0.45*scale);cx.fillStyle='#ffb000';cx.strokeStyle='#3a2600';cx.lineWidth=1;
   for(const side of [-1,1]){if(!(b===3||b===(side<0?1:2)))continue;cx.beginPath();cx.arc(side*(hw*scale-rad*0.3),-fr*scale+rad*0.3,rad,0,7);cx.fill();cx.stroke();}}
@@ -117,20 +170,40 @@ function makePane(cv,D,o){
   const scale=V.scale,pinned=st.pinned;
   const f=F[fi];cx.clearRect(0,0,W,H);cx.fillStyle='#1d2126';cx.fillRect(0,0,W,H);
   cx.lineCap='round';cx.lineJoin='round';
-  // lanes [index, kind, width, light, no_ov, density, turn, bus, pts]
+  // the boundary mask: every lane's footprint (centreline ±width/2), by what it is to the simulation
+  const ring=(poly)=>{cx.beginPath();poly.forEach((q,i)=>{const X=sx(q[0]),Y=sy(q[1]);i?cx.lineTo(X,Y):cx.moveTo(X,Y);});cx.closePath();};
+  if(mask){cx.lineJoin='miter';
+   for(const f of MASK_LANES){ring(f.poly);cx.fillStyle=MC[f.cls];cx.fill();if(f.L[10]===2&&f.L[1]!=='W'){cx.fillStyle=hatchPat();cx.fill();}}
+   if(mask>=2){cx.lineWidth=1;for(const f of MASK_LANES){cx.strokeStyle=f.L[1]==='W'?'rgba(255,255,255,0.45)':'rgba(255,255,255,0.8)';poly(f.l);poly(f.r);}}
+   // the clicked lane and its next / prev chains
+   if(sel!=null&&FP[sel]){const walk=(key,col)=>{let front=[sel];const seen=new Set([sel]);cx.strokeStyle=col;cx.lineWidth=2;
+     for(let k=0;k<6&&front.length;k++){const nx=[];for(const id of front)for(const j of (LI[id]&&LI[id][key])||[]){if(seen.has(j)||!FP[j])continue;seen.add(j);nx.push(j);ring(FP[j].poly);cx.stroke();}front=nx;}};
+    walk(18,'#00e5ff');walk(19,'#ff00c8');cx.strokeStyle='#fff';cx.lineWidth=2.5;ring(FP[sel].poly);cx.stroke();}
+   if(hov&&hov.lane!=null&&FP[hov.lane]){const f=FP[hov.lane];cx.strokeStyle='#fff';cx.lineWidth=1.5;cx.setLineDash([4,3]);ring(f.poly);cx.stroke();cx.setLineDash([]);
+    // the strip of the hovered street lane the people keep off (and a waiting person inside it holds a car)
+    if(f.L[1]==='S'&&mask>=2){const o=offsetPoly(f.L[8],Math.max(f.L[2],LMW)/2+KC);cx.strokeStyle='#ff8bd0';cx.lineWidth=1;cx.setLineDash([3,3]);poly(o.l);poly(o.r);cx.setLineDash([]);}}
+   cx.lineJoin='round';}
+  // lanes [index, kind, width, light, no_ov, density, turn, bus, pts, (no_cars, source, reversed, one_way, stop_line, junction, foes, left, right, next, prev, file, speed, offset, no_unsched)]
   for(const L of D.lanes){const p=L[8];if(!p||p.length<2)continue;
-   if(L[1]==='W'){if(!cross.has(L[0]))continue;cx.setLineDash([Math.max(1,0.5*scale),Math.max(1,0.5*scale)]);cx.lineCap='butt';cx.strokeStyle='rgba(230,237,243,0.35)';cx.lineWidth=Math.max(2,L[2]*scale);poly(p);cx.lineCap='round';cx.setLineDash([]);continue;}
-   cx.strokeStyle=L[1]==='R'?'#6e5a3c':'#3a4048';cx.lineWidth=Math.max(1,Math.max(3,L[2]||3)*scale*0.85);poly(p);
+   if(L[1]==='W'){if(mask||!cross.has(L[0]))continue;cx.setLineDash([Math.max(1,0.5*scale),Math.max(1,0.5*scale)]);cx.lineCap='butt';cx.strokeStyle='rgba(230,237,243,0.35)';cx.lineWidth=Math.max(2,L[2]*scale);poly(p);cx.lineCap='round';cx.setLineDash([]);continue;}
+   if(!mask){cx.strokeStyle=L[1]==='R'?'#6e5a3c':'#3a4048';cx.lineWidth=Math.max(1,Math.max(3,L[2]||3)*scale*0.85);poly(p);}
    cx.strokeStyle=L[4]?'#8a8f96':'#5c636b';cx.lineWidth=1;if(L[5]===0||L[7])cx.setLineDash([4,4]);poly(p);cx.setLineDash([]);
    const n=p.length,a=p[n-2],b=p[n-1],ang=Math.atan2(-(b[1]-a[1]),b[0]-a[0]);
    cx.save();cx.translate(sx(b[0]),sy(b[1]));cx.rotate(ang);cx.fillStyle='#5c636b';cx.beginPath();cx.moveTo(0,0);cx.lineTo(-5,-2.5);cx.lineTo(-5,2.5);cx.fill();cx.restore();}
-  // stop lines [x,y,h,lane,light]
-  for(const s of D.stops){const h=s[2]*Math.PI/180,rx=Math.cos(h),ry=-Math.sin(h),hw=1.6;
-   cx.strokeStyle='#c9d1d9';cx.lineWidth=Math.max(1,0.3*scale);cx.beginPath();cx.moveTo(sx(s[0]-rx*hw),sy(s[1]-ry*hw));cx.lineTo(sx(s[0]+rx*hw),sy(s[1]+ry*hw));cx.stroke();}
+  // stop lines [x,y,h,lane,light] (in the mask across the lane's width, with the 0.6 m gap a car keeps before it)
+  for(const s of D.stops){const h=s[2]*Math.PI/180,rx=Math.cos(h),ry=-Math.sin(h);const L=LI[s[3]];const hw=mask&&L?L[2]/2:1.6;
+   cx.strokeStyle='#c9d1d9';cx.lineWidth=Math.max(1,0.3*scale);cx.beginPath();cx.moveTo(sx(s[0]-rx*hw),sy(s[1]-ry*hw));cx.lineTo(sx(s[0]+rx*hw),sy(s[1]+ry*hw));cx.stroke();
+   if(mask){const fx=Math.sin(h),fy=Math.cos(h);const gx=s[0]-fx*SLG,gy=s[1]-fy*SLG;cx.setLineDash([3,2]);cx.lineWidth=1;cx.beginPath();cx.moveTo(sx(gx-rx*hw),sy(gy-ry*hw));cx.lineTo(sx(gx+rx*hw),sy(gy+ry*hw));cx.stroke();cx.setLineDash([]);}}
+  if(mask){// the crossings' cuts of the street lanes, and the kerbs (the ends of the crossings' chains of pieces)
+   cx.strokeStyle='#e6e6ff';cx.lineWidth=Math.max(1,0.2*scale);
+   for(const [q,d,w] of CUTS){const nx=d[1]*w/2,ny=-d[0]*w/2;cx.beginPath();cx.moveTo(sx(q[0]-nx),sy(q[1]-ny));cx.lineTo(sx(q[0]+nx),sy(q[1]+ny));cx.stroke();}
+   const kr=Math.max(3,0.35*scale);cx.fillStyle='#ffd33d';cx.strokeStyle='#5a4500';cx.lineWidth=1;
+   for(const k of KERBS){const X=sx(k[0]),Y=sy(k[1]);cx.beginPath();cx.moveTo(X,Y-kr);cx.lineTo(X+kr,Y);cx.lineTo(X,Y+kr);cx.lineTo(X-kr,Y);cx.closePath();cx.fill();cx.stroke();}}
   for(const L of D.lanes){if(!L[3]||!L[8])continue;const ls=f.l[L[3][0]+'/'+L[3][1]];const q=L[8][0];
    cx.fillStyle=lightCol(ls);cx.beginPath();cx.arc(sx(q[0]),sy(q[1]),Math.max(3,0.9*scale),0,7);cx.fill();}
-  // people [x,y,state,decision,still,on_crossing]
-  for(const p of f.p){cx.fillStyle=stateCol(p[2]);cx.beginPath();cx.arc(sx(p[0]),sy(p[1]),Math.max(2.5,0.4*scale),0,7);cx.fill();
+  // people [x,y,state,decision,still,on_crossing,pace,at_kerb] (in the mask: the body radius, a square round somebody waiting at a kerb)
+  for(const p of f.p){cx.fillStyle=stateCol(p[2]);cx.beginPath();cx.arc(sx(p[0]),sy(p[1]),mask?Math.max(2,PR*scale):Math.max(2.5,0.4*scale),0,7);cx.fill();
+   if(mask){cx.strokeStyle='rgba(0,0,0,0.6)';cx.lineWidth=1;cx.stroke();if(p[7]){const k=Math.max(4,(PR+0.15)*scale);cx.strokeStyle='#ffd33d';cx.strokeRect(sx(p[0])-k,sy(p[1])-k,2*k,2*k);}}
    if(p[3]!=null){cx.strokeStyle=S[p[3]]==='go'?'#3fb950':'#ff7b72';cx.lineWidth=1.5;cx.beginPath();cx.arc(sx(p[0]),sy(p[1]),Math.max(5,0.8*scale),0,7);cx.stroke();}}
   // vehicles (indicators blink at 1 Hz on the page clock, so they show when paused too)
   const blinkOn=Math.floor(performance.now()/500)%2===0;
@@ -139,10 +212,20 @@ function makePane(cv,D,o){
    cx.fillStyle=WHY[r[5]]||'#8b949e';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);
    cx.fillStyle='rgba(0,0,0,0.45)';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,Math.min(1,fr+re)*scale);
    if(r[10]){cx.strokeStyle='#ffd33d';cx.lineWidth=2;cx.strokeRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);}
+   else if(mask){cx.strokeStyle='rgba(255,255,255,0.85)';cx.lineWidth=1;cx.strokeRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);}
    lamps(r[15],fr,hw,scale,blinkOn);
    if(pinned===r[0]){cx.strokeStyle='#fff';cx.lineWidth=2;cx.setLineDash([3,2]);cx.strokeRect(-hw*scale-3,-fr*scale-3,2*hw*scale+6,(fr+re)*scale+6);cx.setLineDash([]);}
    cx.restore();
    if(scale>5||CARS[r[0]]&&scale>3.5||r[0]===pinned){cx.fillStyle=CARS[r[0]]?'#ffd33d':'#c9d1d9';cx.font='10px system-ui';cx.fillText(r[0],sx(r[1])+hw*scale+2,sy(r[2])-2);}}
+  // the strip the hovered vehicle stops for people in: its way ahead ±(half width + 0.3 m), ±(half width + 1.5 m) for somebody on a crossing
+  if(mask&&hov&&hov.veh!=null&&f.v[hov.veh]){const r=f.v[hov.veh];const inf=VI[r[0]]||[2.2,2.2,0.9];const hw=inf[2];const L=LI[r[11]];
+   if(L&&L[8]){const [,,along]=nearestOn(L[8],[r[1],r[2]]);const way=[[r[1],r[2]]];let acc=0;let s=0;for(let i=0;i<L[8].length-1;i++){const len=Math.hypot(L[8][i+1][0]-L[8][i][0],L[8][i+1][1]-L[8][i][1]);if(acc+len>along+0.3)way.push(L[8][i+1]);acc+=len;}
+    const it=r[16];if(it&&it.length>1)for(let k=1;k<it.length;k++){const N=LI[it[k]];if(!N||!N[8])break;for(const q of N[8])way.push(q);}
+    // (cut at 40 m)
+    const cut=[way[0]];let d=0;for(let i=1;i<way.length&&d<40;i++){d+=Math.hypot(way[i][0]-way[i-1][0],way[i][1]-way[i-1][1]);cut.push(way[i]);}
+    if(cut.length>1){cx.lineJoin='miter';for(const [m,col,dash] of [[hw+0.3,'#ff4fc8',[]],[hw+1.5,'rgba(255,79,200,0.5)',[2,4]]]){const o=offsetPoly(cut,m);cx.strokeStyle=col;cx.lineWidth=1.2;cx.setLineDash(dash);poly(o.l);poly(o.r);cx.setLineDash([]);}cx.lineJoin='round';}}}
+  if(mask&&hov&&hov.pl!=null&&f.pl[hov.pl]){const p=f.pl[hov.pl];const h=p[2]*Math.PI/180,fx=Math.sin(h),fy=Math.cos(h);const way=[[p[0],p[1]],[p[0]+fx*30,p[1]+fy*30]];
+   cx.lineJoin='miter';for(const [m,col,dash] of [[1.25+0.3,'#ff4fc8',[]],[1.25+1.5,'rgba(255,79,200,0.5)',[2,4]]]){const o=offsetPoly(way,m);cx.strokeStyle=col;cx.lineWidth=1.2;cx.setLineDash(dash);poly(o.l);poly(o.r);cx.setLineDash([]);}cx.lineJoin='round';}
   // players [x,y,h,speed]
   for(const p of f.pl){const h=p[2]*Math.PI/180;cx.save();cx.translate(sx(p[0]),sy(p[1]));cx.rotate(h);cx.fillStyle='#ffffff';cx.strokeStyle='#000';cx.lineWidth=1;
    cx.fillRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.strokeRect(-1.25*scale,-6*scale,2.5*scale,12*scale);cx.fillStyle='#e5534b';cx.fillRect(-1.25*scale,-6*scale,2.5*scale,Math.min(1,12)*scale);lamps(p[4],6,1.25,scale,blinkOn);cx.restore();}
@@ -160,6 +243,19 @@ function makePane(cv,D,o){
    if(w){cx.strokeStyle='#00e5ff';cx.lineWidth=3;cx.beginPath();w.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.stroke();
     let a=w[w.length-1],b=null;for(let i=w.length-2;i>=0;i--){if(Math.hypot(a[0]-w[i][0],a[1]-w[i][1])>3){b=w[i];break;}}
     if(b){const ang=Math.atan2(a[1]-b[1],a[0]-b[0]);cx.save();cx.translate(a[0],a[1]);cx.rotate(ang);cx.fillStyle='#00e5ff';cx.beginPath();cx.moveTo(6,0);cx.lineTo(-7,-6);cx.lineTo(-7,6);cx.closePath();cx.fill();cx.restore();}}}
+  // the mask's tooltip: the lane, the vehicle or the person under the pointer
+  if(mask&&hov&&hov.at){let lines=[];
+   if(hov.veh!=null&&f.v[hov.veh]){const r=f.v[hov.veh];const inf=VI[r[0]]||[2.2,2.2,0.9];const lt=vehLat(r);
+    lines.push('vehicle '+r[0]+' · '+(inf[4]||inf[3]||'')+' · '+(2*inf[2]).toFixed(2)+' m wide, '+(inf[0]+inf[1]).toFixed(1)+' m long','lane '+r[11]+' s '+r[12]+' · '+r[5]+(r[6]!=null?' stop in '+r[6]+' m':''));
+    if(lt)lines.push('lane width '+lt[3][2]+' m · '+(lt[0]>=0?'+':'')+lt[0].toFixed(2)+' m off the axis ('+(lt[0]>=0?'right':'left')+')','overhang beyond the lane edge: left '+lt[1].toFixed(2)+' m, right '+lt[2].toFixed(2)+' m','stops for a person within ±'+(inf[2]+0.3).toFixed(2)+' m of its way');}
+   else if(hov.pl!=null&&f.pl[hov.pl]){const p=f.pl[hov.pl];const pl=pedLat(p);lines.push('player bus · drawn 2.5 m wide (the recording has no width) · heading '+p[2]+'° · '+p[3]+' m/s','stops for a person within ±1.55 m of a straight way ahead (a 2.5 m bus: half width + 0.3)');
+    if(pl){const L=LI[pl[0]];const [,lat]=nearestOn(L[8],[p[0],p[1]]);lines.push('nearest street lane '+pl[0]+' ('+L[2]+' m wide): '+(lat>=0?'+':'')+lat.toFixed(2)+' m off its axis, overhang beyond its edge: left '+((-lat+1.25)-L[2]/2).toFixed(2)+' m, right '+((lat+1.25)-L[2]/2).toFixed(2)+' m');}else lines.push('no street lane within 6 m');}
+   else if(hov.ped){const p=hov.ped;const pl=pedLat(p);lines.push('person · '+S[p[2]]+(p[3]!=null?' · '+S[p[3]]:'')+(p[5]?' · on crossing':'')+(p[7]?' · at kerb':''),'body radius '+PR+' m'+(p[6]?' · '+p[6]+' m/s':''));
+    if(pl)lines.push('nearest street lane '+pl[0]+': '+pl[1].toFixed(2)+' m from its axis (edge at '+pl[4].toFixed(2)+')',pl[2]?'INSIDE its keep-off strip (±'+pl[3].toFixed(2)+' m)':'outside its keep-off strip (±'+pl[3].toFixed(2)+' m)');else lines.push('no street lane within 6 m');}
+   else if(hov.lane!=null&&FP[hov.lane]){const f2=FP[hov.lane];lines.push('lane '+hov.lane);for(const [k,v] of laneRows(f2))lines.push(k+': '+v);
+    if(mask>=2){const a=alongAt(f2.L[8],f2.len/2);if(a){cx.font='bold 11px system-ui';cx.fillStyle='#fff';cx.strokeStyle='#000';cx.lineWidth=3;const t=f2.L[2]+' m '+f2.cls;cx.strokeText(t,sx(a[0][0])+4,sy(a[0][1])-4);cx.fillText(t,sx(a[0][0])+4,sy(a[0][1])-4);}}}
+   if(lines.length){cx.font='11px system-ui';const w=Math.max(...lines.map(l=>cx.measureText(l).width))+12,h=lines.length*14+8;let X=hov.at[0]+14,Y=hov.at[1]+14;if(X+w>W)X=Math.max(0,hov.at[0]-w-8);if(Y+h>H)Y=Math.max(0,H-h);
+    cx.fillStyle='rgba(10,14,20,0.92)';cx.fillRect(X,Y,w,h);cx.strokeStyle='#9cacc0';cx.lineWidth=1;cx.strokeRect(X+0.5,Y+0.5,w-1,h-1);cx.fillStyle='#e6edf3';lines.forEach((l,i)=>cx.fillText(l,X+6,Y+15+i*14));}}
   // the flash round a vehicle just looked up
   const now=performance.now();
   if(pinned!=null&&f.v[pinned]&&now<st.flashUntil){const r=f.v[pinned],ph=(now/350)%1;
@@ -175,8 +271,9 @@ function makePane(cv,D,o){
   if(st.pinP){const p=f.p.reduce((b,q)=>{const d=Math.hypot(q[0]-st.pinP[0],q[1]-st.pinP[1]);return !b||d<b[0]?[d,q]:b;},null);
    if(!p||p[0]>3)return '<span class="mut">the pedestrian is not near the pinned place now</span>';const q=p[1];st.pinP=[q[0],q[1]];
    return '<b>pedestrian</b><table>'+row('state',S[q[2]])+row('decision',q[3]==null?null:S[q[3]])+row('still',q[4]+' s')+row('on crossing',q[5]?'yes':'no')+(q[6]?row('pace',q[6]+' m/s'):'')+row('at',q[0]+', '+q[1])+'</table>';}
+  if(mask&&sel!=null&&FP[sel])return m+laneHTML(sel);
   const ls=Object.entries(f.l).map(([k,s])=>`<span style="color:${lightCol(s)}">●</span> ${k} ${lightName(s)}`).join('<br>');
-  return m+'<span class="mut">Click a vehicle or a pedestrian. Drag to pan, wheel to zoom.</span><div style="margin-top:6px">Lights:<br>'+(ls||'<span class="mut">none</span>')+'</div>';}
+  return m+'<span class="mut">Click a vehicle or a pedestrian'+(mask?' or a lane; hover for the mask\'s numbers':'')+'. Drag to pan, wheel to zoom.</span><div style="margin-top:6px">Lights:<br>'+(ls||'<span class="mut">none</span>')+'</div>';}
  // the frame nearest day time t
  function frameAt(t){let lo=0,hi=F.length-1;while(lo<hi){const mid=(lo+hi)>>1;if(F[mid].t<t)lo=mid+1;else hi=mid;}
   return lo>0&&Math.abs(F[lo-1].t-t)<=Math.abs(F[lo].t-t)?lo-1:lo;}
@@ -184,27 +281,46 @@ function makePane(cv,D,o){
  function canvasPoint(e){const b=cv.getBoundingClientRect();return [(e.clientX-b.left-cv.clientLeft)*W/cv.clientWidth,(e.clientY-b.top-cv.clientTop)*H/cv.clientHeight];}
  // drag pans, the wheel zooms about the pointer (both change the shared view, then h.redraw()),
  // a click calls h.click({veh: id|null, ped: [x,y]|null}) for what is under the pointer at frame h.fi()
- function bind(h){let drag=null,moved=false;
+ function bind(h){let drag=null,moved=false;hitAt=(x,y)=>under(x,y,F[h.fi()]);
   cv.onmousedown=e=>{drag=[...canvasPoint(e),V.ox,V.oy];moved=false;};
   window.addEventListener('mouseup',()=>{drag=null;});
-  cv.onmousemove=e=>{if(!drag)return;const [x,y]=canvasPoint(e),dx=x-drag[0],dy=y-drag[1];if(Math.abs(dx)+Math.abs(dy)>3)moved=true;V.ox=drag[2]-dx/V.scale;V.oy=drag[3]+dy/V.scale;h.redraw();};
-  cv.onwheel=e=>{e.preventDefault();const [x,y]=canvasPoint(e);const wx=(x-W/2)/V.scale+V.ox,wy=-(y-H/2)/V.scale+V.oy;V.scale*=e.deltaY<0?1.2:1/1.2;V.scale=Math.max(0.3,Math.min(40,V.scale));V.ox=wx-(x-W/2)/V.scale;V.oy=wy+(y-H/2)/V.scale;h.redraw();};
-  cv.onclick=e=>{if(moved)return;const [x,y]=canvasPoint(e);const scale=V.scale;const wx=(x-W/2)/scale+V.ox,wy=-(y-H/2)/scale+V.oy;const f=F[h.fi()];
+  // what is under canvas point [x,y] at frame f: {veh, ped, lane}
+  function under(x,y,f){const scale=V.scale;const wx=(x-W/2)/scale+V.ox,wy=-(y-H/2)/scale+V.oy;
    let best=null;for(const r of Object.values(f.v)){const d=Math.hypot(r[1]-wx,r[2]-wy);if(d<Math.max(3,10/scale)&&(!best||d<best[0]))best=[d,r[0]];}
    let bp=null;for(const p of f.p){const d=Math.hypot(p[0]-wx,p[1]-wy);if(d<Math.max(1.5,8/scale)&&(!bp||d<bp[0]))bp=[d,p];}
-   if(bp&&(!best||bp[0]<best[0]*0.5))h.click({veh:null,ped:[bp[1][0],bp[1][1]]});else if(best)h.click({veh:best[1],ped:null});else h.click({veh:null,ped:null});};}
- return {F,M,S,VI,V,CARS,fit,fitScale,draw,pinHTML,frameAt,bind};
+   let pl=null;f.pl.forEach((p,i)=>{const d=Math.hypot(p[0]-wx,p[1]-wy);if(d<Math.max(4,10/scale)&&(!pl||d<pl[0]))pl=[d,i];});
+   const lane=mask?laneAt([wx,wy]):null;
+   if(bp&&(!best||bp[0]<best[0]*0.5))return {veh:null,ped:bp[1],lane:lane&&lane.L[0]};if(best)return {veh:best[1],ped:null,lane:lane&&lane.L[0]};if(pl)return {veh:null,ped:null,pl:pl[1],lane:lane&&lane.L[0]};return {veh:null,ped:null,lane:lane?lane.L[0]:null};}
+  cv.onmousemove=e=>{const [x,y]=canvasPoint(e);
+   if(!drag){if(!mask){if(hov){hov=null;h.redraw();}return;}const u=under(x,y,F[h.fi()]);const nh={veh:u.veh,ped:u.ped,pl:u.pl,lane:u.veh!=null||u.ped||u.pl!=null?null:u.lane,at:[x,y]};
+    const same=hov&&hov.veh===nh.veh&&hov.ped===nh.ped&&hov.pl===nh.pl&&hov.lane===nh.lane&&Math.abs(hov.at[0]-x)<1&&Math.abs(hov.at[1]-y)<1;if(!same){hov=nh;h.redraw();}return;}
+   const dx=x-drag[0],dy=y-drag[1];if(Math.abs(dx)+Math.abs(dy)>3)moved=true;V.ox=drag[2]-dx/V.scale;V.oy=drag[3]+dy/V.scale;h.redraw();};
+  cv.onmouseleave=()=>{if(hov){hov=null;h.redraw();}};
+  cv.onwheel=e=>{e.preventDefault();const [x,y]=canvasPoint(e);const wx=(x-W/2)/V.scale+V.ox,wy=-(y-H/2)/V.scale+V.oy;V.scale*=e.deltaY<0?1.2:1/1.2;V.scale=Math.max(0.3,Math.min(40,V.scale));V.ox=wx-(x-W/2)/V.scale;V.oy=wy+(y-H/2)/V.scale;h.redraw();};
+  cv.onclick=e=>{if(moved)return;const [x,y]=canvasPoint(e);const u=under(x,y,F[h.fi()]);
+   // (a click on a lane's footprint pins it: its next / prev chains; on nothing unpins)
+   sel=u.veh!=null||u.ped?null:u.lane;
+   if(u.ped)h.click({veh:null,ped:[u.ped[0],u.ped[1]],lane:null});else h.click({veh:u.veh,ped:null,lane:sel});};}
+ function setMask(m){mask=((m|0)%3+3)%3;if(!mask){hov=null;sel=null;}}
+ function setSel(id){sel=id!=null&&FP[id]?id:null;}
+ // (for a page's screenshot: the tooltip of world point [x,y] as if the pointer were there)
+ function hoverAt(x,y){const X=sx(x),Y=sy(y);const u=hitAt(X,Y);hov={veh:u.veh,ped:u.ped,pl:u.pl,lane:u.veh!=null||u.ped||u.pl!=null?null:u.lane,at:[X,Y]};}
+ let hitAt=()=>({});
+ return {F,M,S,VI,V,CARS,fit,fitScale,draw,pinHTML,frameAt,bind,setMask,maskMode:()=>mask,laneHTML,setSel,sel:()=>sel,hoverAt};
 }
 // ==PANE-END==
 (function(){
 const D=JSON.parse(document.getElementById('data').textContent);
 const G=JSON.parse(document.getElementById('diagdata').textContent)||{};
+const O=(()=>{try{return JSON.parse(document.getElementById('opts').textContent)||{};}catch(e){return {};}})();
 const CARS={};for(const c of (G.cars||[]))CARS[c.id]=c;
 const cv=document.getElementById('cv');
 const V={};
-const P=makePane(cv,D,{view:V,cars:CARS,chain:true});
+const P=makePane(cv,D,{view:V,cars:CARS,chain:true,mask:O.mask|0});
 const M=P.M,F=P.F;
-document.getElementById('legend').innerHTML=legendHTML();
+function maskUI(){const m=P.maskMode();document.getElementById('mask').textContent='Mask: '+MASK_NAMES[m];document.getElementById('legend').innerHTML=legendHTML()+(m?'<span style="grid-column:1/-1;border-top:1px solid var(--bd);padding-top:8px;margin-top:4px"><b>Boundary mask</b>'+(M.footprints?'':' <span class="mut">(trace without --footprints: pavements away from crossings are not in it)</span>')+'</span>'+maskLegendHTML():'');}
+maskUI();
+document.getElementById('mask').onclick=()=>{P.setMask(P.maskMode()+1);maskUI();draw();};
 function fit(){P.fit();}
 let fi=0,playing=false,speed=1,lastTs=null,acc=0;
 const st={pinned:null,pinP:null,msg:'',flashUntil:0};
@@ -248,7 +364,11 @@ function go(id,t,zoom){id=+id;if(!Number.isFinite(id))return;st.msg='';st.pinned
  if(zoom)V.scale=+zoom;const r=F[fi].v[id];if(r){V.ox=r[1];V.oy=r[2];}
  acc=0;st.flashUntil=performance.now()+4000;requestAnimationFrame(flashLoop);
  const want=`pin=${id}&t=${hms(F[fi].t)}&zoom=${zoom||V.scale.toFixed(1)}`;if(location.hash.slice(1)!==want)history.replaceState(null,'','#'+want);}
-function applyHash(){const h=new URLSearchParams(location.hash.slice(1));if(h.get('pin'))go(h.get('pin'),h.get('t'),h.get('zoom'));else if(h.get('t')){go(NaN);}}
+// #pin=<id>&t=HH:MM:SS&zoom=<px per m> pins a vehicle; #at=x,y&zoom=N&t=HH:MM:SS&mask=0|1|2 opens a place (x,y relative to the centre)
+function applyHash(){const h=new URLSearchParams(location.hash.slice(1));if(h.get('mask')!=null){P.setMask(+h.get('mask'));maskUI();}if(h.get('lane')!=null)P.setSel(+h.get('lane'));
+ if(h.get('pin'))go(h.get('pin'),h.get('t'),h.get('zoom'));else{if(h.get('t')){const tt=secs(h.get('t'));let b=0;for(let i=0;i<F.length;i++)if(Math.abs(F[i].t-tt)<Math.abs(F[b].t-tt))b=i;fi=b;}
+  if(h.get('at')){const [x,y]=h.get('at').split(',').map(Number);if(Number.isFinite(x)&&Number.isFinite(y)){V.ox=x;V.oy=y;}}if(h.get('zoom'))V.scale=Math.max(0.3,Math.min(40,+h.get('zoom')));
+  if(h.get('hover')){const [x,y]=h.get('hover').split(',').map(Number);if(Number.isFinite(x)&&Number.isFinite(y))P.hoverAt(x,y);}draw();}}
 window.addEventListener('hashchange',applyHash);
 document.addEventListener('click',e=>{const a=e.target.closest('a.vid');if(!a)return;e.preventDefault();const h=new URLSearchParams(a.getAttribute('href').slice(1));go(h.get('pin'),h.get('t'),h.get('zoom'));cv.scrollIntoView({block:'nearest',behavior:'smooth'});});
 document.getElementById('find').onkeydown=e=>{if(e.key!=='Enter')return;const id=e.target.value.replace(/[^0-9]/g,'');if(!id)return;go(id,CARS[id]?CARS[id].start:null,2);};
@@ -257,8 +377,9 @@ document.getElementById('spd').onchange=e=>{speed=+e.target.value;};
 document.getElementById('fit').onclick=()=>{fit();draw();};
 scrub.oninput=()=>{fi=+scrub.value;acc=0;draw();};
 P.bind({fi:()=>fi,redraw:draw,click:h=>{st.msg='';
- if(h.ped){st.pinP=h.ped;st.pinned=null;}else if(h.veh!=null){st.pinned=h.veh;st.pinP=null;}else{st.pinned=null;st.pinP=null;}draw();}});
-window.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type==='text')return;if(e.key===' '){e.preventDefault();document.getElementById('play').click();}else if(e.key==='ArrowRight'){fi=Math.min(F.length-1,fi+1);draw();}else if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);draw();}});
+ if(h.ped){st.pinP=h.ped;st.pinned=null;}else if(h.veh!=null){st.pinned=h.veh;st.pinP=null;}else{st.pinned=null;st.pinP=null;}
+ if(P.maskMode()){const want=`at=${V.ox.toFixed(1)},${V.oy.toFixed(1)}&zoom=${V.scale.toFixed(1)}&t=${hms(F[fi].t)}&mask=${P.maskMode()}`+(h.lane!=null?`&lane=${h.lane}`:'');history.replaceState(null,'','#'+want);}draw();}});
+window.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type==='text')return;if(e.key==='m'||e.key==='M'){document.getElementById('mask').click();}else if(e.key===' '){e.preventDefault();document.getElementById('play').click();}else if(e.key==='ArrowRight'){fi=Math.min(F.length-1,fi+1);draw();}else if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);draw();}});
 // start at the window's middle; #pin=<vehicle id>&t=HH:MM:SS&zoom=<px per m> opens a vehicle pinned
 let m=0;for(let i=0;i<F.length;i++)if(Math.abs(F[i].t-M.mid)<Math.abs(F[m].t-M.mid))m=i;fi=m;
 setInterval(()=>{if(!playing&&!document.hidden)P.draw(fi,st);},250);
