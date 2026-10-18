@@ -113,12 +113,22 @@ pub struct JunctionView {
     pub past_line: bool,
     /// Past its line (passed while the light let it in), the light no longer green, and rolling
     /// on or already at the first meeting place with another way: in the box when its light
-    /// turned, it clears it. No
-    /// light holds it (that light, nor another of its controller on this junction's pieces)
+    /// turned, it clears it. That light holds it no more (`clears_past`; a later line on the
+    /// way, a left-turn waiting area's under another light of the controller, holds it as any)
     /// and it is committed to its way through; a fresh green waits for it.
     pub clearing: bool,
     /// The way through's length (m, along the chain's pieces).
     pub way_len: f32,
+}
+
+impl JunctionView {
+    /// Clearing the box, the car is not held by `sig` when that is the light whose line it
+    /// passed and the line lies behind its front (`front`: from the origin to the front).
+    /// (Review7: it ignored every light of the controller on its way through and drove over
+    /// the red of a left-turn waiting area's second line, 41 such ways in viz3.)
+    pub fn clears_past(&self, sig: &SignalView, front: f32) -> bool {
+        self.clearing && self.light.is_some_and(|(ctl, li, _)| (ctl, li) == (sig.ctl, sig.light)) && sig.dist < front
+    }
 }
 
 /// The light of junction `j` that a car on its pieces came through: back from `lane` along

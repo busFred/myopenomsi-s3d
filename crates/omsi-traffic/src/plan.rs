@@ -242,10 +242,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.body_block = p.body_block;
     }
 
-    // 2. lights (not one of its junction's controller on the pieces of the way through while
-    // it clears the box: in it when its light turned, it drives on)
-    let clearing = |sig: &SignalView| p.junction.as_ref().is_some_and(|j| j.clearing && j.light.is_some_and(|(ctl, _, _)| ctl == sig.ctl) && sig.dist < j.entry + j.way_len);
-    if let Some(sig) = p.signal.filter(|s| !clearing(s)) {
+    // 2. lights (not the one whose line it passed while it clears the box: in it when that
+    // light turned, it drives on; a later line, of that controller or not, holds it as any)
+    if let Some(sig) = p.signal.filter(|s| !p.junction.as_ref().is_some_and(|j| j.clears_past(s, st.front))) {
         let call = light_call(me, p, &sig);
         if call.mark {
             out.amber = Some((sig.ctl, sig.light));

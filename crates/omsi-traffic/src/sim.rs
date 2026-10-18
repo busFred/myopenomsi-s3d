@@ -688,8 +688,9 @@ impl Simulation {
             // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
             let light_line = j.light_line;
             let (light_red, until_go) = match p.signal {
-                // (clearing the box: no light holds it, `JunctionView::clearing`)
-                _ if j.clearing => (false, None),
+                // (clearing the box: the light it passed holds it no more,
+                // `JunctionView::clears_past`)
+                Some(sig) if j.clears_past(&sig, st.front) => (false, None),
                 Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one

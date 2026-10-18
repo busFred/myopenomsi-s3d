@@ -3,7 +3,7 @@
 //! car inside the box when its light turns red.
 
 use glam::DVec3;
-use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
+use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
 use omsi_traffic::sim::PLAYER_ID_BASE;
 use omsi_traffic::{PlayerView, Simulation, Vehicle, VehicleClass};
 
@@ -167,4 +167,52 @@ fn review7_rule_e_a_dwelling_player_bus_does_not_hold_the_turner() {
         sim.players = vec![player];
     });
     assert!(held < 3.0, "the turner waited {held:.1} s for a bus standing at its stop");
+}
+
+/// Review7 (rule F): one way through object 9 under two lights of one controller, as at
+/// BeijingCity's left-turn waiting areas (viz3 junction 1: lane 1124 lit 3.2, then 1255 lit
+/// 3.3; 41 such ways in the viz3 fixtures). Eastbound: approach 0, piece 1 (x -20..-19, lit
+/// (0, 0)), piece 2 (x -19..10), piece 3 (x 10..11, lit (0, 1), the waiting area's line), piece 4
+/// (x 11..40), exit 5; the northbound way (piece 8) crosses piece 2 at x = 0, before the waiting
+/// area's line, as 1234/1237 cross lane 1250 before 1255. Light 0 green 0-10 s then
+/// red; light 1 red throughout; light 2 (northbound) green from 14 s. A car crawling at 2 m/s
+/// passes light 0 on green and is in the waiting area when light 0 turns red: "clearing", the
+/// plan drops every signal of controller 0 on its way through, and it drives over light 1's red.
+#[test]
+fn review7_rule_f_clearing_does_not_run_the_second_red_of_its_controller() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-20.0, 0.0)], 1)); // 0
+    let mut p1 = piece(&[(-20.0, 0.0), (-19.0, 0.0)], 0, 128.0);
+    p1.traffic_light = Some((0, 0));
+    net.lanes.push(p1); // 1
+    net.lanes.push(piece(&[(-19.0, 0.0), (10.0, 0.0)], 1, 128.0)); // 2
+    let mut p3 = piece(&[(10.0, 0.0), (11.0, 0.0)], 2, 128.0);
+    p3.traffic_light = Some((0, 1));
+    net.lanes.push(p3); // 3
+    net.lanes.push(piece(&[(11.0, 0.0), (40.0, 0.0)], 3, 128.0)); // 4
+    net.lanes.push(road(&[(40.0, 0.0), (400.0, 0.0)], 2)); // 5
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -20.0)], 3)); // 6
+    let mut n1 = piece(&[(0.0, -20.0), (0.0, -19.0)], 4, 128.0);
+    n1.traffic_light = Some((0, 2));
+    net.lanes.push(n1); // 7
+    net.lanes.push(piece(&[(0.0, -19.0), (0.0, 20.0)], 5, 128.0)); // 8
+    net.lanes.push(road(&[(0.0, 20.0), (0.0, 300.0)], 4)); // 9
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(6, 10.0), (0, 50.0)], vec![(0, 60.0)], vec![(0, 14.0), (6, 46.0)]], 60.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut slow = car(1, 0, 276.0, 2.0);
+    slow.state.max_speed_kmh = 7.2;
+    slow.state.desire = 1.0;
+    let mut cars = vec![slow];
+    let mut furthest = f32::NEG_INFINITY;
+    let mut red0_at_x = None;
+    run(&net, &mut sim, &mut cars, 30.0, |t, sim, cars| {
+        let c = &cars[0];
+        let x = c.pos.x as f32 + c.state.front;
+        furthest = furthest.max(x);
+        if red0_at_x.is_none() && sim.lights[0].state(0) < 3 { red0_at_x = Some((t, x)); }
+    });
+    let (t0, x0) = red0_at_x.unwrap();
+    assert!(x0 > -19.0 && x0 < 9.0, "set-up: in the waiting area when light 0 turned red ({t0:.1} s, x {x0:.1})");
+    assert!(furthest <= 10.3, "drove over the second line (x = 10, light 1 red throughout) to x = {furthest:.1}");
 }
