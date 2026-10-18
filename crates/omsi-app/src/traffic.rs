@@ -578,6 +578,11 @@ pub struct Traffic {
     /// bus put back by the timetable carries nobody, and nobody is left riding a bus that
     /// is gone.
     pub riders_out: Vec<u64>,
+    /// [ROLLBACK r4d-B2] The through lanes as the traffic drives them (for the timetable
+    /// buses' layovers), and the timetable buses taken off the road as a last resort, with
+    /// the time of day their trip is to be put on the road again.
+    pub through: crate::bus_service::ThroughLanes,
+    pub respawned: Vec<(u64, f64)>,
     /// One-way lanes that have had their reverse twin added (`add_reverse_twins`).
     twinned: hashbrown::HashSet<usize>,
     /// Bodies besides the AI vehicles' that no timetable vehicle may be put into: the
@@ -1166,6 +1171,8 @@ impl Traffic {
             removed_scheduled: Vec::new(),
             dead_ended: Vec::new(),
             riders_out: Vec::new(),
+            through: Default::default(),
+            respawned: Vec::new(),
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
@@ -3063,8 +3070,8 @@ impl Traffic {
         chain.len() - 1
     }
 
-    /// [ROLLBACK r4d-B2] Timetable bus `i` stands out a long wait at its stop (or queues for an
-    /// occupied berth) across a through lane and the queue behind it asks it to go: a way off
+    /// [ROLLBACK r4d-B2] Timetable bus `i` stands out its layover (or queues for an occupied
+    /// berth) across a through lane and the queue behind it asks it to go: a way off
     /// (`bus_service::plan_detour`). None when it need not go; Some(None) when nothing fits.
     fn bus_detour(&self, i: usize, queue_behind_secs: f32) -> Option<Option<crate::bus_service::Detour>> {
         let c = &self.cars[i];
@@ -3079,7 +3086,8 @@ impl Traffic {
         let stop = b.stops.front()?;
         let near = st.route_distance(&self.net, stop.ri, stop.s);
         let left = b.detour_wanted(st.speed, self.day_time, queued && near < 60.0)?;
-        if !crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, c.half_width) {
+        let through = self.through.through(&self.net, st.lane, c.id);
+        if !crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, c.half_width, through) {
             return None;
         }
         if !crate::bus_service::queue_asks_to_go(queue_behind_secs, self.queued_behind(i)) {
@@ -3088,43 +3096,70 @@ impl Traffic {
         // back to where it stands, or to its stop point when that lies on this lane ahead
         let back_to = if stop.ri == st.route_index && stop.s > st.s { stop.s } else { st.s };
         let len = st.front + st.rear;
-        let room = |l: usize| self.bus_room(l, len, c.half_width);
+        let room = |l: usize| self.bus_room(c.id, l, len, c.half_width);
         Some(crate::bus_service::plan_detour(&self.net, st.lane, st.s, back_to, left, &room))
     }
 
-    /// [ROLLBACK r4d-B2] Where on lane `l` a bus `len` metres long (`half_width` wide) can
-    /// stand out of the through traffic: a street lane of its own (no random traffic, not a
-    /// timetable connector) with nobody on it, or a gap between two parked cars at its kerb
-    /// with `bus_service::PARK_ROOM` to spare. Its origin's place and its offset, if anywhere.
-    fn bus_room(&self, l: usize, len: f32, half_width: f32) -> Option<(f32, f32)> {
-        let lane = self.net.lanes.get(l)?;
-        if lane.kind != LaneKind::Street {
+    /// [ROLLBACK r4d-B2] The last resort for timetable bus `i`, which nothing lets out of the
+    /// way: when nobody sees it, the time of day its trip comes back on the road (its
+    /// departure from the stop it waits for, less `bus_service::RESPAWN_LEAD`, at least half
+    /// a minute on).
+    fn respawn_at(&self, i: usize) -> Option<f64> {
+        let c = &self.cars[i];
+        let b = c.bus.as_ref()?;
+        let p = c.vehicle.position;
+        let r = (c.ai.state.front + c.ai.state.rear) as f64 * 0.5 + 2.0;
+        if self.viewer.is_some_and(|v| (p - v.pos).length() < 80.0 || v.frames(p, r)) {
             return None;
         }
-        let need = len + crate::bus_service::PARK_ROOM;
-        let taken = |a: f32, b: f32| self.cars.iter().any(|o| o.ai.state.lane == l && o.ai.state.s + o.ai.state.front > a && o.ai.state.s - o.ai.state.rear < b);
-        if lane.density <= 0.0 && !lane.no_cars && lane.length() >= need + 4.0 {
-            let s = lane.length() - 2.0 - len * 0.5;
-            if !taken(0.0, lane.length()) {
-                return Some((s, 0.0));
+        let depart = if b.at_stop() { b.leave_at } else { b.stops.front()?.depart };
+        let at = (depart - crate::bus_service::RESPAWN_LEAD).max(self.day_time + 30.0);
+        log::info!("t={:.1}: timetable bus {} taken off the road: no loop or room within range, {} queued behind it; its trip comes back at {:.1} min", self.day_time, c.id, self.queued_behind(i), at / 60.0);
+        Some(at)
+    }
+
+    /// [ROLLBACK r4d-B2] Where on lane `l` timetable bus `me`, `len` metres long and
+    /// `half_width` wide, can stand out of the through traffic (`bus_service::room_on_lane`):
+    /// another stop's bay off the lane, the lane itself when no vehicle's way uses it, or the
+    /// kerb of a parked row (a gap, before it, after it), clear of the lane's junction and
+    /// crossings and of every vehicle there. Its origin's place and its offset, if anywhere.
+    fn bus_room(&self, me: u64, l: usize, len: f32, half_width: f32) -> Option<(f32, f32)> {
+        let lane = self.net.lanes.get(l)?;
+        if lane.kind != LaneKind::Street || lane.no_cars {
+            return None;
+        }
+        let bays: Vec<(f32, f32)> = self
+            .cars
+            .iter()
+            .filter(|o| o.id != me)
+            .filter_map(|o| Some((o.bus.as_ref()?, &o.ai.state.route)))
+            .flat_map(|(b, route)| b.stops.iter().filter(move |x| route.get(x.ri) == Some(&l)).map(|x| (x.s, x.bay)))
+            .collect();
+        let parked = self.parked.get(&l).cloned().unwrap_or_default();
+        let keep_off: Vec<f32> = self.net.crossings.get(l).into_iter().flatten().map(|c| c.at).chain(self.net.walks.get(l).into_iter().flatten().map(|w| w.1)).collect();
+        let free = |a: f32, b: f32, lat: f32| {
+            !self.cars.iter().any(|o| {
+                let st = &o.ai.state;
+                st.lane == l && st.s + st.front > a && st.s - st.rear < b && (lat.abs() < 0.1 || (st.lateral - lat).abs() < 2.5)
+            })
+        };
+        crate::bus_service::room_on_lane(lane.length(), lane.width, len, half_width, self.through.used(l), &bays, &parked, &keep_off, &free)
+    }
+
+    /// [ROLLBACK r4d-B2] The through lanes as of this frame: the lanes the random traffic is
+    /// on (kept), and those on the timetable vehicles' routes now.
+    fn note_through_lanes(&mut self) {
+        self.through.routes.clear();
+        for c in &self.cars {
+            if c.bus.is_none() || c.ai.gone {
+                self.through.driven.insert(c.ai.state.lane);
+            } else {
+                let st = &c.ai.state;
+                for &l in std::iter::once(&st.lane).chain(st.route.iter().skip(st.route_index)) {
+                    self.through.routes.entry(l).or_default().push(c.id);
+                }
             }
         }
-        let spots = self.parked.get(&l)?;
-        let mut spots: Vec<(f32, f32)> = spots.iter().copied().filter(|p| p.1.abs() > 1.5).collect();
-        spots.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for w in spots.windows(2) {
-            let ((s1, lat1), (s2, lat2)) = (w[0], w[1]);
-            if lat1.signum() != lat2.signum() || s2 - s1 - 4.6 < need {
-                continue;
-            }
-            let mid = (s1 + s2) * 0.5;
-            if mid - len * 0.5 < 2.0 || mid + len * 0.5 > lane.length() - 2.0 || taken(mid - len * 0.5 - 1.0, mid + len * 0.5 + 1.0) {
-                continue;
-            }
-            let lat = (lat1 + lat2) * 0.5 + lat1.signum() * (half_width - 0.9);
-            return Some((mid, lat));
-        }
-        None
     }
 
     /// One frame: what the drivers see besides each other (the player and the LAN
@@ -3167,6 +3202,9 @@ impl Traffic {
         self.sim.day_time = self.day_time;
         self.sim.time_scale = self.time_scale;
         // the bus services and the parking plans: what they ask of the driver this frame
+        self.note_through_lanes();
+        // [ROLLBACK r4d-B2] buses taken off the road this frame as the last resort
+        let mut respawn: Vec<usize> = Vec::new();
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
@@ -3189,7 +3227,17 @@ impl Traffic {
             } else {
                 0.0
             };
-            let detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs) } else { None };
+            let mut detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs) } else { None };
+            // [ROLLBACK r4d-B2] no loop and no room within range, a queue behind it: the last
+            // resort, out of anybody's sight - off the road, and back on its timetable for
+            // its departure (as a bus off a dead end)
+            if matches!(detour, Some(None)) {
+                if let Some(at) = self.respawn_at(i) {
+                    respawn.push(i);
+                    self.respawned.push((self.cars[i].id, at));
+                    detour = None;
+                }
+            }
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
             let net = &self.net;
@@ -3289,7 +3337,10 @@ impl Traffic {
         }
         self.day_time = self.sim.day_time;
         self.held_at_red = self.sim.held_at_red;
-        let remove: Vec<usize> = self.sim.removed.clone();
+        let mut remove: Vec<usize> = self.sim.removed.clone();
+        remove.extend(respawn.iter().copied());
+        remove.sort_unstable_by(|a, b| b.cmp(a));
+        remove.dedup();
         let t_plan = std::time::Instant::now();
         // what the scripts are told, and the follow-camera triggers
         let mut frames: Vec<Option<AiFrame>> = Vec::with_capacity(self.cars.len());
@@ -3438,7 +3489,7 @@ impl Traffic {
                 self.riders_out.push(c.id);
             }
             // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
-            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone {
+            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone && !self.respawned.iter().any(|r| r.0 == c.id) {
                 if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
                     log::info!("scheduled bus {}: off the dead end of lane {} at ({:.0}, {:.0})", c.id, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y);
                 }

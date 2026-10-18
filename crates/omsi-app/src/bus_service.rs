@@ -238,6 +238,9 @@ pub fn pace_for(ahead_by: f64, dist: f32, v_nom: f32) -> f32 {
 pub const LAYOVER_QUEUE: f32 = 20.0;
 pub const LAYOVER_QUEUE_CARS: usize = 3;
 pub const LAYOVER_LOOP_MAX: f32 = 1200.0;
+/// [ROLLBACK r4d-B2] The least way round the block (m) from the end of the lane back to its
+/// start that counts as one.
+pub const LAYOVER_LOOP_MIN: f32 = 100.0;
 pub const LAYOVER_PARK_MAX: f32 = 400.0;
 const DETOUR_MARGIN: f64 = 60.0;
 /// The pace a detour is timed at (m/s: town traffic with its lights and junctions), and the
@@ -248,17 +251,99 @@ const DETOUR_MIN_LEFT: f64 = 90.0;
 const DETOUR_RETRY: f64 = 30.0;
 /// Room a parked bus needs beyond its length (m).
 pub const PARK_ROOM: f32 = 4.0;
+/// [ROLLBACK r4d-B2] A bus taken off the road as the last resort comes back this long (s)
+/// before its departure.
+pub const RESPAWN_LEAD: f64 = 60.0;
 
 /// [ROLLBACK r4d-B2] Seconds a detour of `len` metres takes.
 fn detour_time(len: f32) -> f64 {
     (len / DETOUR_SPEED) as f64
 }
 
-/// [ROLLBACK r4d-B2] A bus standing across a through lane: a street lane random traffic runs
-/// on (not a stand of its own), its body (`half_width`) not moved off the lane into a bay
-/// (a bus half on the pavement still holds up a car).
-pub fn covers_through_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
-    net.lanes.get(lane).is_some_and(|l| l.kind == LaneKind::Street && l.density > 0.0 && lateral.abs() < half_width + l.width * 0.5 - 0.5)
+/// [ROLLBACK r4d-B2] A street lane that is a through lane (`ThroughLanes::through`): other
+/// vehicles drive it.
+pub fn covers_through_lane(net: &Network, lane: usize, lateral: f32, half_width: f32, through: bool) -> bool {
+    through && net.lanes.get(lane).is_some_and(|l| l.kind == LaneKind::Street) && covers_lane(net, lane, lateral, half_width)
+}
+
+/// [ROLLBACK r4d-B2] A bus `lateral` metres right of lane `lane` covers it: its body
+/// (`half_width`) is not moved off the lane into a bay (a bus half on the pavement still
+/// holds up a car).
+pub fn covers_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
+    net.lanes.get(lane).is_some_and(|l| lateral.abs() < half_width + l.width * 0.5 - 0.5)
+}
+
+/// [ROLLBACK r4d-B2] The through lanes, as the traffic has driven them: a street lane is one
+/// when a vehicle of the random traffic has been on it, when another timetable vehicle's
+/// route runs over it, or when it has a lane beside it (a road of several lanes). The lane
+/// density says nothing: 25 street lanes of BeijingCity with density 0 carried 287 cars in
+/// ten minutes, and some with density 1 at the edge of the loaded map none.
+#[derive(Debug, Default, Clone)]
+pub struct ThroughLanes {
+    /// Lanes the random traffic has been on.
+    pub driven: std::collections::HashSet<usize>,
+    /// Lanes on the timetable routes (as they are now), with the vehicles whose route they
+    /// are on.
+    pub routes: std::collections::HashMap<usize, Vec<u64>>,
+}
+
+impl ThroughLanes {
+    /// Lane `l` is a through lane for vehicle `me`.
+    pub fn through(&self, net: &Network, l: usize, me: u64) -> bool {
+        let Some(lane) = net.lanes.get(l) else { return false };
+        lane.kind == LaneKind::Street && (self.driven.contains(&l) || lane.left.is_some() || lane.right.is_some() || self.routes.get(&l).is_some_and(|v| v.iter().any(|&o| o != me)))
+    }
+
+    /// Lane `l` is on the way of any vehicle at all (its own route counts too): nobody parks
+    /// on it.
+    pub fn used(&self, l: usize) -> bool {
+        self.driven.contains(&l) || self.routes.contains_key(&l)
+    }
+}
+
+/// [ROLLBACK r4d-B2] Where on a lane a bus `len` metres long and `half_width` wide stands out
+/// of the through traffic, nearest the start of the lane first: its origin's place and its
+/// offset right of the lane. `lane_len`, `width`: the lane; `free(a, b)`: nobody on the lane
+/// between `a` and `b`; `on_way`: some vehicle's way uses the lane; `bays`: other stops'
+/// places off the lane (origin, offset); `parked`: the cars parked beside it (s, offset);
+/// `keep_off`: places along the lane a bus must not stand on (junction mouths, crossings).
+/// Candidates, in order: another stop's bay, the lane itself when nobody's way uses it (a
+/// lay-by, a stand), a gap in a parked row or the kerb before or after the row.
+#[allow(clippy::too_many_arguments)]
+pub fn room_on_lane(lane_len: f32, width: f32, len: f32, half_width: f32, on_way: bool, bays: &[(f32, f32)], parked: &[(f32, f32)], keep_off: &[f32], free: &dyn Fn(f32, f32, f32) -> bool) -> Option<(f32, f32)> {
+    let need = len + PARK_ROOM;
+    // off the lane: the body clear of the lane by the margin `covers_lane` asks
+    let off = |lat: f32| lat.abs() >= half_width + width * 0.5 - 0.5;
+    let clear = |mid: f32| mid - need * 0.5 >= 2.0 && mid + need * 0.5 <= lane_len - 2.0 && keep_off.iter().all(|&k| (k - mid).abs() > need * 0.5 + 4.0);
+    // (a bus's origin is about its middle)
+    for &(mid, lat) in bays {
+        if off(lat) && clear(mid) && free(mid - need * 0.5, mid + need * 0.5, lat) {
+            return Some((mid, lat));
+        }
+    }
+    if !on_way && lane_len >= need + 4.0 {
+        let s = lane_len - 2.0 - need * 0.5;
+        if clear(s) && free(0.0, lane_len, 0.0) {
+            return Some((s, 0.0));
+        }
+    }
+    let mut row: Vec<(f32, f32)> = parked.iter().copied().filter(|p| off(p.1 + p.1.signum() * (half_width - 0.9))).collect();
+    row.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let at = |lat: f32| lat + lat.signum() * (half_width - 0.9);
+    let mut spots: Vec<(f32, f32)> = Vec::new();
+    if let (Some(&first), Some(&last)) = (row.first(), row.last()) {
+        // the kerb before the row and after it
+        spots.push((first.0 - 2.3 - 1.0 - need * 0.5, at(first.1)));
+        spots.push((last.0 + 2.3 + 1.0 + need * 0.5, at(last.1)));
+    }
+    for w in row.windows(2) {
+        let ((s1, lat1), (s2, lat2)) = (w[0], w[1]);
+        if lat1.signum() == lat2.signum() && s2 - s1 - 4.6 >= need {
+            spots.push(((s1 + s2) * 0.5, at((lat1 + lat2) * 0.5)));
+        }
+    }
+    spots.sort_by(|a, b| a.0.total_cmp(&b.0));
+    spots.into_iter().find(|&(mid, lat)| clear(mid) && free(mid - need * 0.5, mid + need * 0.5, lat))
 }
 
 /// [ROLLBACK r4d-B2] The queue behind a bus asks it to go: somebody has stood behind it for
@@ -285,7 +370,10 @@ pub fn plan_detour(net: &Network, lane: usize, s: f32, back_to: f32, time_left: 
         }
         let Some(p) = net.shortest_path(n, lane) else { continue };
         let len = rest + way_len(&p) + back_to;
-        if len <= LAYOVER_LOOP_MAX && detour_time(len) <= budget && best.as_ref().is_none_or(|b| len < b.0) {
+        // (a loop of a few metres is a fault in the lanes, not a block: BeijingCity has 1-2 m
+        // "loops" of two lane pieces linked into each other)
+        let around = len - rest - back_to;
+        if around >= LAYOVER_LOOP_MIN && len <= LAYOVER_LOOP_MAX && detour_time(len) <= budget && best.as_ref().is_none_or(|b| len < b.0) {
             best = Some((len, p));
         }
     }
@@ -678,7 +766,9 @@ impl BusService {
         }
         let stop = self.stops.front()?;
         let left = match self.phase {
-            Phase::Waiting | Phase::Boarding => self.leave_at - day_time,
+            // (only its layover - at a terminus, at the first stop of a trip -, not the wait
+            // at a stop on the way where the timetable holds it, nor a lead waited out)
+            Phase::Waiting | Phase::Boarding if self.this_layover => self.leave_at - day_time,
             Phase::Running if queued && speed < 0.3 => stop.depart - day_time,
             _ => return None,
         };
@@ -701,10 +791,16 @@ impl BusService {
         self.detour_looked = day_time;
         match self.phase {
             Phase::Running => self.take_detour(st, net, d, day_time, id),
-            Phase::Boarding | Phase::Waiting => {
+            // the doors shut: off once they are; open: once the people at them are in or out
+            // (`board`: the passengers holding them are waited for as at any stop)
+            Phase::Waiting => {
                 self.pending = Some(d);
                 self.leave_at = day_time;
                 self.set_phase(Phase::Closing);
+            }
+            Phase::Boarding => {
+                self.pending = Some(d);
+                self.leave_at = day_time;
             }
             _ => {}
         }
@@ -1301,7 +1397,7 @@ mod tests {
         s.arrive(&ctx, 400.0, 7, (0, 50.0));
         assert_eq!(s.phase, Phase::Boarding);
         // in the lane, four cars queued behind it: it looks for a way off
-        assert!(covers_through_lane(&net, 0, st.lateral, 1.25));
+        assert!(covers_through_lane(&net, 0, st.lateral, 1.25, true));
         assert!(queue_asks_to_go(5.0, 4) && queue_asks_to_go(25.0, 0) && !queue_asks_to_go(5.0, 3));
         let left = s.detour_wanted(0.0, 100.0, false).expect("a long wait");
         assert!((left - 300.0).abs() < 1e-6);
@@ -1310,7 +1406,8 @@ mod tests {
         assert_eq!(route, vec![0, 1, 2, 3, 0]);
         assert!((len - 400.0).abs() < 2.0, "{len}");
         s.start_detour(&mut st, &net, d, 100.0, 1);
-        assert_eq!(s.phase, Phase::Closing);
+        // (the people who just got on are in first: the doors shut after its boarding time)
+        assert_eq!(s.phase, Phase::Boarding);
         // the doors shut, round the block, back at its stop before its departure
         let mut left_at = None;
         let back = drive(&mut s, &mut st, &mut v, &net, 100.0, 300.0, |t, s, _| {
@@ -1319,7 +1416,7 @@ mod tests {
             }
             left_at.is_some() && s.at_stop()
         });
-        assert!(left_at.is_some_and(|t| t < 105.0), "{left_at:?}");
+        assert!(left_at.is_some_and(|t| t < 115.0), "{left_at:?}");
         assert!(back < 400.0 - 30.0, "back at {back}");
         assert_eq!((st.lane, st.route_index), (0, 4));
         assert!((st.s - 50.0).abs() < 2.5, "at its stop: {}", st.s);
@@ -1332,7 +1429,14 @@ mod tests {
         assert_eq!(st.route, vec![0, 1, 2, 3, 0, 4]);
 
         // the same layover moved into a bay off the lane: nothing to go round for
-        assert!(!covers_through_lane(&net, 0, 3.2, 1.25));
+        assert!(!covers_through_lane(&net, 0, 3.2, 1.25, true));
+        // a "loop" of two lane pieces linked into each other is none
+        let mut tiny = ring_of(400.0);
+        tiny.lanes[0].next.push(5);
+        tiny.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![tiny.lanes[0].end(), tiny.lanes[0].end() + glam::DVec3::new(0.5, 0.0, 0.0)], LaneKind::Street, 3.5));
+        tiny.lanes[5].next = vec![0];
+        let Some(Detour::Loop { route, .. }) = plan_detour(&tiny, 0, 50.0, 50.0, 300.0, &|_| None) else { panic!("the ring") };
+        assert_eq!(route, vec![0, 1, 2, 3, 0], "round the ring, not the 0.5 m piece");
         // nor with too little time for the loop (67 s at 6 m/s, and a minute to spare)
         assert!(plan_detour(&net, 0, 50.0, 50.0, 120.0, &|_| None).is_none());
     }
@@ -1614,6 +1718,145 @@ mod tests {
         }
         assert_eq!(s.phase, Phase::Waiting);
         assert!((st.s - 112.0).abs() < 1.0 && st.speed < 0.1, "pulled on: {} at {}", st.s, st.speed);
+    }
+
+    /// [ROLLBACK r4d-B2] Only a layover (or a queue for an occupied berth) looks for a way off:
+    /// not the wait at a stop on the way where the timetable holds the bus.
+    #[test]
+    fn only_a_layover_or_a_queue_for_the_berth_looks_for_a_way_off() {
+        let (s, _) = layover_bus(true, 0.0);
+        assert!(s.detour_wanted(0.0, 100.0, false).is_some(), "its layover");
+        // a wait stop on the way, as long a wait
+        let (mut s, ctx) = layover_bus(true, 0.0);
+        s.restart(vec![Stop { ri: 0, s: 0.0, bay: 0.0, depart: 300.0, id: 8, side: 0.0 }], false);
+        s.wait_stops = vec![8];
+        s.arrive(&ctx, 300.0, 8, (0, 0.0));
+        assert!(s.leave_at - ctx.day_time > 90.0);
+        assert_eq!(s.detour_wanted(0.0, 100.0, false), None);
+        // driving: only standing in the queue for the berth
+        let mut s = BusService::new(vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 300.0, id: 9, side: 0.0 }]);
+        assert_eq!(s.detour_wanted(0.0, 100.0, false), None);
+        assert!(s.detour_wanted(0.0, 100.0, true).is_some());
+        assert_eq!(s.detour_wanted(5.0, 100.0, true), None, "moving");
+        // looked a moment ago: not again for half a minute
+        s.no_detour(100.0, 1);
+        assert_eq!(s.detour_wanted(0.0, 110.0, true), None);
+        assert!(s.detour_wanted(0.0, 131.0, true).is_some());
+    }
+
+    /// [ROLLBACK r4d-B2] A layover sent round the block while people get on keeps its doors
+    /// open for them: it leaves only once nobody holds them any more.
+    #[test]
+    fn a_layover_sent_round_the_block_waits_for_the_people_at_its_doors() {
+        let net = ring();
+        let mut v = test_vehicle();
+        let mut st = AiState::new(0, 50.0, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.route = vec![0, 4];
+        let mut s = BusService::new(vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 400.0, id: 7, side: 0.0 }]);
+        s.layover = true;
+        let ctx = ctx_on(&net, &[], 100.0, 0.0);
+        s.arrive(&ctx, 400.0, 7, (0, 50.0));
+        assert_eq!(s.phase, Phase::Boarding);
+        let d = plan_detour(&net, 0, 50.0, 50.0, 300.0, &|_| None).unwrap();
+        s.start_detour(&mut st, &net, d, 100.0, 1);
+        assert_eq!(s.phase, Phase::Boarding, "the doors stay open");
+        // somebody at the doors for 15 s
+        let mut closed_at = None;
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 60.0, |t, s, _| {
+            if s.phase == Phase::Closing && closed_at.is_none() {
+                closed_at = Some(t);
+            }
+            s.phase == Phase::Running
+        });
+        // (`drive` cannot hold the doors: do it by hand)
+        let mut s = BusService::new(vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 400.0, id: 7, side: 0.0 }]);
+        s.layover = true;
+        let mut st = AiState::new(0, 50.0, 1);
+        st.route = vec![0, 4];
+        s.arrive(&ctx, 400.0, 7, (0, 50.0));
+        let d = plan_detour(&net, 0, 50.0, 50.0, 300.0, &|_| None).unwrap();
+        s.start_detour(&mut st, &net, d, 100.0, 1);
+        let mut t = 100.0;
+        let mut closed = None;
+        while t < 160.0 {
+            if t < 115.0 {
+                s.hold(Some(7), 2.0);
+            }
+            let ctx = ctx_on(&net, &[], t, 0.0);
+            s.step(&mut st, &mut v, &ctx);
+            if s.phase != Phase::Boarding && closed.is_none() {
+                closed = Some(t);
+            }
+            t += 0.1;
+        }
+        let closed = closed.expect("it goes in the end");
+        assert!(closed >= 115.0 && closed < 118.0, "doors shut once nobody holds them: {closed}");
+        assert!(closed_at.is_some_and(|t| t < 115.0), "nobody at the doors: off once boarding is over");
+        assert_eq!(st.route, vec![0, 1, 2, 3, 0, 4], "and round the block");
+    }
+
+    /// [ROLLBACK r4d-B2] The through lanes are the lanes the traffic drives, not those of a
+    /// density: a density-0 lane the random cars use is one, a density-1 lane nobody drives
+    /// is not; another bus's route makes one, the bus's own does not; so does a lane beside.
+    #[test]
+    fn a_through_lane_is_one_the_traffic_drives() {
+        use omsi_sim::traffic::LaneBuilder;
+        let l = |x: f64| LaneBuilder::polyline(vec![glam::DVec3::new(x, 0.0, 0.0), glam::DVec3::new(x, 100.0, 0.0)], LaneKind::Street, 3.5);
+        let mut net = Network { lanes: vec![l(0.0), l(10.0), l(20.0), l(30.0)], ..Default::default() };
+        net.lanes[0].density = 0.0;
+        net.lanes[3].left = Some(2);
+        let mut t = ThroughLanes::default();
+        t.driven.insert(0);
+        t.routes.insert(1, vec![5]);
+        t.routes.insert(2, vec![5, 6]);
+        assert!(t.through(&net, 0, 5), "density 0, driven by cars");
+        assert!(!t.through(&net, 1, 5), "only its own route");
+        assert!(t.through(&net, 1, 6), "another bus's route");
+        assert!(t.through(&net, 2, 5));
+        assert!(t.through(&net, 3, 5), "a lane beside it");
+        assert!(t.used(1) && !t.used(3));
+        // a bus in the middle of a driven lane covers it; moved 3.2 m over into a bay it does not
+        assert!(covers_through_lane(&net, 0, 0.0, 1.25, true));
+        assert!(!covers_through_lane(&net, 0, 3.2, 1.25, true));
+        assert!(!covers_through_lane(&net, 0, 0.0, 1.25, false));
+    }
+
+    /// [ROLLBACK r4d-B2] Where a 12 m bus stands out of the way on a lane: another stop's bay,
+    /// the lane itself only when no vehicle's way uses it, the kerb of a parked row (a gap,
+    /// before it, after it) - never on a lane in use, never over a crossing, never where a
+    /// vehicle is.
+    #[test]
+    fn a_bus_parks_in_a_bay_on_an_unused_lane_or_at_the_kerb_of_a_parked_row() {
+        let none = |_: f32, _: f32, _: f32| true;
+        // a lane in use, nothing beside it: nowhere
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &[], &[], &none), None);
+        // nobody's way: the lane's end
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, false, &[], &[], &[], &none), Some((190.0, 0.0)));
+        // ... unless a crossing is there
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, false, &[], &[], &[195.0], &none), None);
+        // another stop's bay 3.2 m over
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[(80.0, 3.2)], &[], &[], &none), Some((80.0, 3.2)));
+        // a bay that leaves the bus over the lane is none
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[(80.0, 1.2)], &[], &[], &none), None);
+        // a parked row 3 m over from 60 to 90 m, cars 5 m apart: the kerb before it
+        let row: Vec<(f32, f32)> = (0..7).map(|k| (60.0 + 5.0 * k as f32, 3.0)).collect();
+        let (s, lat) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none).expect("the kerb before the row");
+        assert!(s < 60.0 - 2.3 - 8.0 && (lat - 3.35).abs() < 0.01, "{s} {lat}");
+        // the stretch before the row too short (row from 15 m): after it
+        let row: Vec<(f32, f32)> = (0..7).map(|k| (15.0 + 5.0 * k as f32, 3.0)).collect();
+        let (s, _) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none).expect("after the row");
+        assert!(s > 45.0 + 2.3 + 8.0, "{s}");
+        // a gap of 30 m in the row (no room before it or after it on an 80 m lane): the gap,
+        // unless somebody stands there
+        let mut row: Vec<(f32, f32)> = (0..4).map(|k| (15.0 + 5.0 * k as f32, 3.0)).collect();
+        row.extend((0..4).map(|k| (60.0 + 5.0 * k as f32, 3.0)));
+        assert_eq!(room_on_lane(80.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none), Some((45.0, 3.35)));
+        assert_eq!(room_on_lane(80.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &|_, _, _| false), None);
+        // a row so close to the lane that a bus there would still cover it: none
+        let row: Vec<(f32, f32)> = (0..7).map(|k| (60.0 + 5.0 * k as f32, 1.8)).collect();
+        assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none), None);
     }
 
     #[test]

@@ -2067,6 +2067,16 @@ impl Schedule {
                 self.waiting.push(i);
             }
         }
+        // [ROLLBACK r4d-B2] buses taken off the road as the last resort come back on their
+        // timetable for their departure
+        for (id, at) in std::mem::take(&mut traffic.respawned) {
+            self.running.retain(|r| r.car != id);
+            let dep = self.car_departure.remove(&id);
+            if let Some(i) = self.resumes.respawned(id, dep, at) {
+                self.retry_at.insert(i, at);
+                self.waiting.push(i);
+            }
+        }
         if self.car_departure.len() > 64 + traffic.cars.len() * 2 {
             let alive: std::collections::HashSet<u64> = traffic.cars.iter().map(|c| c.id).collect();
             self.car_departure.retain(|id, _| alive.contains(id));
@@ -2333,7 +2343,11 @@ impl Schedule {
         // [ROLLBACK r4d-B1] a trip whose bus drove off a dead end goes on past it: from the
         // step after the dead end, once its timetable has the bus there
         let resume = if onto.is_none() { self.resumes.resume_from.get(&i).copied() } else { None };
-        match self.resumes.decide(i, &slots, at, onto.is_some()) {
+        match self.resumes.decide(i, &slots, at, onto.is_some(), day_time) {
+            ResumeAt::Until(t) => {
+                self.retry_at.insert(i, t);
+                return Placed::Wait;
+            }
             ResumeAt::Drop => {
                 log::debug!("trip {trip_name}: nothing of its track after the dead end");
                 return Placed::Drop;
@@ -2848,6 +2862,10 @@ struct Resumes {
     /// Departures whose bus drove off a dead end: the step the trip resumes at. The bus
     /// comes back there when its timetable has it there, not before.
     resume_from: HashMap<usize, usize>,
+    /// [ROLLBACK r4d-B2] Departures whose bus was taken off the road as the last resort (it
+    /// blocked a through lane and could go nowhere): not put on the road again before this
+    /// time of day.
+    held: HashMap<usize, f64>,
 }
 
 /// What becomes of a departure put on the road again (`Resumes::decide`).
@@ -2857,6 +2875,8 @@ enum ResumeAt {
     Go,
     /// Its timetable has the bus before step `r` still: again when it is there.
     Before(usize),
+    /// [ROLLBACK r4d-B2] Its bus was taken off the road: again at this time of day.
+    Until(f64),
     /// Nothing of its track follows the dead end: the trip is over.
     Drop,
 }
@@ -2877,8 +2897,24 @@ impl Resumes {
         Some((i, step))
     }
 
-    /// Departure `i` is to be placed, its timetable having the bus at step `at` of `slots`.
-    fn decide(&mut self, i: usize, slots: &[Slot], at: usize, onto: bool) -> ResumeAt {
+    /// [ROLLBACK r4d-B2] Bus `car` (of departure `dep`, if it had one) was taken off the road
+    /// as the last resort: its trip comes back at `at`.
+    fn respawned(&mut self, car: u64, dep: Option<usize>, at: f64) -> Option<usize> {
+        self.route_end_step.remove(&car);
+        let i = dep?;
+        self.held.insert(i, at);
+        Some(i)
+    }
+
+    /// Departure `i` is to be placed at `day_time`, its timetable having the bus at step `at`
+    /// of `slots`.
+    fn decide(&mut self, i: usize, slots: &[Slot], at: usize, onto: bool, day_time: f64) -> ResumeAt {
+        if let Some(&t) = self.held.get(&i) {
+            if day_time < t && !onto {
+                return ResumeAt::Until(t);
+            }
+            self.held.remove(&i);
+        }
         let Some(&r) = self.resume_from.get(&i).filter(|_| !onto) else { return ResumeAt::Go };
         if !slots.iter().skip(r).any(|s| *s != Slot::Absent) {
             self.resume_from.remove(&i);
@@ -5282,23 +5318,38 @@ pub(crate) mod tests {
         let mut r = Resumes::default();
         r.placed(11, 3, 8);
         // another departure is not touched
-        assert_eq!(r.decide(4, &slots, 2, false), ResumeAt::Go);
+        assert_eq!(r.decide(4, &slots, 2, false, 0.0), ResumeAt::Go);
         assert_eq!(r.dead_ended(11, Some(3)), Some((3, 8)));
         assert_eq!(r.dead_ended(11, Some(3)), None, "once");
-        assert_eq!(r.decide(3, &slots, 5, false), ResumeAt::Before(8));
+        assert_eq!(r.decide(3, &slots, 5, false, 0.0), ResumeAt::Before(8));
         // the tour's own bus taking the trip on is not held back
-        assert_eq!(r.decide(3, &slots, 5, true), ResumeAt::Go);
-        assert_eq!(r.decide(3, &slots, 9, false), ResumeAt::Go);
+        assert_eq!(r.decide(3, &slots, 5, true, 0.0), ResumeAt::Go);
+        assert_eq!(r.decide(3, &slots, 9, false, 0.0), ResumeAt::Go);
         r.placed(12, 3, 11);
-        assert_eq!(r.decide(3, &slots, 2, false), ResumeAt::Go, "placed again: no longer held");
+        assert_eq!(r.decide(3, &slots, 2, false, 0.0), ResumeAt::Go, "placed again: no longer held");
         assert_eq!(r.dead_ended(12, Some(3)), Some((3, 11)));
         // nothing after the dead end: the trip is over
         let short = vec![lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, Slot::Absent];
-        assert_eq!(r.decide(3, &short, 9, false), ResumeAt::Drop);
-        assert_eq!(r.decide(3, &short, 9, false), ResumeAt::Go, "forgotten");
+        assert_eq!(r.decide(3, &short, 9, false, 0.0), ResumeAt::Drop);
+        assert_eq!(r.decide(3, &short, 9, false, 0.0), ResumeAt::Go, "forgotten");
         // a bus whose departure was lost meanwhile: nothing to put back
         r.placed(13, 5, 4);
         assert_eq!(r.dead_ended(13, None), None);
+    }
+
+    /// [ROLLBACK r4d-B2] A bus taken off the road as the last resort: its departure is not put
+    /// on the road again before the time it was given, and then as any departure.
+    #[test]
+    fn a_bus_taken_off_as_the_last_resort_comes_back_at_its_time() {
+        let slots = vec![Slot::Lane(0); 6];
+        let mut r = Resumes::default();
+        r.placed(21, 7, 6);
+        assert_eq!(r.respawned(21, Some(7), 1000.0), Some(7));
+        assert_eq!(r.decide(7, &slots, 0, false, 900.0), ResumeAt::Until(1000.0));
+        assert_eq!(r.decide(7, &slots, 0, false, 1000.0), ResumeAt::Go);
+        assert_eq!(r.decide(7, &slots, 0, false, 900.0), ResumeAt::Go, "once");
+        // nor is it a dead end
+        assert_eq!(r.dead_ended(21, Some(7)), None);
     }
 
     #[test]
