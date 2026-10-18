@@ -211,15 +211,30 @@ impl Lane {
     /// instead of becoming a chain of chords: a car following the chords turned in small
     /// jerks at every sample and at every lane joint.
     pub fn at(&self, s: f32) -> (DVec3, f32) {
+        self.at_with(s, &mut Tangents::default())
+    }
+
+    /// `at`, the tangents of the segment kept in `cache` for the next point.
+    fn at_with(&self, s: f32, cache: &mut Tangents) -> (DVec3, f32) {
         if self.points.len() < 2 {
             return (self.points.first().copied().unwrap_or(DVec3::ZERO), self.headings.first().copied().unwrap_or(0.0));
         }
         let (i, t) = self.locate(s);
         let (h0, h1) = (self.headings[i], self.headings[i + 1]);
-        (self.hermite(i, t as f64), h0 + wrap_deg(h1 - h0) * t)
+        (self.hermite(i, t as f64, cache), h0 + wrap_deg(h1 - h0) * t)
     }
 
-    fn hermite(&self, i: usize, t: f64) -> DVec3 {
+    /// The heading of `at`, without the point.
+    fn heading_at(&self, s: f32) -> f32 {
+        if self.points.len() < 2 {
+            return self.headings.first().copied().unwrap_or(0.0);
+        }
+        let (i, t) = self.locate(s);
+        let (h0, h1) = (self.headings[i], self.headings[i + 1]);
+        h0 + wrap_deg(h1 - h0) * t
+    }
+
+    fn hermite(&self, i: usize, t: f64, cache: &mut Tangents) -> DVec3 {
         let (a, b) = (self.points[i], self.points[i + 1]);
         let lin = a.lerp(b, t);
         let chord = (b - a).truncate();
@@ -227,8 +242,15 @@ impl Lane {
         if len < 1e-6 {
             return lin;
         }
-        let d0 = heading_dir(self.headings[i] as f64);
-        let d1 = heading_dir(self.headings[i + 1] as f64);
+        let key = (self as *const Lane as usize, i);
+        let (d0, d1) = match cache.0 {
+            Some((k, d0, d1)) if k == key => (d0, d1),
+            _ => {
+                let d = (heading_dir(self.headings[i] as f64), heading_dir(self.headings[i + 1] as f64));
+                cache.0 = Some((key, d.0, d.1));
+                d
+            }
+        };
         // tangents far off the chord (a kink in hand-made samples) would make the curve loop
         let c = chord / len;
         if d0.dot(c) < 0.8 || d1.dot(c) < 0.8 {
@@ -242,6 +264,21 @@ impl Lane {
     /// Position and heading at `s`, continued straight along the end tangents beyond either
     /// end of the lane.
     pub fn at_ext(&self, s: f32) -> (DVec3, f32) {
+        self.at_ext_with(s, &mut Tangents::default())
+    }
+
+    /// The heading of `at_ext`, without the point.
+    fn heading_at_ext(&self, s: f32) -> f32 {
+        if s < 0.0 {
+            self.start_heading()
+        } else if s > self.length() {
+            self.end_heading()
+        } else {
+            self.heading_at(s)
+        }
+    }
+
+    fn at_ext_with(&self, s: f32, cache: &mut Tangents) -> (DVec3, f32) {
         if s < 0.0 {
             let h = self.start_heading();
             let d = heading_dir(h as f64) * s as f64;
@@ -251,7 +288,7 @@ impl Lane {
             let d = heading_dir(h as f64) * (s - self.length()) as f64;
             (self.end() + DVec3::new(d.x, d.y, 0.0), h)
         } else {
-            self.at(s)
+            self.at_with(s, cache)
         }
     }
 
@@ -2765,6 +2802,12 @@ fn smooth01(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// The tangents of the lane segment `Lane::hermite` used last ((lane, segment), at its start,
+/// at its end): a run of points along a lane mostly falls in one segment, and the two sines
+/// and cosines were most of a point's cost.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tangents(Option<((usize, usize), DVec2, DVec2)>);
+
 /// A short sequence of lanes the way runs along, with the lane the car is on at `cur`.
 struct LaneSeq {
     lanes: [usize; PLAN_LANES + 2],
@@ -2783,9 +2826,9 @@ impl LaneSeq {
 
     /// Point and heading `u` metres into `lanes[i]` (beyond the ends of the first and last
     /// lane: straight on), with the joints on both sides smoothed.
-    fn at(&self, net: &Network, i: usize, u: f32) -> (DVec3, f32) {
+    fn at(&self, net: &Network, i: usize, u: f32, cache: &mut Tangents) -> (DVec3, f32) {
         let l = &net.lanes[self.lanes[i]];
-        let (mut p, h) = l.at_ext(u);
+        let (mut p, h) = l.at_ext_with(u, cache);
         let w = |x: f32| 1.0 - smooth01(x / JOINT_BLEND);
         if i > 0 {
             if let Some(g) = self.gap(net, i - 1) {
@@ -2818,8 +2861,19 @@ impl LaneSeq {
 
     /// Point and heading `d` metres from distance `s` of the current lane.
     fn point(&self, net: &Network, s: f32, d: f32) -> (DVec3, f32) {
+        self.point_with(net, s, d, &mut Tangents::default())
+    }
+
+    /// `point`, the tangents of the lane segment kept in `cache` for the next one.
+    fn point_with(&self, net: &Network, s: f32, d: f32, cache: &mut Tangents) -> (DVec3, f32) {
         let (i, u) = self.locate(net, s, d);
-        self.at(net, i, u)
+        self.at(net, i, u, cache)
+    }
+
+    /// The heading of `point`, without the point (the joints' smoothing moves the point only).
+    fn heading(&self, net: &Network, s: f32, d: f32) -> f32 {
+        let (i, u) = self.locate(net, s, d);
+        net.lanes[self.lanes[i]].heading_at_ext(u)
     }
 }
 
@@ -3216,16 +3270,28 @@ impl AiState {
     /// out to the side where it pulls into a bay or round a parked car. The steering
     /// follows this curve; it has no steps, so neither does the car.
     pub fn way_point(&self, net: &Network, d: f32) -> DVec3 {
-        let (mut p, mut h) = self.seq().point(net, self.s, d);
-        if let Some(c) = self.change {
-            if c.to < net.lanes.len() {
-                let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, d);
-                // how far the change will have got by the time the car is `d` metres on
-                let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
-                let k = smooth01(c.t + tau);
-                p = p.lerp(pt, k as f64);
-                h += wrap_deg(ht - h) * k;
-            }
+        let change = self.change.filter(|c| c.to < net.lanes.len()).map(|c| self.change_seq(c.to));
+        self.way_point_on(net, &self.seq(), change.as_ref(), d, &mut [Tangents::default(); 2])
+    }
+
+    /// `way_point` at each of `ds`: the same points, the lane sequences built once and the
+    /// tangents of a lane segment kept while the points fall in it (the perception samples
+    /// a hundred metres of way for every car each frame).
+    pub fn way_points(&self, net: &Network, ds: impl Iterator<Item = f32>) -> Vec<DVec3> {
+        let (seq, change) = (self.seq(), self.change.filter(|c| c.to < net.lanes.len()).map(|c| self.change_seq(c.to)));
+        let mut cache = [Tangents::default(); 2];
+        ds.map(|d| self.way_point_on(net, &seq, change.as_ref(), d, &mut cache)).collect()
+    }
+
+    fn way_point_on(&self, net: &Network, seq: &LaneSeq, change_seq: Option<&LaneSeq>, d: f32, cache: &mut [Tangents; 2]) -> DVec3 {
+        let (mut p, mut h) = seq.point_with(net, self.s, d, &mut cache[0]);
+        if let (Some(c), Some(cs)) = (self.change, change_seq) {
+            let (pt, ht) = cs.point_with(net, c.s_to, d, &mut cache[1]);
+            // how far the change will have got by the time the car is `d` metres on
+            let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
+            let k = smooth01(c.t + tau);
+            p = p.lerp(pt, k as f64);
+            h += wrap_deg(ht - h) * k;
         }
         let lat = self.lateral_at(self.odometer + d);
         if lat.abs() > 1e-3 {
@@ -3262,7 +3328,7 @@ impl AiState {
         let mut next = first;
         while d <= reach {
             let (i, u) = q.locate(net, s, d);
-            let turn = wrap_deg(q.point(net, s, d + 3.0).1 - q.point(net, s, d - 3.0).1).abs().to_radians() / 6.0;
+            let turn = wrap_deg(q.heading(net, s, d + 3.0) - q.heading(net, s, d - 3.0)).abs().to_radians() / 6.0;
             let k = net.lanes[q.lanes[i]].curvature_at(u).abs().max(turn);
             if k > 1e-4 {
                 let v = (self.lat_accel / k).sqrt().max(2.5);

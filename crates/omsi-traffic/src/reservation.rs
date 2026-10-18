@@ -447,10 +447,12 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
     }
     // a claim stands for the whole way through: the piece it names and the pieces that
     // one continues into, each as far along as its start lies (claim, piece, shift)
-    let mut expanded: Vec<(usize, usize, f32)> = Vec::new();
+    // (by junction and piece, in claim order: each foe looks up its own; scanning them all for
+    // every foe of every claim was most of the resolver's time once merges were foes too)
+    let mut expanded: hashbrown::HashMap<(usize, usize), Vec<(usize, f32)>> = hashbrown::HashMap::new();
     for (k, c) in claims.iter().enumerate() {
         for &(m, off) in &c.chain {
-            expanded.push((k, m, off));
+            expanded.entry((c.junction, m)).or_default().push((k, off));
         }
     }
     let _ = net;
@@ -497,7 +499,7 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
-            for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle) {
+            for &(ok, shift) in expanded.get(&(c.junction, foe.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle) {
                 // (one eased off for me in a mutual hold: not in my way at the junction; its
                 // body still is, to the plan)
                 if claims[ok].yields_now == Some(c.vehicle) {
