@@ -2182,6 +2182,26 @@ impl TrafficLightController {
         }
     }
 
+    /// Lights `a` and `b` of this program never let vehicles in at the same time: at no
+    /// point of the cycle (sampled every quarter second) do both show anything but red or
+    /// red-and-yellow (yellow counts as letting in: a driver may still take the line). Two
+    /// signal groups of conflicting streams; a light is never exclusive of itself.
+    pub fn never_together(&self, a: usize, b: usize) -> bool {
+        if a == b || a >= self.lights.len() || b >= self.lights.len() {
+            return false;
+        }
+        let lets_in = |s: i32| !matches!(Self::aspect(s), Aspect::Red | Aspect::RedYellow);
+        let cycle = self.cycle_len();
+        let mut x = 0.0;
+        while x < cycle {
+            if lets_in(self.state_at(a, x)) && lets_in(self.state_at(b, x)) {
+                return false;
+            }
+            x += 0.25;
+        }
+        true
+    }
+
     /// May a vehicle drive over the stop line now (not counting yellow, which is the
     /// driver's decision)?
     pub fn allows_go(state: i32) -> bool {
@@ -3735,6 +3755,20 @@ mod light_tests {
         let d = at(TrafficLightController::new(vec![vec![(0, 19.0), (3, 2.0), (6, 11.0), (9, 3.0), (0, 0.0)]], 38.0), 36.0);
         assert!((d.remaining(0) - 21.0).abs() < 1e-4, "{}", d.remaining(0));
         assert!(at(TrafficLightController::new(vec![vec![(6, 5.0)]], 0.0), 1.0).remaining(0).is_infinite());
+    }
+
+    #[test]
+    fn two_signal_groups_of_one_program_are_never_green_together_or_overlap() {
+        // 0: green 0-20, yellow 20-23, red to 40; 1: red 0-25, red-yellow 25-26, green 26-37,
+        // yellow 37-40; 2: green 15-35 (overlaps both)
+        let c = TrafficLightController::new(
+            vec![vec![(6, 20.0), (9, 3.0), (0, 17.0)], vec![(0, 25.0), (3, 1.0), (6, 11.0), (9, 3.0)], vec![(0, 15.0), (6, 20.0), (0, 5.0)]],
+            40.0,
+        );
+        assert!(c.never_together(0, 1) && c.never_together(1, 0));
+        assert!(!c.never_together(0, 2) && !c.never_together(1, 2));
+        assert!(!c.never_together(0, 0), "a light is not exclusive of itself");
+        assert!(!c.never_together(0, 7));
     }
 }
 

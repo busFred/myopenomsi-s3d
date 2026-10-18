@@ -62,6 +62,25 @@ pub struct Claim {
     /// lane's start; the first is minus its place along it). Empty: not known (a player off
     /// the lanes). (For a car behind me in my own lane.)
     pub lanes: Vec<(usize, f32)>,
+    /// The light at this junction's line (controller, light; `JunctionView::light`), None
+    /// on an unlit way. With `light_red` false the car has its green (or takes the yellow).
+    pub light: Option<(usize, usize)>,
+}
+
+/// What the resolver reads besides the claims: the light programs' signal groups.
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    /// (controller, light a, light b) with a < b: the two lights never let vehicles in at
+    /// the same time (`TrafficLightController::never_together`). A pair not in the map is
+    /// not known to be exclusive.
+    pub exclusive: hashbrown::HashMap<(usize, usize, usize), bool>,
+}
+
+impl Context {
+    /// Lights `a` and `b` (controller, light) are never green together.
+    pub fn exclusive(&self, a: (usize, usize), b: (usize, usize)) -> bool {
+        a.0 == b.0 && a.1 != b.1 && self.exclusive.get(&(a.0, a.1.min(b.1), a.1.max(b.1))).copied().unwrap_or(false)
+    }
 }
 
 impl Claim {
@@ -134,13 +153,18 @@ fn window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
 /// are each other's foes are put in an order first (`standing_order`), so that of two who
 /// would drop each other only one goes.
 pub fn resolve(js: &Junctions, net: &Network, claims: &[Claim]) -> Vec<Grant> {
-    let plain = decide(js, net, claims, None, None);
+    resolve_with(js, net, claims, &Context::default())
+}
+
+/// [`resolve`] knowing the light programs' signal groups (`ctx`).
+pub fn resolve_with(js: &Junctions, net: &Network, claims: &[Claim], ctx: &Context) -> Vec<Grant> {
+    let plain = decide_in(ctx, js, net, claims, None, None);
     let fed_up = !claims.iter().all(|c| c.impatience.claims_after().is_none() && c.impatience.value < HALF_FED_UP);
     if !fed_up && plain.iter().all(|g| g.go) {
         return plain;
     }
     let standing = standing_order(js, claims, &plain);
-    decide(js, net, claims, Some(&plain), Some(&standing))
+    decide_in(ctx, js, net, claims, Some(&plain), Some(&standing))
 }
 
 /// A claim as the second pass sees it.
@@ -308,7 +332,27 @@ fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
 /// One pass over the claims; `plain` is the first pass's answer in the second pass. Both
 /// drop followers and those behind on the same way; `standing` (the second pass) drops
 /// standing refused foes, the contenders decided in their order.
+#[cfg(test)]
 fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant]>, standing: Option<&[Standing]>) -> Vec<Grant> {
+    decide_in(&Context::default(), js, net, claims, plain, standing)
+}
+
+/// Lights before the table: a foe that my green makes no competitor. My light lets me
+/// in (`c` has a light and is not held by it), the foe stands or rolls towards a red that
+/// holds it (`light_red`: its driver stops there, wherever it is and however fast), and the
+/// two lights never let vehicles in together: it cannot come while I have my green, and
+/// when its own green comes mine is gone (a car of mine still inside is then waited for,
+/// `Claim::committed`). (Before, only a foe standing or creeping at its red was shifted to
+/// its green; a stream braking towards a long red at 1-12 m/s re-held a green leader every
+/// 3-5 s, viz3 case16: 50 s of a 57 s green.)
+fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
+    match (c.light, o.light) {
+        (Some(mine), Some(theirs)) => !c.light_red && o.light_red && ctx.exclusive(mine, theirs),
+        _ => false,
+    }
+}
+
+fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant]>, standing: Option<&[Standing]>) -> Vec<Grant> {
     let mut out: Vec<Option<Grant>> = vec![None; claims.len()];
     // (the contenders first, in their order: each sees whether the ones before it go)
     let mut order: Vec<usize> = (0..claims.len()).collect();
@@ -334,7 +378,9 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
         let node = &js.nodes[c.junction];
         let my_foes = js.foes_along(c.junction, &c.chain);
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
-        if c.committed || c.absolute {
+        // (held at my red I am held by my light, and no foe matters: the plan stops me at
+        // the line, before any meeting place)
+        if c.committed || c.absolute || c.light_red {
             out[k] = Some(Grant { vehicle: c.vehicle, go: true, wait_for: None, hold: None });
             continue;
         }
@@ -365,6 +411,10 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                     shifted.committed = false;
                 }
                 let o = &shifted;
+                // lights before the table: held at a red that is never green with mine
+                if !their_inside && red_foe(ctx, c, o) {
+                    continue;
+                }
                 // behind me in my own lane, or merging in behind me: it
                 // comes after me at any speed, committed or not
                 if behind_in_my_lane(c, &claims[ok], foe.theirs.0 - o.s) || (!their_inside && merging_behind(c, o, foe)) {
@@ -433,7 +483,7 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
                 // (two fed-up drivers must not squeeze in on each other: all four at an equal
                 // junction became fed up and went at once, into each other. The one with the
                 // lower index takes it first, the other waits for it.)
-                let goes_now = o.speed < 1.0 && (plain.map(|p| p[ok].go).unwrap_or(false) || (standing.is_some() && out[ok].map(|g| g.go).unwrap_or(false)));
+                let goes_now = o.speed < 1.0 && !o.light_red && (plain.map(|p| p[ok].go).unwrap_or(false) || (standing.is_some() && out[ok].map(|g| g.go).unwrap_or(false)));
                 // (never into a stream: a fed-up driver squeezes in front of a foe that is
                 // slow or still well away, not across one doing town speed 35 m off. A
                 // turner facing a green stream waits for it to stop at its red.)
@@ -522,7 +572,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new() }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -1153,7 +1203,9 @@ mod tests {
                 i += START_DELAY;
                 o += START_DELAY;
             }
-            if c.light_red && (c.speed < 0.5 || (c.red_hysteresis && c.speed <= 1.0)) {
+            // (round 4, rule A: a claimant held by its red is let go by the junction, its light
+            // holds it before any meeting place: it comes at its green, whatever its speed)
+            if c.light_red {
                 return c.until_go.map(|t| (i + t, o + t));
             }
             Some((i, o))
@@ -1243,12 +1295,15 @@ mod tests {
             let idx = |v: usize| claims.iter().position(|c| c.vehicle == v).unwrap();
             let can_move = |k: usize| {
                 let c = &claims[k];
-                !(c.blocked || (c.light_red && (c.speed < 0.5 || (c.red_hysteresis && c.speed <= 1.0))))
+                !(c.blocked || c.light_red)
             };
             for p in round3_both_released(js, &claims, &g) {
                 if !po.contains(&p) {
                     let (a, b) = (idx(p.0), idx(p.1));
-                    let moved = [a, b].iter().any(|&k| !old[k].go && g[k].go && can_move(k));
+                    // (round 4, rule A: one of the pair held by its red is let go by the junction and
+                    // claims again at its green, when the table decides between the two)
+                    let at_red = [a, b].iter().any(|&k| claims[k].light_red);
+                    let moved = !at_red && [a, b].iter().any(|&k| !old[k].go && g[k].go && can_move(k));
                     if !moved {
                         held_pairs += 1;
                         continue;
@@ -1317,5 +1372,72 @@ mod tests {
         let claims = [me, foe];
         let g = resolve(&js, &net, &claims);
         assert!(!grant_of(&g, 1).go, "the side car goes in front of a 10 m/s main road car 15 m out: {g:?}");
+    }
+
+    // ---- round 4: junction right of way ----
+
+    /// Lights (0, 0) on the main road and (0, 1) on the side road, never green together.
+    fn exclusive_lights() -> Context {
+        let mut ctx = Context::default();
+        ctx.exclusive.insert((0, 0, 1), true);
+        ctx
+    }
+
+    /// The side road car (1) has its green at the line; the main road car (2, right of way by
+    /// the table) rolls at `speed` towards its red `dist` m out.
+    fn green_side_red_main(dist: f32, speed: f32) -> (Network, Junctions, Vec<Claim>) {
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let mut me = claim(1, side, -1.0, 0.0);
+        me.light = Some((0, 1));
+        let mut foe = claim(2, main, mine0 - dist - 2.0, speed);
+        foe.light = Some((0, 0));
+        foe.light_red = true;
+        foe.until_go = Some(40.0);
+        (net, js, vec![me, foe])
+    }
+
+    #[test]
+    fn rule_a_a_foe_rolling_towards_a_red_never_green_with_mine_is_no_competitor() {
+        // at 10 m/s 20 m out, at 3 m/s 5 m out, standing 1 m out: whatever its speed
+        for (dist, speed) in [(20.0, 10.0), (5.0, 3.0), (1.0, 0.0), (60.0, 13.0)] {
+            let (net, js, claims) = green_side_red_main(dist, speed);
+            let g = resolve_with(&js, &net, &claims, &exclusive_lights());
+            assert!(grant_of(&g, 1).go, "{dist} m at {speed} m/s: {g:?}");
+            // the same phase (or not known to be exclusive): the old rules, it is waited for
+            let g = resolve_with(&js, &net, &claims, &Context::default());
+            if speed > 1.0 {
+                assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{dist} m at {speed} m/s, same phase: {g:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rule_a_a_foe_inside_the_box_is_kept_and_my_red_holds_me_not_the_foes() {
+        let (net, js, mut claims) = green_side_red_main(0.0, 2.0);
+        // its front in the meeting place (it took the line before its light went red)
+        let main = claims[1].movement;
+        let f = js.nodes[0].movements[main].foes[0];
+        claims[1].s = f.mine.0 + 1.0 - 2.0;
+        let g = resolve_with(&js, &net, &claims, &exclusive_lights());
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // not held by its red (it goes through: light_red false): a competitor whatever the lights
+        let (net, js, mut claims) = green_side_red_main(20.0, 10.0);
+        claims[1].light_red = false;
+        let g = resolve_with(&js, &net, &claims, &exclusive_lights());
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // my own light red: held by it, the junction holds me for nobody
+        let (net, js, mut claims) = green_side_red_main(20.0, 10.0);
+        claims[1].light_red = false;
+        claims[0].light_red = true;
+        claims[0].until_go = Some(30.0);
+        let g = resolve_with(&js, &net, &claims, &exclusive_lights());
+        assert!(grant_of(&g, 1).go && grant_of(&g, 1).wait_for.is_none(), "{g:?}");
+        // an unlit foe is no red foe
+        let (net, js, mut claims) = green_side_red_main(20.0, 10.0);
+        claims[1].light = None;
+        let g = resolve_with(&js, &net, &claims, &exclusive_lights());
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
     }
 }

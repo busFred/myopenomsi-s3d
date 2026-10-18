@@ -578,7 +578,10 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
     // what the switches were once: a list with all of them on (`all` too) is the current rules
     let with = |v: u32, l: Option<&str>| Header { version: v, switches: l.map(str::to_string), ..r.header.clone() };
-    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some("signal_foes, stub_links,competitor_filter,pass_room"))), None);
+    let current = omsi_traffic::record::RULES.replace(',', ", ") + ",pass_room";
+    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some(&current))), None);
+    // (round 4: the round-3 list lacks the junction rules added since)
+    assert!(omsi_traffic::replay::other_rules(&with(2, Some("signal_foes, stub_links,competitor_filter,pass_room"))).is_some_and(|w| w.contains("lights_first")));
     assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some("all"))), None);
     // ... and one without some, or none recorded, or format 1, was made under other rules
     assert!(omsi_traffic::replay::other_rules(&with(2, Some("competitor_filter,signal_foes"))).is_some_and(|w| w.contains("stub_links")));

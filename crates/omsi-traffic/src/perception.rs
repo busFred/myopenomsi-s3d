@@ -98,6 +98,62 @@ pub struct JunctionView {
     pub conflict_start: f32,
     /// Room past the junction's conflicts for this vehicle, measured along its own way.
     pub exit_room: bool,
+    /// Distance from the origin to the first place where the way meets another way (not
+    /// one of its own pieces, nor a piece forking where one of them starts): a light that
+    /// holds the car at this junction stands before it (the end of the way through when
+    /// it meets nobody).
+    pub light_line: f32,
+    /// The light at this junction's line: (controller, light, distance from the origin to
+    /// the lit lane's start, negative once passed). The first lit lane of the way, from the
+    /// lane leading in, before `light_line`; for a car inside the junction past it, the
+    /// lit lane it came through (looked for back along the pieces of the junction).
+    pub light: Option<(usize, usize, f32)>,
+    /// The front is over that light's line (by more than half a metre), or the lit lane lies
+    /// behind the car.
+    pub past_line: bool,
+}
+
+/// The light of junction `j` that a car on its pieces came through: back from `lane` along
+/// the lanes leading into it (the car's own previous lane first), within the junction and the
+/// lane leading into it, at most eight pieces or 80 m. (controller, light, distance from the
+/// origin to the lit lane's start; `back` is the distance to `lane`'s start, <= 0.) None when
+/// none is found or two different lights are (the way it came is not known).
+fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
+    let mut found: Option<(usize, usize, f32)> = None;
+    let mut ambiguous = false;
+    // (lane, distance from the origin to its start, steps)
+    let mut stack: Vec<(usize, f32, usize)> = vec![(lane, back, 0)];
+    while let Some((l, d, n)) = stack.pop() {
+        if n >= 8 || d < -80.0 {
+            continue;
+        }
+        let prevs = net.prev.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+        // the way it came: its previous lane, when it is one of them
+        let only: Option<usize> = if n == 0 { prev_lane.filter(|p| prevs.contains(p)) } else { None };
+        for &p in prevs {
+            if only.is_some_and(|o| o != p) {
+                continue;
+            }
+            let Some(pl) = net.lanes.get(p) else { continue };
+            let dp = d - pl.length();
+            if let Some((ctl, li)) = pl.traffic_light {
+                match found {
+                    Some((c, i, _)) if (c, i) != (ctl, li) => ambiguous = true,
+                    Some(_) => {}
+                    None => found = Some((ctl, li, dp)),
+                }
+                continue;
+            }
+            if js.of_lane.get(&p).map(|x| x.0) == Some(j) {
+                stack.push((p, dp, n + 1));
+            }
+        }
+    }
+    if ambiguous {
+        None
+    } else {
+        found
+    }
 }
 
 /// A lane beside the current one.
@@ -600,7 +656,39 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
             }
         }
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need });
+        // the light at this junction's line: on the way before the first meeting place with
+        // another way, wherever the object begins (BeijingCity lights a 1 m stub inside the
+        // crossing object, past its lead-in piece). (The lead-in and its own stub end 1 m
+        // apart and compile as a merge of each other: a meeting place of the way with itself,
+        // before the light, which is no meeting with anybody else's way; nor is one with a
+        // piece forking from where one of my own pieces starts: an unlit 0.3 m stub beside the
+        // lit one at the end of the lead-in.)
+        let light_line = {
+            let node = &js.nodes[j];
+            let starts: Vec<DVec3> = chain.iter().filter_map(|&(mm, _)| net.lanes.get(node.movements[mm].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
+            let fork = |mm: usize| net.lanes.get(node.movements[mm].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
+            let first = foes.iter().filter(|f| !chain.iter().any(|&(mm, _)| mm == f.movement) && !fork(f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            if first.is_finite() {
+                d0 + first
+            } else {
+                conflict_start
+            }
+        };
+        let mut light = None;
+        for &(wl, wd) in &way[k.saturating_sub(1)..] {
+            if wd > light_line + 1.0 {
+                break;
+            }
+            if let Some((ctl, li)) = net.lanes[wl].traffic_light {
+                light = Some((ctl, li, wd));
+                break;
+            }
+        }
+        if light.is_none() && inside && k == 0 {
+            light = light_behind(net, js, j, l, d0, me.state.prev_lane);
+        }
+        let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line });
     }
     None
 }

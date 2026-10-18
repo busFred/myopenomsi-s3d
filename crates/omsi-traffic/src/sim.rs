@@ -294,6 +294,9 @@ pub struct Simulation {
     pub removed: Vec<usize>,
     /// Vehicles counted standing at a red light this frame (diagnostics).
     pub held_at_red: usize,
+    /// What the junction grants read besides the claims: the pairs of lights that are
+    /// never green together, filled in as claimants meet.
+    pub signal_groups: reservation::Context,
 }
 
 impl Simulation {
@@ -316,6 +319,7 @@ impl Simulation {
             left_hand: net.left_hand,
             removed: Vec::new(),
             held_at_red: 0,
+            signal_groups: reservation::Context::default(),
         }
     }
 
@@ -597,27 +601,10 @@ impl Simulation {
             let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
-            // the way before the first meeting place with
-            // another way, wherever the object begins (BeijingCity lights a 1 m stub
-            // inside the crossing object, past its lead-in piece: the old test, the light
-            // within 1 m of the object's entry, never saw a car standing at that red as
-            // held by it). (The lead-in and its own stub end 1 m apart and compile as a
-            // merge of each other: a meeting place of the way with itself, before the
-            // light, which is no meeting with anybody else's way.)
-            // (and not with a piece forking from where one of my own pieces starts: an unlit
-            // 0.3 m stub beside the lit one at the end of the lead-in, which merged with the
-            // lead-in a few metres before the light, put the line before the light)
-            let light_line = {
-                let node = &self.junctions.nodes[j.junction];
-                let starts: Vec<glam::DVec3> = j.chain.iter().filter_map(|&(m, _)| net.lanes.get(node.movements[m].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
-                let fork = |m: usize| net.lanes.get(node.movements[m].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
-                let first = self.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| !j.chain.iter().any(|&(m, _)| m == f.movement) && !fork(f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
-                if first.is_finite() {
-                    j.entry + first
-                } else {
-                    j.conflict_start
-                }
-            };
+            // the way before the first meeting place with another way, wherever the object
+            // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
+            // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
+            let light_line = j.light_line;
             let (light_red, until_go) = match p.signal {
                 Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
@@ -673,6 +660,7 @@ impl Simulation {
                 blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
                 red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
+                light: j.light.map(|(c, l, _)| (c, l)),
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -759,12 +747,29 @@ impl Simulation {
                 blocked: false,
                 red_hysteresis: false,
                 lanes: Vec::new(),
+                light: None,
             });
         }
         for (i, standing) in standing_now {
             vehicles[i].claim_standing = standing;
         }
-        let grants: Vec<Grant> = reservation::resolve(&self.junctions, net, &claims);
+        // the signal groups the claimants' lights belong to: which pairs never let vehicles
+        // in together (worked out once per pair of lights, from the programs)
+        for a in 0..claims.len() {
+            let Some((ctl, la)) = claims[a].light else { continue };
+            for b in a + 1..claims.len() {
+                let Some((ctl_b, lb)) = claims[b].light else { continue };
+                if ctl_b != ctl || la == lb || claims[b].junction != claims[a].junction {
+                    continue;
+                }
+                let key = (ctl, la.min(lb), la.max(lb));
+                if !self.signal_groups.exclusive.contains_key(&key) {
+                    let ex = self.lights.get(ctl).is_some_and(|c| c.never_together(la, lb));
+                    self.signal_groups.exclusive.insert(key, ex);
+                }
+            }
+        }
+        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
 
         // plan and act, one vehicle at a time
         for i in 0..vehicles.len() {
