@@ -65,6 +65,9 @@ pub struct Claim {
     /// or clearing, between which the table decides (two clearing claimants both went:
     /// review9, a left turner in the box against an amber runner).
     pub clearing: bool,
+    /// A standing standoff broken in its favour (`Simulation::break_standoffs`): the other
+    /// one (the caller's index) is no foe of it for a few seconds.
+    pub ignore: Option<usize>,
     /// Standing as of its last claim (`was_standing`): creeping to its red
     /// under 1 m/s it is still held there (its claim shifted by `until_go`).
     pub red_hysteresis: bool,
@@ -488,7 +491,7 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
-            for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle) {
+            for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle && Some(claims[k].vehicle) != c.ignore) {
                 // the foe as it stands on this piece of its way
                 let mut shifted = claims[ok].clone();
                 shifted.s -= shift;
@@ -793,7 +796,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, ignore: None }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2268,6 +2271,16 @@ mod tests {
             b2.committed = true;
             let g = resolve(&js, &net, &[a, b2]);
             assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "{g:?}");
+        }
+        #[test]
+        fn standoff_a_claimant_ignoring_the_other_of_a_broken_standoff_drops_it() {
+            let (net, js) = four_way(192.0, 64.0);
+            let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+            let mut me = claim(1, side, -1.0, 0.0);
+            let foe = claim(2, main, -3.0, 0.0);
+            assert_eq!(grant_of(&resolve(&js, &net, &[me.clone(), foe.clone()]), 1).wait_for, Some(2));
+            me.ignore = Some(2);
+            assert!(grant_of(&resolve(&js, &net, &[me, foe]), 1).go);
         }
     }
 }

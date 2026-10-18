@@ -351,3 +351,62 @@ fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane
     let at = stood_at.expect("the car never stood for the main road");
     assert!(at <= -19.5, "stood with its front at x = {at:.1}, past the line into the converging lead-ins");
 }
+
+#[test]
+fn a_standing_standoff_with_no_compiled_foe_is_broken_after_3_s() {
+    // two lanes 2.6 m apart, no meeting place between them (as viz3 case06's 4516/4541)
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1));
+    net.lanes.push(road(&[(0.0, 2.6), (100.0, 2.6)], 2));
+    let net = finish(net);
+    let standoff = |a_s: f32, b_s: f32, a_body: bool, b_body: bool| -> (Vec<Vehicle>, Simulation) {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(1, 0, a_s, 0.0), car(2, 1, b_s, 0.0)];
+        if a_body { cars[0].last.body_block = Some(2) } else { cars[0].last.wait_for = Some(2) }
+        if b_body { cars[1].last.body_block = Some(1) } else { cars[1].last.wait_for = Some(1) }
+        for _ in 0..7 {
+            sim.break_standoffs(&mut cars, 0.5);
+        }
+        (cars, sim)
+    };
+    // both waiting for each other: the further along goes (car 2), after 3 s
+    let (cars, _) = standoff(50.0, 50.5, false, false);
+    assert!(cars[1].ignore_lead.is_some_and(|(id, _)| id == 1) && cars[0].ignore_lead.is_none(), "{:?} {:?}", cars[0].ignore_lead, cars[1].ignore_lead);
+    // level: the lower id
+    let (cars, _) = standoff(50.0, 50.0, false, false);
+    assert!(cars[0].ignore_lead.is_some() && cars[1].ignore_lead.is_none());
+    // car 2 further along, but body-blocked by car 1 which only waits for it: car 1 goes
+    let (cars, _) = standoff(50.0, 50.5, false, true);
+    assert!(cars[0].ignore_lead.is_some_and(|(id, _)| id == 2) && cars[1].ignore_lead.is_none());
+    // not yet 3 s: nobody
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 50.0, 0.0), car(2, 1, 50.5, 0.0)];
+    cars[0].last.wait_for = Some(2);
+    cars[1].last.wait_for = Some(1);
+    for _ in 0..5 {
+        sim.break_standoffs(&mut cars, 0.5);
+    }
+    assert!(cars.iter().all(|c| c.ignore_lead.is_none()));
+    // one of them moving: no standoff
+    let mut cars = vec![car(1, 0, 50.0, 2.0), car(2, 1, 50.5, 0.0)];
+    cars[0].last.wait_for = Some(2);
+    cars[1].last.wait_for = Some(1);
+    for _ in 0..8 {
+        sim.break_standoffs(&mut cars, 0.5);
+    }
+    assert!(cars.iter().all(|c| c.ignore_lead.is_none()));
+}
+
+#[test]
+fn a_standoff_between_lanes_with_a_compiled_meeting_place_is_left_to_the_table() {
+    // the side and main pieces of `long_way_through` cross: a compiled foe
+    let net = long_way_through(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 1, 5.0, 0.0), car(2, 4, 5.0, 0.0)];
+    cars[0].last.wait_for = Some(2);
+    cars[1].last.wait_for = Some(1);
+    for _ in 0..8 {
+        sim.break_standoffs(&mut cars, 0.5);
+    }
+    assert!(cars.iter().all(|c| c.ignore_lead.is_none()));
+}

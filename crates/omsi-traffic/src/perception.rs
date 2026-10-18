@@ -505,6 +505,10 @@ fn body_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize
         if o.last.body_block == Some(me.id) && me.id > o.id {
             continue;
         }
+        // (a standoff broken in my favour, `Simulation::break_standoffs`)
+        if me.ignore_lead.is_some_and(|(id, until)| id == o.id && sim.time < until) {
+            continue;
+        }
         let b = o.obb();
         if let Some(d) = way.hit(&b, me.half_width as f64, look) {
             let gap = d - st.front;

@@ -228,6 +228,10 @@ pub struct Vehicle {
     /// from these, so a keyframe restores it.
     #[serde(default)]
     pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    /// Standing in a standoff: (the other's id, seconds), each holding the other (`Simulation::
+    /// break_standoffs`).
+    #[serde(default)]
+    pub standoff: Option<(u64, f32)>,
 }
 
 impl Vehicle {
@@ -260,6 +264,7 @@ impl Vehicle {
             passed_on_go: None,
             amber_line: None,
             zip_won: None,
+            standoff: None,
         }
     }
 
@@ -300,6 +305,12 @@ pub struct Occupant {
     /// Passing on this lane against its direction.
     pub foreign: bool,
 }
+
+/// Two standing vehicles holding each other this long (s) are a standoff
+/// (`Simulation::break_standoffs`) ...
+pub const STANDOFF_SECS: f32 = 3.0;
+/// ... and the one that goes ignores the other this long (s).
+pub const STANDOFF_IGNORE: f64 = 5.0;
 
 /// Grid cell size of the vehicle and people grids (m).
 const GRID: f64 = 50.0;
@@ -622,6 +633,8 @@ impl Simulation {
         // the claimants' standing hysteresis as of this claim, written
         // back once all claims are filed
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
+        // vehicle index by id (a standoff's other one)
+        let ids: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         // the line each vehicle has passed on green or yellow, written back with them
         let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
         let mut stale_amber: Vec<usize> = Vec::new();
@@ -747,6 +760,7 @@ impl Simulation {
                 // lets it go on a schedule, as a light or a lead moving off does)
                 // in the box when its light turned: it clears it (rule F)
                 clearing: j.clearing,
+                ignore: v.ignore_lead.filter(|&(_, until)| self.time < until).and_then(|(id, _)| ids.get(&id).copied()),
                 stuck: st.speed < 0.3
                     && v.last.held
                     && match v.last.why {
@@ -884,6 +898,7 @@ impl Simulation {
                 blocked,
                 stuck: false,
                 clearing: false,
+                ignore: None,
                 red_hysteresis: false,
                 lanes: way,
                 light,
@@ -945,6 +960,7 @@ impl Simulation {
             let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
             self.act(net, vehicles, i, plan, dt);
         }
+        self.break_standoffs(vehicles, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
     }
 
@@ -1091,6 +1107,56 @@ impl Simulation {
         }
         if !alive {
             self.removed.push(i);
+        }
+    }
+
+    /// Two standing vehicles each held by the other, by its body across the way or a junction
+    /// wait (`Decision::body_block`, `Decision::wait_for`), for more than `STANDOFF_SECS`, with
+    /// no meeting place compiled between the lanes they stand on (lanes converging too close
+    /// for the network to know them as foes): the one further along its lane (then the lower
+    /// id) goes, unless the other's body is across its way and its own is not across the
+    /// other's (then the other goes), ignoring the other for `STANDOFF_IGNORE` s (`Vehicle::ignore_lead`, read by
+    /// the perception and the claim); the other keeps holding. (viz3 case06: #15110 and
+    /// #10813, 2.6 m apart on 4516/4541, stood 60 s so.)
+    pub fn break_standoffs(&mut self, vehicles: &mut [Vehicle], dt: f32) {
+        let ids: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+        let holds = |v: &Vehicle, other: u64| v.last.body_block == Some(other) || v.last.wait_for == Some(other);
+        let mut next: Vec<Option<(u64, f32)>> = vec![None; vehicles.len()];
+        for (i, v) in vehicles.iter().enumerate() {
+            if v.state.speed >= 0.3 {
+                continue;
+            }
+            let other = [v.last.body_block, v.last.wait_for].into_iter().flatten().find(|o| ids.get(o).is_some_and(|&j| vehicles[j].state.speed < 0.3 && holds(&vehicles[j], v.id)));
+            if let Some(o) = other {
+                let t = match v.standoff {
+                    Some((p, t)) if p == o => t + dt,
+                    _ => dt,
+                };
+                next[i] = Some((o, t));
+            }
+        }
+        for i in 0..vehicles.len() {
+            vehicles[i].standoff = next[i];
+            let Some((o, t)) = next[i] else { continue };
+            if t <= STANDOFF_SECS {
+                continue;
+            }
+            let j = ids[&o];
+            let (a, b) = (&vehicles[i], &vehicles[j]);
+            // a compiled meeting place between the lanes they stand on: the table decides
+            let foe = match (self.junctions.of_lane.get(&a.state.lane), self.junctions.of_lane.get(&b.state.lane)) {
+                (Some(&(ja, ma)), Some(&(jb, mb))) if ja == jb => self.junctions.nodes[ja].movements[ma].foes.iter().any(|f| f.movement == mb),
+                _ => false,
+            };
+            // (one whose way the other's body is across cannot go through it: the other goes;
+            // else the further along its lane, then the lower id)
+            let (a_body, b_body) = (a.last.body_block == Some(b.id), b.last.body_block == Some(a.id));
+            let first = if a_body != b_body { b_body } else { a.state.s > b.state.s || (a.state.s == b.state.s && a.id < b.id) };
+            if foe || !first || a.ignore_lead.is_some_and(|(id, until)| id == o && self.time < until) {
+                continue;
+            }
+            log::info!("traffic: standoff of #{} and #{} for {t:.1} s broken, #{} goes", a.id, b.id, a.id);
+            vehicles[i].ignore_lead = Some((o, self.time + STANDOFF_IGNORE));
         }
     }
 
