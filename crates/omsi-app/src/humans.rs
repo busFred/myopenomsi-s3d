@@ -1554,7 +1554,7 @@ struct Around<'a> {
     lights: Option<&'a dyn PedLights>,
     cars: &'a [SeenCar],
     /// [ROLLBACK r4c-P4] The people on the carriageway of each crossing (by its key).
-    streams: &'a HashMap<usize, Vec<(u32, DVec2)>>,
+    streams: &'a Streams,
     time: f64,
 }
 
@@ -1995,7 +1995,7 @@ fn pedestrian_window(
 /// One frame of a walk along the pavement network: where `me` goes, and what they decide at
 /// the kerbs.
 #[allow(clippy::too_many_arguments)]
-fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rng: &mut u64, yields: &mut HashMap<u64, f64>, dt: f32) -> Want {
+fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rng: &mut u64, yields: &mut Yields, dt: f32) -> Want {
     let net = at.net;
     let pos2 = me.pos;
     me.walk_pace = me.pace;
@@ -2205,6 +2205,13 @@ fn late_stepper(id: u32, key: usize) -> bool {
 const PED_YIELD_AFTER: f32 = 8.0;
 /// [ROLLBACK r4c-P4] Seconds the people arriving at the kerb wait for such a vehicle, at most.
 const PED_YIELD_MAX: f32 = 6.0;
+/// [ROLLBACK r4c-L4] All the yields to one standing vehicle lie within this many seconds of the
+/// first (3 x PED_YIELD_MAX).
+const PED_YIELD_CAP: f32 = 3.0 * PED_YIELD_MAX;
+/// The people on the carriageway of each crossing (by its key): id, position, velocity.
+type Streams = HashMap<usize, Vec<(u32, DVec2, DVec2)>>;
+/// The vehicles yielded to: the start of the current window and of the first.
+type Yields = HashMap<u64, (f64, f64)>;
 /// [ROLLBACK r4c-P4] A stream: somebody else on the crossing within this distance (m).
 const PED_STREAM_GAP: f64 = 3.0;
 const YIELDS: &str = "yields to a standing vehicle";
@@ -2398,7 +2405,7 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
 /// the clearance until a light of the carriageway turns green - must do; without a light no
 /// car may be about to pass the crossing. Somebody who has waited very long takes any green
 /// (never a red).
-fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut HashMap<u64, f64>) -> Result<(), &'static str> {
+fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut Yields) -> Result<(), &'static str> {
     let net = at.net;
     let next = walk.legs[c.from];
     let pace = me.pace;
@@ -2444,7 +2451,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // of people that never gaps (a station's crossing: heads stood 75 and 90 s): the people
     // arriving let it pass, for a few seconds; those on the carriageway go on across
     let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
-    let stream = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q)| *id != me.id && (*q - me.pos).length() < PED_STREAM_GAP)).unwrap_or(false);
+    let stream = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q, _)| *id != me.id && (*q - me.pos).length() < PED_STREAM_GAP)).unwrap_or(false);
     for car in at.cars {
         if car.vel.length() >= 0.5 || car.stood <= PED_YIELD_AFTER || !stands_at(car, &cuts) {
             continue;
@@ -2452,24 +2459,33 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
         // (somebody of the stream still on the crossing in front of it: the vehicle's seconds
         // start once they are off it - with the window running from the first yield the
         // crossing was clear for a second of the six, and the queue stood 90 s)
-        let in_front = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q)| *id != me.id && cuts.iter().any(|x| (*q - *x).length() < 2.0 && stands_at(car, std::slice::from_ref(x))))).unwrap_or(false);
-        match yields.get(&car.id) {
-            Some(&since) if at.time - since < PED_YIELD_MAX as f64 => {
+        // (only somebody walking towards the cut: one lingering there held the clock for good)
+        let in_front = at.streams.get(&c.key).map(|v| {
+            v.iter().any(|(id, q, vel)| {
+                *id != me.id && cuts.iter().any(|x| (*q - *x).length() < 2.0 && vel.length() > 0.2 && vel.dot(*x - *q) > 0.0 && stands_at(car, std::slice::from_ref(x)))
+            })
+        });
+        let in_front = in_front.unwrap_or(false);
+        match yields.get(&car.id).copied() {
+            // (all the yields to one vehicle, resets and renewals too, within PED_YIELD_CAP of
+            // the first)
+            Some((_, first)) if at.time - first >= PED_YIELD_CAP as f64 => {}
+            Some((since, first)) if at.time - since < PED_YIELD_MAX as f64 => {
                 if in_front {
-                    yields.insert(car.id, at.time);
+                    yields.insert(car.id, (at.time, first));
                 }
                 return Err(YIELDS);
             }
             // [ROLLBACK r4c-L4] still standing after the people's own turn (as long again): it
             // is let go again (once, the people on a long crossing outlasted the window and
             // the vehicle stood for good)
-            Some(&since) if stream && at.time - since >= 2.0 * PED_YIELD_MAX as f64 => {
-                yields.insert(car.id, at.time);
+            Some((since, first)) if stream && at.time - since >= 2.0 * PED_YIELD_MAX as f64 => {
+                yields.insert(car.id, (at.time, first));
                 return Err(YIELDS);
             }
             Some(_) => {}
             None if stream => {
-                yields.insert(car.id, at.time);
+                yields.insert(car.id, (at.time, at.time));
                 return Err(YIELDS);
             }
             None => {}
@@ -2874,9 +2890,9 @@ pub struct Humans {
     /// [ROLLBACK r4c-P4] Seconds each vehicle near has stood, by id.
     car_stood: HashMap<u64, f32>,
     /// [ROLLBACK r4c-P4] The vehicles people at an unlit crossing yield to, and since when.
-    yields: HashMap<u64, f64>,
+    yields: Yields,
     /// [ROLLBACK r4c-P4] The people on the carriageway of each crossing (by its key) this frame.
-    streams: HashMap<usize, Vec<(u32, DVec2)>>,
+    streams: Streams,
     hidden: Vec<usize>,
     /// GPU side of the human types, shared by everyone of a type: textures by file and the
     /// materials of every (type, mesh) - each person used to upload its own copies - and
@@ -6020,11 +6036,11 @@ impl Humans {
             let car_stood = &self.car_stood;
             self.yields.retain(|id, _| car_stood.get(id).map(|s| *s > 0.0).unwrap_or(false));
             // and who is on the carriageway of which crossing
-            let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
+            let mut streams: Streams = HashMap::new();
             for p in &self.people {
                 if let State::Strolling(w) = &p.state {
                     if let Some(c) = w.cross.filter(|c| c.on(w.leg) && p.on_crossing) {
-                        streams.entry(c.key).or_default().push((p.id, p.position.truncate()));
+                        streams.entry(c.key).or_default().push((p.id, p.position.truncate(), p.vel));
                     }
                 }
             }
@@ -8554,7 +8570,7 @@ mod ped_tests {
 
     /// `frame` with the streams on the crossings and the yields to vehicles.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn frame_with(net: &Network, ped: &mut PedNet, lights: Option<&dyn PedLights>, cars: &[SeenCar], streams: &HashMap<usize, Vec<(u32, DVec2)>>, yields: &mut HashMap<u64, f64>, t: f64, me: &mut Me, walk: &mut PedWalk, dt: f32) -> DVec2 {
+    pub(super) fn frame_with(net: &Network, ped: &mut PedNet, lights: Option<&dyn PedLights>, cars: &[SeenCar], streams: &Streams, yields: &mut Yields, t: f64, me: &mut Me, walk: &mut PedWalk, dt: f32) -> DVec2 {
         let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ me.id as u64;
         let at = Around { net, lights, cars, streams, time: t };
         let w = stroll(Some(ped), &at, me, walk, &mut rng, yields, dt);
@@ -9078,15 +9094,15 @@ mod ped_tests {
     /// Somebody arriving at the kerb with another person just ahead of them on the crossing
     /// (`stream`) and the car of `car_before` standing there `stood` s: their decisions over
     /// `secs` (time, decision), where they end up and the yields.
-    fn arrive_at(lit: bool, stood: f32, stream: bool, secs: f32) -> (Vec<(f32, Option<&'static str>)>, Me, HashMap<u64, f64>) {
+    fn arrive_at(lit: bool, stood: f32, stream: bool, secs: f32) -> (Vec<(f32, Option<&'static str>)>, Me, Yields) {
         let (net, mut ped) = crossing(lit);
         let lights = FakeLights::new(GREEN, 60.0);
         let mut walk = across();
         walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
         let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
-        let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
+        let mut streams: Streams = HashMap::new();
         if stream {
-            streams.insert(3, vec![(50, DVec2::new(0.0, -4.5))]);
+            streams.insert(3, vec![(50, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
         }
         let mut yields = HashMap::new();
         let mut car = car_before(stood);
@@ -9124,10 +9140,10 @@ mod ped_tests {
         // a car standing on, a stream on: those arriving let it go for 6 s, cross themselves
         // for as long, then let it go again (once, it stood for good after the first 6 s)
         let (net, mut ped) = crossing(false);
-        let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
-        streams.insert(3, vec![(50, DVec2::new(0.0, -4.5))]);
+        let mut streams: Streams = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
         let mut yields = HashMap::new();
-        let decide = |t: f64, yields: &mut HashMap<u64, f64>, ped: &mut PedNet| {
+        let decide = |t: f64, yields: &mut Yields, ped: &mut PedNet| {
             let mut walk = across();
             walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
             let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
@@ -9145,9 +9161,9 @@ mod ped_tests {
         // while somebody of the stream is still on the crossing in front of the car, its six
         // seconds wait for them to be off it
         let mut yields = HashMap::new();
-        let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
-        streams.insert(3, vec![(50, DVec2::new(0.0, -1.75)), (51, DVec2::new(0.0, -4.5))]);
-        let decide = |t: f64, yields: &mut HashMap<u64, f64>, ped: &mut PedNet, streams: &HashMap<usize, Vec<(u32, DVec2)>>| {
+        let mut streams: Streams = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -2.5), DVec2::new(0.0, 1.2)), (51, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
+        let decide = |t: f64, yields: &mut Yields, ped: &mut PedNet, streams: &Streams| {
             let mut walk = across();
             walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
             let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
@@ -9159,9 +9175,35 @@ mod ped_tests {
         assert_eq!(decide(0.0, &mut yields, &mut ped, &streams), Some(YIELDS));
         assert_eq!(decide(5.0, &mut yields, &mut ped, &streams), Some(YIELDS));
         assert_eq!(decide(9.0, &mut yields, &mut ped, &streams), Some(YIELDS), "still somebody in front of it");
-        streams.insert(3, vec![(50, DVec2::new(0.0, 3.0))]);
+        streams.insert(3, vec![(50, DVec2::new(0.0, 3.0), DVec2::new(0.0, 1.2))]);
         assert_eq!(decide(13.0, &mut yields, &mut ped, &streams), Some(YIELDS), "six seconds once they are off");
         assert_eq!(decide(15.5, &mut yields, &mut ped, &streams), Some("go"));
+    }
+
+    #[test]
+    fn l4_somebody_lingering_at_the_cut_holds_arrivals_18_s_at_most() {
+        // a car standing on, the stream on, and one person standing in front of it at the cut
+        // for 60 s: the arrivals let the car go for 18 s at most in all
+        let (net, mut ped) = crossing(false);
+        let mut streams: Streams = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -1.75), DVec2::ZERO), (51, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
+        let mut yields: Yields = HashMap::new();
+        let (mut held, mut last_held) = (0.0f64, 0.0f64);
+        for k in 0..60 {
+            let t = k as f64;
+            let mut walk = across();
+            walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+            let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+            for _ in 0..6 {
+                frame_with(&net, &mut ped, None, &[car_before(10.0 + t as f32)], &streams, &mut yields, t, &mut m, &mut walk, 0.05);
+            }
+            if m.decision == Some(YIELDS) {
+                held += 1.0;
+                last_held = t;
+            }
+        }
+        assert!(held >= 6.0 && held <= 18.0, "held {held} s");
+        assert!(last_held < 18.0, "still held at {last_held} s");
     }
 
     #[test]

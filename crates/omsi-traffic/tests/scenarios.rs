@@ -671,10 +671,10 @@ fn a_bus_goes_past_a_person_waiting_at_the_kerb_spot() {
     let (held, s) = run_with(1.25 + 0.3, true);
     assert!(!held, "held by somebody waiting outside its footprint");
     assert!(s > 115.0, "the bus did not go: s = {s:.1}");
-    let (held, s) = run_with(1.25 + 0.3 - 0.05, true);
-    assert!(!held && s > 115.0, "to a tenth: s = {s:.1}");
+    let (held, s) = run_with(1.25 + 0.28 + 0.01, true);
+    assert!(!held && s > 115.0, "just beyond the body radius: s = {s:.1}");
     let (held, _) = run_with(1.25 + 0.3 - 0.05, false);
     assert!(held, "somebody not waiting there still holds it");
-    let (held, _) = run_with(1.25 + 0.05, true);
-    assert!(held, "waiting inside its footprint holds it");
+    let (held, _) = run_with(1.25 + 0.25, true);
+    assert!(held, "waiting with the body inside its side and 0.3 m holds it");
 }

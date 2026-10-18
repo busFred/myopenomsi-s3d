@@ -508,10 +508,10 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                 let across = r.dot(right).abs();
                 if along.abs() <= WAY_STEP as f64 * 0.5 + 0.05 && (across as f32) < half {
                     // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
-                    // footprint and its 0.3 m (to a tenth: the kerb spot is half a lane and
+                    // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
                     // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
                     // with a stream on the crossing they let the vehicle go first (P4)
-                    if p.at_kerb && !p.on_crossing && (across as f32) >= me.half_width + 0.2 {
+                    if p.at_kerb && !p.on_crossing && (across as f32) >= me.half_width + 0.28 {
                         continue;
                     }
                     // someone who has stood at the edge for a while does not hold a standing car
