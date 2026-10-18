@@ -619,7 +619,11 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let o_fwd = DVec2::new(oh.sin(), oh.cos());
         let hit = way.corridor_span(&ob, w, reach).or_else(|| into_mine.and_then(|b| way.corridor_span(&b, w, reach).filter(|h| h.0 - st.front >= 0.0)));
         // (moving into my corridor: where it will be, if nearer, `cut_in_hit`)
-        let hit = match (hit, cut_in_hit(way, &ob, o_fwd, o.state.speed, o.last.stop.map(|sp| sp - o.state.front), w, reach)) {
+        // (one keeping its lane - no change, no pass - comes no nearer sideways than its lane's
+        // line lets it, `lane_room`: a car drifting half a metre in its own lane made the one
+        // beside it brake hard, review11 re-check)
+        let lane_room = (o.state.change.is_none() && o.passing.is_none()).then_some(o.state.lateral_target - o.state.lateral);
+        let hit = match (hit, cut_in_hit(way, &ob, o_fwd, o.state.speed, o.last.stop.map(|sp| sp - o.state.front), lane_room, w, reach)) {
             (Some(h), Some(c)) if c.0 < h.0 => Some((c.0, h.1, c.1, c.2)),
             (None, Some(c)) => Some((c.0, c.0 + o.length(), c.1, c.2)),
             (h, _) => h,
@@ -650,7 +654,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         }
         // beside me: a lead only when it is moving into my corridor (`cutting_in`), at gap 0
         if gap < -0.5 {
-            if !cutting_in(o_fwd, o.state.speed, f, o.pos.truncate() - way.pts[k].1, w) {
+            if !cutting_in(o_fwd, o.state.speed, f, o.pos.truncate() - way.pts[k].1, lane_room, w) {
                 continue;
             }
             gap = 0.0;
@@ -771,8 +775,9 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
 /// (over 0.5 m/s) with its heading more than `CUT_IN_DEG` towards my way or its sideways speed
 /// towards it over `CUT_IN_SPEED`. Such a body is a lead at gap 0 (I hold back and let it
 /// in, braking as for one standing there until it is ahead of me); one merely beside me and
-/// parallel is not.
-fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, w: f64) -> bool {
+/// parallel is not, nor one keeping its lane whose line lets it come no nearer (`lane_room`:
+/// how far its lane's line still takes it sideways, + = its right; see `lane_room_toward`).
+fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, lane_room: Option<f32>, w: f64) -> bool {
     let right = DVec2::new(f.y, -f.x);
     let (along, lat) = (rel.dot(f), rel.dot(right));
     if along <= 0.0 {
@@ -783,6 +788,9 @@ fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, w: f64) -> bool {
         return true;
     }
     if speed < 0.5 {
+        return false;
+    }
+    if lane_room_toward(lane_room, lat).is_some_and(|r| r < 0.05) {
         return false;
     }
     let toward = -(o_fwd.dot(right)) * lat.signum();
@@ -799,7 +807,7 @@ fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, w: f64) -> bool {
 /// It is my lead from there: seen only where it is, a bus cutting in at 6-15 degrees left the
 /// car half a second to brake, and its near edge in my lane ran back towards the car faster
 /// than its speed said (review11).
-fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
+fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>, lane_room: Option<f32>, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
     if speed < 0.5 || way.pts.len() < 2 {
         return None;
     }
@@ -822,11 +830,22 @@ fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>
     // (no further than the stop it is braking for lets it: a car creeping up to the line it
     // waits at comes no nearer)
     let shift = (speed as f64 * toward * CUT_IN_TIME as f64).min(room.map(|r| r.max(0.0) as f64 * toward).unwrap_or(f64::INFINITY)).clamp(0.0, 3.0);
+    // (nor further than its lane's line takes one keeping its lane)
+    let shift = shift.min(lane_room_toward(lane_room, lat).unwrap_or(f64::INFINITY));
     if shift < 0.05 {
         return None;
     }
     let moved = Obb { center: b.center - right * (lat.signum() * shift), ..*b };
     way.corridor_hit(&moved, w, upto)
+}
+
+/// How much further a body keeping its lane can come towards my way (m): its way's sideways
+/// offset still to go, `lane_room` (+ = its right, `AiState::lateral_target - lateral`), taken
+/// towards my way, which lies on its left when its offset from my way `lat` is positive (the
+/// two run within 45 degrees of each other, so its right is mine, about). Nothing: no limit
+/// (a lane change, a pass, the player).
+fn lane_room_toward(lane_room: Option<f32>, lat: f64) -> Option<f64> {
+    lane_room.map(|d| (d as f64 * -lat.signum()).max(0.0))
 }
 
 /// Metres more than its gap a car keeps behind where a pass standing out beside the lane steps
@@ -863,7 +882,7 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
         // further back than the gap it says, viz3 case13)
         let b = p.obb(ahead, 0.0);
         let w = me.half_width as f64 + LEAD_MARGIN;
-        let hit = match (way.corridor_hit(&b, w, look), cut_in_hit(way, &b, p.fwd(), p.speed.abs(), None, w, look)) {
+        let hit = match (way.corridor_hit(&b, w, look), cut_in_hit(way, &b, p.fwd(), p.speed.abs(), None, None, w, look)) {
             (Some(h), Some(c)) if c.0 < h.0 => Some(c),
             (None, Some(c)) => Some(c),
             (h, _) => h,
@@ -875,7 +894,7 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
             // bus cutting in from the next lane at 6-15 degrees was dropped once part of it was
             // beside the car, and the car drove through it at 8 m/s)
             if gap < -0.5 {
-                if !cutting_in(p.fwd(), p.speed.abs(), fwd, p.pos.truncate() - way.pts[k].1, me.half_width as f64 + LEAD_MARGIN) {
+                if !cutting_in(p.fwd(), p.speed.abs(), fwd, p.pos.truncate() - way.pts[k].1, None, me.half_width as f64 + LEAD_MARGIN) {
                     continue;
                 }
                 gap = 0.0;
@@ -1371,3 +1390,40 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
 
 #[allow(dead_code)]
 fn _unused(_: DVec3) {}
+
+#[cfg(test)]
+mod cut_in_tests {
+    use super::{cutting_in, lane_room_toward};
+    use glam::DVec2;
+
+    /// A car beside me, 2.6 m to my right, heading 8 degrees towards my way at 9 m/s, with its
+    /// middle 3 m ahead of my way's sample.
+    fn beside() -> (DVec2, f32, DVec2, DVec2) {
+        let a = 8f64.to_radians();
+        (DVec2::new(-a.sin(), a.cos()), 9.0, DVec2::Y, DVec2::new(2.6, 3.0))
+    }
+
+    /// Review11 re-check: a car keeping its lane whose line takes it no nearer is not cutting
+    /// in, whatever its heading says; one changing lanes, passing, or the player (no lane room)
+    /// is; and one whose line still brings it a metre towards me is.
+    #[test]
+    fn a_car_keeping_its_lane_is_not_cutting_in() {
+        let (o_fwd, speed, f, rel) = beside();
+        assert!(cutting_in(o_fwd, speed, f, rel, None, 1.2));
+        // it sits 0.6 m left of its lane's line, drifted towards me, and goes back to it (I
+        // am on its left: its line lies 0.6 m to its right)
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some(0.6), 1.2));
+        // its line is where it is: it stays
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some(0.0), 1.2));
+        // its line lies 1 m to its left, towards me: it comes
+        assert!(cutting_in(o_fwd, speed, f, rel, Some(-1.0), 1.2));
+        // its line lies 1 m to its right, away from me: it does not
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some(1.0), 1.2));
+        assert_eq!(lane_room_toward(Some(-1.0), 2.6), Some(1.0));
+        assert_eq!(lane_room_toward(Some(1.0), 2.6), Some(0.0));
+        assert_eq!(lane_room_toward(Some(1.0), -2.6), Some(1.0));
+        assert_eq!(lane_room_toward(None, 2.6), None);
+        // its middle already inside my corridor: in, whatever its line says
+        assert!(cutting_in(o_fwd, speed, f, DVec2::new(1.0, 3.0), Some(0.0), 1.2));
+    }
+}
