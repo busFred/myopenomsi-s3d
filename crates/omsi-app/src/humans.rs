@@ -1316,6 +1316,13 @@ struct PedWalk {
     side: f32,
     /// Seconds spent waiting at the kerb before the current leg.
     held: f32,
+    /// [ROLLBACK r4c-P1] The crossing being walked: its pieces among `legs`, from kerb to kerb.
+    cross: Option<Cross>,
+    /// [ROLLBACK r4c-P1] Back at the near kerb after turning round on a crossing put down on
+    /// (no pavement leg to stand on): the next leg is decided as at a kerb.
+    kerb_hold: bool,
+    /// [ROLLBACK r4c-P3] Where they wait at this kerb: (leg, next lane, spot).
+    spot: Option<(usize, usize, DVec2)>,
 }
 
 impl PedWalk {
@@ -1327,8 +1334,223 @@ impl PedWalk {
             roam,
             side,
             held: 0.0,
+            cross: None,
+            kerb_hold: false,
+            spot: None,
         }
     }
+
+    /// On to the next leg.
+    fn step_on(&mut self) {
+        let len = self.legs.get(self.leg).map(|l| l.len()).unwrap_or(0.0);
+        self.s = (self.s - len).max(0.0);
+        self.leg += 1;
+        self.held = 0.0;
+        self.spot = None;
+        self.kerb_hold = false;
+    }
+
+    /// [ROLLBACK r4c-P1] Caught by the change before the middle of the crossing: back to the
+    /// near kerb the way they came (then the crossing again, at the next green).
+    fn turn_back(&mut self) {
+        let Some(c) = self.cross else { return };
+        let k = self.leg;
+        if !c.on(k) || k >= self.legs.len() {
+            return;
+        }
+        let walked = c.walked(self);
+        let cur = self.legs[k];
+        let mut back = vec![Leg { lane: cur.lane, a: cur.dist(self.s.min(cur.len())), b: cur.a }];
+        for j in (c.from..k).rev() {
+            let l = self.legs[j];
+            back.push(Leg { lane: l.lane, a: l.b, b: l.a });
+        }
+        // (the pavement leg they stepped off, entered at its end; the crossing again, and on)
+        let mut rest: Vec<Leg> = c.kerb.into_iter().collect();
+        rest.extend_from_slice(&self.legs[c.from..]);
+        let n = back.len();
+        self.legs.truncate(k);
+        self.legs.extend(back);
+        self.legs.extend(rest);
+        self.s = 0.0;
+        self.held = 0.0;
+        self.spot = None;
+        self.cross = Some(Cross { from: k, to: k + n - 1, total: walked, back: true, caught: true, ..c });
+    }
+}
+
+/// [ROLLBACK r4c-P1] A crossing: the footpath pieces from one kerb to the other (the lit stub,
+/// the pieces over each lane, a median between them), walked as one: the light applies at
+/// the kerb only, and nobody stops on the carriageway.
+#[derive(Debug, Clone, Copy)]
+struct Cross {
+    /// Indices into the walk's `legs` of the first piece and the last.
+    from: usize,
+    to: usize,
+    /// Length of all the pieces (m).
+    total: f32,
+    /// The light that governs it (a piece's own, or that of the crossing object's crossing).
+    light: Option<(usize, usize)>,
+    /// Walking back to the near kerb (the pieces `from..=to` are the way back).
+    back: bool,
+    /// The light changed while they were on the carriageway.
+    caught: bool,
+    /// The pavement leg that led to the near kerb.
+    kerb: Option<Leg>,
+    /// The crossing's key: its lowest lane (the same both ways).
+    key: usize,
+}
+
+impl Cross {
+    fn on(&self, leg: usize) -> bool {
+        leg >= self.from && leg <= self.to
+    }
+    /// Metres walked from the kerb.
+    fn walked(&self, walk: &PedWalk) -> f32 {
+        let done: f32 = walk.legs[self.from.min(walk.legs.len())..walk.leg.min(walk.legs.len())].iter().map(|l| l.len()).sum();
+        done + walk.legs.get(walk.leg).map(|l| walk.s.min(l.len())).unwrap_or(0.0)
+    }
+}
+
+/// [ROLLBACK r4c-P1] Caught by the change at `walked` metres of a `total` m crossing: back to the
+/// near kerb before its middle, else on to the far kerb.
+fn change_turns_back(walked: f32, total: f32) -> bool {
+    walked < total * 0.5
+}
+
+/// What the walk asks the traffic lights (the traffic, or a test's).
+trait PedLights {
+    /// State of light `li` of controller `c` and the seconds it keeps showing it.
+    fn light_state(&self, c: usize, li: usize) -> Option<(i32, f32)>;
+    /// Seconds until the light lets traffic go (0 while it does).
+    fn light_until_go(&self, c: usize, li: usize) -> Option<f32>;
+    /// The light governing footpath lane `lane` (its own, or its crossing's).
+    fn crossing_light(&self, lane: usize) -> Option<(usize, usize)>;
+    /// Whether footpath lane `lane` is a piece of a crossing object's pedestrian crossing.
+    fn crossing_piece(&self, lane: usize) -> bool;
+}
+
+impl PedLights for Traffic {
+    fn light_state(&self, c: usize, li: usize) -> Option<(i32, f32)> {
+        Traffic::light_state(self, c, li)
+    }
+    fn light_until_go(&self, c: usize, li: usize) -> Option<f32> {
+        Traffic::light_until_go(self, c, li)
+    }
+    fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
+        Traffic::crossing_light(self, lane)
+    }
+    fn crossing_piece(&self, lane: usize) -> bool {
+        self.sim.junctions.crossing_of(lane).is_some()
+    }
+}
+
+/// The id the player's vehicle goes by among the `SeenCar`s (its rear sections count down).
+const PLAYER_CAR: u64 = u64::MAX - 16;
+
+/// A vehicle as the people on foot see it.
+#[derive(Debug, Clone, Copy)]
+struct SeenCar {
+    id: u64,
+    pos: DVec2,
+    vel: DVec2,
+    half_len: f64,
+    /// Its box on the ground.
+    body: Block,
+    /// Stopping for somebody on foot (a car that yields is no threat to the one it yields to).
+    yielding: bool,
+    /// Seconds it has stood (under 0.5 m/s).
+    stood: f32,
+}
+
+/// What the walk needs of the person (copied in and out of `Person`).
+#[derive(Debug, Clone)]
+struct Me {
+    id: u32,
+    pos: DVec2,
+    pace: f64,
+    on_crossing: bool,
+    decision: Option<&'static str>,
+    why: &'static str,
+    /// The pace walked this frame.
+    walk_pace: f64,
+}
+
+/// What a stroller sees this frame.
+struct Around<'a> {
+    net: &'a Network,
+    lights: Option<&'a dyn PedLights>,
+    cars: &'a [SeenCar],
+    time: f64,
+}
+
+fn xorshift(x: &mut u64) -> u64 {
+    let mut v = *x;
+    v ^= v >> 12;
+    v ^= v << 25;
+    v ^= v >> 27;
+    *x = v;
+    v.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// A piece of a crossing proper: it cuts a carriageway, carries a light, or is one of the
+/// pieces of a crossing object's pedestrian crossing (BeijingCity lays its crossings in 1 m
+/// pieces, most of which cut no lane).
+fn core_piece(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> bool {
+    net.lanes[lane].traffic_light.is_some() || lights.map(|t| t.crossing_piece(lane)).unwrap_or(false) || !ped.crossings(net, lane).is_empty()
+}
+
+/// [ROLLBACK r4c-P1] The crossing starting with `walk.legs[start]`: the pieces on from it that
+/// cut a carriageway or carry a light, with short pieces between them (a median); a stroll
+/// is planned on straight across where its legs run out. None when no such piece follows.
+fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &mut PedWalk, start: usize) -> Option<Cross> {
+    const SHORT: f32 = 6.0;
+    if start >= walk.legs.len() {
+        return None;
+    }
+    let planned = walk.legs.len();
+    let mut last_core: Option<usize> = None;
+    // (the short pieces since the last piece proper, in metres: a median)
+    let mut pending = 0.0f32;
+    let mut k = start;
+    while k < start + 64 {
+        if k >= walk.legs.len() {
+            if !walk.roam || k == 0 {
+                break;
+            }
+            let prev = walk.legs[k - 1];
+            let Some(n) = ped.straight_on(net, &prev, 60.0, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT) else { break };
+            walk.legs.push(n);
+        }
+        let leg = walk.legs[k];
+        if core_piece(ped, net, lights, leg.lane) {
+            last_core = Some(k);
+            pending = 0.0;
+        } else if pending + leg.len() <= SHORT {
+            pending += leg.len();
+        } else {
+            break;
+        }
+        k += 1;
+    }
+    // (what was planned past the far kerb only to look at it goes again)
+    walk.legs.truncate(planned.max(last_core.map(|e| e + 1).unwrap_or(0)));
+    let end = last_core?;
+    let pieces = &walk.legs[start..=end];
+    let light = pieces
+        .iter()
+        .find_map(|l| net.lanes[l.lane].traffic_light)
+        .or_else(|| lights.and_then(|t| pieces.iter().find_map(|l| t.crossing_light(l.lane))));
+    Some(Cross {
+        from: start,
+        to: end,
+        total: pieces.iter().map(|l| l.len()).sum(),
+        light,
+        back: false,
+        caught: false,
+        kerb: None,
+        key: pieces.iter().map(|l| l.lane).min().unwrap_or(0),
+    })
 }
 
 /// The pavement paths as a walking network: path ends closer than a metre are one
@@ -1560,6 +1782,37 @@ impl PedNet {
     }
 
 
+    /// [ROLLBACK r4c-P1] The leg on from the end of `leg` that turns least (within `max_turn`
+    /// degrees) among the lanes `ok` accepts; not back along `leg`'s lane or its twin.
+    fn straight_on(&mut self, net: &Network, leg: &Leg, max_turn: f64, mut ok: impl FnMut(&mut PedNet, usize) -> bool) -> Option<Leg> {
+        let node = self.end_node(net, leg)?;
+        let (_, h_in) = leg.at(net, leg.len());
+        let back = self.ends.get(&leg.lane).copied();
+        let list: Vec<(usize, bool)> = self.out.get(node)?.clone();
+        let mut best: Option<(f64, Leg)> = None;
+        for (l, fwd) in list {
+            if l == leg.lane {
+                continue;
+            }
+            if let (Some(&(a, b)), Some((c, d))) = (self.ends.get(&l), back) {
+                if a == d && b == c && (net.lanes[l].length() - net.lanes[leg.lane].length()).abs() < 1.0 {
+                    continue;
+                }
+            }
+            if !ok(self, l) {
+                continue;
+            }
+            let len = net.lanes[l].length();
+            let cand = if fwd { Leg { lane: l, a: 0.0, b: len } } else { Leg { lane: l, a: len, b: 0.0 } };
+            let (_, h) = cand.at(net, 0.0);
+            let turn = angle_between(h_in, h);
+            if turn <= max_turn && best.map(|b| turn < b.0).unwrap_or(true) {
+                best = Some((turn, cand));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     /// Where pavement lane `lane` crosses a carriageway.
     fn crossings(&mut self, net: &Network, lane: usize) -> &[DVec2] {
         if !self.crossings.contains_key(&lane) {
@@ -1621,15 +1874,19 @@ impl PedNet {
 /// while the pedestrians still have theirs, are turning traffic that gives way. Without
 /// such a light, the pedestrian green `green_left` and two seconds.
 fn pedestrian_window(
-    ped: Option<&mut PedNet>,
+    mut ped: Option<&mut PedNet>,
     net: &Network,
-    traffic: &Traffic,
-    path: usize,
+    traffic: &dyn PedLights,
+    paths: &[usize],
     green_left: f32,
 ) -> f32 {
     let mut window = f32::MAX;
-    if let Some(ped) = ped {
-        for &s in ped.crossed_lanes(net, path) {
+    let crossed: Vec<usize> = match ped.as_deref_mut() {
+        Some(ped) => paths.iter().flat_map(|&p| ped.crossed_lanes(net, p).to_vec()).collect(),
+        None => Vec::new(),
+    };
+    {
+        for &s in &crossed {
             let feeding = net.prev.get(s).map(|p| p.as_slice()).unwrap_or(&[]);
             for &l in std::iter::once(&s).chain(feeding) {
                 let Some((c, li)) = net.lanes[l].traffic_light else {
@@ -1649,6 +1906,269 @@ fn pedestrian_window(
     } else {
         window
     }
+}
+
+/// One frame of a walk along the pavement network: where `me` goes, and what they decide at
+/// the kerbs.
+fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rng: &mut u64, dt: f32) -> Want {
+    let net = at.net;
+    let pos2 = me.pos;
+    me.walk_pace = me.pace;
+    if walk.leg >= walk.legs.len() {
+        me.on_crossing = false;
+        return Want::stand(None, Activity::Stand);
+    }
+    // [ROLLBACK r4c-P1] the light changes while they are on the carriageway: back before the
+    // middle of the crossing, on past it (nobody stops in the road)
+    if let (Some(c), Some(lights)) = (walk.cross, at.lights) {
+        if c.on(walk.leg) && !c.back && !c.caught {
+            if let Some((state, _)) = c.light.and_then(|(ctl, li)| lights.light_state(ctl, li)) {
+                if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
+                    if change_turns_back(c.walked(walk), c.total) {
+                        walk.turn_back();
+                        me.decision = Some(TURNS_BACK);
+                    } else {
+                        if let Some(c) = walk.cross.as_mut() {
+                            c.caught = true;
+                        }
+                        me.decision = Some(HURRIES_ON);
+                    }
+                }
+            }
+        }
+    }
+    let leg = walk.legs[walk.leg];
+    if walk.s >= leg.len() - 0.35 || walk.held > 0.0 {
+        match walk.cross {
+            // between two pieces of the crossing: on, no decision on the carriageway
+            Some(c) if walk.leg >= c.from && walk.leg < c.to => walk.step_on(),
+            _ => {
+                // the crossing walked: at a kerb (turned back, they stand on the pavement at
+                // the near kerb again)
+                if let Some(c) = walk.cross.take() {
+                    if c.back && c.kerb.is_some() && walk.leg + 1 < walk.legs.len() {
+                        walk.leg += 1;
+                        walk.s = walk.legs[walk.leg].len();
+                        walk.held = 0.0;
+                        walk.spot = None;
+                        me.on_crossing = false;
+                        return Want::stand(None, Activity::Stand);
+                    }
+                    walk.kerb_hold = true;
+                }
+                if walk.leg + 1 >= walk.legs.len() {
+                    if !walk.roam {
+                        walk.leg += 1;
+                        me.on_crossing = false;
+                        return Want::stand(None, Activity::Stand);
+                    }
+                    let pick = xorshift(rng);
+                    let next = ped
+                        .as_ref()
+                        .and_then(|p| p.end_node(net, &leg).and_then(|n| p.next_leg(net, n, leg.lane, pick)))
+                        .unwrap_or_else(|| {
+                            // a leg that ends in the middle of its path (the point of a stop
+                            // somebody got off at) goes on to one of its ends: turned round
+                            // there, the people off a bus were sent back to the same point
+                            // every frame and milled round each other at the stop (#913)
+                            let lane_len = net.lanes[leg.lane].length();
+                            if leg.b > 0.05 && leg.b < lane_len - 0.05 {
+                                let fwd = if leg.len() > 0.05 { leg.b > leg.a } else { pick % 2 == 0 };
+                                Leg { lane: leg.lane, a: leg.b, b: if fwd { lane_len } else { 0.0 } }
+                            } else {
+                                Leg { lane: leg.lane, a: leg.b, b: leg.a }
+                            }
+                        });
+                    walk.legs.push(next);
+                    if walk.leg > 6 {
+                        walk.legs.drain(..walk.leg);
+                        walk.leg = 0;
+                        walk.spot = None;
+                    }
+                }
+                let next = walk.legs[walk.leg + 1];
+                // (put down on a crossing, not at a kerb: the rest of it, this piece too)
+                let mid = !walk.kerb_hold && ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
+                let at_kerb = next.from_end(net) && !mid;
+                let span = match ped.as_deref_mut() {
+                    Some(p) => crossing_span(p, net, at.lights, walk, if mid { walk.leg } else { walk.leg + 1 }),
+                    None => None,
+                };
+                match span {
+                    Some(c) if at_kerb => {
+                        let verdict = match ped.as_deref_mut() {
+                            Some(p) => kerb_verdict(p, at, walk, &c, me),
+                            None => Ok(()),
+                        };
+                        match verdict {
+                            Ok(()) => {
+                                me.decision = Some("go");
+                                if walk.held > 0.0 && debug_pax() {
+                                    log::info!("t={:.1} pax #{} crosses path {} after waiting {:.0} s", at.time, me.id, next.lane, walk.held);
+                                }
+                                let from_pavement = !ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
+                                walk.cross = Some(Cross { kerb: from_pavement.then_some(leg), ..c });
+                                walk.step_on();
+                            }
+                            Err(why) => {
+                                walk.held += dt;
+                                me.why = why;
+                                me.decision = Some(why);
+                                // a light that stays red (nobody crosses on red any more): a
+                                // stroller gives up after three minutes and walks back the way
+                                // they came
+                                if walk.roam && why == "red light" && walk.held > 180.0 {
+                                    if debug_pax() {
+                                        log::info!("t={:.1} pax #{} gives up waiting at the red light and turns back", at.time, me.id);
+                                    }
+                                    walk.legs.truncate(walk.leg + 1);
+                                    walk.legs.push(Leg { lane: leg.lane, a: leg.b, b: leg.a });
+                                    walk.held = 0.0;
+                                    walk.spot = None;
+                                    walk.kerb_hold = false;
+                                    return Want::stand(None, Activity::Stand);
+                                }
+                                me.on_crossing = false;
+                                return wait_at_kerb(at, me, walk, &leg, &next);
+                            }
+                        }
+                    }
+                    Some(c) => {
+                        me.decision = Some("go");
+                        walk.cross = Some(c);
+                        walk.step_on();
+                    }
+                    None => {
+                        me.decision = Some("go");
+                        walk.step_on();
+                    }
+                }
+            }
+        }
+    }
+    let leg = walk.legs[walk.leg];
+    let len = leg.len();
+    let (p, h) = leg.at(net, (walk.s + 1.3).min(len));
+    let lane = &net.lanes[leg.lane];
+    let width = (lane.width as f64).max(1.0);
+    let crosses = ped.as_ref().map(|p| p.crossings.get(&leg.lane).map(|x| !x.is_empty()).unwrap_or(false)).unwrap_or(false);
+    // [ROLLBACK r4c-P1] on the crossing from the first steps off the kerb to the far kerb, on
+    // every piece of it (the cars of the lanes ahead stop for them)
+    me.on_crossing = match walk.cross {
+        Some(c) if c.on(walk.leg) => walk.leg > c.from || walk.s > 0.3 || c.back,
+        _ => false,
+    };
+    let crossing = lane.traffic_light.is_some() || crosses || me.on_crossing;
+    let pace = me.walk_pace;
+    // keep to the right of the pavement (less so on a crossing) - the left where the
+    // traffic drives on the left
+    let side = if crossing { (walk.side.abs() as f64).min(0.3) } else { (walk.side.abs() as f64).min(width * 0.5 - 0.3).max(0.0) };
+    let side = if net.left_hand { -side } else { side };
+    let hr = h.to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    let target = p.truncate() + right * side;
+    let vel = (target - pos2).normalize_or_zero() * pace;
+    // stay on the path: the lane locally, as wide as it is
+    let (a, _) = leg.at(net, (walk.s - 2.0).max(0.0));
+    let (b, _) = leg.at(net, (walk.s + 2.5).min(len));
+    let (m, _) = leg.at(net, (walk.s + 0.25).min(len));
+    let bow = crowd::project_on_segment(m.truncate(), a.truncate(), b.truncate()).0.distance(m.truncate());
+    let corridor = ((b - a).truncate().length() > 0.5).then(|| (a.truncate() + right * side, b.truncate() + right * side, (width * 0.5 - side).max(0.35) + bow));
+    let corridor = path_corridor_band(pos2, corridor, STROLL_BAND);
+    if me.why != "queueing behind somebody" {
+        me.why = "";
+    }
+    Want { vel, face: None, give: 1.0, corridor, idle: Activity::Stand }
+}
+
+/// [ROLLBACK r4c-P1] Decisions on a crossing as the recording shows them.
+const TURNS_BACK: &str = "caught by the change: back to the kerb";
+const HURRIES_ON: &str = "caught by the change: on across";
+
+/// Waiting at the kerb before `next`: facing the way across, spread along it and a step back.
+fn wait_at_kerb(at: &Around, me: &Me, walk: &mut PedWalk, leg: &Leg, next: &Leg) -> Want {
+    let net = at.net;
+    let (end, _) = leg.at(net, leg.len());
+    let (_, h) = next.at(net, 0.3);
+    let hr = h.to_radians();
+    let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
+    let id = me.id;
+    let spread = ((id % 5) as f64 - 2.0) * 0.45;
+    let back = 0.25 + (id % 3) as f64 * 0.45;
+    let spot = end.truncate() + right * spread - fwd * back;
+    let _ = walk;
+    Want { vel: arrive(me.pos, spot, me.pace * 0.6), face: Some(h), give: 0.5, corridor: None, idle: Activity::Stand }
+}
+
+/// May a pedestrian at the kerb start across crossing `c` (from `walk.legs[c.from]` on)? A
+/// pedestrian light must show green, and the time left to get across - the green and then
+/// the clearance until a light of the carriageway turns green - must do; without a light no
+/// car may be about to pass the crossing. Somebody who has waited very long takes any green
+/// (never a red).
+fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) -> Result<(), &'static str> {
+    let net = at.net;
+    let next = walk.legs[c.from];
+    let pace = me.pace;
+    let held = walk.held;
+    let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
+    if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
+        if let Some((state, left)) = t.light_state(ctl, li) {
+            if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
+                return Err("red light");
+            }
+            if held > 150.0 {
+                return Ok(());
+            }
+            // A pedestrian green is short (8 s at Grundorf for an 11.6 m crossing that
+            // takes 10.7 s): who starts on green crosses in the clearance time after
+            // it, until the cars get their green. Only the green alone was counted, so
+            // nobody ever started on green and everybody went across on red after
+            // 150 s, in front of moving cars.
+            let window = pedestrian_window(Some(&mut *ped), net, t, &[next.lane], left);
+            if (window as f64) < t_cross {
+                return Err("the green ends before they would be across");
+            }
+            return Ok(());
+        }
+    }
+    // somebody who has waited long accepts a shorter gap (down to the time the crossing
+    // takes, never less): a steady stream does not hold them for ever, but nobody walks
+    // out in front of a car that is about to be there (after 45 s they used to ignore
+    // the cars altogether)
+    let margin = if held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { 2.5 };
+    for x in ped.crossings(net, next.lane) {
+        for car in at.cars {
+            // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
+            // the pedestrian passes (a child and a taxi stood for each other for minutes,
+            // the child waiting for the taxi's creep, the taxi for the child)
+            if car.yielding {
+                continue;
+            }
+            let rel = *x - car.pos;
+            let dist = rel.length();
+            if dist > 90.0 {
+                continue;
+            }
+            let speed = car.vel.length();
+            let half = car.half_len;
+            // [ROLLBACK pedcross-1] a vehicle standing on the crossing holds them for a
+            // few seconds only; then they step round it (a car held in a queue on the
+            // zebra and the people waiting for it to move stood for each other for good)
+            if dist < half + 1.5 && (speed >= 0.5 || held < 5.0) {
+                return Err("a vehicle stands on the crossing");
+            }
+            if speed < 0.5 {
+                continue;
+            }
+            let dir = car.vel / speed;
+            let along = rel.dot(dir);
+            let lateral = rel.perp_dot(dir).abs();
+            if along > -half && lateral < 3.5 && along / speed < t_cross + margin {
+                return Err("waits for a car to pass");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn seg_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<DVec2> {
@@ -5011,7 +5531,7 @@ impl Humans {
         self.pax_frame(dt, world, &buses, &bus_ix, &at_stops, bus, renderer, scene, &mut taken_ticket, &mut remove);
         stage!("passengers");
         // the pedestrians: a crowd on the pavements
-        let mut cars: Vec<(DVec2, DVec2, f64, bool)> = Vec::new();
+        let mut cars: Vec<SeenCar> = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         if let Some(t) = traffic {
             for c in &t.cars {
@@ -5021,12 +5541,21 @@ impl Humans {
                 let h = c.vehicle.heading.to_radians();
                 let fwd = DVec2::new(h.sin(), h.cos());
                 let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
+                let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
+                let body = Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.ai.state.speed as f64 };
                 // [ROLLBACK pedyield-1] (and whether it is stopping for somebody on foot:
                 // a car that yields is no threat to the one it yields to)
-                cars.push((c.vehicle.position.truncate(), fwd * c.ai.state.speed as f64, bb[1] as f64 * 0.5, c.ai.last.why == omsi_traffic::Why::People));
+                cars.push(SeenCar {
+                    id: c.id,
+                    pos: c.vehicle.position.truncate(),
+                    vel: fwd * c.ai.state.speed as f64,
+                    half_len: bb[1] as f64 * 0.5,
+                    body,
+                    yielding: c.ai.last.why == omsi_traffic::Why::People,
+                    stood: 0.0,
+                });
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
-                    let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
-                    blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.ai.state.speed as f64 });
+                    blocks.push(body);
                     for t in &c.vehicle.trailers {
                         let tb = t.ty.def.bounding_box.unwrap_or([2.5, 7.0, 3.0, 0.0, 0.0, 1.5]);
                         let o = omsi_sim::collision::Obb::from_box(tb, t.position, t.heading);
@@ -5042,12 +5571,14 @@ impl Humans {
             }
         }
         if let Some(pb) = bus_ix.get(&BusId::Player).map(|&i| &buses[i]) {
-            cars.push((pb.pos.truncate(), pb.fwd() * pb.speed, pb.half.y, false));
-            for t in &pb.trailers {
+            let bodies = pb.blocks();
+            cars.push(SeenCar { id: PLAYER_CAR, pos: pb.pos.truncate(), vel: pb.fwd() * pb.speed, half_len: pb.half.y, body: bodies[0], yielding: false, stood: 0.0 });
+            for (k, t) in pb.trailers.iter().enumerate() {
                 let h = t.heading.to_radians();
-                cars.push((t.pos.truncate(), DVec2::new(h.sin(), h.cos()) * pb.speed, t.half.y, false));
+                let body = bodies.get(k + 1).copied().unwrap_or(bodies[0]);
+                cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0 });
             }
-            blocks.extend(pb.blocks());
+            blocks.extend(bodies);
         }
         let mut wants: Vec<Want> = Vec::with_capacity(self.people.len());
         for i in 0..self.people.len() {
@@ -5186,7 +5717,7 @@ impl Humans {
         world: &World,
         net: Option<&Network>,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64, bool)],
+        cars: &[SeenCar],
         remove: &mut Vec<usize>,
     ) -> Want {
         let state = self.people[i].state.clone();
@@ -5278,296 +5809,22 @@ impl Humans {
         walk: &mut PedWalk,
         net: &Network,
         traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64, bool)],
+        cars: &[SeenCar],
         dt: f32,
     ) -> Want {
         let mut ped = self.ped.take();
-        let w = self.walk_want_with(ped.as_mut(), i, walk, net, traffic, cars, dt);
+        let p = &self.people[i];
+        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace };
+        let at = Around { net, lights: traffic.map(|t| t as &dyn PedLights), cars, time: self.time };
+        let mut rng = self.rng;
+        let w = stroll(ped.as_mut(), &at, &mut me, walk, &mut rng, dt);
+        self.rng = rng;
         self.ped = ped;
+        let p = &mut self.people[i];
+        p.on_crossing = me.on_crossing;
+        p.last_decision = me.decision;
+        p.why = me.why;
         w
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk_want_with(
-        &mut self,
-        mut ped: Option<&mut PedNet>,
-        i: usize,
-        walk: &mut PedWalk,
-        net: &Network,
-        traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64, bool)],
-        dt: f32,
-    ) -> Want {
-        let pos2 = self.people[i].position.truncate();
-        let pace = self.people[i].pace;
-        if walk.leg >= walk.legs.len() {
-            return Want::stand(None, Activity::Stand);
-        }
-        let leg = walk.legs[walk.leg];
-        if walk.s >= leg.len() - 0.35 || walk.held > 0.0 {
-            // at the end of the leg: which way on
-            if walk.leg + 1 >= walk.legs.len() {
-                if !walk.roam {
-                    walk.leg += 1;
-                    return Want::stand(None, Activity::Stand);
-                }
-                let pick = self.rand();
-                let next = ped
-                    .as_ref()
-                    .and_then(|p| {
-                        p.end_node(net, &leg)
-                            .and_then(|n| p.next_leg(net, n, leg.lane, pick))
-                    })
-                    .unwrap_or_else(|| {
-                        // a leg that ends in the middle of its path (the point of a stop
-                        // somebody got off at) goes on to one of its ends: turned round
-                        // there, the people off a bus were sent back to the same point
-                        // every frame and milled round each other at the stop (#913)
-                        let lane_len = net.lanes[leg.lane].length();
-                        if leg.b > 0.05 && leg.b < lane_len - 0.05 {
-                            let fwd = if leg.len() > 0.05 { leg.b > leg.a } else { pick % 2 == 0 };
-                            Leg {
-                                lane: leg.lane,
-                                a: leg.b,
-                                b: if fwd { lane_len } else { 0.0 },
-                            }
-                        } else {
-                            Leg {
-                                lane: leg.lane,
-                                a: leg.b,
-                                b: leg.a,
-                            }
-                        }
-                    });
-                walk.legs.push(next);
-                if walk.leg > 6 {
-                    walk.legs.drain(..walk.leg);
-                    walk.leg = 0;
-                }
-            }
-            let next = walk.legs[walk.leg + 1];
-            match self.may_cross(
-                ped.as_deref_mut(),
-                net,
-                &next,
-                traffic,
-                cars,
-                pace,
-                walk.held,
-                self.people[i].on_crossing,
-            ) {
-                Ok(()) => {
-                    self.people[i].last_decision = Some("go");
-                    if walk.held > 0.0 && debug_pax() {
-                        let light = net.lanes[next.lane].traffic_light.and_then(|(c, li)| {
-                            traffic
-                                .and_then(|t| t.light_state(c, li))
-                                .map(|(st, left)| {
-                                    format!(", light {c}.{li} state {st} for {left:.1} s more")
-                                })
-                        });
-                        log::info!(
-                            "t={:.1} pax {} crosses path {} after waiting {:.0} s{}",
-                            self.time,
-                            self.people[i].label(),
-                            next.lane,
-                            walk.held,
-                            light.unwrap_or_default()
-                        );
-                    }
-                    walk.s = (walk.s - leg.len()).max(0.0);
-                    walk.leg += 1;
-                    walk.held = 0.0;
-                }
-                Err(why) => {
-                    walk.held += dt;
-                    self.people[i].why = why;
-                    self.people[i].last_decision = Some(why);
-                    // a light that stays red (nobody crosses on red any more): a stroller
-                    // gives up after three minutes and walks back the way they came
-                    if walk.roam && why == "red light" && walk.held > 180.0 {
-                        if debug_pax() {
-                            log::info!(
-                                "t={:.1} pax {} gives up waiting at the red light and turns back",
-                                self.time,
-                                self.people[i].label()
-                            );
-                        }
-                        walk.legs.truncate(walk.leg + 1);
-                        walk.legs.push(Leg {
-                            lane: leg.lane,
-                            a: leg.b,
-                            b: leg.a,
-                        });
-                        walk.held = 0.0;
-                        return Want::stand(None, Activity::Stand);
-                    }
-                    // at the kerb, facing the way across, spread along it and a step back
-                    let (end, _) = leg.at(net, leg.len());
-                    let (_, h) = next.at(net, 0.3);
-                    let hr = h.to_radians();
-                    let (fwd, right) = (
-                        DVec2::new(hr.sin(), hr.cos()),
-                        DVec2::new(hr.cos(), -hr.sin()),
-                    );
-                    let id = self.people[i].id;
-                    let spread = ((id % 5) as f64 - 2.0) * 0.45;
-                    let back = 0.25 + (id % 3) as f64 * 0.45;
-                    let spot = end.truncate() + right * spread - fwd * back;
-                    return Want {
-                        vel: arrive(pos2, spot, pace * 0.6),
-                        face: Some(h),
-                        give: 0.5,
-                        corridor: None,
-                        idle: Activity::Stand,
-                    };
-                }
-            }
-        }
-        let leg = walk.legs[walk.leg];
-        let len = leg.len();
-        let (p, h) = leg.at(net, (walk.s + 1.3).min(len));
-        let lane = &net.lanes[leg.lane];
-        let width = (lane.width as f64).max(1.0);
-        let crosses = ped
-            .as_ref()
-            .map(|p| {
-                p.crossings
-                    .get(&leg.lane)
-                    .map(|x| !x.is_empty())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        let crossing = lane.traffic_light.is_some() || crosses;
-        self.people[i].on_crossing = crosses && walk.s > 0.3;
-        // keep to the right of the pavement (less so on a crossing) - the left where the
-        // traffic drives on the left
-        let side = if crossing {
-            (walk.side.abs() as f64).min(0.3)
-        } else {
-            (walk.side.abs() as f64).min(width * 0.5 - 0.3).max(0.0)
-        };
-        let side = if net.left_hand { -side } else { side };
-        let hr = h.to_radians();
-        let right = DVec2::new(hr.cos(), -hr.sin());
-        let target = p.truncate() + right * side;
-        let vel = (target - pos2).normalize_or_zero() * pace;
-        // stay on the path: the lane locally, as wide as it is
-        let (a, _) = leg.at(net, (walk.s - 2.0).max(0.0));
-        let (b, _) = leg.at(net, (walk.s + 2.5).min(len));
-        let (m, _) = leg.at(net, (walk.s + 0.25).min(len));
-        let bow = crowd::project_on_segment(m.truncate(), a.truncate(), b.truncate())
-            .0
-            .distance(m.truncate());
-        let corridor = ((b - a).truncate().length() > 0.5).then(|| {
-            (
-                a.truncate() + right * side,
-                b.truncate() + right * side,
-                (width * 0.5 - side).max(0.35) + bow,
-            )
-        });
-        let corridor = path_corridor_band(pos2, corridor, STROLL_BAND);
-        if self.people[i].why != "queueing behind somebody" {
-            self.people[i].why = "";
-        }
-        Want {
-            vel,
-            face: None,
-            give: 1.0,
-            corridor,
-            idle: Activity::Stand,
-        }
-    }
-
-    /// May a pedestrian at the kerb start along `next`? A pedestrian light must show green,
-    /// and the time left to get across - the green and then the clearance until a light of
-    /// the carriageway turns green - must do; without a light no car may be about to pass
-    /// the crossing. Somebody who has waited very long takes any green (never a red).
-    #[allow(clippy::too_many_arguments)]
-    fn may_cross(
-        &self,
-        mut ped: Option<&mut PedNet>,
-        net: &Network,
-        next: &Leg,
-        traffic: Option<&Traffic>,
-        cars: &[(DVec2, DVec2, f64, bool)],
-        pace: f64,
-        held: f32,
-        mid_crossing: bool,
-    ) -> Result<(), &'static str> {
-        if !next.from_end(net) {
-            return Ok(());
-        }
-        // [ROLLBACK pedcross-1] off the kerb, the crossing is one decision: at an unlit piece
-        // of it nobody waits for a gap again (the cars of the lanes ahead stop for somebody
-        // on the crossing), only for a car too fast to stop; a lit median still holds.
-        // Re-deciding at every 2 m piece, people stood in the road for a gap in the next
-        // lane while the light went red, and then crossed "on red".
-        let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
-        // (the lane's own light, or, stepping off the kerb, that of the crossing it is a
-        // piece of: the pieces beyond the lit stub are governed by the same light. Once
-        // off the kerb only a lit piece - a median - holds again, see above: the light
-        // turning red mid-crossing must not freeze anybody in the road)
-        let lane = &net.lanes[next.lane];
-        let light = lane.traffic_light.or_else(|| if mid_crossing { None } else { traffic.and_then(|t| t.crossing_light(next.lane)) });
-        if let (Some((c, li)), Some(t)) = (light, traffic) {
-            if let Some((state, left)) = t.light_state(c, li) {
-                if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
-                    return Err("red light");
-                }
-                if held > 150.0 {
-                    return Ok(());
-                }
-                // A pedestrian green is short (8 s at Grundorf for an 11.6 m crossing that
-                // takes 10.7 s): who starts on green crosses in the clearance time after
-                // it, until the cars get their green. Only the green alone was counted, so
-                // nobody ever started on green and everybody went across on red after
-                // 150 s, in front of moving cars.
-                let window = pedestrian_window(ped.as_deref_mut(), net, t, next.lane, left);
-                if (window as f64) < t_cross {
-                    return Err("the green ends before they would be across");
-                }
-                return Ok(());
-            }
-        }
-        let Some(ped) = ped else { return Ok(()) };
-        // somebody who has waited long accepts a shorter gap (down to the time the crossing
-        // takes, never less): a steady stream does not hold them for ever, but nobody walks
-        // out in front of a car that is about to be there (after 45 s they used to ignore
-        // the cars altogether)
-        let margin = if mid_crossing || held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { 2.5 };
-        for x in ped.crossings(net, next.lane) {
-            for (p, v, half, yielding) in cars {
-                // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
-                // the pedestrian passes (a child and a taxi stood for each other for minutes,
-                // the child waiting for the taxi's creep, the taxi for the child)
-                if *yielding {
-                    continue;
-                }
-                let rel = *x - *p;
-                let dist = rel.length();
-                if dist > 90.0 {
-                    continue;
-                }
-                let speed = v.length();
-                // [ROLLBACK pedcross-1] a vehicle standing on the crossing holds them for a
-                // few seconds only; then they step round it (a car held in a queue on the
-                // zebra and the people waiting for it to move stood for each other for good)
-                if dist < half + 1.5 && (speed >= 0.5 || held < 5.0) {
-                    return Err("a vehicle stands on the crossing");
-                }
-                if speed < if mid_crossing { 2.0 } else { 0.5 } {
-                    continue;
-                }
-                let dir = *v / speed;
-                let along = rel.dot(dir);
-                let lateral = rel.perp_dot(dir).abs();
-                if along > -half && lateral < 3.5 && along / speed < t_cross + margin {
-                    return Err("waits for a car to pass");
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Take over where the crowd moved person `i`.
@@ -7676,6 +7933,242 @@ mod tests {
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.1), 3);
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.9), 7);
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.999_999), 7);
+    }
+}
+
+/// [ROLLBACK r4c] The rules of the people at crossings (round 4c, P1..P6).
+#[cfg(test)]
+mod ped_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Pedestrian lights the test sets: one light, its state and the seconds it keeps it.
+    pub(super) struct FakeLights {
+        pub state: Cell<i32>,
+        pub left: Cell<f32>,
+        /// The pieces of a crossing object's crossing (lit by light (0, 0)).
+        pub pieces: Vec<usize>,
+    }
+
+    pub(super) const GREEN: i32 = 6;
+    pub(super) const RED: i32 = 0;
+
+    impl FakeLights {
+        pub fn new(state: i32, left: f32) -> FakeLights {
+            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new() }
+        }
+    }
+
+    impl PedLights for FakeLights {
+        fn light_state(&self, _c: usize, _li: usize) -> Option<(i32, f32)> {
+            Some((self.state.get(), self.left.get()))
+        }
+        fn light_until_go(&self, _c: usize, _li: usize) -> Option<f32> {
+            Some(if omsi_sim::traffic::TrafficLightController::allows_go(self.state.get()) { 0.0 } else { 20.0 })
+        }
+        fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
+            self.pieces.contains(&lane).then_some((0, 0))
+        }
+        fn crossing_piece(&self, lane: usize) -> bool {
+            self.pieces.contains(&lane)
+        }
+    }
+
+    fn lane(points: Vec<DVec3>, kind: LaneKind, width: f32) -> omsi_sim::traffic::Lane {
+        omsi_sim::traffic::LaneBuilder::polyline(points, kind, width)
+    }
+
+    fn p(x: f64, y: f64) -> DVec3 {
+        DVec3::new(x, y, 0.0)
+    }
+
+    /// A street of two 3.5 m lanes along x (axes y = -1.75 and +1.75, kerbs at -3.5 and
+    /// 3.5) and a crossing over it at x = 0 from the pavement at y = -5.5 to the one at y =
+    /// 5.5: a lit 1.5 m stub, a piece over each lane, a lit stub at the far kerb (11 m in
+    /// all). Lanes: 0, 1 the street; 2 the near pavement (-20, -5.5) to (0, -5.5); 3 the
+    /// stub; 4, 5 the pieces; 6 the far stub; 7 the far pavement (0, 5.5) to (20, 5.5).
+    pub(super) fn crossing(lit: bool) -> (Network, PedNet) {
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(street(-1.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(1.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(vec![p(-20.0, -5.5), p(0.0, -5.5)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, -5.5), p(0.0, -4.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, -4.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(0.0, 4.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 4.0), p(0.0, 5.5)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 5.5), p(20.0, 5.5)], LaneKind::Sidewalk, 2.5));
+        if lit {
+            net.lanes[3].traffic_light = Some((0, 0));
+            net.lanes[6].traffic_light = Some((0, 0));
+        }
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        (net, ped)
+    }
+
+    /// Across the crossing of `crossing` from 10 m before the near kerb.
+    pub(super) fn across() -> PedWalk {
+        PedWalk::new(
+            vec![
+                Leg { lane: 2, a: 10.0, b: 20.0 },
+                Leg { lane: 3, a: 0.0, b: 1.5 },
+                Leg { lane: 4, a: 0.0, b: 4.0 },
+                Leg { lane: 5, a: 0.0, b: 4.0 },
+                Leg { lane: 6, a: 0.0, b: 1.5 },
+                Leg { lane: 7, a: 0.0, b: 20.0 },
+            ],
+            false,
+            0.0,
+        )
+    }
+
+    pub(super) fn me(id: u32, pos: DVec2, pace: f64) -> Me {
+        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace }
+    }
+
+    /// One frame of the walk as the game moves them (the crowd left out): (velocity).
+    pub(super) fn frame(net: &Network, ped: &mut PedNet, lights: Option<&dyn PedLights>, cars: &[SeenCar], t: f64, me: &mut Me, walk: &mut PedWalk, dt: f32) -> DVec2 {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ me.id as u64;
+        let at = Around { net, lights, cars, time: t };
+        let w = stroll(Some(ped), &at, me, walk, &mut rng, dt);
+        me.pos += w.vel * dt as f64;
+        if let Some(leg) = walk.legs.get(walk.leg) {
+            walk.s = leg.project(net, me.pos.extend(0.0), walk.s).max(walk.s - 0.3);
+        }
+        w.vel
+    }
+
+    /// The carriageway of `crossing` (inside the kerbs).
+    pub(super) fn in_road(q: DVec2) -> bool {
+        q.y.abs() < 3.5
+    }
+
+    /// Walks the crossing with the light green, turning red once they are `red_at` m across;
+    /// returns where they end up after `secs`, the longest they stood on the carriageway and
+    /// whether they were `on_crossing` everywhere between the kerbs.
+    fn caught_at(red_at: f32, secs: f32) -> (DVec2, f32, bool, Option<&'static str>) {
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = across();
+        let mut m = me(3, DVec2::new(-10.0, -5.5), 1.2);
+        let dt = 0.05;
+        let (mut t, mut still, mut longest, mut flagged) = (0.0f32, 0.0f32, 0.0f32, true);
+        while t < secs {
+            if walk.cross.map(|c| c.walked(&walk) >= red_at && !c.back).unwrap_or(false) {
+                lights.state.set(RED);
+                lights.left.set(30.0);
+            }
+            let v = frame(&net, &mut ped, Some(&lights), &[], t as f64, &mut m, &mut walk, dt);
+            if in_road(m.pos) {
+                still = if v.length() < 0.05 { still + dt } else { 0.0 };
+                longest = longest.max(still);
+                // (between the kerbs, past the first steps off it)
+                if m.pos.y.abs() < 4.9 && !m.on_crossing {
+                    flagged = false;
+                }
+            }
+            t += dt;
+        }
+        (m.pos, longest, flagged, m.decision)
+    }
+
+    #[test]
+    fn p1_a_crossing_of_one_metre_pieces_is_one_crossing() {
+        // BeijingCity: the crossing object's crossing in 1 m pieces, most cutting no lane and
+        // none lit itself (the light is the crossing's); the walk leaves every other piece
+        // out (both ends of one are within the 1.2 m that make one node)
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(street(-1.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(1.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(vec![p(-20.0, -5.5), p(0.0, -5.5)], LaneKind::Sidewalk, 2.5));
+        let mut pieces = Vec::new();
+        for k in 0..11 {
+            pieces.push(net.lanes.len());
+            net.lanes.push(lane(vec![p(0.0, -5.5 + k as f64), p(0.0, -4.5 + k as f64)], LaneKind::Sidewalk, 2.0));
+        }
+        net.lanes.push(lane(vec![p(0.0, 5.5), p(20.0, 5.5)], LaneKind::Sidewalk, 2.5));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let mut lights = FakeLights::new(GREEN, 60.0);
+        lights.pieces = pieces.clone();
+        let first = Leg { lane: 2, a: 10.0, b: 20.0 };
+        let node = ped.end_node(&net, &first).unwrap();
+        let (l0, fwd) = *ped.out[node].iter().find(|(l, _)| pieces.contains(l)).unwrap();
+        assert!(fwd);
+        let mut walk = PedWalk::new(vec![first, Leg { lane: l0, a: 0.0, b: 1.0 }], true, 0.0);
+        let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 1).unwrap();
+        let last = walk.legs[c.to];
+        assert!(last.at(&net, last.len()).0.y > 4.4, "to the far kerb: {:?}", walk.legs);
+        assert!(c.total > 4.5 && c.total < 6.5, "{}", c.total);
+        assert_eq!(c.light, Some((0, 0)));
+        // and walked: on_crossing everywhere between the kerbs, the red at the kerb only
+        let mut m = me(9, DVec2::new(-10.0, -5.5), 1.2);
+        let mut walk = PedWalk::new(vec![first], true, 0.0);
+        walk.legs.push(Leg { lane: l0, a: 0.0, b: 1.0 });
+        let (mut flagged, mut stood, mut longest) = (true, 0.0f32, 0.0f32);
+        for k in 0..600 {
+            let v = frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if walk.cross.map(|c| c.walked(&walk) > c.total * 0.6).unwrap_or(false) {
+                lights.state.set(RED);
+            }
+            if in_road(m.pos) {
+                if !m.on_crossing {
+                    flagged = false;
+                }
+                stood = if v.length() < 0.05 { stood + 0.05 } else { 0.0 };
+                longest = longest.max(stood);
+            }
+        }
+        assert!(flagged);
+        assert!(longest < 0.2, "{longest}");
+        assert!(m.pos.y > 5.0, "{:?}", m.pos);
+    }
+
+    #[test]
+    fn p1_caught_past_the_middle_goes_on_to_the_far_kerb() {
+        let (end, stood, flagged, _) = caught_at(6.0, 40.0);
+        assert!(end.y > 5.3, "on the far pavement: {end:?}");
+        assert!(stood < 0.2, "stood {stood:.2} s on the carriageway");
+        assert!(flagged, "on_crossing on every piece between the kerbs");
+    }
+
+    #[test]
+    fn p1_caught_before_the_middle_goes_back_to_the_near_kerb() {
+        let (end, stood, flagged, decision) = caught_at(3.0, 40.0);
+        assert!(end.y < -5.0, "back on the near side: {end:?}");
+        assert!(!in_road(end));
+        assert!(stood < 0.2, "stood {stood:.2} s on the carriageway");
+        assert!(flagged);
+        // and waits there for the green
+        assert_eq!(decision, Some("red light"));
+    }
+
+    #[test]
+    fn p1_the_light_counts_at_the_kerb_only() {
+        // red at the kerb: they wait on the pavement; on the pieces past the stub the light
+        // is not asked again (it is green throughout here, so nothing changes on the way)
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(RED, 30.0);
+        let mut walk = across();
+        let mut m = me(4, DVec2::new(-10.0, -5.5), 1.2);
+        for k in 0..400 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert!(!in_road(m.pos) && m.pos.y < -5.0, "{:?}", m.pos);
+        assert_eq!(m.decision, Some("red light"));
+        assert_eq!(walk.leg, 0);
+        // the crossing is all four pieces, 11 m, with the light of its stubs
+        let c = crossing_span(&mut ped, &net, None, &mut walk, 1).unwrap();
+        assert_eq!((c.from, c.to), (1, 4));
+        assert!((c.total - 11.0).abs() < 1e-3);
+        assert_eq!(c.light, Some((0, 0)));
+        // a stroll is planned straight across
+        let mut roam = PedWalk::new(vec![Leg { lane: 2, a: 10.0, b: 20.0 }, Leg { lane: 3, a: 0.0, b: 1.5 }], true, 0.0);
+        let c = crossing_span(&mut ped, &net, None, &mut roam, 1).unwrap();
+        assert_eq!(roam.legs.iter().map(|l| l.lane).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
+        assert_eq!(c.to, 4);
     }
 }
 
