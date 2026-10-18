@@ -1130,3 +1130,167 @@ fn x6_a_pass_held_out_there_by_a_red_light_is_given_up() {
     assert!(at > 8.0 && at < 16.0, "back in {at:.1} s after it stood");
     assert!(cars[0].pos.x < 238.0, "ran the red");
 }
+
+#[test]
+fn x3_a_frozen_change_with_both_lanes_taken_beside_it_waits_where_it_is() {
+    // lanes 4.5 m apart; the change 53 % across, a car standing level with it in each lane:
+    // neither done nor given up (either puts its body into a car), it stays where it is; once
+    // the one in its own lane (its nose 1 m past its rear) has driven off, it is given up into
+    // that lane
+    let mut net = Network::default();
+    let a = road(&[(0.0, 0.0), (300.0, 0.0)], 1);
+    let mut b = road(&[(0.0, -4.5), (300.0, -4.5)], 1);
+    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+    b.offset = 4.5;
+    net.lanes.push(a);
+    net.lanes.push(b);
+    let net = finish(net);
+    let mut me = car(1, 0, 100.0, 0.0);
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false });
+    let mut cars = vec![me];
+    for (id, lane, s) in [(2u64, 1usize, 97.0f32), (3, 0, 103.0), (4, 1, 105.5)] {
+        let mut o = car(id, lane, s, 0.0);
+        o.pull_out = 1000.0;
+        cars.push(o);
+    }
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.update_positions(&net, &mut cars);
+    let start = cars[0].pos;
+    let (mut moved, mut waiting_at_10) = (0.0f64, false);
+    let min_gap = run(&net, &mut sim, &mut cars, 20.0, |t, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if t < 10.0 {
+            moved = moved.max((me.pos - start).truncate().length());
+            waiting_at_10 = me.state.change.is_some();
+        }
+        // (at 10 s the car beside it in its own lane drives off)
+        if t > 10.0 {
+            cars.iter_mut().find(|c| c.id == 3).unwrap().pull_out = 0.0;
+        }
+    });
+    assert!(waiting_at_10, "settled into a lane where a car stands beside it");
+    assert!(moved < 0.05, "the body moved {moved:.2} m while it waited");
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(me.state.change.is_none() && me.state.lane == 0, "not given up into its own lane once free: {:?} lane {}", me.state.change, me.state.lane);
+    assert!(min_gap > 0.1, "bodies {min_gap:.2} m apart");
+}
+
+/// The eastbound two-way road of `two_way(false)` with a crossing of object 9 at x = `jx`: the
+/// eastbound and westbound roads run through it as pieces (x `jx` - 10..`jx` + 10), a
+/// northbound main road (priority 192) crosses them. Lanes: 0 eastbound to the crossing, 3
+/// westbound beyond it, 4 westbound after it.
+fn two_way_with_crossing(jx: f64) -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (jx - 10.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(jx - 10.0, 0.0), (jx + 10.0, 0.0)], 0)); // 1
+    net.lanes.push(road(&[(jx + 10.0, 0.0), (600.0, 0.0)], 2)); // 2
+    net.lanes.push(road(&[(600.0, 3.0), (jx + 10.0, 3.0)], 3)); // 3
+    net.lanes.push(road(&[(jx - 10.0, 3.0), (0.0, 3.0)], 4)); // 4
+    net.lanes.push(piece(&[(jx + 10.0, 3.0), (jx - 10.0, 3.0)], 1)); // 5
+    net.lanes.push(road(&[(jx, -300.0), (jx, -15.0)], 5)); // 6
+    let mut main = piece(&[(jx, -15.0), (jx, 15.0)], 2);
+    main.priority = 192.0;
+    net.lanes.push(main); // 7
+    net.lanes.push(road(&[(jx, 15.0), (jx, 300.0)], 6)); // 8
+    finish(net)
+}
+
+/// The bumper gap at which car 1, coming at 10 m/s, first stands behind a car standing for
+/// good at x = 200 (rear at 198), the oncoming lane `oncoming`'s traffic given.
+fn stands_behind_broken_down(net: &Network, oncoming: &[Vehicle]) -> f32 {
+    let mut sim = Simulation::new(net, vec![]);
+    let mut cars = vec![car(1, 0, 120.0, 10.0), broken_down(2, 200.0)];
+    cars.extend(oncoming.iter().cloned());
+    let mut gap: Option<f32> = None;
+    run(net, &mut sim, &mut cars, 20.0, |t, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if gap.is_none() && t > 1.0 && me.state.speed < 0.05 {
+            gap = Some(198.0 - (me.pos.x as f32 + me.state.front));
+        }
+    });
+    gap.expect("it never stood")
+}
+
+#[test]
+fn x4_no_room_is_kept_where_no_pass_can_start_a_junction_near_or_the_oncoming_lane_taken() {
+    // free to pass: room to pull out again (out_len 9 m + 1 m)
+    let free = stands_behind_broken_down(&two_way(false), &[]);
+    assert!(free > 8.5 && free < 11.5, "free to pass: {free:.2} m");
+    // a crossing 18 m past the standing car's front (within `JUNCTION_KEEP` of mine): no
+    // pass can start, it closes up
+    let net = two_way_with_crossing(220.0);
+    let js = omsi_traffic::Junctions::compile(&net);
+    assert!(js.movement(1).is_some(), "the crossing is a junction");
+    let near_junction = stands_behind_broken_down(&net, &[]);
+    assert!(near_junction > 1.0 && near_junction < 3.5, "a junction ahead: {near_junction:.2} m");
+    // the oncoming lane taken by a stream (a car every 25 m at 12 m/s): it closes up
+    let stream: Vec<Vehicle> = (0..14u64).map(|k| car(20 + k, 3, 150.0 + 25.0 * k as f32, 12.0)).collect();
+    let taken = stands_behind_broken_down(&two_way(false), &stream);
+    assert!(taken > 1.0 && taken < 3.5, "the oncoming lane taken: {taken:.2} m");
+}
+
+/// The side road car (1) standing for good at its line, the main road car (2) at its line
+/// eased off for it from the first frame both claim the crossing, run through the whole
+/// simulation for `secs` (the main road's light `light` given: on the main road's piece, its
+/// line at x = -15): when car 2's ease ended, how far car 2 had moved by then (from where it
+/// was eased off) and by the end, and the least gap between the bodies.
+fn eased_for_a_car_that_never_goes(light: Option<omsi_sim::traffic::TrafficLightController>, secs: f32) -> (Option<f32>, f32, f32, f32) {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -15.0)], 1));
+    net.lanes.push(piece(&[(0.0, -15.0), (0.0, 15.0)], 0));
+    net.lanes.push(road(&[(0.0, 15.0), (0.0, 300.0)], 2));
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 3));
+    let mut main = piece(&[(-15.0, 0.0), (15.0, 0.0)], 1);
+    main.priority = 192.0;
+    if light.is_some() {
+        main.traffic_light = Some((0, 0));
+    }
+    net.lanes.push(main);
+    net.lanes.push(road(&[(15.0, 0.0), (300.0, 0.0)], 4));
+    let net = finish(net);
+    let mut a = car(1, 0, 285.0 - 2.5, 0.0);
+    a.pull_out = 1000.0;
+    let b = car(2, 3, 285.0 - 2.5, 0.0);
+    let mut cars = vec![a, b];
+    let mut sim = Simulation::new(&net, light.into_iter().collect());
+    let (mut eased_at, mut ended, mut moved_eased) = (None::<f32>, None::<f32>, 0.0f32);
+    let min_gap = run(&net, &mut sim, &mut cars, secs, |t, sim, cars| {
+        if eased_at.is_none() && sim.claims.len() == 2 {
+            let b = cars.iter_mut().find(|c| c.id == 2).unwrap();
+            b.ease_for = Some((1, 0, 0.0));
+            eased_at = Some(b.pos.x as f32);
+            return;
+        }
+        let Some(start) = eased_at else { return };
+        let b = cars.iter().find(|c| c.id == 2).unwrap();
+        if ended.is_none() && b.ease_for.is_none() {
+            ended = Some(t);
+        }
+        if ended.is_none() {
+            moved_eased = moved_eased.max(b.pos.x as f32 - start);
+        }
+    });
+    let start = eased_at.expect("the two never both claimed the crossing");
+    let b = cars.iter().find(|c| c.id == 2).unwrap();
+    (ended, moved_eased, b.pos.x as f32 - start, min_gap)
+}
+
+#[test]
+fn x7_an_ease_off_ends_after_thirty_seconds_or_at_a_red_light_end_to_end() {
+    use omsi_traffic::sim::EASE_MAX;
+    // the one it eased off for never goes: after `EASE_MAX` the ease ends and it goes (it has
+    // the right of way)
+    let (ended, moved_eased, moved, min_gap) = eased_for_a_car_that_never_goes(None, EASE_MAX + 8.0);
+    let ended = ended.expect("the ease never ended");
+    assert!((ended - EASE_MAX).abs() < 1.0, "the ease ended at {ended:.1} s");
+    assert!(moved_eased < 0.3, "it moved {moved_eased:.1} m while eased off");
+    assert!(moved > 5.0, "it did not go once the ease ended: {moved:.1} m");
+    assert!(min_gap > 0.3, "bodies {min_gap:.2} m apart");
+    // its light goes red at 4 s: the ease ends there (the light holds it now), well before
+    // `EASE_MAX`, and it does not move
+    let red_at_4 = omsi_sim::traffic::TrafficLightController::new(vec![vec![(6, 4.0), (0, 100.0)]], 104.0);
+    let (ended, moved_eased, moved, _) = eased_for_a_car_that_never_goes(Some(red_at_4), 12.0);
+    let ended = ended.expect("the ease did not end at the red");
+    assert!(ended > 3.5 && ended < 5.0, "the ease ended at {ended:.1} s");
+    assert!(moved_eased < 0.3 && moved < 0.3, "it moved {moved:.1} m");
+}
