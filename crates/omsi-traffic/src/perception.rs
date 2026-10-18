@@ -524,6 +524,20 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             (None, Some(c)) => Some((c.0, c.0 + o.length(), c.1, c.2)),
             (h, _) => h,
         };
+        // (a pass standing out beside the lane, given up or held: also where its body steps back
+        // to, so that I keep my gap behind it there and it can; review12, case15 #47012 closed up
+        // to 0.23 m behind #47238's rear and it never could)
+        let back_in = o.passing.filter(|p| p.aborted || o.stopped > 2.0).filter(|_| o.state.lateral.abs() > 0.5).map(|_| {
+            let r = DVec2::new(o_fwd.y, -o_fwd.x);
+            Obb { center: o.obb().center - r * o.state.lateral as f64, ..o.obb() }
+        });
+        // (half a metre more than the gap kept: at least two metres behind its rear)
+        let back_in = back_in.and_then(|b| way.corridor_span(&b, w, reach).filter(|h| h.0 - st.front >= -0.5)).map(|h| (h.0 - BACK_IN_MARGIN, h.1, h.2, h.3));
+        let hit = match (hit, back_in) {
+            (Some(h), Some(c)) if c.0 < h.0 => Some(c),
+            (None, Some(c)) => Some(c),
+            (h, _) => h,
+        };
         let Some((near, far, k, f)) = hit else { continue };
         // (not one on another level: a bridge over the way, the road under it)
         if !on_way && (o.pos.z - way.zs[k]).abs() > 3.0 {
@@ -713,6 +727,10 @@ fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>
     let moved = Obb { center: b.center - right * (lat.signum() * shift), ..*b };
     way.corridor_hit(&moved, w, upto)
 }
+
+/// Metres more than its gap a car keeps behind where a pass standing out beside the lane steps
+/// back in to.
+pub const BACK_IN_MARGIN: f32 = 0.5;
 
 /// `cut_in_hit`: the seconds of sideways movement looked ahead.
 pub const CUT_IN_TIME: f32 = 2.5;

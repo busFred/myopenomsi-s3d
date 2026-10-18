@@ -4031,8 +4031,8 @@ struct Extra {
     passes: u64,
     passes_unsignalled: u64,
     pass_wrong_side_s: u64,
-    /// Seconds a vehicle stands (> 8 s) with a pass on the oncoming lane under way, short of the
-    /// end of what it passes and not at a red light (its way back in blocked).
+    /// Seconds a vehicle stands (> 8 s) with a pass on the oncoming lane under way or given up
+    /// (out there more than 0.5 m, whatever holds it, and not stepping back in).
     pass_stranded_s: u64,
     /// `overlap_s` without the pairs that touched within 3 s of one of them coming on the road.
     overlap_nospawn_s: u64,
@@ -4195,6 +4195,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     let mut phantom_ids: HashSet<u64> = HashSet::new();
     let mut phantom_review_ids: HashSet<u64> = HashSet::new();
     let mut keepback_ids: HashSet<u64> = HashSet::new();
+    let mut stranded_ids: HashSet<u64> = HashSet::new();
+    let mut stranded_lat: HashMap<u64, f32> = HashMap::new();
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
@@ -4507,8 +4509,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                     if !p.aborted && st.lateral.abs() > 1.0 && v.blinker_shown.0 != if p.side > 0.0 { 2 } else { 1 } {
                         ex.pass_wrong_side_s += 1;
                     }
-                    if p.lane.is_some() && !p.aborted && v.stopped > 8.0 && st.odometer < p.until && v.last.why != Why::Light {
+                    // (any pass, given up or not, held by a light or not, review12; not while it
+                    // steps back into its lane)
+                    let stepping = stranded_lat.insert(v.id, st.lateral).is_some_and(|was| (was - st.lateral).abs() > 0.05);
+                    if p.lane.is_some() && v.stopped > 8.0 && st.lateral.abs() > 0.5 && !stepping {
                         ex.pass_stranded_s += 1;
+                        if stranded_ids.insert(v.id) {
+                            ex.events.push(format!("STRANDED {} t={t:.1} #{} lane {} lat {:.2} aborted {} wait {:.1} past {:.1} why {:?} lead {:?} gap {:?} stop {:?} obstacle {:?}", sc.name, v.id, st.lane, st.lateral, p.aborted, p.wait, st.odometer - p.until, v.last.why, v.last.lead_id, v.last.lead.map(|l| l.gap), v.last.stop.map(|sp| sp - st.front), p.obstacle));
+                        }
                     }
                 }
                 if st.change.is_some() && change_since.get(&v.id).is_some_and(|e| e.3) {

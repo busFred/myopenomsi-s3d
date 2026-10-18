@@ -414,6 +414,12 @@ pub struct Simulation {
     pub claims: Vec<(Claim, Grant)>,
 }
 
+/// How far on (m) a pass coming back in looks for a body beside it, and runs straight when
+/// one is: half a metre past its front (at least 2 m; its body turns with the way there).
+fn return_look(st: &AiState) -> f32 {
+    (st.front + 0.5).max(2.0)
+}
+
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
@@ -1130,6 +1136,16 @@ impl Simulation {
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
         let sidestep = self.sidestep(vehicles, i, dt);
+        // (a pass given up whose obstacle has left: over, the car drives on where it is and the
+        // offset eases off as it goes, re-entering its lane ahead; review12, case15 #47238 stood
+        // 88 s out on the oncoming side, its stop behind it, after the obstacle had gone)
+        let obstacle_gone = vehicles[i].passing.filter(|p| p.aborted).and_then(|p| p.obstacle).is_some_and(|id| {
+            if id >= PLAYER_ID_BASE {
+                self.players.iter().find(|p| p.id as u64 == id - PLAYER_ID_BASE).is_none_or(|p| p.speed.abs() > 1.0)
+            } else {
+                vehicles.iter().find(|o| o.id == id).is_none_or(|o| o.state.speed > 1.0)
+            }
+        });
         let return_blocked = self.return_blocked(vehicles, i);
         let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
         let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
@@ -1190,10 +1206,18 @@ impl Simulation {
                     p.aborted = true;
                     p.hold = hold;
                 }
-                // back in over what room there is, at least two metres
+                // back in over what room there is, at least two metres (standing: over a bay's
+                // S-curve as it drives on, else the way bent over two metres turned the body
+                // 20-30 degrees where it stood, review12)
                 let odo = v.state.odometer;
-                let back = (hold - odo - 0.5).clamp(2.0, 8.0);
-                v.state.lateral_curve = vec![(odo, v.state.lateral), (odo + back, 0.0)];
+                let lat = v.state.lateral;
+                if v.state.speed < 0.5 {
+                    v.state.lateral_curve.clear();
+                    v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                } else {
+                    let back = (hold - odo - 0.5).clamp(2.0, 8.0);
+                    v.state.lateral_curve = vec![(odo, lat), (odo + back, 0.0)];
+                }
                 v.state.lateral_target = 0.0;
             }
             None => {}
@@ -1214,11 +1238,14 @@ impl Simulation {
         // coming back in: not into a body beside it - it stays out a metre more (a pass recorded
         // under way at a fixture's start came back in on top of the car that had drawn level,
         // viz3 case11 #28490, -1.77 m)
+        // (straight on past its front: the body follows the way under its front, and bent
+        // nearer than that it turned towards the body beside it, review12)
         if let (true, Some(p)) = (return_blocked, v.passing.as_mut()) {
             let (odo, lat) = (v.state.odometer, v.state.lateral);
+            let straight = return_look(&v.state);
             p.until = p.until.max(odo + 1.0);
             let back = (p.back_len * (lat.abs() / p.side.abs().max(0.1))).max(2.0);
-            v.state.lateral_curve = vec![(odo, lat), (odo + 1.0, lat), (odo + 1.0 + back, 0.0)];
+            v.state.lateral_curve = vec![(odo, lat), (odo + straight, lat), (odo + straight + back, 0.0)];
         }
         v.state.accel_cap = plan.accel_cap;
         // a fresh car: no harder braking than its driver likes at the start
@@ -1272,6 +1299,20 @@ impl Simulation {
             v.amber = None;
         }
         // a pass runs its course: the bent way brings the car back by itself
+        if obstacle_gone {
+            // (a pass on its way back in from where it is: the bent way eases the offset off
+            // as it drives, held out while a body beside it is in the way, `return_blocked`)
+            let (odo, lat) = (v.state.odometer, v.state.lateral);
+            let back = (lat.abs() * 8.0).clamp(8.0, 30.0);
+            if let Some(p) = v.passing.as_mut() {
+                *p = Passing { side: lat, until: odo, block: odo, aborted: false, hold: odo, back_len: back, wait: 0.0, obstacle: None, ..*p };
+            }
+            // (straight on past its front first: bent under it where it stands, the body
+            // turned on the spot)
+            let straight = return_look(&v.state);
+            v.state.lateral_curve = vec![(odo, lat), (odo + straight, lat), (odo + straight + back, 0.0)];
+            v.state.lateral_target = 0.0;
+        }
         if let Some(p) = v.passing {
             if p.aborted {
                 // standing out there, it steps back into its lane where it stands, at a walking
@@ -1296,10 +1337,12 @@ impl Simulation {
             } else if v.state.odometer >= p.until + p.back_len {
                 v.passing = None;
             } else if v.stopped > 8.0 && v.state.lateral.abs() < p.side.abs() * 0.5 {
-                // never got out: give it up where it stands
+                // never got out: give it up where it stands (the offset easing off as it drives)
                 v.passing = None;
-                let odo = v.state.odometer;
-                v.state.lateral_curve = vec![(odo, v.state.lateral), (odo + 4.0, 0.0)];
+                let (odo, lat) = (v.state.odometer, v.state.lateral);
+                v.state.lateral_curve.clear();
+                v.state.lateral_target = 0.0;
+                v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
             }
         }
         // a random car that stands for ever asks to be taken away when nobody looks
@@ -1372,15 +1415,16 @@ impl Simulation {
         }
     }
 
-    /// A pass coming back into its lane whose bent way would bring its body, 2 m on, within 0.2 m
+    /// A pass coming back into its lane whose bent way would bring its body, `return_look` on, within 0.2 m
     /// of another vehicle (and nearer than it is now): one beside it in the lane.
     fn return_blocked(&self, vehicles: &[Vehicle], i: usize) -> bool {
         let v = &vehicles[i];
         let Some(p) = v.passing.filter(|p| !p.aborted && p.wait <= 0.0) else { return false };
         let (odo, lat) = (v.state.odometer, v.state.lateral);
-        // (on its way back in, or about to be: where the way puts it 2 m on)
-        let next = v.state.lateral_ahead(2.0);
-        if odo + 2.0 < p.until || (next.abs() >= lat.abs() - 0.01) {
+        // (on its way back in, or about to be: where the way puts it a little past its front)
+        let look = return_look(&v.state);
+        let next = v.state.lateral_ahead(look);
+        if odo + look < p.until || (next.abs() >= lat.abs() - 0.01) {
             return false;
         }
         let h = (v.heading as f64).to_radians();

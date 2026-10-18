@@ -463,15 +463,21 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // standing out there with the way back in blocked: given up, back in behind the obstacle
         // at the gap kept (where it is still behind it), else into the lane where it is, and the
         // obstacle is a lead again (viz case09 #30816 stood 110 s on the oncoming side)
-        // (not once past it, on its way back in, nor held by a light: that is no blocked return)
-        if !pass.aborted && out.start.is_none() && pass.wait <= 0.0 && me.stopped > PASS_STRANDED && st.odometer < pass.until && out.why != Why::Light {
+        // (past it, on its way back in, it is stranded too while it stands still out there, held
+        // by a red light or a queue: review12, #20946 stood out on a scheduled bus's lane 84 s)
+        let held_out = st.lateral.abs() > 1.0;
+        if !pass.aborted && out.start.is_none() && pass.wait <= 0.0 && me.stopped > PASS_STRANDED && (st.odometer < pass.until || held_out) {
             // (beside it or past it already: it stays where it is and steps back in as soon as
             // its body there touches nobody, `Simulation::sidestep`)
             let hold = if st.odometer + 0.5 < pass.block { pass.block + st.front + 0.6 - st.min_gap } else { st.odometer };
             out.start = Some(Start::AbortPass { hold });
         }
-        if pass.aborted {
+        // (given up, it holds where it said, until what it went round has left)
+        let gone = pass.obstacle.is_some_and(|ob| obstacle_bus(sim, vehicles, ob).is_none_or(|(_, _, moves)| moves));
+        if pass.aborted && !gone {
             min_stop(&mut out.stop, &mut out.why, Some((pass.hold - st.odometer).max(0.0)), Why::Lead);
+        } else if pass.aborted {
+            // (its obstacle gone: nothing holds it here, the pass is over, `Simulation::act`)
         } else if pass.wait > 0.0 {
             // signalling: still behind it, with the room to pull out
             min_stop(&mut out.stop, &mut out.why, Some(st.front + (pass.block - st.odometer - pass.out_len - 1.0).max(0.0)), Why::Lead);

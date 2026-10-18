@@ -1032,3 +1032,101 @@ fn x2_an_ai_car_beside_me_cutting_in_is_let_in() {
         assert!(min_gap > 0.0, "apart {apart} ahead {ahead}: drove into it, {min_gap:.2} m");
     }
 }
+
+/// A car (id 1) at `s` on lane 0, out `lat` m on a pass (on the oncoming lane 3), standing.
+fn out_on_a_pass(s: f32, lat: f32, aborted: bool, until: f32, obstacle: Option<u64>) -> Vehicle {
+    let mut me = car(1, 0, s, 0.0);
+    let odo = me.state.odometer;
+    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo + until, block: odo - 4.0, out_len: 9.0, back_len: 18.0, aborted, hold: odo, wait: 0.0, obstacle });
+    me.state.lateral = lat;
+    me.state.lateral_target = lat;
+    me.state.lateral_ramp = (lat, lat, 0.0, 1.0);
+    me
+}
+
+#[test]
+fn x6_a_follower_does_not_close_up_on_a_given_up_pass_so_it_can_step_back() {
+    // review12, case15: #47238 gave up its pass 2.1 m out; #47012 closed up to 0.23 m behind its
+    // rear and it never got the 0.2 m it needs to step back
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut follower = car(3, 0, 80.0, 5.0);
+    follower.state.max_speed_kmh = 30.0;
+    let mut cars = vec![out_on_a_pass(100.0, -2.1, true, 20.0, Some(2)), broken_down(2, 106.5), follower];
+    let (mut least_behind, mut back, mut least_lat) = (f32::INFINITY, false, f32::INFINITY);
+    let min_gap = run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let f = cars.iter().find(|c| c.id == 3).unwrap();
+        // (while it stands out there; back in, the follower keeps its own gap)
+        if me.passing.is_some_and(|p| p.aborted) {
+            least_behind = least_behind.min((me.pos.x as f32 - me.state.rear) - (f.pos.x as f32 + f.state.front));
+        }
+        // (back in, the pass over; it may set out on a new one later)
+        back |= me.passing.is_none() && me.state.lateral.abs() < 0.1;
+        least_lat = least_lat.min(me.state.lateral.abs());
+    });
+    assert!(least_behind >= 2.0, "the follower closed up to {least_behind:.2} m behind its rear");
+    assert!(back, "never stepped back: lateral down to {least_lat:.2}");
+    assert!(min_gap > 0.2, "bodies {min_gap:.2} m apart");
+}
+
+#[test]
+fn x6_a_given_up_pass_beside_its_obstacle_drives_on_once_the_obstacle_leaves() {
+    // abreast of the car it went round (it cannot step back into it); at 3 s that car moves
+    // off: the pass is over, the car drives on and eases back into its lane ahead
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![out_on_a_pass(106.0, -3.0, true, 10.0, Some(2)), broken_down(2, 105.0)];
+    let mut gone_at: Option<f32> = None;
+    let mut over_at: Option<f32> = None;
+    let (mut turned, mut last_heading) = (0.0f32, 90.0f32);
+    let min_gap = run(&net, &mut sim, &mut cars, 25.0, |t, _, cars| {
+        if t > 3.0 {
+            cars.iter_mut().find(|c| c.id == 2).unwrap().pull_out = 0.0;
+        }
+        let o = cars.iter().find(|c| c.id == 2).unwrap().state.speed;
+        if gone_at.is_none() && o > 1.0 {
+            gone_at = Some(t);
+        }
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if over_at.is_none() && !me.passing.is_some_and(|p| p.aborted) {
+            over_at = Some(t);
+        }
+        // (turning where it stands: the review12 glitch, 20-30 degrees)
+        if me.state.speed < 0.1 {
+            turned += (me.heading - last_heading).abs();
+        }
+        last_heading = me.heading;
+    });
+    let (gone, over) = (gone_at.expect("the obstacle never left"), over_at.expect("the pass was never over"));
+    assert!(over - gone < 1.0, "the pass was over {:.1} s after the obstacle left", over - gone);
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(me.state.lateral.abs() < 0.1 && me.pos.x > 120.0, "not on in its lane: lateral {:.2} x {:.1}", me.state.lateral, me.pos.x);
+    assert!(turned < 3.0, "the body turned {turned:.1} degrees standing");
+    // (it stepped back to 0.2 m beside it; no nearer as they move off)
+    assert!(min_gap > 0.18, "bodies {min_gap:.2} m apart");
+}
+
+#[test]
+fn x6_a_pass_held_out_there_by_a_red_light_is_given_up() {
+    // past what it passed, still out 3 m, standing at the red 13 m on (review12: #20946 stood
+    // out on a scheduled bus's lane at a red 84 s): given up after 8 s, it steps back in
+    let net = two_way(true);
+    let red = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 120.0)]], 120.0);
+    let mut sim = Simulation::new(&net, vec![red]);
+    let mut cars = vec![out_on_a_pass(223.0, -3.0, false, -2.0, None)];
+    let (mut back_at, mut stood_at): (Option<f32>, Option<f32>) = (None, None);
+    run(&net, &mut sim, &mut cars, 25.0, |t, _, cars| {
+        let me = &cars[0];
+        if stood_at.is_none() && me.state.speed < 0.1 && t > 1.0 {
+            stood_at = Some(t);
+        }
+        if back_at.is_none() && me.passing.is_none() && me.state.lateral.abs() < 0.1 {
+            back_at = Some(t);
+        }
+    });
+    let at = back_at.expect("still out on the pass at the red") - stood_at.expect("never stood at the red");
+    // (8 s stranded, then 3 m back at a walking pace)
+    assert!(at > 8.0 && at < 16.0, "back in {at:.1} s after it stood");
+    assert!(cars[0].pos.x < 238.0, "ran the red");
+}
