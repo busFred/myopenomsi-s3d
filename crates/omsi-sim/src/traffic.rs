@@ -436,8 +436,11 @@ pub const YARD_DENSITY: f32 = 0.01;
 pub const TURN_DEG: f32 = 30.0;
 /// ... at a merge, a way bending this much more than the other (degrees) merges into it.
 pub const MERGE_DEG: f32 = 15.0;
-/// ... the approach is the last this many metres of the way to the meeting place.
+/// ... the approach is the last this many metres of the way to the meeting place (its turn);
 pub const APPROACH_WINDOW: f32 = 20.0;
+/// ... and the road it comes off (a yard, the road class) the first spline lane within this
+/// many metres back (case05's side road: its yard spline lies 34 m before the meeting place).
+pub const SPLINE_WINDOW: f32 = 40.0;
 /// ... a road whose density is this many times another's is the major one ...
 pub const CLASS_DENSITY_RATIO: f32 = 3.0;
 /// ... and, between spline approaches, one with this many times the speed limit.
@@ -884,19 +887,25 @@ impl Network {
             }
         };
         note(&mut ap, a);
+        // (back from the meeting place: `left` of the turn's window, `back` the distance from
+        // the meeting place to the current lane's start, for the spline's)
         let mut left = APPROACH_WINDOW - at;
+        let mut back = at;
         let mut cur = a;
         let mut h_back = la.at((at - APPROACH_WINDOW).max(0.0)).1;
-        for _ in 0..8 {
-            if left <= 0.0 {
+        for _ in 0..16 {
+            if left <= 0.0 && (ap.spline.is_some() || back >= SPLINE_WINDOW) {
                 break;
             }
             let start_h = self.lanes[cur].start_heading();
             let Some(&p) = self.prev.get(cur).and_then(|v| v.iter().min_by(|&&x, &&y| wrap_deg(self.lanes[x].end_heading() - start_h).abs().total_cmp(&wrap_deg(self.lanes[y].end_heading() - start_h).abs()))) else { break };
             let lp = &self.lanes[p];
             note(&mut ap, p);
-            h_back = lp.at((lp.length() - left).max(0.0)).1;
-            left -= lp.length();
+            if left > 0.0 {
+                h_back = lp.at((lp.length() - left).max(0.0)).1;
+                left -= lp.length();
+            }
+            back += lp.length();
             cur = p;
         }
         ap.heading_change = wrap_deg(h_meet - h_back).abs();
@@ -927,7 +936,7 @@ impl Network {
     /// left: Some(true) when `a` yields to `b`, Some(false) when `b` yields to `a`, None when
     /// none of these says. In order:
     /// 1. a way out of a yard, a car park, a garage or a bus bay (the spline lane it comes off
-    ///    within the window carries `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and
+    ///    within `SPLINE_WINDOW` carries `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and
     ///    BeijingCity paths off the street say so) yields to
     ///    the street; at a merge, a way coming in at an angle to the way out (`MERGE_DEG` more
     ///    than the other, which comes within `TURN_DEG` of it) yields to the other;
@@ -3864,6 +3873,24 @@ mod tests {
         assert!(!net.crossings[0].is_empty(), "they cross");
         assert!(net.must_yield_old(1, 0) && !net.must_yield_old(0, 1), "baseline: the turner yields");
         assert!(net.must_yield(1, 0) && !net.must_yield(0, 1), "the left turner must still yield to the oncoming straight (fails on r4a: the straight yields)");
+    }
+
+    #[test]
+    fn right_of_way_a_yard_spline_34_m_back_is_still_a_yard() {
+        // as case05's side road: the side way (b) runs 10 m on its last piece and 24 m on the
+        // piece before it before its spline (density 0.001) ends; the main way (a) comes off a
+        // spline of 3.0 right behind its piece
+        let mut sa = line(&[(0.0, -200.0), (0.0, -10.0)]);
+        sa.density = 3.0;
+        let mut sb = line(&[(200.0, 0.0), (34.0, 0.0)]);
+        sb.density = 0.001;
+        let mut net = object_net(vec![line(&[(0.0, -10.0), (0.0, 40.0)]), line(&[(10.0, 0.0), (-40.0, 0.0)]), line(&[(34.0, 0.0), (10.0, 0.0)]), sa, sb]);
+        for l in 3..5 {
+            net.lanes[l].source = 1;
+            net.lanes[l].key = Some(LaneKey { tile: (0, 0), id: 100 + l as i64, path: 0 });
+        }
+        assert!(net.approach_to(1, net.meeting_on(1, 0).0).spline.is_some_and(|c| c.density == 0.001));
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the side way off the yard yields");
     }
 
     #[test]
