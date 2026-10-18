@@ -169,3 +169,71 @@ fn review9_f_clearing_car_and_a_rolling_fresh_green_do_not_meet() {
         assert!(min_gap > 0.3, "fresh green arriving at {arrive} s: touched the clearing car, {min_gap:.2} m");
     }
 }
+
+/// Rule F: a left turner waits in the box (past its line and past its first meeting place,
+/// the westbound street) for the oncoming stream; the shared green turns yellow. The turner is
+/// now "clearing" (committed, no hold); the oncoming cars within "comfortable" take the yellow.
+#[test]
+fn review9_f_a_left_turner_clearing_on_amber_meets_the_oncoming_amber_runner() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(2.0, -400.0), (2.0, -20.0)], 1)); // 0 northbound approach
+    let mut l1 = piece(&[(2.0, -20.0), (2.0, -19.0)], 0, 128.0); // 1 lit stub
+    l1.traffic_light = Some((0, 0));
+    net.lanes.push(l1);
+    net.lanes.push(piece(&[(2.0, -19.0), (2.0, 25.0)], 1, 128.0)); // 2
+    net.lanes.push(road(&[(2.0, 25.0), (2.0, 400.0)], 2)); // 3
+    net.lanes.push(road(&[(-2.0, 300.0), (-2.0, 26.0)], 3)); // 4 southbound approach
+    let mut l5 = piece(&[(-2.0, 26.0), (-2.0, 25.0)], 2, 128.0); // 5 lit stub
+    l5.traffic_light = Some((0, 1));
+    net.lanes.push(l5);
+    let mut turn = piece(&[(-2.0, 25.0), (-2.0, 5.0), (5.0, -2.0), (25.0, -2.0)], 3, 128.0); // 6
+    turn.turn = 1;
+    net.lanes.push(turn);
+    net.lanes.push(road(&[(25.0, -2.0), (300.0, -2.0)], 4)); // 7
+    // westbound cross street at y = 17 (nobody on it), its own light
+    net.lanes.push(road(&[(300.0, 17.0), (26.0, 17.0)], 5)); // 8
+    let mut l9 = piece(&[(26.0, 17.0), (25.0, 17.0)], 4, 128.0); // 9
+    l9.traffic_light = Some((0, 2));
+    net.lanes.push(l9);
+    net.lanes.push(piece(&[(25.0, 17.0), (-25.0, 17.0)], 5, 128.0)); // 10
+    net.lanes.push(road(&[(-25.0, 17.0), (-300.0, 17.0)], 6)); // 11
+    let net = finish(net);
+    {
+        let js = omsi_traffic::Junctions::compile(&net);
+        for l in [1usize, 2, 5, 6] {
+            if let Some((_, m)) = js.movement(l) { eprintln!("lane {l}: cs {} foes {:?}", m.conflict_start, m.foes.iter().map(|f| (js.nodes[0].movements[f.movement].lane, f.mine, f.kind, f.yields)).collect::<Vec<_>>()); }
+        }
+    }
+    for (gap, phase) in [(30.0f32, 20.0f32), (24.0, 20.0), (36.0, 20.0), (30.0, 21.0), (30.0, 22.0)] {
+        // north/south green 0..phase, yellow 3 s, red; westbound green later
+        let ctl = TrafficLightController::new(vec![vec![(6, phase), (9, 3.0), (0, 60.0 - phase - 3.0)], vec![(6, phase), (9, 3.0), (0, 60.0 - phase - 3.0)], vec![(0, phase + 6.0), (6, 60.0 - phase - 6.0)]], 60.0);
+        let mut sim = Simulation::new(&net, vec![ctl]);
+        eprintln!("RUN {gap} {phase}");
+        let mut cars = vec![car(1, 4, 274.0 - 2.0 - 60.0, 10.0)];
+        for k in 0..14u64 {
+            cars.push(car(10 + k, 0, 380.0 - 2.0 - gap * k as f32, 12.0));
+        }
+        let mut clearing_at = None;
+        let mut turner_in_box_at_amber = false;
+        let mut log = String::new();
+        let min_gap = run(&net, &mut sim, &mut cars, 35.0, |t, _, cars| {
+            let tr = cars.iter().find(|c| c.id == 1);
+            if let Some(tr) = tr {
+                if (t - phase).abs() < DT && tr.state.lane == 6 {
+                    turner_in_box_at_amber = true;
+                }
+                if clearing_at.is_none() && t > phase && tr.state.lane == 6 && tr.state.speed > 0.5 {
+                    clearing_at = Some(t);
+                }
+                if t > phase - 1.0 && t < phase + 5.0 && (t * 30.0).round() as i32 % 6 == 0 {
+                    log += &format!("\n t {t:.1} turner L{} s {:.1} v {:.1} {:?} wf {:?}", tr.state.lane, tr.state.s, tr.state.speed, tr.last.why, tr.last.wait_for);
+                    for c in cars.iter().filter(|c| c.id != 1 && (c.pos.y > -40.0 && c.pos.y < 10.0)) {
+                        log += &format!(" | #{} y {:.1} v {:.1} {:?} wf {:?} hold {:?} stop {:?} amber {:?}", c.id, c.pos.y, c.state.speed, c.last.why, c.last.wait_for, c.last.hold, c.last.stop, c.amber);
+                    }
+                }
+            }
+        });
+        eprintln!("F-turner gap {gap} phase {phase}: min {min_gap:.2} turner in box at amber {turner_in_box_at_amber} moved off at {clearing_at:?}");
+        assert!(min_gap > 0.3, "gap {gap} phase {phase}: touched, {min_gap:.2} m{log}");
+    }
+}

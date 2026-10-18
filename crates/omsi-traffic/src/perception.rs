@@ -111,11 +111,12 @@ pub struct JunctionView {
     /// The front is over that light's line (by more than half a metre), or the lit lane lies
     /// behind the car.
     pub past_line: bool,
-    /// Past its line (passed while the light let it in), the light no longer green, and rolling
-    /// on or already at the first meeting place with another way: in the box when its light
-    /// turned, it clears it. That light holds it no more (`clears_past`; a later line on the
+    /// Past its line (passed while the light let it in), the light no longer green, and unable
+    /// to stop before the first meeting place with another way or already at it: in the box
+    /// when its light turned, it clears it. That light holds it no more (`clears_past`; a later line on the
     /// way, a left-turn waiting area's under another light of the controller, holds it as any)
-    /// and it is committed to its way through; a fresh green waits for it.
+    /// and it goes on through, waiting only for foes committed or clearing themselves (the
+    /// table decides between those); a fresh green waits for it (`Claim::clearing`).
     pub clearing: bool,
     /// The way through's length (m, along the chain's pieces).
     pub way_len: f32,
@@ -713,7 +714,12 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
         let turned = light.is_some_and(|(ctl, li, _)| sim.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), Aspect::Green | Aspect::GreenYellow | Aspect::Dark)));
         // (it passed the line while the light let it in: `Vehicle::passed_on_go`)
-        let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (me.state.speed >= 1.0 || light_line - me.state.front <= 0.5);
+        // (and only once it cannot stop before its first meeting place, or is at it: a car
+        // over its line on yellow 16 m short of it, that could still stop, was committed and
+        // went in front of a car it had been refused for; review9)
+        let to_line = light_line - me.state.front - 0.6;
+        let cannot_stop = me.state.speed > 1.0 && to_line < me.state.speed * me.state.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+        let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
         return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }
     None

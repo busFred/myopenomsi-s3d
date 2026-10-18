@@ -59,6 +59,12 @@ pub struct Claim {
     /// zebra in front of it, a lead that stands too. Not coming for as long as that holds,
     /// however near the meeting place it stands.
     pub stuck: bool,
+    /// In the box when its light turned, unable to stop before its first meeting place or at
+    /// it (`JunctionView::clearing`): it goes on through. To the others it is committed (a
+    /// fresh green waits for it); itself it waits only for foes in the meeting place, committed
+    /// or clearing, between which the table decides (two clearing claimants both went:
+    /// review9, a left turner in the box against an amber runner).
+    pub clearing: bool,
     /// Standing as of its last claim (`was_standing`): creeping to its red
     /// under 1 m/s it is still held there (its claim shifted by `until_go`).
     pub red_hysteresis: bool,
@@ -499,7 +505,15 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 if shifted.speed < 0.3 && !their_inside {
                     shifted.committed = false;
                 }
+                if shifted.clearing {
+                    shifted.committed = true;
+                }
                 let o = &shifted;
+                // clearing the box myself: only those in the meeting place, committed or
+                // clearing, can still hold me
+                if c.clearing && !their_inside && !o.committed {
+                    continue;
+                }
                 // lights before the table: held at a red that is never green with mine, it
                 // comes at its green (`red_foe`)
                 let at_red = !their_inside && red_foe(ctx, c, o);
@@ -754,7 +768,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.

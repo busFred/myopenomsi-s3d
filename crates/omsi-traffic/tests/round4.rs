@@ -213,21 +213,39 @@ fn signalled_cross() -> (Network, TrafficLightController) {
 
 #[test]
 fn rule_f_a_car_in_the_box_when_its_light_turns_clears_it_and_the_fresh_green_waits() {
-    let (net, ctl) = signalled_cross();
+    // as `signalled_cross`, but the northbound line 5 m before the crossing (approach 3 to
+    // y = -5, lit piece 4 from there); eastbound green 0-2 s, yellow 2-3, red from 3;
+    // northbound red to 6 s, green from 6
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-20.0, 0.0)], 1));
+    let mut a = piece(&[(-20.0, 0.0), (20.0, 0.0)], 0, 128.0);
+    a.traffic_light = Some((0, 0));
+    net.lanes.push(a);
+    net.lanes.push(road(&[(20.0, 0.0), (300.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -5.0)], 3));
+    let mut b = piece(&[(0.0, -5.0), (0.0, 20.0)], 1, 128.0);
+    b.traffic_light = Some((0, 1));
+    net.lanes.push(b);
+    net.lanes.push(road(&[(0.0, 20.0), (0.0, 300.0)], 4));
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(6, 2.0), (9, 1.0), (0, 57.0)], vec![(0, 6.0), (6, 54.0)]], 60.0);
     let mut sim = Simulation::new(&net, vec![ctl]);
-    // the eastbound car crawls (7 km/h) over its line at about 9 s, on green; it is still
-    // short of the crossing when its light is red and the northbound one green
-    let mut slow = car(1, 0, 280.0 - 2.0 - 1.95 * 9.0, 1.95);
-    slow.state.max_speed_kmh = 7.0;
+    // the eastbound car crawls into the crossing on green: in it when its light turns red
+    // (3 s), it clears it, still in it at the northbound green (6 s) and some seconds after.
+    // (Review9: one that can still stop short of its first meeting place is not clearing, and
+    // gives way as the table says.)
+    let mut slow = car(1, 1, 16.5, 0.8);
+    slow.state.max_speed_kmh = 3.0;
     slow.state.desire = 1.0;
-    // the northbound car stands at its red line
-    let fresh = car(2, 3, 280.0 - 2.0 - 0.5, 0.0);
+    // the northbound car stands at its red line, 2 m short of the crossing
+    let fresh = car(2, 3, 295.0 - 2.0 - 0.3, 0.0);
     let mut cars = vec![slow, fresh];
     let (mut held_in_box, mut fresh_waited, mut t_cleared, mut t_fresh_in) = (false, false, None, None);
     let min_gap = run(&net, &mut sim, &mut cars, 30.0, |t, _, cars| {
-        let (x, y) = (&cars[0], &cars[1]);
+        // (the fresh car leaves the network at the end of its exit)
+        let (Some(x), Some(y)) = (cars.iter().find(|c| c.id == 1), cars.iter().find(|c| c.id == 2)) else { return };
         let in_box = x.pos.x > -20.0 && x.pos.x - (x.state.rear as f64) < 20.0;
-        if t > 13.0 && in_box && x.state.speed < 0.3 {
+        if t > 3.0 && in_box && x.state.speed < 0.1 && matches!(x.last.why, Why::Light | Why::Junction | Why::ExitFull) {
             held_in_box = true;
         }
         fresh_waited |= y.last.wait_for == Some(1);
@@ -240,9 +258,9 @@ fn rule_f_a_car_in_the_box_when_its_light_turns_clears_it_and_the_fresh_green_wa
             t_fresh_in = Some(t);
         }
     });
-    assert!(!held_in_box, "the car in the box stood after its light went red");
+    assert!(!held_in_box, "the car in the box was held after its light went red");
     let cleared = t_cleared.expect("the slow car never cleared the crossing");
-    assert!(cleared > 15.0, "(the scenario: still in the box at the fresh green, cleared at {cleared:.1} s)");
+    assert!(cleared > 7.0, "(the scenario: still in the box after the fresh green, cleared at {cleared:.1} s)");
     assert!(fresh_waited, "the fresh green never waited for the car in the box");
     assert!(t_fresh_in.map(|t| t > cleared).unwrap_or(true), "the fresh green went in at {t_fresh_in:?} s, before the box was clear at {cleared:.1} s");
     assert!(min_gap > 0.3, "touched: {min_gap:.2} m");

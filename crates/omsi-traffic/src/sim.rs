@@ -711,9 +711,6 @@ impl Simulation {
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
             let committed = committed && !(light_red && st.speed < 0.5 && light_line - st.front > 0.5);
-            // in the box when its light turned: it clears it, committed to its way through
-            // until it has left it, and a fresh green waits for it (rule F)
-            let committed = committed || j.clearing;
             // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
             let was_standing = v.claim_standing;
@@ -748,6 +745,8 @@ impl Simulation {
                 blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
                 // (people or a zebra in front of it, or a lead that stands too: nothing that
                 // lets it go on a schedule, as a light or a lead moving off does)
+                // in the box when its light turned: it clears it (rule F)
+                clearing: j.clearing,
                 stuck: st.speed < 0.3
                     && v.last.held
                     && match v.last.why {
@@ -884,6 +883,7 @@ impl Simulation {
                 held: p.still > 2.0,
                 blocked,
                 stuck: false,
+                clearing: false,
                 red_hysteresis: false,
                 lanes: way,
                 light,
