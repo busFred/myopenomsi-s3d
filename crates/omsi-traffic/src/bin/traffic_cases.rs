@@ -8,6 +8,7 @@
 //! traffic_cases heads <fixture> [--radius 200] [--free]
 //! traffic_cases ab <fixture>... [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases stubs <fixture>... [--all]
+//! traffic_cases converge <fixture>... [--all]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
 //! traffic_cases compare <dir> [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
@@ -70,6 +71,7 @@ fn main() {
         Some("heads") if args.len() >= 3 => heads(Path::new(&args[2]), &args[3..]),
         Some("ab") if args.len() >= 3 => ab(&args[2..]),
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
+        Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
@@ -83,7 +85,7 @@ fn main() {
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|stubs|viewer|viewer2|compare|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|diagnose|heads|ab|stubs|converge|viewer|viewer2|compare|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -4615,5 +4617,133 @@ fn stubs(args: &[String]) -> Res<()> {
         t_bad += bad;
     }
     println!("TOTAL links dropped {t_links}, meetings dropped {t_pairs}, unexpected {t_bad}");
+    Ok(())
+}
+
+/// `converge <fixture>... [--all]`: lane pairs of one crossing object whose centre lines come
+/// within `MEET_DIST` (2.6 m: two buses touch) of each other with no meeting place compiled
+/// between them (`Network::crossings`), on the network the replay runs (the lit stubs applied,
+/// the lanes added later linked). Pieces of one way (one leads into the other within three
+/// links) and forks from one point (starts within 0.5 m) are left out unless `--all`. Per pair:
+/// the stretch along the first where they are that close, the least distance, how far apart
+/// they start and end, and whether they lead into a common lane; the nearest first. (Converging lanes whose
+/// starts lie under 3 m apart are no merge to `compute_conflicts`: cars on them met side by
+/// side, round 4a.)
+fn converge(args: &[String]) -> Res<()> {
+    let all = args.iter().any(|a| a == "--all");
+    let fixtures: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let near = omsi_sim::traffic::MEET_DIST;
+    let mut total = 0usize;
+    for f in fixtures {
+        let path = Path::new(f);
+        let (r, _) = grown(path, true)?;
+        let net = &r.net;
+        // street lanes by object, with their boxes
+        let mut by_object: BTreeMap<((i32, i32), i64), Vec<usize>> = BTreeMap::new();
+        for (i, l) in net.lanes.iter().enumerate() {
+            if l.source != 2 || l.kind != LaneKind::Street || l.points.len() < 2 {
+                continue;
+            }
+            if let Some(k) = l.key {
+                by_object.entry((k.tile, k.id)).or_default().push(i);
+            }
+        }
+        let bbox = |l: usize| {
+            let pts = &net.lanes[l].points;
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for p in pts {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            (x0 - near, y0 - near, x1 + near, y1 + near)
+        };
+        let leads = |from: usize, to: usize| -> bool {
+            let mut at = vec![from];
+            for _ in 0..3 {
+                at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+                if at.contains(&to) {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut lines: Vec<(f32, String)> = Vec::new();
+        for (key, lanes) in &by_object {
+            let boxes: Vec<(f64, f64, f64, f64)> = lanes.iter().map(|&l| bbox(l)).collect();
+            for x in 0..lanes.len() {
+                for y in x + 1..lanes.len() {
+                    let (a, b) = (lanes[x], lanes[y]);
+                    let (ba, bb) = (boxes[x], boxes[y]);
+                    if ba.2 < bb.0 || bb.2 < ba.0 || ba.3 < bb.1 || bb.3 < ba.1 {
+                        continue;
+                    }
+                    let (la, lb) = (&net.lanes[a], &net.lanes[b]);
+                    if la.key.map(|k| k.path) == lb.key.map(|k| k.path) {
+                        continue;
+                    }
+                    if net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b)) {
+                        continue;
+                    }
+                    let pieces = leads(a, b) || leads(b, a);
+                    let starts = (la.start() - lb.start()).truncate().length();
+                    let fork = starts <= 0.5;
+                    if (pieces || fork) && !all {
+                        continue;
+                    }
+                    // the stretch along `a` within `near` of `b`
+                    let (mut s0, mut s1, mut least) = (f32::INFINITY, f32::NEG_INFINITY, f64::INFINITY);
+                    let len = la.length();
+                    let mut s = 0.0f32;
+                    while s <= len {
+                        if let Some((_, d)) = lb.nearest_point(la.at(s).0) {
+                            least = least.min(d);
+                            if d < near {
+                                s0 = s0.min(s);
+                                s1 = s1.max(s);
+                            }
+                        }
+                        s += 0.5;
+                    }
+                    if !s0.is_finite() {
+                        continue;
+                    }
+                    let ends = (la.end() - lb.end()).truncate().length();
+                    let common = la.next.iter().any(|n| lb.next.contains(n));
+                    let tag = if pieces { " [pieces of one way]" } else if fork { " [fork]" } else { "" };
+                    lines.push((
+                        least as f32,
+                        format!(
+                            "{a}/{b} object {}:{}:{}: within {near} m along {a} s {s0:.1}-{s1:.1} ({:.1} m), least {least:.2} m; starts {starts:.2} m apart, ends {ends:.2} m{}; next {:?} / {:?}{tag}",
+                            key.0 .0,
+                            key.0 .1,
+                            key.1,
+                            s1 - s0,
+                            if common { ", a common next lane" } else { "" },
+                            la.next,
+                            lb.next
+                        ),
+                    ));
+                }
+            }
+        }
+        // (the nearest first: lanes of one road side by side are 2.3-2.6 m apart in BeijingCity;
+        // the converging pairs come nearer)
+        lines.sort_by(|p, q| p.0.total_cmp(&q.0));
+        let under = |d: f32| lines.iter().filter(|l| l.0 < d).count();
+        println!(
+            "{}: {} lane pairs within {near} m with no compiled meeting place ({} nearer than 2.0 m, {} nearer than 1.0 m)",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
+            lines.len(),
+            under(2.0),
+            under(1.0)
+        );
+        for (_, l) in &lines {
+            println!("  {l}");
+        }
+        total += lines.len();
+    }
+    println!("TOTAL {total}");
     Ok(())
 }
