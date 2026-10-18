@@ -214,6 +214,15 @@ pub struct Vehicle {
     /// keyframe restores it (recordings before format 2 lack it: false).
     #[serde(default)]
     pub claim_standing: bool,
+    /// The light (controller, light) whose line the vehicle passed while it let vehicles in
+    /// (green or yellow), as long as it is past that line: in the box when it turned, the
+    /// vehicle clears it (`JunctionView::clearing`). One put down past a red line, or that ran
+    /// it, has none.
+    #[serde(default)]
+    pub passed_on_go: Option<(usize, usize)>,
+    /// With `amber`: the odometer reading at the line it marks.
+    #[serde(default)]
+    pub amber_line: Option<f32>,
 }
 
 impl Vehicle {
@@ -243,6 +252,8 @@ impl Vehicle {
             pos: DVec3::ZERO,
             heading: 0.0,
             claim_standing: false,
+            passed_on_go: None,
+            amber_line: None,
         }
     }
 
@@ -605,7 +616,40 @@ impl Simulation {
         // the claimants' standing hysteresis as of this claim, written
         // back once all claims are filed
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
+        // the line each vehicle has passed on green or yellow, written back with them
+        let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
+        let mut stale_amber: Vec<usize> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
+            let passed = p.junction.as_ref().and_then(|j| {
+                let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
+                let lets_in = self.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow));
+                if lets_in || v.passed_on_go == Some((ctl, li)) {
+                    Some((ctl, li))
+                } else {
+                    None
+                }
+            });
+            if passed != v.passed_on_go {
+                passed_now.push((i, passed));
+            }
+            // the mark of a line taken on green or yellow (`Vehicle::amber`) is for that line:
+            // gone once neither the light ahead nor the junction's light is that light, or once
+            // the car is past that line and a line of the same light lies ahead (it stayed on
+            // after the junction, and the next approach under the same signal group went over
+            // its red on it: viz3 case01, light 1.0 lights three approaches)
+            if let Some(a) = v.amber {
+                let ahead = p.signal.filter(|s| (s.ctl, s.light) == a);
+                let here = p.junction.as_ref().and_then(|j| j.light).map(|(c, l, _)| (c, l));
+                let left = ahead.is_none() && here != Some(a);
+                let another = ahead.is_some_and(|s| s.dist > v.state.front + 0.5) && v.amber_line.is_some_and(|at| v.state.odometer > at + v.length() + 1.0);
+                // (or the line ahead lies further than a mark is ever taken at this speed:
+                // `plan::light_call`, a yellow within "comfortable", kept 6 m beyond it)
+                let comfortable = v.state.speed * v.state.speed / (2.0 * v.params.comfort_brake * 1.4) + 1.0;
+                let far = ahead.is_some_and(|s| s.dist - v.state.front > comfortable + 6.0);
+                if left || another || far {
+                    stale_amber.push(i);
+                }
+            }
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
             // a claim is filed from eight seconds before the meeting place (at least 60 m,
@@ -638,6 +682,8 @@ impl Simulation {
             // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
             let light_line = j.light_line;
             let (light_red, until_go) = match p.signal {
+                // (clearing the box: no light holds it, `JunctionView::clearing`)
+                _ if j.clearing => (false, None),
                 Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
@@ -658,6 +704,9 @@ impl Simulation {
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
             let committed = committed && !(light_red && st.speed < 0.5 && light_line - st.front > 0.5);
+            // in the box when its light turned: it clears it, committed to its way through
+            // until it has left it, and a fresh green waits for it (rule F)
+            let committed = committed || j.clearing;
             // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
             let was_standing = v.claim_standing;
@@ -816,6 +865,13 @@ impl Simulation {
         for (i, standing) in standing_now {
             vehicles[i].claim_standing = standing;
         }
+        for (i, passed) in passed_now {
+            vehicles[i].passed_on_go = passed;
+        }
+        for i in stale_amber {
+            vehicles[i].amber = None;
+            vehicles[i].amber_line = None;
+        }
         // the signal groups the claimants' lights belong to: which pairs never let vehicles
         // in together (worked out once per pair of lights, from the programs)
         for a in 0..claims.len() {
@@ -864,6 +920,7 @@ impl Simulation {
         }
         if let Some(light) = plan.amber {
             v.amber = Some(light);
+            v.amber_line = plan.amber_line.map(|gap| v.state.odometer + gap);
         }
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;

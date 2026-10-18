@@ -75,6 +75,8 @@ pub struct Plan {
     pub body_block: Option<u64>,
     /// At the line on green or yellow: the driver goes through whatever it turns to.
     pub amber: Option<(usize, usize)>,
+    /// With `amber`: the gap from the front to that line (m).
+    pub amber_line: Option<f32>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -240,11 +242,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.body_block = p.body_block;
     }
 
-    // 2. lights
-    if let Some(sig) = p.signal {
+    // 2. lights (not one of its junction's controller on the pieces of the way through while
+    // it clears the box: in it when its light turned, it drives on)
+    let clearing = |sig: &SignalView| p.junction.as_ref().is_some_and(|j| j.clearing && j.light.is_some_and(|(ctl, _, _)| ctl == sig.ctl) && sig.dist < j.entry + j.way_len);
+    if let Some(sig) = p.signal.filter(|s| !clearing(s)) {
         let call = light_call(me, p, &sig);
         if call.mark {
             out.amber = Some((sig.ctl, sig.light));
+            out.amber_line = Some(sig.dist - st.front);
         }
         if !call.go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);

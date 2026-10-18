@@ -111,6 +111,14 @@ pub struct JunctionView {
     /// The front is over that light's line (by more than half a metre), or the lit lane lies
     /// behind the car.
     pub past_line: bool,
+    /// Past its line (passed while the light let it in), the light no longer green, and rolling
+    /// on or already at the first meeting place with another way: in the box when its light
+    /// turned, it clears it. No
+    /// light holds it (that light, nor another of its controller on this junction's pieces)
+    /// and it is committed to its way through; a fresh green waits for it.
+    pub clearing: bool,
+    /// The way through's length (m, along the chain's pieces).
+    pub way_len: f32,
 }
 
 /// The light of junction `j` that a car on its pieces came through: back from `lane` along
@@ -693,7 +701,10 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             light = light_behind(net, js, j, l, d0, me.state.prev_lane);
         }
         let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line });
+        let turned = light.is_some_and(|(ctl, li, _)| sim.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), Aspect::Green | Aspect::GreenYellow | Aspect::Dark)));
+        // (it passed the line while the light let it in: `Vehicle::passed_on_go`)
+        let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (me.state.speed >= 1.0 || light_line - me.state.front <= 0.5);
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }
     None
 }

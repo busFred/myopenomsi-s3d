@@ -190,3 +190,90 @@ fn rule_e_the_oncoming_left_turner_yields_to_the_player_going_straight() {
     assert!(waited, "the turner never waited for the player");
     assert!(!entered_before, "the turner turned across in front of the player");
 }
+
+/// A signalled crossing: eastbound (approach 0, piece 1 x -20..20 lit (0, 0), exit 2) and
+/// northbound (approach 3, piece 4 y -20..20 lit (0, 1), exit 5), equal priorities (the
+/// northbound way comes from the eastbound's right). Eastbound green 0-10 s, yellow 10-13,
+/// red 13-40; northbound red 0-15, green 15-37, yellow 37-40.
+fn signalled_cross() -> (Network, TrafficLightController) {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-20.0, 0.0)], 1));
+    let mut a = piece(&[(-20.0, 0.0), (20.0, 0.0)], 0, 128.0);
+    a.traffic_light = Some((0, 0));
+    net.lanes.push(a);
+    net.lanes.push(road(&[(20.0, 0.0), (300.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -20.0)], 3));
+    let mut b = piece(&[(0.0, -20.0), (0.0, 20.0)], 1, 128.0);
+    b.traffic_light = Some((0, 1));
+    net.lanes.push(b);
+    net.lanes.push(road(&[(0.0, 20.0), (0.0, 300.0)], 4));
+    let ctl = TrafficLightController::new(vec![vec![(6, 10.0), (9, 3.0), (0, 27.0)], vec![(0, 15.0), (6, 22.0), (9, 3.0)]], 40.0);
+    (finish(net), ctl)
+}
+
+#[test]
+fn rule_f_a_car_in_the_box_when_its_light_turns_clears_it_and_the_fresh_green_waits() {
+    let (net, ctl) = signalled_cross();
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    // the eastbound car crawls (7 km/h) over its line at about 9 s, on green; it is still
+    // short of the crossing when its light is red and the northbound one green
+    let mut slow = car(1, 0, 280.0 - 2.0 - 1.95 * 9.0, 1.95);
+    slow.state.max_speed_kmh = 7.0;
+    slow.state.desire = 1.0;
+    // the northbound car stands at its red line
+    let fresh = car(2, 3, 280.0 - 2.0 - 0.5, 0.0);
+    let mut cars = vec![slow, fresh];
+    let (mut held_in_box, mut fresh_waited, mut t_cleared, mut t_fresh_in) = (false, false, None, None);
+    let min_gap = run(&net, &mut sim, &mut cars, 30.0, |t, _, cars| {
+        let (x, y) = (&cars[0], &cars[1]);
+        let in_box = x.pos.x > -20.0 && x.pos.x - (x.state.rear as f64) < 20.0;
+        if t > 13.0 && in_box && x.state.speed < 0.3 {
+            held_in_box = true;
+        }
+        fresh_waited |= y.last.wait_for == Some(1);
+        // the slow car's rear past the northbound way's meeting place (x = 2.6); the fresh
+        // car's front into it (y = -2.6)
+        if t_cleared.is_none() && x.pos.x as f32 - x.state.rear > 2.6 {
+            t_cleared = Some(t);
+        }
+        if t_fresh_in.is_none() && y.pos.y as f32 + y.state.front > -2.6 {
+            t_fresh_in = Some(t);
+        }
+    });
+    assert!(!held_in_box, "the car in the box stood after its light went red");
+    let cleared = t_cleared.expect("the slow car never cleared the crossing");
+    assert!(cleared > 15.0, "(the scenario: still in the box at the fresh green, cleared at {cleared:.1} s)");
+    assert!(fresh_waited, "the fresh green never waited for the car in the box");
+    assert!(t_fresh_in.map(|t| t > cleared).unwrap_or(true), "the fresh green went in at {t_fresh_in:?} s, before the box was clear at {cleared:.1} s");
+    assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
+}
+
+#[test]
+fn rule_f_the_mark_of_a_line_taken_on_green_does_not_carry_to_the_next_line_of_its_light() {
+    // two lit pieces in a row under the same light (0, 0): object 9 at x -10..10, object 10
+    // at x 110..130 (BeijingCity lights several approaches of one object with one light)
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-10.0, 0.0)], 1));
+    let mut a = piece(&[(-10.0, 0.0), (10.0, 0.0)], 0, 128.0);
+    a.traffic_light = Some((0, 0));
+    net.lanes.push(a);
+    net.lanes.push(road(&[(10.0, 0.0), (110.0, 0.0)], 2));
+    let mut b = piece(&[(110.0, 0.0), (130.0, 0.0)], 0, 128.0);
+    b.key = Some(LaneKey { tile: (0, 0), id: 10, path: 0 });
+    b.traffic_light = Some((0, 0));
+    net.lanes.push(b);
+    net.lanes.push(road(&[(130.0, 0.0), (600.0, 0.0)], 3));
+    let net = finish(net);
+    // green 0-6 s, yellow 6-9, red 9-60
+    let ctl = TrafficLightController::new(vec![vec![(6, 6.0), (9, 3.0), (0, 51.0)]], 60.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    // over the first line at about 3 s, on green, at 10 m/s
+    let mut cars = vec![car(1, 0, 258.0, 10.0)];
+    let (mut marked, mut furthest) = (false, f32::NEG_INFINITY);
+    run(&net, &mut sim, &mut cars, 40.0, |_, _, cars| {
+        marked |= cars[0].amber.is_some();
+        furthest = furthest.max(front_x(&cars[0]));
+    });
+    assert!(marked, "it never took the first line on green");
+    assert!(furthest <= 110.3, "its front got to x = {furthest:.1}, over the second line at 110 on red");
+}
