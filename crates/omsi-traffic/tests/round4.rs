@@ -318,7 +318,7 @@ fn rule_e_the_player_standing_at_its_red_does_not_hold_a_green_stream() {
 }
 
 #[test]
-fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane_first() {
+fn rule_d_a_held_car_where_its_way_converges_with_another_lane_first_stops_out_of_both_meeting_places() {
     // lead-in piece 1 (x -20..0) and a second lead-in 4 starting 2.4 m beside it and running
     // into its end (no merge to the old rule: their starts lie under 3 m apart; round 4b
     // compiles them as a meeting place over the stretch where they converge), then piece 2
@@ -337,7 +337,7 @@ fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane
     let (_, lead_in) = js.movement(1).unwrap();
     // (round 4b, X1: the two lead-ins are foes over the stretch where they converge, a
     // merge-kind meeting place, so they are no longer a convergence the junction knows no foe
-    // on; the held car still stops at its line, now before that meeting place)
+    // on; the held car stops at its line or past that meeting place, short of the main road)
     assert!(lead_in.foes.iter().any(|f| js.nodes[0].movements[f.movement].lane == 4 && f.kind == omsi_traffic::FoeKind::Merge), "the two lead-ins meet: {:?}", lead_in.foes);
     assert!(lead_in.converge.is_empty(), "no convergence left without a foe: {:?}", lead_in.converge);
     let mut sim = Simulation::new(&net, vec![]);
@@ -346,7 +346,7 @@ fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane
         cars.push(car(10 + k, 5, 330.0 - 30.0 * k as f32, 12.0));
     }
     let mut stood_at: Option<f32> = None;
-    run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+    let min_gap = run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
         let me = cars.iter().find(|c| c.id == 1).unwrap();
         if me.state.speed < 0.1 && me.last.why == Why::Junction && stood_at.is_none() {
             stood_at = Some(front_x(me));
@@ -354,7 +354,9 @@ fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane
     });
     let at = stood_at.expect("the car never stood for the main road");
     // (round 4b: with the convergence a compiled meeting place, rule D's band keeps the body
-    // out of it: the car stands at its line or with its rear past the stretch, x = 0, and short
-    // of the main road; before, the line was its only safe place)
-    assert!(at <= -19.5 || (at - 4.0 >= -0.1 && at < 19.0), "stood with its front at x = {at:.1}, its body in the converging lead-ins or the main road");
+    // out of it: the car stands at its line or with its rear past the stretch, x = 0, and its
+    // front short of the main road's cars, x = 20 less their half width and a margin
+    // (review12: 19 let the nose touch them); before, the line was its only safe place)
+    assert!(at <= -19.5 || (at - 4.0 >= -0.1 && at <= 17.5), "stood with its front at x = {at:.1}, its body in the converging lead-ins or the main road");
+    assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
 }
