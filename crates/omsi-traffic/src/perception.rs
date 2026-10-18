@@ -407,7 +407,12 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            if o.state.planned_next != Some(next) {
+            // into the same next lane; or out of a lane ending where mine does, whichever
+            // lane it goes on into (two lanes converging on one joint whose starts lie too
+            // close for the network to call them a merge, and for the junction to know them
+            // as foes, met side by side at the joint)
+            let same_joint = (pl.end() - my_lane.end()).truncate().length() < 1.5;
+            if o.state.planned_next != Some(next) && !same_joint {
                 continue;
             }
             // someone held at a light or a junction never arrives

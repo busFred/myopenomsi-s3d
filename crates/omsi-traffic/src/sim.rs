@@ -661,6 +661,7 @@ impl Simulation {
                 red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
+                id: v.id,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -748,6 +749,7 @@ impl Simulation {
                 red_hysteresis: false,
                 lanes: Vec::new(),
                 light: None,
+                id: PLAYER_ID_BASE + p.id as u64,
             });
         }
         for (i, standing) in standing_now {
@@ -770,6 +772,12 @@ impl Simulation {
             }
         }
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        // who went first on a tie at a zipper merge: the next tie there is the other side's
+        for (g, c) in grants.iter().zip(&claims) {
+            if let (true, Some((key, piece))) = (g.go, g.zip) {
+                self.signal_groups.zipper.insert(key, (piece, c.id));
+            }
+        }
 
         // plan and act, one vehicle at a time
         for i in 0..vehicles.len() {

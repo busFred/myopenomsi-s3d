@@ -428,6 +428,39 @@ pub const REACH_MAX: f32 = 600.0;
 /// A way on that ends within this distance is a dead end to a driver who has a choice (m).
 pub const DEAD_END: f32 = 500.0;
 
+/// Right of way between paths of equal `[rule] priority` (`Network::right_of_way`): a path
+/// whose approach carries at most this `[rule] trafficdensity` is a way out of a yard, a car
+/// park, a garage or a bus bay.
+pub const YARD_DENSITY: f32 = 0.01;
+/// ... more heading change than this (degrees) over the approach is a turn.
+pub const TURN_DEG: f32 = 30.0;
+/// ... at a merge, a way bending this much more than the other (degrees) merges into it.
+pub const MERGE_DEG: f32 = 15.0;
+/// ... the approach is the last this many metres of the way to the meeting place.
+pub const APPROACH_WINDOW: f32 = 20.0;
+/// ... a road whose density is this many times another's is the major one ...
+pub const CLASS_DENSITY_RATIO: f32 = 3.0;
+/// ... and, between spline approaches, one with this many times the speed limit.
+pub const CLASS_SPEED_RATIO: f32 = 1.5;
+
+/// How a vehicle comes to a meeting place (`Network::approach_to`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Approach {
+    /// The turn flag of the lane at the meeting place.
+    pub turn: i32,
+    /// Degrees between the heading at the meeting place and `APPROACH_WINDOW` metres back.
+    pub heading_change: f32,
+    /// The heading `APPROACH_WINDOW` metres back (degrees).
+    pub entry_heading: f32,
+    /// The lowest `[rule] trafficdensity` over the approach.
+    pub density: f32,
+    /// The most lanes abreast in its direction over the approach.
+    pub lanes: u32,
+    /// The highest speed limit of the spline lanes of the approach (km/h), None when it runs
+    /// on junction pieces only.
+    pub speed_kmh: Option<f32>,
+}
+
 /// Where two lanes of a junction meet.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Crossing {
@@ -755,11 +788,14 @@ impl Network {
         (n, walks)
     }
 
-    /// Must a vehicle on lane `a` let one on lane `b` go first where they meet? The path with
-    /// the higher `[rule] priority` goes first; between equals, a left turn waits for the
-    /// oncoming traffic, and otherwise the one coming from the right has the right of way
-    /// (the German "rechts vor links" that the stock maps rely on wherever they set no
-    /// priorities) - mirrored on a left-hand-traffic map. A train always goes first.
+    /// Must a vehicle on lane `a` let one on lane `b` go first where they meet? In order:
+    /// a train always goes first; the path with the higher `[rule] priority` goes first;
+    /// between equals (BeijingCity sets none at all), the fallbacks of
+    /// [`Network::right_of_way`]: a way out of a yard yields to the street, a movement merging
+    /// into the other's lane or turning yields to the one continuing its way, the minor road
+    /// yields to the major one; only then right before left (the German "rechts vor links"
+    /// the stock maps rely on wherever they set no priorities, mirrored on a left-hand-traffic
+    /// map), with a left turn waiting for the oncoming traffic.
     pub fn must_yield(&self, a: usize, b: usize) -> bool {
         let (la, lb) = (&self.lanes[a], &self.lanes[b]);
         if la.kind == LaneKind::Rail {
@@ -770,6 +806,9 @@ impl Network {
         }
         if (la.priority - lb.priority).abs() > 0.5 {
             return la.priority < lb.priority;
+        }
+        if let Some(y) = self.right_of_way(a, b) {
+            return y;
         }
         let rel = wrap_deg(lb.start_heading() - la.start_heading());
         // (the turn across the oncoming traffic: left, or right when driving on the left)
@@ -789,6 +828,134 @@ impl Network {
         }
         // side by side from the same direction: the one turning across the other waits
         la.turn != 0 && lb.turn == 0
+    }
+
+    /// Where lanes `a` and `b` meet, along `a` (the crossing point, or `a`'s end at a merge;
+    /// `a`'s end when the network does not know the place), and whether it is a merge.
+    fn meeting_on(&self, a: usize, b: usize) -> (f32, bool) {
+        match self.crossings.get(a).and_then(|v| v.iter().find(|c| c.other == b)) {
+            Some(c) => (c.at, c.merge),
+            None => (self.lanes[a].length(), false),
+        }
+    }
+
+    /// How a vehicle comes to distance `at` of lane `a`: over the last `APPROACH_WINDOW`
+    /// metres of its way there (back along `a` and the lanes leading into it, each time the
+    /// one that continues it most smoothly).
+    pub fn approach_to(&self, a: usize, at: f32) -> Approach {
+        let la = &self.lanes[a];
+        let at = at.clamp(0.0, la.length());
+        let h_meet = la.at(at).1;
+        let mut ap = Approach { turn: la.turn, heading_change: 0.0, entry_heading: 0.0, density: la.density, lanes: self.lanes_abreast(a), speed_kmh: None };
+        if la.source != 2 {
+            ap.speed_kmh = Some(la.speed_limit_kmh);
+        }
+        let mut left = APPROACH_WINDOW - at;
+        let mut cur = a;
+        let mut h_back = la.at((at - APPROACH_WINDOW).max(0.0)).1;
+        for _ in 0..8 {
+            if left <= 0.0 {
+                break;
+            }
+            let start_h = self.lanes[cur].start_heading();
+            let Some(&p) = self.prev.get(cur).and_then(|v| v.iter().min_by(|&&x, &&y| wrap_deg(self.lanes[x].end_heading() - start_h).abs().total_cmp(&wrap_deg(self.lanes[y].end_heading() - start_h).abs()))) else { break };
+            let lp = &self.lanes[p];
+            ap.density = ap.density.min(lp.density);
+            ap.lanes = ap.lanes.max(self.lanes_abreast(p));
+            if lp.source != 2 {
+                ap.speed_kmh = Some(ap.speed_kmh.unwrap_or(0.0).max(lp.speed_limit_kmh));
+            }
+            h_back = lp.at((lp.length() - left).max(0.0)).1;
+            left -= lp.length();
+            cur = p;
+        }
+        ap.heading_change = wrap_deg(h_meet - h_back).abs();
+        ap.entry_heading = h_back;
+        ap
+    }
+
+    /// Lanes of the road side by side in `l`'s direction (the `left`/`right` chains).
+    fn lanes_abreast(&self, l: usize) -> u32 {
+        let mut n = 1;
+        for side in [true, false] {
+            let mut cur = l;
+            for _ in 0..8 {
+                let next = if side { self.lanes[cur].left } else { self.lanes[cur].right };
+                match next {
+                    Some(x) if x != l && x < self.lanes.len() => {
+                        n += 1;
+                        cur = x;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        n
+    }
+
+    /// The right of way between two paths of equal `[rule] priority` before right before
+    /// left: Some(true) when `a` yields to `b`, Some(false) when `b` yields to `a`, None when
+    /// none of these says. In order:
+    /// 1. a way out of a yard, a car park, a garage or a bus bay (its last stretch carries
+    ///    `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and BeijingCity paths off the
+    ///    street say so; BeijingCity's garage exit 0.001 against 0.5 in the street) yields to
+    ///    the street; at a merge, a way coming in at an angle to the way out (`MERGE_DEG` more
+    ///    than the other, which comes within `TURN_DEG` of it) yields to the other;
+    /// 2. a turning movement (a turn flag, or more than `TURN_DEG` of heading change over its
+    ///    approach) yields to one going on straight (not between oncoming ways: there the
+    ///    left turn waits, step 4);
+    /// 3. the minor road yields to the major one: 2+ lanes abreast against 1, else
+    ///    `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO` times lower, else (for
+    ///    spline approaches) a speed limit `CLASS_SPEED_RATIO` times lower.
+    pub fn right_of_way(&self, a: usize, b: usize) -> Option<bool> {
+        let (at_a, merge) = self.meeting_on(a, b);
+        let (at_b, _) = self.meeting_on(b, a);
+        let (pa, pb) = (self.approach_to(a, at_a), self.approach_to(b, at_b));
+        let decided = |ya: bool, yb: bool| -> Option<bool> {
+            match (ya, yb) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            }
+        };
+        // 1. yards; merging into the other's lane
+        let yard = |p: &Approach| p.density <= YARD_DENSITY;
+        if let Some(y) = decided(yard(&pa), yard(&pb)) {
+            return Some(y);
+        }
+        if merge {
+            // (how far off the way out each comes in: the lane both lead into, else the
+            // middle of their two ends)
+            let (la, lb) = (&self.lanes[a], &self.lanes[b]);
+            let exit = la.next.iter().find(|n| lb.next.contains(n)).and_then(|&n| self.lanes.get(n)).map(|n| n.start_heading());
+            let exit = exit.unwrap_or(la.end_heading() + wrap_deg(lb.end_heading() - la.end_heading()) * 0.5);
+            let (oa, ob) = (wrap_deg(exit - pa.entry_heading).abs(), wrap_deg(exit - pb.entry_heading).abs());
+            if let Some(y) = decided(oa >= ob + MERGE_DEG && ob <= TURN_DEG, ob >= oa + MERGE_DEG && oa <= TURN_DEG) {
+                return Some(y);
+            }
+        }
+        // 2. turning against straight on (oncoming ways: step 4)
+        let rel = wrap_deg(self.lanes[b].start_heading() - self.lanes[a].start_heading());
+        if rel.abs() <= 135.0 {
+            let turning = |p: &Approach| p.turn != 0 || p.heading_change > TURN_DEG;
+            if let Some(y) = decided(turning(&pa), turning(&pb)) {
+                return Some(y);
+            }
+        }
+        // 3. road class
+        if let Some(y) = decided(pa.lanes == 1 && pb.lanes >= 2, pb.lanes == 1 && pa.lanes >= 2) {
+            return Some(y);
+        }
+        let (da, db) = (pa.density.max(1e-4), pb.density.max(1e-4));
+        if let Some(y) = decided(db > da * CLASS_DENSITY_RATIO, da > db * CLASS_DENSITY_RATIO) {
+            return Some(y);
+        }
+        if let (Some(va), Some(vb)) = (pa.speed_kmh, pb.speed_kmh) {
+            if let Some(y) = decided(vb >= va * CLASS_SPEED_RATIO, va >= vb * CLASS_SPEED_RATIO) {
+                return Some(y);
+            }
+        }
+        None
     }
 
     /// The lane beside `lane` at `s` that carries the traffic the other way (the other half
@@ -3560,6 +3727,80 @@ mod tests {
         net.lanes[2].turn = 1;
         assert!(!net.must_yield(2, 0));
         assert_eq!(net.oncoming_sign(), 1.0);
+    }
+
+    /// Lanes of one crossing object (source 2, one key), linked, with their meeting places.
+    fn object_net(lanes: Vec<Lane>) -> Network {
+        let mut net = Network { lanes, ..Default::default() };
+        for (k, l) in net.lanes.iter_mut().enumerate() {
+            l.source = 2;
+            l.key = Some(LaneKey { tile: (0, 0), id: 7, path: k as u16 });
+        }
+        net.link(1.5);
+        net.compute_conflicts();
+        net
+    }
+
+    fn line(pts: &[(f64, f64)]) -> Lane {
+        LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.0)
+    }
+
+    #[test]
+    fn right_of_way_fallbacks_between_equal_priorities() {
+        // a northbound on x = 0; b westbound on y = 0, coming from a's right: right before
+        // left, a yields to b
+        let a = || line(&[(0.0, -40.0), (0.0, 40.0)]);
+        let b = || line(&[(40.0, 0.0), (-40.0, 0.0)]);
+        let net = object_net(vec![a(), b()]);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "right before left");
+        // 1. b comes out of a yard (density 0.001): it yields to the street
+        let mut yard = b();
+        yard.density = 0.001;
+        let net = object_net(vec![a(), yard.clone()]);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the yard yields");
+        // ... a [rule] priority still decides first
+        let mut net = object_net(vec![a(), yard]);
+        net.lanes[0].priority = 64.0;
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "[rule] priority first");
+        // 2. b turns 45 degrees right before it crosses (no turn flag): it yields to a, which
+        // goes straight on
+        let turn = line(&[(40.0, 0.0), (10.0, 0.0), (0.0, 10.0), (-30.0, 40.0)]);
+        let net = object_net(vec![a(), turn]);
+        assert!(net.approach_to(1, net.crossings[1][0].at).heading_change > TURN_DEG);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the turner yields");
+        // ... with a turn flag on a straight path just the same
+        let mut flagged = b();
+        flagged.turn = 1;
+        let net = object_net(vec![a(), flagged]);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the flagged turner yields");
+        // 3. road class: two lanes abreast against one
+        let mut net = object_net(vec![a(), b(), line(&[(3.5, -40.0), (3.5, 40.0)])]);
+        net.lanes[0].right = Some(2);
+        net.lanes[2].left = Some(0);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "one lane yields to two");
+        // ... density 3.0 against 0.5 (more than 3 times)
+        let mut main = a();
+        main.density = 3.0;
+        let mut side = b();
+        side.density = 0.5;
+        let net = object_net(vec![main, side.clone()]);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the minor road yields");
+        // ... 0.5 against 1.0 is no clear difference: right before left
+        let net = object_net(vec![a(), side]);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0));
+    }
+
+    #[test]
+    fn right_of_way_a_way_merging_in_at_an_angle_yields_to_the_one_going_on() {
+        // a straight on into the exit; b comes in from the right at about 35 degrees, neither
+        // with a turn of TURN_DEG over its approach
+        let a = line(&[(0.0, -40.0), (0.0, 0.0)]);
+        let b = line(&[(25.0, -35.0), (6.0, -10.0), (0.0, 0.0)]);
+        let exit = line(&[(0.0, 0.0), (0.0, 30.0)]);
+        let net = object_net(vec![a, b, exit]);
+        assert!(net.crossings[0].iter().any(|c| c.merge && c.other == 1), "{:?}", net.crossings[0]);
+        assert!(net.approach_to(1, net.lanes[1].length()).heading_change <= TURN_DEG);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the merging way yields");
     }
 
     #[test]

@@ -233,7 +233,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let at_line = j.entry - 0.3;
             let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
             let at = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
-            if at > st.front - 0.3 {
+            if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {
+                // second at a zipper merge, both rolling: in behind the other at my gap
+                out.hold = g.hold;
+                out.wait_for = g.wait_for;
+                let behind = Lead { gap, speed, acc: 0.0 };
+                if out.lead.map(|l| gap < l.gap).unwrap_or(true) {
+                    out.lead = Some(behind);
+                    out.lead_seen = Some(Seen::Vehicle(w));
+                }
+            } else if at > st.front - 0.3 {
                 out.hold = g.hold;
                 out.wait_for = g.wait_for;
                 let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };

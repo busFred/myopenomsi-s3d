@@ -304,15 +304,26 @@ impl Junctions {
     /// The foes of a way through `j` over the pieces `chain` (as from `chain_along`), with
     /// the meeting places at their distance along the whole way.
     pub fn foes_along(&self, j: usize, chain: &[(usize, f32)]) -> Vec<Foe> {
+        self.foes_along_pieces(j, chain).into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// [`Junctions::foes_along`], each foe with the piece of the chain it meets.
+    pub fn foes_along_pieces(&self, j: usize, chain: &[(usize, f32)]) -> Vec<(usize, Foe)> {
         let node = &self.nodes[j];
         let mut out = Vec::new();
         for &(m, off) in chain {
             for f in &node.movements[m].foes {
-                out.push(Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields });
+                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields }));
             }
         }
-        out.sort_by(|a, b| a.mine.0.total_cmp(&b.mine.0));
+        out.sort_by(|a, b| a.1.mine.0.total_cmp(&b.1.mine.0));
         out
+    }
+
+    /// Two movements merging into one another that no rule of the table separates (neither
+    /// gives way to the other): they take turns (`reservation`'s zipper).
+    pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
+        foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
     }
 
     /// The pedestrian crossings of the object: every footpath lane that cuts a way through
