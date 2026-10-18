@@ -264,77 +264,114 @@ pub fn way_lanes(net: &Network, st: &AiState, within: f32) -> Vec<(usize, f32)> 
     out
 }
 
-/// The car's way ahead, sampled: (distance from the origin, point, forward direction).
+/// The car's way ahead, sampled: (distance from the origin, point, forward direction), with
+/// the height of each sample.
 struct WayPts {
     pts: Vec<(f32, DVec2, DVec2)>,
-    z: f64,
+    zs: Vec<f64>,
 }
 
-/// Sample spacing of the way (m).
+/// Sample spacing of the way (m) ...
 const WAY_STEP: f32 = 1.5;
+/// ... over this many metres, twice that beyond (a lead far ahead).
+const WAY_FINE: f32 = 60.0;
+
+/// Margin round my corridor (m): a body that comes within it of where my body will be is a
+/// lead (`lead_by_bodies`).
+pub const LEAD_MARGIN: f64 = 0.3;
 
 impl WayPts {
     fn sample(net: &Network, st: &AiState, upto: f32) -> WayPts {
-        let n = (upto / WAY_STEP).ceil() as usize + 2;
+        let n = (upto.min(WAY_FINE) / WAY_STEP).ceil() as usize + ((upto - WAY_FINE).max(0.0) / (2.0 * WAY_STEP)).ceil() as usize + 2;
         let mut pts = Vec::with_capacity(n);
+        let mut zs = Vec::with_capacity(n);
         let mut prev = st.way_point(net, -WAY_STEP).truncate();
         let mut d = 0.0f32;
-        let mut z = 0.0;
-        for k in 0..n {
+        for _ in 0..n {
             let q = st.way_point(net, d);
-            if k == 0 {
-                z = q.z;
-            }
+            zs.push(q.z);
             let q2 = q.truncate();
             let fwd = (q2 - prev).normalize_or_zero();
             pts.push((d, q2, fwd));
             prev = q2;
-            d += WAY_STEP;
+            d += if d < WAY_FINE { WAY_STEP } else { 2.0 * WAY_STEP };
         }
-        WayPts { pts, z }
+        WayPts { pts, zs }
     }
 
-    /// The first sample inside the box (grown by `margin`), bisected back to the edge:
-    /// the distance from the origin.
-    fn hit(&self, b: &Obb, margin: f64, upto: f32) -> Option<f32> {
-        for w in self.pts.windows(2) {
-            let (d, q, _) = w[1];
-            if d > upto + WAY_STEP {
+    /// Where box `b` comes into the corridor of half width `w` round the way (no further than
+    /// `upto` along it): (distance from the origin along the way to its near edge, the index
+    /// of the sample whose slice it enters, the slice's forward direction). Each slice of the
+    /// way (between two samples) clips the box in its own frame, so a box beside the way,
+    /// however near, is no hit, and one across it is met at its near edge.
+    fn corridor_hit(&self, b: &Obb, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
+        let corners = b.corners();
+        let reach = b.half.length() + w;
+        for k in 0..self.pts.len().saturating_sub(1) {
+            let (d, q, _) = self.pts[k];
+            if d > upto {
                 break;
             }
-            if inside(b, q, margin) {
-                let (mut lo, mut hi) = (w[0].1, q);
-                let (mut dlo, mut dhi) = (w[0].0, d);
-                for _ in 0..5 {
-                    let mid = (lo + hi) * 0.5;
-                    let dm = (dlo + dhi) * 0.5;
-                    if inside(b, mid, margin) {
-                        hi = mid;
-                        dhi = dm;
-                    } else {
-                        lo = mid;
-                        dlo = dm;
-                    }
-                }
-                return Some(dhi);
+            let (d1, q1, _) = self.pts[k + 1];
+            let step = (d1 - d) as f64;
+            if (b.center - q).length() > reach + step + 0.5 {
+                continue;
             }
+            let f = (q1 - q).normalize_or_zero();
+            if f == DVec2::ZERO {
+                continue;
+            }
+            let r = DVec2::new(f.y, -f.x);
+            let poly: Vec<DVec2> = corners.iter().map(|c| {
+                let v = *c - q;
+                DVec2::new(v.dot(f), v.dot(r))
+            }).collect();
+            let Some((x0, x1)) = clip_strip(&poly, w) else { continue };
+            // (the first slice reaches back behind the origin: a body beside the car)
+            let lo = if k == 0 { f64::NEG_INFINITY } else { 0.0 };
+            if x1 < lo || x0 > step {
+                continue;
+            }
+            return Some((d + x0 as f32, k, f));
         }
         None
     }
 }
 
-/// Is `p` inside the box, in plan view, grown by `margin`?
-fn inside(b: &Obb, p: DVec2, margin: f64) -> bool {
-    let [r, f] = b.axes();
-    let rel = p - b.center;
-    rel.dot(r).abs() <= b.half.x + margin && rel.dot(f).abs() <= b.half.y + margin
+/// The x extent (min, max) of the polygon `poly` cut to the strip |y| <= `w`, if anything of it
+/// lies in the strip.
+fn clip_strip(poly: &[DVec2], w: f64) -> Option<(f64, f64)> {
+    fn clip(pts: &[DVec2], keep: impl Fn(DVec2) -> f64) -> Vec<DVec2> {
+        let mut out = Vec::with_capacity(pts.len() + 2);
+        for k in 0..pts.len() {
+            let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+            let (fa, fb) = (keep(a), keep(b));
+            if fa >= 0.0 {
+                out.push(a);
+            }
+            if (fa >= 0.0) != (fb >= 0.0) {
+                out.push(a + (b - a) * (fa / (fa - fb)));
+            }
+        }
+        out
+    }
+    let upper = clip(poly, |p| w - p.y);
+    if upper.is_empty() {
+        return None;
+    }
+    let both = clip(&upper, |p| p.y + w);
+    if both.is_empty() {
+        return None;
+    }
+    Some(both.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.x), b.max(p.x))))
 }
 
 fn look_ahead(v: f32) -> f32 {
     (v * v / 3.0 + 2.0 * v + 20.0).clamp(70.0, 150.0)
 }
 
-/// The vehicle ahead on the way, through the lanes ahead.
+/// The vehicle ahead on the way, through the lanes ahead (by lane registration: an aircraft's,
+/// whose way has no body test).
 fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)], look: f32) -> Option<Headway> {
     let me = &vehicles[i];
     let st = &me.state;
@@ -403,6 +440,131 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
     best
 }
 
+/// The vehicles ahead by their bodies where they really are (round 4b): every vehicle whose box
+/// comes into my corridor (my half width and `LEAD_MARGIN` either side of the way my body will
+/// take) ahead of my front, the gap measured along my way to its near edge. Lane registration
+/// is only the index the candidates are found by: the occupants of the lanes of my way within
+/// `look` (and of the lane I change onto) are leads of the kind `Seen::Vehicle`, the others
+/// near me (within `body_look`) `Seen::Body` (across the way: crossing a junction, pulling
+/// out, passing). A car changing lanes is where its body is, not on its target lane at its
+/// middle from the first frame (viz3 case01 #4519 stood behind #4436 3.5 m to its side, a
+/// frozen change). Not my lead: my follower that has me as its lead, a lead I ignore for a
+/// while (`ignore_lead`), the standing thing I am passing, and, of two bodies blocking each
+/// other, the one with the lower id's for the higher. (nearest of the lane kind, nearest body)
+fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], way: &WayPts, look: f32, body_look: f32) -> (Option<Headway>, Option<Headway>) {
+    let me = &vehicles[i];
+    let st = &me.state;
+    let passing = me.passing.filter(|p| !p.aborted);
+    // (candidates: index, found on my way's lanes)
+    let mut cand: Vec<(usize, bool)> = Vec::new();
+    for &(l, d0) in lanes {
+        if d0 > look {
+            break;
+        }
+        for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            cand.push((occ.vehicle, true));
+        }
+    }
+    if let Some(c) = st.change {
+        if !lanes.iter().any(|w| w.0 == c.to) {
+            for occ in sim.occupancy.get(&c.to).map(|v| v.as_slice()).unwrap_or(&[]) {
+                cand.push((occ.vehicle, true));
+            }
+        }
+    }
+    for j in sim.vehicles_near(me.pos, body_look as f64 + 12.0) {
+        cand.push((j, false));
+    }
+    // (once each, on-way first)
+    cand.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    cand.dedup_by_key(|c| c.0);
+    let w = me.half_width as f64 + LEAD_MARGIN;
+    let h = (me.heading as f64).to_radians();
+    let my_fwd = DVec2::new(h.sin(), h.cos());
+    let (mut on_lane, mut body): (Option<Headway>, Option<Headway>) = (None, None);
+    for (j, on_way) in cand {
+        if j == i {
+            continue;
+        }
+        let o = &vehicles[j];
+        let rel = (o.pos - me.pos).truncate();
+        let reach = if on_way { look } else { body_look };
+        if rel.length() > reach as f64 + o.length() as f64 + 2.0 {
+            continue;
+        }
+        // (two bodies blocking each other: the higher id goes)
+        if !on_way && o.last.body_block == Some(me.id) && me.id > o.id {
+            continue;
+        }
+        // (one changing into a lane of my way: also where its body is going, at that lane's
+        // middle - it signals, I let it in ahead of me, as one in that lane; the lane-based
+        // lead had it there from its first frame. Not one beside me: it waits for its gap)
+        let into_mine = o.state.change.filter(|c| lanes.iter().any(|w| w.0 == c.to)).and_then(|_| o.state.change_anchors(net)).map(|(_, (p, h))| Obb::vehicle(p.truncate(), h as f64, o.state.front as f64, o.state.rear as f64, o.half_width as f64));
+        let hit = way.corridor_hit(&o.obb(), w, reach).or_else(|| into_mine.and_then(|b| way.corridor_hit(&b, w, reach).filter(|h| h.0 - st.front >= 0.0)));
+        let Some((near, k, f)) = hit else { continue };
+        // (not one on another level: a bridge over the way, the road under it)
+        if !on_way && (o.pos.z - way.zs[k]).abs() > 3.0 {
+            continue;
+        }
+        let gap = near - st.front;
+        if gap < -0.5 || gap > reach {
+            continue;
+        }
+        // the one behind that follows me is not my lead
+        if o.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
+            continue;
+        }
+        if let Some((id, until)) = me.ignore_lead {
+            if id == o.id && sim.time < until {
+                continue;
+            }
+        }
+        // the standing thing I am passing
+        if let Some(p) = passing {
+            if o.state.speed < 0.3 && st.odometer + gap + st.front < p.until + 1.0 {
+                continue;
+            }
+        }
+        let oh = (o.heading as f64).to_radians();
+        let o_fwd = DVec2::new(oh.sin(), oh.cos());
+        let along = o_fwd.dot(f) as f32;
+        let speed = o.state.speed * along;
+        let acc = if along > 0.7 { o.state.acc * along } else { 0.0 };
+        let (q, right) = (way.pts[k].1, DVec2::new(f.y, -f.x));
+        let lateral = (o.pos.truncate() - q).dot(right) as f32 + st.lateral_ahead(way.pts[k].0);
+        let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
+        let held = o.last.held || o.last.stop.is_some();
+        let hw = Headway { gap, speed, acc, what: if on_way { Seen::Vehicle(j) } else { Seen::Body(j) }, standing_for, half_width: o.half_width, length: o.length(), held, at_stop: o.external.at_stop, lateral };
+        if on_way {
+            on_lane = Headway::nearer(on_lane, Some(hw));
+        } else {
+            body = Headway::nearer(body, Some(hw));
+        }
+    }
+    // changing lanes myself: the cars in the lane I move to, ahead of where I will be in it,
+    // whose bodies lie in that lane (the corridor bends over only as I drive: a slower car just
+    // ahead there, not yet in it, was cut in on, viz2 case07 #10906)
+    if let Some(c) = st.change {
+        for occ in sim.occupancy.get(&c.to).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if occ.vehicle == i {
+                continue;
+            }
+            let o = &vehicles[occ.vehicle];
+            let gap = occ.s - c.s_to - o.state.rear - st.front;
+            if gap < -0.5 || gap > look || occ.lateral.abs() > me.half_width + o.half_width + LEAD_MARGIN as f32 {
+                continue;
+            }
+            if o.lead_id == Some(me.id) || me.ignore_lead.is_some_and(|(id, until)| id == o.id && sim.time < until) {
+                continue;
+            }
+            let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
+            let hw = Headway { gap, speed: if occ.foreign { -o.state.speed } else { o.state.speed }, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for, half_width: o.half_width, length: o.length(), held: o.last.held || o.last.stop.is_some(), at_stop: o.external.at_stop, lateral: occ.lateral };
+            on_lane = Headway::nearer(on_lane, Some(hw));
+        }
+    }
+    (on_lane, body)
+}
+
 /// A vehicle on another lane into the same next lane that gets to the joint first.
 fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
     let me = &vehicles[i];
@@ -468,53 +630,21 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
         // from a car that was rightly waiting behind.)
         let same_way = omsi_sim::traffic::wrap_deg(p.heading - me.heading).abs() < 60.0;
         let ahead = if p.priority && !same_way && p.speed.abs() > 0.5 { (p.speed.abs() * 5.0) as f64 } else { 0.0 };
-        let b = p.obb(ahead, 0.5);
-        if let Some(d) = way.hit(&b, me.half_width as f64, look) {
+        // (its body where it is, in my corridor as any vehicle's: `lead_by_bodies`; the box
+        // grown by half a metre all round and my half width, as before, kept a follower 1.4 m
+        // further back than the gap it says, viz3 case13)
+        let b = p.obb(ahead, 0.0);
+        if let Some((d, k, fwd)) = way.corridor_hit(&b, me.half_width as f64 + LEAD_MARGIN, look) {
             let gap = d - st.front;
-            let fwd = way.pts.iter().find(|w| w.0 >= d).map(|w| w.2).unwrap_or(DVec2::Y);
+            if gap < -0.5 {
+                continue;
+            }
             let speed = (p.fwd() * p.speed as f64).dot(fwd) as f32;
             let right = DVec2::new(fwd.y, -fwd.x);
-            let q = way.pts.iter().find(|w| w.0 >= d).map(|w| w.1).unwrap_or(me.pos.truncate());
-            let lateral = (p.pos.truncate() - q).dot(right) as f32;
+            let q = way.pts[k].1;
+            let lateral = (p.pos.truncate() - q).dot(right) as f32 + st.lateral_ahead(way.pts[k].0);
             let hw = Headway { gap, speed, acc: 0.0, what: Seen::Player(p.id), standing_for: p.still, half_width: p.half_width, length: p.half_len * 2.0, held: false, at_stop: false, lateral };
             best = Headway::nearer(best, Some(hw));
-        }
-    }
-    best
-}
-
-/// Another vehicle's body across the way (crossing a junction, pulling out, passing).
-fn body_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], way: &WayPts, look: f32) -> Option<Headway> {
-    let me = &vehicles[i];
-    let st = &me.state;
-    let mut best: Option<Headway> = None;
-    for j in sim.vehicles_near(me.pos, look as f64 + 12.0) {
-        if j == i {
-            continue;
-        }
-        let o = &vehicles[j];
-        let rel = (o.pos - me.pos).truncate();
-        if rel.length() > look as f64 + o.length() as f64 || (o.pos.z - way.z).abs() > 3.0 {
-            continue;
-        }
-        // on my way: the occupancy has it
-        if lanes.iter().any(|w| w.0 == o.state.lane) && o.passing.is_none() {
-            continue;
-        }
-        // both blocking each other: the higher id goes
-        if o.last.body_block == Some(me.id) && me.id > o.id {
-            continue;
-        }
-        let b = o.obb();
-        if let Some(d) = way.hit(&b, me.half_width as f64, look) {
-            let gap = d - st.front;
-            if gap > -0.5 {
-                let fwd = way.pts.iter().find(|w| w.0 >= d).map(|w| w.2).unwrap_or(DVec2::Y);
-                let oh = (o.heading as f64).to_radians();
-                let speed = (DVec2::new(oh.sin(), oh.cos()) * o.state.speed as f64).dot(fwd) as f32;
-                let h = Headway { gap, speed, acc: 0.0, what: Seen::Body(j), standing_for: o.stopped, half_width: o.half_width, length: o.length(), held: o.last.held || o.last.stop.is_some(), at_stop: o.external.at_stop, lateral: 0.0 };
-                best = Headway::nearer(best, Some(h));
-            }
         }
     }
     best
@@ -936,20 +1066,22 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     p.road_left = net.reach.get(st.lane).copied().unwrap_or(lane.length()) - st.s;
     let air = me.class == crate::driver::VehicleClass::Air;
 
-    p.leader = leader_on_way(sim, vehicles, i, &p.way, look);
     p.merging = merging_ahead(net, sim, vehicles, i);
-    p.leader = Headway::nearer(p.leader, p.merging);
-    if !air {
+    if air {
+        p.leader = Headway::nearer(leader_on_way(sim, vehicles, i, &p.way, look), p.merging);
+    } else {
         // the way ahead, sampled once for the bodies, the players and the people
         let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
         let people_reach = (st.speed * st.speed / 5.0 + st.speed + 6.0).clamp(8.0, 45.0) + st.front;
         let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
-        let upto = body_look.max(people_reach).max(if player_near { look } else { 0.0 });
+        let upto = body_look.max(people_reach).max(look);
         let way = WayPts::sample(net, st, upto);
+        let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &p.way, &way, look, body_look);
+        p.leader = Headway::nearer(on_lane, p.merging);
         if player_near {
             p.leader = Headway::nearer(p.leader, player_on_way(sim, me, &way, look));
         }
-        if let Some(h) = body_on_way(sim, vehicles, i, &p.way, &way, body_look) {
+        if let Some(h) = body {
             // a body across the way replaces the lead only when clearly nearer
             if p.leader.map(|l| h.gap < l.gap - 0.5).unwrap_or(true) {
                 if let Seen::Body(j) = h.what {

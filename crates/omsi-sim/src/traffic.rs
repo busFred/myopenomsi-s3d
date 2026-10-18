@@ -3084,6 +3084,16 @@ impl AiState {
         Some((b, if side > 0.0 || (side.abs() < 0.5 && lb.offset > la.offset) { 2 } else { 1 }))
     }
 
+    /// During a lane change: the places on its own lane and on the lane it moves to that the car
+    /// is level with, (point, heading in degrees) each.
+    pub fn change_anchors(&self, net: &Network) -> Option<((DVec3, f32), (DVec3, f32))> {
+        let c = self.change?;
+        if c.to >= net.lanes.len() {
+            return None;
+        }
+        Some((self.seq().point(net, self.s, 0.0), self.change_seq(c.to).point(net, c.s_to, 0.0)))
+    }
+
     /// Pull out into `to` from behind a standing obstacle: a short, steep move.
     pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32) {
         self.start_change(net, to, dir);

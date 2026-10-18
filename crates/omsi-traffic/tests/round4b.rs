@@ -274,3 +274,115 @@ fn x1_a_car_standing_at_the_second_red_of_a_long_object_is_held_by_it_not_cleari
     assert!(cars[0].passed_on_go.is_some(), "it did not take the first line on green");
     assert!(held && !clearing, "held by the light {held}, clearing {clearing}");
 }
+
+/// Two lanes of one road eastbound, lane 0 at y = 0 and lane 1 at y = -3.5 (on its right).
+fn two_lanes() -> Network {
+    let mut net = Network::default();
+    let mut a = road(&[(0.0, 0.0), (300.0, 0.0)], 1);
+    a.offset = 0.0;
+    let mut b = road(&[(0.0, -3.5), (300.0, -3.5)], 1);
+    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+    b.offset = 3.5;
+    net.lanes.push(a);
+    net.lanes.push(b);
+    finish(net)
+}
+
+/// What vehicle `i` sees, the bodies placed and the lanes occupied as a frame does.
+fn seen(net: &Network, vehicles: &mut [Vehicle], i: usize) -> omsi_traffic::Perception {
+    let mut sim = Simulation::new(net, vec![]);
+    for v in vehicles.iter_mut() {
+        v.state.plan_next(net);
+    }
+    sim.update_positions(net, vehicles);
+    sim.build_occupancy(net, vehicles);
+    omsi_traffic::perception::perceive(net, &sim, vehicles, i)
+}
+
+#[test]
+fn x2_a_car_frozen_most_of_the_way_into_the_next_lane_is_not_the_lead_of_the_one_behind() {
+    let net = two_lanes();
+    let mut follower = car(1, 0, 80.0, 0.0);
+    follower.stopped = 10.0;
+    // still registered on lane 0, its body 85 % over into lane 1 (3.3 m to the side)
+    let mut changer = car(2, 0, 100.0, 0.0);
+    changer.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.85, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false });
+    let mut cars = vec![follower, changer];
+    let p = seen(&net, &mut cars, 0);
+    assert!((cars[1].pos.y + 3.3).abs() < 0.2, "the changer stands at y = {:.2}", cars[1].pos.y);
+    assert!(p.leader.is_none(), "a phantom lead: {:?}", p.leader);
+    // counter-case: one 30 % over is still in my corridor
+    cars[1].state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.3, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false });
+    let p = seen(&net, &mut cars, 0);
+    let l = p.leader.expect("the car half in my lane is my lead");
+    assert!((l.gap - 16.0).abs() < 0.3, "gap {:.2}", l.gap);
+}
+
+#[test]
+fn x2_a_body_in_my_corridor_is_my_lead_whatever_lane_it_is_registered_on() {
+    let net = two_lanes();
+    // registered on lane 1, but standing 3.5 m to its left: in lane 0, 16 m ahead of my front
+    let mut other = car(2, 1, 100.0, 0.0);
+    other.state.lateral = -3.5;
+    other.state.lateral_target = -3.5;
+    other.state.lateral_ramp = (-3.5, -3.5, 0.0, 1.0);
+    let mut cars = vec![car(1, 0, 80.0, 8.0), other];
+    let p = seen(&net, &mut cars, 0);
+    assert!((cars[1].pos.y).abs() < 0.05, "it stands at y = {:.2}", cars[1].pos.y);
+    let l = p.leader.expect("the body ahead in my lane is my lead");
+    assert!((l.gap - 16.0).abs() < 0.3, "gap {:.2}", l.gap);
+    // and the one in its own lane beside mine is not: lateral 0, 3.5 m to my right
+    cars[1].state.lateral = 0.0;
+    cars[1].state.lateral_target = 0.0;
+    cars[1].state.lateral_ramp = (0.0, 0.0, 0.0, 1.0);
+    let p = seen(&net, &mut cars, 0);
+    assert!(p.leader.is_none(), "{:?}", p.leader);
+    // a car straight ahead in my lane: the bumper gap, as the lane-based lead had it
+    let mut cars = vec![car(1, 0, 80.0, 8.0), car(3, 0, 110.0, 5.0)];
+    let p = seen(&net, &mut cars, 0);
+    let l = p.leader.expect("the car ahead");
+    assert!((l.gap - 26.0).abs() < 0.3 && (l.speed - 5.0).abs() < 0.1, "{l:?}");
+    assert!(matches!(l.what, omsi_traffic::Seen::Vehicle(1)), "{:?}", l.what);
+}
+
+#[test]
+fn x2_changing_lanes_the_car_ahead_in_the_lane_i_move_to_is_my_lead() {
+    // I move over into lane 1 at 10 m/s; a car 12 m ahead there at 4 m/s: my corridor reaches
+    // its lane only metres on, but it is my lead now (viz2 case07 #10906 cut in on one)
+    let net = two_lanes();
+    let mut me = car(1, 0, 100.0, 10.0);
+    me.state.start_change(&net, 1, 2);
+    if let Some(c) = me.state.change.as_mut() {
+        c.wait = 0.0;
+    }
+    let mut cars = vec![me, car(2, 1, 112.0, 4.0)];
+    let p = seen(&net, &mut cars, 0);
+    let l = p.leader.expect("the car in the lane I move to");
+    assert!(matches!(l.what, omsi_traffic::Seen::Vehicle(1)) && (l.gap - 8.0).abs() < 0.5, "{l:?}");
+    // and the car changing into my lane ahead of me, from the lane beside: my lead too
+    let mut other = car(3, 1, 112.0, 4.0);
+    other.state.start_change(&net, 0, 1);
+    let mut cars = vec![car(1, 0, 100.0, 10.0), other];
+    let p = seen(&net, &mut cars, 0);
+    assert!(p.leader.is_some_and(|l| (l.gap - 8.0).abs() < 0.5), "{:?}", p.leader);
+}
+
+#[test]
+fn x2_my_follower_that_has_me_as_its_lead_is_not_my_lead() {
+    // my way goes east, round a tight U-turn and back west 5 m north: the car behind me on
+    // the way back (its body in the corridor my way takes after the turn) follows me
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (50.0, 0.0)], 1));
+    net.lanes.push(road(&[(50.0, 0.0), (51.8, 0.7), (52.5, 2.5), (51.8, 4.3), (50.0, 5.0)], 2));
+    net.lanes.push(road(&[(50.0, 5.0), (0.0, 5.0)], 3));
+    let net = finish(net);
+    let mut follower = car(2, 2, 20.0, 0.0);
+    follower.lead_id = Some(1);
+    let mut cars = vec![car(1, 0, 40.0, 3.0), follower];
+    let p = seen(&net, &mut cars, 0);
+    assert!(p.leader.is_none(), "{:?}", p.leader);
+    // counter-case: not following me, it is in my way
+    cars[1].lead_id = None;
+    let p = seen(&net, &mut cars, 0);
+    assert!(p.leader.is_some_and(|l| l.gap > 20.0), "{:?}", p.leader);
+}
