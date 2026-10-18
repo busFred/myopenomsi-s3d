@@ -470,13 +470,44 @@ const EARLY_STOP_SHORT: f64 = 20.0;
 /// only after this long (s); before, it creeps up to the pole once they are clear.
 const PEOPLE_SERVE_MAX: f32 = 30.0;
 
-/// [ROLLBACK r4d-B5] The room on the bus's way past a point `from` metres ahead of its origin:
-/// up to the first junction after it (or the end of the way it knows), less 2 m.
-fn room_past(ctx: &Ctx, from: f32) -> f32 {
-    let junction = ctx.way.iter().filter(|&&(l, dl)| dl > from && !ctx.net.crossings.get(l).is_none_or(|c| c.is_empty())).map(|w| w.1).reduce(f32::min);
-    let end = ctx.way.last().map(|&(l, dl)| dl + ctx.net.lanes[l].length()).unwrap_or(from);
-    (junction.unwrap_or(end).min(end) - from - 2.0).max(0.0)
+/// [ROLLBACK r4d-B5] The room on the bus's way past a point `from` metres ahead of its origin
+/// (its front at its stop point), less 2 m: up to the first junction after it, the meeting
+/// place of a junction on the lane it is on (its mouth), a footpath crossing (a zebra: its
+/// near edge), or the end of the way it knows; at a stop with a bay (`bay` over 0.3 m) no
+/// further than `BAY_PULL` - where the bay ends is not known, and past it the bus would stand
+/// across the lane.
+fn room_past(ctx: &Ctx, from: f32, bay: f32) -> f32 {
+    let mut limit = ctx.way.last().map(|&(l, dl)| dl + ctx.net.lanes[l].length()).unwrap_or(from);
+    for &(l, dl) in ctx.way {
+        let crossings = ctx.net.crossings.get(l).map(|c| c.as_slice()).unwrap_or(&[]);
+        if dl > from && !crossings.is_empty() {
+            limit = limit.min(dl);
+        }
+        for c in crossings {
+            let at = dl + c.at - c.before;
+            if at > from {
+                limit = limit.min(at);
+            }
+        }
+        for &(_, at, _) in ctx.net.walks.get(l).map(|w| w.as_slice()).unwrap_or(&[]) {
+            let edge = dl + at - ZEBRA_HALF;
+            if dl + at + ZEBRA_HALF > from {
+                limit = limit.min(edge);
+            }
+        }
+    }
+    let room = (limit - from - 2.0).max(0.0);
+    if bay.abs() > 0.3 {
+        room.min(BAY_PULL)
+    } else {
+        room
+    }
 }
+
+/// [ROLLBACK r4d-B5] Half the width of a footpath crossing (m), and how far on a bus pulls
+/// at most in a bay (m).
+const ZEBRA_HALF: f32 = 2.0;
+const BAY_PULL: f32 = 4.0;
 
 /// What the service needs of the world this frame.
 pub struct Ctx<'a> {
@@ -954,7 +985,8 @@ impl BusService {
                 // the one behind the pole
                 if ctx.follower_close && !self.pulled_here && self.phase == Phase::Waiting && !ctx.passing {
                     self.pulled_here = true;
-                    let pull = (st.front + st.rear).min(room_past(ctx, st.front));
+                    let bay = self.stops.front().map_or(0.0, |x| x.bay);
+                    let pull = (st.front + st.rear).min(room_past(ctx, st.front, bay));
                     if pull >= 3.0 {
                         self.pull_to = Some(st.odometer + pull);
                     }
@@ -1093,7 +1125,7 @@ impl BusService {
             // [ROLLBACK r4d-B5] by its length, as far as the road before the next junction
             // lets it, so that the one behind serves the pole)
             if ctx.follower_close && d > -2.0 {
-                let want = (st.front + st.rear).min(room_past(ctx, d.max(0.0) + st.front));
+                let want = (st.front + st.rear).min(room_past(ctx, d.max(0.0) + st.front, stop.bay));
                 self.pull = self.pull.max(want);
             }
             let pull = self.pull;
@@ -1687,9 +1719,9 @@ mod tests {
             st
         };
         // the first, a follower behind it: where does it come to rest
-        let first = |net: &Network, follower: bool| {
+        let first = |net: &Network, follower: bool, bay: f32| {
             let mut v = test_vehicle();
-            let mut s = BusService::new(vec![stop, Stop { id: 8, s: 290.0, ..stop }]);
+            let mut s = BusService::new(vec![Stop { bay, ..stop }, Stop { id: 8, s: 290.0, ..stop }]);
             let mut st = bus_at(40.0, 10.0);
             let mut t = 100.0;
             let mut stopped = 0.0;
@@ -1706,14 +1738,29 @@ mod tests {
             st.s
         };
         let net = straight(300.0);
-        let alone = first(&net, false);
+        let alone = first(&net, false, 0.0);
         assert!((alone - 100.0).abs() < 1.5, "at the pole: {alone}");
-        let pulled = first(&net, true);
+        let pulled = first(&net, true, 0.0);
         assert!((pulled - 112.0).abs() < 1.5, "a bus length on: {pulled}");
         // the road ends 6 m past the pole: only 4 m on
         let net = straight(112.0);
-        let short = first(&net, true);
+        let short = first(&net, true, 0.0);
         assert!((short - 104.0).abs() < 1.5, "as far as the road lets it: {short}");
+        // a zebra 8 m past the pole (its front there at 106 m, the crossing at 114 m): it stops
+        // 2 m short of the crossing's edge, not on it
+        let mut net = straight(300.0);
+        net.walks = vec![vec![(9, 114.0, 0.0)]];
+        let zebra = first(&net, true, 0.0);
+        assert!((zebra - 104.0).abs() < 1.5 && zebra + 6.0 <= 112.0 - 1.0, "off the zebra: {zebra}");
+        // the mouth of a junction on its own lane 6 m past the pole: not into it
+        let mut net = straight(300.0);
+        net.crossings = vec![vec![omsi_sim::traffic::Crossing { other: 0, at: 113.0, other_at: 0.0, merge: false, before: 1.0, after: 1.0, other_before: 1.0, other_after: 1.0 }]];
+        let mouth = first(&net, true, 0.0);
+        assert!((mouth - 104.0).abs() < 1.5, "short of the junction: {mouth}");
+        // in a bay: no further on than the bay is known to reach
+        let net = straight(300.0);
+        let bay = first(&net, true, 2.0);
+        assert!((bay - 104.0).abs() < 1.5, "within the bay: {bay}");
 
         // the second: close behind the first, standing a second at the pole's approach - it
         // serves the stop there; without the first ahead it drives on to the pole
