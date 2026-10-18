@@ -3193,7 +3193,9 @@ impl Traffic {
                 let roadside = service.stops.front().is_some_and(|s| {
                     s.bay.abs() < 0.3 && car.ai.state.route.get(s.ri).and_then(|&l| net.lanes.get(l)).is_some_and(|l| l.density > 0.0)
                 });
+                let v_nom = net.lanes.get(car.ai.state.lane).map_or(13.9, |l| (l.speed_limit_kmh * car.ai.params.speed_factor).min(car.ai.state.max_speed_kmh).max(10.0) / 3.6);
                 let ctx = crate::bus_service::Ctx {
+                    v_nom,
                     roadside,
                     queue_behind_secs,
                     wanted,
@@ -3219,6 +3221,8 @@ impl Traffic {
                     // (the route it drives now, for the recording)
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);
                 }
+                // [ROLLBACK r4d-B3] ahead of its timetable: slower
+                car.ai.state.desire = car.ai.params.speed_factor * service.pace;
                 ext.bay = Some(car.ai.state.lateral_target);
                 ext.blinker_off = matches!(service.phase, Phase::Boarding | Phase::Waiting);
                 // [ROLLBACK aiparked-73] a long layover at the terminus: engine off

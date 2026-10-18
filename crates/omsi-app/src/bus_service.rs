@@ -107,6 +107,14 @@ pub struct BusService {
     this_layover: bool,
     /// Its route was changed this frame (for the recording).
     pub rerouted: bool,
+    /// [ROLLBACK r4d-B3] Seconds ahead of its timetable since it left a stop early for the
+    /// traffic it held up (the roadside layover's early start): it drives slower
+    /// (`pace`, the factor on its usual speed) until that is made up, and waits out what is
+    /// left at its next stop.
+    pub ahead_by: f64,
+    pub pace: f32,
+    /// It leaves this stop early for the traffic behind it.
+    left_early: bool,
 }
 
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
@@ -197,6 +205,20 @@ const LAYOVER_BOARDING: f64 = 45.0;
 /// town more than a few minutes' lead on the timetable.
 const ROADSIDE_QUEUE: f32 = 20.0;
 const ROADSIDE_EARLY_MIN: f64 = 30.0;
+/// [ROLLBACK r4d-B3] A bus ahead of its timetable drives no slower than this share of its
+/// usual speed while it makes the lead up; a lead under a second is none.
+pub const PACE_MIN: f32 = 0.6;
+
+/// [ROLLBACK r4d-B3] The share of its usual speed at which a bus `ahead_by` seconds early,
+/// `dist` metres before its next stop at `v_nom`, takes the lead up by the time it is there
+/// (at least `PACE_MIN`).
+pub fn pace_for(ahead_by: f64, dist: f32, v_nom: f32) -> f32 {
+    if ahead_by < 1.0 || dist <= 0.0 {
+        return 1.0;
+    }
+    let t = dist / v_nom.max(1.0);
+    (t / (t + ahead_by as f32)).clamp(PACE_MIN, 1.0)
+}
 /// [ROLLBACK r4d-B2] A bus standing out a long wait at its stop (or queueing for an occupied
 /// berth) with its body over a through lane leaves once a vehicle has stood behind it this
 /// long (s), or more than `LAYOVER_QUEUE_CARS` stand queued behind it: round the shortest
@@ -369,6 +391,9 @@ pub struct Ctx<'a> {
     pub roadside: bool,
     /// Seconds a vehicle has stood right behind this bus (0 when none does).
     pub queue_behind_secs: f32,
+    /// [ROLLBACK r4d-B3] Its usual speed on the lane it is on (m/s: the limit at its driver's
+    /// speed factor).
+    pub v_nom: f32,
 }
 
 impl BusService {
@@ -398,6 +423,9 @@ impl BusService {
             detour_none: None,
             this_layover: false,
             rerouted: false,
+            ahead_by: 0.0,
+            pace: 1.0,
+            left_early: false,
         }
     }
 
@@ -473,6 +501,10 @@ impl BusService {
         self.roadside_layover = false;
         self.away = None;
         self.pending = None;
+        // [ROLLBACK r4d-B3] a new trip has a timetable of its own
+        self.ahead_by = 0.0;
+        self.pace = 1.0;
+        self.left_early = false;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -509,6 +541,18 @@ impl BusService {
         } else {
             0.0
         };
+        // [ROLLBACK r4d-B3] still ahead of its timetable from an early start: it waits the
+        // rest out here - where it is out of the way (not at a stop on a through lane: the
+        // next stop of a terminus a few metres on had it wait out the whole lead again in
+        // the lane it had left early to free; there it keeps making the lead up on the way)
+        let wait = if self.ahead_by >= 1.0 && !ctx.roadside {
+            let rest = std::mem::take(&mut self.ahead_by).min((depart - ctx.day_time).max(0.0));
+            log::info!("t={:.1}: timetable bus {} at its stop {id} {rest:.0} s early after its early start: it waits", ctx.day_time, ctx.id);
+            wait.max(rest)
+        } else {
+            wait
+        };
+        self.pace = 1.0;
         self.leave_at = ctx.day_time + wait;
         self.long_wait = wait >= PARKED_WAIT;
         self.boarding = boarding_time(ctx.id);
@@ -540,6 +584,13 @@ impl BusService {
     /// Off from the stop: the next one is the front.
     fn depart(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) {
         let bay = self.stops.front().map(|s| s.bay).unwrap_or(0.0);
+        // [ROLLBACK r4d-B3] off early for the traffic behind: the lead is made up on the way
+        if std::mem::take(&mut self.left_early) {
+            if let Some(stop) = self.stops.front() {
+                self.ahead_by = (stop.depart - ctx.day_time).max(0.0);
+                log::info!("t={:.1}: timetable bus {} leaves its stop {} {:.0} s early for the traffic behind it", ctx.day_time, ctx.id, stop.id, self.ahead_by);
+            }
+        }
         if let Some(d) = self.pending.take() {
             // [ROLLBACK r4d-B2] off round the block (or to a place with room): the stop stays
             // the next one
@@ -722,6 +773,7 @@ impl BusService {
         // the closing sequence below then runs as usual
         if self.roadside_layover && ctx.queue_behind_secs > ROADSIDE_QUEUE && self.leave_at - ctx.day_time > ROADSIDE_EARLY_MIN {
             self.leave_at = ctx.day_time;
+            self.left_early = true;
         }
         // an early bus waits for its departure with the doors open, as drivers do
         // (shut, it stood at the stop for half a minute for no reason anyone could
@@ -805,6 +857,16 @@ impl BusService {
                 continue;
             }
             let d = st.route_distance(ctx.net, stop.ri, stop.s);
+            // [ROLLBACK r4d-B3] slower while ahead of the timetable: the lead goes by the time
+            // it is at the stop (the time it drives slower is time it is behind its usual pace)
+            if self.ahead_by >= 1.0 {
+                self.pace = pace_for(self.ahead_by, d, ctx.v_nom);
+                if st.speed > 0.5 {
+                    self.ahead_by = (self.ahead_by - ctx.dt as f64 * (1.0 - self.pace) as f64).max(0.0);
+                }
+            } else {
+                self.pace = 1.0;
+            }
             // near enough to see whether anybody wants it (a train keeps to its stations)
             if self.serve.is_none() && d < SKIP_DECIDE {
                 let rail = ctx.net.lanes.get(st.lane).is_some_and(|l| l.kind == LaneKind::Rail);
@@ -1001,6 +1063,7 @@ mod tests {
             debug: false,
             roadside,
             queue_behind_secs,
+            v_nom: 13.9,
         };
         s.arrive(&ctx, 300.0, 7, (0, 0.0));
         (s, ctx)
@@ -1125,7 +1188,7 @@ mod tests {
     }
 
     fn ctx_on<'a>(net: &'a Network, way: &'a [(usize, f32)], day_time: f64, stopped: f32) -> Ctx<'a> {
-        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0 }
+        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0, v_nom: 13.9 }
     }
 
     /// The bus driven along its way by `AiState::drive` for `secs` from `t`, its service
@@ -1136,8 +1199,10 @@ mod tests {
         let mut stopped = 0.0f32;
         while t < end {
             let way = omsi_traffic::perception::way_lanes(net, st, 200.0);
-            let ctx = ctx_on(net, &way, t, stopped);
+            let mut ctx = ctx_on(net, &way, t, stopped);
+            ctx.roadside = s.stops.front().is_some_and(|x| x.bay.abs() < 0.3);
             let stop = s.step(st, v, &ctx);
+            st.desire = s.pace;
             assert!(st.drive(net, 0.1, None, stop), "still on the road");
             stopped = if st.speed < 0.3 { stopped + 0.1 } else { 0.0 };
             t += 0.1;
@@ -1243,6 +1308,82 @@ mod tests {
         assert_eq!(st.lane, 0);
         assert_eq!(s.stops.front().map(|x| (x.id, x.ri)), Some((7, 4)));
         assert_eq!(s.leave_at, 700.0);
+    }
+
+    #[test]
+    fn a_lead_is_taken_up_at_no_less_than_six_tenths_of_the_usual_speed() {
+        // 60 s early, 2 km at 13.9 m/s (144 s): 0.7 of the usual speed
+        let p = pace_for(60.0, 2000.0, 13.9);
+        assert!((p - 144.0 / 204.0).abs() < 0.01, "{p}");
+        // a lead too long for the way: no slower than 0.6
+        assert_eq!(pace_for(600.0, 2000.0, 13.9), PACE_MIN);
+        // on time: the usual speed
+        assert_eq!(pace_for(0.0, 2000.0, 13.9), 1.0);
+        // a lead from the last stop of a trip is not carried into the next trip
+        let mut s = BusService::new(vec![]);
+        s.ahead_by = 60.0;
+        s.pace = 0.7;
+        s.restart(vec![], true);
+        assert_eq!((s.ahead_by, s.pace), (0.0, 1.0));
+    }
+
+    /// [ROLLBACK r4d-B3] A roadside layover that starts 60 s early for the queue behind it
+    /// makes the lead up over the next 2 km to its next stop and is there on time, not a
+    /// minute early.
+    #[test]
+    fn a_bus_that_leaves_a_minute_early_makes_it_up_over_the_next_two_kilometres() {
+        use omsi_sim::traffic::LaneBuilder;
+        let l = |a: f64, b: f64| LaneBuilder::polyline(vec![glam::DVec3::new(0.0, a, 0.0), glam::DVec3::new(0.0, b, 0.0)], LaneKind::Street, 3.5);
+        let mut net = Network { lanes: vec![l(0.0, 100.0), l(100.0, 2100.0), l(2100.0, 2400.0)], ..Default::default() };
+        net.link(1.5);
+        let run = |queue: f32, bay: f32, at: f32| {
+            let mut v = test_vehicle();
+            let mut st = AiState::new(0, 50.0, 1);
+            st.front = 6.0;
+            st.rear = 6.0;
+            st.route = vec![0, 1, 2];
+            // the next stop 2 km on, timed at 150 s after the first
+            let stops = vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 160.0, id: 7, side: 0.0 }, Stop { ri: 1, s: at, bay, depart: 310.0, id: 8, side: 0.0 }, Stop { ri: 2, s: 200.0, bay: 0.0, depart: 400.0, id: 9, side: 0.0 }];
+            let mut s = BusService::new(stops);
+            s.layover = true;
+            let mut ctx = ctx_on(&net, &[], 100.0, 0.0);
+            s.arrive(&ctx, 160.0, 7, (0, 50.0));
+            ctx.queue_behind_secs = queue;
+            s.board(&ctx);
+            let (mut off, mut there, mut slowest) = (None, None, 1.0f32);
+            let t = drive(&mut s, &mut st, &mut v, &net, 100.0, 400.0, |t, s, _| {
+                if off.is_none() && s.phase == Phase::Running {
+                    off = Some(t);
+                }
+                if off.is_some() && there.is_none() && s.at_stop() {
+                    there = Some(t);
+                }
+                slowest = slowest.min(s.pace);
+                there.is_some() && s.phase == Phase::Running
+            });
+            (off.unwrap(), there.unwrap(), t, slowest, s.ahead_by)
+        };
+        // a queue: off a minute early, at about 0.7 of its speed, at the next stop on time
+        // (the stop 2 km on in a bay, out of the way)
+        let (off, there, gone, slowest, left) = run(25.0, 2.0, 1950.0);
+        assert!(left < 1.0, "made up: {left}");
+        // (once the people are in)
+        assert!(off < 115.0, "off at {off}");
+        assert!((0.6..0.8).contains(&slowest), "{slowest}");
+        assert!((295.0..312.0).contains(&there), "there at {there}");
+        assert!(gone >= 305.0, "on from there at {gone}");
+        // no queue: it leaves on time and drives at its usual speed
+        let (off, there, _, slowest, _) = run(0.0, 2.0, 1950.0);
+        assert!(off >= 160.0, "off at {off}");
+        assert_eq!(slowest, 1.0);
+        assert!(there < 340.0, "{there}");
+        // the next stop 300 m on, too near to make the minute up: in a bay the rest is
+        // waited out there; in the lane, where it would hold the traffic up again, it is not
+        // (but made up on the way on)
+        let (_, _, gone, _, left) = run(25.0, 2.0, 250.0);
+        assert!(left == 0.0 && gone > 175.0, "waited out: {left}, on at {gone}");
+        let (_, _, gone, _, left) = run(25.0, 0.0, 250.0);
+        assert!(left > 30.0 && gone < 170.0, "not waited out in the lane: {left}, on at {gone}");
     }
 
     #[test]
