@@ -570,6 +570,9 @@ pub struct Traffic {
     /// Timetable buses taken off the road because the tile under them was unloaded (their
     /// ids), for the timetable to put them back when the tiles come again.
     pub removed_scheduled: Vec<u64>,
+    /// [ROLLBACK r4d-B1] Timetable buses in service that drove off the end of a dead-end lane
+    /// (their ids): the timetable puts the trip back where its track goes on.
+    pub dead_ended: Vec<u64>,
     /// One-way lanes that have had their reverse twin added (`add_reverse_twins`).
     twinned: hashbrown::HashSet<usize>,
     /// Bodies besides the AI vehicles' that no timetable vehicle may be put into: the
@@ -1156,6 +1159,7 @@ impl Traffic {
             others_still: HashMap::new(),
             pull_out_rooms: HashMap::new(),
             removed_scheduled: Vec::new(),
+            dead_ended: Vec::new(),
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
@@ -3325,6 +3329,13 @@ impl Traffic {
         self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
+            // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
+            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone {
+                if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
+                    log::info!("scheduled bus {}: off the dead end of lane {} at ({:.0}, {:.0})", c.id, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y);
+                }
+                self.dead_ended.push(c.id);
+            }
             self.orphan_sounds.extend(c.sounds);
             // the renders go back to the world at the next sync
             self.released.push(c.render);

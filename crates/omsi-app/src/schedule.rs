@@ -401,6 +401,12 @@ pub struct Schedule {
     /// they are tried again then, so that a plane coming in over tiles nobody loads appears
     /// where its path enters the loaded ones, not up to half a minute later in mid-air.
     retry_at: HashMap<usize, f64>,
+    /// [ROLLBACK r4d-B1] For each bus on the road (its id): the first step of its trip that
+    /// its route does not have - past a dead end of the road, or a tile still to come.
+    route_end_step: HashMap<u64, usize>,
+    /// [ROLLBACK r4d-B1] Departures whose bus drove off a dead end: the step the trip resumes
+    /// at. The bus comes back there when its timetable has it there, not before.
+    resume_from: HashMap<usize, usize>,
     /// Vehicle sets being read ahead on the workers, with the type to upload them with, and
     /// those read and waiting for their upload.
     fleet_reading: HashMap<crate::scene::VehicleKey, Arc<VehicleType>>,
@@ -741,6 +747,8 @@ impl Schedule {
             last_retry: f64::NEG_INFINITY,
             car_departure: HashMap::new(),
             retry_at: HashMap::new(),
+            route_end_step: HashMap::new(),
+            resume_from: HashMap::new(),
             fleet_reading: HashMap::new(),
             fleet_ready: Default::default(),
             fleet_check: f64::NEG_INFINITY,
@@ -1911,6 +1919,7 @@ impl Schedule {
         self.later_layover.clear();
         self.startup.clear();
         self.retry_at.clear();
+        self.resume_from.clear();
         self.boards_made = f64::NEG_INFINITY;
         self.last_retry = f64::NEG_INFINITY;
         log::info!("timetable: the clock was set to another time: {gone} buses taken off the road, {n} departures made ready to run again");
@@ -2053,9 +2062,21 @@ impl Schedule {
                 self.waiting.push(i);
             }
         }
+        // [ROLLBACK r4d-B1] buses that drove off a dead end come back where the track goes
+        // on, at the time the timetable has them there
+        for id in std::mem::take(&mut traffic.dead_ended) {
+            let end = self.route_end_step.remove(&id);
+            self.running.retain(|r| r.car != id);
+            if let (Some(i), Some(step)) = (self.car_departure.remove(&id), end) {
+                log::info!("scheduled bus {id}: off a dead end, its trip resumes at step {step}");
+                self.resume_from.insert(i, step);
+                self.waiting.push(i);
+            }
+        }
         if self.car_departure.len() > 64 + traffic.cars.len() * 2 {
             let alive: std::collections::HashSet<u64> = traffic.cars.iter().map(|c| c.id).collect();
             self.car_departure.retain(|id, _| alive.contains(id));
+            self.route_end_step.retain(|id, _| alive.contains(id));
         }
         // tiles brought lanes, or half a minute went by: the waiting departures may be on
         // loaded ground now, and the routes that stopped short may go on
@@ -2146,15 +2167,20 @@ impl Schedule {
                 })
                 .collect();
             // (bridged from the end of what the bus has)
-            let lanes = match last {
+            let lane_steps: Vec<usize> = (0..n).filter(|&k| matches!(slots[k], Slot::Lane(_))).map(|k| run.next + k).collect();
+            let (lanes, cut_at) = match last {
                 Some(l) if !lanes.is_empty() => {
                     let with: Vec<usize> = std::iter::once(l).chain(lanes.iter().copied()).collect();
                     Self::add_connectors(traffic, &with);
-                    bridge_gaps(&traffic.net, &with).0[1..].to_vec()
+                    let (out, index) = bridge_gaps(&traffic.net, &with);
+                    // [ROLLBACK r4d-B1] not on past a dead end of the road (see `cut_at_dead_ends`)
+                    let steps: Vec<usize> = std::iter::once(usize::MAX).chain(lane_steps.iter().copied()).collect();
+                    let (out, _, cut_at) = cut_at_dead_ends(&traffic.net, out, &index, &steps, 0);
+                    (out[1..].to_vec(), cut_at)
                 }
                 _ => {
                     Self::add_connectors(traffic, &lanes);
-                    bridge_gaps(&traffic.net, &lanes).0
+                    (bridge_gaps(&traffic.net, &lanes).0, None)
                 }
             };
             if !lanes.is_empty() {
@@ -2196,9 +2222,17 @@ impl Schedule {
                 traffic.note_vehicle_changed(ci);
             }
             run.next += n;
-            if run.next < run.steps.len() {
+            if let Some(step) = cut_at {
+                // the rest of the trip comes back past the dead end (`Schedule::tick`)
+                self.route_end_step.insert(run.car, step);
+                if let Some(b) = traffic.cars[ci].bus.as_mut() {
+                    b.route_open = false;
+                }
+            } else if run.next < run.steps.len() {
+                self.route_end_step.insert(run.car, run.next);
                 keep.push(run);
             } else {
+                self.route_end_step.insert(run.car, run.next);
                 if let Some(b) = traffic.cars[ci].bus.as_mut() {
                     b.route_open = false;
                 }
@@ -2302,6 +2336,22 @@ impl Schedule {
         let Some((at, offset)) = step_at(&steps, &slots, &est, leg, frac) else {
             return Placed::Drop;
         };
+        // [ROLLBACK r4d-B1] a trip whose bus drove off a dead end goes on past it: from the
+        // step after the dead end, once its timetable has the bus there
+        let resume = if onto.is_none() { self.resume_from.get(&i).copied() } else { None };
+        if let Some(r) = resume {
+            if !slots.iter().skip(r).any(|s| *s != Slot::Absent) {
+                self.resume_from.remove(&i);
+                log::debug!("trip {trip_name}: nothing of its track after the dead end");
+                return Placed::Drop;
+            }
+            if at < r {
+                let retry = time_at_step(&steps, &est, track, leg, (at, offset), r, (t0, t1), day_time.max(departure));
+                log::debug!("trip {trip_name}: back past the dead end at {:.2} min", retry / 60.0);
+                self.retry_at.insert(i, retry.max(day_time + 2.0));
+                return Placed::Wait;
+            }
+        }
         if slots[at] == Slot::Waiting {
             // when it reaches the next loaded step, at the pace of its leg
             let in_leg = |k: usize| track || steps[k].leg == leg;
@@ -2329,6 +2379,7 @@ impl Schedule {
         }
         // the part of the route around the bus that the network has
         let (start, end) = section_around(&slots, at);
+        let start = resume.map_or(start, |r| start.max(r).min(at));
         let whole = start == 0 && end == slots.len();
         let lane_of = |s: &Slot| {
             if let Slot::Lane(l) = s {
@@ -2343,6 +2394,14 @@ impl Schedule {
         let net = &traffic.net;
         let (section, index) = bridge_gaps(net, &section);
         let start_index = index[start_index.min(index.len() - 1)];
+        // [ROLLBACK r4d-B1] the route ends where the road does (the bus drives off the dead
+        // end and comes back where the track goes on), rather than jumping the gap
+        let lane_steps: Vec<usize> = (start..end).filter(|&k| matches!(slots[k], Slot::Lane(_))).collect();
+        let bridged_len = section.len();
+        let (section, start_index, cut_at) = cut_at_dead_ends(net, section, &index, &lane_steps, start_index);
+        let whole = whole && section.len() == bridged_len;
+        let open = cut_at.is_none() && end < slots.len();
+        let end_step = cut_at.unwrap_or(end);
         let mut s = offset.min(net.lanes[section[start_index]].length() as f64) as f32;
         // stations → stop points on that part of the route
         let reach = if whole { None } else { Some(STOP_REACH) };
@@ -2477,7 +2536,7 @@ impl Schedule {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             set_ai_destination(&mut car.vehicle, hof.as_deref(), &line, &terminus, &names);
             if let Some(b) = car.bus.as_mut() {
-                b.route_open = end < slots.len();
+                b.route_open = open;
                 b.terminus = terminus.clone();
                 b.last_stop = last_stop;
                 b.always = always;
@@ -2486,8 +2545,9 @@ impl Schedule {
             }
             let id = car.id;
             self.car_departure.insert(id, i);
+            self.route_end_step.insert(id, end_step);
             self.running.retain(|r| r.car != id);
-            if end < slots.len() {
+            if open {
                 self.running.push(RunningTrip {
                     car: id,
                     steps,
@@ -2671,7 +2731,7 @@ impl Schedule {
         if let Some(b) = car.bus.as_mut() {
             b.layover = departure > day_time
                 && b.stops.front().map(|st| st.ri == 0 && (st.s - s).abs() < 2.0).unwrap_or(false);
-            b.route_open = end < slots.len();
+            b.route_open = open;
             b.terminus = terminus.clone();
             b.last_stop = last_stop;
             b.always = always;
@@ -2684,7 +2744,9 @@ impl Schedule {
         }
         set_ai_destination(&mut car.vehicle, hof.as_deref(), &line, &terminus, &names);
         log::info!("scheduled bus: line {line} tour {tour} trip {trip_name} {} #{:?} at {:.1} min, {} stops, at ({:.1}, {:.1}) heading {:.0}{}", ty.def.type_name, number.as_ref().map(|n| format!("{} plate {:?} paint {:?}", n.0, n.1, scheme.and_then(|i| ty.paint_schemes.get(i)).map(|p| p.name.as_str()))), day_time / 60.0, car.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), car.vehicle.position.x, car.vehicle.position.y, car.vehicle.heading, if end < slots.len() { format!(", route {} of {} steps so far", end - start, steps.len()) } else { String::new() });
-        if end < slots.len() {
+        self.route_end_step.insert(car.id, end_step);
+        self.resume_from.remove(&i);
+        if open {
             self.running.push(RunningTrip {
                 car: car.id,
                 steps,
@@ -2781,6 +2843,37 @@ fn bridge_gaps(net: &Network, lanes: &[usize]) -> (Vec<usize>, Vec<usize>) {
         out.push(b);
     }
     (out, index)
+}
+
+/// [ROLLBACK r4d-B1] When a bus at step `at.0` (`at.1` metres into it) on leg `leg` (from
+/// `t.0` to `t.1`) reaches step `r`, at the pace of its leg from `base` on (as a bus on a tile
+/// still to come reaches the loaded ones); on a later leg, the end of this one (look again).
+#[allow(clippy::too_many_arguments)]
+fn time_at_step(steps: &[Step], est: &[f64], track: bool, leg: usize, at: (usize, f64), r: usize, t: (f64, f64), base: f64) -> f64 {
+    let in_leg = |k: usize| track || steps[k].leg == leg;
+    let leg_len: f64 = (0..steps.len()).filter(|&k| in_leg(k)).map(|k| est[k]).sum();
+    let rate = (t.1 - t.0).max(0.0) / leg_len.max(1e-3);
+    if r < steps.len() && in_leg(r) {
+        base + ((est[at.0] - at.1).max(0.0) + (at.0 + 1..r).map(|j| est[j]).sum::<f64>()) * rate
+    } else {
+        t.1.max(base)
+    }
+}
+
+/// [ROLLBACK r4d-B1] The part of `section` (bridged, see `bridge_gaps`: `index` gives each
+/// lane of the route steps `lane_steps` its place in it) that the bus on lane `at` of it
+/// drives: up to the first dead end after it where the next lane does not join on (a road
+/// whose bridge the map left without paths), from the last such gap before it. Returns
+/// the lanes, the bus's lane in them, and the step past the dead end where the trip goes on.
+fn cut_at_dead_ends(net: &Network, section: Vec<usize>, index: &[usize], lane_steps: &[usize], at: usize) -> (Vec<usize>, usize, Option<usize>) {
+    let gaps: Vec<usize> = (1..section.len())
+        .filter(|&k| net.lanes[section[k - 1]].next.is_empty() && !joins(net, section[k - 1], section[k]) && index.contains(&k))
+        .collect();
+    let lo = gaps.iter().copied().filter(|&k| k <= at).max().unwrap_or(0);
+    let hi = gaps.iter().copied().find(|&k| k > at);
+    let step = hi.and_then(|k| index.iter().position(|&x| x == k)).and_then(|j| lane_steps.get(j).copied());
+    let end = if step.is_some() { hi.unwrap_or(section.len()) } else { section.len() };
+    (section[lo..end].to_vec(), at - lo, step)
 }
 
 /// The lanes strictly between `a` and `b` on the shortest way from the end of `a` to the
@@ -5089,6 +5182,50 @@ impl PlayerDuty {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// [ROLLBACK r4d-B1] A road east (lanes 0, 1) whose bridge the map left without paths:
+    /// lane 1 ends in nothing at x = 200, the track goes on 300 m further on (lanes 2, 3).
+    fn bridge_gap() -> Network {
+        use omsi_sim::traffic::{LaneBuilder, LaneKind};
+        let l = |a: f64, b: f64| LaneBuilder::polyline(vec![glam::DVec3::new(a, 0.0, 0.0), glam::DVec3::new(b, 0.0, 0.0)], LaneKind::Street, 3.5);
+        let mut net = Network { lanes: vec![l(0.0, 100.0), l(100.0, 200.0), l(500.0, 600.0), l(600.0, 700.0)], ..Default::default() };
+        net.link(1.5);
+        net
+    }
+
+    #[test]
+    fn a_route_ends_at_a_dead_end_and_the_trip_goes_on_past_it() {
+        let net = bridge_gap();
+        assert!(net.lanes[1].next.is_empty());
+        let section = vec![0, 1, 2, 3];
+        let index = vec![0, 1, 2, 3];
+        // steps 4..8, the bridge (steps 6 and 7) absent
+        let steps = vec![4, 5, 8, 9];
+        // a bus before the gap drives to the dead end; the trip goes on at step 8
+        let (route, at, resume) = cut_at_dead_ends(&net, section.clone(), &index, &steps, 0);
+        assert_eq!((route, at, resume), (vec![0, 1], 0, Some(8)));
+        // one placed past it has the rest
+        let (route, at, resume) = cut_at_dead_ends(&net, section.clone(), &index, &steps, 3);
+        assert_eq!((route, at, resume), (vec![2, 3], 1, None));
+        // no gap where the road goes on
+        let mut joined = bridge_gap();
+        joined.lanes[1].next = vec![2];
+        assert_eq!(cut_at_dead_ends(&joined, section, &index, &steps, 0), (vec![0, 1, 2, 3], 0, None));
+    }
+
+    #[test]
+    fn a_bus_past_a_dead_end_is_timed_where_its_track_goes_on() {
+        // one leg of 1000 s over ten 100 m steps; the bus at step 2, 50 m in, at t = 500
+        let steps: Vec<Step> = (0..10).map(|_| Step { key: None, leg: 0, length: 100.0 }).collect();
+        let est = vec![100.0; 10];
+        // step 6 begins 350 m on: 350 s later
+        let t = time_at_step(&steps, &est, false, 0, (2, 50.0), 6, (0.0, 1000.0), 500.0);
+        assert!((t - 850.0).abs() < 1e-6, "{t}");
+        // a step of a later leg: when this leg is over
+        let mut later = steps.clone();
+        later[6].leg = 1;
+        assert_eq!(time_at_step(&later, &est, false, 0, (2, 50.0), 6, (0.0, 1000.0), 500.0), 1000.0);
+    }
 
     /// The row OMSI's AI bus is given: the first whose ident is the destination, whatever
     /// the codes' order; of equally loose matches the first as well.

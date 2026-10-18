@@ -455,10 +455,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // 10. the end of a fixed route: stop at its end
+    // 10. the end of a fixed route: stop at its end. [ROLLBACK r4d-B1] Not where the road
+    //     itself ends (a street lane that runs into nothing, no stop of the bus's own on it):
+    //     there the bus keeps its speed and is taken off as it reaches the end (`AiState::
+    //     drive` finds no way on), as a plain car at a dead end; the timetable puts it back
+    //     where its track goes on. Held 0.5 m before the end, two buses on the Anwai bridge
+    //     (BeijingCity) stood for up to half an hour with fifty cars behind them.
     if !st.route.is_empty() && st.route_index + 1 >= st.route.len() && st.planned_next.is_none() {
         let end = lane.length() - st.s - 0.5;
-        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus {
+        let dead_end = lane.next.is_empty() && lane.kind == omsi_sim::traffic::LaneKind::Street;
+        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus && !dead_end {
             min_stop(&mut out.stop, &mut out.why, Some(end.max(0.0)), Why::End);
         }
     }
