@@ -353,7 +353,10 @@ fn the_side_road_never_squeezes_into_a_continuous_main_road_stream() {
         }
         let side = cars.iter().find(|c| c.id == 1).unwrap();
         stood |= side.state.speed < 0.3 && side.last.why == Why::Junction;
-        if side.state.lane != 3 && side_enters.is_none() {
+        // (round 4, rule D: it waits inside the object at the edge of the main road, its
+        // front a metre short of the meeting place, rather than at the object's entry: it
+        // "enters" when its front reaches the meeting place, 2.6 m short of the main lane)
+        if side.pos.y as f32 + side.state.front > -2.6 && side_enters.is_none() {
             side_enters = Some(t);
         }
     });

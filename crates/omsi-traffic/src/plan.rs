@@ -4,7 +4,7 @@
 //! grant.
 
 use crate::driver::VehicleClass;
-use crate::perception::{NeighbourView, Perception, Seen, SignalView};
+use crate::perception::{JunctionView, NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
 use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network};
@@ -75,6 +75,8 @@ pub struct Plan {
     pub body_block: Option<u64>,
     /// At the line on green or yellow: the driver goes through whatever it turns to.
     pub amber: Option<(usize, usize)>,
+    /// With `amber`: the gap from the front to that line (m).
+    pub amber_line: Option<f32>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -195,6 +197,43 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     }
 }
 
+/// Where a car refused for a foe stops (rule D): its front a metre before the first stretch
+/// it waits for (`waited`, along the way through), pulled back before any other meeting
+/// place ahead or pedestrian crossing its body would stand in ("keep the junction clear"; a
+/// meeting place it is in already it cannot leave but forward). A distance from the origin.
+fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, waited: f32) -> f32 {
+    let front = me.state.front;
+    let len = me.length();
+    // the stretches where it may not stand, as (from, to) distances of its front's stop
+    // and of the body: a meeting place a metre before it on, a crossing 2.5 m before it
+    // (the zebra stop) to 2 m past it
+    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
+    let node = &sim.junctions.nodes[j.junction];
+    for &(m, off) in &j.chain {
+        for &(_, sa, _) in net.walks.get(node.movements[m].lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let point = j.entry + off + sa;
+            bands.push((point - 2.5, point + 2.0));
+        }
+    }
+    bands.extend(converge_bands(sim, j));
+    let mut stop = j.entry + waited - 1.0;
+    for _ in 0..32 {
+        let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len).map(|b| b.0).fold(f32::INFINITY, f32::min);
+        if !hit.is_finite() {
+            break;
+        }
+        stop = hit;
+    }
+    stop
+}
+
+/// The stretches of the way through where it converges with a lane of the junction that is no
+/// foe (`Movement::converge`), as (from a metre before, to) distances from the origin.
+fn converge_bands(sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
+    let node = &sim.junctions.nodes[j.junction];
+    j.chain.iter().flat_map(|&(m, off)| node.movements[m].converge.iter().map(move |&(a, b)| (j.entry + off + a - 1.0, j.entry + off + b))).collect()
+}
+
 /// Decide for vehicle `i`.
 pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: &Perception, grant: Option<Grant>) -> Plan {
     let me = &vehicles[i];
@@ -211,11 +250,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.body_block = p.body_block;
     }
 
-    // 2. lights
-    if let Some(sig) = p.signal {
+    // 2. lights (not the one whose line it passed while it clears the box: in it when that
+    // light turned, it drives on; a later line, of that controller or not, holds it as any)
+    if let Some(sig) = p.signal.filter(|s| !p.junction.as_ref().is_some_and(|j| j.clears_past(s, st.front))) {
         let call = light_call(me, p, &sig);
         if call.mark {
             out.amber = Some((sig.ctl, sig.light));
+            out.amber_line = Some(sig.dist - st.front);
         }
         if !call.go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);
@@ -232,8 +273,40 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // it; a line the bumper is already over drew an emergency stop for a frame)
             let at_line = j.entry - 0.3;
             let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
-            let at = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
-            if at > st.front - 0.3 {
+            let first = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
+            // refused for a foe: just before the first stretch it waits for, not short of the
+            // first meeting place of its way (viz3 case03: a car waiting for a stretch 22 m
+            // on stood 2.8 m in, on the fork shared with the turn pockets, and blocked the
+            // turners behind it)
+            // (not where its way converges with another lane short of that stretch, that the
+            // junction knows no foe on: there it stops at the line, or short of the first
+            // meeting place, as before; review9: refused cars stood beside, and rolled into, the
+            // very car they waited for, on 5229/5231, 1430/1179, 10814/10625)
+            let at = match (g.hold, g.at) {
+                (Some(Hold::Foe), Some(waited)) => {
+                    let at = hold_point(net, sim, me, j, waited);
+                    let converges = converge_bands(sim, j).iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear);
+                    if (at < first || converges) && first > st.front - 0.3 {
+                        first
+                    } else if converges {
+                        // (past the line already: as soon as it can stop gently)
+                        at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
+                    } else {
+                        at
+                    }
+                }
+                _ => first,
+            };
+            if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {
+                // second at a zipper merge, both rolling: in behind the other at my gap
+                out.hold = g.hold;
+                out.wait_for = g.wait_for;
+                let behind = Lead { gap, speed, acc: 0.0 };
+                if out.lead.map(|l| gap < l.gap).unwrap_or(true) {
+                    out.lead = Some(behind);
+                    out.lead_seen = Some(Seen::Vehicle(w));
+                }
+            } else if at > st.front - 0.3 {
                 out.hold = g.hold;
                 out.wait_for = g.wait_for;
                 let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };

@@ -153,6 +153,33 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
+/// The lane a player's vehicle goes on into from `lane`: the only one, or at a fork the one
+/// its indicator points to (the furthest turn that way, a lane flagged with that turn first),
+/// else the straightest (a lane without a turn flag first).
+fn player_next(net: &Network, lane: usize, blinker: u8) -> Option<usize> {
+    let l = net.lanes.get(lane)?;
+    let nexts: Vec<usize> = l.next.iter().copied().filter(|&n| net.lanes.get(n).is_some_and(|x| x.kind == LaneKind::Street && !x.points.is_empty())).collect();
+    if nexts.len() <= 1 {
+        return nexts.first().copied();
+    }
+    let h = l.end_heading();
+    // (heading change into and along each, degrees: negative to the left)
+    let bend = |n: usize| omsi_sim::traffic::wrap_deg(net.lanes[n].end_heading() - h);
+    let want = blinker as i32;
+    let key = |n: usize| -> (u8, f32) {
+        let flag = net.lanes[n].turn;
+        match want {
+            1 => (u8::from(flag != 1), bend(n)),
+            2 => (u8::from(flag != 2), -bend(n)),
+            _ => (u8::from(flag != 0), bend(n).abs()),
+        }
+    };
+    nexts.into_iter().min_by(|&a, &b| {
+        let (ka, kb) = (key(a), key(b));
+        ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+    })
+}
+
 /// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vehicle {
@@ -191,6 +218,24 @@ pub struct Vehicle {
     /// keyframe restores it (recordings before format 2 lack it: false).
     #[serde(default)]
     pub claim_standing: bool,
+    /// The light (controller, light) whose line the vehicle passed while it let vehicles in
+    /// (green or yellow), as long as it is past that line: in the box when it turned, the
+    /// vehicle clears it (`JunctionView::clearing`). One put down past a red line, or that ran
+    /// it, has none.
+    #[serde(default)]
+    pub passed_on_go: Option<(usize, usize)>,
+    /// With `amber`: the odometer reading at the line it marks.
+    #[serde(default)]
+    pub amber_line: Option<f32>,
+    /// The zipper merge it last went first at: (the merge, its piece there, the time). The
+    /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
+    /// from these, so a keyframe restores it.
+    #[serde(default)]
+    pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    /// Standing in a standoff: (the other's id, seconds), each holding the other (`Simulation::
+    /// break_standoffs`).
+    #[serde(default)]
+    pub standoff: Option<(u64, f32)>,
 }
 
 impl Vehicle {
@@ -220,6 +265,10 @@ impl Vehicle {
             pos: DVec3::ZERO,
             heading: 0.0,
             claim_standing: false,
+            passed_on_go: None,
+            amber_line: None,
+            zip_won: None,
+            standoff: None,
         }
     }
 
@@ -261,6 +310,12 @@ pub struct Occupant {
     pub foreign: bool,
 }
 
+/// Two standing vehicles holding each other this long (s) are a standoff
+/// (`Simulation::break_standoffs`) ...
+pub const STANDOFF_SECS: f32 = 3.0;
+/// ... and the one that goes ignores the other this long (s).
+pub const STANDOFF_IGNORE: f64 = 5.0;
+
 /// Grid cell size of the vehicle and people grids (m).
 const GRID: f64 = 50.0;
 
@@ -298,6 +353,9 @@ pub struct Simulation {
     pub removed: Vec<usize>,
     /// Vehicles counted standing at a red light this frame (diagnostics).
     pub held_at_red: usize,
+    /// What the junction grants read besides the claims: the pairs of lights that are
+    /// never green together, filled in as claimants meet.
+    pub signal_groups: reservation::Context,
 }
 
 impl Simulation {
@@ -320,6 +378,7 @@ impl Simulation {
             left_hand: net.left_hand,
             removed: Vec::new(),
             held_at_red: 0,
+            signal_groups: reservation::Context::default(),
         }
     }
 
@@ -578,7 +637,42 @@ impl Simulation {
         // the claimants' standing hysteresis as of this claim, written
         // back once all claims are filed
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
+        // vehicle index by id (a standoff's other one)
+        let ids: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+        // the line each vehicle has passed on green or yellow, written back with them
+        let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
+        let mut stale_amber: Vec<usize> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
+            let passed = p.junction.as_ref().and_then(|j| {
+                let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
+                let lets_in = self.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow));
+                if lets_in || v.passed_on_go == Some((ctl, li)) {
+                    Some((ctl, li))
+                } else {
+                    None
+                }
+            });
+            if passed != v.passed_on_go {
+                passed_now.push((i, passed));
+            }
+            // the mark of a line taken on green or yellow (`Vehicle::amber`) is for that line:
+            // gone once neither the light ahead nor the junction's light is that light, or once
+            // the car is past that line and a line of the same light lies ahead (it stayed on
+            // after the junction, and the next approach under the same signal group went over
+            // its red on it: viz3 case01, light 1.0 lights three approaches)
+            if let Some(a) = v.amber {
+                let ahead = p.signal.filter(|s| (s.ctl, s.light) == a);
+                let here = p.junction.as_ref().and_then(|j| j.light).map(|(c, l, _)| (c, l));
+                let left = ahead.is_none() && here != Some(a);
+                let another = ahead.is_some_and(|s| s.dist > v.state.front + 0.5) && v.amber_line.is_some_and(|at| v.state.odometer > at + v.length() + 1.0);
+                // (or the line ahead lies further than a mark is ever taken at this speed:
+                // `plan::light_call`, a yellow within "comfortable", kept 6 m beyond it)
+                let comfortable = v.state.speed * v.state.speed / (2.0 * v.params.comfort_brake * 1.4) + 1.0;
+                let far = ahead.is_some_and(|s| s.dist - v.state.front > comfortable + 6.0);
+                if left || another || far {
+                    stale_amber.push(i);
+                }
+            }
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
             // a claim is filed from eight seconds before the meeting place (at least 60 m,
@@ -588,41 +682,32 @@ impl Simulation {
             if !j.inside && j.conflict_start - st.front > horizon {
                 continue;
             }
-            // committed: past the first meeting place of the way through, or too close to
-            // it to stop before it even braking hard. A driver who can still stop, if not
-            // comfortably, gives way as the rules say (two cars arriving together at an
-            // unmarked junction both took themselves for committed and met in the middle);
-            // one on the lead-in piece of a long object is inside but not yet committed.
-            // (at the line a driver stops hard if it must; one already inside does not
-            // slam on in the middle of the junction, it goes on unless it can stop gently)
-            let room = j.conflict_start - st.front - 0.6;
+            // committed: too close to the next meeting place it has not entered to stop before
+            // it even braking hard, or past every one it has (in the last it is in). A driver
+            // who can still stop, if not comfortably, gives way as the rules say (two cars
+            // arriving together at an unmarked junction both took themselves for committed
+            // and met in the middle); one on the lead-in piece of a long object is inside but
+            // not yet committed; one standing in the box short of a later stretch it waits
+            // for (`plan`: the stop before the stretch waited for) is committed to the ones it
+            // is in, not to that one (`reservation`: a meeting place I am in). (at the line a
+            // driver stops hard if it must; one already inside does not slam on in the middle
+            // of the junction, it goes on unless it can stop gently)
+            let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+            let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
+            let room = next - st.front - 0.6;
             let brake = if j.inside { st.decel * 1.5 } else { omsi_sim::traffic::MAX_BRAKE * 0.7 };
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
-            let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
+            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
-            // the way before the first meeting place with
-            // another way, wherever the object begins (BeijingCity lights a 1 m stub
-            // inside the crossing object, past its lead-in piece: the old test, the light
-            // within 1 m of the object's entry, never saw a car standing at that red as
-            // held by it). (The lead-in and its own stub end 1 m apart and compile as a
-            // merge of each other: a meeting place of the way with itself, before the
-            // light, which is no meeting with anybody else's way.)
-            // (and not with a piece forking from where one of my own pieces starts: an unlit
-            // 0.3 m stub beside the lit one at the end of the lead-in, which merged with the
-            // lead-in a few metres before the light, put the line before the light)
-            let light_line = {
-                let node = &self.junctions.nodes[j.junction];
-                let starts: Vec<glam::DVec3> = j.chain.iter().filter_map(|&(m, _)| net.lanes.get(node.movements[m].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
-                let fork = |m: usize| net.lanes.get(node.movements[m].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
-                let first = self.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| !j.chain.iter().any(|&(m, _)| m == f.movement) && !fork(f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
-                if first.is_finite() {
-                    j.entry + first
-                } else {
-                    j.conflict_start
-                }
-            };
+            // the way before the first meeting place with another way, wherever the object
+            // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
+            // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
+            let light_line = j.light_line;
             let (light_red, until_go) = match p.signal {
+                // (clearing the box: the light it passed holds it no more,
+                // `JunctionView::clears_past`)
+                Some(sig) if j.clears_past(&sig, st.front) => (false, None),
                 Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
@@ -675,75 +760,129 @@ impl Simulation {
                 // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                 // answer or a full exit)
                 blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                // (people or a zebra in front of it, or a lead that stands too: nothing that
+                // lets it go on a schedule, as a light or a lead moving off does)
+                // in the box when its light turned: it clears it (rule F)
+                clearing: j.clearing,
+                ignore: v.ignore_lead.filter(|&(_, until)| self.time < until).and_then(|(id, _)| ids.get(&id).copied()),
+                stuck: st.speed < 0.3
+                    && v.last.held
+                    && match v.last.why {
+                        Why::People | Why::Zebra => true,
+                        Why::Lead => p.leader.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0),
+                        _ => false,
+                    },
                 red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
+                light: j.light.map(|(c, l, _)| (c, l)),
+                id: v.id,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
-        // read: the player drives): the junction on the lane under the vehicle, or on the
-        // lanes ahead of it within the deciding distance
+        // read: the player drives): the junction on the way ahead of the lane under the
+        // vehicle (its `next` lanes, straight on at a fork unless the indicator says
+        // otherwise), the claim over every piece of it the way takes (`chain_along`, as for an
+        // AI vehicle: a claim of the first piece alone never met the oncoming left turner
+        // on the piece after it, viz3 case11); off the lanes, the junction on the lanes
+        // starting ahead of it, on its first piece
         for (k, p) in self.players.iter().enumerate() {
-            // the way through chosen by the indicator, else the straightest
-            let pick = |entries: &Vec<(usize, usize)>| {
-                entries.iter().copied().min_by_key(|&(j, m)| {
-                    let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
-                    let want = p.blinker as i32;
-                    if want != 0 && turn == want {
-                        0
-                    } else if turn == 0 {
-                        1
-                    } else {
-                        2
-                    }
-                })
-            };
-            // candidate lanes: (lane, distance from the vehicle's origin to the lane's start)
-            let mut lanes: Vec<(usize, f32)> = Vec::new();
+            let v = p.speed.max(0.0);
+            let horizon = (8.0 * v + 30.0).clamp(60.0, 220.0);
+            // the way: (lane, distance from the vehicle's origin to the lane's start)
+            let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {
-                lanes.push((lane, -s));
+                way.push((lane, -s));
                 let mut d = net.lanes[lane].length() - s;
                 let mut cur = lane;
-                for _ in 0..6 {
-                    if d > 80.0 {
+                for _ in 0..16 {
+                    if d > horizon + 40.0 {
                         break;
                     }
-                    let Some(&n) = net.lanes[cur].next.first() else { break };
-                    lanes.push((n, d));
+                    let Some(n) = player_next(net, cur, p.blinker) else { break };
+                    way.push((n, d));
                     d += net.lanes[n].length();
                     cur = n;
                 }
             }
-            lanes.extend(self.lanes_ahead_of(net, p, 80.0).into_iter().map(|(l, d)| (l, d - p.half_len)));
-            let mut found: Option<(usize, usize, f32)> = None;
-            for (lane, d0) in lanes {
-                let len = net.lanes[lane].length();
-                let hit = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
-                    Some((j, m, -d0))
-                } else if let Some(entries) = self.junctions.entries.get(&lane) {
-                    pick(entries).map(|(j, m)| (j, m, -(d0 + len)))
-                } else {
-                    None
+            let on_way = way.iter().position(|(l, _)| self.junctions.of_lane.contains_key(l)).map(|at| {
+                let j = self.junctions.of_lane[&way[at].0].0;
+                (j, self.junctions.chain_along(j, &way[at..]), -way[at].1)
+            });
+            let hit = on_way.or_else(|| {
+                // off the lanes: the way through chosen by the indicator, else the straightest
+                let pick = |entries: &Vec<(usize, usize)>| {
+                    entries.iter().copied().min_by_key(|&(j, m)| {
+                        let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
+                        let want = p.blinker as i32;
+                        if want != 0 && turn == want {
+                            0
+                        } else if turn == 0 {
+                            1
+                        } else {
+                            2
+                        }
+                    })
                 };
-                if let Some(h) = hit {
-                    if found.map(|f| h.2 > f.2).unwrap_or(true) {
-                        found = Some(h);
+                let mut found: Option<(usize, usize, f32)> = None;
+                for (lane, d0) in self.lanes_ahead_of(net, p, 80.0).into_iter().map(|(l, d)| (l, d - p.half_len)) {
+                    let len = net.lanes[lane].length();
+                    let hit = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
+                        Some((j, m, -d0))
+                    } else if let Some(entries) = self.junctions.entries.get(&lane) {
+                        pick(entries).map(|(j, m)| (j, m, -(d0 + len)))
+                    } else {
+                        None
+                    };
+                    if let Some(h) = hit {
+                        if found.map(|f| h.2 > f.2).unwrap_or(true) {
+                            found = Some(h);
+                        }
                     }
                 }
-            }
-            let Some((j, m, s_on)) = found else { continue };
-            if s_on < -70.0 {
+                found.map(|(j, m, s_on)| (j, vec![(m, 0.0)], s_on))
+            });
+            let Some((j, chain, s_on)) = hit else { continue };
+            let Some(&(m, _)) = chain.first() else { continue };
+            // where its meeting places begin along the way through (the end of the way when
+            // it meets nobody), and the next one its front has not entered
+            let foes = self.junctions.foes_along(j, &chain);
+            let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[self.junctions.nodes[j].movements[mm].lane].length()).sum();
+            let cs = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let cs = if cs.is_finite() { cs } else { way_len };
+            let front_at = s_on + p.half_len;
+            if cs - front_at > horizon {
                 continue;
             }
-            let v = p.speed.max(0.0);
-            let cs = self.junctions.nodes[j].movements[m].conflict_start;
-            let cs = if cs.is_finite() { cs } else { net.lanes[self.junctions.nodes[j].movements[m].lane].length() };
-            let room = cs - s_on - p.half_len - 0.6;
+            let next_ahead = foes.iter().map(|f| f.mine.0).filter(|&m0| m0 - front_at > 0.5).fold(f32::INFINITY, f32::min);
+            let room = if next_ahead.is_finite() { next_ahead } else { cs } - front_at - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
+            // its light, as an AI car's: the first lit lane of its way before the first
+            // meeting place, red (or red and yellow) at its line with room to stop there
+            let line_limit = -s_on + cs + 1.0;
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
+            let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
+                Some((lt, d, c)) => {
+                    let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
+                    let gap = d - p.half_len;
+                    let can_stop = v < 1.0 || gap > v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8) + 0.5;
+                    if red && can_stop {
+                        (Some(lt), true, c.time_until_go(lt.1))
+                    } else {
+                        (Some(lt), false, None)
+                    }
+                }
+                None => (None, false, None),
+            };
+            // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
+            // AI car held by its lead; it comes from rest when it moves off (an AI car waited
+            // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
+            let blocked = p.still > 2.0 && p.speed.abs() < 0.3 && !light_red;
             claims.push(Claim {
-                chain: vec![(m, 0.0)],
+                chain,
                 was_standing: false,
-                light_red: false,
-                until_go: None,
+                light_red,
+                until_go,
                 lead: None,
                 vehicle: usize::MAX - k,
                 junction: j,
@@ -755,20 +894,69 @@ impl Simulation {
                 front: p.half_len,
                 rear: p.half_len,
                 gap: 4.0,
-                committed: cs - s_on - p.half_len <= 0.5 || cannot_stop,
+                committed,
                 exit_room: true,
                 impatience: Impatience::default(),
                 absolute: p.priority,
                 held: p.still > 2.0,
-                blocked: false,
+                blocked,
+                stuck: false,
+                clearing: false,
+                ignore: None,
                 red_hysteresis: false,
-                lanes: Vec::new(),
+                lanes: way,
+                light,
+                id: PLAYER_ID_BASE + p.id as u64,
             });
         }
         for (i, standing) in standing_now {
             vehicles[i].claim_standing = standing;
         }
-        let grants: Vec<Grant> = reservation::resolve(&self.junctions, net, &claims);
+        for (i, passed) in passed_now {
+            vehicles[i].passed_on_go = passed;
+        }
+        for i in stale_amber {
+            vehicles[i].amber = None;
+            vehicles[i].amber_line = None;
+        }
+        // the signal groups the claimants' lights belong to: which pairs never let vehicles
+        // in together (worked out once per pair of lights, from the programs)
+        for a in 0..claims.len() {
+            let Some((ctl, la)) = claims[a].light else { continue };
+            for b in a + 1..claims.len() {
+                let Some((ctl_b, lb)) = claims[b].light else { continue };
+                if ctl_b != ctl || la == lb || claims[b].junction != claims[a].junction {
+                    continue;
+                }
+                let key = (ctl, la.min(lb), la.max(lb));
+                if !self.signal_groups.exclusive.contains_key(&key) {
+                    let ex = self.lights.get(ctl).is_some_and(|c| c.never_together(la, lb));
+                    self.signal_groups.exclusive.insert(key, ex);
+                }
+            }
+        }
+        // who went first last at each zipper merge, from the vehicles (the latest per merge)
+        let mut last_won: HashMap<(usize, usize, usize), (f64, usize, u64)> = HashMap::new();
+        for v in vehicles.iter() {
+            if let Some((key, piece, t)) = v.zip_won {
+                if last_won.get(&key).map(|w| t > w.0 || (t == w.0 && v.id < w.2)).unwrap_or(true) {
+                    last_won.insert(key, (t, piece, v.id));
+                }
+            }
+        }
+        self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
+        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        // who went first at a zipper merge: it keeps going first while the two are engaged,
+        // and the next tie there is the other side's
+        for (g, c) in grants.iter().zip(&claims) {
+            if let (true, Some((key, piece))) = (g.go, g.zip) {
+                // (a player's win is not remembered: no keyframe would carry it)
+                if let Some(v) = vehicles.get_mut(c.vehicle) {
+                    v.zip_won = Some((key, piece, self.time));
+                    self.signal_groups.zipper.insert(key, (piece, c.id));
+                }
+            }
+        }
 
         // plan and act, one vehicle at a time
         for i in 0..vehicles.len() {
@@ -776,6 +964,7 @@ impl Simulation {
             let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
             self.act(net, vehicles, i, plan, dt);
         }
+        self.break_standoffs(vehicles, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
     }
 
@@ -794,6 +983,7 @@ impl Simulation {
         }
         if let Some(light) = plan.amber {
             v.amber = Some(light);
+            v.amber_line = plan.amber_line.map(|gap| v.state.odometer + gap);
         }
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
@@ -921,6 +1111,56 @@ impl Simulation {
         }
         if !alive {
             self.removed.push(i);
+        }
+    }
+
+    /// Two standing vehicles each held by the other, by its body across the way or a junction
+    /// wait (`Decision::body_block`, `Decision::wait_for`), for more than `STANDOFF_SECS`, with
+    /// no meeting place compiled between the lanes they stand on (lanes converging too close
+    /// for the network to know them as foes): the one further along its lane (then the lower
+    /// id) goes, unless the other's body is across its way and its own is not across the
+    /// other's (then the other goes), ignoring the other for `STANDOFF_IGNORE` s (`Vehicle::ignore_lead`, read by
+    /// the perception and the claim); the other keeps holding. (viz3 case06: #15110 and
+    /// #10813, 2.6 m apart on 4516/4541, stood 60 s so.)
+    pub fn break_standoffs(&mut self, vehicles: &mut [Vehicle], dt: f32) {
+        let ids: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+        let holds = |v: &Vehicle, other: u64| v.last.body_block == Some(other) || v.last.wait_for == Some(other);
+        let mut next: Vec<Option<(u64, f32)>> = vec![None; vehicles.len()];
+        for (i, v) in vehicles.iter().enumerate() {
+            if v.state.speed >= 0.3 {
+                continue;
+            }
+            let other = [v.last.body_block, v.last.wait_for].into_iter().flatten().find(|o| ids.get(o).is_some_and(|&j| vehicles[j].state.speed < 0.3 && holds(&vehicles[j], v.id)));
+            if let Some(o) = other {
+                let t = match v.standoff {
+                    Some((p, t)) if p == o => t + dt,
+                    _ => dt,
+                };
+                next[i] = Some((o, t));
+            }
+        }
+        for i in 0..vehicles.len() {
+            vehicles[i].standoff = next[i];
+            let Some((o, t)) = next[i] else { continue };
+            if t <= STANDOFF_SECS {
+                continue;
+            }
+            let j = ids[&o];
+            let (a, b) = (&vehicles[i], &vehicles[j]);
+            // a compiled meeting place between the lanes they stand on: the table decides
+            let foe = match (self.junctions.of_lane.get(&a.state.lane), self.junctions.of_lane.get(&b.state.lane)) {
+                (Some(&(ja, ma)), Some(&(jb, mb))) if ja == jb => self.junctions.nodes[ja].movements[ma].foes.iter().any(|f| f.movement == mb),
+                _ => false,
+            };
+            // (one whose way the other's body is across cannot go through it: the other goes;
+            // else the further along its lane, then the lower id)
+            let (a_body, b_body) = (a.last.body_block == Some(b.id), b.last.body_block == Some(a.id));
+            let first = if a_body != b_body { b_body } else { a.state.s > b.state.s || (a.state.s == b.state.s && a.id < b.id) };
+            if foe || !first || a.ignore_lead.is_some_and(|(id, until)| id == o && self.time < until) {
+                continue;
+            }
+            log::info!("traffic: standoff of #{} and #{} for {t:.1} s broken, #{} goes", a.id, b.id, a.id);
+            vehicles[i].ignore_lead = Some((o, self.time + STANDOFF_IGNORE));
         }
     }
 

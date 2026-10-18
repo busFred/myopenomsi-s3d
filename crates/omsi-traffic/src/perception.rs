@@ -98,6 +98,81 @@ pub struct JunctionView {
     pub conflict_start: f32,
     /// Room past the junction's conflicts for this vehicle, measured along its own way.
     pub exit_room: bool,
+    /// Distance from the origin to the first place where the way meets another way (not
+    /// one of its own pieces, nor a piece forking where one of them starts): a light that
+    /// holds the car at this junction stands before it (the end of the way through when
+    /// it meets nobody).
+    pub light_line: f32,
+    /// The light at this junction's line: (controller, light, distance from the origin to
+    /// the lit lane's start, negative once passed). The first lit lane of the way, from the
+    /// lane leading in, before `light_line`; for a car inside the junction past it, the
+    /// lit lane it came through (looked for back along the pieces of the junction).
+    pub light: Option<(usize, usize, f32)>,
+    /// The front is over that light's line (by more than half a metre), or the lit lane lies
+    /// behind the car.
+    pub past_line: bool,
+    /// Past its line (passed while the light let it in), the light no longer green, and unable
+    /// to stop before the first meeting place with another way or already at it: in the box
+    /// when its light turned, it clears it. That light holds it no more (`clears_past`; a later line on the
+    /// way, a left-turn waiting area's under another light of the controller, holds it as any)
+    /// and it goes on through, waiting only for foes committed or clearing themselves (the
+    /// table decides between those); a fresh green waits for it (`Claim::clearing`).
+    pub clearing: bool,
+    /// The way through's length (m, along the chain's pieces).
+    pub way_len: f32,
+}
+
+impl JunctionView {
+    /// Clearing the box, the car is not held by `sig` when that is the light whose line it
+    /// passed and the line lies behind its front (`front`: from the origin to the front).
+    /// (Review7: it ignored every light of the controller on its way through and drove over
+    /// the red of a left-turn waiting area's second line, 41 such ways in viz3.)
+    pub fn clears_past(&self, sig: &SignalView, front: f32) -> bool {
+        self.clearing && self.light.is_some_and(|(ctl, li, _)| (ctl, li) == (sig.ctl, sig.light)) && sig.dist < front
+    }
+}
+
+/// The light of junction `j` that a car on its pieces came through: back from `lane` along
+/// the lanes leading into it (the car's own previous lane first), within the junction and the
+/// lane leading into it, at most eight pieces or 80 m. (controller, light, distance from the
+/// origin to the lit lane's start; `back` is the distance to `lane`'s start, <= 0.) None when
+/// none is found or two different lights are (the way it came is not known).
+fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
+    let mut found: Option<(usize, usize, f32)> = None;
+    let mut ambiguous = false;
+    // (lane, distance from the origin to its start, steps)
+    let mut stack: Vec<(usize, f32, usize)> = vec![(lane, back, 0)];
+    while let Some((l, d, n)) = stack.pop() {
+        if n >= 8 || d < -80.0 {
+            continue;
+        }
+        let prevs = net.prev.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+        // the way it came: its previous lane, when it is one of them
+        let only: Option<usize> = if n == 0 { prev_lane.filter(|p| prevs.contains(p)) } else { None };
+        for &p in prevs {
+            if only.is_some_and(|o| o != p) {
+                continue;
+            }
+            let Some(pl) = net.lanes.get(p) else { continue };
+            let dp = d - pl.length();
+            if let Some((ctl, li)) = pl.traffic_light {
+                match found {
+                    Some((c, i, _)) if (c, i) != (ctl, li) => ambiguous = true,
+                    Some(_) => {}
+                    None => found = Some((ctl, li, dp)),
+                }
+                continue;
+            }
+            if js.of_lane.get(&p).map(|x| x.0) == Some(j) {
+                stack.push((p, dp, n + 1));
+            }
+        }
+    }
+    if ambiguous {
+        None
+    } else {
+        found
+    }
 }
 
 /// A lane beside the current one.
@@ -351,7 +426,12 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            if o.state.planned_next != Some(next) {
+            // into the same next lane; or out of a lane ending where mine does, whichever
+            // lane it goes on into (two lanes converging on one joint whose starts lie too
+            // close for the network to call them a merge, and for the junction to know them
+            // as foes, met side by side at the joint)
+            let same_joint = (pl.end() - my_lane.end()).truncate().length() < 1.5;
+            if o.state.planned_next != Some(next) && !same_joint {
                 continue;
             }
             // someone held at a light or a junction never arrives
@@ -423,6 +503,10 @@ fn body_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize
         }
         // both blocking each other: the higher id goes
         if o.last.body_block == Some(me.id) && me.id > o.id {
+            continue;
+        }
+        // (a standoff broken in my favour, `Simulation::break_standoffs`)
+        if me.ignore_lead.is_some_and(|(id, until)| id == o.id && sim.time < until) {
             continue;
         }
         let b = o.obb();
@@ -607,7 +691,47 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
             }
         }
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need });
+        // the light at this junction's line: on the way before the first meeting place with
+        // another way, wherever the object begins (BeijingCity lights a 1 m stub inside the
+        // crossing object, past its lead-in piece). (The lead-in and its own stub end 1 m
+        // apart and compile as a merge of each other: a meeting place of the way with itself,
+        // before the light, which is no meeting with anybody else's way; nor is one with a
+        // piece forking from where one of my own pieces starts: an unlit 0.3 m stub beside the
+        // lit one at the end of the lead-in.)
+        let light_line = {
+            let node = &js.nodes[j];
+            let starts: Vec<DVec3> = chain.iter().filter_map(|&(mm, _)| net.lanes.get(node.movements[mm].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
+            let fork = |mm: usize| net.lanes.get(node.movements[mm].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
+            let first = foes.iter().filter(|f| !chain.iter().any(|&(mm, _)| mm == f.movement) && !fork(f.movement)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            if first.is_finite() {
+                d0 + first
+            } else {
+                conflict_start
+            }
+        };
+        let mut light = None;
+        for &(wl, wd) in &way[k.saturating_sub(1)..] {
+            if wd > light_line + 1.0 {
+                break;
+            }
+            if let Some((ctl, li)) = net.lanes[wl].traffic_light {
+                light = Some((ctl, li, wd));
+                break;
+            }
+        }
+        if light.is_none() && inside && k == 0 {
+            light = light_behind(net, js, j, l, d0, me.state.prev_lane);
+        }
+        let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
+        let turned = light.is_some_and(|(ctl, li, _)| sim.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), Aspect::Green | Aspect::GreenYellow | Aspect::Dark)));
+        // (it passed the line while the light let it in: `Vehicle::passed_on_go`)
+        // (and only once it cannot stop before its first meeting place, or is at it: a car
+        // over its line on yellow 16 m short of it, that could still stop, was committed and
+        // went in front of a car it had been refused for; review9)
+        let to_line = light_line - me.state.front - 0.6;
+        let cannot_stop = me.state.speed > 1.0 && to_line < me.state.speed * me.state.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+        let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }
     None
 }
