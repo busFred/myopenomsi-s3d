@@ -1159,7 +1159,10 @@ impl BusService {
                 self.short_by_people = true;
             }
             let people_short = self.short_by_people && ctx.stopped < PEOPLE_SERVE_MAX;
-            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short);
+            // [ROLLBACK r4d-B2] (a bus coming to its layover queues for the berth instead: it
+            // stands out its wait there, not in the lane behind - only right behind another
+            // bus at the stop, `close`, it serves it where it stands)
+            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short && !self.layover);
             if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 - pull && crept_past) {
                 self.near_d = f32::INFINITY;
                 self.arrive(ctx, stop.depart, stop.id, (st.lane, st.s));
@@ -2023,6 +2026,48 @@ mod tests {
         let (there, _, _, leave) = run(false, true);
         assert!(there < 270.0, "early at the stop: {there}");
         assert!(leave >= there + 30.0, "and waits the lead out there: {leave} (there {there})");
+    }
+
+    /// [ROLLBACK r4d-B2] A bus put back 30 m before its layover stop, the berth taken: it
+    /// queues, drives up once the berth frees, waits out its layover there and departs on
+    /// time.
+    #[test]
+    fn a_bus_put_back_before_its_taken_berth_drives_up_once_it_frees_and_departs() {
+        use omsi_sim::traffic::LaneBuilder;
+        let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![glam::DVec3::ZERO, glam::DVec3::new(0.0, 300.0, 0.0)], LaneKind::Street, 3.5)], ..Default::default() };
+        net.link(1.5);
+        let mut v = test_vehicle();
+        let mut st = AiState::new(0, 70.0, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.route = vec![0];
+        let mut s = BusService::new(vec![Stop { ri: 0, s: 100.0, bay: 0.0, depart: 400.0, id: 9, side: 0.0 }, Stop { ri: 0, s: 280.0, bay: 0.0, depart: 500.0, id: 10, side: 0.0 }]);
+        // (as `Schedule::spawn_departure` puts a respawned bus back: on its layover)
+        s.layover = true;
+        let (mut t, mut stopped, mut at_stop, mut off) = (300.0, 0.0f32, None, None);
+        while t < 460.0 && off.is_none() {
+            let way = omsi_traffic::perception::way_lanes(&net, &st, 200.0);
+            let ctx = ctx_on(&net, &way, t, stopped);
+            let mut stop = s.step(&mut st, &mut v, &ctx);
+            // the berth taken until 330: a bus there, its tail 15 m before the stop point
+            if t < 330.0 {
+                let tail = st.route_distance(&net, 0, 85.0) - st.front - 2.0;
+                stop = Some(stop.map_or(tail.max(0.0) + st.front, |x| x.min(tail.max(0.0) + st.front)));
+            }
+            st.drive(&net, 0.1, None, stop);
+            stopped = if st.speed < 0.3 { stopped + 0.1 } else { 0.0 };
+            t += 0.1;
+            if at_stop.is_none() && s.at_stop() {
+                at_stop = Some((t, st.s));
+            }
+            if at_stop.is_some() && s.phase == Phase::Running {
+                off = Some(t);
+            }
+        }
+        let (there, where_) = at_stop.expect("at its stop");
+        assert!(there > 330.0 && (where_ - 100.0).abs() < 2.5, "drove up once the berth freed: {there} at {where_}");
+        let off = off.expect("off");
+        assert!((400.0..410.0).contains(&off), "on time: {off}");
     }
 
     #[test]

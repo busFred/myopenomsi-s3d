@@ -2589,7 +2589,7 @@ impl Schedule {
             self.car_departure.insert(id, i);
             let back = self.resumes.placed(id, i, end_step);
             if let Some(t) = self.resumes.respawn_block(self.tour_key(i), day_time, back) {
-                traffic.respawn_block.insert(id, t);
+                block_until(&mut traffic.respawn_block, id, t);
             }
             self.running.retain(|r| r.car != id);
             if open {
@@ -2683,8 +2683,36 @@ impl Schedule {
         // [ROLLBACK r4d-B2] a bus taken off the road as the last resort comes back at the stop
         // it was taken from (not at the start of its trip, 128 m before it)
         if let Some((ri, ss)) = respawn_stop.and_then(|id| respawn_start(&stops, id)) {
-            start_index = ri;
-            s = ss;
+            // the stop first; taken (the queue behind it moved up into the berth), or in the
+            // player's view: the first clear spot out of view on its way up to it, at most
+            // `RESPAWN_APPROACH` m before it - it drives up and queues for the berth then
+            let places = respawn_places(&traffic.net, &section, (ri, ss));
+            let check = |k: usize, at_s: f32| -> Result<(), &'static str> {
+                let (p, h) = traffic.net.lanes[section[k]].at(at_s);
+                if !track_is_air(traffic, section[k]) && !world.has_ground(p.x, p.y) {
+                    return Err("tile unloaded");
+                }
+                if traffic.blocked(&ty, p, h as f64) || !traffic.spawn_clear(&ty, p, h as f64) {
+                    return Err("no free lane");
+                }
+                if !traffic.may_appear(world, p) {
+                    return Err("too close to the player");
+                }
+                Ok(())
+            };
+            match first_place(&places, check) {
+                Ok((k, at_s)) => {
+                    if (k, at_s) != (ri, ss) {
+                        log::info!("timetable: trip {trip_name}: its stop taken, the bus taken off the road comes back {:.0} m before it", stop_gap(&traffic.net, &section, (k, at_s), (ri, ss)));
+                    }
+                    start_index = k;
+                    s = at_s;
+                }
+                Err(reason) => {
+                    self.fail_reason = Some(reason);
+                    return if reason == "tile unloaded" { Placed::Wait } else { Placed::Busy };
+                }
+            }
         }
         let at_pos = traffic.net.lanes[section[start_index]].at(s).0;
         // lanes stay in the network when their tile is unloaded: nothing is put on ground
@@ -2785,7 +2813,7 @@ impl Schedule {
         // may lie on a part of the track that is not loaded): it waits there for its departure
         if let Some(b) = car.bus.as_mut() {
             b.layover = departure > day_time
-                && b.stops.front().map(|st| st.ri == 0 && (st.s - s).abs() < 2.0).unwrap_or(false);
+                && b.stops.front().map(|st| (st.ri == 0 && (st.s - s).abs() < 2.0) || respawn_stop == Some(st.id)).unwrap_or(false);
             b.route_open = open;
             b.terminus = terminus.clone();
             b.last_stop = last_stop;
@@ -2804,7 +2832,7 @@ impl Schedule {
             log::info!("timetable: departure {i} (line {} tour {}): its bus is back as {} at its stop, {:.0} s before its departure", self.departures[i].line, self.departures[i].tour, car.id, departure - day_time);
         }
         if let Some(t) = self.resumes.respawn_block(self.tour_key(i), day_time, back) {
-            traffic.respawn_block.insert(car.id, t);
+            block_until(&mut traffic.respawn_block, car.id, t);
         }
         if open {
             self.running.push(RunningTrip {
@@ -3036,6 +3064,66 @@ impl Resumes {
             ResumeAt::Go
         }
     }
+}
+
+/// [ROLLBACK r4d-B2] Bus `car` may not be taken off the road again before `t`: the longer
+/// block holds (the tour's next trip handed to the bus put back had shortened it to the
+/// tour's, and the bus was taken off again 100 s after it was back).
+fn block_until(blocks: &mut HashMap<u64, f64>, car: u64, t: f64) {
+    let e = blocks.entry(car).or_insert(t);
+    *e = e.max(t);
+}
+
+/// [ROLLBACK r4d-B2] How far before its stop a bus taken off the road may come back (m), and
+/// the step between the places tried on the way up to it.
+const RESPAWN_APPROACH: f32 = 150.0;
+const RESPAWN_STEP: f32 = 10.0;
+
+/// [ROLLBACK r4d-B2] The place `d` metres back along `section` from (`at.0`, `at.1`): lane
+/// index in it and distance along that lane. None before the section's start.
+fn back_along(net: &Network, section: &[usize], at: (usize, f32), d: f32) -> Option<(usize, f32)> {
+    let (mut k, mut s) = (at.0, at.1 - d);
+    while s < 0.0 {
+        if k == 0 {
+            return None;
+        }
+        k -= 1;
+        s += net.lanes[section[k]].length();
+    }
+    Some((k, s))
+}
+
+/// [ROLLBACK r4d-B2] The metres from `a` to `b` along `section`.
+fn stop_gap(net: &Network, section: &[usize], a: (usize, f32), b: (usize, f32)) -> f32 {
+    (a.0..b.0).map(|k| net.lanes[section[k]].length()).sum::<f32>() - a.1 + b.1
+}
+
+/// [ROLLBACK r4d-B2] The places a bus taken off the road may be put back at, in order: its
+/// stop (`stop`), then on its way up to it every `RESPAWN_STEP` m back as far as
+/// `RESPAWN_APPROACH` (along its own trip's lanes).
+fn respawn_places(net: &Network, section: &[usize], stop: (usize, f32)) -> Vec<(usize, f32)> {
+    let mut out = vec![stop];
+    let mut d = RESPAWN_STEP;
+    while d <= RESPAWN_APPROACH + 1e-3 {
+        out.extend(back_along(net, section, stop, d));
+        d += RESPAWN_STEP;
+    }
+    out
+}
+
+/// [ROLLBACK r4d-B2] The first of `places` that `check` lets the bus appear at; when none
+/// does, why the first (its stop) would not.
+fn first_place(places: &[(usize, f32)], mut check: impl FnMut(usize, f32) -> Result<(), &'static str>) -> Result<(usize, f32), &'static str> {
+    let mut why = None;
+    for &(k, s) in places {
+        match check(k, s) {
+            Ok(()) => return Ok((k, s)),
+            Err(e) => {
+                why.get_or_insert(e);
+            }
+        }
+    }
+    Err(why.unwrap_or("other"))
 }
 
 /// [ROLLBACK r4d-B2] Where a bus taken off the road at stop `id` is put back: half a metre
@@ -5488,6 +5576,12 @@ pub(crate) mod tests {
         assert_eq!(r.respawn_block(5, 1100.0, false), Some(1200.0));
         assert_eq!(r.respawn_block(5, 1250.0, false), None);
         assert_eq!(r.respawn_block(6, 1100.0, false), None, "another tour");
+        // the bus put back blocked to 1300; its tour's next trip handed to it at 1100 asks
+        // only to 1200: 1300 holds
+        let mut blocks = HashMap::new();
+        block_until(&mut blocks, 22, 1300.0);
+        block_until(&mut blocks, 22, 1200.0);
+        assert_eq!(blocks.get(&22), Some(&1300.0));
     }
 
     /// [ROLLBACK r4d-B2] (1) A bus taken off at its stop comes back at it, half a metre short
@@ -5497,6 +5591,48 @@ pub(crate) mod tests {
         let stops = vec![(0usize, 40.0f32, 0.0f32, 100.0f64, 41i64, 0.0f32), (2, 28.0, 0.0, 200.0, 42, 0.0), (5, 10.0, 0.0, 300.0, 43, 0.0)];
         assert_eq!(respawn_start(&stops, 42), Some((2, 27.5)));
         assert_eq!(respawn_start(&stops, 44), None);
+    }
+
+    /// [ROLLBACK r4d-B2] A bus taken off the road whose stop is taken when it is due back is
+    /// put on its way up to it (the first clear place out of view, every 10 m back as far as
+    /// 150 m); with the player close by for the whole window it is given up, said once.
+    #[test]
+    fn a_bus_whose_stop_is_taken_comes_back_on_its_way_up_to_it() {
+        use omsi_sim::traffic::{LaneBuilder, LaneKind};
+        let l = |a: f64, b: f64| LaneBuilder::polyline(vec![glam::DVec3::new(0.0, a, 0.0), glam::DVec3::new(0.0, b, 0.0)], LaneKind::Street, 3.5);
+        let mut net = Network { lanes: vec![l(0.0, 100.0), l(100.0, 200.0)], ..Default::default() };
+        net.link(1.5);
+        let section = vec![0, 1];
+        let places = respawn_places(&net, &section, (1, 30.0));
+        assert_eq!(places[0], (1, 30.0), "the stop first");
+        assert_eq!(places[1], (1, 20.0));
+        assert_eq!(places[4], (0, 90.0), "back over the lane joint");
+        assert_eq!(places.len(), 14, "as far as 130 m back: the section starts there");
+        // the berth taken (the queue moved up), clear 20 m back: there
+        let berth_taken = |k: usize, s: f32| if (k, s) == (1, 30.0) || (k, s) == (1, 20.0) { Err("no free lane") } else { Ok(()) };
+        assert_eq!(first_place(&places, berth_taken), Ok((1, 10.0)));
+        // nothing will do: why the stop would not
+        let player_close = |_: usize, _: f32| Err("too close to the player");
+        assert_eq!(first_place(&places, player_close), Err("too close to the player"));
+        // and so for the whole window: tried every 3 s, said once, given up 120 s after the
+        // departure
+        let mut r = Resumes::default();
+        let gone = crate::bus_service::Respawned { car: 1, removed: 0.0, at: 240.0, depart: 300.0, stop: 9 };
+        r.respawned(1, Some(4), gone, None);
+        let (mut t, mut told, mut gave_up) = (240.0, 0, None);
+        while gave_up.is_none() && t < 1000.0 {
+            let reason = first_place(&places, player_close).unwrap_err();
+            match r.respawn_failed(4, reason, t) {
+                Some(RespawnNext::Retry(next, new)) => {
+                    told += new as usize;
+                    t = next;
+                }
+                Some(RespawnNext::GiveUp) => gave_up = Some(t),
+                None => unreachable!(),
+            }
+        }
+        assert_eq!(told, 1);
+        assert!(gave_up.is_some_and(|t| (420.0..424.0).contains(&t)), "{gave_up:?}");
     }
 
     #[test]
