@@ -386,3 +386,139 @@ fn x2_my_follower_that_has_me_as_its_lead_is_not_my_lead() {
     let p = seen(&net, &mut cars, 0);
     assert!(p.leader.is_some_and(|l| l.gap > 20.0), "{:?}", p.leader);
 }
+
+/// A car (id 1) on lane 0 at x = 100 changing over to lane 1 with its change at `t`, standing
+/// behind a car (id 2) standing in lane 1 just ahead of it and one (id 3) standing in lane 0:
+/// the change cannot go on.
+fn frozen_change(t: f32) -> (Network, Vec<Vehicle>) {
+    let net = two_lanes();
+    let mut me = car(1, 0, 100.0, 0.0);
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false });
+    let mut ahead_target = car(2, 1, 105.5, 0.0);
+    ahead_target.pull_out = 1000.0;
+    let mut ahead_own = car(3, 0, 105.5, 0.0);
+    ahead_own.pull_out = 1000.0;
+    (net, vec![me, ahead_target, ahead_own])
+}
+
+#[test]
+fn x3_a_change_frozen_more_than_half_across_is_done_in_place_and_one_less_given_up() {
+    for (t, done) in [(0.8f32, true), (0.25, false)] {
+        let (net, mut cars) = frozen_change(t);
+        let mut sim = Simulation::new(&net, vec![]);
+        sim.update_positions(&net, &mut cars);
+        let start = cars[0].pos;
+        let mut jump = 0.0f64;
+        let mut prev = start;
+        let mut settled_at: Option<f32> = None;
+        run(&net, &mut sim, &mut cars, 8.0, |time, _, cars| {
+            let me = cars.iter().find(|c| c.id == 1).unwrap();
+            jump = jump.max((me.pos - prev).truncate().length());
+            prev = me.pos;
+            if me.state.change.is_none() && settled_at.is_none() {
+                settled_at = Some(time);
+            }
+        });
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let at = settled_at.expect("the change was never settled");
+        assert!(at > 4.9 && at < 5.5, "settled at {at:.2} s");
+        assert_eq!(me.state.lane, if done { 1 } else { 0 }, "t {t}");
+        // where the body was: on lane 1 offset to the left, or on lane 0 offset to the right
+        let y = me.pos.y;
+        assert!((y - start.y).abs() < 0.05, "the body moved from y {:.2} to {:.2}", start.y, y);
+        assert!(jump < 0.05, "a jump of {jump:.2} m");
+        let lat = me.state.lateral;
+        let expect = if done { -(y + 3.5) as f32 } else { -y as f32 };
+        assert!((lat - expect).abs() < 0.05, "lateral {lat:.2}, expected {expect:.2}");
+        // the occupancy follows the body
+        sim.build_occupancy(&net, &cars);
+        let i = cars.iter().position(|c| c.id == 1).unwrap();
+        let occ = sim.occupancy.get(&me.state.lane).unwrap().iter().find(|o| o.vehicle == i).unwrap();
+        assert!((occ.lateral - expect).abs() < 0.05, "registered at lateral {:.2}", occ.lateral);
+        let other = if done { 0 } else { 1 };
+        assert!(sim.occupancy.get(&other).map(|v| v.iter().all(|o| o.vehicle != i)).unwrap_or(true));
+    }
+}
+
+#[test]
+fn x3_a_frozen_change_is_not_done_into_a_car_standing_beside_it() {
+    // lanes 4.5 m apart; the change 55 % across, a car standing in the target lane level with
+    // it (viz case06: done in place, the two stood side by side in one lane and touched as the
+    // offset eased off): given up instead, back on its own lane
+    let mut net = Network::default();
+    let a = road(&[(0.0, 0.0), (300.0, 0.0)], 1);
+    let mut b = road(&[(0.0, -4.5), (300.0, -4.5)], 1);
+    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+    b.offset = 4.5;
+    net.lanes.push(a);
+    net.lanes.push(b);
+    let net = finish(net);
+    let mut me = car(1, 0, 100.0, 0.0);
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false });
+    let mut beside = car(2, 1, 97.0, 0.0);
+    beside.pull_out = 1000.0;
+    let mut ahead_target = car(3, 1, 105.5, 0.0);
+    ahead_target.pull_out = 1000.0;
+    let mut ahead_own = car(4, 0, 105.5, 0.0);
+    ahead_own.pull_out = 1000.0;
+    let mut cars = vec![me, beside, ahead_target, ahead_own];
+    let mut sim = Simulation::new(&net, vec![]);
+    let min_gap = run(&net, &mut sim, &mut cars, 7.0, |_, _, _| {});
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(me.state.change.is_none(), "never settled: {:?} still {:?} v {:.2} pos {:?} others {:?}", me.state.change, me.change_still, me.state.speed, me.pos, cars.iter().map(|c| (c.id, c.pos.x as i32, c.pos.y)).collect::<Vec<_>>());
+    assert_eq!(me.state.lane, 0, "done into the lane where a car stands beside it");
+    assert!(min_gap > 0.1, "bodies {min_gap:.2} m apart");
+}
+
+#[test]
+fn x3_mid_change_the_body_is_registered_where_it_is_on_both_lanes() {
+    let (net, mut cars) = frozen_change(0.5);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.update_positions(&net, &mut cars);
+    sim.build_occupancy(&net, &cars);
+    let y = cars[0].pos.y as f32;
+    let own = sim.occupancy[&0].iter().find(|o| o.vehicle == 0).unwrap();
+    let target = sim.occupancy[&1].iter().find(|o| o.vehicle == 0).unwrap();
+    assert!((own.lateral + y).abs() < 0.05 && (target.lateral + y + 3.5).abs() < 0.05, "{:.2} {:.2} at y {y:.2}", own.lateral, target.lateral);
+}
+
+#[test]
+fn x3_a_change_begun_at_the_tail_of_a_red_queue_does_not_stand_across_the_lines() {
+    // viz3 case09: queues stand at a red in both lanes; a car rolls up to the tail of its own
+    // lane's queue at 9 m/s, starts over to the other lane 14 m short of it and has to stop
+    // part-way behind that lane's queue
+    let net = two_lanes();
+    let mut cars = Vec::new();
+    for k in 0..4u64 {
+        let mut a = car(10 + k, 0, 200.0 - 6.5 * k as f32, 0.0);
+        a.pull_out = 1000.0;
+        cars.push(a);
+        let mut b = car(20 + k, 1, 196.0 - 6.5 * k as f32, 0.0);
+        b.pull_out = 1000.0;
+        cars.push(b);
+    }
+    let mut me = car(1, 0, 160.0, 9.0);
+    me.state.start_change(&net, 1, 2);
+    if let Some(c) = me.state.change.as_mut() {
+        c.wait = 0.0;
+    }
+    cars.push(me);
+    let mut sim = Simulation::new(&net, vec![]);
+    let (mut stood, mut diagonal_after) = (0.0f32, 0.0f32);
+    let min_gap = run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if me.state.speed < 0.1 {
+            stood += DT;
+            if stood > 6.0 && me.state.change.is_some() {
+                diagonal_after += DT;
+            }
+        } else {
+            stood = 0.0;
+        }
+    });
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(stood > 6.0, "it never came to stand ({stood:.1} s)");
+    assert_eq!(diagonal_after, 0.0, "still mid-change {diagonal_after:.1} s after 6 s standing");
+    assert!(me.state.change.is_none());
+    assert!(min_gap > 0.2, "bodies {min_gap:.2} m apart");
+}

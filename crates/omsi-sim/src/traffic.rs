@@ -3094,6 +3094,67 @@ impl AiState {
         Some((self.seq().point(net, self.s, 0.0), self.change_seq(c.to).point(net, c.s_to, 0.0)))
     }
 
+    /// During a lane change: how far it has got (the S-curve's share of the way across, 0..1)
+    /// and where the body is, as lateral offsets (m, + right) from its own lane and from the
+    /// lane it moves to, at the place along each the car is level with.
+    pub fn change_offsets(&self, net: &Network) -> Option<(f32, f32, f32)> {
+        let c = self.change?;
+        if c.to >= net.lanes.len() {
+            return None;
+        }
+        let (ps, hs) = self.seq().point(net, self.s, 0.0);
+        let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, 0.0);
+        let k = smooth01(c.t - c.wait * self.speed.max(2.0) / c.length);
+        let p = ps.lerp(pt, k as f64);
+        let off = |q: DVec3, h: f32| {
+            let hr = (h as f64).to_radians();
+            (p - q).truncate().dot(DVec2::new(hr.cos(), -hr.sin())) as f32
+        };
+        Some((k, off(ps, hs) + self.lateral, off(pt, ht) + self.lateral))
+    }
+
+    /// A lane change that stands frozen part-way (the car cannot move on, so neither does the
+    /// change, which goes by distance): settled where the body is, `done` in place (the car is
+    /// on the lane it moved to, offset by what was left of the move) or given up (back on its
+    /// own lane, offset by what it had moved). Either way the offset eases off over the S-curve
+    /// of a bay as the car drives on (`lateral_ramp`), so the body does not jump. (viz3 case09:
+    /// 13 cars that began a change at the tail of a red queue stood diagonally across the lines
+    /// for 40-95 s; case01 #4436 for 45 s.) Which: see the traffic's `settle_choice`.
+    pub fn settle_change(&mut self, net: &Network, done: bool) {
+        let Some(c) = self.change else { return };
+        let Some((_, from_own, from_target)) = self.change_offsets(net) else {
+            self.change = None;
+            self.change_plan.clear();
+            return;
+        };
+        let off = if done { from_target } else { from_own };
+        if done {
+            if self.route.get(self.route_index + 1) == Some(&c.to) {
+                self.route_index += 1;
+            }
+            let to_len = net.lanes[c.to].length();
+            self.lane = c.to;
+            self.s = c.s_to.min(to_len);
+            self.prev_lane = None;
+            let plan = std::mem::take(&mut self.change_plan);
+            self.planned_next = plan.first().copied();
+            self.ahead = plan.into_iter().skip(1).collect();
+            if self.route.is_empty() && self.planned_next.is_none() {
+                self.plan_next(net);
+            }
+            self.change_cooldown = 6.0;
+        } else {
+            self.change_plan.clear();
+            // (not straight into the same change again)
+            self.change_cooldown = 10.0;
+        }
+        self.change = None;
+        self.lateral_curve.clear();
+        self.lateral = off;
+        self.lateral_target = 0.0;
+        self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
+    }
+
     /// Pull out into `to` from behind a standing obstacle: a short, steep move.
     pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32) {
         self.start_change(net, to, dir);

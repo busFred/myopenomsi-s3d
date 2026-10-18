@@ -232,7 +232,16 @@ pub struct Vehicle {
     /// from these, so a keyframe restores it.
     #[serde(default)]
     pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    /// A lane change under way: (its progress when it last moved on, seconds since while
+    /// standing). Frozen for `FROZEN_CHANGE` it is settled where the body is
+    /// (`AiState::settle_change`).
+    #[serde(default)]
+    pub change_still: (f32, f32),
 }
+
+/// Seconds a lane change may stand without moving on before it is settled where the car is:
+/// done in place, or given up (`AiState::settle_change`).
+pub const FROZEN_CHANGE: f32 = 5.0;
 
 impl Vehicle {
     pub fn new(id: u64, class: VehicleClass, state: AiState, half_width: f32, seed: u64) -> Vehicle {
@@ -264,6 +273,7 @@ impl Vehicle {
             passed_on_go: None,
             amber_line: None,
             zip_won: None,
+            change_still: (0.0, 0.0),
         }
     }
 
@@ -458,7 +468,9 @@ impl Simulation {
                 continue;
             }
             self.vehicle_grid.entry(cell(v.pos)).or_default().push(i);
-            self.occupancy.entry(st.lane).or_default().push(Occupant { vehicle: i, s: st.s, lateral: st.lateral, foreign: false });
+            // (a car changing lanes is on both, where its body is from each)
+            let offsets = st.change_offsets(net);
+            self.occupancy.entry(st.lane).or_default().push(Occupant { vehicle: i, s: st.s, lateral: offsets.map(|o| o.1).unwrap_or(st.lateral), foreign: false });
             if let Some(p) = st.prev_lane {
                 if st.s < st.rear + 1.0 && st.change.is_none() {
                     if let Some(pl) = net.lanes.get(p) {
@@ -467,7 +479,7 @@ impl Simulation {
                 }
             }
             if let Some(c) = st.change {
-                self.occupancy.entry(c.to).or_default().push(Occupant { vehicle: i, s: c.s_to, lateral: 0.0, foreign: false });
+                self.occupancy.entry(c.to).or_default().push(Occupant { vehicle: i, s: c.s_to, lateral: offsets.map(|o| o.2).unwrap_or(0.0), foreign: false });
             }
             if let Some(p) = v.passing {
                 if let (Some(opp), true) = (p.lane, st.lateral.abs() > 1.2) {
@@ -964,6 +976,7 @@ impl Simulation {
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
+        let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
         let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
@@ -1037,6 +1050,21 @@ impl Simulation {
             }
         }
         let alive = v.state.drive(net, dt, plan.lead, plan.stop);
+        // a lane change that stands frozen part-way is settled where the body is
+        match v.state.change {
+            Some(c) => {
+                if v.state.speed >= 0.3 || (c.t - v.change_still.0).abs() > 0.01 {
+                    v.change_still = (c.t, 0.0);
+                } else {
+                    v.change_still.1 += dt;
+                    if let (true, Some(done)) = (v.change_still.1 > FROZEN_CHANGE, settle) {
+                        v.state.settle_change(net, done);
+                        v.change_still = (0.0, 0.0);
+                    }
+                }
+            }
+            None => v.change_still = (0.0, 0.0),
+        }
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
         v.pull_out = (v.pull_out - dt).max(0.0);
@@ -1105,6 +1133,34 @@ impl Simulation {
         }
         if !alive {
             self.removed.push(i);
+        }
+    }
+
+    /// How a frozen lane change of vehicle `i` is settled (`AiState::settle_change`): done in
+    /// place with the body more than half over the lane it moves to, else given up - on the lane
+    /// where its body, at that lane's middle, would come within 0.2 m of nobody; the other if
+    /// that one is taken (the change froze because a car stood beside it in the lane it went
+    /// for: done in place, the two stood side by side in one lane and touched as the offset
+    /// eased off, viz case06); neither: it stays as it is for now. True: done.
+    fn settle_choice(&self, net: &Network, vehicles: &[Vehicle], i: usize) -> Option<bool> {
+        let v = &vehicles[i];
+        let (k, _, _) = v.state.change_offsets(net)?;
+        let (own, target) = v.state.change_anchors(net)?;
+        let near = self.vehicles_near(v.pos, 25.0);
+        // (its body at that lane's middle, along it)
+        let free = |(p, h): (DVec3, f32)| {
+            let b = Obb::vehicle(p.truncate(), h as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+            near.iter().filter(|&&j| j != i).all(|&j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || vehicles[j].obb().separation(&b) > 0.2)
+                && self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || p.obb(0.0, 0.0).separation(&b) > 0.2)
+        };
+        let first = k > 0.5;
+        let place = |done: bool| if done { target } else { own };
+        if free(place(first)) {
+            Some(first)
+        } else if free(place(!first)) {
+            Some(!first)
+        } else {
+            None
         }
     }
 
