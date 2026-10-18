@@ -1578,6 +1578,11 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
     let mut last_core: Option<usize> = None;
     // (the short pieces since the last piece proper, in metres: a median)
     let mut pending = 0.0f32;
+    // [ROLLBACK r4c-L2] the light of the crossing so far: a piece with another (the second
+    // street beyond an island, a median with its own light) is another crossing, decided at
+    // its own kerb (merged, the second street was walked on its red)
+    let piece_light = |l: usize| net.lanes[l].traffic_light.or_else(|| lights.and_then(|t| t.crossing_light(l)));
+    let mut group: Option<(usize, usize)> = None;
     let mut k = start;
     while k < start + 64 {
         if k >= walk.legs.len() {
@@ -1589,6 +1594,12 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
             walk.legs.push(n);
         }
         let leg = walk.legs[k];
+        if let Some(g) = piece_light(leg.lane) {
+            if group.map(|h| h != g).unwrap_or(false) {
+                break;
+            }
+            group = Some(g);
+        }
         if core_piece(ped, net, lights, leg.lane) {
             last_core = Some(k);
             pending = 0.0;
@@ -1603,10 +1614,7 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
     walk.legs.truncate(planned.max(last_core.map(|e| e + 1).unwrap_or(0)));
     let end = last_core?;
     let pieces = &walk.legs[start..=end];
-    let light = pieces
-        .iter()
-        .find_map(|l| net.lanes[l.lane].traffic_light)
-        .or_else(|| lights.and_then(|t| pieces.iter().find_map(|l| t.crossing_light(l.lane))));
+    let light = group;
     Some(Cross {
         from: start,
         to: end,
@@ -2098,7 +2106,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                                     return Want::stand(None, Activity::Stand);
                                 }
                                 me.on_crossing = false;
-                                return wait_at_kerb(at, me, walk, &leg, &next);
+                                return wait_at_kerb(ped.as_deref_mut(), at, me, walk, &leg, &next);
                             }
                         }
                     }
@@ -2239,7 +2247,7 @@ const HURRIES_ON: &str = "caught by the change: on across";
 
 /// Waiting at the kerb before `next`: facing the way across, spread along it and a step back,
 /// [ROLLBACK r4c-P3] off the carriageway (see `kerb_spot`).
-fn wait_at_kerb(at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
+fn wait_at_kerb(mut ped: Option<&mut PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
     let net = at.net;
     let (_, h) = next.at(net, 0.3);
     let id = me.id;
@@ -2252,6 +2260,11 @@ fn wait_at_kerb(at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg
             let mut way: Vec<Leg> = Vec::new();
             for k in (0..=walk.leg.min(walk.legs.len().saturating_sub(1))).rev() {
                 let l = walk.legs[k];
+                // [ROLLBACK r4c-L2] (never back onto a crossing just walked: at an island between
+                // two lights the spot was backed across the first street)
+                if ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, l.lane)).unwrap_or(false) {
+                    break;
+                }
                 if let Some(after) = way.last() {
                     let joins = (l.at(net, l.len()).0 - after.at(net, 0.0).0).truncate().length() < 1.2;
                     let on_cross = walk.cross.map(|c| c.on(k)).unwrap_or(false) || net.lanes[l.lane].traffic_light.is_some();
@@ -8386,6 +8399,8 @@ mod ped_tests {
         /// The pieces of a crossing object's crossing (lit by light (0, 0) unless `unlit`).
         pub pieces: Vec<usize>,
         pub unlit: bool,
+        /// The state of light (0, 1), a second group.
+        pub second: Cell<i32>,
     }
 
     pub(super) const GREEN: i32 = 6;
@@ -8393,13 +8408,13 @@ mod ped_tests {
 
     impl FakeLights {
         pub fn new(state: i32, left: f32) -> FakeLights {
-            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false }
+            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false, second: Cell::new(state) }
         }
     }
 
     impl PedLights for FakeLights {
-        fn light_state(&self, _c: usize, _li: usize) -> Option<(i32, f32)> {
-            Some((self.state.get(), self.left.get()))
+        fn light_state(&self, _c: usize, li: usize) -> Option<(i32, f32)> {
+            Some((if li == 1 { self.second.get() } else { self.state.get() }, self.left.get()))
         }
         fn light_until_go(&self, _c: usize, _li: usize) -> Option<f32> {
             Some(if omsi_sim::traffic::TrafficLightController::allows_go(self.state.get()) { 0.0 } else { 20.0 })
@@ -8588,6 +8603,59 @@ mod ped_tests {
         assert!(went.unwrap() < 0.5);
         let (went, _, _) = unlit_with_car(moving(10.0));
         assert!(went.unwrap() < 0.5);
+    }
+
+    #[test]
+    fn l2_two_light_groups_beyond_an_island_are_two_crossings() {
+        // the street of `crossing`, a 6 m island (y 3.5..9.5, its piece 4 m), and a second
+        // street (lanes at y 11.75 and 15.75) whose crossing has a light of its own, (0, 1)
+        let (mut net, _) = crossing(true);
+        net.lanes.truncate(6);
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(vec![p(0.0, 4.0), p(0.0, 8.0)], LaneKind::Sidewalk, 2.5)); // 6 island
+        net.lanes.push(lane(vec![p(0.0, 8.0), p(0.0, 9.5)], LaneKind::Sidewalk, 2.5)); // 7 stub
+        net.lanes.push(lane(vec![p(0.0, 9.5), p(0.0, 13.75)], LaneKind::Sidewalk, 2.5)); // 8
+        net.lanes.push(lane(vec![p(0.0, 13.75), p(0.0, 18.0)], LaneKind::Sidewalk, 2.5)); // 9
+        net.lanes.push(lane(vec![p(0.0, 18.0), p(20.0, 18.0)], LaneKind::Sidewalk, 2.5)); // 10
+        net.lanes.push(lane(street(11.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(15.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes[7].traffic_light = Some((0, 1));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        lights.second.set(RED);
+        let legs = vec![
+            Leg { lane: 2, a: 10.0, b: 20.0 },
+            Leg { lane: 3, a: 0.0, b: 1.5 },
+            Leg { lane: 4, a: 0.0, b: 4.0 },
+            Leg { lane: 5, a: 0.0, b: 4.0 },
+            Leg { lane: 6, a: 0.0, b: 4.0 },
+            Leg { lane: 7, a: 0.0, b: 1.5 },
+            Leg { lane: 8, a: 0.0, b: 4.25 },
+            Leg { lane: 9, a: 0.0, b: 4.25 },
+            Leg { lane: 10, a: 0.0, b: 20.0 },
+        ];
+        let mut walk = PedWalk::new(legs.clone(), false, 0.0);
+        let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 1).unwrap();
+        assert_eq!((c.to, c.light), (3, Some((0, 0))), "the first street only");
+        let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 4).unwrap();
+        assert_eq!((c.from, c.to, c.light), (4, 7, Some((0, 1))), "the island and the second street");
+        // walked: across the first on its green, then at the island for the second's red
+        let mut walk = PedWalk::new(legs, false, 0.0);
+        let mut m = me(2, DVec2::new(-10.0, -5.5), 1.2);
+        let mut on_second = false;
+        for k in 0..800 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            on_second |= m.pos.y > 10.0;
+        }
+        assert!(!on_second, "walked onto the second street on its red");
+        assert!(m.pos.y > 3.5 && m.pos.y < 9.5, "waits on the island: {:?} ({:?})", m.pos, m.decision);
+        assert_eq!(m.decision, Some("red light"));
+        lights.second.set(GREEN);
+        for k in 800..1400 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert!(m.pos.y > 17.5, "across on its green: {:?}", m.pos);
     }
 
     #[test]
