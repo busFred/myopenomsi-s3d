@@ -9,6 +9,8 @@
 //! traffic_cases ab <fixture>... [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases stubs <fixture>... [--all]
 //! traffic_cases converge <fixture>... [--all]
+//! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset]
+//! traffic_cases foes <fixture> <lane>...
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
 //! traffic_cases compare <dir> [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
@@ -72,6 +74,8 @@ fn main() {
         Some("ab") if args.len() >= 3 => ab(&args[2..]),
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
+        Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
+        Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
@@ -4417,7 +4421,20 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                                 ex.phantom_s += 1;
                                 if phantom_ids.insert(v.id) {
                                     ex.phantom_vehicles += 1;
-                                    ex.events.push(format!("PHANTOM {} t={t:.1} #{} lane {} follows #{} lane {} gap {:.1}", sc.name, v.id, st.lane, oid, o.state.lane, l.gap));
+                                    // (where its middle lies from my way: the nearest sample)
+                                    let mut near_d = (0.0f32, f64::INFINITY, 0.0f64);
+                                    let mut d = 0.0f32;
+                                    while d <= upto + 10.0 {
+                                        let p0 = st.way_point(net, d).truncate();
+                                        let p1 = st.way_point(net, d + 0.5).truncate();
+                                        let f = (p1 - p0).normalize_or_zero();
+                                        let q = ob.center - p0;
+                                        if q.length() < near_d.1 {
+                                            near_d = (d, q.length(), q.dot(glam::DVec2::new(f.y, -f.x)));
+                                        }
+                                        d += 0.5;
+                                    }
+                                    ex.events.push(format!("PHANTOM {} t={t:.1} #{} lane {} follows #{} lane {} gap {:.1} seen {:?} (its middle {:.1} m from my way at {:.1} m, across {:+.1}; it changes {:?}, passes {})", sc.name, v.id, st.lane, oid, o.state.lane, l.gap, v.last.lead_seen, near_d.1, near_d.0, near_d.2, o.state.change.map(|c| (c.to, c.t)), o.passing.is_some()));
                                 }
                             }
                         }
@@ -4992,11 +5009,13 @@ fn converge(args: &[String]) -> Res<()> {
                     lines.push((
                         least as f32,
                         format!(
-                            "{a}/{b} object {}:{}:{}: within {near} m along {a} s {s0:.1}-{s1:.1} ({:.1} m), least {least:.2} m; starts {starts:.2} m apart, ends {ends:.2} m{}; next {:?} / {:?}{tag}",
+                            "{a}/{b} object {}:{}:{}: within {near} m along {a} s {s0:.1}-{s1:.1} ({:.1} m), least {least:.2} m; widths {:.1}/{:.1}; starts {starts:.2} m apart, ends {ends:.2} m{}; next {:?} / {:?}{tag}",
                             key.0 .0,
                             key.0 .1,
                             key.1,
                             s1 - s0,
+                            la.width,
+                            lb.width,
                             if common { ", a common next lane" } else { "" },
                             la.next,
                             lb.next
@@ -5022,5 +5041,104 @@ fn converge(args: &[String]) -> Res<()> {
         total += lines.len();
     }
     println!("TOTAL {total}");
+    Ok(())
+}
+
+/// `watch <fixture> --ids a,b [--from t] [--to t] [--every 0.5] [--reset]`: the free run (or
+/// with `--reset` the reset-at-keyframes replay) of a fixture, printing the named vehicles'
+/// state every `--every` seconds between the times (the replay's clock): lane, place, speed,
+/// lateral offset, lane change, pass, the decision, the indicator, and the least distance between
+/// the boxes of each pair of them.
+fn watch(fixture: &Path, args: &[String]) -> Res<()> {
+    let ids: Vec<u64> = opt(args, "--ids").unwrap_or("").split(',').filter_map(|x| x.trim().trim_start_matches('#').parse().ok()).collect();
+    let from: f64 = opt(args, "--from").map(|s| s.parse()).transpose()?.unwrap_or(f64::NEG_INFINITY);
+    let to: f64 = opt(args, "--to").map(|s| s.parse()).transpose()?.unwrap_or(f64::INFINITY);
+    let every: f64 = opt(args, "--every").map(|s| s.parse()).transpose()?.unwrap_or(0.5);
+    let mut r = Replay::load(fixture)?;
+    r.free_run = !args.iter().any(|a| a == "--reset");
+    if !r.at(0) {
+        return Err("the fixture has no keyframe".into());
+    }
+    let mut next = from.max(r.sim.time);
+    while r.step() {
+        let t = r.sim.time;
+        if t > to {
+            break;
+        }
+        if t + 1e-6 < next {
+            continue;
+        }
+        while next <= t + 1e-6 {
+            next += every;
+        }
+        r.sim.update_positions(&r.net, &mut r.vehicles);
+        let found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        for &i in &found {
+            let v = &r.vehicles[i];
+            let st = &v.state;
+            let d = &v.last;
+            println!(
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1}",
+                v.id,
+                st.lane,
+                st.s,
+                st.speed,
+                st.lateral,
+                v.pos.x,
+                v.pos.y,
+                v.heading,
+                st.change.map(|c| (c.to, (c.t * 1000.0).round() / 1000.0, c.wait, c.bypass)),
+                v.passing.map(|p| (p.lane, p.side, p.block - st.odometer, p.until - st.odometer, p.aborted)),
+                why_name(d.why),
+                d.stop.map(|x| x - st.front),
+                d.lead.map(|l| ((l.gap * 100.0).round() / 100.0, (l.speed * 10.0).round() / 10.0)),
+                d.lead_id,
+                d.wait_for,
+                d.hold,
+                d.body_block,
+                v.blinker_shown,
+                v.stopped
+            );
+        }
+        for &i in &found {
+            if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {
+                println!(
+                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} -> go {} wait_for {:?} hold {:?} at {:?}",
+                    r.vehicles[i].id, c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked, c.stuck, c.held, c.clearing, c.exit_room, g.go, g.wait_for.and_then(|w| r.vehicles.get(w)).map(|o| o.id), g.hold, g.at
+                );
+            }
+        }
+        for (x, &a) in found.iter().enumerate() {
+            for &b in &found[x + 1..] {
+                let sep = r.vehicles[a].obb().separation(&r.vehicles[b].obb());
+                println!("t={t:.1}   #{}/#{} boxes {sep:.2} m apart", r.vehicles[a].id, r.vehicles[b].id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `foes <fixture> <lane>...`: the foes of each lane's movement on the network the replay runs
+/// (the other lane, the kind, who yields, the stretches), and whether the meeting place is
+/// one of two converging lanes (`Network::add_converging`).
+fn foes(fixture: &Path, args: &[String]) -> Res<()> {
+    let (r, _) = grown(fixture, true)?;
+    let js = &r.sim.junctions;
+    for a in args {
+        let Ok(l) = a.parse::<usize>() else { continue };
+        let Some(&(j, m)) = js.of_lane.get(&l) else {
+            println!("lane {l}: no junction movement (entries {:?})", js.entries.get(&l));
+            continue;
+        };
+        let mv = &js.nodes[j].movements[m];
+        let ln = &r.net.lanes[l];
+        println!("lane {l} j{j} m{m} len {:.1} turn {} light {:?} next {:?} continues {:?} converge {:?}", ln.length(), ln.turn, mv.light, ln.next, mv.continues.iter().map(|&c| js.nodes[j].movements[c].lane).collect::<Vec<_>>(), mv.converge);
+        for f in &mv.foes {
+            let ol = js.nodes[j].movements[f.movement].lane;
+            let conv = omsi_sim::traffic::converging_stretch(ln, &r.net.lanes[ol]).is_some() && f.kind == omsi_traffic::FoeKind::Merge && (ln.end() - r.net.lanes[ol].end()).truncate().length() >= 1.5;
+            let back = js.nodes[j].movements[f.movement].foes.iter().find(|g| g.movement == m).map(|g| g.yields);
+            println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" });
+        }
+    }
     Ok(())
 }

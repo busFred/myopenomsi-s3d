@@ -35,6 +35,9 @@ pub struct Foe {
     pub theirs: (f32, f32),
     /// I give way to this foe (by `[rule] priority`, right before left, a train first).
     pub yields: bool,
+    /// A merge of two lanes running side by side, not a joint (`Crossing::side`).
+    #[serde(default)]
+    pub side: bool,
 }
 
 /// One way through a junction: one of its lanes.
@@ -267,7 +270,7 @@ impl Junctions {
                 };
                 let mine = ((c.at - c.before).max(0.0), (c.at + c.after).min(net.lanes[lane].length()));
                 let theirs = ((c.other_at - c.other_before).max(0.0), (c.other_at + c.other_after).min(net.lanes[c.other].length()));
-                foes.push(Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other) });
+                foes.push(Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other), side: c.side });
             }
             // (a movement that continues into another inner piece is in the way of
             // everything that piece is in the way of, as far as the queue behind the stop
@@ -325,7 +328,7 @@ impl Junctions {
         let mut out = Vec::new();
         for &(m, off) in chain {
             for f in &node.movements[m].foes {
-                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields }));
+                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields, side: f.side }));
             }
         }
         out.sort_by(|a, b| a.1.mine.0.total_cmp(&b.1.mine.0));

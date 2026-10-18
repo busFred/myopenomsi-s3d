@@ -486,6 +486,11 @@ pub struct Crossing {
     pub after: f32,
     pub other_before: f32,
     pub other_after: f32,
+    /// A merge of two lanes running side by side closer than a car is wide, that neither
+    /// cross nor run into one another (`Network::add_converging`): the stretch is where they
+    /// run together, not a joint.
+    #[serde(default)]
+    pub side: bool,
 }
 
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
@@ -507,6 +512,52 @@ fn meeting_extent(a: &Lane, at: f32, b: &Lane) -> (f32, f32) {
         after += 0.5;
     }
     (before, after)
+}
+
+/// Two lanes of one object that neither cross nor run into one another but whose centre lines
+/// come this close (m) over a stretch meet there: two cars on them touch (`converging_stretch`).
+/// (Lanes of a two-lane road lie 2.3-2.6 m apart: they stay apart.)
+pub const CONVERGE_DIST: f64 = MEET_DIST - 0.6;
+/// ... or whose edges overlap by this much (m), given the two lanes' widths ...
+pub const CONVERGE_EDGE: f64 = 0.3;
+/// ... running the same way there (degrees between their headings at most).
+pub const CONVERGE_HEADING: f32 = 60.0;
+
+/// Where lanes `a` and `b` run side by side closer than `MEET_DIST`: the stretch along `a`
+/// (from, to), the one along `b`, and the least distance between the centre lines - when they
+/// come within `CONVERGE_DIST`, or their edges overlap by `CONVERGE_EDGE`, somewhere on it.
+/// Sampled every half metre of each lane. (Two lanes of one crossing object that run together
+/// before they part, or converge without ending in one place: case07's 5229/5231, 3769/3770,
+/// 1430/1179; the network compiled no meeting place for them and cars met side by side.)
+pub fn converging_stretch(a: &Lane, b: &Lane) -> Option<((f32, f32), (f32, f32), f64)> {
+    if a.points.len() < 2 || b.points.len() < 2 {
+        return None;
+    }
+    let stretch = |x: &Lane, y: &Lane| -> Option<(f32, f32, f64)> {
+        let (mut s0, mut s1, mut least) = (f32::INFINITY, f32::NEG_INFINITY, f64::INFINITY);
+        let len = x.length();
+        let mut s = 0.0f32;
+        loop {
+            let at = s.min(len);
+            if let Some((_, d)) = y.nearest_point(x.at(at).0) {
+                least = least.min(d);
+                if d < MEET_DIST {
+                    s0 = s0.min(at);
+                    s1 = s1.max(at);
+                }
+            }
+            if at >= len {
+                break;
+            }
+            s += 0.5;
+        }
+        s0.is_finite().then_some((s0, s1, least))
+    };
+    let (a0, a1, least_a) = stretch(a, b)?;
+    let (b0, b1, least_b) = stretch(b, a)?;
+    let least = least_a.min(least_b);
+    let edges = (a.width as f64 + b.width as f64) * 0.5 - least;
+    (least < CONVERGE_DIST || edges >= CONVERGE_EDGE).then_some(((a0, a1), (b0, b1), least))
 }
 
 /// Where two polylines cross: the distance along each (ends excluded).
@@ -765,8 +816,8 @@ impl Network {
                         let (la, lb) = (a.length(), b.length());
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5 });
-                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5 });
+                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false });
+                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false });
                         n += 1;
                         continue;
                     }
@@ -776,8 +827,10 @@ impl Network {
                         let (bb, ba) = if merge { (meeting_extent(b, sb, a).0, 0.5) } else { meeting_extent(b, sb, a) };
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba });
-                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa });
+                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false });
+                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false });
+                        n += 1;
+                    } else if self.add_converging(i, j) {
                         n += 1;
                     }
                 }
@@ -1200,6 +1253,89 @@ impl Network {
             return !self.fed_past(i, j);
         }
         self.leads_into(j, i) && !self.fed_past(j, i)
+    }
+
+    /// Compile the meeting place of two lanes `i` and `j` of one crossing object that neither
+    /// cross nor run into one another but run side by side closer than a car is wide
+    /// (`converging_stretch`): a merge-kind meeting place over the stretch, as far as its end
+    /// (where they part, or where they end together), the right of way read as for any merge
+    /// (`must_yield`; neither yields: a zipper). Not between pieces of one way
+    /// (`one_way_pieces`, nor one leading into the other within three links), nor two
+    /// branches forking from one point (starts within half a metre), nor two lanes of one path
+    /// or that have a meeting place already. True when one was added.
+    pub fn add_converging(&mut self, i: usize, j: usize) -> bool {
+        let (Some(a), Some(b)) = (self.lanes.get(i), self.lanes.get(j)) else { return false };
+        if i == j || a.points.len() < 2 || b.points.len() < 2 || a.kind != LaneKind::Street || b.kind != LaneKind::Street {
+            return false;
+        }
+        if a.key.map(|k| k.path) == b.key.map(|k| k.path) || self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
+            return false;
+        }
+        if (a.start() - b.start()).truncate().length() <= 0.5 || self.one_way_pieces(i, j) || self.links_within(i, j, 3) || self.links_within(j, i, 3) {
+            return false;
+        }
+        // (lanes whose boxes lie further apart than that never come so close)
+        let bbox = |l: &Lane| l.points.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)));
+        let (ba, bb) = (bbox(a), bbox(b));
+        if ba.0 > bb.2 + MEET_DIST || bb.0 > ba.2 + MEET_DIST || ba.1 > bb.3 + MEET_DIST || bb.1 > ba.3 + MEET_DIST {
+            return false;
+        }
+        let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { return false };
+        // (side by side the same way: two lanes of opposite directions close together are a
+        // narrow road, not two ways running into one)
+        if wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > CONVERGE_HEADING {
+            return false;
+        }
+        let (la, lb) = (a.length(), b.length());
+        let (aa, ba) = ((la - a1).min(0.5), (lb - b1).min(0.5));
+        self.conflicts[i].push(j);
+        self.conflicts[j].push(i);
+        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true });
+        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true });
+        true
+    }
+
+    /// Lane `from` reaches `to` over at most `n` links.
+    fn links_within(&self, from: usize, to: usize, n: usize) -> bool {
+        let mut at = vec![from];
+        for _ in 0..n {
+            at = at.iter().flat_map(|&l| self.lanes[l].next.iter().copied()).collect();
+            if at.contains(&to) {
+                return true;
+            }
+            if at.is_empty() {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// The converging lanes of every crossing object (`add_converging`) on a network whose
+    /// meeting places were derived before them (a recording's header): the pairs with no
+    /// meeting place yet. Returns how many were added.
+    pub fn compile_converging(&mut self) -> usize {
+        self.conflicts.resize(self.lanes.len(), Vec::new());
+        self.crossings.resize(self.lanes.len(), Vec::new());
+        let mut by_object: std::collections::BTreeMap<((i32, i32), i64), Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, l) in self.lanes.iter().enumerate() {
+            if l.source != 2 || l.kind != LaneKind::Street {
+                continue;
+            }
+            if let Some(k) = l.key {
+                by_object.entry((k.tile, k.id)).or_default().push(i);
+            }
+        }
+        let mut n = 0;
+        for lanes in by_object.values() {
+            for (x, &i) in lanes.iter().enumerate() {
+                for &j in &lanes[x + 1..] {
+                    if self.add_converging(i, j) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -2067,8 +2203,8 @@ mod stub_links_tests {
         }
         for (i, j) in [(0, 1), (3, 5)] {
             let (li, lj) = (net.lanes[i].length(), net.lanes[j].length());
-            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0 });
-            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0 });
+            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false });
+            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false });
             net.conflicts[i].push(j);
             net.conflicts[j].push(i);
         }

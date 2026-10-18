@@ -345,6 +345,8 @@ pub struct Simulation {
     /// What the junction grants read besides the claims: the pairs of lights that are
     /// never green together, filled in as claimants meet.
     pub signal_groups: reservation::Context,
+    /// This frame's claims and their grants (diagnostics: `traffic_cases watch`).
+    pub claims: Vec<(Claim, Grant)>,
 }
 
 impl Simulation {
@@ -368,6 +370,7 @@ impl Simulation {
             removed: Vec::new(),
             held_at_red: 0,
             signal_groups: reservation::Context::default(),
+            claims: Vec::new(),
         }
     }
 
@@ -695,7 +698,11 @@ impl Simulation {
                 // (clearing the box: the light it passed holds it no more,
                 // `JunctionView::clears_past`)
                 Some(sig) if j.clears_past(&sig, st.front) => (false, None),
-                Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // (or, clearing the box, a later line of the way through: it holds the car as any,
+                // `JunctionView::clears_past`, and the car standing there is held by it, not
+                // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
+                // committed to the cars waiting for it)
+                Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
                     // that took the line on green or yellow and is close to it (queued
@@ -750,7 +757,7 @@ impl Simulation {
                 // (people or a zebra in front of it, or a lead that stands too: nothing that
                 // lets it go on a schedule, as a light or a lead moving off does)
                 // in the box when its light turned: it clears it (rule F)
-                clearing: j.clearing,
+                clearing: j.clearing && !light_red,
                 stuck: st.speed < 0.3
                     && v.last.held
                     && match v.last.why {
@@ -845,7 +852,9 @@ impl Simulation {
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
-            let line_limit = -s_on + cs + 1.0;
+            // (not a stretch it runs side by side with another lane before its light, `Foe::side`)
+            let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
             let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
@@ -931,6 +940,7 @@ impl Simulation {
         }
         self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
         // and the next tie there is the other side's
         for (g, c) in grants.iter().zip(&claims) {
