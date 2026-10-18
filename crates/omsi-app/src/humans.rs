@@ -2119,19 +2119,102 @@ fn late_stepper(id: u32, key: usize) -> bool {
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
 const HURRIES_ON: &str = "caught by the change: on across";
 
-/// Waiting at the kerb before `next`: facing the way across, spread along it and a step back.
-fn wait_at_kerb(at: &Around, me: &Me, walk: &mut PedWalk, leg: &Leg, next: &Leg) -> Want {
+/// Waiting at the kerb before `next`: facing the way across, spread along it and a step back,
+/// [ROLLBACK r4c-P3] off the carriageway (see `kerb_spot`).
+fn wait_at_kerb(at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
     let net = at.net;
-    let (end, _) = leg.at(net, leg.len());
     let (_, h) = next.at(net, 0.3);
-    let hr = h.to_radians();
-    let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
     let id = me.id;
     let spread = ((id % 5) as f64 - 2.0) * 0.45;
     let back = 0.25 + (id % 3) as f64 * 0.45;
-    let spot = end.truncate() + right * spread - fwd * back;
-    let _ = walk;
+    let spot = match walk.spot {
+        Some((l, n, q)) if l == walk.leg && n == next.lane => q,
+        _ => {
+            // the legs walked up to the kerb, the current one first, as long as they join
+            let mut way: Vec<Leg> = Vec::new();
+            for k in (0..=walk.leg.min(walk.legs.len().saturating_sub(1))).rev() {
+                let l = walk.legs[k];
+                if let Some(after) = way.last() {
+                    let joins = (l.at(net, l.len()).0 - after.at(net, 0.0).0).truncate().length() < 1.2;
+                    let on_cross = walk.cross.map(|c| c.on(k)).unwrap_or(false) || net.lanes[l.lane].traffic_light.is_some();
+                    if !joins || on_cross || way.iter().map(|w| w.len()).sum::<f32>() > 12.0 {
+                        break;
+                    }
+                }
+                way.push(l);
+            }
+            let q = kerb_spot(net, &way, next, spread, back);
+            walk.spot = Some((walk.leg, next.lane, q));
+            q
+        }
+    };
     Want { vel: arrive(me.pos, spot, me.pace * 0.6), face: Some(h), give: 0.5, corridor: None, idle: Activity::Stand }
+}
+
+/// [ROLLBACK r4c-P3] How far beyond half a carriageway lane's width from its axis somebody
+/// waiting at the kerb keeps (m).
+const KERB_CLEAR: f64 = 0.3;
+
+/// [ROLLBACK r4c-P3] The width a carriageway lane is taken to have at least (m): the pieces
+/// inside junctions say 1 m, and a bus is 2.5 m wide.
+const LANE_MIN_WIDTH: f64 = 2.5;
+
+/// [ROLLBACK r4c-P3] Whether `q` lies inside the footprint of a carriageway lane: within half
+/// its width and `KERB_CLEAR` of its axis.
+fn on_carriageway(net: &Network, q: DVec3) -> bool {
+    let (cx, cy) = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
+    let mut seen: Vec<usize> = Vec::new();
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for &i in net.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let l = &net.lanes[i];
+                if l.kind != LaneKind::Street || seen.contains(&i) {
+                    continue;
+                }
+                seen.push(i);
+                let reach = (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + KERB_CLEAR;
+                if l.nearest_point(q).map(|(_, d)| d < reach).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// [ROLLBACK r4c-P3] Where somebody waits before stepping onto `next` at the end of `way` (the
+/// legs walked up to the kerb, the last first): a step back from the kerb and spread along
+/// it, outside every carriageway lane's footprint. A kerb inside one (a short piece at the
+/// kerb that lies in the lane: people waited 0.4 m in front of a bumper) is backed away from
+/// along the legs walked until the spot is outside.
+fn kerb_spot(net: &Network, way: &[Leg], next: &Leg, spread: f64, back: f64) -> DVec2 {
+    let (start, _) = next.at(net, 0.0);
+    let (_, h) = next.at(net, 0.3);
+    let hr = h.to_radians();
+    let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
+    let end = way.first().map(|l| l.at(net, l.len()).0).unwrap_or(start);
+    let first = end + (right * spread - fwd * back).extend(0.0);
+    if !on_carriageway(net, first) {
+        return first.truncate();
+    }
+    let mut last = end;
+    let mut d = 0.25f32;
+    for l in way {
+        let len = l.len();
+        while d <= len {
+            let (q, _) = l.at(net, len - d);
+            last = q;
+            for k in [0.5, 0.0] {
+                let c = q + (right * spread * k).extend(0.0);
+                if !on_carriageway(net, c) {
+                    return c.truncate();
+                }
+            }
+            d += 0.25;
+        }
+        d -= len;
+    }
+    last.truncate()
 }
 
 /// May a pedestrian at the kerb start across crossing `c` (from `walk.legs[c.from]` on)? A
@@ -8212,6 +8295,54 @@ mod ped_tests {
         let c = crossing_span(&mut ped, &net, None, &mut roam, 1).unwrap();
         assert_eq!(roam.legs.iter().map(|l| l.lane).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
         assert_eq!(c.to, 4);
+    }
+
+    #[test]
+    fn p3_they_wait_off_the_carriageway() {
+        // the kerb of `crossing` lies outside the lanes: the spot is the kerb's, a step back
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(RED, 30.0);
+        for id in 0..15u32 {
+            let mut walk = across();
+            let mut m = me(id, DVec2::new(-10.0, -5.5), 1.2);
+            for k in 0..400 {
+                frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            }
+            assert!(!on_carriageway(&net, m.pos.extend(0.0)), "#{id} at {:?}", m.pos);
+            assert!(m.pos.y < -5.0 && m.pos.y > -7.0, "#{id} at {:?}", m.pos);
+        }
+        assert!(on_carriageway(&net, DVec3::new(0.0, -3.6, 0.0)), "within the lane and 0.3 m");
+        assert!(!on_carriageway(&net, DVec3::new(0.0, -3.9, 0.0)));
+    }
+
+    #[test]
+    fn p3_a_kerb_inside_the_lane_is_backed_away_from() {
+        // a pavement piece that runs on into the lane's footprint (to y = -3.2, the lane's
+        // edge at -3.5, its footprint to -3.8) and the crossing from there
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(street(-1.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(1.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(vec![p(0.0, -12.0), p(0.0, -3.2)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, -3.2), p(0.0, 3.2)], LaneKind::Sidewalk, 2.5));
+        net.lanes[3].traffic_light = Some((0, 0));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(RED, 30.0);
+        for id in 0..6u32 {
+            let mut walk = PedWalk::new(vec![Leg { lane: 2, a: 0.0, b: 8.8 }, Leg { lane: 3, a: 0.0, b: 6.4 }], false, 0.0);
+            let mut m = me(id, DVec2::new(0.0, -12.0), 1.2);
+            for k in 0..400 {
+                frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            }
+            assert_eq!(m.decision, Some("red light"));
+            assert!(!on_carriageway(&net, m.pos.extend(0.0)), "#{id} at {:?}", m.pos);
+            // (no further back than needed)
+            assert!(m.pos.y > -5.0, "#{id} at {:?}", m.pos);
+        }
+        // the old spot, at the kerb a step back, was in the lane
+        let spot = kerb_spot(&net, &[Leg { lane: 2, a: 0.0, b: 8.8 }], &Leg { lane: 3, a: 0.0, b: 6.4 }, 0.0, 0.25);
+        assert!(spot.y < -3.8 && spot.y > -4.3, "{spot:?}");
     }
 
     /// At the kerb with the green on for `left` s more: what person `id` decides, and (walked
