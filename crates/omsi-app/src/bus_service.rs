@@ -118,6 +118,13 @@ pub struct BusService {
     /// [ROLLBACK r4d-B4] Held short of its stop by somebody in its way: it creeps up to the
     /// pole once they are clear rather than serving the stop where it stands.
     short_by_people: bool,
+    /// [ROLLBACK r4d-B5] How far past its stop point it pulls on for a bus behind it for the
+    /// same stop (kept until it is at the stop: a follower lost from view for a frame made the
+    /// bus 10 m past its point take the stop for missed), and, standing at the stop with the
+    /// doors shut, the odometer reading it pulls on to (once a stop).
+    pull: f32,
+    pull_to: Option<f32>,
+    pulled_here: bool,
 }
 
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
@@ -368,6 +375,14 @@ const EARLY_STOP_SHORT: f64 = 20.0;
 /// only after this long (s); before, it creeps up to the pole once they are clear.
 const PEOPLE_SERVE_MAX: f32 = 30.0;
 
+/// [ROLLBACK r4d-B5] The room on the bus's way past a point `from` metres ahead of its origin:
+/// up to the first junction after it (or the end of the way it knows), less 2 m.
+fn room_past(ctx: &Ctx, from: f32) -> f32 {
+    let junction = ctx.way.iter().filter(|&&(l, dl)| dl > from && !ctx.net.crossings.get(l).is_none_or(|c| c.is_empty())).map(|w| w.1).reduce(f32::min);
+    let end = ctx.way.last().map(|&(l, dl)| dl + ctx.net.lanes[l].length()).unwrap_or(from);
+    (junction.unwrap_or(end).min(end) - from - 2.0).max(0.0)
+}
+
 /// What the service needs of the world this frame.
 pub struct Ctx<'a> {
     pub net: &'a Network,
@@ -435,6 +450,9 @@ impl BusService {
             pace: 1.0,
             left_early: false,
             short_by_people: false,
+            pull: 0.0,
+            pull_to: None,
+            pulled_here: false,
         }
     }
 
@@ -502,6 +520,7 @@ impl BusService {
         self.near_d = f32::INFINITY;
         self.serve = None;
         self.short_by_people = false;
+        self.pull = 0.0;
         self.stops = stops.into();
         self.phase = Phase::Running;
         self.phase_t = 0.0;
@@ -544,6 +563,9 @@ impl BusService {
         self.away = None;
         self.this_layover = layover;
         self.short_by_people = false;
+        self.pull = 0.0;
+        self.pulled_here = false;
+        self.pull_to = None;
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
         // [ROLLBACK waitstop-136] it stands out its time where the timetable says so, on its
         // layover and (a train) at its stations; elsewhere it goes when the people are done
@@ -613,6 +635,7 @@ impl BusService {
         self.near_d = f32::INFINITY;
         self.serve = None;
         self.short_by_people = false;
+        self.pull = 0.0;
         let air = ctx.net.lanes[st.lane].kind == LaneKind::Air;
         if self.stops.is_empty() && !self.route_open && !air && self.away.is_none() {
             self.set_phase(Phase::TripDone);
@@ -725,6 +748,7 @@ impl BusService {
         self.near_d = f32::INFINITY;
         self.serve = None;
         self.short_by_people = false;
+        self.pull = 0.0;
         self.rerouted = true;
         self.set_phase(Phase::Running);
     }
@@ -809,7 +833,23 @@ impl BusService {
             Phase::TripDone => here,
             Phase::Waiting => {
                 self.wait(ctx);
-                here
+                // [ROLLBACK r4d-B5] doors shut, a bus behind it for this stop: it pulls on by
+                // its length (as far as the road before the next junction lets it) to leave
+                // the one behind the pole
+                if ctx.follower_close && !self.pulled_here && self.phase == Phase::Waiting && !ctx.passing {
+                    self.pulled_here = true;
+                    let pull = (st.front + st.rear).min(room_past(ctx, st.front));
+                    if pull >= 3.0 {
+                        self.pull_to = Some(st.odometer + pull);
+                    }
+                }
+                match self.pull_to {
+                    Some(to) if to - st.odometer > 0.3 && self.phase == Phase::Waiting => Some(st.front + (to - st.odometer)),
+                    _ => {
+                        self.pull_to = None;
+                        here
+                    }
+                }
             }
             Phase::Boarding => {
                 self.board(ctx);
@@ -868,6 +908,7 @@ impl BusService {
                 self.near_d = f32::INFINITY;
                 self.serve = None;
                 self.short_by_people = false;
+                self.pull = 0.0;
                 continue;
             }
             let d = st.route_distance(ctx.net, stop.ri, stop.s);
@@ -894,6 +935,7 @@ impl BusService {
                 self.near_d = f32::INFINITY;
                 self.serve = None;
                 self.short_by_people = false;
+                self.pull = 0.0;
                 crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
                 if !ctx.passing {
                     st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
@@ -924,8 +966,14 @@ impl BusService {
             // queued behind something standing at its stop (another bus, the player's):
             // after a while it serves the stop where it stands, as drivers do
             let in_bay = (st.lateral - stop.bay).abs() < 0.5;
-            // (a bus with another one behind it for this stop pulls on past the stop point)
-            let pull = if ctx.follower_close { 2.5 } else { 0.0 };
+            // (a bus with another one behind it for this stop pulls on past the stop point:
+            // [ROLLBACK r4d-B5] by its length, as far as the road before the next junction
+            // lets it, so that the one behind serves the pole)
+            if ctx.follower_close && d > -2.0 {
+                let want = (st.front + st.rear).min(room_past(ctx, d.max(0.0) + st.front));
+                self.pull = self.pull.max(want);
+            }
+            let pull = self.pull;
             let close = ctx.lead_close
                 && in_bay
                 && speed < 0.5
@@ -954,6 +1002,7 @@ impl BusService {
                 self.near_d = f32::INFINITY;
                 self.serve = None;
                 self.short_by_people = false;
+                self.pull = 0.0;
                 continue;
             }
             if d < STOP_REACH {
@@ -1479,6 +1528,92 @@ mod tests {
         assert_eq!(st.lateral_target, 0.0);
         assert!(lateral_at.iter().any(|&(s, l)| s < 101.0 && l > 1.1), "starts in the bay");
         assert!(st.lateral.abs() < 0.05, "back in the lane: {}", st.lateral);
+    }
+
+    /// [ROLLBACK r4d-B5] Two buses, one stop: the first, knowing the second behind it,
+    /// pulls on by its length past the pole (as far as the road lets it) and serves the stop
+    /// there; the second comes up close behind it and serves the stop where it stands. A
+    /// first one standing out its layover with the doors shut pulls on as well.
+    #[test]
+    fn two_buses_at_one_stop_the_first_pulls_on_and_the_second_serves_behind_it() {
+        use omsi_sim::traffic::LaneBuilder;
+        let straight = |len: f64| {
+            let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![glam::DVec3::ZERO, glam::DVec3::new(0.0, len, 0.0)], LaneKind::Street, 3.5)], ..Default::default() };
+            net.link(1.5);
+            net
+        };
+        let stop = Stop { ri: 0, s: 100.0, bay: 0.0, depart: 500.0, id: 7, side: 0.0 };
+        let bus_at = |s: f32, speed: f32| {
+            let mut st = AiState::new(0, s, 1);
+            st.front = 6.0;
+            st.rear = 6.0;
+            st.route = vec![0];
+            st.speed = speed;
+            st
+        };
+        // the first, a follower behind it: where does it come to rest
+        let first = |net: &Network, follower: bool| {
+            let mut v = test_vehicle();
+            let mut s = BusService::new(vec![stop, Stop { id: 8, s: 290.0, ..stop }]);
+            let mut st = bus_at(40.0, 10.0);
+            let mut t = 100.0;
+            let mut stopped = 0.0;
+            while t < 200.0 && !s.at_stop() {
+                let way = omsi_traffic::perception::way_lanes(net, &st, 200.0);
+                let mut ctx = ctx_on(net, &way, t, stopped);
+                ctx.follower_close = follower;
+                let target = s.step(&mut st, &mut v, &ctx);
+                st.drive(net, 0.1, None, target);
+                stopped = if st.speed < 0.3 { stopped + 0.1 } else { 0.0 };
+                t += 0.1;
+            }
+            assert!(s.at_stop(), "served, not missed");
+            st.s
+        };
+        let net = straight(300.0);
+        let alone = first(&net, false);
+        assert!((alone - 100.0).abs() < 1.5, "at the pole: {alone}");
+        let pulled = first(&net, true);
+        assert!((pulled - 112.0).abs() < 1.5, "a bus length on: {pulled}");
+        // the road ends 6 m past the pole: only 4 m on
+        let net = straight(112.0);
+        let short = first(&net, true);
+        assert!((short - 104.0).abs() < 1.5, "as far as the road lets it: {short}");
+
+        // the second: close behind the first, standing a second at the pole's approach - it
+        // serves the stop there; without the first ahead it drives on to the pole
+        let net = straight(300.0);
+        let mut v = test_vehicle();
+        let way = omsi_traffic::perception::way_lanes(&net, &bus_at(86.0, 0.0), 200.0);
+        let mut ctx = ctx_on(&net, &way, 100.0, 1.0);
+        let mut s = BusService::new(vec![stop]);
+        let mut st = bus_at(86.0, 0.0);
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Running);
+        ctx.lead_close = true;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+
+        // a layover with the doors shut: a bus behind for its stop - it pulls on its length
+        let mut s = BusService::new(vec![Stop { depart: 900.0, ..stop }]);
+        s.layover = true;
+        let mut st = bus_at(100.0, 0.0);
+        let mut ctx = ctx_on(&net, &[], 100.0, 0.0);
+        ctx.roadside = false;
+        s.arrive(&ctx, 900.0, 7, (0, 100.0));
+        assert_eq!(s.phase, Phase::Waiting);
+        let mut t = 100.0;
+        while t < 160.0 {
+            let way = omsi_traffic::perception::way_lanes(&net, &st, 200.0);
+            let mut ctx = ctx_on(&net, &way, t, 0.0);
+            ctx.roadside = false;
+            ctx.follower_close = t > 110.0;
+            let target = s.step(&mut st, &mut v, &ctx);
+            st.drive(&net, 0.1, None, target);
+            t += 0.1;
+        }
+        assert_eq!(s.phase, Phase::Waiting);
+        assert!((st.s - 112.0).abs() < 1.0 && st.speed < 0.1, "pulled on: {} at {}", st.s, st.speed);
     }
 
     #[test]
