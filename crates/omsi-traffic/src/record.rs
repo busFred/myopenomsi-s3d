@@ -33,6 +33,9 @@ use std::sync::mpsc;
 /// The format's version (the header's first field). 2: vehicles carry their claim
 /// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it.
 pub const VERSION: u32 = 2;
+/// The rules a recording is made with, as its header names them (`Header::switches`): the
+/// rule changes once tried behind switches and accepted, now always on.
+pub const RULES: &str = "competitor_filter,signal_foes,stub_links";
 /// The memory keeps this many seconds (and the keyframe before them).
 pub const RING_SECS: f64 = 60.0;
 /// A keyframe of every vehicle this often (s): a replay starts at one, and a replay that
@@ -61,9 +64,11 @@ pub struct Header {
     /// takes the game's own. Without it (a fixture written by hand) it is worked out.
     #[serde(default)]
     pub derived: Option<Derived>,
-    /// (format 2) The rule switches the game ran with (`Switches::list`; `stub_links` as the
-    /// network was linked). The replay runs with them unless told otherwise, and links the
-    /// lanes added later as the game did. None: not recorded (all off).
+    /// (format 2) The rules the game ran with, for information: [`RULES`] since the rule
+    /// switches were removed; a recording made while they were switches names those that
+    /// were on. The replay always runs with the current rules; one made under others (none
+    /// recorded: format 1, all off; or a list without all of `RULES`) does not reproduce
+    /// bit-exactly (`Replay::load` warns).
     #[serde(default)]
     pub switches: Option<String>,
 }
@@ -522,8 +527,6 @@ impl Recorder {
                 text
             }
         };
-        let mut switches = sim.switches;
-        switches.stub_links = net.stub_links;
         format!(
             "{{\"version\":{VERSION},\"map\":{},\"left_hand\":{},\"lights\":{},\"started_day_time\":{},\"trigger\":{},\"switches\":{},{}}}",
             json(&map),
@@ -531,7 +534,7 @@ impl Recorder {
             json(&sim.lights),
             json(&sim.day_time),
             json(&trigger),
-            json(&switches.list()),
+            json(RULES),
             net_part
         )
     }

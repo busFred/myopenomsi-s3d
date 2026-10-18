@@ -835,8 +835,6 @@ impl Traffic {
             lanes,
             // (`[lht]`: priority to the left, passing on the right, keeping left)
             left_hand: world.global.left_hand_traffic,
-            // (the game's network takes its switch from `OMSI_TRAFFIC_SWITCHES`)
-            switches_from_env: true,
             ..Default::default()
         };
         if net.left_hand {
@@ -1088,21 +1086,7 @@ impl Traffic {
         let light_prev = lights.iter().map(|c| vec![-100; c.lights.len()]).collect();
         let lanes = 0..net.lanes.len();
         let street_weight = net.lanes.iter().filter_map(street_lane_weight).sum();
-        let mut sim = omsi_traffic::Simulation::new(&net, lights);
-        match omsi_cfg::env::var("OMSI_TRAFFIC_SWITCHES") {
-            Ok(list) => match omsi_traffic::sim::Switches::from_list(&list) {
-                Ok(s) => {
-                    sim.switches = s;
-                    log::info!("traffic: switches on (OMSI_TRAFFIC_SWITCHES): {}", s.list());
-                }
-                Err(e) => {
-                    // (the network linked with none for the same list: keep the two alike)
-                    sim.switches = omsi_traffic::sim::Switches::default();
-                    log::warn!("traffic: OMSI_TRAFFIC_SWITCHES not read, all switches off: {e}");
-                }
-            },
-            Err(_) => log::info!("traffic: switches on (accepted): {}", sim.switches.list()),
-        }
+        let sim = omsi_traffic::Simulation::new(&net, lights);
         let mut t = Traffic {
             net,
             street_weight,

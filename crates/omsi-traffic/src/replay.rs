@@ -4,6 +4,11 @@
 //! did; at every further keyframe it measures how far it drifted and goes on from the
 //! recorded positions, so that one difference does not snowball.
 //!
+//! The replay runs with the current rules. The header's `switches` names the rules the
+//! game ran with, for information only; a recording made under other rules (format 1, or
+//! a list without all of [`crate::record::RULES`]: rule changes once behind switches, off)
+//! loads with a warning, as it will not reproduce bit-exactly.
+//!
 //! ```no_run
 //! let mut r = omsi_traffic::replay::Replay::load(std::path::Path::new("jam.rec")).unwrap();
 //! r.at(0);
@@ -14,8 +19,8 @@
 //! ```
 
 use crate::junction::Junctions;
-use crate::record::{read_lines, write_file, Frame, Header, Record};
-use crate::sim::{External, Simulation, Switches, Vehicle};
+use crate::record::{read_lines, write_file, Frame, Header, Record, RULES};
+use crate::sim::{External, Simulation, Vehicle};
 use hashbrown::HashMap;
 use omsi_sim::traffic::Network;
 use std::io;
@@ -79,8 +84,6 @@ pub struct Replay {
     pub deferred_spawns: u64,
     /// Free run: spawns given up after `SPAWN_PATIENCE` seconds.
     pub dropped_spawns: u64,
-    /// The rule changes under test; kept across `at`, which builds the simulation anew.
-    pub switches: Switches,
     /// Indices of the keyframes in `records`.
     keyframes: Vec<usize>,
 }
@@ -105,49 +108,24 @@ impl Replay {
         if !skipped.is_empty() {
             log::warn!("replay: {} lines of {} could not be read (the first: line {}: {})", skipped.len(), path.display(), skipped[0].0, skipped[0].1);
         }
+        if let Some(why) = other_rules(&header) {
+            log::warn!("replay: {} was made under other rules ({why}): the replay runs with the current ones ({RULES}) and will not reproduce it bit-exactly", path.display());
+        }
         Ok(Replay::new(header, records, skipped, truncated))
     }
 
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        // (the switches the game ran with, as the header has them: `set_switches` overrides)
-        let recorded = header.switches.as_deref().map(|l| {
-            Switches::from_list(l).unwrap_or_else(|e| {
-                log::warn!("replay: the recording's switches are not read: {e}");
-                Switches::default()
-            })
-        });
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, switches: Switches::default(), keyframes };
-        // (a recording without a switch list was made before the switches: it replays with
-        // none, whatever a game now starts with)
-        r.set_switches(recorded.unwrap_or_default());
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes };
+        r.stub_links();
         r
     }
 
-    /// The switches the recording was made with (the header's; none recorded: all off).
-    pub fn recorded_switches(&self) -> Switches {
-        self.header.switches.as_deref().and_then(|l| Switches::from_list(l).ok()).unwrap_or_default()
-    }
-
-    /// Set the rule changes under test (now, and after every `at`).
-    pub fn set_switches(&mut self, switches: Switches) {
-        self.switches = switches;
-        self.sim.switches = switches;
-        if switches.stub_links && !self.net.stub_links {
-            self.stub_links();
-        } else if !switches.stub_links && self.net.stub_links {
-            // (the links dropped are not put back: the network as the header has it)
-            let (net, sim) = build(&self.header);
-            self.net = net;
-            self.sim = sim;
-            self.sim.switches = switches;
-        }
-    }
-
-    /// `stub_links` on the recorded network: the links round the lit stubs and the merges
-    /// of one way's pieces dropped, the junctions compiled from what is left (lanes added
-    /// later are linked and compiled with it on, `Network::extend`).
+    /// The lit stubs on the recorded network: the links round them and the merges of one
+    /// way's pieces dropped (a recording from before them has them; one since, none), the
+    /// junctions compiled from what is left (lanes added later are linked and compiled with
+    /// them, `Network::extend`).
     fn stub_links(&mut self) {
         self.net.apply_stub_links();
         self.sim.junctions = Junctions::compile(&self.net);
@@ -170,10 +148,7 @@ impl Replay {
         let (net, sim) = build(&self.header);
         self.net = net;
         self.sim = sim;
-        self.sim.switches = self.switches;
-        if self.switches.stub_links {
-            self.stub_links();
-        }
+        self.stub_links();
         self.types.clear();
         self.divergence.clear();
         self.missing.clear();
@@ -395,12 +370,10 @@ impl Replay {
                 s.apply(&mut v.state);
             }
         }
-        // (stub_links) the recorded vehicles planned their ways on the network as the game
-        // linked it: the ways round the lit stubs take the stubs
-        if self.net.stub_links {
-            for v in &mut self.vehicles {
-                v.state.route_through_stubs(&self.net);
-            }
+        // (a recording from before the lit stubs: its vehicles planned their ways on the
+        // network as the game linked it, and the ways round the lit stubs take the stubs)
+        for v in &mut self.vehicles {
+            v.state.route_through_stubs(&self.net);
         }
         for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {
             c.time = *time;
@@ -502,6 +475,33 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle) {
 }
 
 /// The network and the simulation the header describes.
+/// Why the recording was made under other rules than the current ones ([`RULES`]), if it
+/// was: format 1 (before the rule switches, all off), or a switch list that lacks one of
+/// them. Such a recording does not replay bit-exactly.
+pub fn other_rules(h: &Header) -> Option<String> {
+    match h.switches.as_deref() {
+        _ if h.version < 2 => Some(format!("format {}, before the rule switches", h.version)),
+        None => Some("no rules recorded".into()),
+        Some(list) => {
+            let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+            let all = names.contains(&"all");
+            let lacking: Vec<&str> = RULES.split(',').filter(|r| !all && !names.contains(r)).collect();
+            if lacking.is_empty() {
+                None
+            } else {
+                Some(format!("recorded with \"{list}\", without {}", lacking.join(", ")))
+            }
+        }
+    }
+}
+
+/// The network and the simulation as the header has them: the recorded lanes, links and
+/// derived data (the junction table too), without the lit stubs applied (`Replay` applies
+/// them).
+pub fn recorded(h: &Header) -> (Network, Simulation) {
+    build(h)
+}
+
 fn build(h: &Header) -> (Network, Simulation) {
     let mut net = Network { lanes: h.lanes.clone(), left_hand: h.left_hand, ..Default::default() };
     for (i, l) in net.lanes.iter().enumerate() {

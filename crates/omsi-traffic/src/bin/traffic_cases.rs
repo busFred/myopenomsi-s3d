@@ -3,31 +3,36 @@
 //! ```text
 //! traffic_cases info <rec>
 //! traffic_cases cut <rec> <out_dir> <HH:MM>[,<HH:MM>...]
-//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--on switches] [--free] [--all-people]
+//! traffic_cases trace <fixture> <out.json> [--center x,y] [--radius 150] [--fps 5] [--max-kb 400] [--free] [--all-people]
 //! traffic_cases diagnose <fixture> [--radius 200] [--min-stand 15]
-//! traffic_cases heads <fixture> [--radius 200] [--free] [--on name,name]
-//! traffic_cases ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
+//! traffic_cases heads <fixture> [--radius 200] [--free]
+//! traffic_cases ab <fixture>... [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases stubs <fixture>... [--all]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
-//! traffic_cases compare <dir> --on <switches> [--left-on <switches>] [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
+//! traffic_cases compare <dir> [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
 //! traffic_cases index <out_dir>
 //! ```
 //!
 //! `trace` normally replays in reset-at-keyframe mode (what the recording shows, vehicles put back
 //! where the game had them at every keyframe); `--free` runs on from the first keyframe with no
-//! resets, so the trace shows what the simulation does by itself with the `--on` switches. The
-//! trace JSON says which (`"mode": "recorded"|"free"`, `"switches": "<the --on list>"`).
+//! resets, so the trace shows what the simulation does by itself. The trace JSON says which
+//! (`"mode": "recorded"|"free"`; `"switches"`: the rules the recording's header names, for
+//! information: a replay always runs with the current rules).
 //!
 //! `viewer2` makes one page of two traces side by side (one clock, one view, one pin); `compare`
-//! does it for every `caseNN-HHMM.rec` of a directory: left = recorded (with `--left-on`), right =
-//! free run with `--on`; writes `caseNN-HHMM-{left,right}.json`, `caseNN-HHMM-ab.html` and
+//! does it for every `caseNN-HHMM.rec` of a directory: left = recorded (reset at every
+//! keyframe), right = free run; writes `caseNN-HHMM-{left,right}.json`, `caseNN-HHMM-ab.html` and
 //! `ab-index.html` (into `--out`, default the directory; titles from `titles.txt`, lines
 //! `NN<TAB>title`; the centre and radius from the player's path: bounding-box middle, farthest
 //! point + 150 m).
 //!
 //! `info` and `cut` stream the recording once (a session recording does not fit in
 //! memory parsed); `trace` and `diagnose` replay a cut fixture headless.
+//!
+//! `ab` scores free runs (or with `--reset`, reset-at-keyframe replays) of fixtures, one row
+//! each; the footer names the rules each recording's header gives. `stubs` lists what the
+//! lit stubs drop from each fixture's recorded network (a recording made before them).
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -718,10 +723,6 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(400);
     let mut r = Replay::load(fixture)?;
-    // (without --on the recording keeps the switches its header names)
-    if let Some(list) = opt(args, "--on") {
-        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
-    }
     // (`--free`: no reset at the keyframes, the simulation runs on by itself from the first one)
     let free = args.iter().any(|a| a == "--free");
     r.free_run = free;
@@ -1204,7 +1205,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
             .collect();
         let doc = json!({
             "mode": if free { "free" } else { "recorded" },
-            "switches": r.switches.list(),
+            "switches": r.header.switches.clone().unwrap_or_default(),
             "meta": {
                 "fixture": fixture.file_name().and_then(|s| s.to_str()),
                 "map": r.header.map,
@@ -1741,10 +1742,6 @@ fn diagnose(fixture: &Path, args: &[String]) -> Res<()> {
         .transpose()?
         .unwrap_or(15.0);
     let mut r = Replay::load(fixture)?;
-    // (without --on the recording keeps the switches its header names)
-    if let Some(list) = opt(args, "--on") {
-        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
-    }
     let mid = window_mid(fixture, &r);
     let c = player_at(&r, mid).ok_or("no player")?;
     let (cx, cy) = (c.x, c.y);
@@ -2714,10 +2711,7 @@ fn viewer2(left: &Path, right: &Path, out: &Path, args: &[String]) -> Res<()> {
         .unwrap_or_else(|| "recorded".to_string());
     let right_label = opt(args, "--right-label")
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let sw = rdoc["switches"].as_str().unwrap_or("");
-            format!("replayed ({})", if sw.is_empty() { "no switches" } else { sw })
-        });
+        .unwrap_or_else(|| format!("replayed ({})", rdoc["mode"].as_str().unwrap_or("free")));
     // (the JSON goes into a script element: no "</" may appear in it)
     let ltext = ltext.replace("</", "<\\/");
     let rtext = rtext.replace("</", "<\\/");
@@ -2794,13 +2788,6 @@ fn player_path(rec: &Path) -> Res<(f64, f64, f64)> {
 }
 
 fn compare(dir: &Path, args: &[String]) -> Res<()> {
-    let on = opt(args, "--on")
-        .ok_or("compare needs --on <switches for the right pane>")?
-        .to_string();
-    let left_on = opt(args, "--left-on").unwrap_or("").to_string();
-    for list in [&on, &left_on] {
-        omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?;
-    }
     let fps: f64 = opt(args, "--fps")
         .map(|s| s.parse())
         .transpose()?
@@ -2850,12 +2837,8 @@ fn compare(dir: &Path, args: &[String]) -> Res<()> {
     if cases.is_empty() {
         return Err(format!("no caseNN-HHMM.rec in {}", dir.display()).into());
     }
-    let left_label = if left_on.is_empty() {
-        "recorded".to_string()
-    } else {
-        format!("recorded ({left_on})")
-    };
-    let right_label = format!("replayed ({})", if on.is_empty() { "no switches" } else { &on });
+    let left_label = "recorded".to_string();
+    let right_label = "replayed (free run)".to_string();
     let mut rows = String::new();
     for (n, stem, rec) in &cases {
         let hhmm = &stem[stem.len() - 4..];
@@ -2874,10 +2857,9 @@ fn compare(dir: &Path, args: &[String]) -> Res<()> {
         if all_people {
             common.push("--all-people".into());
         }
-        let mut largs = common.clone();
-        largs.extend(["--on".to_string(), left_on.clone()]);
+        let largs = common.clone();
         let mut rargs = common;
-        rargs.extend(["--on".to_string(), on.clone(), "--free".to_string()]);
+        rargs.push("--free".to_string());
         let lj = out_dir.join(format!("{stem}-left.json"));
         let rj = out_dir.join(format!("{stem}-right.json"));
         let html = out_dir.join(format!("{stem}-ab.html"));
@@ -3117,12 +3099,8 @@ type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
 fn heads(fixture: &Path, args: &[String]) -> Res<()> {
     let radius: f64 = opt(args, "--radius").map(|s| s.parse()).transpose()?.unwrap_or(200.0);
     let mut r = Replay::load(fixture)?;
-    // (`--free` runs on from its own vehicles at the keyframes, `--on` with rule switches)
+    // (`--free` runs on from its own vehicles at the keyframes)
     r.free_run = args.iter().any(|a| a == "--free");
-    // (without --on the recording keeps the switches its header names)
-    if let Some(list) = opt(args, "--on") {
-        r.set_switches(omsi_traffic::sim::Switches::from_list(list).map_err(|e| -> Box<dyn Error> { e.into() })?);
-    }
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
     }
@@ -3951,12 +3929,15 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
 }
 
 // ---------------------------------------------------------------------------------------
-// ab: replay the fixtures free-running (with rule switches on) and score the result
+// ab: replay the fixtures free-running and score the result
 
 /// The score of one free run.
 #[derive(Default, Clone, Debug)]
 struct Score {
     name: String,
+    /// The rules the recording's header names (for information: the replay runs with the
+    /// current ones).
+    rules: String,
     /// Samples taken (one per second of the window).
     seconds: u64,
     /// Vehicle-seconds standing (speed < 0.3, not at a stop) within the radius.
@@ -4121,16 +4102,18 @@ fn stop_lines(net: &Network) -> Vec<StopLine> {
 }
 
 /// Replay one fixture free-running from its first keyframe to the end and score it.
-fn ab_run(fixture: &Path, switches: Option<omsi_traffic::sim::Switches>, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
+fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
     let mut r = Replay::load(fixture)?;
-    if let Some(sw) = switches {
-        r.set_switches(sw);
-    }
     r.free_run = free_run;
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
     }
-    let mut sc = Score { name: fixture.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(), ..Default::default() };
+    let rules = match &r.header.switches {
+        Some(l) if l.is_empty() => "none".to_string(),
+        Some(l) => l.clone(),
+        None => format!("none recorded (format {})", r.header.version),
+    };
+    let mut sc = Score { name: fixture.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(), rules, ..Default::default() };
     let mut next = r.sim.time;
     // (lookups only: nothing iterated here depends on a hash map's order)
     let mut open: BTreeMap<u64, Vec<HeadTally>> = BTreeMap::new();
@@ -4285,7 +4268,7 @@ fn ab_run(fixture: &Path, switches: Option<omsi_traffic::sim::Switches>, radius:
     Ok(sc)
 }
 
-/// `ab <fixture>... [--on name,name] [--radius 200] [--json out.json] [--min-head 10]
+/// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
 /// [--reset] [--jobs N] [--events] [--drift] [--overlaps] [--mutual]`: free-run every fixture and print
 /// the score table. `--reset` replays as `heads` does (back to the recorded vehicles at every
 /// keyframe), for comparison; `--events` lists the red crossings, `--drift` the keyframes
@@ -4293,7 +4276,7 @@ fn ab_run(fixture: &Path, switches: Option<omsi_traffic::sim::Switches>, radius:
 /// (once per pair, as first sampled), `--mutual` the seconds two vehicles stand waiting for
 /// each other.
 fn ab(args: &[String]) -> Res<()> {
-    let with_value = ["--on", "--radius", "--json", "--min-head", "--jobs"];
+    let with_value = ["--radius", "--json", "--min-head", "--jobs"];
     let mut fixtures: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -4312,8 +4295,6 @@ fn ab(args: &[String]) -> Res<()> {
     let min_head: usize = opt(args, "--min-head").map(|s| s.parse()).transpose()?.unwrap_or(10);
     let jobs: usize = opt(args, "--jobs").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     let free_run = !args.iter().any(|a| a == "--reset");
-    // (without --on every fixture keeps the switches its header names)
-    let switches: Option<omsi_traffic::sim::Switches> = opt(args, "--on").map(|l| omsi_traffic::sim::Switches::from_list(l)).transpose().map_err(|e| -> Box<dyn Error> { e.into() })?;
 
     // (each fixture on its own: the order of the rows is the order given)
     let results: std::sync::Mutex<Vec<Option<Result<Score, String>>>> = std::sync::Mutex::new((0..fixtures.len()).map(|_| None).collect());
@@ -4324,7 +4305,7 @@ fn ab(args: &[String]) -> Res<()> {
                 let k = nextjob.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Some(path) = fixtures.get(k) else { break };
                 let t0 = std::time::Instant::now();
-                let res = ab_run(path, switches, radius, min_head, free_run).map_err(|e| format!("{}: {e}", path.display()));
+                let res = ab_run(path, radius, min_head, free_run).map_err(|e| format!("{}: {e}", path.display()));
                 eprintln!("ab: {} done in {:.1} s", path.display(), t0.elapsed().as_secs_f64());
                 if let Ok(mut g) = results.lock() {
                     g[k] = Some(res);
@@ -4371,8 +4352,7 @@ fn ab(args: &[String]) -> Res<()> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "AB switches [{}] radius {radius:.0} m, {} run, heads counted from {min_head} s, {} fixtures, {} s sampled",
-        switches.map(|s| s.list()).unwrap_or_else(|| "as recorded".to_string()),
+        "AB radius {radius:.0} m, {} run, heads counted from {min_head} s, {} fixtures, {} s sampled",
         if free_run { "free" } else { "reset-at-keyframes" },
         scores.len(),
         total.seconds
@@ -4393,6 +4373,17 @@ fn ab(args: &[String]) -> Res<()> {
         out.push('\n');
     }
     let _ = writeln!(out, "(divergence in the TOTAL row is the largest; missing vehicles at keyframes: {}; spawns deferred: {}, dropped: {})", total.missing, total.deferred_spawns, total.dropped_spawns);
+    // (the rules the recordings name, for information: each replays with the current ones)
+    let mut rules: Vec<(String, usize)> = Vec::new();
+    for s in &scores {
+        match rules.iter_mut().find(|r| r.0 == s.rules) {
+            Some(r) => r.1 += 1,
+            None => rules.push((s.rules.clone(), 1)),
+        }
+    }
+    for (l, n) in &rules {
+        let _ = writeln!(out, "(recorded with switches: {l}; {n} of {} fixtures)", scores.len());
+    }
     print!("{out}");
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     if args.iter().any(|a| a == "--events") {
@@ -4425,7 +4416,7 @@ fn ab(args: &[String]) -> Res<()> {
     }
     if let Some(path) = opt(args, "--json") {
         let doc = json!({
-            "switches": switches.map(|s| s.list()).unwrap_or_else(|| "as recorded".to_string()),
+            "recorded_switches": rules.iter().map(|(l, n)| json!({"switches": l, "fixtures": n})).collect::<Vec<_>>(),
             "radius": radius,
             "min_head": min_head,
             "free_run": free_run,
@@ -4438,12 +4429,18 @@ fn ab(args: &[String]) -> Res<()> {
 }
 
 // ---------------------------------------------------------------------------------------
-// stubs: what the `stub_links` switch changes in a fixture's network
+// stubs: what the lit stubs change in a fixture's recorded network
 
-/// The recording's network grown with every `LanesAdded` record, switches as given.
-fn grown(fixture: &Path, switches: omsi_traffic::sim::Switches) -> Res<(Replay, usize)> {
+/// The recording's network grown with every `LanesAdded` record: as the header has it
+/// (`lit`: false), or with the lit stubs applied as a replay does (`lit`: true). The lanes
+/// added later are linked with the lit stubs either way (`Network::extend`).
+fn grown(fixture: &Path, lit: bool) -> Res<(Replay, usize)> {
     let mut r = Replay::load(fixture)?;
-    r.set_switches(switches);
+    if !lit {
+        let (net, sim) = omsi_traffic::replay::recorded(&r.header);
+        r.net = net;
+        r.sim = sim;
+    }
     let header_lanes = r.net.lanes.len();
     let records = std::mem::take(&mut r.records);
     for rec in &records {
@@ -4456,18 +4453,17 @@ fn grown(fixture: &Path, switches: omsi_traffic::sim::Switches) -> Res<(Replay, 
     Ok((r, header_lanes))
 }
 
-/// `stubs <fixture>... [--all]`: the links and meeting places `stub_links` drops from each
-/// fixture's network (the header's lanes and those added later), each checked against the
-/// rule's patterns, and the junction movements whose first meeting place moved.
+/// `stubs <fixture>... [--all]`: the links and meeting places the lit stubs drop from each
+/// fixture's recorded network (one recorded before them: since, nothing), each checked
+/// against the rule's patterns, and the junction movements whose first meeting place moved.
 fn stubs(args: &[String]) -> Res<()> {
     let all = args.iter().any(|a| a == "--all");
     let fixtures: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let on = omsi_traffic::sim::Switches { stub_links: true, ..Default::default() };
     let (mut t_links, mut t_pairs, mut t_bad) = (0usize, 0usize, 0usize);
     for f in fixtures {
         let path = Path::new(f);
-        let (r0, header_lanes) = grown(path, Default::default())?;
-        let (r1, _) = grown(path, on)?;
+        let (r0, header_lanes) = grown(path, false)?;
+        let (r1, _) = grown(path, true)?;
         let (n0, n1) = (&r0.net, &r1.net);
         let where_ = |i: usize| if i < header_lanes { "header" } else { "added" };
         let mut lines: Vec<String> = Vec::new();
@@ -4481,7 +4477,7 @@ fn stubs(args: &[String]) -> Res<()> {
                 }
                 links += 1;
                 if a < header_lanes { links_h += 1 } else { links_a += 1 }
-                // the stub it went round, as the rule has it (on the network without the switch)
+                // the stub it went round, as the rule has it (on the network as recorded)
                 let st = n0.stub_bypasses(a).into_iter().find(|&(x, _)| x == b).map(|(_, st)| st);
                 let ok = st.is_some_and(|st| n1.lanes[a].next.contains(&st) && n1.lanes[st].next.contains(&b));
                 if !ok {
@@ -4526,9 +4522,9 @@ fn stubs(args: &[String]) -> Res<()> {
                 }
                 pairs += 1;
                 let (a, b) = (&n1.lanes[i], &n1.lanes[j]);
-                // (one leads into the other within three links, as linked without the
-                // switch: the lead-in and its stub, or a piece after its stub that merged
-                // with it through the lane after both, a link the switch dropped)
+                // (one leads into the other within three links, as recorded: the lead-in and
+                // its stub, or a piece after its stub that merged with it through the lane
+                // after both, a link the lit stubs dropped)
                 let after = |net: &Network, from: usize, to: usize| -> bool {
                     let mut at = vec![from];
                     for _ in 0..3 {
@@ -4593,12 +4589,12 @@ fn stubs(args: &[String]) -> Res<()> {
             }
         }
         // the recorded junction table against one compiled from the recorded network (the
-        // replay takes the recorded one; with the switch on it compiles its own)
+        // replay compiles its own, with the lit stubs)
         // (of the header's network: the lanes added later are compiled as the game did,
         // `Junctions::extend`; nodes compared by their object, whatever their order)
-        let fresh = Replay::load(path)?;
-        let compiled = omsi_traffic::Junctions::compile(&fresh.net);
-        let recorded = &fresh.sim.junctions;
+        let (fresh_net, fresh_sim) = omsi_traffic::replay::recorded(&r0.header);
+        let compiled = omsi_traffic::Junctions::compile(&fresh_net);
+        let recorded = &fresh_sim.junctions;
         let differing = recorded.nodes.iter().filter(|n| !compiled.nodes.iter().any(|c| c == *n)).count();
         let same = differing == 0 && compiled.nodes.len() == recorded.nodes.len();
         let j0_len = recorded.nodes.len();

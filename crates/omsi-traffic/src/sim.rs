@@ -182,7 +182,7 @@ pub struct Vehicle {
     /// World position of the origin and heading (degrees), from the way.
     pub pos: DVec3,
     pub heading: f32,
-    /// (competitor_filter) standing as of its last claim at a junction, with hysteresis:
+    /// Standing as of its last claim at a junction, with hysteresis:
     /// from under 0.3 m/s until over 1 m/s (`Claim::standing`). Kept with the vehicle, so a
     /// keyframe restores it (recordings before format 2 lack it: false).
     #[serde(default)]
@@ -264,91 +264,9 @@ fn cell(p: DVec3) -> (i32, i32) {
     ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
 }
 
-/// Rule changes under test, each off until its replay score is accepted (then its default
-/// flips on, and once all are in, the switch and the old path go). Set from the game with
-/// `OMSI_TRAFFIC_SWITCHES=name,name` (see [`Switches::from_list`]), from the replay harness
-/// with `traffic_cases ab --on name,name`, and directly in tests.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Switches {
-    /// A foe counts only if it can compete: not my own follower, not a car behind me on a
-    /// merging piece, not one standing outside the meeting place that is itself refused.
-    pub competitor_filter: bool,
-    /// Signals are part of the right of way: a foe at its red (wherever its light sits) is
-    /// not coming before its light goes.
-    pub signal_foes: bool,
-    /// The approach lane is not linked past a short lit stub straight into the piece after it.
-    pub stub_links: bool,
-    /// A pass of a standing obstacle needs room past it, and a stranded pass is given up.
-    pub pass_room: bool,
-    /// A dead end is driven to at speed and the vehicle taken off as it touches the end.
-    pub dead_end: bool,
-    /// Meeting places are measured with the lanes' widths, not a fixed centre-line distance.
-    pub corner_clearance: bool,
-    /// People wait for their light at the kerb, not in the car lane.
-    pub kerb_wait: bool,
-}
-
-impl Switches {
-    pub const NAMES: [&'static str; 7] = omsi_sim::traffic::SWITCH_NAMES;
-
-    /// Switches from a comma-separated list of names (`all` for every one). Unknown names
-    /// are returned in the error.
-    pub fn from_list(list: &str) -> Result<Switches, String> {
-        let mut s = Switches::default();
-        for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if !s.set(name, true) {
-                return Err(format!("unknown traffic switch '{name}' (known: {})", Self::NAMES.join(", ")));
-            }
-        }
-        Ok(s)
-    }
-
-    /// Set one switch by name; false when the name is unknown.
-    pub fn set(&mut self, name: &str, on: bool) -> bool {
-        match name {
-            "all" => {
-                *self = if on { Switches::all() } else { Switches::default() };
-            }
-            // (`none`: every switch off, the behaviour before the accepted ones)
-            "none" => {
-                *self = if on { Switches::default() } else { Switches::accepted() };
-            }
-            "competitor_filter" => self.competitor_filter = on,
-            "signal_foes" => self.signal_foes = on,
-            "stub_links" => self.stub_links = on,
-            "pass_room" => self.pass_room = on,
-            "dead_end" => self.dead_end = on,
-            "corner_clearance" => self.corner_clearance = on,
-            "kerb_wait" => self.kerb_wait = on,
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn all() -> Switches {
-        Switches { competitor_filter: true, signal_foes: true, stub_links: true, pass_room: true, dead_end: true, corner_clearance: true, kerb_wait: true }
-    }
-
-    /// The switches accepted after their replay scores and an adversarial review: what a
-    /// game runs with unless `OMSI_TRAFFIC_SWITCHES` says otherwise (`none` for the old
-    /// behaviour). A recording without a switch list in its header replays with none, as it
-    /// was made.
-    pub fn accepted() -> Switches {
-        Switches { competitor_filter: true, signal_foes: true, stub_links: true, ..Switches::default() }
-    }
-
-    /// The switches that are on, as the list `from_list` reads.
-    pub fn list(&self) -> String {
-        let on = [self.competitor_filter, self.signal_foes, self.stub_links, self.pass_room, self.dead_end, self.corner_clearance, self.kerb_wait];
-        Self::NAMES.iter().zip(on).filter(|(_, o)| *o).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
-    }
-}
-
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
-    /// Rule changes under test (see [`Switches`]).
-    pub switches: Switches,
     pub junctions: Junctions,
     pub lights: Vec<TrafficLightController>,
     pub time: f64,
@@ -381,7 +299,6 @@ pub struct Simulation {
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
-            switches: Switches::accepted(),
             junctions: Junctions::compile(net),
             lights,
             time: 0.0,
@@ -654,7 +571,7 @@ impl Simulation {
         // claims and grants at the junctions
         let mut claims: Vec<Claim> = Vec::new();
         let mut claim_of: Vec<Option<usize>> = vec![None; vehicles.len()];
-        // (competitor_filter) the claimants' standing hysteresis as of this claim, written
+        // the claimants' standing hysteresis as of this claim, written
         // back once all claims are filed
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
@@ -679,8 +596,8 @@ impl Simulation {
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
             let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
-            // the light at this junction's line, if the driver is held by one. With
-            // `signal_foes`: any light on the way before the first meeting place with
+            // the light at this junction's line, if the driver is held by one: any light on
+            // the way before the first meeting place with
             // another way, wherever the object begins (BeijingCity lights a 1 m stub
             // inside the crossing object, past its lead-in piece: the old test, the light
             // within 1 m of the object's entry, never saw a car standing at that red as
@@ -690,7 +607,7 @@ impl Simulation {
             // (and not with a piece forking from where one of my own pieces starts: an unlit
             // 0.3 m stub beside the lit one at the end of the lead-in, which merged with the
             // lead-in a few metres before the light, put the line before the light)
-            let light_line = if self.switches.signal_foes {
+            let light_line = {
                 let node = &self.junctions.nodes[j.junction];
                 let starts: Vec<glam::DVec3> = j.chain.iter().filter_map(|&(m, _)| net.lanes.get(node.movements[m].lane)).filter(|l| !l.points.is_empty()).map(|l| l.start()).collect();
                 let fork = |m: usize| net.lanes.get(node.movements[m].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
@@ -700,19 +617,15 @@ impl Simulation {
                 } else {
                     j.conflict_start
                 }
-            } else {
-                j.entry
             };
             let (light_red, until_go) = match p.signal {
                 Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
-                    // (signal_foes) not held by a light it goes through: the plan's own
+                    // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
                     // that took the line on green or yellow and is close to it (queued
                     // there, it goes on as soon as its leader moves, whatever the light)
-                    let through = self.switches.signal_foes && {
-                        let call = plan::light_call(v, p, &sig);
-                        call.go || call.marked_through
-                    };
+                    let call = plan::light_call(v, p, &sig);
+                    let through = call.go || call.marked_through;
                     if through {
                         (false, None)
                     } else {
@@ -721,18 +634,15 @@ impl Simulation {
                 }
                 _ => (false, None),
             };
-            // (signal_foes) standing at its red short of the first meeting place with
+            // standing at its red short of the first meeting place with
             // another way, a car is committed to nothing: the merge of the lead-in with its
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
-            let committed = committed && !(self.switches.signal_foes && light_red && st.speed < 0.5 && light_line - st.front > 0.5);
-            // (competitor_filter, signal_foes) standing, with hysteresis (`Claim::standing`):
+            let committed = committed && !(light_red && st.speed < 0.5 && light_line - st.front > 0.5);
+            // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
-            let was_standing = (self.switches.competitor_filter || self.switches.signal_foes) && {
-                let was = v.claim_standing;
-                standing_now.push((i, st.speed < 0.3 || (was && st.speed <= 1.0)));
-                was
-            };
+            let was_standing = v.claim_standing;
+            standing_now.push((i, st.speed < 0.3 || (was_standing && st.speed <= 1.0)));
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
                 chain: j.chain.clone(),
@@ -761,8 +671,8 @@ impl Simulation {
                 // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                 // answer or a full exit)
                 blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
-                red_hysteresis: self.switches.signal_foes && was_standing,
-                lanes: if self.switches.competitor_filter { perception::way_lanes(net, st, 150.0) } else { Vec::new() },
+                red_hysteresis: was_standing,
+                lanes: perception::way_lanes(net, st, 150.0),
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -854,7 +764,7 @@ impl Simulation {
         for (i, standing) in standing_now {
             vehicles[i].claim_standing = standing;
         }
-        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, self.switches.competitor_filter);
+        let grants: Vec<Grant> = reservation::resolve(&self.junctions, net, &claims);
 
         // plan and act, one vehicle at a time
         for i in 0..vehicles.len() {

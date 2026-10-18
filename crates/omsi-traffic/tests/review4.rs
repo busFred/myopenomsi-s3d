@@ -1,4 +1,4 @@
-//! Review4 counter-examples for round 3 (competitor_filter widened), driven in the
+//! Review4 counter-examples for round 3 (the competitor filter widened), driven in the
 //! simulation: who goes first, how hard the car with the right of way brakes, how close the
 //! bodies come. `cargo test --release -p omsi-traffic --test review4 -- --nocapture`
 
@@ -91,32 +91,29 @@ fn merge_net() -> Network {
 fn review4_merging_behind_at_speed() {
     let net = merge_net();
     let mut worst = (0.0f32, 0.0f32, f32::INFINITY);
-    println!("D(m)  cf | first  min_gap  main_min_acc");
+    println!("D(m) | first  min_gap  main_min_acc");
     for d in std::env::var("ONLY_D").ok().map(|x| x.parse::<usize>().unwrap()).map(|x| x..=x).unwrap_or(40..=140).step_by(5) {
-        for cf in [false, true] {
-            let mut sim = Simulation::new(&net, vec![]);
-            sim.switches.competitor_filter = cf;
-            let mut side = car(1, 2, net.lanes[2].length() - 2.0 - 0.3, 0.0);
-            side.state.planned_next = Some(3);
-            side.state.ahead = vec![4];
-            let _ = side_s;
-            let main_s = net.lanes[0].length() - (d as f32 - 10.0) - 2.0;
-            let mut main = car(2, 0, main_s, 13.5);
-            main.state.planned_next = Some(1);
-            main.state.ahead = vec![4];
-            let mut cars = vec![side, main];
-            let (first, gap, acc) = drive(&net, &mut sim, &mut cars, 14.0, &|v: &Vehicle| v.state.lane == 4, 2, 0.5);
-            println!("{d:>4} {:>5} | {first:?} {gap:>6.2} {acc:>7.2}", cf);
-            if cf && acc < worst.2 {
-                worst = (d as f32, gap, acc);
-            }
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut side = car(1, 2, net.lanes[2].length() - 2.0 - 0.3, 0.0);
+        side.state.planned_next = Some(3);
+        side.state.ahead = vec![4];
+        let _ = side_s;
+        let main_s = net.lanes[0].length() - (d as f32 - 10.0) - 2.0;
+        let mut main = car(2, 0, main_s, 13.5);
+        main.state.planned_next = Some(1);
+        main.state.ahead = vec![4];
+        let mut cars = vec![side, main];
+        let (first, gap, acc) = drive(&net, &mut sim, &mut cars, 14.0, &|v: &Vehicle| v.state.lane == 4, 2, 0.5);
+        println!("{d:>4} | {first:?} {gap:>6.2} {acc:>7.2}");
+        if acc < worst.2 {
+            worst = (d as f32, gap, acc);
         }
     }
-    assert!(worst.2 > -3.0, "competitor_filter on: the main road car braked {:.1} m/s² (D {} m, min gap {:.2} m)", worst.2, worst.0, worst.1);
+    assert!(worst.2 > -3.0, "the main road car braked {:.1} m/s² (D {} m, min gap {:.2} m)", worst.2, worst.0, worst.1);
 }
 
 /// (C3) A main road car (right of way, west) stands at its red, held by the light; the light
-/// turns green at 5 s. A side road car (south, green, gives way) comes up at 8 m/s. On, the
+/// turns green at 5 s. A side road car (south, green, gives way) comes up at 8 m/s. The
 /// standing main road car is "blocked" (why=Light) and dropped when the side car is out
 /// before it could be in "from rest after 1.5 s"; the real start reaction is 0.3-1.3 s.
 #[test]
@@ -139,30 +136,27 @@ fn review4_blocked_foe_whose_light_turns_green_now() {
     net.link(0.5);
     net.compute_conflicts();
     let mut worst = (0.0f32, f32::INFINITY, f32::INFINITY, None);
-    println!("south_d  cf | first  min_gap  west_min_acc (west reaction)");
+    println!("green | first  min_gap  west_min_acc (west reaction)");
     for k in 0..=36 {
         let green = 3.0 + 0.5 * k as f32;
         let d = 30.0f32;
-        for cf in [false, true] {
-            let ctl = TrafficLightController::new(vec![vec![(0, green), (6, 100.0)], vec![(6, 200.0)]], 100.0 + green);
-            let mut sim = Simulation::new(&net, vec![ctl]);
-            sim.switches.competitor_filter = cf;
-            let mut west = car(1, 1, 8.0 - 2.0 - 0.3, 0.0);
-            west.state.planned_next = Some(2);
-            west.state.ahead = vec![3, 4];
-            // south car: front `d` m before the crossing point at 8 m/s at t = 0
-            let mut south = car(2, 5, 200.0 - d - 2.0, 8.0);
-            south.state.max_speed_kmh = 29.0;
-            south.state.planned_next = Some(6);
-            south.state.ahead = vec![7, 8, 9];
-            let reaction = west.state.reaction;
-            let mut cars = vec![west, south];
-            let (first, gap, acc) = drive(&net, &mut sim, &mut cars, green + 14.0, &|v: &Vehicle| (v.state.lane == 3 || v.state.lane == 8) && v.state.s - v.state.rear > 13.0, 1, green);
-            println!("green {green:>5.1} {:>5} | {first:?} {gap:>6.2} {acc:>7.2} ({reaction:.2})", cf);
-            if cf && (gap < worst.1 || acc < worst.2) {
-                worst = (green, gap.min(worst.1), acc.min(worst.2), first);
-            }
+        let ctl = TrafficLightController::new(vec![vec![(0, green), (6, 100.0)], vec![(6, 200.0)]], 100.0 + green);
+        let mut sim = Simulation::new(&net, vec![ctl]);
+        let mut west = car(1, 1, 8.0 - 2.0 - 0.3, 0.0);
+        west.state.planned_next = Some(2);
+        west.state.ahead = vec![3, 4];
+        // south car: front `d` m before the crossing point at 8 m/s at t = 0
+        let mut south = car(2, 5, 200.0 - d - 2.0, 8.0);
+        south.state.max_speed_kmh = 29.0;
+        south.state.planned_next = Some(6);
+        south.state.ahead = vec![7, 8, 9];
+        let reaction = west.state.reaction;
+        let mut cars = vec![west, south];
+        let (first, gap, acc) = drive(&net, &mut sim, &mut cars, green + 14.0, &|v: &Vehicle| (v.state.lane == 3 || v.state.lane == 8) && v.state.s - v.state.rear > 13.0, 1, green);
+        println!("green {green:>5.1} | {first:?} {gap:>6.2} {acc:>7.2} ({reaction:.2})");
+        if gap < worst.1 || acc < worst.2 {
+            worst = (green, gap.min(worst.1), acc.min(worst.2), first);
         }
     }
-    assert!(worst.2 > -3.0 && worst.1 > 0.0, "on: worst west braking {:.1} m/s², min gap {:.2} m (green at {} s)", worst.2, worst.1, worst.0);
+    assert!(worst.2 > -3.0 && worst.1 > 0.0, "worst west braking {:.1} m/s², min gap {:.2} m (green at {} s)", worst.2, worst.1, worst.0);
 }

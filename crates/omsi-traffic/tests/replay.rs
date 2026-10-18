@@ -353,10 +353,6 @@ fn a_free_run_keeps_its_vehicles_at_keyframes() {
     // the spawn at 8 s did not duplicate anything, and the run goes on to the end
     while r.step() {}
     assert_eq!(r.vehicles.iter().filter(|v| v.id == 20).count(), 1);
-    // switches are kept across `at`
-    r.set_switches(omsi_traffic::sim::Switches::from_list("pass_room,kerb_wait").unwrap());
-    assert!(r.at(0));
-    assert_eq!(r.sim.switches.list(), "pass_room,kerb_wait");
 }
 
 /// A free run that has moved on does not put a spawn onto a vehicle (it waits for room, and
@@ -470,25 +466,30 @@ fn a_free_run_defers_spawns_and_keeps_changed_vehicles_where_they_are() {
     assert!(r.pending_spawns.is_empty());
 }
 
-/// The recordings made in the game: `OMSI_TRAFFIC_FIXTURES` or `~/.openomsi/traffic/viz`.
+/// The recordings made in the game: `OMSI_TRAFFIC_FIXTURES` or `~/.openomsi/traffic/viz3`
+/// (made under the current rules; those in `viz` are from before them).
 fn fixture(name: &str) -> Option<PathBuf> {
-    let dir = std::env::var_os("OMSI_TRAFFIC_FIXTURES").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".openomsi/traffic/viz")))?;
+    let dir = std::env::var_os("OMSI_TRAFFIC_FIXTURES").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".openomsi/traffic/viz3")))?;
     let p = dir.join(name);
     p.exists().then_some(p)
 }
 
-/// Free run with every rule as recorded must be the recording: the first 30 s of the
-/// smallest fixture (`cargo test --release -p omsi-traffic --test replay free_run --
-/// --nocapture`; skipped when the fixtures are not on this machine).
+/// A free run of a game recording made under the current rules must be the recording: the
+/// first 30 s of a fixture (`cargo test --release -p omsi-traffic --test replay free_run --
+/// --nocapture`; skipped when the fixture is not on this machine, or was made under other
+/// rules and cannot reproduce bit-exactly).
 #[test]
-fn a_free_run_without_switches_reproduces_a_game_recording() {
-    let Some(path) = fixture("case01-0814.rec") else {
-        eprintln!("no fixture case01-0814.rec: skipped");
+fn a_free_run_reproduces_a_game_recording_made_under_the_current_rules() {
+    let Some(path) = fixture("case01-0811.rec") else {
+        eprintln!("no fixture case01-0811.rec: skipped");
         return;
     };
     let mut r = Replay::load(&path).expect("the fixture reads");
+    if let Some(why) = omsi_traffic::replay::other_rules(&r.header) {
+        eprintln!("{} was made under other rules ({why}): skipped", path.display());
+        return;
+    }
     r.free_run = true;
-    r.set_switches(Default::default());
     assert!(r.at(0));
     let t0 = r.sim.time;
     r.run_until(t0 + 30.0);
@@ -502,7 +503,7 @@ fn a_free_run_without_switches_reproduces_a_game_recording() {
     assert!(r.missing.is_empty(), "{:?}", r.missing.first());
 }
 
-/// The standing hysteresis of `competitor_filter` (`Vehicle::claim_standing`) is the
+/// The claim standing hysteresis (`Vehicle::claim_standing`) is the
 /// vehicle's: a replay started at any keyframe has it as the game had it, and drives on
 /// as the game did. (It lived in the simulation, and a replay started at a keyframe began
 /// with nobody standing: a car creeping off at 0.76 m/s after a stand was taken for a
@@ -519,8 +520,7 @@ fn the_claim_standing_hysteresis_is_kept_with_the_vehicle_across_keyframes() {
         cars.push(car(30 + k, 3, 182.0 - 7.0 * k as f32, 0.0));
     }
     let path = temp("standing");
-    let mut hook = |t: f32, _: &mut Network, sim: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
-        sim.switches.competitor_filter = true;
+    let mut hook = |t: f32, _: &mut Network, _: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
         if (t - 9.0).abs() < DT * 0.5 {
             cars.push(car(20, 0, 60.0, 12.0));
         }
@@ -541,7 +541,6 @@ fn the_claim_standing_hysteresis_is_kept_with_the_vehicle_across_keyframes() {
     for k in 0..n - 1 {
         let mut r = Replay::new(base.header.clone(), base.records.clone(), Vec::new(), false);
         r.free_run = true;
-        r.set_switches(omsi_traffic::sim::Switches { competitor_filter: true, ..Default::default() });
         assert!(r.at(k));
         r.run_until(base.keyframe_time(k + 1).unwrap() + 0.01);
         let d = r.divergence.first().copied().expect("the next keyframe was compared");
@@ -563,38 +562,33 @@ fn a_vehicle_without_the_standing_mark_reads_as_not_standing() {
     assert!(!old.claim_standing);
 }
 
-/// The header keeps the switches the game ran with (stub_links as its network was linked);
-/// the replay runs with them, lanes added later linked the same way, unless told otherwise.
+/// The header names the rules the game ran with (`record::RULES`), for information; the
+/// replay runs with the current rules whatever it says, and knows a recording made under
+/// others (format 1, or a switch list without all of them) for one it cannot reproduce.
 #[test]
-fn the_recording_keeps_its_switches_and_the_replay_runs_with_them() {
-    let mut net = priority_junction();
-    net.stub_links = true;
-    let mut sim = Simulation::new(&net, vec![]);
-    // (a game starts with the accepted switches; this one runs with a list of its own)
-    sim.switches = omsi_traffic::sim::Switches::default();
-    sim.switches.competitor_filter = true;
-    let path = temp("switches");
-    let mut rec = Recorder::new();
-    rec.start_full(&path, &net, &sim, "test").expect("the recording starts");
-    let mut cars = vec![car(10, 0, 100.0, 12.0)];
-    for _ in 0..200 {
-        rec.frame(&sim, DT, &cars, &[], &[], &|i| format!("car {}", cars[i].id));
-        sim.tick(&net, DT, &mut cars);
-    }
-    rec.stop_full();
-    rec.flush();
+fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
+    let (net, lights) = signalled_junction();
+    let path = temp("rules");
+    let cars = vec![car(10, 0, 100.0, 12.0), car(11, 3, 120.0, 10.0)];
+    record(net, lights, cars, 12.0, &path, &mut |_, _, _, _, _| {});
     let r = Replay::load(&path).expect("the recording reads");
     let _ = std::fs::remove_file(&path);
-    assert_eq!(r.header.switches.as_deref(), Some("competitor_filter,stub_links"));
-    assert_eq!(r.switches.list(), "competitor_filter,stub_links");
-    assert!(r.net.stub_links, "lanes added later are linked with stub_links");
-    // told otherwise
-    let mut off = Replay::new(r.header.clone(), r.records.clone(), Vec::new(), false);
-    off.set_switches(Default::default());
-    assert!(off.at(0));
-    assert!(!off.net.stub_links && off.sim.switches.list().is_empty());
-    // a recording without them (format 1): all off
-    let mut h = r.header.clone();
-    h.switches = None;
-    assert_eq!(Replay::new(h, Vec::new(), Vec::new(), false).switches.list(), "");
+    assert_eq!(r.header.version, omsi_traffic::record::VERSION);
+    assert_eq!(r.header.switches.as_deref(), Some(omsi_traffic::record::RULES));
+    assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
+    // what the switches were once: a list with all of them on (`all` too) is the current rules
+    let with = |v: u32, l: Option<&str>| Header { version: v, switches: l.map(str::to_string), ..r.header.clone() };
+    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some("signal_foes, stub_links,competitor_filter,pass_room"))), None);
+    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some("all"))), None);
+    // ... and one without some, or none recorded, or format 1, was made under other rules
+    assert!(omsi_traffic::replay::other_rules(&with(2, Some("competitor_filter,signal_foes"))).is_some_and(|w| w.contains("stub_links")));
+    assert!(omsi_traffic::replay::other_rules(&with(2, Some(""))).is_some());
+    assert!(omsi_traffic::replay::other_rules(&with(2, None)).is_some());
+    assert!(omsi_traffic::replay::other_rules(&with(1, None)).is_some());
+    // a replay of one runs with the current rules all the same (here, with no rule the
+    // scenario meets that changed, as the recording ran)
+    let mut old = Replay::new(with(1, None), r.records.clone(), Vec::new(), false);
+    assert!(old.at(0));
+    while old.step() {}
+    assert!(old.divergence.len() >= 2 && old.divergence.iter().all(|d| d.1 == 0.0), "{:?}", old.divergence);
 }
