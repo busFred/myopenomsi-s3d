@@ -36,7 +36,7 @@ pub const VERSION: u32 = 2;
 /// The rules a recording is made with, as its header names them (`Header::switches`): the
 /// rule changes once tried behind switches and accepted, now always on, and the junction
 /// rules of round 4 (a recording made before them replays under them, not bit-exactly).
-pub const RULES: &str = "competitor_filter,signal_foes,stub_links,lights_first,right_of_way,blocked_foe,stop_placement";
+pub const RULES: &str = "competitor_filter,signal_foes,stub_links,lights_first,right_of_way,blocked_foe,stop_placement,player_chain";
 /// The memory keeps this many seconds (and the keyframe before them).
 pub const RING_SECS: f64 = 60.0;
 /// A keyframe of every vehicle this often (s): a replay starts at one, and a replay that

@@ -4,7 +4,8 @@
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
-use omsi_traffic::{Simulation, Vehicle, VehicleClass, Why};
+use omsi_traffic::sim::PLAYER_ID_BASE;
+use omsi_traffic::{PlayerView, Simulation, Vehicle, VehicleClass, Why};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -143,4 +144,49 @@ fn rule_d_on_red_the_held_car_stops_at_its_line() {
         furthest = furthest.max(front_x(me));
     });
     assert!(furthest <= -15.0 + 0.3, "its front got to x = {furthest:.1}, past its red line at -15");
+}
+
+/// Northbound (x = 2): approach 0, lead-in piece 1 (y -20..-5, meets nobody), crossing piece
+/// 2 (y -5..20), exit 3. Southbound (x = -2): approach 4, a left turn 5 (south, then east
+/// across the northbound way at y = 1, flagged turn 1), exit 6 (east).
+fn oncoming_left_turn() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(2.0, -300.0), (2.0, -20.0)], 1));
+    net.lanes.push(piece(&[(2.0, -20.0), (2.0, -5.0)], 0, 128.0));
+    net.lanes.push(piece(&[(2.0, -5.0), (2.0, 20.0)], 1, 128.0));
+    net.lanes.push(road(&[(2.0, 20.0), (2.0, 300.0)], 2));
+    net.lanes.push(road(&[(-2.0, 200.0), (-2.0, 20.0)], 3));
+    let mut turn = piece(&[(-2.0, 20.0), (-2.0, 5.0), (5.0, -2.0), (20.0, -2.0)], 2, 128.0);
+    turn.turn = 1;
+    net.lanes.push(turn);
+    net.lanes.push(road(&[(20.0, -2.0), (300.0, -2.0)], 4));
+    finish(net)
+}
+
+#[test]
+fn rule_e_the_oncoming_left_turner_yields_to_the_player_going_straight() {
+    let net = oncoming_left_turn();
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, lead_in) = js.movement(1).unwrap();
+    assert!(lead_in.foes.is_empty(), "{:?}", lead_in.foes);
+    let (_, turner) = js.movement(5).unwrap();
+    assert!(turner.foes.iter().any(|f| f.yields && js.nodes[0].movements[f.movement].lane == 2), "{:?}", turner.foes);
+    let mut sim = Simulation::new(&net, vec![]);
+    // the turner stands at its line; the player's bus comes up at 10 m/s, 60 m out
+    let mut cars = vec![car(1, 4, 178.0, 0.0)];
+    let mut player = PlayerView { id: 7, pos: DVec3::new(2.0, -80.0, 0.0), heading: 0.0, half_len: 6.0, half_width: 1.25, speed: 10.0, still: 0.0, blinker: 0, signalling: 0.0, priority: false };
+    let (mut waited, mut entered_before) = (false, false);
+    run(&net, &mut sim, &mut cars, 10.0, |_, sim, cars| {
+        let t = &cars[0];
+        waited |= t.last.wait_for == Some(PLAYER_ID_BASE + 7);
+        // the turner's front across the northbound way (x > 0.5) while the bus has not passed
+        let front = t.state.way_point(&net, t.state.front);
+        if front.x > 0.5 && player.pos.y - (player.half_len as f64) < 4.0 {
+            entered_before = true;
+        }
+        player.pos.y += player.speed as f64 * DT as f64;
+        sim.players = vec![player];
+    });
+    assert!(waited, "the turner never waited for the player");
+    assert!(!entered_before, "the turner turned across in front of the player");
 }

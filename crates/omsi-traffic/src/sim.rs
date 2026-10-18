@@ -149,6 +149,33 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
+/// The lane a player's vehicle goes on into from `lane`: the only one, or at a fork the one
+/// its indicator points to (the furthest turn that way, a lane flagged with that turn first),
+/// else the straightest (a lane without a turn flag first).
+fn player_next(net: &Network, lane: usize, blinker: u8) -> Option<usize> {
+    let l = net.lanes.get(lane)?;
+    let nexts: Vec<usize> = l.next.iter().copied().filter(|&n| net.lanes.get(n).is_some_and(|x| x.kind == LaneKind::Street && !x.points.is_empty())).collect();
+    if nexts.len() <= 1 {
+        return nexts.first().copied();
+    }
+    let h = l.end_heading();
+    // (heading change into and along each, degrees: negative to the left)
+    let bend = |n: usize| omsi_sim::traffic::wrap_deg(net.lanes[n].end_heading() - h);
+    let want = blinker as i32;
+    let key = |n: usize| -> (u8, f32) {
+        let flag = net.lanes[n].turn;
+        match want {
+            1 => (u8::from(flag != 1), bend(n)),
+            2 => (u8::from(flag != 2), -bend(n)),
+            _ => (u8::from(flag != 0), bend(n).abs()),
+        }
+    };
+    nexts.into_iter().min_by(|&a, &b| {
+        let (ka, kb) = (key(a), key(b));
+        ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+    })
+}
+
 /// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vehicle {
@@ -679,67 +706,86 @@ impl Simulation {
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
-        // read: the player drives): the junction on the lane under the vehicle, or on the
-        // lanes ahead of it within the deciding distance
+        // read: the player drives): the junction on the way ahead of the lane under the
+        // vehicle (its `next` lanes, straight on at a fork unless the indicator says
+        // otherwise), the claim over every piece of it the way takes (`chain_along`, as for an
+        // AI vehicle: a claim of the first piece alone never met the oncoming left turner
+        // on the piece after it, viz3 case11); off the lanes, the junction on the lanes
+        // starting ahead of it, on its first piece
         for (k, p) in self.players.iter().enumerate() {
-            // the way through chosen by the indicator, else the straightest
-            let pick = |entries: &Vec<(usize, usize)>| {
-                entries.iter().copied().min_by_key(|&(j, m)| {
-                    let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
-                    let want = p.blinker as i32;
-                    if want != 0 && turn == want {
-                        0
-                    } else if turn == 0 {
-                        1
-                    } else {
-                        2
-                    }
-                })
-            };
-            // candidate lanes: (lane, distance from the vehicle's origin to the lane's start)
-            let mut lanes: Vec<(usize, f32)> = Vec::new();
+            let v = p.speed.max(0.0);
+            let horizon = (8.0 * v + 30.0).clamp(60.0, 220.0);
+            // the way: (lane, distance from the vehicle's origin to the lane's start)
+            let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {
-                lanes.push((lane, -s));
+                way.push((lane, -s));
                 let mut d = net.lanes[lane].length() - s;
                 let mut cur = lane;
-                for _ in 0..6 {
-                    if d > 80.0 {
+                for _ in 0..16 {
+                    if d > horizon + 40.0 {
                         break;
                     }
-                    let Some(&n) = net.lanes[cur].next.first() else { break };
-                    lanes.push((n, d));
+                    let Some(n) = player_next(net, cur, p.blinker) else { break };
+                    way.push((n, d));
                     d += net.lanes[n].length();
                     cur = n;
                 }
             }
-            lanes.extend(self.lanes_ahead_of(net, p, 80.0).into_iter().map(|(l, d)| (l, d - p.half_len)));
-            let mut found: Option<(usize, usize, f32)> = None;
-            for (lane, d0) in lanes {
-                let len = net.lanes[lane].length();
-                let hit = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
-                    Some((j, m, -d0))
-                } else if let Some(entries) = self.junctions.entries.get(&lane) {
-                    pick(entries).map(|(j, m)| (j, m, -(d0 + len)))
-                } else {
-                    None
+            let on_way = way.iter().position(|(l, _)| self.junctions.of_lane.contains_key(l)).map(|at| {
+                let j = self.junctions.of_lane[&way[at].0].0;
+                (j, self.junctions.chain_along(j, &way[at..]), -way[at].1)
+            });
+            let hit = on_way.or_else(|| {
+                // off the lanes: the way through chosen by the indicator, else the straightest
+                let pick = |entries: &Vec<(usize, usize)>| {
+                    entries.iter().copied().min_by_key(|&(j, m)| {
+                        let turn = net.lanes[self.junctions.nodes[j].movements[m].lane].turn;
+                        let want = p.blinker as i32;
+                        if want != 0 && turn == want {
+                            0
+                        } else if turn == 0 {
+                            1
+                        } else {
+                            2
+                        }
+                    })
                 };
-                if let Some(h) = hit {
-                    if found.map(|f| h.2 > f.2).unwrap_or(true) {
-                        found = Some(h);
+                let mut found: Option<(usize, usize, f32)> = None;
+                for (lane, d0) in self.lanes_ahead_of(net, p, 80.0).into_iter().map(|(l, d)| (l, d - p.half_len)) {
+                    let len = net.lanes[lane].length();
+                    let hit = if let Some(&(j, m)) = self.junctions.of_lane.get(&lane) {
+                        Some((j, m, -d0))
+                    } else if let Some(entries) = self.junctions.entries.get(&lane) {
+                        pick(entries).map(|(j, m)| (j, m, -(d0 + len)))
+                    } else {
+                        None
+                    };
+                    if let Some(h) = hit {
+                        if found.map(|f| h.2 > f.2).unwrap_or(true) {
+                            found = Some(h);
+                        }
                     }
                 }
-            }
-            let Some((j, m, s_on)) = found else { continue };
-            if s_on < -70.0 {
+                found.map(|(j, m, s_on)| (j, vec![(m, 0.0)], s_on))
+            });
+            let Some((j, chain, s_on)) = hit else { continue };
+            let Some(&(m, _)) = chain.first() else { continue };
+            // where its meeting places begin along the way through (the end of the way when
+            // it meets nobody), and the next one its front has not entered
+            let foes = self.junctions.foes_along(j, &chain);
+            let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[self.junctions.nodes[j].movements[mm].lane].length()).sum();
+            let cs = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let cs = if cs.is_finite() { cs } else { way_len };
+            let front_at = s_on + p.half_len;
+            if cs - front_at > horizon {
                 continue;
             }
-            let v = p.speed.max(0.0);
-            let cs = self.junctions.nodes[j].movements[m].conflict_start;
-            let cs = if cs.is_finite() { cs } else { net.lanes[self.junctions.nodes[j].movements[m].lane].length() };
-            let room = cs - s_on - p.half_len - 0.6;
+            let next_ahead = foes.iter().map(|f| f.mine.0).filter(|&m0| m0 - front_at > 0.5).fold(f32::INFINITY, f32::min);
+            let room = if next_ahead.is_finite() { next_ahead } else { cs } - front_at - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             claims.push(Claim {
-                chain: vec![(m, 0.0)],
+                chain,
                 was_standing: false,
                 light_red: false,
                 until_go: None,
@@ -754,7 +800,7 @@ impl Simulation {
                 front: p.half_len,
                 rear: p.half_len,
                 gap: 4.0,
-                committed: cs - s_on - p.half_len <= 0.5 || cannot_stop,
+                committed,
                 exit_room: true,
                 impatience: Impatience::default(),
                 absolute: p.priority,
@@ -762,7 +808,7 @@ impl Simulation {
                 blocked: false,
                 stuck: false,
                 red_hysteresis: false,
-                lanes: Vec::new(),
+                lanes: way,
                 light: None,
                 id: PLAYER_ID_BASE + p.id as u64,
             });
