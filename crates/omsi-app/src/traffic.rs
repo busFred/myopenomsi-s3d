@@ -3228,6 +3228,24 @@ impl Traffic {
                 0.0
             };
             let mut detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs) } else { None };
+            // [ROLLBACK r4d-B3] a vehicle close behind it (the player's too), and its body over
+            // a through lane
+            let (close_behind, covers_through) = if self.cars[i].bus.is_some() {
+                let me = &self.cars[i];
+                let cars = self.cars.iter().any(|o| o.ai.last.lead_id == Some(me.id) && o.ai.last.lead.is_some_and(|l| l.gap < crate::bus_service::PACE_FOLLOWER));
+                let player_close = player.is_some_and(|p| {
+                    let h = (me.ai.heading as f64).to_radians();
+                    let fwd = DVec2::new(h.sin(), h.cos());
+                    let rel = (p.0 - me.ai.pos).truncate();
+                    let behind = -rel.dot(fwd) as f32 - me.ai.state.rear - p.2;
+                    (0.0..crate::bus_service::PACE_FOLLOWER).contains(&behind) && rel.perp_dot(fwd).abs() < 2.5
+                });
+                let st = &me.ai.state;
+                let through = self.through.through(&self.net, st.lane, me.id);
+                (cars || player_close, crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, me.half_width, through))
+            } else {
+                (false, false)
+            };
             // [ROLLBACK r4d-B2] no loop and no room within range, a queue behind it: the last
             // resort, out of anybody's sight - off the road, and back on its timetable for
             // its departure (as a bus off a dead end)
@@ -3252,6 +3270,8 @@ impl Traffic {
                 });
                 let v_nom = net.lanes.get(car.ai.state.lane).map_or(13.9, |l| (l.speed_limit_kmh * car.ai.params.speed_factor).min(car.ai.state.max_speed_kmh).max(10.0) / 3.6);
                 let ctx = crate::bus_service::Ctx {
+                    close_behind,
+                    covers_through,
                     people_hold: car.ai.last.why == Why::People,
                     v_nom,
                     roadside,
