@@ -3037,6 +3037,87 @@ impl Traffic {
         (lead_close, follower_close)
     }
 
+    /// [ROLLBACK r4d-B2] How many vehicles stand queued behind car `i` (each standing with the
+    /// one ahead of it as its lead), as far back as 30 of them.
+    fn queued_behind(&self, i: usize) -> usize {
+        let mut chain = vec![self.cars[i].id];
+        let mut k = 0;
+        while k < chain.len() && chain.len() <= 30 {
+            let id = chain[k];
+            for o in &self.cars {
+                if o.ai.state.speed < 0.3 && o.ai.last.lead_id == Some(id) && !chain.contains(&o.id) {
+                    chain.push(o.id);
+                }
+            }
+            k += 1;
+        }
+        chain.len() - 1
+    }
+
+    /// [ROLLBACK r4d-B2] Timetable bus `i` stands out a long wait at its stop (or queues for an
+    /// occupied berth) across a through lane and the queue behind it asks it to go: a way off
+    /// (`bus_service::plan_detour`). None when it need not go; Some(None) when nothing fits.
+    fn bus_detour(&self, i: usize, queue_behind_secs: f32) -> Option<Option<crate::bus_service::Detour>> {
+        let c = &self.cars[i];
+        let b = c.bus.as_ref()?;
+        let st = &c.ai.state;
+        if c.is_rail() || st.change.is_some() || c.ai.passing.is_some() || st.route.get(st.route_index) != Some(&st.lane) {
+            return None;
+        }
+        // queueing behind what holds its stop: a vehicle standing at a stop, or the exit full
+        let queued = c.ai.last.why == Why::ExitFull
+            || c.ai.last.lead_id.and_then(|id| self.cars.iter().find(|o| o.id == id)).is_some_and(|o| o.at_stop() || o.ai.last.why == Why::ExitFull);
+        let stop = b.stops.front()?;
+        let near = st.route_distance(&self.net, stop.ri, stop.s);
+        let left = b.detour_wanted(st.speed, self.day_time, queued && near < 60.0)?;
+        if !crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, c.half_width) {
+            return None;
+        }
+        if !crate::bus_service::queue_asks_to_go(queue_behind_secs, self.queued_behind(i)) {
+            return None;
+        }
+        // back to where it stands, or to its stop point when that lies on this lane ahead
+        let back_to = if stop.ri == st.route_index && stop.s > st.s { stop.s } else { st.s };
+        let len = st.front + st.rear;
+        let room = |l: usize| self.bus_room(l, len, c.half_width);
+        Some(crate::bus_service::plan_detour(&self.net, st.lane, st.s, back_to, left, &room))
+    }
+
+    /// [ROLLBACK r4d-B2] Where on lane `l` a bus `len` metres long (`half_width` wide) can
+    /// stand out of the through traffic: a street lane of its own (no random traffic, not a
+    /// timetable connector) with nobody on it, or a gap between two parked cars at its kerb
+    /// with `bus_service::PARK_ROOM` to spare. Its origin's place and its offset, if anywhere.
+    fn bus_room(&self, l: usize, len: f32, half_width: f32) -> Option<(f32, f32)> {
+        let lane = self.net.lanes.get(l)?;
+        if lane.kind != LaneKind::Street {
+            return None;
+        }
+        let need = len + crate::bus_service::PARK_ROOM;
+        let taken = |a: f32, b: f32| self.cars.iter().any(|o| o.ai.state.lane == l && o.ai.state.s + o.ai.state.front > a && o.ai.state.s - o.ai.state.rear < b);
+        if lane.density <= 0.0 && !lane.no_cars && lane.length() >= need + 4.0 {
+            let s = lane.length() - 2.0 - len * 0.5;
+            if !taken(0.0, lane.length()) {
+                return Some((s, 0.0));
+            }
+        }
+        let spots = self.parked.get(&l)?;
+        let mut spots: Vec<(f32, f32)> = spots.iter().copied().filter(|p| p.1.abs() > 1.5).collect();
+        spots.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for w in spots.windows(2) {
+            let ((s1, lat1), (s2, lat2)) = (w[0], w[1]);
+            if lat1.signum() != lat2.signum() || s2 - s1 - 4.6 < need {
+                continue;
+            }
+            let mid = (s1 + s2) * 0.5;
+            if mid - len * 0.5 < 2.0 || mid + len * 0.5 > lane.length() - 2.0 || taken(mid - len * 0.5 - 1.0, mid + len * 0.5 + 1.0) {
+                continue;
+            }
+            let lat = (lat1 + lat2) * 0.5 + lat1.signum() * (half_width - 0.9);
+            return Some((mid, lat));
+        }
+        None
+    }
+
     /// One frame: what the drivers see besides each other (the player and the LAN
     /// players, the people, the parked cars), the bus services and the parking plans,
     /// then the drivers (`omsi_traffic::Simulation::tick`), then the bodies and the
@@ -3099,6 +3180,7 @@ impl Traffic {
             } else {
                 0.0
             };
+            let detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs) } else { None };
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
             let net = &self.net;
@@ -3127,7 +3209,16 @@ impl Traffic {
                     follower_close,
                     debug: debug || omsi_cfg::env::var_os("OMSI_DEBUG_PAX").is_some(),
                 };
+                match detour {
+                    Some(Some(d)) => service.start_detour(&mut car.ai.state, net, d, day_time, car.id),
+                    Some(None) => service.no_detour(day_time, car.id),
+                    None => {}
+                }
                 ext.stop_at = service.step(&mut car.ai.state, &mut car.vehicle, &ctx);
+                if std::mem::take(&mut service.rerouted) {
+                    // (the route it drives now, for the recording)
+                    self.recorder.vehicle_changed(self.sim.time, &car.ai);
+                }
                 ext.bay = Some(car.ai.state.lateral_target);
                 ext.blinker_off = matches!(service.phase, Phase::Boarding | Phase::Waiting);
                 // [ROLLBACK aiparked-73] a long layover at the terminus: engine off

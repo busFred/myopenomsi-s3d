@@ -94,6 +94,55 @@ pub struct BusService {
     /// (`[profile_otherstopping]` 3 and 4, `schedule::WAIT_KINDS`); at any other it leaves
     /// when the people are off and on, early or not.
     pub wait_stops: Vec<i64>,
+    /// [ROLLBACK r4d-B2] Away from the stop it waits at (round the block, or to a place with
+    /// room off the through lane), to be back for its departure.
+    pub away: Option<Away>,
+    /// A way off decided while the doors were open: taken once they are shut.
+    pending: Option<Detour>,
+    /// When it last looked for a way off (seconds of the day), and the stop it found none at
+    /// (logged once).
+    detour_looked: f64,
+    detour_none: Option<i64>,
+    /// The wait at the front stop is its layover (as `arrive` had it).
+    this_layover: bool,
+    /// Its route was changed this frame (for the recording).
+    pub rerouted: bool,
+}
+
+/// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
+#[derive(Debug, Clone)]
+pub struct Away {
+    /// It comes back for its layover (it waits for the departure when it is back).
+    layover: bool,
+    /// Parked somewhere with room: where, and what it comes back by.
+    park: Option<ParkAway>,
+}
+
+#[derive(Debug, Clone)]
+struct ParkAway {
+    /// The place: route index, where its origin comes to rest, how far right of the lane.
+    ri: usize,
+    s: f32,
+    lat: f32,
+    /// The way back to the lane it left (that lane last), the route on from there and the
+    /// stops (their route indices from the lane it left).
+    back: Vec<usize>,
+    rest: Vec<usize>,
+    stops: Vec<Stop>,
+    /// When it sets off back (seconds of the day).
+    leave_at: f64,
+    arrived: bool,
+}
+
+/// [ROLLBACK r4d-B2] A way off a stop for a bus that blocks a through lane: `route` starts
+/// on the lane it stands on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Detour {
+    /// Round the block and back onto that lane (`route` ends on it again).
+    Loop { route: Vec<usize>, len: f32 },
+    /// To a place with room on the last lane of `route` (its origin at `s`, `lat` right of
+    /// the lane), and back from there by `back` (ending on the lane it left).
+    Park { route: Vec<usize>, s: f32, lat: f32, len: f32, back: Vec<usize>, back_len: f32 },
 }
 
 /// The side the bus pulls out towards: left (1) from a bay on the right, else right (2).
@@ -148,6 +197,132 @@ const LAYOVER_BOARDING: f64 = 45.0;
 /// town more than a few minutes' lead on the timetable.
 const ROADSIDE_QUEUE: f32 = 20.0;
 const ROADSIDE_EARLY_MIN: f64 = 30.0;
+/// [ROLLBACK r4d-B2] A bus standing out a long wait at its stop (or queueing for an occupied
+/// berth) with its body over a through lane leaves once a vehicle has stood behind it this
+/// long (s), or more than `LAYOVER_QUEUE_CARS` stand queued behind it: round the shortest
+/// loop back to the stop of at most `LAYOVER_LOOP_MAX` m that it drives in the time to its
+/// departure less `DETOUR_MARGIN`, else to the nearest place with room within
+/// `LAYOVER_PARK_MAX` m, standing there until it is time to drive back.
+pub const LAYOVER_QUEUE: f32 = 20.0;
+pub const LAYOVER_QUEUE_CARS: usize = 3;
+pub const LAYOVER_LOOP_MAX: f32 = 1200.0;
+pub const LAYOVER_PARK_MAX: f32 = 400.0;
+const DETOUR_MARGIN: f64 = 60.0;
+/// The pace a detour is timed at (m/s: town traffic with its lights and junctions), and the
+/// least wait worth one (s).
+const DETOUR_SPEED: f32 = 6.0;
+const DETOUR_MIN_LEFT: f64 = 90.0;
+/// Seconds between two looks for a way off at the same stop.
+const DETOUR_RETRY: f64 = 30.0;
+/// Room a parked bus needs beyond its length (m).
+pub const PARK_ROOM: f32 = 4.0;
+
+/// [ROLLBACK r4d-B2] Seconds a detour of `len` metres takes.
+fn detour_time(len: f32) -> f64 {
+    (len / DETOUR_SPEED) as f64
+}
+
+/// [ROLLBACK r4d-B2] A bus standing across a through lane: a street lane random traffic runs
+/// on (not a stand of its own), its body (`half_width`) not moved off the lane into a bay
+/// (a bus half on the pavement still holds up a car).
+pub fn covers_through_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
+    net.lanes.get(lane).is_some_and(|l| l.kind == LaneKind::Street && l.density > 0.0 && lateral.abs() < half_width + l.width * 0.5 - 0.5)
+}
+
+/// [ROLLBACK r4d-B2] The queue behind a bus asks it to go: somebody has stood behind it for
+/// longer than `LAYOVER_QUEUE`, or more than `LAYOVER_QUEUE_CARS` stand in it.
+pub fn queue_asks_to_go(queue_behind_secs: f32, queued: usize) -> bool {
+    queue_behind_secs > LAYOVER_QUEUE || queued > LAYOVER_QUEUE_CARS
+}
+
+/// [ROLLBACK r4d-B2] A way off for a bus at `s` on `lane` that is to be back at `back_to`
+/// on that lane (where its origin stands at the stop) within `time_left` seconds: the
+/// shortest loop through the network back onto the lane, or - if none fits - the nearest
+/// place with room (`room`: where on a lane a bus can stand off the through traffic, its
+/// origin's place and offset) with a way back. None when nothing fits.
+pub fn plan_detour(net: &Network, lane: usize, s: f32, back_to: f32, time_left: f64, room: &dyn Fn(usize) -> Option<(f32, f32)>) -> Option<Detour> {
+    let here = net.lanes.get(lane)?;
+    let budget = time_left - DETOUR_MARGIN;
+    let rest = here.length() - s;
+    let way_len = |p: &[usize]| p[..p.len().saturating_sub(1)].iter().map(|&l| net.lanes[l].length()).sum::<f32>();
+    // round the block
+    let mut best: Option<(f32, Vec<usize>)> = None;
+    for &n in &here.next {
+        if n == lane || net.lanes[n].kind != LaneKind::Street {
+            continue;
+        }
+        let Some(p) = net.shortest_path(n, lane) else { continue };
+        let len = rest + way_len(&p) + back_to;
+        if len <= LAYOVER_LOOP_MAX && detour_time(len) <= budget && best.as_ref().is_none_or(|b| len < b.0) {
+            best = Some((len, p));
+        }
+    }
+    if let Some((len, p)) = best {
+        let route = std::iter::once(lane).chain(p).collect();
+        return Some(Detour::Loop { route, len });
+    }
+    // to a place with room nearby: the lanes ahead nearest first
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
+    let mm = |m: f32| (m.max(0.0) * 1000.0) as u64;
+    let mut parent: HashMap<usize, usize> = HashMap::new();
+    let mut seen: HashMap<usize, f32> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    for &n in &here.next {
+        heap.push((Reverse(mm(rest)), n, lane));
+    }
+    while let Some((Reverse(c), l, from)) = heap.pop() {
+        let c = c as f32 / 1000.0;
+        if c > LAYOVER_PARK_MAX || seen.contains_key(&l) || l == lane {
+            continue;
+        }
+        seen.insert(l, c);
+        parent.insert(l, from);
+        let ln = &net.lanes[l];
+        if ln.kind != LaneKind::Street {
+            continue;
+        }
+        if let Some((ps, lat)) = room(l) {
+            let len = c + ps;
+            let back = net.shortest_path(l, lane);
+            if let (true, Some(back)) = (len <= LAYOVER_PARK_MAX, back) {
+                let back_len = ln.length() - ps + way_len(&back[1..]) + back_to;
+                // (the way back is bounded by the time it takes only)
+                if detour_time(len) + detour_time(back_len) <= budget {
+                    let mut route = vec![l];
+                    let mut at = l;
+                    while let Some(&p) = parent.get(&at) {
+                        route.push(p);
+                        if p == lane {
+                            break;
+                        }
+                        at = p;
+                    }
+                    route.reverse();
+                    return Some(Detour::Park { route, s: ps, lat, len, back, back_len });
+                }
+            }
+        }
+        let c2 = c + ln.length();
+        for &n in &ln.next {
+            if !seen.contains_key(&n) {
+                heap.push((Reverse(mm(c2)), n, l));
+            }
+        }
+    }
+    None
+}
+
+/// [ROLLBACK r4d-B2] Put `route` (starting on the lane the bus is on) on the bus's way.
+fn set_route(st: &mut AiState, net: &Network, route: Vec<usize>) {
+    st.route = route;
+    st.route_index = 0;
+    st.change = None;
+    st.planned_next = None;
+    st.ahead.clear();
+    st.plan_next(net);
+}
+
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
 /// 30 m unless its object strings say otherwise (Omsi.exe 0x620058, string 4; the bus
 /// moves over once it is that near, 0x7dac5e).
@@ -217,6 +392,12 @@ impl BusService {
             always: Vec::new(),
             serve_early: Vec::new(),
             wait_stops: Vec::new(),
+            away: None,
+            pending: None,
+            detour_looked: f64::NEG_INFINITY,
+            detour_none: None,
+            this_layover: false,
+            rerouted: false,
         }
     }
 
@@ -290,6 +471,8 @@ impl BusService {
         self.boarded = false;
         self.layover = layover;
         self.roadside_layover = false;
+        self.away = None;
+        self.pending = None;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -315,6 +498,9 @@ impl BusService {
             log::info!("t={:.1}: timetable bus {} serves its stop {:?}", ctx.day_time, ctx.id, self.stops.front().map(|s| s.id));
         }
         let layover = std::mem::take(&mut self.layover);
+        // [ROLLBACK r4d-B2] back from round the block (or never away)
+        self.away = None;
+        self.this_layover = layover;
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
         // [ROLLBACK waitstop-136] it stands out its time where the timetable says so, on its
         // layover and (a train) at its stations; elsewhere it goes when the people are done
@@ -354,12 +540,18 @@ impl BusService {
     /// Off from the stop: the next one is the front.
     fn depart(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) {
         let bay = self.stops.front().map(|s| s.bay).unwrap_or(0.0);
-        self.stops.pop_front();
+        if let Some(d) = self.pending.take() {
+            // [ROLLBACK r4d-B2] off round the block (or to a place with room): the stop stays
+            // the next one
+            self.take_detour(st, ctx.net, d, ctx.day_time, ctx.id);
+        } else {
+            self.stops.pop_front();
+            crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
+        }
         self.near_d = f32::INFINITY;
         self.serve = None;
-        crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
         let air = ctx.net.lanes[st.lane].kind == LaneKind::Air;
-        if self.stops.is_empty() && !self.route_open && !air {
+        if self.stops.is_empty() && !self.route_open && !air && self.away.is_none() {
             self.set_phase(Phase::TripDone);
             st.signal = 0;
             st.signal_time = 0.0;
@@ -389,6 +581,126 @@ impl BusService {
                 vehicle.var("IBIS_busstop")
             );
         }
+    }
+
+    /// [ROLLBACK r4d-B2] The seconds left before the bus may leave the front stop, when it
+    /// stands out a long wait there - or queues for it (`queued`, standing behind what holds
+    /// the stop) - and a way off is worth looking for now.
+    pub fn detour_wanted(&self, speed: f32, day_time: f64, queued: bool) -> Option<f64> {
+        if self.away.is_some() || self.pending.is_some() || day_time - self.detour_looked < DETOUR_RETRY {
+            return None;
+        }
+        let stop = self.stops.front()?;
+        let left = match self.phase {
+            Phase::Waiting | Phase::Boarding => self.leave_at - day_time,
+            Phase::Running if queued && speed < 0.3 => stop.depart - day_time,
+            _ => return None,
+        };
+        (left > DETOUR_MIN_LEFT).then_some(left)
+    }
+
+    /// [ROLLBACK r4d-B2] Looked for a way off and found none: it stays (said once a stop).
+    pub fn no_detour(&mut self, day_time: f64, id: u64) {
+        self.detour_looked = day_time;
+        let stop = self.stops.front().map(|s| s.id);
+        if self.detour_none != stop {
+            self.detour_none = stop;
+            log::info!("t={day_time:.1}: timetable bus {id} blocks a through lane at its stop {stop:?}, and no loop or place with room fits before its departure: it stays");
+        }
+    }
+
+    /// [ROLLBACK r4d-B2] Leave the stop (or the queue for it) on `d`: at once while driving,
+    /// at a stop once the doors are shut (`depart`).
+    pub fn start_detour(&mut self, st: &mut AiState, net: &Network, d: Detour, day_time: f64, id: u64) {
+        self.detour_looked = day_time;
+        match self.phase {
+            Phase::Running => self.take_detour(st, net, d, day_time, id),
+            Phase::Boarding | Phase::Waiting => {
+                self.pending = Some(d);
+                self.leave_at = day_time;
+                self.set_phase(Phase::Closing);
+            }
+            _ => {}
+        }
+    }
+
+    fn take_detour(&mut self, st: &mut AiState, net: &Network, d: Detour, day_time: f64, id: u64) {
+        let cur = st.route_index;
+        let rest: Vec<usize> = st.route.iter().skip(cur + 1).copied().collect();
+        let layover = self.this_layover || self.layover;
+        let depart = self.stops.front().map(|s| s.depart).unwrap_or(day_time);
+        match d {
+            Detour::Loop { route, len } => {
+                log::info!("t={day_time:.1}: timetable bus {id} goes round the block ({len:.0} m, {} lanes) to be back for {:.0} s from now", route.len(), depart - day_time);
+                let k = route.len() - 1;
+                for s in self.stops.iter_mut() {
+                    s.ri = s.ri.saturating_sub(cur) + k;
+                }
+                let mut r = route;
+                r.extend(rest);
+                set_route(st, net, r);
+                self.away = Some(Away { layover, park: None });
+            }
+            Detour::Park { route, s, lat, len, back, back_len } => {
+                let leave_at = depart - detour_time(back_len) - DETOUR_MARGIN * 0.5;
+                log::info!("t={day_time:.1}: timetable bus {id} parks {len:.0} m off at lane {} until {:.0} s before its departure", route.last().copied().unwrap_or(0), depart - leave_at);
+                let stops = self
+                    .stops
+                    .drain(..)
+                    .map(|mut x| {
+                        x.ri = x.ri.saturating_sub(cur);
+                        x
+                    })
+                    .collect();
+                let ri = route.len() - 1;
+                set_route(st, net, route);
+                self.away = Some(Away { layover, park: Some(ParkAway { ri, s, lat, back, rest, stops, leave_at, arrived: false }) });
+            }
+        }
+        // (back at the stop it waits for its departure as on its layover)
+        self.layover = layover;
+        self.near_d = f32::INFINITY;
+        self.serve = None;
+        self.rerouted = true;
+        self.set_phase(Phase::Running);
+    }
+
+    /// [ROLLBACK r4d-B2] Driving to the place with room, standing there, and setting off back
+    /// for the stop when it is time: where it has to stop, if anywhere.
+    fn park_away(&mut self, st: &mut AiState, ctx: &Ctx) -> Option<f32> {
+        let away = self.away.as_mut()?;
+        let p = away.park.as_mut()?;
+        if !p.arrived {
+            let d = st.route_distance(ctx.net, p.ri, p.s);
+            if !ctx.passing {
+                st.lateral_target = if d < BAY_REACH { p.lat } else { 0.0 };
+            }
+            if st.speed < 0.3 && (d < 1.5 || (ctx.stopped > 5.0 && d < 15.0 && (st.lateral - p.lat).abs() < 0.5)) {
+                p.arrived = true;
+            }
+            return Some(d.max(0.0) + st.front - 0.3);
+        }
+        if ctx.day_time < p.leave_at {
+            return Some(st.front);
+        }
+        // back: the way to the lane it left, and the route on from there
+        let p = away.park.take()?;
+        let k = p.back.len() - 1;
+        let mut route = p.back;
+        route.extend(p.rest);
+        set_route(st, ctx.net, route);
+        self.stops = p.stops.into_iter().map(|mut x| {
+            x.ri += k;
+            x
+        }).collect();
+        self.rerouted = true;
+        st.signal = out_signal(p.lat);
+        st.signal_time = 2.5;
+        st.lateral_target = 0.0;
+        if ctx.debug {
+            log::info!("t={:.1}: timetable bus {} sets off back for its stop", ctx.day_time, ctx.id);
+        }
+        None
     }
 
     /// One frame at a stop with the doors shut: they open for the last minute.
@@ -464,6 +776,9 @@ impl BusService {
 
     /// Driving: brake for the next stop, pull into its bay.
     fn approach(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) -> Option<f32> {
+        if self.away.as_ref().is_some_and(|a| a.park.is_some()) {
+            return self.park_away(st, ctx);
+        }
         loop {
             let Some(stop) = self.stops.front().copied() else {
                 if !ctx.passing {
@@ -763,6 +1078,171 @@ mod tests {
         s.board(&ctx);
         // 20 s before its time, as any stop where the timetable holds a bus
         assert_eq!(s.leave_at, 480.0);
+    }
+
+    /// [ROLLBACK r4d-B2] A ring road of four quarter lanes (0..3, 100 m each, clockwise) and
+    /// a road on from the end of lane 0 (lane 4): a block to go round.
+    fn ring() -> Network {
+        ring_of(400.0)
+    }
+
+    fn ring_of(around: f64) -> Network {
+        use omsi_sim::traffic::LaneBuilder;
+        let r = around / std::f64::consts::TAU;
+        let arc = |q: usize| {
+            let pts = (0..=24)
+                .map(|k| {
+                    let a = (q as f64 + k as f64 / 24.0) * std::f64::consts::FRAC_PI_2;
+                    glam::DVec3::new(r * a.sin(), r * a.cos(), 0.0)
+                })
+                .collect();
+            LaneBuilder::polyline(pts, LaneKind::Street, 3.5)
+        };
+        let end = glam::DVec3::new(r, 0.0, 0.0);
+        let on = LaneBuilder::polyline(vec![end, end + glam::DVec3::new(0.0, -200.0, 0.0)], LaneKind::Street, 3.5);
+        let mut net = Network { lanes: vec![arc(0), arc(1), arc(2), arc(3), on], ..Default::default() };
+        net.link(1.5);
+        net
+    }
+
+    fn test_vehicle() -> VehicleInstance {
+        let program = omsi_script::compile(&omsi_script::CompileInput::default());
+        let ty = std::sync::Arc::new(omsi_sim::VehicleType {
+            def: Default::default(),
+            model: Default::default(),
+            model_dir: std::path::PathBuf::new(),
+            program: std::sync::Arc::new(program),
+            meshes: Vec::new(),
+            paint_schemes: Vec::new(),
+            texchanges: Vec::new(),
+            wheel_meshes: Vec::new(),
+            suspension_axles: Vec::new(),
+            missing_packs: Vec::new(),
+            mesh_bounds: Vec::new(),
+            mesh_boxes: Vec::new(),
+        });
+        VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()))
+    }
+
+    fn ctx_on<'a>(net: &'a Network, way: &'a [(usize, f32)], day_time: f64, stopped: f32) -> Ctx<'a> {
+        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0 }
+    }
+
+    /// The bus driven along its way by `AiState::drive` for `secs` from `t`, its service
+    /// stepped every 0.1 s; returns the time of day then. `each` sees every step and ends
+    /// the drive by answering true.
+    fn drive(s: &mut BusService, st: &mut AiState, v: &mut VehicleInstance, net: &Network, mut t: f64, secs: f64, mut each: impl FnMut(f64, &BusService, &AiState) -> bool) -> f64 {
+        let end = t + secs;
+        let mut stopped = 0.0f32;
+        while t < end {
+            let way = omsi_traffic::perception::way_lanes(net, st, 200.0);
+            let ctx = ctx_on(net, &way, t, stopped);
+            let stop = s.step(st, v, &ctx);
+            assert!(st.drive(net, 0.1, None, stop), "still on the road");
+            stopped = if st.speed < 0.3 { stopped + 0.1 } else { 0.0 };
+            t += 0.1;
+            if each(t, s, st) {
+                break;
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn a_layover_across_a_through_lane_with_a_queue_goes_round_the_block_and_is_back_for_its_departure() {
+        let net = ring();
+        assert_eq!(net.lanes[0].next.len(), 2, "the ring and the road on: {:?}", net.lanes[0].next);
+        let mut v = test_vehicle();
+        let mut st = AiState::new(0, 50.0, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.route = vec![0, 4];
+        let stops = vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 400.0, id: 7, side: 0.0 }, Stop { ri: 1, s: 150.0, bay: 0.0, depart: 600.0, id: 8, side: 0.0 }];
+        let mut s = BusService::new(stops);
+        s.layover = true;
+        let ctx = ctx_on(&net, &[], 100.0, 0.0);
+        s.arrive(&ctx, 400.0, 7, (0, 50.0));
+        assert_eq!(s.phase, Phase::Boarding);
+        // in the lane, four cars queued behind it: it looks for a way off
+        assert!(covers_through_lane(&net, 0, st.lateral, 1.25));
+        assert!(queue_asks_to_go(5.0, 4) && queue_asks_to_go(25.0, 0) && !queue_asks_to_go(5.0, 3));
+        let left = s.detour_wanted(0.0, 100.0, false).expect("a long wait");
+        assert!((left - 300.0).abs() < 1e-6);
+        let d = plan_detour(&net, 0, 50.0, 50.0, left, &|_| None).expect("round the ring");
+        let Detour::Loop { route, len } = d.clone() else { panic!("{d:?}") };
+        assert_eq!(route, vec![0, 1, 2, 3, 0]);
+        assert!((len - 400.0).abs() < 2.0, "{len}");
+        s.start_detour(&mut st, &net, d, 100.0, 1);
+        assert_eq!(s.phase, Phase::Closing);
+        // the doors shut, round the block, back at its stop before its departure
+        let mut left_at = None;
+        let back = drive(&mut s, &mut st, &mut v, &net, 100.0, 300.0, |t, s, _| {
+            if s.phase == Phase::Running && left_at.is_none() {
+                left_at = Some(t);
+            }
+            left_at.is_some() && s.at_stop()
+        });
+        assert!(left_at.is_some_and(|t| t < 105.0), "{left_at:?}");
+        assert!(back < 400.0 - 30.0, "back at {back}");
+        assert_eq!((st.lane, st.route_index), (0, 4));
+        assert!((st.s - 50.0).abs() < 2.5, "at its stop: {}", st.s);
+        assert_eq!(s.stops.front().map(|x| (x.id, x.ri)), Some((7, 4)));
+        // it waits for its departure there, and goes on time
+        assert_eq!(s.leave_at, 400.0);
+        let gone = drive(&mut s, &mut st, &mut v, &net, back, 400.0, |_, s, _| s.phase == Phase::Running);
+        assert!((400.0..410.0).contains(&gone), "off at {gone}");
+        assert_eq!(s.stops.front().map(|x| (x.id, x.ri)), Some((8, 5)));
+        assert_eq!(st.route, vec![0, 1, 2, 3, 0, 4]);
+
+        // the same layover moved into a bay off the lane: nothing to go round for
+        assert!(!covers_through_lane(&net, 0, 3.2, 1.25));
+        // nor with too little time for the loop (67 s at 6 m/s, and a minute to spare)
+        assert!(plan_detour(&net, 0, 50.0, 50.0, 120.0, &|_| None).is_none());
+    }
+
+    #[test]
+    fn a_layover_with_no_loop_parks_where_there_is_room_and_drives_back_in_time() {
+        // a ring of 1600 m (no loop under 1200 m), the bus 300 m into lane 0; lane 4 (no
+        // random traffic) has room 150 m in, and a way back onto the ring (lane 1)
+        let mut net = ring_of(1600.0);
+        net.lanes[4].density = 0.0;
+        net.lanes[4].next = vec![1];
+        assert!(plan_detour(&net, 0, 300.0, 300.0, 600.0, &|_| None).is_none(), "the loop is too long");
+        let room = |l: usize| (l == 4).then_some((150.0, 0.0));
+        let d = plan_detour(&net, 0, 300.0, 300.0, 600.0, &room).expect("parks on lane 4");
+        let Detour::Park { route, s: ps, back, .. } = d.clone() else { panic!("{d:?}") };
+        assert_eq!((route, ps, back), (vec![0, 4], 150.0, vec![4, 1, 2, 3, 0]));
+        // without the time to drive there and back, it stays
+        assert!(plan_detour(&net, 0, 300.0, 300.0, 300.0, &room).is_none());
+        let mut v = test_vehicle();
+        let mut st = AiState::new(0, 300.0, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.route = vec![0, 1];
+        let stops = vec![Stop { ri: 0, s: 300.0, bay: 0.0, depart: 700.0, id: 7, side: 0.0 }, Stop { ri: 1, s: 50.0, bay: 0.0, depart: 800.0, id: 8, side: 0.0 }];
+        let mut s = BusService::new(stops);
+        s.layover = true;
+        let ctx = ctx_on(&net, &[], 100.0, 0.0);
+        s.arrive(&ctx, 700.0, 7, (0, 300.0));
+        s.start_detour(&mut st, &net, d, 100.0, 1);
+        // there and standing; then back at the stop before the departure
+        let (mut parked_at, mut set_off) = (None, None);
+        let back = drive(&mut s, &mut st, &mut v, &net, 100.0, 600.0, |t, s, st| {
+            if st.lane == 4 && st.speed < 0.05 && (st.s - 150.0).abs() < 2.0 && parked_at.is_none() {
+                parked_at = Some(t);
+            }
+            if parked_at.is_some() && set_off.is_none() && st.speed > 0.5 {
+                set_off = Some(t);
+            }
+            parked_at.is_some() && s.at_stop()
+        });
+        assert!(parked_at.is_some_and(|t| t < 150.0), "{parked_at:?}");
+        // it stands there until the way back (1550 m at 6 m/s) and half a minute are left
+        assert!(set_off.is_some_and(|t| (410.0..416.0).contains(&t)), "{set_off:?}");
+        assert!(back < 700.0, "back at {back}");
+        assert_eq!(st.lane, 0);
+        assert_eq!(s.stops.front().map(|x| (x.id, x.ri)), Some((7, 4)));
+        assert_eq!(s.leave_at, 700.0);
     }
 
     #[test]
