@@ -345,6 +345,15 @@ impl Viewer {
         self.min_size <= 0.0 || 2.0 * r / (dist.max(0.01) * self.fov.max(1e-3)) >= self.min_size
     }
 
+    /// Could a vehicle of radius `r` at `p` come or go unseen with nothing hiding it: the
+    /// rule of `Traffic::hidden` without its "behind a building or the ground" branch, for
+    /// where no world is at hand. Never within `NEVER_VANISH_WITHIN`; beyond that where
+    /// the renderer leaves it out, or past `NEAR_HIDE` out of the picture.
+    pub fn hides_plainly(&self, p: DVec3, r: f64) -> bool {
+        let d = (p - self.pos).length();
+        d >= NEVER_VANISH_WITHIN && (!self.draws(d, r) || (d >= NEAR_HIDE && !self.frames(p, r)))
+    }
+
     /// Does a sphere of radius `r` at `p` lie within the view frustum and range?
     pub fn frames(&self, p: DVec3, r: f64) -> bool {
         let rel = p - self.pos;
@@ -586,6 +595,9 @@ pub struct Traffic {
     /// [ROLLBACK r4d-B2] Timetable buses not to be taken off the road as the last resort
     /// before this time of day (the tour's bus was, a moment ago: `RESPAWN_COOLDOWN`).
     pub respawn_block: HashMap<u64, f64>,
+    /// [ROLLBACK r4d-B2] Why each timetable bus that nothing lets out of the way was not
+    /// taken off the road either, as logged (once per reason).
+    respawn_refused: HashMap<u64, &'static str>,
     /// One-way lanes that have had their reverse twin added (`add_reverse_twins`).
     twinned: hashbrown::HashSet<usize>,
     /// Bodies besides the AI vehicles' that no timetable vehicle may be put into: the
@@ -1177,6 +1189,7 @@ impl Traffic {
             through: Default::default(),
             respawned: Vec::new(),
             respawn_block: HashMap::new(),
+            respawn_refused: HashMap::new(),
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
@@ -2899,6 +2912,12 @@ impl Traffic {
     /// checked only for a vehicle origin within 9 m, and a layover bus appeared inside the
     /// articulated bus waiting at the same stand.
     pub fn spawn_clear(&self, ty: &VehicleType, pos: DVec3, heading: f64) -> bool {
+        self.spawn_clear_except(ty, pos, heading, None)
+    }
+
+    /// `spawn_clear`, leaving out car `except` (a vehicle asking whether it could be put
+    /// back where it stands).
+    pub fn spawn_clear_except(&self, ty: &VehicleType, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
         let (front, rear, half_w) = extents(ty, 12.0);
         let h = heading.to_radians();
         let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
@@ -2913,14 +2932,15 @@ impl Traffic {
             z: pos.z,
         };
         if self.footprints().iter().any(|f| {
-            (f.center - me.center).length() < f.half_len + me.half_len + 5.0
+            Some(f.car) != except
+                && (f.center - me.center).length() < f.half_len + me.half_len + 5.0
                 && (f.z - me.z).abs() < 4.0
                 && f.overlaps(&me, 1.0)
         }) {
             return false;
         }
         // nor just in front of a car driving up to that place (it would have to stop hard)
-        let in_front = self.cars.iter().any(|c| {
+        let in_front = self.cars.iter().enumerate().filter(|(i, _)| Some(*i) != except).any(|(_, c)| {
             let rel = pos - c.vehicle.position;
             let h = c.vehicle.heading.to_radians();
             let (along, across) = (
@@ -3105,27 +3125,68 @@ impl Traffic {
     }
 
     /// [ROLLBACK r4d-B2] The last resort for timetable bus `i`, which nothing lets out of the
-    /// way: when nobody sees it, the time of day its trip comes back on the road (its
-    /// departure from the stop it waits for, less `bus_service::RESPAWN_LEAD`, at least half
-    /// a minute on).
-    fn respawn_at(&self, i: usize) -> Option<crate::bus_service::Respawned> {
-        let c = &self.cars[i];
-        let b = c.bus.as_ref()?;
-        let p = c.vehicle.position;
-        let r = (c.ai.state.front + c.ai.state.rear) as f64 * 0.5 + 2.0;
-        if self.viewer.is_some_and(|v| (p - v.pos).length() < 80.0 || v.frames(p, r)) {
+    /// way: when nobody sees it go, and it could come back unseen, the time of day its trip
+    /// comes back on the road (its departure from the stop it waits for, less
+    /// `bus_service::RESPAWN_LEAD`, at least half a minute on). It goes only by the rule a
+    /// bus appears by (`may_appear`, without the buildings: never within 150 m of the
+    /// player, nor in the picture within 350 m), and only while a place within
+    /// `schedule::RESPAWN_APPROACH` of its stop is free and out of view by that same rule
+    /// at this moment (a bus vanished 183 m from the player in plain sight, and then no
+    /// place to come back at was ever out of view: a departure lost for nothing).
+    fn respawn_at(&mut self, i: usize) -> Option<crate::bus_service::Respawned> {
+        let (p, r, id, stop, depart, ty, route) = {
+            let c = &self.cars[i];
+            let b = c.bus.as_ref()?;
+            let stop = *b.stops.front()?;
+            let depart = if b.at_stop() { b.leave_at.max(stop.depart) } else { stop.depart };
+            let r = (c.ai.state.front + c.ai.state.rear) as f64 * 0.5 + 2.0;
+            (c.vehicle.position, r, c.id, stop, depart, c.vehicle.ty.clone(), c.ai.state.route.clone())
+        };
+        if route.get(stop.ri).is_none() {
             return None;
         }
         // (not again for a while: the tour's bus put back for its departure was taken off
         // again 36 s later at its next layover)
-        if self.respawn_block.get(&c.id).is_some_and(|&t| self.day_time < t) {
+        if self.respawn_block.get(&id).is_some_and(|&t| self.day_time < t) {
             return None;
         }
-        let stop = b.stops.front()?;
-        let depart = if b.at_stop() { b.leave_at.max(stop.depart) } else { stop.depart };
+        if self.viewer.is_some_and(|v| !v.hides_plainly(p, r)) {
+            self.respawn_refuse(i, "in the player's sight");
+            return None;
+        }
+        let places = crate::schedule::respawn_places(&self.net, &route, (stop.ri, stop.s));
+        let viewer = self.viewer;
+        let mut why = None;
+        let back = places.iter().any(|&(k, at_s)| {
+            let (q, h) = self.net.lanes[route[k]].at(at_s);
+            if viewer.is_some_and(|v| !v.hides_plainly(q, 8.0)) {
+                why.get_or_insert("every place to come back at is in the player's sight");
+                return false;
+            }
+            if self.blocked_except(&ty, q, h as f64, Some(i)) || !self.spawn_clear_except(&ty, q, h as f64, Some(i)) {
+                why.get_or_insert("no place to come back at is free");
+                return false;
+            }
+            true
+        });
+        if !back {
+            self.respawn_refuse(i, why.unwrap_or("nowhere to come back at"));
+            return None;
+        }
+        self.respawn_refused.remove(&id);
         let at = (depart - crate::bus_service::RESPAWN_LEAD).max(self.day_time + 30.0);
-        log::info!("t={:.1}: timetable bus {} taken off the road: no loop or room within range, {} queued behind it; its trip comes back at its stop {} at {:.1} min (departure {:.1} min)", self.day_time, c.id, self.queued_behind(i), stop.id, at / 60.0, depart / 60.0);
-        Some(crate::bus_service::Respawned { car: c.id, removed: self.day_time, at, depart, stop: stop.id })
+        log::info!("t={:.1}: timetable bus {} taken off the road: no loop or room within range, {} queued behind it; its trip comes back at its stop {} at {:.1} min (departure {:.1} min)", self.day_time, id, self.queued_behind(i), stop.id, at / 60.0, depart / 60.0);
+        Some(crate::bus_service::Respawned { car: id, removed: self.day_time, at, depart, stop: stop.id })
+    }
+
+    /// [ROLLBACK r4d-B2] Bus `i` stays where it is although nothing lets it out of the way:
+    /// `why` it was not taken off the road either, logged once per reason.
+    fn respawn_refuse(&mut self, i: usize, why: &'static str) {
+        let id = self.cars[i].id;
+        if self.respawn_refused.get(&id) != Some(&why) {
+            log::info!("t={:.1}: timetable bus {} stays: no loop or room within range, {} queued behind it, and not taken off the road: {why}", self.day_time, id, self.queued_behind(i));
+            self.respawn_refused.insert(id, why);
+        }
     }
 
     /// [ROLLBACK r4d-B2] Where on lane `l` timetable bus `me`, `len` metres long and
@@ -3882,6 +3943,12 @@ impl Traffic {
     /// an articulated bus reaches 6 m ahead of its origin and 12 m behind it, and one put
     /// down 9.3 m from the player's bus stood 1.8 m inside it.
     pub fn blocked(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64) -> bool {
+        self.blocked_except(ty, pos, heading, None)
+    }
+
+    /// `blocked`, leaving out car `except` (a vehicle asking whether it could be put back
+    /// where it stands).
+    pub fn blocked_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
         let grown = |mut b: omsi_sim::collision::Obb| {
             b.half += glam::DVec2::splat(0.5);
             b
@@ -3923,8 +3990,9 @@ impl Traffic {
             || self
                 .cars
                 .iter()
-                .filter(|c| (c.vehicle.position - pos).length() < reach)
-                .any(|c| vehicle_bodies(&c.vehicle).iter().any(|o| touches(o)))
+                .enumerate()
+                .filter(|(i, c)| Some(*i) != except && (c.vehicle.position - pos).length() < reach)
+                .any(|(_, c)| vehicle_bodies(&c.vehicle).iter().any(|o| touches(o)))
     }
 
     /// The lanes the other way along one-way paths `lanes` (see `Schedule`'s route
@@ -5077,3 +5145,39 @@ mod group_density_tests {
 }
 
 
+
+#[cfg(test)]
+mod respawn_sight_tests {
+    use super::{Viewer, NEAR_HIDE, NEVER_VANISH_WITHIN};
+    use glam::DVec3;
+
+    /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
+    fn viewer() -> Viewer {
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57 }
+    }
+
+    /// [ROLLBACK r4d-B2] A bus is taken off the road by the rule it comes back by: never
+    /// near the player, nor in the picture within 350 m, whatever the collision boxes say.
+    #[test]
+    fn a_bus_goes_only_where_it_could_come_back() {
+        let v = viewer();
+        // 120 m behind the player, out of the picture: the mirrors see it
+        assert!(!v.hides_plainly(DVec3::new(0.0, -120.0, 0.0), 8.0));
+        assert!(NEVER_VANISH_WITHIN > 120.0);
+        // 183 m ahead, in plain sight (the bus lost at Anwai)
+        assert!(!v.hides_plainly(DVec3::new(0.0, 183.0, 0.0), 8.0));
+        // 183 m behind: in no mirror's range, but a turn of the head sees it
+        assert!(!v.hides_plainly(DVec3::new(0.0, -183.0, 0.0), 8.0));
+        assert!(NEAR_HIDE > 183.0);
+        // 400 m behind, out of the picture
+        assert!(v.hides_plainly(DVec3::new(0.0, -400.0, 0.0), 8.0));
+        // 400 m ahead, in the picture
+        assert!(!v.hides_plainly(DVec3::new(0.0, 400.0, 0.0), 8.0));
+        // beyond what is drawn at all
+        assert!(v.hides_plainly(DVec3::new(0.0, 950.0, 0.0), 8.0));
+        // the renderer's culling leaves a bus out from 300 m: it goes there
+        let v = viewer().with_culling(0.0, 300.0);
+        assert!(v.hides_plainly(DVec3::new(0.0, 330.0, 0.0), 8.0));
+        assert!(!v.hides_plainly(DVec3::new(0.0, 280.0, 0.0), 8.0));
+    }
+}

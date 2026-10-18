@@ -3076,7 +3076,7 @@ fn block_until(blocks: &mut HashMap<u64, f64>, car: u64, t: f64) {
 
 /// [ROLLBACK r4d-B2] How far before its stop a bus taken off the road may come back (m), and
 /// the step between the places tried on the way up to it.
-const RESPAWN_APPROACH: f32 = 150.0;
+pub(crate) const RESPAWN_APPROACH: f32 = 150.0;
 const RESPAWN_STEP: f32 = 10.0;
 
 /// [ROLLBACK r4d-B2] The place `d` metres back along `section` from (`at.0`, `at.1`): lane
@@ -3101,7 +3101,7 @@ fn stop_gap(net: &Network, section: &[usize], a: (usize, f32), b: (usize, f32)) 
 /// [ROLLBACK r4d-B2] The places a bus taken off the road may be put back at, in order: its
 /// stop (`stop`), then on its way up to it every `RESPAWN_STEP` m back as far as
 /// `RESPAWN_APPROACH` (along its own trip's lanes).
-fn respawn_places(net: &Network, section: &[usize], stop: (usize, f32)) -> Vec<(usize, f32)> {
+pub(crate) fn respawn_places(net: &Network, section: &[usize], stop: (usize, f32)) -> Vec<(usize, f32)> {
     let mut out = vec![stop];
     let mut d = RESPAWN_STEP;
     while d <= RESPAWN_APPROACH + 1e-3 {
