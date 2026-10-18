@@ -8,7 +8,7 @@ use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
 use omsi_traffic::junction::FoeKind;
 #[allow(unused_imports)]
-use omsi_traffic::{Junctions, Simulation, Vehicle, VehicleClass};
+use omsi_traffic::{Junctions, PlayerView, Simulation, Vehicle, VehicleClass};
 
 #[allow(dead_code)]
 const DT: f32 = 1.0 / 30.0;
@@ -887,4 +887,148 @@ fn x7_who_eases_off_is_a_hash_of_the_pair_and_the_junction() {
     // (both sides come up)
     let picks: Vec<bool> = (0..64usize).map(|j| eases_off(3, 4, j) == 3).collect();
     assert!(picks.iter().any(|&p| p) && picks.iter().any(|&p| !p));
+}
+
+/// X2: a player's bus beside an AI car on lanes `apart` m apart cuts in: from abreast (the
+/// bus's rear `behind` m behind the car's front), it turns `angle` degrees into the car's lane
+/// over 1.5 s at 7 m/s, the car doing 8 m/s.
+#[test]
+fn r11_x2_player_bus_beside_cuts_in() {
+    let mut rows = Vec::new();
+    let mut worst = f32::INFINITY;
+    for apart in [2.4f64, 3.0, 3.5] {
+        for behind in [0.0f32, 1.0, 2.0, 4.0] {
+            for angle in [6.0f64, 10.0, 15.0] {
+                let mut net = Network::default();
+                let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
+                a.offset = 0.0;
+                let mut b = road(&[(0.0, -apart), (600.0, -apart)], 1);
+                b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+                b.offset = apart as f32;
+                net.lanes.push(a);
+                net.lanes.push(b);
+                let net = finish(net);
+                let mut sim = Simulation::new(&net, vec![]);
+                let mut me = car(1, 0, 100.0, 8.0);
+                me.state.max_speed_kmh = 29.0;
+                let mut cars = vec![me];
+                // the bus: centre x so that its rear is `behind` m behind the car's front (102)
+                let mut bx = 102.0 - behind as f64 + 6.0;
+                let mut by = -apart;
+                let mut h = 90.0f64;
+                let mut least = f32::INFINITY;
+                let mut t_in = None;
+                let mut at_contact: Option<String> = None;
+                let mut v_after = 0.0f32;
+                let mut lost = 0;
+                run(&net, &mut sim, &mut cars, 8.0, |t, sim, cars| {
+                    let v = 7.0f64;
+                    if t > 0.5 && h > 90.0 - angle {
+                        h -= angle * DT as f64 / 1.5;
+                    }
+                    // straighten once over the line
+                    if by > -0.3 && h < 90.0 {
+                        h = (h + 20.0 * DT as f64).min(90.0);
+                    }
+                    let hr = h.to_radians();
+                    bx += hr.sin() * v * DT as f64;
+                    by += hr.cos() * v * DT as f64;
+                    let pl = PlayerView { id: 7, pos: DVec3::new(bx, by, 0.0), heading: h as f32, half_len: 6.0, half_width: 1.25, speed: 7.0, still: 0.0, blinker: 1, signalling: 3.0 + t, priority: false };
+                    let s = pl.obb(0.0, 0.0).separation(&cars[0].obb()) as f32;
+                    if s < least {
+                        least = s;
+                    }
+                    if s < 0.0 && at_contact.is_none() {
+                        at_contact = Some(format!("t {t:.2} AI v {:.1} lead {:?} why {:?}", cars[0].state.speed, cars[0].last.lead.map(|l| (l.gap * 10.0).round() / 10.0), cars[0].last.why));
+                    }
+                    if at_contact.is_some() {
+                        v_after = v_after.max(cars[0].state.speed);
+                        if cars[0].last.lead_seen.is_none() {
+                            lost += 1;
+                        }
+                    }
+                    if t_in.is_none() && cars[0].last.lead_seen.is_some() {
+                        t_in = Some(t);
+                    }
+                    sim.players = vec![pl];
+                });
+                rows.push(format!("apart {apart} behind {behind} angle {angle}: least {least:.2}, AI saw a lead from {t_in:?}; first contact {at_contact:?}, AI top speed after contact {v_after:.1}, frames after contact with no lead {lost}"));
+                worst = worst.min(least);
+            }
+        }
+    }
+    eprintln!("X2 player bus cuts in:\n  {}", rows.join("\n  "));
+    assert!(worst > 0.0, "the AI car drove into the bus cutting in: {worst:.2}");
+}
+
+/// A car (an AI car, or the player's bus) driving beside me in the next lane, parallel, at my
+/// speed or a little faster: no lead, I am not held.
+#[test]
+fn x2_a_parallel_vehicle_beside_me_does_not_hold_me() {
+    for apart in [2.6f64, 3.0, 3.5] {
+        for player in [false, true] {
+            let mut net = Network::default();
+            let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
+            a.offset = 0.0;
+            let mut b = road(&[(0.0, -apart), (600.0, -apart)], 1);
+            b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+            b.offset = apart as f32;
+            net.lanes.push(a);
+            net.lanes.push(b);
+            let net = finish(net);
+            let mut sim = Simulation::new(&net, vec![]);
+            let mut me = car(1, 0, 100.0, 8.0);
+            me.state.max_speed_kmh = 29.0;
+            let mut cars = vec![me];
+            if !player {
+                let mut o = car(2, 1, 103.0, 8.5);
+                o.state.max_speed_kmh = 31.0;
+                cars.push(o);
+            }
+            let mut bx = 106.0f64;
+            let mut slowest = f32::INFINITY;
+            let mut held = 0;
+            run(&net, &mut sim, &mut cars, 6.0, |t, sim, cars| {
+                bx += 8.5 * DT as f64;
+                if player {
+                    sim.players = vec![omsi_traffic::PlayerView { id: 7, pos: DVec3::new(bx, -apart, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 8.5, still: 0.0, blinker: 0, signalling: 0.0, priority: false }];
+                }
+                let me = cars.iter().find(|c| c.id == 1).unwrap();
+                if t > 0.5 {
+                    slowest = slowest.min(me.state.speed);
+                    held += me.last.lead.is_some_and(|l| l.gap < 3.0) as i32;
+                }
+            });
+            assert!(held == 0 && slowest > 7.5, "apart {apart} player {player}: held {held} frames, slowest {slowest:.1}");
+        }
+    }
+}
+
+/// An AI car beside me in the next lane, a little ahead, changes into my lane (no gap for it):
+/// it is moving into my corridor, I drop back and do not drive into it.
+#[test]
+fn x2_an_ai_car_beside_me_cutting_in_is_let_in() {
+    for (apart, ahead) in [(3.0f64, 2.0f32), (3.5, 0.5), (3.5, 3.0)] {
+        let mut net = Network::default();
+        let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
+        a.offset = 0.0;
+        let mut b = road(&[(0.0, -apart), (600.0, -apart)], 1);
+        b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+        b.offset = apart as f32;
+        net.lanes.push(a);
+        net.lanes.push(b);
+        let net = finish(net);
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut me = car(1, 0, 100.0, 8.0);
+        me.state.max_speed_kmh = 29.0;
+        let mut other = car(2, 1, 100.0 + ahead, 7.0);
+        other.state.max_speed_kmh = 25.2;
+        other.state.start_change(&net, 0, 1);
+        if let Some(c) = other.state.change.as_mut() {
+            c.wait = 0.0;
+        }
+        let mut cars = vec![me, other];
+        let min_gap = run(&net, &mut sim, &mut cars, 8.0, |_, _, _| {});
+        assert!(min_gap > 0.0, "apart {apart} ahead {ahead}: drove into it, {min_gap:.2} m");
+    }
 }

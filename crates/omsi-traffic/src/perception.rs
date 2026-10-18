@@ -504,6 +504,10 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             continue;
         }
         // (two bodies blocking each other: the higher id goes)
+        // TODO(review11, pre-existing): of two bodies blocking each other head-on, the higher id
+        // ignores the lower one's body and drives into it (-1.82 m on both the baseline and
+        // round 4b); it should keep the body as an obstacle and leave the pair to the
+        // negotiation of a mutual hold instead.
         if !on_way && o.last.body_block == Some(me.id) && me.id > o.id {
             continue;
         }
@@ -511,15 +515,32 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // middle - it signals, I let it in ahead of me, as one in that lane; the lane-based
         // lead had it there from its first frame. Not one beside me: it waits for its gap)
         let into_mine = o.state.change.filter(|c| lanes.iter().any(|w| w.0 == c.to)).and_then(|_| o.state.change_anchors(net)).map(|(_, (p, h))| Obb::vehicle(p.truncate(), h as f64, o.state.front as f64, o.state.rear as f64, o.half_width as f64));
+        let oh = (o.heading as f64).to_radians();
+        let o_fwd = DVec2::new(oh.sin(), oh.cos());
         let hit = way.corridor_span(&o.obb(), w, reach).or_else(|| into_mine.and_then(|b| way.corridor_span(&b, w, reach).filter(|h| h.0 - st.front >= 0.0)));
+        // (moving into my corridor: where it will be, if nearer, `cut_in_hit`)
+        let hit = match (hit, cut_in_hit(way, &o.obb(), o_fwd, o.state.speed, o.last.stop.map(|sp| sp - o.state.front), w, reach)) {
+            (Some(h), Some(c)) if c.0 < h.0 => Some((c.0, h.1, c.1, c.2)),
+            (None, Some(c)) => Some((c.0, c.0 + o.length(), c.1, c.2)),
+            (h, _) => h,
+        };
         let Some((near, far, k, f)) = hit else { continue };
         // (not one on another level: a bridge over the way, the road under it)
         if !on_way && (o.pos.z - way.zs[k]).abs() > 3.0 {
             continue;
         }
-        let gap = near - st.front;
-        if gap < -0.5 || gap > reach {
+        let mut gap = near - st.front;
+        let mut cut_in = false;
+        if gap > reach {
             continue;
+        }
+        // beside me: a lead only when it is moving into my corridor (`cutting_in`), at gap 0
+        if gap < -0.5 {
+            if !cutting_in(o_fwd, o.state.speed, f, o.pos.truncate() - way.pts[k].1, w) {
+                continue;
+            }
+            gap = 0.0;
+            cut_in = true;
         }
         // the one behind that follows me is not my lead
         if o.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
@@ -543,10 +564,9 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 continue;
             }
         }
-        let oh = (o.heading as f64).to_radians();
-        let o_fwd = DVec2::new(oh.sin(), oh.cos());
         let along = o_fwd.dot(f) as f32;
-        let speed = o.state.speed * along;
+        // (cutting in beside me: held as standing there, so that I drop back behind it)
+        let speed = if cut_in { 0.0 } else { o.state.speed * along };
         let acc = if along > 0.7 { o.state.acc * along } else { 0.0 };
         let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
         let held = o.last.held || o.last.stop.is_some();
@@ -631,6 +651,79 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
     best
 }
 
+/// A body beside me (`rel`: from the way's sample to its middle, `f`: the way's direction
+/// there) that overlaps my corridor and is moving into it (or is in it already, its middle
+/// within my corridor's half width `w`): its middle ahead of mine, moving
+/// (over 0.5 m/s) with its heading more than `CUT_IN_DEG` towards my way or its sideways speed
+/// towards it over `CUT_IN_SPEED`. Such a body is a lead at gap 0 (I hold back and let it
+/// in, braking as for one standing there until it is ahead of me); one merely beside me and
+/// parallel is not.
+fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, w: f64) -> bool {
+    let right = DVec2::new(f.y, -f.x);
+    let (along, lat) = (rel.dot(f), rel.dot(right));
+    if along <= 0.0 {
+        return false;
+    }
+    // (or in already: its middle inside my corridor, `w` either side of my way)
+    if lat.abs() <= w {
+        return true;
+    }
+    if speed < 0.5 {
+        return false;
+    }
+    let toward = -(o_fwd.dot(right)) * lat.signum();
+    if o_fwd.dot(f) < CUT_IN_MAX_DEG.to_radians().cos() as f64 {
+        return false;
+    }
+    toward > (CUT_IN_DEG as f64).to_radians().sin() || speed as f64 * toward > CUT_IN_SPEED as f64
+}
+
+/// A body moving sideways into my corridor (`cutting_in`'s heading or sideways speed, measured
+/// at the sample of my way nearest its middle): where its box would come into my corridor
+/// moved sideways by what it covers in `CUT_IN_TIME` (at most 3 m, and no further than `room`, the
+/// way its front has to the stop it brakes for), as `WayPts::corridor_hit`.
+/// It is my lead from there: seen only where it is, a bus cutting in at 6-15 degrees left the
+/// car half a second to brake, and its near edge in my lane ran back towards the car faster
+/// than its speed said (review11).
+fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
+    if speed < 0.5 || way.pts.len() < 2 {
+        return None;
+    }
+    let k = (0..way.pts.len() - 1).min_by(|&x, &y| (way.pts[x].1 - b.center).length().total_cmp(&(way.pts[y].1 - b.center).length()))?;
+    let f = (way.pts[k + 1].1 - way.pts[k].1).normalize_or_zero();
+    let right = DVec2::new(f.y, -f.x);
+    let lat = (b.center - way.pts[k].1).dot(right);
+    if lat.abs() < 1e-3 {
+        return None;
+    }
+    let toward = -(o_fwd.dot(right)) * lat.signum();
+    // (my way, about: crossing traffic is the junctions' to sort out)
+    if o_fwd.dot(f) < CUT_IN_MAX_DEG.to_radians().cos() as f64 {
+        return None;
+    }
+    if !(toward > (CUT_IN_DEG as f64).to_radians().sin() || speed as f64 * toward > CUT_IN_SPEED as f64) {
+        return None;
+    }
+    // (no further than the stop it is braking for lets it: a car creeping up to the line it
+    // waits at comes no nearer)
+    let shift = (speed as f64 * toward * CUT_IN_TIME as f64).min(room.map(|r| r.max(0.0) as f64 * toward).unwrap_or(f64::INFINITY)).clamp(0.0, 3.0);
+    if shift < 0.05 {
+        return None;
+    }
+    let moved = Obb { center: b.center - right * (lat.signum() * shift), ..*b };
+    way.corridor_hit(&moved, w, upto)
+}
+
+/// `cut_in_hit`: the seconds of sideways movement looked ahead.
+pub const CUT_IN_TIME: f32 = 2.5;
+
+/// A body beside me heading more than this many degrees towards my way is cutting in ...
+pub const CUT_IN_DEG: f32 = 5.0;
+/// ... heading within this many degrees of my way (one going across it is crossing traffic) ...
+pub const CUT_IN_MAX_DEG: f32 = 45.0;
+/// ... or moving towards it sideways faster than this (m/s).
+pub const CUT_IN_SPEED: f32 = 0.2;
+
 /// A player's vehicle on the way.
 fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Option<Headway> {
     let st = &me.state;
@@ -650,12 +743,26 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
         // grown by half a metre all round and my half width, as before, kept a follower 1.4 m
         // further back than the gap it says, viz3 case13)
         let b = p.obb(ahead, 0.0);
-        if let Some((d, k, fwd)) = way.corridor_hit(&b, me.half_width as f64 + LEAD_MARGIN, look) {
-            let gap = d - st.front;
+        let w = me.half_width as f64 + LEAD_MARGIN;
+        let hit = match (way.corridor_hit(&b, w, look), cut_in_hit(way, &b, p.fwd(), p.speed.abs(), None, w, look)) {
+            (Some(h), Some(c)) if c.0 < h.0 => Some(c),
+            (None, Some(c)) => Some(c),
+            (h, _) => h,
+        };
+        if let Some((d, k, fwd)) = hit {
+            let mut gap = d - st.front;
+            let mut cut_in = false;
+            // (beside me: a lead only when it is moving into my corridor, at gap 0; review11: the
+            // bus cutting in from the next lane at 6-15 degrees was dropped once part of it was
+            // beside the car, and the car drove through it at 8 m/s)
             if gap < -0.5 {
-                continue;
+                if !cutting_in(p.fwd(), p.speed.abs(), fwd, p.pos.truncate() - way.pts[k].1, me.half_width as f64 + LEAD_MARGIN) {
+                    continue;
+                }
+                gap = 0.0;
+                cut_in = true;
             }
-            let speed = (p.fwd() * p.speed as f64).dot(fwd) as f32;
+            let speed = if cut_in { 0.0 } else { (p.fwd() * p.speed as f64).dot(fwd) as f32 };
             let right = DVec2::new(fwd.y, -fwd.x);
             let q = way.pts[k].1;
             let lateral = (p.pos.truncate() - q).dot(right) as f32 + st.lateral_ahead(way.pts[k].0);

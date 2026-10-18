@@ -530,6 +530,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let junction_near = p.junction.as_ref().map(|j| (j.entry < real + st.front + obstacle_len + zone || j.entry - st.front < JUNCTION_KEEP) && !matches!(l.what, Seen::Parked)).unwrap_or(false);
         let road_ok = p.road_left > pass_len + real + 30.0;
         let oncoming = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked);
+        // TODO(review11, pre-existing): `clear_for` is the oncoming car's time to the passer's
+        // current position, compared with the pass time + 1.5 s; a car coming at 13 m/s meets
+        // the passer before that point. It should be the time to where the pass ends.
         let oncoming_free = oncoming.is_some_and(|o| {
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
