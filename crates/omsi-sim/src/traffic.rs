@@ -2583,7 +2583,7 @@ const PLAN_LANES: usize = 20;
 const JOINT_BLEND: f32 = 6.0;
 /// Seconds of signalling before a lane change begins to move sideways.
 // [ROLLBACK lanechange-108] two seconds (was 1.2) before the car moves over
-const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
+pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
 /// going. The body that follows this way is `ai_motion::AiBody`.

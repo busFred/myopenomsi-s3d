@@ -150,6 +150,18 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     (desire, gap_accepted(me, nb))
 }
 
+/// The vehicle `id` passed (a player's: `PLAYER_ID_BASE` + its id): (a bus, indicating out
+/// towards the traffic, moving). None when it is gone.
+fn obstacle_bus(sim: &Simulation, vehicles: &[Vehicle], id: u64) -> Option<(bool, bool, bool)> {
+    let out = sim.out_side();
+    if id >= crate::sim::PLAYER_ID_BASE {
+        let p = sim.players.iter().find(|p| p.id as u64 == id - crate::sim::PLAYER_ID_BASE)?;
+        return Some((true, p.blinker as i32 == out, p.speed.abs() > 0.5));
+    }
+    let o = vehicles.iter().find(|o| o.id == id)?;
+    Some((o.is_bus(), o.blinker_shown.0 == out, o.state.speed > 0.5))
+}
+
 /// Within this many metres of a junction (from the front to where its object begins) a car
 /// does not pull out to pass, nor keeps back to be able to.
 pub const JUNCTION_KEEP: f32 = 40.0;
@@ -396,8 +408,22 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
         }
+        // passing a bus that indicates out of its stop or moves off: back in behind it at the
+        // gap the driver keeps, while it still can (it pulls out in front of the car; the
+        // player's bus is let out of its stop so, `letting_out`)
+        if !pass.aborted && out.start.is_none() {
+            if let Some((true, signals, moves)) = pass.obstacle.and_then(|ob| obstacle_bus(sim, vehicles, ob)) {
+                let shallow = pass.wait > 0.0 || st.lateral.abs() < pass.side.abs() - me.half_width - 1.45;
+                if (signals || moves) && shallow && st.odometer + v * v / 7.0 + 0.4 < pass.block {
+                    out.start = Some(Start::AbortPass { hold: pass.block + st.front + 0.6 - st.min_gap });
+                }
+            }
+        }
         if pass.aborted {
             min_stop(&mut out.stop, &mut out.why, Some((pass.hold - st.odometer).max(0.0)), Why::Lead);
+        } else if pass.wait > 0.0 {
+            // signalling: still behind it, with the room to pull out
+            min_stop(&mut out.stop, &mut out.why, Some(st.front + (pass.block - st.odometer - pass.out_len - 1.0).max(0.0)), Why::Lead);
         } else {
             if st.odometer < pass.block + 2.0 {
                 // edging out: gently
@@ -418,6 +444,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let solid = lane.no_overtaking;
         let player = matches!(l.what, Seen::Player(_));
         let player_out = player && sim.players.iter().any(|pl| pl.blinker as i32 == out_side && pl.signalling < 1.0);
+        // the thing standing, and a bus of it that indicates out of its stop (not passed: it
+        // is let out, Sobol's rule)
+        let obstacle_id = match l.what {
+            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.id),
+            Seen::Player(id) => Some(crate::sim::PLAYER_ID_BASE + id as u64),
+            Seen::Parked => None,
+        };
+        let bus_out = obstacle_id.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, _)| bus && signals);
         // a bus does not pass what stands at its own next stop
         let own_stop = me.external.stop_at.map(|s| s < l.gap + l.length + st.front + 15.0).unwrap_or(false);
         // how far the car has to swing out: past the thing inside the lane if the lane
@@ -444,7 +478,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = can_pass && !own_stop && !player_out && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
+        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
         // (or round it into the lane beside, `Start::Bypass`)
         let bypass_possible = !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
         // keep back: room to pull out again, where the car can still stop there gently - only
@@ -467,7 +501,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
             let lane = if squeeze { None } else { oncoming.map(|o| o.lane) };
-            out.start = Some(Start::Pass(Passing { lane, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0 }));
+            out.start = Some(Start::Pass(Passing { lane, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0, wait: omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, obstacle: obstacle_id }));
         }
     }
 

@@ -454,7 +454,8 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
 fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], way: &WayPts, look: f32, body_look: f32) -> (Option<Headway>, Option<Headway>) {
     let me = &vehicles[i];
     let st = &me.state;
-    let passing = me.passing.filter(|p| !p.aborted);
+    // (once it pulls out: while it signals the thing is its lead)
+    let passing = me.passing.filter(|p| !p.aborted && p.wait <= 0.0);
     // (candidates: index, found on my way's lanes)
     let mut cand: Vec<(usize, bool)> = Vec::new();
     for &(l, d0) in lanes {

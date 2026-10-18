@@ -94,6 +94,13 @@ pub struct Passing {
     pub aborted: bool,
     /// Odometer reading at which an aborted pass holds the car.
     pub hold: f32,
+    /// Seconds of indicating left before the car pulls out (it signals the side it moves to
+    /// `SIGNAL_BEFORE_CHANGE` ahead, as a lane change does, and until it is back in its lane).
+    #[serde(default)]
+    pub wait: f32,
+    /// The vehicle passed (its id; a player's: `PLAYER_ID_BASE` + its id), if one.
+    #[serde(default)]
+    pub obstacle: Option<u64>,
 }
 
 impl Passing {
@@ -106,6 +113,15 @@ impl Passing {
 
     pub fn back_len_for(side: f32) -> f32 {
         (side.abs() * 6.0).clamp(8.0, 20.0)
+    }
+
+    /// The indicator of the side the car moves to (1 left, 2 right).
+    pub fn blinker(&self) -> i32 {
+        if self.side > 0.0 {
+            2
+        } else {
+            1
+        }
     }
 
     /// The bent way, as (odometer, offset) points from `odo` and the offset `from` there.
@@ -1023,7 +1039,10 @@ impl Simulation {
             }
             Some(Start::Pass(p)) => {
                 v.passing = Some(p);
-                v.state.lateral_curve = p.curve(v.state.odometer, v.state.lateral);
+                // (it pulls out once it has signalled, below)
+                if p.wait <= 0.0 {
+                    v.state.lateral_curve = p.curve(v.state.odometer, v.state.lateral);
+                }
                 v.state.lateral_target = 0.0;
                 v.stopped = 0.0;
             }
@@ -1039,6 +1058,19 @@ impl Simulation {
                 v.state.lateral_target = 0.0;
             }
             None => {}
+        }
+        // a pass pulls out once it has signalled for `SIGNAL_BEFORE_CHANGE` (counted while its
+        // indicator shows that side: from the other side's it takes a moment to change)
+        let shown = v.blinker_shown.0;
+        if let Some(p) = v.passing.as_mut() {
+            if !p.aborted && p.wait > 0.0 && shown == p.blinker() {
+                p.wait = (p.wait - dt).max(0.0);
+                if p.wait <= 0.0 {
+                    let pc = *p;
+                    v.state.lateral_curve = pc.curve(v.state.odometer, v.state.lateral);
+                    v.state.lateral_target = 0.0;
+                }
+            }
         }
         v.state.accel_cap = plan.accel_cap;
         // a fresh car: no harder braking than its driver likes at the start
@@ -1115,6 +1147,13 @@ impl Simulation {
             }
         }
         // indicators: what the car does, debounced so a flicker of the plan does not flash
+        // (a pass shows the side it moves to from before it pulls out until it is back in its
+        // lane: the bent way's offset alone showed the side it would come back to, the right
+        // while out on the left, viz3 review: 47 of 47)
+        if let Some(p) = v.passing.filter(|p| !p.aborted) {
+            v.state.signal = p.blinker();
+            v.state.signal_time = 0.25;
+        }
         v.state.update_blinker(net);
         let want = if v.external.blinker_off { 0 } else { v.state.blinker };
         let (shown, since) = v.blinker_shown;

@@ -568,3 +568,102 @@ fn x4_behind_a_standing_player_at_a_red_the_car_closes_up_and_keeps_room_only_wh
     let free = stands_behind_player(&two_way(false), vec![]);
     assert!(free > 8.5 && free < 11.5, "behind the player, free to pass: {free:.2} m");
 }
+
+/// A car standing for good on lane 0 at x = 200 (nothing holds it: an obstacle after 4 s).
+fn broken_down(id: u64, s: f32) -> Vehicle {
+    let mut o = car(id, 0, s, 0.0);
+    o.stopped = 30.0;
+    o.pull_out = 1000.0;
+    o
+}
+
+#[test]
+fn x5_a_pass_signals_the_side_it_moves_to_two_seconds_ahead_and_until_it_is_back() {
+    let net = two_way(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 150.0, 8.0), broken_down(2, 200.0)];
+    let (mut out_at, mut lead_time, mut wrong, mut started, mut back) = (None::<f32>, 0.0f32, 0, false, false);
+    let min_gap = run(&net, &mut sim, &mut cars, 40.0, |t, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        started |= me.passing.is_some();
+        if out_at.is_none() && me.state.lateral.abs() > 0.3 {
+            out_at = Some(t);
+            // the left indicator, shown since
+            assert_eq!(me.blinker_shown.0, 1, "pulled out showing {}", me.blinker_shown.0);
+            lead_time = t - me.blinker_shown.1 as f32;
+        }
+        if me.passing.is_some() && me.state.lateral.abs() > 1.0 && me.blinker_shown.0 != 1 {
+            wrong += 1;
+        }
+        back |= out_at.is_some() && me.passing.is_none() && me.state.lateral.abs() < 0.05 && me.pos.x > 215.0;
+    });
+    assert!(started && out_at.is_some(), "it never passed");
+    assert!(lead_time > 1.9, "signalled {lead_time:.2} s before pulling out");
+    assert_eq!(wrong, 0, "frames out on the left showing another indicator");
+    assert!(back, "never back in its lane past the obstacle");
+    assert!(min_gap > 0.3, "bodies {min_gap:.2} m apart");
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert_eq!(me.blinker_shown.0, 0, "the indicator is still on");
+}
+
+/// A bus serving its stop on lane 0 at x = 200, and a car rolling up behind it.
+fn bus_at_stop() -> (Network, Vec<Vehicle>) {
+    let net = two_way(false);
+    let mut st = AiState::new(0, 200.0, 2);
+    st.front = 6.0;
+    st.rear = 6.0;
+    st.length = 12.0;
+    st.veh_type = 2;
+    let mut bus = Vehicle::new(2, VehicleClass::Bus, st, 1.25, 2 * 7919);
+    bus.fresh = 0.0;
+    bus.external.at_stop = true;
+    bus.external.standing_for = 30.0;
+    bus.external.stop_at = Some(6.1);
+    (net, vec![car(1, 0, 150.0, 8.0), bus])
+}
+
+#[test]
+fn x5_a_pass_of_a_bus_at_its_stop_is_given_up_when_it_indicates_or_moves_off() {
+    // the bus indicates out of its stop (or moves off) while the car signals to pass it
+    for moves in [false, true] {
+        let (net, mut cars) = bus_at_stop();
+        let mut sim = Simulation::new(&net, vec![]);
+        let (mut started_at, mut aborted, mut out) = (None::<f32>, false, 0.0f32);
+        run(&net, &mut sim, &mut cars, 25.0, |t, _, cars| {
+            let me = cars.iter().find(|c| c.id == 1).unwrap();
+            if started_at.is_none() && me.passing.is_some() {
+                started_at = Some(t);
+            }
+            // (given up: the pass is over before it pulled out)
+            aborted |= started_at.is_some() && me.passing.is_none();
+            out = out.max(me.state.lateral.abs());
+            let pulled = started_at.is_some_and(|s| t > s + 1.0);
+            let bus = cars.iter_mut().find(|c| c.id == 2).unwrap();
+            if pulled {
+                bus.state.signal = 1;
+                bus.state.signal_time = 5.0;
+                if moves {
+                    bus.external.stop_at = None;
+                    bus.external.at_stop = false;
+                }
+            }
+        });
+        assert!(started_at.is_some(), "it never set out to pass the bus");
+        assert!(aborted, "the pass went on (moves {moves})");
+        assert!(out < 0.5, "it pulled out {out:.2} m (moves {moves})");
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let bus = cars.iter().find(|c| c.id == 2).unwrap();
+        assert!(me.passing.is_none(), "still passing");
+        assert!(me.pos.x as f32 + me.state.front < bus.pos.x as f32 - bus.state.rear, "not behind the bus");
+    }
+    // a bus that already indicates is not passed at all
+    let (net, mut cars) = bus_at_stop();
+    cars[1].state.signal = 1;
+    cars[1].state.signal_time = 60.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut started = false;
+    run(&net, &mut sim, &mut cars, 15.0, |_, _, cars| {
+        started |= cars.iter().find(|c| c.id == 1).unwrap().passing.is_some();
+    });
+    assert!(!started, "it set out to pass a bus indicating out of its stop");
+}
