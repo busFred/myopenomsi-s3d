@@ -666,6 +666,17 @@ impl ApplicationHandler for App {
                         t.player_priority = self.player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
                         t.player_blinker = self.player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
                         t.tick(dt, self.player.as_ref().map(|p| player_outline(p)));
+                        // [ROLLBACK r4d-B1] the riders of the timetable buses taken off the road
+                        let out = std::mem::take(&mut t.riders_out);
+                        if let (Some(h), Some(w)) = (self.humans.as_mut(), self.world.as_ref()) {
+                            for id in out {
+                                let n = h.people_in(crate::humans::BusId::Ai(id));
+                                if n > 0 {
+                                    log::info!("timetable bus {id} taken off the road: {n} riders put out with it");
+                                }
+                                h.evict(crate::humans::BusId::Ai(id), w);
+                            }
+                        }
                         if let Some(w) = self.world.as_ref() {
                             w.set_switches(&t.switch_requests());
                             let rail = self.player.as_ref().and_then(|p| p.rail.as_ref()).map(|r| (r.lane, r.along));

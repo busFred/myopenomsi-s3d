@@ -634,6 +634,17 @@ pub(crate) fn run_offscreen(
             t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
             t.player_blinker = player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
             t.tick(dt, player.as_ref().map(|p| player_outline(p)));
+            // [ROLLBACK r4d-B1] the riders of the timetable buses taken off the road
+            let out = std::mem::take(&mut t.riders_out);
+            if let Some(h) = humans_off.as_mut() {
+                for id in out {
+                    let n = h.people_in(humans::BusId::Ai(id));
+                    if n > 0 {
+                        log::info!("timetable bus {id} taken off the road: {n} riders put out with it");
+                    }
+                    h.evict(humans::BusId::Ai(id), &world);
+                }
+            }
             world.set_switches(&t.switch_requests());
             world.set_signals(&t.signal_aspects(&world.signal_routes, None));
             if let Some(p) = player.as_mut() {

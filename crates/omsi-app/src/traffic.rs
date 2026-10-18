@@ -573,6 +573,11 @@ pub struct Traffic {
     /// [ROLLBACK r4d-B1] Timetable buses in service that drove off the end of a dead-end lane
     /// (their ids): the timetable puts the trip back where its track goes on.
     pub dead_ended: Vec<u64>,
+    /// [ROLLBACK r4d-B1] Timetable buses taken off the road this frame, by any rule (their
+    /// ids): whoever rides them is put out with them (`humans::Humans::evict`), so that a
+    /// bus put back by the timetable carries nobody, and nobody is left riding a bus that
+    /// is gone.
+    pub riders_out: Vec<u64>,
     /// One-way lanes that have had their reverse twin added (`add_reverse_twins`).
     twinned: hashbrown::HashSet<usize>,
     /// Bodies besides the AI vehicles' that no timetable vehicle may be put into: the
@@ -1160,6 +1165,7 @@ impl Traffic {
             pull_out_rooms: HashMap::new(),
             removed_scheduled: Vec::new(),
             dead_ended: Vec::new(),
+            riders_out: Vec::new(),
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
@@ -1818,6 +1824,9 @@ impl Traffic {
                 }
             } else if remove {
                 let c = self.cars.swap_remove(i);
+                if c.is_bus() {
+                    self.riders_out.push(c.id);
+                }
                 if c.is_bus() && (unloaded || at_edge) {
                     self.removed_scheduled.push(c.id);
                 }
@@ -3425,6 +3434,9 @@ impl Traffic {
         self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
+            if c.is_bus() {
+                self.riders_out.push(c.id);
+            }
             // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
             if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone {
                 if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
@@ -3998,6 +4010,9 @@ impl Traffic {
             return false;
         };
         let c = self.cars.swap_remove(i);
+        if c.is_bus() {
+            self.riders_out.push(c.id);
+        }
         self.orphan_sounds.extend(c.sounds);
         for r in std::iter::once(c.render).chain(c.trailer_renders) {
             world.release_vehicle(renderer, scene, r);
