@@ -277,3 +277,24 @@ fn rule_f_the_mark_of_a_line_taken_on_green_does_not_carry_to_the_next_line_of_i
     assert!(marked, "it never took the first line on green");
     assert!(furthest <= 110.3, "its front got to x = {furthest:.1}, over the second line at 110 on red");
 }
+
+#[test]
+fn rule_e_the_player_standing_at_its_red_does_not_hold_a_green_stream() {
+    // the player's bus stands at its northbound red line (red until 15 s, never green with
+    // the eastbound light), for a second only (not blocked); the eastbound car has its green
+    // and must give way to it by the table (it comes from the right)
+    let (net, ctl) = signalled_cross();
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 0, 280.0 - 2.0 - 60.0, 10.0)];
+    let player = PlayerView { id: 7, pos: DVec3::new(0.0, -20.0 - 6.2, 0.0), heading: 0.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 1.0, blinker: 0, signalling: 0.0, priority: false };
+    let (mut waited, mut through) = (false, None);
+    run(&net, &mut sim, &mut cars, 12.0, |t, sim, cars| {
+        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
+        if through.is_none() && front_x(&cars[0]) > 20.0 {
+            through = Some(t);
+        }
+        sim.players = vec![player];
+    });
+    assert!(!waited, "the green car waited for the player standing at its red");
+    assert!(through.is_some_and(|t| t < 10.0), "through the box at {through:?}");
+}

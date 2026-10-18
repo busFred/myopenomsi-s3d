@@ -4,7 +4,8 @@
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
-use omsi_traffic::{Simulation, Vehicle, VehicleClass};
+use omsi_traffic::sim::PLAYER_ID_BASE;
+use omsi_traffic::{PlayerView, Simulation, Vehicle, VehicleClass};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -47,6 +48,27 @@ fn finish(mut net: Network) -> Network {
     net.compute_conflicts();
     net
 }
+
+/// Run `secs`; `each` sees every frame. Returns the smallest gap between two bodies.
+fn run(net: &Network, sim: &mut Simulation, vehicles: &mut Vec<Vehicle>, secs: f32, mut each: impl FnMut(f32, &mut Simulation, &mut [Vehicle])) -> f32 {
+    let mut min_gap = f32::INFINITY;
+    let mut t = 0.0;
+    while t < secs {
+        sim.tick(net, DT, vehicles);
+        for &i in &sim.removed {
+            vehicles.remove(i);
+        }
+        for (a, va) in vehicles.iter().enumerate() {
+            for vb in vehicles.iter().skip(a + 1) {
+                min_gap = min_gap.min(va.obb().separation(&vb.obb()) as f32);
+            }
+        }
+        each(t, sim, vehicles.as_mut_slice());
+        t += DT;
+    }
+    min_gap
+}
+
 
 /// Review7: the zipper's "who went last" lives in `Simulation::signal_groups`, which no keyframe
 /// carries. A simulation restored from a keyframe (the vehicles, as `Replay::at` and the reset
@@ -106,4 +128,43 @@ fn review7_zipper_memory_survives_a_keyframe_restore() {
     assert!(control < 1e-6, "control (zipper memory copied too) drifted {control:.3} m");
     let worst = drift(false);
     assert!(worst < 1e-6, "the restored simulation (vehicles only, as a keyframe) drifted {worst:.2} m from the one it was restored from; with the zipper memory copied: {control}");
+}
+
+/// Northbound (x = 2): approach 0, lead-in piece 1 (y -20..-5, meets nobody), crossing piece
+/// 2 (y -5..20), exit 3. Southbound (x = -2): approach 4, a left turn 5 (south, then east
+/// across the northbound way at y = 1, flagged turn 1), exit 6 (east).
+fn oncoming_left_turn() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(2.0, -300.0), (2.0, -20.0)], 1));
+    net.lanes.push(piece(&[(2.0, -20.0), (2.0, -5.0)], 0, 128.0));
+    net.lanes.push(piece(&[(2.0, -5.0), (2.0, 20.0)], 1, 128.0));
+    net.lanes.push(road(&[(2.0, 20.0), (2.0, 300.0)], 2));
+    net.lanes.push(road(&[(-2.0, 200.0), (-2.0, 20.0)], 3));
+    let mut turn = piece(&[(-2.0, 20.0), (-2.0, 5.0), (5.0, -2.0), (20.0, -2.0)], 2, 128.0);
+    turn.turn = 1;
+    net.lanes.push(turn);
+    net.lanes.push(road(&[(20.0, -2.0), (300.0, -2.0)], 4));
+    finish(net)
+}
+
+
+/// Review7 (rule E): the player's bus dwells at a stop on the lead-in piece, its front 8 m short of
+/// the piece that crosses the left turn, standing for a minute. An AI bus standing so is
+/// `blocked` and dropped by `START_DELAY`; the player's claim is never `blocked`, and now that it
+/// covers the crossing piece too the turner waits out the whole dwell (viz3: AI vehicle-seconds
+/// held for a standing player more than 15 m away 1.8 s at the baseline, 124.8 s with r4a).
+#[test]
+fn review7_rule_e_a_dwelling_player_bus_does_not_hold_the_turner() {
+    let net = oncoming_left_turn();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 4, 178.0, 0.0)];
+    let player = PlayerView { id: 7, pos: DVec3::new(2.0, -19.0, 0.0), heading: 0.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 60.0, blinker: 0, signalling: 0.0, priority: false };
+    let mut held = 0.0f32;
+    run(&net, &mut sim, &mut cars, 12.0, |_, sim, cars| {
+        if cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7) {
+            held += DT;
+        }
+        sim.players = vec![player];
+    });
+    assert!(held < 3.0, "the turner waited {held:.1} s for a bus standing at its stop");
 }

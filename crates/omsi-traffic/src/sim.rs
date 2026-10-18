@@ -839,11 +839,32 @@ impl Simulation {
             let room = if next_ahead.is_finite() { next_ahead } else { cs } - front_at - 0.6;
             let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
+            // its light, as an AI car's: the first lit lane of its way before the first
+            // meeting place, red (or red and yellow) at its line with room to stop there
+            let line_limit = -s_on + cs + 1.0;
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
+            let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
+                Some((lt, d, c)) => {
+                    let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
+                    let gap = d - p.half_len;
+                    let can_stop = v < 1.0 || gap > v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8) + 0.5;
+                    if red && can_stop {
+                        (Some(lt), true, c.time_until_go(lt.1))
+                    } else {
+                        (Some(lt), false, None)
+                    }
+                }
+                None => (None, false, None),
+            };
+            // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
+            // AI car held by its lead; it comes from rest when it moves off (an AI car waited
+            // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
+            let blocked = p.still > 2.0 && p.speed.abs() < 0.3 && !light_red;
             claims.push(Claim {
                 chain,
                 was_standing: false,
-                light_red: false,
-                until_go: None,
+                light_red,
+                until_go,
                 lead: None,
                 vehicle: usize::MAX - k,
                 junction: j,
@@ -860,11 +881,11 @@ impl Simulation {
                 impatience: Impatience::default(),
                 absolute: p.priority,
                 held: p.still > 2.0,
-                blocked: false,
+                blocked,
                 stuck: false,
                 red_hysteresis: false,
                 lanes: way,
-                light: None,
+                light,
                 id: PLAYER_ID_BASE + p.id as u64,
             });
         }
