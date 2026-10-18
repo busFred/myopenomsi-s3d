@@ -658,6 +658,15 @@ impl Simulation {
                 // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                 // answer or a full exit)
                 blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                // (people or a zebra in front of it, or a lead that stands too: nothing that
+                // lets it go on a schedule, as a light or a lead moving off does)
+                stuck: st.speed < 0.3
+                    && v.last.held
+                    && match v.last.why {
+                        Why::People | Why::Zebra => true,
+                        Why::Lead => p.leader.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0),
+                        _ => false,
+                    },
                 red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
@@ -746,6 +755,7 @@ impl Simulation {
                 absolute: p.priority,
                 held: p.still > 2.0,
                 blocked: false,
+                stuck: false,
                 red_hysteresis: false,
                 lanes: Vec::new(),
                 light: None,

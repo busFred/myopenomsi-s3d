@@ -55,6 +55,10 @@ pub struct Claim {
     /// a zebra, a light. It cannot move off before that lets it go,
     /// whatever the junction says.
     pub blocked: bool,
+    /// Blocked (`blocked`) by something that does not let it go on a schedule: people or a
+    /// zebra in front of it, a lead that stands too. Not coming for as long as that holds,
+    /// however near the meeting place it stands.
+    pub stuck: bool,
     /// Standing as of its last claim (`was_standing`): creeping to its red
     /// under 1 m/s it is still held there (its claim shifted by `until_go`).
     pub red_hysteresis: bool,
@@ -299,6 +303,32 @@ fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain:
     false
 }
 
+/// The standing claim `k` cannot come while what holds it holds (rule C): it is stuck itself
+/// (people, a zebra, a standing lead in front of it), or it stands refused by the junction
+/// (the first pass's `wait_for`) for one that is, or for one refused for one that is, within
+/// four steps. (Not for `me`: a foe waiting for me is `held_by`'s.)
+fn held_off(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
+    let mut at = k;
+    for step in 0..4 {
+        let o = &claims[at];
+        if !o.standing() || o.committed {
+            return false;
+        }
+        if o.stuck {
+            return true;
+        }
+        let Some(w) = plain.and_then(|p| p[at].wait_for) else { return false };
+        if w == me {
+            return false;
+        }
+        match claim_of.get(&w) {
+            Some(&next) if next != k && step < 3 => at = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// `o` is behind `c` on its own way: some piece of the junction is on both ways, `c`'s
 /// front bumper has reached it (the piece starts at or before `c`'s current place), and
 /// `o`'s origin lies further back along that piece than `c`'s. Positions along a piece
@@ -476,12 +506,21 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                         None => continue,
                     }
                 }
-                // a foe standing outside the meeting place, held there by
-                // something other than a junction (its lead, people, a zebra, a light), is not
-                // coming: not waited for when I am out of the meeting place before it could be
-                // in it from rest after its start (`START_DELAY`), moving or not. (Not when I am
-                // held so myself: my window is no more real than its, and two such would let
-                // each other go; I am not going anywhere before my own lead lets me.)
+                // a foe standing outside the meeting place, held there by people, a zebra or
+                // a lead that stands too, or standing refused for one so held, is not coming
+                // for as long as that holds, however near the meeting place it stands: it is
+                // not waited for whatever my clear time (the drop by `START_DELAY` below kept a
+                // taxi 44.9 s for a garage car held by 60 people 22.9 m before the merge, viz3
+                // case14: the foe stood nearer the meeting place than the claimant could clear
+                // it). When it moves off it is a competitor again; if I am in the box by then,
+                // committed, it waits for me. (Not when I am held so myself: my window is no
+                // more real than its, and two such would let each other go.)
+                if !their_inside && !o.committed && !c.blocked && held_off(claims, &claim_of, plain, ok, c.vehicle) {
+                    continue;
+                }
+                // one held by something else that lets it go on a schedule (a light, a lead
+                // moving off), is not waited for when I am out of the meeting place before it
+                // could be in it from rest after its start (`START_DELAY`)
                 if o.blocked && !c.blocked && !c.light_red && o.standing() && !their_inside && !o.committed && my_out + CLEAR_MARGIN <= their_in + START_DELAY {
                     continue;
                 }
@@ -648,7 +687,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64 }
+        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -1616,5 +1655,72 @@ mod tests {
         let g = resolve(&js, &net, &[me, side]);
         assert!(grant_of(&g, 1).go, "{g:?}");
         assert_eq!(grant_of(&g, 2).wait_for, Some(1), "{g:?}");
+    }
+
+    #[test]
+    fn rule_c_a_foe_stuck_behind_people_is_dropped_whatever_my_clear_time() {
+        // 1 m out, held by people (stuck): from rest after its start it would be in the
+        // meeting place before I am out (the drop by START_DELAY keeps it), but it is not coming
+        let (net, js, mut claims) = held_main_road_foe(1.0, 3.0, true);
+        claims[1].stuck = true;
+        let g = resolve(&js, &net, &claims);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // standing at the line myself, a long bus: the same
+        let mut bus = claims.clone();
+        bus[0].speed = 0.0;
+        bus[0].rear = 9.6;
+        assert!(grant_of(&resolve(&js, &net, &bus), 1).go);
+        // it moves off: a competitor again
+        let mut moving = claims.clone();
+        moving[1].speed = 2.0;
+        moving[1].stuck = false;
+        moving[1].blocked = false;
+        assert_eq!(grant_of(&resolve(&js, &net, &moving), 1).wait_for, Some(2));
+        // held by something that lets it go on a schedule (not stuck): the old timing
+        let (net, js, claims) = held_main_road_foe(1.0, 3.0, true);
+        assert_eq!(grant_of(&resolve(&js, &net, &claims), 1).wait_for, Some(2));
+        // in the meeting place it is waited for, stuck or not
+        let (net, js, mut claims) = held_main_road_foe(-3.0, 3.0, true);
+        claims[1].stuck = true;
+        assert_eq!(grant_of(&resolve(&js, &net, &claims), 1).wait_for, Some(2));
+        // held myself (blocked): not my call yet
+        let (net, js, mut claims) = held_main_road_foe(1.0, 0.0, true);
+        claims[1].stuck = true;
+        claims[0].held = true;
+        claims[0].blocked = true;
+        assert_eq!(grant_of(&resolve(&js, &net, &claims), 1).wait_for, Some(2));
+    }
+
+    #[test]
+    fn rule_c_a_foe_refused_for_a_stuck_third_party_is_not_coming_and_one_that_moves_is() {
+        // review_cross: 0 east, 1 west, 2 north, 3 south. Me northbound (2) at my line; the
+        // westbound car (1) comes from my right and stands at its line, refused for the
+        // southbound car (3) that stands in its meeting place held by people.
+        let (net, js) = review_cross();
+        let f = |m: usize, o: usize| js.nodes[0].movements[m].foes.iter().find(|f| f.movement == o).copied().unwrap();
+        assert!(f(2, 1).yields && f(1, 3).yields, "{:?}", js.nodes[0].movements);
+        let me = claim(1, 2, f(2, 1).mine.0 - 1.0 - 2.0, 0.0);
+        let west = claim(2, 1, f(1, 2).mine.0.min(f(1, 3).mine.0) - 1.0 - 2.0, 0.0);
+        let mut south = claim(3, 3, f(3, 1).mine.0 + 1.0 - 2.0, 0.0);
+        south.held = true;
+        south.blocked = true;
+        south.stuck = true;
+        let claims = [me, west, south];
+        let g = resolve(&js, &net, &claims);
+        assert_eq!(grant_of(&g, 2).wait_for, Some(3), "the westbound car waits for the stuck one: {g:?}");
+        assert!(grant_of(&g, 1).go, "it is not coming before the people let the other go: {g:?}");
+        // the southbound car has gone on and the westbound car rolls off: a competitor again
+        let mut moving = vec![claims[0].clone(), claims[1].clone()];
+        moving[1].speed = 1.5;
+        let g = resolve(&js, &net, &moving);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // I am committed in the box when the westbound car moves off: it waits for me
+        let mut inside = vec![claims[0].clone(), claims[1].clone()];
+        inside[0].s = f(2, 1).mine.0 + 0.5 - 2.0;
+        inside[0].speed = 3.0;
+        inside[0].committed = true;
+        inside[1].speed = 1.5;
+        let g = resolve(&js, &net, &inside);
+        assert!(grant_of(&g, 1).go && grant_of(&g, 2).wait_for == Some(1), "{g:?}");
     }
 }
