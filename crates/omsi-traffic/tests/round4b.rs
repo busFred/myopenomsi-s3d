@@ -522,3 +522,49 @@ fn x3_a_change_begun_at_the_tail_of_a_red_queue_does_not_stand_across_the_lines(
     assert!(me.state.change.is_none());
     assert!(min_gap > 0.2, "bodies {min_gap:.2} m apart");
 }
+
+/// A two-way road: eastbound lane 0 (x 0..238), a 1 m stub (lit by light 0.0 when `lit`) and
+/// lane 2 (x 239..600); the westbound lane 3 3 m to the north.
+fn two_way(lit: bool) -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (238.0, 0.0)], 1));
+    let mut stub = road(&[(238.0, 0.0), (239.0, 0.0)], 2);
+    if lit {
+        stub.traffic_light = Some((0, 0));
+    }
+    net.lanes.push(stub);
+    net.lanes.push(road(&[(239.0, 0.0), (600.0, 0.0)], 3));
+    net.lanes.push(road(&[(600.0, 3.0), (0.0, 3.0)], 4));
+    finish(net)
+}
+
+fn standing_player(x: f64) -> omsi_traffic::PlayerView {
+    omsi_traffic::PlayerView { id: 7, pos: DVec3::new(x, 0.0, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 30.0, blinker: 0, signalling: 0.0, priority: false }
+}
+
+/// The bumper gap at which car 1 first stands behind the standing player bus at x = 200.
+fn stands_behind_player(net: &Network, lights: Vec<omsi_sim::traffic::TrafficLightController>) -> f32 {
+    let mut sim = Simulation::new(net, lights);
+    let player = standing_player(200.0);
+    sim.players = vec![player];
+    let mut cars = vec![car(1, 0, 120.0, 10.0)];
+    let mut gap: Option<f32> = None;
+    run(net, &mut sim, &mut cars, 20.0, |_, sim, cars| {
+        sim.players = vec![player];
+        if gap.is_none() && cars[0].state.speed < 0.05 {
+            gap = Some((200.0 - 6.0) - (cars[0].pos.x as f32 + cars[0].state.front));
+        }
+    });
+    gap.expect("it never stood")
+}
+
+#[test]
+fn x4_behind_a_standing_player_at_a_red_the_car_closes_up_and_keeps_room_only_where_it_can_pass() {
+    // a red 38 m past the bus's front: no pass can start, so no room is kept
+    let red = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 60.0)]], 60.0);
+    let at_red = stands_behind_player(&two_way(true), vec![red]);
+    assert!(at_red > 1.5 && at_red < 3.0, "behind the player at the red: {at_red:.2} m");
+    // no light, the oncoming lane free: room to pull out (out_len 9 m + 1 m)
+    let free = stands_behind_player(&two_way(false), vec![]);
+    assert!(free > 8.5 && free < 11.5, "behind the player, free to pass: {free:.2} m");
+}

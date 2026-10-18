@@ -150,6 +150,27 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     (desire, gap_accepted(me, nb))
 }
 
+/// Within this many metres of a junction (from the front to where its object begins) a car
+/// does not pull out to pass, nor keeps back to be able to.
+pub const JUNCTION_KEEP: f32 = 40.0;
+
+/// Could the car get round the standing `lead` into the lane beside, `nb` (`Start::Bypass`,
+/// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
+/// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
+/// the thing standing and a gap it accepts.
+fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+    let lane = &net.lanes[me.state.lane];
+    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < 40.0 {
+        return false;
+    }
+    let my_turn = me.state.turn_ahead(net, 150.0).map(|t| t.0).unwrap_or(0);
+    if (my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0) {
+        return false;
+    }
+    let _ = p;
+    nb.ahead.map(|a| a.0 > lead.gap + lead.length + 6.0).unwrap_or(true) && gap_accepted(me, nb)
+}
+
 /// What the driver does about the light ahead this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LightCall {
@@ -407,9 +428,31 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let squeeze = squeeze_side.abs() + me.half_width <= lane.width.max(3.0) * 0.5 + 0.3 && !player_out;
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
-        // keep back: room to pull out again, where the car can still stop there gently
         let room = out_len + 1.0;
-        if !(me.is_bus() && l.at_stop) && l.gap > room + 0.5 {
+        // what a pass would need, now: no light or junction just past the obstacle (within
+        // `JUNCTION_KEEP` of the front, a junction), the road going on, and the oncoming lane
+        // (or the lane's own width) free for it
+        let real = l.gap + if player { 0.5 } else { 0.0 };
+        let obstacle_len = l.length;
+        let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
+        let zone = if player { 60.0 } else { 25.0 };
+        let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
+        let junction_near = p.junction.as_ref().map(|j| (j.entry < real + st.front + obstacle_len + zone || j.entry - st.front < JUNCTION_KEEP) && !matches!(l.what, Seen::Parked)).unwrap_or(false);
+        let road_ok = p.road_left > pass_len + real + 30.0;
+        let oncoming = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked);
+        let oncoming_free = oncoming.is_some_and(|o| {
+            let v_cap = (p.v_want).clamp(4.0, 14.0);
+            o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
+        });
+        let pass_possible = can_pass && !own_stop && !player_out && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
+        // (or round it into the lane beside, `Start::Bypass`)
+        let bypass_possible = !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
+        // keep back: room to pull out again, where the car can still stop there gently - only
+        // where a pass (or a bypass) could start now; behind a standing player at a red 40 m
+        // on, or a queue at a junction, the car closes up to its queue gap (viz3 review: 4785
+        // keyframe rows 6 m back behind AI leads and 56 behind the player where no pass could
+        // ever start)
+        if (pass_possible || bypass_possible) && !(me.is_bus() && l.at_stop) && l.gap > room + 0.5 {
             let dist = l.gap - room;
             let need_brake = v * v / (2.0 * dist.max(0.1));
             if need_brake <= dp.comfort_brake * 1.5 {
@@ -420,27 +463,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // over what room it has once it has stood a while, rather than for ever)
         let too_close = l.gap < room - 1.0;
         let ready = (me.stopped >= 3.0 || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
-        if can_pass && !own_stop && !player_out && ready {
+        if pass_possible && ready {
             let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
-            let real = l.gap + if player { 0.5 } else { 0.0 };
-            let obstacle_len = l.length;
-            let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
-            let zone = if player { 60.0 } else { 25.0 };
-            let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
-            let junction_near = p.junction.as_ref().map(|j| j.entry < real + st.front + obstacle_len + zone && !matches!(l.what, Seen::Parked)).unwrap_or(false);
-            let road_ok = p.road_left > pass_len + real + 30.0;
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
-            if real >= 0.3 && !light_near && !junction_near && road_ok {
-                if squeeze {
-                    out.start = Some(Start::Pass(Passing { lane: None, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0 }));
-                } else if let Some(o) = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked) {
-                    let v_cap = (p.v_want).clamp(4.0, 14.0);
-                    let t_need = arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5;
-                    if o.clear_for > t_need {
-                        out.start = Some(Start::Pass(Passing { lane: Some(o.lane), side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0 }));
-                    }
-                }
-            }
+            let lane = if squeeze { None } else { oncoming.map(|o| o.lane) };
+            out.start = Some(Start::Pass(Passing { lane, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0 }));
         }
     }
 
