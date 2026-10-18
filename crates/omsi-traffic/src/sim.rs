@@ -94,6 +94,13 @@ pub struct Passing {
     pub aborted: bool,
     /// Odometer reading at which an aborted pass holds the car.
     pub hold: f32,
+    /// Seconds of indicating left before the car pulls out (it signals the side it moves to
+    /// `SIGNAL_BEFORE_CHANGE` ahead, as a lane change does, and until it is back in its lane).
+    #[serde(default)]
+    pub wait: f32,
+    /// The vehicle passed (its id; a player's: `PLAYER_ID_BASE` + its id), if one.
+    #[serde(default)]
+    pub obstacle: Option<u64>,
 }
 
 impl Passing {
@@ -106,6 +113,15 @@ impl Passing {
 
     pub fn back_len_for(side: f32) -> f32 {
         (side.abs() * 6.0).clamp(8.0, 20.0)
+    }
+
+    /// The indicator of the side the car moves to (1 left, 2 right).
+    pub fn blinker(&self) -> i32 {
+        if self.side > 0.0 {
+            2
+        } else {
+            1
+        }
     }
 
     /// The bent way, as (odometer, offset) points from `odo` and the offset `from` there.
@@ -232,7 +248,53 @@ pub struct Vehicle {
     /// from these, so a keyframe restores it.
     #[serde(default)]
     pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    /// A lane change under way: (its progress when it last moved on, seconds since while
+    /// standing). Frozen for `FROZEN_CHANGE` it is settled where the body is
+    /// (`AiState::settle_change`).
+    #[serde(default)]
+    pub change_still: (f32, f32),
+    /// Holding the vehicle with this id at a junction while it holds this one (each the
+    /// other's `wait_for` or `body_block`), and for how many seconds (`MUTUAL_HOLD`).
+    #[serde(default)]
+    pub mutual: Option<(u64, f32)>,
+    /// Eased off for the vehicle with this id at this junction, since then (s): it stays held
+    /// and its claim does not stand in the other's way (`Claim::yields_now`) until the other
+    /// has left the meeting places of the two.
+    #[serde(default)]
+    pub ease_for: Option<(u64, usize, f32)>,
 }
+
+/// Two vehicles holding each other this long (s) at a junction where they have a meeting place
+/// negotiate: one eases off (`Vehicle::ease_for`).
+pub const MUTUAL_HOLD: f32 = 6.0;
+/// An eased-off car takes part again after this long (s) whatever the other does.
+pub const EASE_MAX: f32 = 30.0;
+
+/// Which of two vehicles (ids `a`, `b`) in a mutual hold at junction `j` eases off: a hash of
+/// the lower id, the higher and the junction, the same in every run.
+pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    let mut x = lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi.rotate_left(21) ^ (j as u64).rotate_left(42);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    if x & 1 == 0 {
+        lo
+    } else {
+        hi
+    }
+}
+
+/// An aborted pass standing out there steps back into its lane at this pace (m/s) ...
+pub const SIDESTEP_SPEED: f32 = 0.5;
+/// ... until it is this near its lane's middle (m).
+pub const SIDESTEP_DONE: f32 = 0.05;
+
+/// Seconds a lane change may stand without moving on before it is settled where the car is:
+/// done in place, or given up (`AiState::settle_change`).
+pub const FROZEN_CHANGE: f32 = 5.0;
 
 impl Vehicle {
     pub fn new(id: u64, class: VehicleClass, state: AiState, half_width: f32, seed: u64) -> Vehicle {
@@ -264,6 +326,9 @@ impl Vehicle {
             passed_on_go: None,
             amber_line: None,
             zip_won: None,
+            change_still: (0.0, 0.0),
+            mutual: None,
+            ease_for: None,
         }
     }
 
@@ -345,6 +410,14 @@ pub struct Simulation {
     /// What the junction grants read besides the claims: the pairs of lights that are
     /// never green together, filled in as claimants meet.
     pub signal_groups: reservation::Context,
+    /// This frame's claims and their grants (diagnostics: `traffic_cases watch`).
+    pub claims: Vec<(Claim, Grant)>,
+}
+
+/// How far on (m) a pass coming back in looks for a body beside it, and runs straight when
+/// one is: half a metre past its front (at least 2 m; its body turns with the way there).
+fn return_look(st: &AiState) -> f32 {
+    (st.front + 0.5).max(2.0)
 }
 
 impl Simulation {
@@ -368,6 +441,7 @@ impl Simulation {
             removed: Vec::new(),
             held_at_red: 0,
             signal_groups: reservation::Context::default(),
+            claims: Vec::new(),
         }
     }
 
@@ -455,7 +529,9 @@ impl Simulation {
                 continue;
             }
             self.vehicle_grid.entry(cell(v.pos)).or_default().push(i);
-            self.occupancy.entry(st.lane).or_default().push(Occupant { vehicle: i, s: st.s, lateral: st.lateral, foreign: false });
+            // (a car changing lanes is on both, where its body is from each)
+            let offsets = st.change_offsets(net);
+            self.occupancy.entry(st.lane).or_default().push(Occupant { vehicle: i, s: st.s, lateral: offsets.map(|o| o.1).unwrap_or(st.lateral), foreign: false });
             if let Some(p) = st.prev_lane {
                 if st.s < st.rear + 1.0 && st.change.is_none() {
                     if let Some(pl) = net.lanes.get(p) {
@@ -464,7 +540,7 @@ impl Simulation {
                 }
             }
             if let Some(c) = st.change {
-                self.occupancy.entry(c.to).or_default().push(Occupant { vehicle: i, s: c.s_to, lateral: 0.0, foreign: false });
+                self.occupancy.entry(c.to).or_default().push(Occupant { vehicle: i, s: c.s_to, lateral: offsets.map(|o| o.2).unwrap_or(0.0), foreign: false });
             }
             if let Some(p) = v.passing {
                 if let (Some(opp), true) = (p.lane, st.lateral.abs() > 1.2) {
@@ -695,7 +771,11 @@ impl Simulation {
                 // (clearing the box: the light it passed holds it no more,
                 // `JunctionView::clears_past`)
                 Some(sig) if j.clears_past(&sig, st.front) => (false, None),
-                Some(sig) if sig.dist <= light_line + 1.0 && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // (or, clearing the box, a later line of the way through: it holds the car as any,
+                // `JunctionView::clears_past`, and the car standing there is held by it, not
+                // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
+                // committed to the cars waiting for it)
+                Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
                     // that took the line on green or yellow and is close to it (queued
@@ -750,7 +830,7 @@ impl Simulation {
                 // (people or a zebra in front of it, or a lead that stands too: nothing that
                 // lets it go on a schedule, as a light or a lead moving off does)
                 // in the box when its light turned: it clears it (rule F)
-                clearing: j.clearing,
+                clearing: j.clearing && !light_red,
                 stuck: st.speed < 0.3
                     && v.last.held
                     && match v.last.why {
@@ -762,6 +842,7 @@ impl Simulation {
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
+                yields_now: None,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -845,7 +926,9 @@ impl Simulation {
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
-            let line_limit = -s_on + cs + 1.0;
+            // (not a stretch it runs side by side with another lane before its light, `Foe::side`)
+            let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
             let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
@@ -892,6 +975,7 @@ impl Simulation {
                 lanes: way,
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
+                yields_now: None,
             });
         }
         for (i, standing) in standing_now {
@@ -930,7 +1014,9 @@ impl Simulation {
             }
         }
         self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
+        self.eased_claims(vehicles, &mut claims, &claim_of, dt);
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
         // and the next tie there is the other side's
         for (g, c) in grants.iter().zip(&claims) {
@@ -949,11 +1035,119 @@ impl Simulation {
             let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
             self.act(net, vehicles, i, plan, dt);
         }
+        self.negotiate(vehicles, &claim_of, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
+    }
+
+    /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
+    /// `yields_now` for the other while it has not left the meeting places of the two; the
+    /// ease ends when it has, when either is gone or no longer claims the junction, when either
+    /// is held by a red light, or after `EASE_MAX`.
+    fn eased_claims(&self, vehicles: &mut [Vehicle], claims: &mut [Claim], claim_of: &[Option<usize>], dt: f32) {
+        for i in 0..vehicles.len() {
+            let Some((oid, j, since)) = vehicles[i].ease_for else { continue };
+            let keep = (|| {
+                let k = claim_of[i]?;
+                let o = vehicles.iter().position(|v| v.id == oid)?;
+                let ko = claim_of[o]?;
+                let (mine, theirs) = (&claims[k], &claims[ko]);
+                if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
+                    return None;
+                }
+                // (the other still short of, or in, a meeting place of the two)
+                let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
+                let inside = pieces.iter().any(|(_, f)| theirs.chain.iter().any(|&(m, off)| m == f.movement && theirs.s - off - theirs.rear <= f.theirs.1));
+                inside.then_some((k, o))
+            })();
+            match keep {
+                Some((k, o)) => {
+                    claims[k].yields_now = Some(o);
+                    if let Some(e) = vehicles[i].ease_for.as_mut() {
+                        e.2 += dt;
+                    }
+                }
+                None => vehicles[i].ease_for = None,
+            }
+        }
+    }
+
+    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`) for
+    /// `MUTUAL_HOLD` at a junction where their ways meet, neither at a red light: one eases off
+    /// (`Vehicle::ease_for`), the other goes on by the ordinary rules - bodies, other foes and
+    /// all (round 4a's standoff break let the winner ignore the other's body and claim, and it
+    /// squeezed past at -0.01 m, review9). The one that eases off: of two where only one is
+    /// body-blocked by the other, that one (it cannot go anyway; the other waits for it at the
+    /// junction); else by `eases_off`, the same in every run.
+    pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
+        let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+        let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
+        let mut timers: Vec<Option<(u64, f32)>> = Vec::with_capacity(vehicles.len());
+        for v in vehicles.iter() {
+            // (both standing: one rolling up to its stop is not held yet)
+            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
+            timers.push(other.map(|o| (o, match v.mutual {
+                Some((p, t)) if p == o => t + dt,
+                _ => dt,
+            })));
+        }
+        for (v, t) in vehicles.iter_mut().zip(&timers) {
+            v.mutual = *t;
+        }
+        for a in 0..vehicles.len() {
+            let Some((oid, t)) = vehicles[a].mutual else { continue };
+            let Some(&b) = by_id.get(&oid) else { continue };
+            if vehicles[a].id > oid || t < MUTUAL_HOLD || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
+                continue;
+            }
+            if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+                continue;
+            }
+            let (Some(ka), Some(kb)) = (claim_of[a], claim_of[b]) else { continue };
+            let (ca, cb) = (&self.claims[ka].0, &self.claims[kb].0);
+            if ca.junction != cb.junction || ca.light_red || cb.light_red || ca.vehicle != a || cb.vehicle != b {
+                continue;
+            }
+            let j = ca.junction;
+            let meet = self.junctions.foes_along_pieces(j, &ca.chain).iter().any(|(_, f)| cb.chain.iter().any(|&(m, _)| m == f.movement));
+            if !meet {
+                continue;
+            }
+            let (ida, idb) = (vehicles[a].id, vehicles[b].id);
+            let blocked_a = vehicles[a].last.body_block == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida);
+            let ease = if blocked_a != blocked_b {
+                if blocked_a {
+                    a
+                } else {
+                    b
+                }
+            } else if eases_off(ida, idb, j) == ida {
+                a
+            } else {
+                b
+            };
+            let other = if ease == a { idb } else { ida };
+            vehicles[ease].ease_for = Some((other, j, 0.0));
+            vehicles[a].mutual = None;
+            vehicles[b].mutual = None;
+        }
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
+        let sidestep = self.sidestep(vehicles, i, dt);
+        // (a pass given up whose obstacle has left: over, the car drives on where it is and the
+        // offset eases off as it goes, re-entering its lane ahead; review12, case15 #47238 stood
+        // 88 s out on the oncoming side, its stop behind it, after the obstacle had gone)
+        let obstacle_gone = vehicles[i].passing.filter(|p| p.aborted).and_then(|p| p.obstacle).is_some_and(|id| {
+            if id >= PLAYER_ID_BASE {
+                self.players.iter().find(|p| p.id as u64 == id - PLAYER_ID_BASE).is_none_or(|p| p.speed.abs() > 1.0)
+            } else {
+                vehicles.iter().find(|o| o.id == id).is_none_or(|o| o.state.speed > 1.0)
+            }
+        });
+        let return_blocked = self.return_blocked(vehicles, i);
+        let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
         let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
@@ -1000,7 +1194,10 @@ impl Simulation {
             }
             Some(Start::Pass(p)) => {
                 v.passing = Some(p);
-                v.state.lateral_curve = p.curve(v.state.odometer, v.state.lateral);
+                // (it pulls out once it has signalled, below)
+                if p.wait <= 0.0 {
+                    v.state.lateral_curve = p.curve(v.state.odometer, v.state.lateral);
+                }
                 v.state.lateral_target = 0.0;
                 v.stopped = 0.0;
             }
@@ -1009,13 +1206,46 @@ impl Simulation {
                     p.aborted = true;
                     p.hold = hold;
                 }
-                // back in over what room there is, at least two metres
+                // back in over what room there is, at least two metres (standing: over a bay's
+                // S-curve as it drives on, else the way bent over two metres turned the body
+                // 20-30 degrees where it stood, review12)
                 let odo = v.state.odometer;
-                let back = (hold - odo - 0.5).clamp(2.0, 8.0);
-                v.state.lateral_curve = vec![(odo, v.state.lateral), (odo + back, 0.0)];
+                let lat = v.state.lateral;
+                if v.state.speed < 0.5 {
+                    v.state.lateral_curve.clear();
+                    v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                } else {
+                    let back = (hold - odo - 0.5).clamp(2.0, 8.0);
+                    v.state.lateral_curve = vec![(odo, lat), (odo + back, 0.0)];
+                }
                 v.state.lateral_target = 0.0;
             }
             None => {}
+        }
+        // a pass pulls out once it has signalled for `SIGNAL_BEFORE_CHANGE` (counted while its
+        // indicator shows that side: from the other side's it takes a moment to change)
+        let shown = v.blinker_shown.0;
+        if let Some(p) = v.passing.as_mut() {
+            if !p.aborted && p.wait > 0.0 && shown == p.blinker() {
+                p.wait = (p.wait - dt).max(0.0);
+                if p.wait <= 0.0 {
+                    let pc = *p;
+                    v.state.lateral_curve = pc.curve(v.state.odometer, v.state.lateral);
+                    v.state.lateral_target = 0.0;
+                }
+            }
+        }
+        // coming back in: not into a body beside it - it stays out a metre more (a pass recorded
+        // under way at a fixture's start came back in on top of the car that had drawn level,
+        // viz3 case11 #28490, -1.77 m)
+        // (straight on past its front: the body follows the way under its front, and bent
+        // nearer than that it turned towards the body beside it, review12)
+        if let (true, Some(p)) = (return_blocked, v.passing.as_mut()) {
+            let (odo, lat) = (v.state.odometer, v.state.lateral);
+            let straight = return_look(&v.state);
+            p.until = p.until.max(odo + 1.0);
+            let back = (p.back_len * (lat.abs() / p.side.abs().max(0.1))).max(2.0);
+            v.state.lateral_curve = vec![(odo, lat), (odo + straight, lat), (odo + straight + back, 0.0)];
         }
         v.state.accel_cap = plan.accel_cap;
         // a fresh car: no harder braking than its driver likes at the start
@@ -1027,6 +1257,21 @@ impl Simulation {
             }
         }
         let alive = v.state.drive(net, dt, plan.lead, plan.stop);
+        // a lane change that stands frozen part-way is settled where the body is
+        match v.state.change {
+            Some(c) => {
+                if v.state.speed >= 0.3 || (c.t - v.change_still.0).abs() > 0.01 {
+                    v.change_still = (c.t, 0.0);
+                } else {
+                    v.change_still.1 += dt;
+                    if let (true, Some(done)) = (v.change_still.1 > FROZEN_CHANGE, settle) {
+                        v.state.settle_change(net, done);
+                        v.change_still = (0.0, 0.0);
+                    }
+                }
+            }
+            None => v.change_still = (0.0, 0.0),
+        }
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
         v.pull_out = (v.pull_out - dt).max(0.0);
@@ -1058,19 +1303,50 @@ impl Simulation {
             v.amber = None;
         }
         // a pass runs its course: the bent way brings the car back by itself
+        if obstacle_gone {
+            // (a pass on its way back in from where it is: the bent way eases the offset off
+            // as it drives, held out while a body beside it is in the way, `return_blocked`)
+            let (odo, lat) = (v.state.odometer, v.state.lateral);
+            let back = (lat.abs() * 8.0).clamp(8.0, 30.0);
+            if let Some(p) = v.passing.as_mut() {
+                *p = Passing { side: lat, until: odo, block: odo, aborted: false, hold: odo, back_len: back, wait: 0.0, obstacle: None, ..*p };
+            }
+            // (straight on past its front first: bent under it where it stands, the body
+            // turned on the spot)
+            let straight = return_look(&v.state);
+            v.state.lateral_curve = vec![(odo, lat), (odo + straight, lat), (odo + straight + back, 0.0)];
+            v.state.lateral_target = 0.0;
+        }
         if let Some(p) = v.passing {
             if p.aborted {
-                if v.state.speed < 0.1 && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
+                // standing out there, it steps back into its lane where it stands, at a walking
+                // pace, while its body there touches nobody (backing up a little and pulling
+                // in: the way bends only as the car drives); once back the pass is over
+                if v.state.speed < 0.1 {
+                    if let Some(lat) = sidestep {
+                        v.state.lateral_curve.clear();
+                        v.state.lateral = lat;
+                        v.state.lateral_target = 0.0;
+                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                    }
+                }
+                if v.state.speed < 0.1 && v.state.lateral.abs() <= SIDESTEP_DONE && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
                     v.passing = None;
+                    // (from where it is: the rest of the way back eases off as it drives on)
+                    let lat = v.state.lateral;
                     v.state.lateral_curve.clear();
+                    v.state.lateral_target = 0.0;
+                    v.state.lateral_ramp = (lat, 0.0, v.state.odometer, 8.0);
                 }
             } else if v.state.odometer >= p.until + p.back_len {
                 v.passing = None;
             } else if v.stopped > 8.0 && v.state.lateral.abs() < p.side.abs() * 0.5 {
-                // never got out: give it up where it stands
+                // never got out: give it up where it stands (the offset easing off as it drives)
                 v.passing = None;
-                let odo = v.state.odometer;
-                v.state.lateral_curve = vec![(odo, v.state.lateral), (odo + 4.0, 0.0)];
+                let (odo, lat) = (v.state.odometer, v.state.lateral);
+                v.state.lateral_curve.clear();
+                v.state.lateral_target = 0.0;
+                v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
             }
         }
         // a random car that stands for ever asks to be taken away when nobody looks
@@ -1081,6 +1357,19 @@ impl Simulation {
             }
         }
         // indicators: what the car does, debounced so a flicker of the plan does not flash
+        // (a pass shows the side it moves to from before it pulls out until it is back in its
+        // lane: the bent way's offset alone showed the side it would come back to, the right
+        // while out on the left, viz3 review: 47 of 47)
+        if let Some(p) = v.passing {
+            if !p.aborted {
+                v.state.signal = p.blinker();
+                v.state.signal_time = 0.25;
+            } else if v.state.lateral.abs() > 0.3 {
+                // (given up: the side back into its lane, while it is out)
+                v.state.signal = if v.state.lateral > 0.0 { 1 } else { 2 };
+                v.state.signal_time = 0.25;
+            }
+        }
         v.state.update_blinker(net);
         let want = if v.external.blinker_off { 0 } else { v.state.blinker };
         let (shown, since) = v.blinker_shown;
@@ -1100,6 +1389,74 @@ impl Simulation {
         if !alive {
             self.removed.push(i);
         }
+    }
+
+    /// How a frozen lane change of vehicle `i` is settled (`AiState::settle_change`): done in
+    /// place with the body more than half over the lane it moves to, else given up - on the lane
+    /// where its body, at that lane's middle, would come within 0.2 m of nobody; the other if
+    /// that one is taken (the change froze because a car stood beside it in the lane it went
+    /// for: done in place, the two stood side by side in one lane and touched as the offset
+    /// eased off, viz case06); neither: it stays as it is for now. True: done.
+    fn settle_choice(&self, net: &Network, vehicles: &[Vehicle], i: usize) -> Option<bool> {
+        let v = &vehicles[i];
+        let (k, _, _) = v.state.change_offsets(net)?;
+        let (own, target) = v.state.change_anchors(net)?;
+        let near = self.vehicles_near(v.pos, 25.0);
+        // (its body at that lane's middle, along it)
+        let free = |(p, h): (DVec3, f32)| {
+            let b = Obb::vehicle(p.truncate(), h as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+            near.iter().filter(|&&j| j != i).all(|&j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || vehicles[j].obb().separation(&b) > 0.2)
+                && self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || p.obb(0.0, 0.0).separation(&b) > 0.2)
+        };
+        let first = k > 0.5;
+        let place = |done: bool| if done { target } else { own };
+        if free(place(first)) {
+            Some(first)
+        } else if free(place(!first)) {
+            Some(!first)
+        } else {
+            None
+        }
+    }
+
+    /// A pass coming back into its lane whose bent way would bring its body, `return_look` on, within 0.2 m
+    /// of another vehicle (and nearer than it is now): one beside it in the lane.
+    fn return_blocked(&self, vehicles: &[Vehicle], i: usize) -> bool {
+        let v = &vehicles[i];
+        let Some(p) = v.passing.filter(|p| !p.aborted && p.wait <= 0.0) else { return false };
+        let (odo, lat) = (v.state.odometer, v.state.lateral);
+        // (on its way back in, or about to be: where the way puts it a little past its front)
+        let look = return_look(&v.state);
+        let next = v.state.lateral_ahead(look);
+        if odo + look < p.until || (next.abs() >= lat.abs() - 0.01) {
+            return false;
+        }
+        let h = (v.heading as f64).to_radians();
+        let right = DVec2::new(h.cos(), -h.sin());
+        let now = v.obb();
+        let b = Obb::vehicle(v.pos.truncate() + right * (next - lat) as f64, v.heading as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+        // (a body that the move brings nearer than 0.2 m, and nearer than it is now)
+        self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).any(|j| {
+            let o = vehicles[j].obb();
+            (vehicles[j].pos.z - v.pos.z).abs() <= 3.0 && o.separation(&b) < 0.2 && o.separation(&b) < o.separation(&now)
+        })
+    }
+
+    /// An aborted pass standing out there: the lateral offset one step (`SIDESTEP_SPEED` for
+    /// `dt`) back towards its lane, if its body there would come within 0.2 m of nobody.
+    fn sidestep(&self, vehicles: &[Vehicle], i: usize, dt: f32) -> Option<f32> {
+        let v = &vehicles[i];
+        if !v.passing.is_some_and(|p| p.aborted) || v.state.speed >= 0.1 || v.state.lateral.abs() <= SIDESTEP_DONE {
+            return None;
+        }
+        let lat = v.state.lateral;
+        let new = lat - (SIDESTEP_SPEED * dt).min(lat.abs()) * lat.signum();
+        let h = (v.heading as f64).to_radians();
+        let right = DVec2::new(h.cos(), -h.sin());
+        let b = Obb::vehicle(v.pos.truncate() - right * (lat - new) as f64, v.heading as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+        let clear_of_cars = self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).all(|j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || vehicles[j].obb().separation(&b) > 0.2);
+        let clear_of_players = self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || p.obb(0.0, 0.0).separation(&b) > 0.2);
+        (clear_of_cars && clear_of_players).then_some(new)
     }
 
     /// The indicator a vehicle shows now (0 off, 1 left, 2 right).

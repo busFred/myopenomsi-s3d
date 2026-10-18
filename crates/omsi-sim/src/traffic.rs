@@ -211,15 +211,30 @@ impl Lane {
     /// instead of becoming a chain of chords: a car following the chords turned in small
     /// jerks at every sample and at every lane joint.
     pub fn at(&self, s: f32) -> (DVec3, f32) {
+        self.at_with(s, &mut Tangents::default())
+    }
+
+    /// `at`, the tangents of the segment kept in `cache` for the next point.
+    fn at_with(&self, s: f32, cache: &mut Tangents) -> (DVec3, f32) {
         if self.points.len() < 2 {
             return (self.points.first().copied().unwrap_or(DVec3::ZERO), self.headings.first().copied().unwrap_or(0.0));
         }
         let (i, t) = self.locate(s);
         let (h0, h1) = (self.headings[i], self.headings[i + 1]);
-        (self.hermite(i, t as f64), h0 + wrap_deg(h1 - h0) * t)
+        (self.hermite(i, t as f64, cache), h0 + wrap_deg(h1 - h0) * t)
     }
 
-    fn hermite(&self, i: usize, t: f64) -> DVec3 {
+    /// The heading of `at`, without the point.
+    fn heading_at(&self, s: f32) -> f32 {
+        if self.points.len() < 2 {
+            return self.headings.first().copied().unwrap_or(0.0);
+        }
+        let (i, t) = self.locate(s);
+        let (h0, h1) = (self.headings[i], self.headings[i + 1]);
+        h0 + wrap_deg(h1 - h0) * t
+    }
+
+    fn hermite(&self, i: usize, t: f64, cache: &mut Tangents) -> DVec3 {
         let (a, b) = (self.points[i], self.points[i + 1]);
         let lin = a.lerp(b, t);
         let chord = (b - a).truncate();
@@ -227,8 +242,15 @@ impl Lane {
         if len < 1e-6 {
             return lin;
         }
-        let d0 = heading_dir(self.headings[i] as f64);
-        let d1 = heading_dir(self.headings[i + 1] as f64);
+        let key = (self as *const Lane as usize, i);
+        let (d0, d1) = match cache.0 {
+            Some((k, d0, d1)) if k == key => (d0, d1),
+            _ => {
+                let d = (heading_dir(self.headings[i] as f64), heading_dir(self.headings[i + 1] as f64));
+                cache.0 = Some((key, d.0, d.1));
+                d
+            }
+        };
         // tangents far off the chord (a kink in hand-made samples) would make the curve loop
         let c = chord / len;
         if d0.dot(c) < 0.8 || d1.dot(c) < 0.8 {
@@ -242,6 +264,21 @@ impl Lane {
     /// Position and heading at `s`, continued straight along the end tangents beyond either
     /// end of the lane.
     pub fn at_ext(&self, s: f32) -> (DVec3, f32) {
+        self.at_ext_with(s, &mut Tangents::default())
+    }
+
+    /// The heading of `at_ext`, without the point.
+    fn heading_at_ext(&self, s: f32) -> f32 {
+        if s < 0.0 {
+            self.start_heading()
+        } else if s > self.length() {
+            self.end_heading()
+        } else {
+            self.heading_at(s)
+        }
+    }
+
+    fn at_ext_with(&self, s: f32, cache: &mut Tangents) -> (DVec3, f32) {
         if s < 0.0 {
             let h = self.start_heading();
             let d = heading_dir(h as f64) * s as f64;
@@ -251,7 +288,7 @@ impl Lane {
             let d = heading_dir(h as f64) * (s - self.length()) as f64;
             (self.end() + DVec3::new(d.x, d.y, 0.0), h)
         } else {
-            self.at(s)
+            self.at_with(s, cache)
         }
     }
 
@@ -486,6 +523,11 @@ pub struct Crossing {
     pub after: f32,
     pub other_before: f32,
     pub other_after: f32,
+    /// A merge of two lanes running side by side closer than a car is wide, that neither
+    /// cross nor run into one another (`Network::add_converging`): the stretch is where they
+    /// run together, not a joint.
+    #[serde(default)]
+    pub side: bool,
 }
 
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
@@ -507,6 +549,52 @@ fn meeting_extent(a: &Lane, at: f32, b: &Lane) -> (f32, f32) {
         after += 0.5;
     }
     (before, after)
+}
+
+/// Two lanes of one object that neither cross nor run into one another but whose centre lines
+/// come this close (m) over a stretch meet there: two cars on them touch (`converging_stretch`).
+/// (Lanes of a two-lane road lie 2.3-2.6 m apart: they stay apart.)
+pub const CONVERGE_DIST: f64 = MEET_DIST - 0.6;
+/// ... or whose edges overlap by this much (m), given the two lanes' widths ...
+pub const CONVERGE_EDGE: f64 = 0.3;
+/// ... running the same way there (degrees between their headings at most).
+pub const CONVERGE_HEADING: f32 = 60.0;
+
+/// Where lanes `a` and `b` run side by side closer than `MEET_DIST`: the stretch along `a`
+/// (from, to), the one along `b`, and the least distance between the centre lines - when they
+/// come within `CONVERGE_DIST`, or their edges overlap by `CONVERGE_EDGE`, somewhere on it.
+/// Sampled every half metre of each lane. (Two lanes of one crossing object that run together
+/// before they part, or converge without ending in one place: case07's 5229/5231, 3769/3770,
+/// 1430/1179; the network compiled no meeting place for them and cars met side by side.)
+pub fn converging_stretch(a: &Lane, b: &Lane) -> Option<((f32, f32), (f32, f32), f64)> {
+    if a.points.len() < 2 || b.points.len() < 2 {
+        return None;
+    }
+    let stretch = |x: &Lane, y: &Lane| -> Option<(f32, f32, f64)> {
+        let (mut s0, mut s1, mut least) = (f32::INFINITY, f32::NEG_INFINITY, f64::INFINITY);
+        let len = x.length();
+        let mut s = 0.0f32;
+        loop {
+            let at = s.min(len);
+            if let Some((_, d)) = y.nearest_point(x.at(at).0) {
+                least = least.min(d);
+                if d < MEET_DIST {
+                    s0 = s0.min(at);
+                    s1 = s1.max(at);
+                }
+            }
+            if at >= len {
+                break;
+            }
+            s += 0.5;
+        }
+        s0.is_finite().then_some((s0, s1, least))
+    };
+    let (a0, a1, least_a) = stretch(a, b)?;
+    let (b0, b1, least_b) = stretch(b, a)?;
+    let least = least_a.min(least_b);
+    let edges = (a.width as f64 + b.width as f64) * 0.5 - least;
+    (least < CONVERGE_DIST || edges >= CONVERGE_EDGE).then_some(((a0, a1), (b0, b1), least))
 }
 
 /// Where two polylines cross: the distance along each (ends excluded).
@@ -765,8 +853,8 @@ impl Network {
                         let (la, lb) = (a.length(), b.length());
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5 });
-                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5 });
+                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false });
+                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false });
                         n += 1;
                         continue;
                     }
@@ -776,8 +864,10 @@ impl Network {
                         let (bb, ba) = if merge { (meeting_extent(b, sb, a).0, 0.5) } else { meeting_extent(b, sb, a) };
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba });
-                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa });
+                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false });
+                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false });
+                        n += 1;
+                    } else if self.add_converging(i, j) {
                         n += 1;
                     }
                 }
@@ -1200,6 +1290,89 @@ impl Network {
             return !self.fed_past(i, j);
         }
         self.leads_into(j, i) && !self.fed_past(j, i)
+    }
+
+    /// Compile the meeting place of two lanes `i` and `j` of one crossing object that neither
+    /// cross nor run into one another but run side by side closer than a car is wide
+    /// (`converging_stretch`): a merge-kind meeting place over the stretch, as far as its end
+    /// (where they part, or where they end together), the right of way read as for any merge
+    /// (`must_yield`; neither yields: a zipper). Not between pieces of one way
+    /// (`one_way_pieces`, nor one leading into the other within three links), nor two
+    /// branches forking from one point (starts within half a metre), nor two lanes of one path
+    /// or that have a meeting place already. True when one was added.
+    pub fn add_converging(&mut self, i: usize, j: usize) -> bool {
+        let (Some(a), Some(b)) = (self.lanes.get(i), self.lanes.get(j)) else { return false };
+        if i == j || a.points.len() < 2 || b.points.len() < 2 || a.kind != LaneKind::Street || b.kind != LaneKind::Street {
+            return false;
+        }
+        if a.key.map(|k| k.path) == b.key.map(|k| k.path) || self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
+            return false;
+        }
+        if (a.start() - b.start()).truncate().length() <= 0.5 || self.one_way_pieces(i, j) || self.links_within(i, j, 3) || self.links_within(j, i, 3) {
+            return false;
+        }
+        // (lanes whose boxes lie further apart than that never come so close)
+        let bbox = |l: &Lane| l.points.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)));
+        let (ba, bb) = (bbox(a), bbox(b));
+        if ba.0 > bb.2 + MEET_DIST || bb.0 > ba.2 + MEET_DIST || ba.1 > bb.3 + MEET_DIST || bb.1 > ba.3 + MEET_DIST {
+            return false;
+        }
+        let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { return false };
+        // (side by side the same way: two lanes of opposite directions close together are a
+        // narrow road, not two ways running into one)
+        if wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > CONVERGE_HEADING {
+            return false;
+        }
+        let (la, lb) = (a.length(), b.length());
+        let (aa, ba) = ((la - a1).min(0.5), (lb - b1).min(0.5));
+        self.conflicts[i].push(j);
+        self.conflicts[j].push(i);
+        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true });
+        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true });
+        true
+    }
+
+    /// Lane `from` reaches `to` over at most `n` links.
+    fn links_within(&self, from: usize, to: usize, n: usize) -> bool {
+        let mut at = vec![from];
+        for _ in 0..n {
+            at = at.iter().flat_map(|&l| self.lanes[l].next.iter().copied()).collect();
+            if at.contains(&to) {
+                return true;
+            }
+            if at.is_empty() {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// The converging lanes of every crossing object (`add_converging`) on a network whose
+    /// meeting places were derived before them (a recording's header): the pairs with no
+    /// meeting place yet. Returns how many were added.
+    pub fn compile_converging(&mut self) -> usize {
+        self.conflicts.resize(self.lanes.len(), Vec::new());
+        self.crossings.resize(self.lanes.len(), Vec::new());
+        let mut by_object: std::collections::BTreeMap<((i32, i32), i64), Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, l) in self.lanes.iter().enumerate() {
+            if l.source != 2 || l.kind != LaneKind::Street {
+                continue;
+            }
+            if let Some(k) = l.key {
+                by_object.entry((k.tile, k.id)).or_default().push(i);
+            }
+        }
+        let mut n = 0;
+        for lanes in by_object.values() {
+            for (x, &i) in lanes.iter().enumerate() {
+                for &j in &lanes[x + 1..] {
+                    if self.add_converging(i, j) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -2067,8 +2240,8 @@ mod stub_links_tests {
         }
         for (i, j) in [(0, 1), (3, 5)] {
             let (li, lj) = (net.lanes[i].length(), net.lanes[j].length());
-            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0 });
-            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0 });
+            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false });
+            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false });
             net.conflicts[i].push(j);
             net.conflicts[j].push(i);
         }
@@ -2447,7 +2620,7 @@ const PLAN_LANES: usize = 20;
 const JOINT_BLEND: f32 = 6.0;
 /// Seconds of signalling before a lane change begins to move sideways.
 // [ROLLBACK lanechange-108] two seconds (was 1.2) before the car moves over
-const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
+pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
 /// going. The body that follows this way is `ai_motion::AiBody`.
@@ -2629,6 +2802,12 @@ fn smooth01(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// The tangents of the lane segment `Lane::hermite` used last ((lane, segment), at its start,
+/// at its end): a run of points along a lane mostly falls in one segment, and the two sines
+/// and cosines were most of a point's cost.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tangents(Option<((usize, usize), DVec2, DVec2)>);
+
 /// A short sequence of lanes the way runs along, with the lane the car is on at `cur`.
 struct LaneSeq {
     lanes: [usize; PLAN_LANES + 2],
@@ -2647,9 +2826,9 @@ impl LaneSeq {
 
     /// Point and heading `u` metres into `lanes[i]` (beyond the ends of the first and last
     /// lane: straight on), with the joints on both sides smoothed.
-    fn at(&self, net: &Network, i: usize, u: f32) -> (DVec3, f32) {
+    fn at(&self, net: &Network, i: usize, u: f32, cache: &mut Tangents) -> (DVec3, f32) {
         let l = &net.lanes[self.lanes[i]];
-        let (mut p, h) = l.at_ext(u);
+        let (mut p, h) = l.at_ext_with(u, cache);
         let w = |x: f32| 1.0 - smooth01(x / JOINT_BLEND);
         if i > 0 {
             if let Some(g) = self.gap(net, i - 1) {
@@ -2682,8 +2861,19 @@ impl LaneSeq {
 
     /// Point and heading `d` metres from distance `s` of the current lane.
     fn point(&self, net: &Network, s: f32, d: f32) -> (DVec3, f32) {
+        self.point_with(net, s, d, &mut Tangents::default())
+    }
+
+    /// `point`, the tangents of the lane segment kept in `cache` for the next one.
+    fn point_with(&self, net: &Network, s: f32, d: f32, cache: &mut Tangents) -> (DVec3, f32) {
         let (i, u) = self.locate(net, s, d);
-        self.at(net, i, u)
+        self.at(net, i, u, cache)
+    }
+
+    /// The heading of `point`, without the point (the joints' smoothing moves the point only).
+    fn heading(&self, net: &Network, s: f32, d: f32) -> f32 {
+        let (i, u) = self.locate(net, s, d);
+        net.lanes[self.lanes[i]].heading_at_ext(u)
     }
 }
 
@@ -2948,6 +3138,77 @@ impl AiState {
         Some((b, if side > 0.0 || (side.abs() < 0.5 && lb.offset > la.offset) { 2 } else { 1 }))
     }
 
+    /// During a lane change: the places on its own lane and on the lane it moves to that the car
+    /// is level with, (point, heading in degrees) each.
+    pub fn change_anchors(&self, net: &Network) -> Option<((DVec3, f32), (DVec3, f32))> {
+        let c = self.change?;
+        if c.to >= net.lanes.len() {
+            return None;
+        }
+        Some((self.seq().point(net, self.s, 0.0), self.change_seq(c.to).point(net, c.s_to, 0.0)))
+    }
+
+    /// During a lane change: how far it has got (the S-curve's share of the way across, 0..1)
+    /// and where the body is, as lateral offsets (m, + right) from its own lane and from the
+    /// lane it moves to, at the place along each the car is level with.
+    pub fn change_offsets(&self, net: &Network) -> Option<(f32, f32, f32)> {
+        let c = self.change?;
+        if c.to >= net.lanes.len() {
+            return None;
+        }
+        let (ps, hs) = self.seq().point(net, self.s, 0.0);
+        let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, 0.0);
+        let k = smooth01(c.t - c.wait * self.speed.max(2.0) / c.length);
+        let p = ps.lerp(pt, k as f64);
+        let off = |q: DVec3, h: f32| {
+            let hr = (h as f64).to_radians();
+            (p - q).truncate().dot(DVec2::new(hr.cos(), -hr.sin())) as f32
+        };
+        Some((k, off(ps, hs) + self.lateral, off(pt, ht) + self.lateral))
+    }
+
+    /// A lane change that stands frozen part-way (the car cannot move on, so neither does the
+    /// change, which goes by distance): settled where the body is, `done` in place (the car is
+    /// on the lane it moved to, offset by what was left of the move) or given up (back on its
+    /// own lane, offset by what it had moved). Either way the offset eases off over the S-curve
+    /// of a bay as the car drives on (`lateral_ramp`), so the body does not jump. (viz3 case09:
+    /// 13 cars that began a change at the tail of a red queue stood diagonally across the lines
+    /// for 40-95 s; case01 #4436 for 45 s.) Which: see the traffic's `settle_choice`.
+    pub fn settle_change(&mut self, net: &Network, done: bool) {
+        let Some(c) = self.change else { return };
+        let Some((_, from_own, from_target)) = self.change_offsets(net) else {
+            self.change = None;
+            self.change_plan.clear();
+            return;
+        };
+        let off = if done { from_target } else { from_own };
+        if done {
+            if self.route.get(self.route_index + 1) == Some(&c.to) {
+                self.route_index += 1;
+            }
+            let to_len = net.lanes[c.to].length();
+            self.lane = c.to;
+            self.s = c.s_to.min(to_len);
+            self.prev_lane = None;
+            let plan = std::mem::take(&mut self.change_plan);
+            self.planned_next = plan.first().copied();
+            self.ahead = plan.into_iter().skip(1).collect();
+            if self.route.is_empty() && self.planned_next.is_none() {
+                self.plan_next(net);
+            }
+            self.change_cooldown = 6.0;
+        } else {
+            self.change_plan.clear();
+            // (not straight into the same change again)
+            self.change_cooldown = 10.0;
+        }
+        self.change = None;
+        self.lateral_curve.clear();
+        self.lateral = off;
+        self.lateral_target = 0.0;
+        self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
+    }
+
     /// Pull out into `to` from behind a standing obstacle: a short, steep move.
     pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32) {
         self.start_change(net, to, dir);
@@ -3009,16 +3270,28 @@ impl AiState {
     /// out to the side where it pulls into a bay or round a parked car. The steering
     /// follows this curve; it has no steps, so neither does the car.
     pub fn way_point(&self, net: &Network, d: f32) -> DVec3 {
-        let (mut p, mut h) = self.seq().point(net, self.s, d);
-        if let Some(c) = self.change {
-            if c.to < net.lanes.len() {
-                let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, d);
-                // how far the change will have got by the time the car is `d` metres on
-                let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
-                let k = smooth01(c.t + tau);
-                p = p.lerp(pt, k as f64);
-                h += wrap_deg(ht - h) * k;
-            }
+        let change = self.change.filter(|c| c.to < net.lanes.len()).map(|c| self.change_seq(c.to));
+        self.way_point_on(net, &self.seq(), change.as_ref(), d, &mut [Tangents::default(); 2])
+    }
+
+    /// `way_point` at each of `ds`: the same points, the lane sequences built once and the
+    /// tangents of a lane segment kept while the points fall in it (the perception samples
+    /// a hundred metres of way for every car each frame).
+    pub fn way_points(&self, net: &Network, ds: impl Iterator<Item = f32>) -> Vec<DVec3> {
+        let (seq, change) = (self.seq(), self.change.filter(|c| c.to < net.lanes.len()).map(|c| self.change_seq(c.to)));
+        let mut cache = [Tangents::default(); 2];
+        ds.map(|d| self.way_point_on(net, &seq, change.as_ref(), d, &mut cache)).collect()
+    }
+
+    fn way_point_on(&self, net: &Network, seq: &LaneSeq, change_seq: Option<&LaneSeq>, d: f32, cache: &mut [Tangents; 2]) -> DVec3 {
+        let (mut p, mut h) = seq.point_with(net, self.s, d, &mut cache[0]);
+        if let (Some(c), Some(cs)) = (self.change, change_seq) {
+            let (pt, ht) = cs.point_with(net, c.s_to, d, &mut cache[1]);
+            // how far the change will have got by the time the car is `d` metres on
+            let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
+            let k = smooth01(c.t + tau);
+            p = p.lerp(pt, k as f64);
+            h += wrap_deg(ht - h) * k;
         }
         let lat = self.lateral_at(self.odometer + d);
         if lat.abs() > 1e-3 {
@@ -3055,7 +3328,7 @@ impl AiState {
         let mut next = first;
         while d <= reach {
             let (i, u) = q.locate(net, s, d);
-            let turn = wrap_deg(q.point(net, s, d + 3.0).1 - q.point(net, s, d - 3.0).1).abs().to_radians() / 6.0;
+            let turn = wrap_deg(q.heading(net, s, d + 3.0) - q.heading(net, s, d - 3.0)).abs().to_radians() / 6.0;
             let k = net.lanes[q.lanes[i]].curvature_at(u).abs().max(turn);
             if k > 1e-4 {
                 let v = (self.lat_accel / k).sqrt().max(2.5);

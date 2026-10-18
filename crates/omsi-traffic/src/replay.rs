@@ -124,10 +124,13 @@ impl Replay {
 
     /// The lit stubs on the recorded network: the links round them and the merges of one
     /// way's pieces dropped (a recording from before them has them; one since, none), the
-    /// junctions compiled from what is left (lanes added later are linked and compiled with
+    /// converging lanes compiled, the junctions compiled from what is left (lanes added later are linked and compiled with
     /// them, `Network::extend`).
     fn stub_links(&mut self) {
         self.net.apply_stub_links();
+        // (and the lanes of one object converging side by side, that a header from before
+        // them has no meeting place for: `Network::add_converging`)
+        self.net.compile_converging();
         self.sim.junctions = Junctions::compile(&self.net);
     }
 
