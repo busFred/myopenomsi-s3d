@@ -1389,6 +1389,9 @@ struct Cross {
     to: usize,
     /// Length of all the pieces (m).
     total: f32,
+    /// Kerb to kerb (m): the pieces and the steps between them (pieces of 1 m each join the
+    /// next a metre on: a walk leaves every other one out).
+    span: f32,
     /// The light that governs it (a piece's own, or that of the crossing object's crossing).
     light: Option<(usize, usize)>,
     /// Walking back to the near kerb (the pieces `from..=to` are the way back).
@@ -1545,6 +1548,8 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
         from: start,
         to: end,
         total: pieces.iter().map(|l| l.len()).sum(),
+        span: pieces.iter().map(|l| l.len()).sum::<f32>()
+            + pieces.windows(2).map(|w| (w[0].at(net, w[0].len()).0 - w[1].at(net, 0.0).0).truncate().length() as f32).sum::<f32>(),
         light,
         back: false,
         caught: false,
@@ -2081,6 +2086,35 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
     Want { vel, face: None, give: 1.0, corridor, idle: Activity::Stand }
 }
 
+/// [ROLLBACK r4c-P2] Whether somebody at the far kerb `arrival` s after stepping on makes it:
+/// past the middle of the crossing before the pedestrian green ends in `green_left` s (the
+/// change turns the others back, P1) and across before the cars get their green (`window`
+/// s): the light must not turn red before the arrival less a margin, the shorter of half
+/// the crossing and the clearance time.
+fn makes_it(green_left: f32, window: f32, arrival: f64) -> bool {
+    let clearance = (window - green_left).max(0.0) as f64;
+    let margin = (arrival * 0.5).min(clearance);
+    green_left as f64 >= arrival - margin
+}
+
+/// [ROLLBACK r4c-P2] The share of people who step onto a lit crossing they cannot make before
+/// the red (each person at each crossing, seeded: always the same ones).
+const PED_LATE_CHANCE: f64 = 0.08;
+
+/// A number in 0..1 fixed by `a` and `b`.
+fn hash01(a: u64, b: u64) -> f64 {
+    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_add(0x632B_E59B_D9B4_E019).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    x ^= x >> 31;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// [ROLLBACK r4c-P2] Whether person `id` steps onto crossing `key` late anyway.
+fn late_stepper(id: u32, key: usize) -> bool {
+    hash01(id as u64, key as u64) < PED_LATE_CHANCE
+}
+
 /// [ROLLBACK r4c-P1] Decisions on a crossing as the recording shows them.
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
 const HURRIES_ON: &str = "caught by the change: on across";
@@ -2124,8 +2158,17 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             // it, until the cars get their green. Only the green alone was counted, so
             // nobody ever started on green and everybody went across on red after
             // 150 s, in front of moving cars.
-            let window = pedestrian_window(Some(&mut *ped), net, t, &[next.lane], left);
-            if (window as f64) < t_cross {
+            // [ROLLBACK r4c-P2] the whole crossing, kerb to kerb (the next piece alone was
+            // counted: people stepped onto a 28 s crossing 1-4 s before the red)
+            let arrival = c.span as f64 / pace.max(0.5) + 1.0;
+            let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
+            let window = pedestrian_window(Some(&mut *ped), net, t, &paths, left);
+            if !makes_it(left, window, arrival) {
+                // (a few go anyway, so that a crowd does not freeze all at once; the change
+                // then turns them back or sends them on, P1)
+                if left > 2.0 && late_stepper(me.id, c.key) {
+                    return Ok(());
+                }
                 return Err("the green ends before they would be across");
             }
             return Ok(());
@@ -8101,7 +8144,7 @@ mod ped_tests {
         let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 1).unwrap();
         let last = walk.legs[c.to];
         assert!(last.at(&net, last.len()).0.y > 4.4, "to the far kerb: {:?}", walk.legs);
-        assert!(c.total > 4.5 && c.total < 6.5, "{}", c.total);
+        assert!(c.span > 8.5 && c.span < 10.5, "{}", c.span);
         assert_eq!(c.light, Some((0, 0)));
         // and walked: on_crossing everywhere between the kerbs, the red at the kerb only
         let mut m = me(9, DVec2::new(-10.0, -5.5), 1.2);
@@ -8169,6 +8212,72 @@ mod ped_tests {
         let c = crossing_span(&mut ped, &net, None, &mut roam, 1).unwrap();
         assert_eq!(roam.legs.iter().map(|l| l.lane).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
         assert_eq!(c.to, 4);
+    }
+
+    /// At the kerb with the green on for `left` s more: what person `id` decides, and (walked
+    /// on for 30 s with the red coming when the green is over) where they end up and the
+    /// longest they stood on the carriageway.
+    fn at_green(id: u32, left: f32) -> (Option<&'static str>, DVec2, f32) {
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, left);
+        let mut walk = across();
+        walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+        let mut m = me(id, DVec2::new(-0.5, -5.5), 1.2);
+        let dt = 0.05;
+        let (mut first, mut still, mut longest) = (None, 0.0f32, 0.0f32);
+        let mut t = 0.0f32;
+        while t < 30.0 {
+            let rest = left - t;
+            if rest <= 0.0 {
+                lights.state.set(RED);
+                lights.left.set(30.0);
+            } else {
+                lights.left.set(rest);
+            }
+            let v = frame(&net, &mut ped, Some(&lights), &[], t as f64, &mut m, &mut walk, dt);
+            if first.is_none() && m.decision.is_some() {
+                first = m.decision;
+            }
+            if in_road(m.pos) {
+                still = if v.length() < 0.05 { still + dt } else { 0.0 };
+                longest = longest.max(still);
+            }
+            t += dt;
+        }
+        (first, m.pos, longest)
+    }
+
+    #[test]
+    fn p2_the_whole_crossing_is_timed_at_the_kerb() {
+        // 11 m at 1.2 m/s: at the far kerb 10.2 s after stepping on; with no light for the
+        // cars the clearance is 2 s
+        assert!(makes_it(9.0, 11.0, 10.2));
+        assert!(!makes_it(4.0, 6.0, 10.2));
+        // past the middle before the red, across in the clearance
+        assert!(makes_it(6.0, 20.0, 10.2));
+        assert!(!makes_it(4.0, 20.0, 10.2));
+        let id = (1..200u32).find(|&id| !late_stepper(id, 2) && !late_stepper(id, 3)).unwrap();
+        // not enough green left: they wait at the kerb, off the carriageway
+        let (first, end, _) = at_green(id, 4.0);
+        assert_eq!(first, Some("the green ends before they would be across"));
+        assert!(end.y < -5.0, "{end:?}");
+        // enough: across
+        let (first, end, stood) = at_green(id, 20.0);
+        assert_eq!(first, Some("go"));
+        assert!(end.y > 5.3, "{end:?}");
+        assert!(stood < 0.2);
+    }
+
+    #[test]
+    fn p2_a_late_stepper_goes_and_the_change_clears_them() {
+        let share = (1..2001u32).filter(|&id| late_stepper(id, 3)).count() as f64 / 2000.0;
+        assert!((share - PED_LATE_CHANCE).abs() < 0.03, "{share}");
+        let id = (1..400u32).find(|&id| late_stepper(id, 3)).unwrap();
+        let (first, end, stood) = at_green(id, 4.0);
+        assert_eq!(first, Some("go"));
+        // caught before the middle: back on the near pavement, never standing in the road
+        assert!(end.y < -5.0, "{end:?}");
+        assert!(stood < 0.2, "{stood}");
     }
 }
 
