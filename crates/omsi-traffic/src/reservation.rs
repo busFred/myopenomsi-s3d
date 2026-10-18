@@ -397,14 +397,16 @@ fn decide(js: &Junctions, net: &Network, claims: &[Claim], plain: Option<&[Grant
     decide_in(&Context::default(), js, net, claims, plain, standing)
 }
 
-/// Lights before the table: a foe that my green makes no competitor. My light lets me
-/// in (`c` has a light and is not held by it), the foe stands or rolls towards a red that
-/// holds it (`light_red`: its driver stops there, wherever it is and however fast), and the
-/// two lights never let vehicles in together: it cannot come while I have my green, and
-/// when its own green comes mine is gone (a car of mine still inside is then waited for,
-/// `Claim::committed`). (Before, only a foe standing or creeping at its red was shifted to
-/// its green; a stream braking towards a long red at 1-12 m/s re-held a green leader every
-/// 3-5 s, viz3 case16: 50 s of a 57 s green.)
+/// Lights before the table: a foe that my green holds back. My light lets me in (`c` has a
+/// light and is not held by it), the foe stands or rolls towards a red that holds it
+/// (`light_red`: its driver stops there, wherever it is and however fast), and the two lights
+/// never let vehicles in together: it does not come before its green, whatever its speed. Its
+/// window is put at its green (`until_go`; no later than its own if it rolls) and it is a
+/// competitor only when that still meets mine: some programs have no intergreen at all
+/// (viz3 controller 16, lights 0/2; 19, lights 5/6), and a foe 0.2 s from its green at 10 m/s
+/// is coming. (Before, only a foe standing or creeping at its red was shifted to its green; a
+/// stream braking towards a long red at 1-12 m/s re-held a green leader every 3-5 s, viz3
+/// case16: 50 s of a 57 s green.)
 fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     match (c.light, o.light) {
         (Some(mine), Some(theirs)) => !c.light_red && o.light_red && ctx.exclusive(mine, theirs),
@@ -485,8 +487,10 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                     shifted.committed = false;
                 }
                 let o = &shifted;
-                // lights before the table: held at a red that is never green with mine
-                if !their_inside && red_foe(ctx, c, o) {
+                // lights before the table: held at a red that is never green with mine, it
+                // comes at its green (`red_foe`)
+                let at_red = !their_inside && red_foe(ctx, c, o);
+                if at_red && o.until_go.is_none() {
                     continue;
                 }
                 if me_in && !their_inside {
@@ -511,7 +515,19 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 // the left-turner on its arrow turns in front of the oncoming queue
                 // (creeping up to its line under 1 m/s after a stand counts as
                 // standing there, `Claim::red_hysteresis`)
-                if o.light_red && (o.speed < 0.5 || (o.red_hysteresis && o.speed <= 1.0)) && !their_inside {
+                if at_red {
+                    let t = o.until_go.unwrap_or(f32::INFINITY);
+                    let standing = o.speed < 0.5 || (o.red_hysteresis && o.speed <= 1.0);
+                    // (standing: from rest at its green; rolling: not before its green, nor
+                    // before its own window says)
+                    let shift = if standing { t } else { (t - their_in).max(0.0) };
+                    their_in += shift;
+                    their_out += shift;
+                    let margin = if foe.yields { c.gap.max(CLEAR_MARGIN) } else { CLEAR_MARGIN };
+                    if my_out + margin <= their_in {
+                        continue;
+                    }
+                } else if o.light_red && (o.speed < 0.5 || (o.red_hysteresis && o.speed <= 1.0)) && !their_inside {
                     match o.until_go {
                         Some(t) => {
                             their_in += t;
@@ -555,7 +571,8 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 // waited for was dropped; a car held by its lead, "first" by a start it could
                 // not make, went past the contender before it in the order)
                 let i_am_first = my_out + margin <= their_in && !c.blocked;
-                let they_are_first = their_out + CLEAR_MARGIN <= my_in && !(o.blocked && !their_inside);
+                // (nor one braking for its red: it is not through on the schedule of its speed)
+                let they_are_first = their_out + CLEAR_MARGIN <= my_in && !(o.blocked && !their_inside) && !at_red;
                 // the two are clear of each other in time whatever the rules say
                 if !their_inside && i_am_first && !o.committed {
                     continue;
@@ -1739,5 +1756,35 @@ mod tests {
         inside[1].speed = 1.5;
         let g = resolve(&js, &net, &inside);
         assert!(grant_of(&g, 1).go && grant_of(&g, 2).wait_for == Some(1), "{g:?}");
+    }
+
+    // ---- review7 counter-examples ----
+
+    /// BeijingCity controller 16 (viz3): light 2's yellow runs to the end of the 93 s cycle
+    /// and light 0 turns green at 0 s, so the two are "never together" with an intergreen of
+    /// zero. I take light 2's yellow at its last 0.2 s; the main road car (light 0, right of
+    /// way) rolls at 10 m/s 12 m out, held by a red that turns green in 0.2 s. Dropping it
+    /// "whatever its speed" sends me across a stream that gets its green before I am through.
+    #[test]
+    fn review7_rule_a_zero_intergreen_foe_rolling_at_its_red_is_still_a_competitor() {
+        let ph = |v: &[(i32, f32)]| v.to_vec();
+        let ctl = omsi_sim::traffic::TrafficLightController::new(
+            vec![
+                ph(&[(6, 50.0), (12, 0.5), (6, 0.5), (12, 0.5), (6, 0.5), (12, 0.5), (6, 0.5), (10, 3.0), (0, 1.0)]),
+                ph(&[(0, 62.0), (6, 15.0), (0, 10.0)]),
+                ph(&[(0, 62.0), (6, 25.0), (12, 0.5), (6, 0.5), (12, 0.5), (6, 0.5), (12, 0.5), (6, 0.5), (10, 3.0), (0, 1.0)]),
+            ],
+            93.0,
+        );
+        assert!(ctl.never_together(0, 2), "the program's pair is exclusive");
+        let mut ctx = Context::default();
+        ctx.exclusive.insert((0, 0, 2), ctl.never_together(0, 2));
+        let (net, js, mut claims) = green_side_red_main(12.0, 10.0);
+        claims[0].light = Some((0, 2));
+        claims[1].light = Some((0, 0));
+        claims[1].until_go = Some(0.2);
+        // (the old shift would put it 0.2 s later: still well inside my window)
+        let g = resolve_with(&js, &net, &claims, &ctx);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "dropped a 10 m/s foe 0.2 s from its green: {g:?}");
     }
 }
