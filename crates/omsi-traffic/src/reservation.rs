@@ -633,15 +633,37 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                     // case03/04 #8927/#5315)
                     let ahead_len = if d_me < d_them { c.front + c.rear } else { o.front + o.rear };
                     let engaged = d_me.min(d_them) < ZIP_FIXED || (d_me - d_them).abs() < ahead_len;
-                    let theirs = match held {
-                        Some(t) if engaged || level => t,
+                    // (where our ways meet elsewhere too and the table says there who gives way,
+                    // that holds here: the garage way of viz3 case14 meets the street with its
+                    // piece 10094, giving way, and again with 10096, a zipper; each car waited
+                    // for the other, one at either meeting place)
+                    let table = {
+                        let oc = &claims[ok].chain;
+                        let mut t = None;
+                        for (mp, f) in &my_foes {
+                            if !oc.iter().any(|&(m, _)| m == f.movement) {
+                                continue;
+                            }
+                            if f.yields {
+                                t = Some(true);
+                                break;
+                            }
+                            if node.movements[f.movement].foes.iter().any(|g| g.movement == *mp && g.yields) {
+                                t = Some(false);
+                            }
+                        }
+                        t
+                    };
+                    let theirs = match (table, held) {
+                        (Some(t), _) => t,
+                        (None, Some(t)) if engaged || level => t,
                         _ if !level => d_them < d_me,
                         _ => match last {
                             Some((piece, _)) => piece == my_piece,
                             None => o.vehicle < c.vehicle,
                         },
                     };
-                    if !theirs {
+                    if !theirs && table.is_none() {
                         zip_tie = Some((key, my_piece));
                     }
                     theirs
