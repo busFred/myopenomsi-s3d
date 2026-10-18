@@ -371,7 +371,7 @@ fn a_car_waits_behind_a_parked_car_while_a_stream_comes_the_other_way() {
 fn a_car_stops_for_a_person_on_a_crossing_and_goes_on_when_they_are_gone() {
     let net = straight_road();
     let mut sim = Simulation::new(&net, vec![]);
-    sim.people.push(omsi_traffic::Person { pos: DVec3::new(150.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 0.0, waiting_for_bus: false });
+    sim.people.push(omsi_traffic::Person { pos: DVec3::new(150.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 0.0, waiting_for_bus: false, at_kerb: false });
     let mut cars = vec![car(1, 0, 60.0, 12.0)];
     let mut frames = 0;
     let mut stood_short = false;
@@ -632,4 +632,49 @@ fn the_same_scenario_twice_gives_the_same_positions() {
     let b = determinism_scenario();
     assert!(a.len() >= 8);
     assert_eq!(a, b);
+}
+
+/// [ROLLBACK r4c-L4] A 2.5 m bus standing in a 2.5 m lane, somebody 5 m ahead of its nose at the
+/// kerb spot (half the lane and 0.3 m off its axis): waiting there to cross, they hold it
+/// neither as a person (People) nor at a crossing (Zebra) and it drives on; not waiting
+/// (the same place, walking about) they still do, and somebody waiting nearer than the bus's
+/// footprint and 0.3 m does too.
+#[test]
+fn a_bus_goes_past_a_person_waiting_at_the_kerb_spot() {
+    let run_with = |lateral: f64, at_kerb: bool| -> (bool, f32) {
+        let mut net = Network::default();
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(400.0, 0.0, 0.0)], LaneKind::Street, 2.5);
+        l.source = 1;
+        l.key = Some(LaneKey { tile: (0, 0), id: 1, path: 0 });
+        net.lanes.push(l);
+        net.link(1.5);
+        net.compute_conflicts();
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut st = AiState::new(0, 100.0, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.length = 12.0;
+        st.max_speed_kmh = 60.0;
+        st.veh_type = 2;
+        let mut bus = Vehicle::new(1, VehicleClass::Bus, st, 1.25, 7);
+        bus.fresh = 0.0;
+        let mut cars = vec![bus];
+        sim.people.push(omsi_traffic::Person { pos: DVec3::new(111.0, -lateral, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.5, waiting_for_bus: false, at_kerb });
+        let mut held = false;
+        run(&net, &mut sim, &mut cars, 8.0, |_, sim, cars| {
+            held |= matches!(cars[0].last.why, Why::People | Why::Zebra);
+            // (standing still on: the person's seconds go on)
+            let _ = sim;
+        });
+        (held, cars[0].state.s)
+    };
+    let (held, s) = run_with(1.25 + 0.3, true);
+    assert!(!held, "held by somebody waiting outside its footprint");
+    assert!(s > 115.0, "the bus did not go: s = {s:.1}");
+    let (held, s) = run_with(1.25 + 0.3 - 0.05, true);
+    assert!(!held && s > 115.0, "to a tenth: s = {s:.1}");
+    let (held, _) = run_with(1.25 + 0.3 - 0.05, false);
+    assert!(held, "somebody not waiting there still holds it");
+    let (held, _) = run_with(1.25 + 0.05, true);
+    assert!(held, "waiting inside its footprint holds it");
 }

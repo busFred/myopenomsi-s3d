@@ -520,7 +520,7 @@ pub struct Traffic {
     /// Everybody on foot on the ground: position, velocity, whether they are waiting at a
     /// stop, and for how long they have stood still (set every frame) - the cars stop for
     /// anybody in their way, not only on a crossing.
-    pub people: Vec<(DVec3, DVec2, bool, f32, bool)>,
+    pub people: Vec<(DVec3, DVec2, bool, f32, bool, bool)>,
     /// No car has been placed yet: the first population may fill the view.
     initial: bool,
     /// Seconds of the last tick (the lamp scripts run in `sync`).
@@ -3067,7 +3067,7 @@ impl Traffic {
         }
         self.others_still.retain(|id, _| others.iter().any(|o| o.0 == *id));
         self.sim.players = views;
-        self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting }).collect();
+        self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb }).collect();
         self.sim.walkers = self.walkers.clone();
         self.sim.parked = self.parked.iter().map(|(l, v)| (*l, v.iter().map(|&(s, lateral)| Parked { s, lateral, half_width: 0.9, half_len: 2.3 }).collect())).collect();
         self.sim.day_time = self.day_time;

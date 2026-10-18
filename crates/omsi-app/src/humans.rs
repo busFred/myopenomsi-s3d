@@ -119,6 +119,10 @@ enum Along {
 /// [ROLLBACK r4c-P5] Past a box `b` that lies along the way `dir` from `here`: the walker's line
 /// moved sideways by the box's overlap and half a metre, to the side where that stays within
 /// the path (`corridor`: its axis and half width), the nearer if both do.
+// TODO(r4c-L6, review 2026-10-18, low): `fits` checks only the lateral offset at `here`; the
+// second waypoint is the box's length + 0.8 m ahead along the bus axis, unchecked against a
+// path that bends; with no corridor any side is taken. The turn cap (P5) makes pacers stand
+// (vel 0) up to 5 s instead of turning, still inside a bus's strip if they were there.
 fn along_box(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Along {
     const CLEAR: f64 = 0.5;
     let f = DVec2::new(b.heading.sin(), b.heading.cos());
@@ -161,6 +165,10 @@ fn may_turn(since: f32) -> bool {
 
 /// [ROLLBACK r4c-P5] Whether the box `b` covers the path from `from` along `dir` within `ahead`
 /// m (a walker's body wide).
+// TODO(r4c-L5, review 2026-10-18, low): margin mismatch - this uses BODY_OUTSIDE 0.28 m, the
+// crowd's in_way check 0.43 m (BODY_OUTSIDE + 0.15); with a box 0.28-0.43 m from the line in
+// the first 1.5 m the kerb says go, the crowd blocks, car_wait 2 s -> turn_back -> kerb -> go:
+// a 3-4 s oscillation (reviewer's probe D: covers false, in_way true). Not seen in game.
 fn covers_path(b: &Block, from: DVec2, dir: DVec2, ahead: f64) -> bool {
     (0..=6).any(|k| b.near(from + dir * (ahead * k as f64 / 6.0), BODY_OUTSIDE))
 }
@@ -2441,8 +2449,24 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
         if car.vel.length() >= 0.5 || car.stood <= PED_YIELD_AFTER || !stands_at(car, &cuts) {
             continue;
         }
+        // (somebody of the stream still on the crossing in front of it: the vehicle's seconds
+        // start once they are off it - with the window running from the first yield the
+        // crossing was clear for a second of the six, and the queue stood 90 s)
+        let in_front = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q)| *id != me.id && cuts.iter().any(|x| (*q - *x).length() < 2.0 && stands_at(car, std::slice::from_ref(x))))).unwrap_or(false);
         match yields.get(&car.id) {
-            Some(&since) if at.time - since < PED_YIELD_MAX as f64 => return Err(YIELDS),
+            Some(&since) if at.time - since < PED_YIELD_MAX as f64 => {
+                if in_front {
+                    yields.insert(car.id, at.time);
+                }
+                return Err(YIELDS);
+            }
+            // [ROLLBACK r4c-L4] still standing after the people's own turn (as long again): it
+            // is let go again (once, the people on a long crossing outlasted the window and
+            // the vehicle stood for good)
+            Some(&since) if stream && at.time - since >= 2.0 * PED_YIELD_MAX as f64 => {
+                yields.insert(car.id, at.time);
+                return Err(YIELDS);
+            }
             Some(_) => {}
             None if stream => {
                 yields.insert(car.id, at.time);
@@ -2717,6 +2741,11 @@ impl Person {
     }
     fn inside(&self, bus: BusId) -> bool {
         matches!(self.place, Place::Bus(b, _) if b == bus)
+    }
+    /// [ROLLBACK r4c-L4] Waiting at a kerb to cross (held there by `may_cross`'s verdict), off the
+    /// carriageway: the cars' people check takes them as clear outside their footprint.
+    fn at_kerb(&self) -> bool {
+        matches!(&self.state, State::Strolling(w) if w.held > 0.0) && !self.on_crossing && self.last_decision.map(|d| d != "go").unwrap_or(false)
     }
     fn label(&self) -> String {
         format!(
@@ -3522,13 +3551,13 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position, p.vel, waiting, p.still, p.on_crossing)
+                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb())
             })
             .collect()
     }
@@ -3561,6 +3590,7 @@ impl Humans {
                     leg,
                     decision: p.last_decision.map(Cow::Borrowed),
                     pace: if matches!(p.state, State::Strolling(_)) { p.walk_pace as f32 } else { p.pace as f32 },
+                    at_kerb: p.at_kerb(),
                 }
             })
             .collect()
@@ -9087,6 +9117,51 @@ mod ped_tests {
         assert_eq!(seen.last().unwrap().1, Some(YIELDS));
         assert!(!m.on_crossing);
         assert!((m.pos.y + 1.75).abs() > 0.9 + 0.3, "{:?}", m.pos);
+    }
+
+    #[test]
+    fn l4_the_yield_renews_while_the_vehicle_keeps_standing() {
+        // a car standing on, a stream on: those arriving let it go for 6 s, cross themselves
+        // for as long, then let it go again (once, it stood for good after the first 6 s)
+        let (net, mut ped) = crossing(false);
+        let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -4.5))]);
+        let mut yields = HashMap::new();
+        let decide = |t: f64, yields: &mut HashMap<u64, f64>, ped: &mut PedNet| {
+            let mut walk = across();
+            walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+            let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+            for _ in 0..6 {
+                frame_with(&net, ped, None, &[car_before(10.0 + t as f32)], &streams, yields, t, &mut m, &mut walk, 0.05);
+            }
+            m.decision
+        };
+        assert_eq!(decide(0.0, &mut yields, &mut ped), Some(YIELDS));
+        assert_eq!(decide(5.0, &mut yields, &mut ped), Some(YIELDS));
+        assert_eq!(decide(8.0, &mut yields, &mut ped), Some("go"));
+        assert_eq!(decide(11.5, &mut yields, &mut ped), Some("go"));
+        assert_eq!(decide(12.5, &mut yields, &mut ped), Some(YIELDS));
+        assert_eq!(decide(17.0, &mut yields, &mut ped), Some(YIELDS));
+        // while somebody of the stream is still on the crossing in front of the car, its six
+        // seconds wait for them to be off it
+        let mut yields = HashMap::new();
+        let mut streams: HashMap<usize, Vec<(u32, DVec2)>> = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -1.75)), (51, DVec2::new(0.0, -4.5))]);
+        let decide = |t: f64, yields: &mut HashMap<u64, f64>, ped: &mut PedNet, streams: &HashMap<usize, Vec<(u32, DVec2)>>| {
+            let mut walk = across();
+            walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+            let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+            for _ in 0..6 {
+                frame_with(&net, ped, None, &[car_before(10.0 + t as f32)], streams, yields, t, &mut m, &mut walk, 0.05);
+            }
+            m.decision
+        };
+        assert_eq!(decide(0.0, &mut yields, &mut ped, &streams), Some(YIELDS));
+        assert_eq!(decide(5.0, &mut yields, &mut ped, &streams), Some(YIELDS));
+        assert_eq!(decide(9.0, &mut yields, &mut ped, &streams), Some(YIELDS), "still somebody in front of it");
+        streams.insert(3, vec![(50, DVec2::new(0.0, 3.0))]);
+        assert_eq!(decide(13.0, &mut yields, &mut ped, &streams), Some(YIELDS), "six seconds once they are off");
+        assert_eq!(decide(15.5, &mut yields, &mut ped, &streams), Some("go"));
     }
 
     #[test]

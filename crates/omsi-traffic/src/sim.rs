@@ -60,6 +60,10 @@ pub struct Person {
     pub still: f32,
     /// Waiting at a bus stop: a bus keeps well in, a car drives by.
     pub waiting_for_bus: bool,
+    /// Waiting at a kerb to cross (a red light, a car to pass, yielding to a vehicle), off
+    /// the carriageway: clear of a vehicle whose footprint they stand outside.
+    #[serde(default)]
+    pub at_kerb: bool,
 }
 
 /// A parked car beside a lane.
