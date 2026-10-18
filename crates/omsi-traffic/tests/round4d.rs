@@ -111,11 +111,27 @@ fn a_bus_pulls_up_to_its_pole_beside_the_people_and_only_one_in_its_way_holds_it
     let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
     let mut sim = Simulation::new(&net, vec![]);
     let mut vs = vec![bus(1, vec![0], 40.0, 8.0)];
-    sim.people = vec![person(149.0, -2.5, true), person(148.0, -2.5, true), person(146.0, -2.6, false), person(144.0, -2.5, false)];
+    // (1.6-1.7 m from the middle of the bus in the bay: its footprint (1.25 m) and 0.3 m clear)
+    sim.people = vec![person(149.0, -2.85, true), person(148.0, -2.85, true), person(146.0, -2.95, false), person(144.0, -2.9, false)];
     run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| to_the_stop(&mut vs[0]));
     let b = &vs[0];
     assert!((b.state.s + b.state.front - 150.0).abs() < 0.6, "at its pole: front at {}", b.state.s + b.state.front);
     assert!(b.state.speed < 0.1 && (b.state.lateral - 1.23).abs() < 0.1, "in the bay: {}", b.state.lateral);
+
+    // one standing 0.2 m outside its footprint, inside the clearance: held short of them
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 8.0)];
+    sim.people = vec![person(146.0, -1.23 - 1.45, false)];
+    run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| to_the_stop(&mut vs[0]));
+    let front = vs[0].state.s + vs[0].state.front;
+    assert!(front < 145.0, "kept 0.3 m clear: front at {front}");
+    // one on a zebra beside its way (2 m from its middle): held, as any car is
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 8.0)];
+    sim.people = vec![omsi_traffic::Person { on_crossing: true, ..person(130.0, -1.23 - 2.0, false) }];
+    run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| to_the_stop(&mut vs[0]));
+    let front = vs[0].state.s + vs[0].state.front;
+    assert!(front < 129.0, "stops for the zebra: front at {front}");
 
     // somebody standing inside its footprint 10 m before the pole: held short of them
     let mut sim = Simulation::new(&net, vec![]);

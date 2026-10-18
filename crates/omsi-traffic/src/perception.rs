@@ -556,6 +556,10 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 }
 
 /// Someone on foot in the strip ahead.
+/// [ROLLBACK r4d-B4] The clearance (m) a bus at its stop keeps round its footprint from the
+/// people standing at the kerb.
+const KERB_CLEAR: f32 = 0.3;
+
 fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     let st = &me.state;
     let v = st.speed;
@@ -563,8 +567,9 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     let radius = (st.front + reach + 6.0) as f64;
     let mut best: Option<f32> = None;
     // [ROLLBACK r4d-B4] a bus coming up to its own stop pulls in beside the people standing
-    // at the kerb: only one inside its footprint holds it (four waiting 2.5 m beside its
-    // nose - 1.3 m from its middle in the bay - stopped a bus 7.4 m short of its pole)
+    // at the kerb: only one inside its footprint and `KERB_CLEAR` round it holds it, where
+    // they stand (where their shuffle would take them stopped a bus 7.4 m short of its pole),
+    // and with no "stood at the edge a while" exemption (it crept on and stopped by turns)
     let own_stop = me.is_bus() && me.external.stop_at.is_some_and(|s| s - st.front < 40.0);
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
@@ -579,7 +584,8 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
         } else if p.waiting_for_bus && me.is_bus() {
             me.half_width - 0.3
         } else if at_kerb_of_stop {
-            me.half_width
+            // (its footprint and 0.3 m clear of it)
+            me.half_width + KERB_CLEAR
         } else {
             me.half_width + 0.3
         };
