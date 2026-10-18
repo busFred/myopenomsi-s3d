@@ -104,6 +104,67 @@ fn around_box(b: &Block, here: DVec2, dir: DVec2) -> Option<[DVec2; 2]> {
     let at = |x: f64, y: f64| b.center + r * x + f * y;
     Some([at(side * hx, ye), at(-side * hx, ye)])
 }
+/// [ROLLBACK r4c-P5] How the way leads past a standing box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Along {
+    /// It lies along the way: through these two points beside it (its near end, past its far
+    /// end) on its free side.
+    Route([DVec2; 2]),
+    /// It lies along the way and leaves no room beside it within the path.
+    NoRoom,
+    /// It lies across the way (or not in it): round its end (`around_box`).
+    Across,
+}
+
+/// [ROLLBACK r4c-P5] Past a box `b` that lies along the way `dir` from `here`: the walker's line
+/// moved sideways by the box's overlap and half a metre, to the side where that stays within
+/// the path (`corridor`: its axis and half width), the nearer if both do.
+fn along_box(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Along {
+    const CLEAR: f64 = 0.5;
+    let f = DVec2::new(b.heading.sin(), b.heading.cos());
+    if f.dot(dir).abs() < 0.7 {
+        return Along::Across;
+    }
+    if [0.9, 1.8, 3.0].iter().all(|t| !b.closest(here + dir * *t).1) && !b.near(here + dir * 0.9, BODY_OUTSIDE + 0.15) {
+        return Along::Across;
+    }
+    // (in the box's own axes: the way along it, and across)
+    let fd = if f.dot(dir) < 0.0 { -f } else { f };
+    let n = DVec2::new(fd.y, -fd.x);
+    let rel = b.center - here;
+    let (c_n, c_d) = (rel.dot(n), rel.dot(fd));
+    let (e_n, e_d) = (b.half.x, b.half.y);
+    if c_d + e_d < 0.0 {
+        return Along::Across;
+    }
+    let fits = |x: f64| match corridor {
+        Some((a, bb, dev)) => {
+            let axis = crowd::project_on_segment(here + n * x, a, bb).0;
+            (here + n * x - axis).length() <= dev + 0.2
+        }
+        None => true,
+    };
+    let mut sides = [c_n - e_n - CLEAR, c_n + e_n + CLEAR];
+    sides.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+    let Some(x) = sides.into_iter().find(|x| fits(*x)) else { return Along::NoRoom };
+    let near = (c_d - e_d).max(0.3);
+    Along::Route([here + n * x + fd * near, here + n * x + fd * (c_d + e_d + 0.8)])
+}
+
+/// [ROLLBACK r4c-P5] Seconds between two turns round beside a standing vehicle, at least.
+const PED_TURN_EVERY: f32 = 5.0;
+
+/// [ROLLBACK r4c-P5] Whether somebody who last turned round `since` s ago may turn again.
+fn may_turn(since: f32) -> bool {
+    since >= PED_TURN_EVERY
+}
+
+/// [ROLLBACK r4c-P5] Whether the box `b` covers the path from `from` along `dir` within `ahead`
+/// m (a walker's body wide).
+fn covers_path(b: &Block, from: DVec2, dir: DVec2, ahead: f64) -> bool {
+    (0..=6).any(|k| b.near(from + dir * (ahead * k as f64 / 6.0), BODY_OUTSIDE))
+}
+
 /// Stops within this distance of the player have their people (Omsi.exe: the stop's tile
 /// and the eight round the camera's, sub_61bf94).
 const STOP_RANGE: f64 = 450.0;
@@ -2305,6 +2366,20 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             None => {}
         }
     }
+    // [ROLLBACK r4c-P5] a vehicle whose box covers the first 1.5 m of the way across: one that
+    // stands there holds them for a few seconds only, then they step round it (a car held in
+    // a queue on the zebra and the people waiting for it to move stood for each other for
+    // good); one beside the way, or the player's bus with its nose short of it, does not hold
+    // (nine walkers were held 5 s each 1-1.5 m from the nose of a standing bus)
+    let (from, _) = next.at(net, 0.0);
+    let (ahead, _) = next.at(net, 1.5);
+    let way = (ahead - from).truncate().normalize_or_zero();
+    for car in at.cars {
+        let speed = car.vel.length();
+        if (speed >= 0.5 || held < 5.0) && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
+            return Err("a vehicle stands on the crossing");
+        }
+    }
     for x in ped.crossings(net, next.lane) {
         for car in at.cars {
             // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
@@ -2320,12 +2395,6 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             }
             let speed = car.vel.length();
             let half = car.half_len;
-            // [ROLLBACK pedcross-1] a vehicle standing on the crossing holds them for a
-            // few seconds only; then they step round it (a car held in a queue on the
-            // zebra and the people waiting for it to move stood for each other for good)
-            if dist < half + 1.5 && (speed >= 0.5 || held < 5.0) {
-                return Err("a vehicle stands on the crossing");
-            }
             if speed < 0.5 {
                 continue;
             }
@@ -2474,6 +2543,10 @@ pub struct Person {
     /// Which way round (+1 anticlockwise, -1 clockwise) while `detour` lasts: round a corner
     /// the sides' own choices flipped each other and people shuffled at a post.
     detour_side: f64,
+    /// [ROLLBACK r4c-P5] The way they wanted to walk last, and the seconds since they last turned
+    /// round (beside a standing vehicle: at most once in `PED_TURN_EVERY`).
+    want_dir: DVec2,
+    turned: f32,
     /// [ROLLBACK around-86] Going round a standing bus or lorry: the two corners of its box to
     /// walk through (the near end, the far side of it), the one on its way and the seconds left.
     around: Option<([DVec2; 2], usize, f32)>,
@@ -3592,6 +3665,8 @@ impl Humans {
             detour: 0.0,
             detour_side: 0.0,
             around: None,
+            want_dir: DVec2::ZERO,
+            turned: PED_TURN_EVERY,
             why: "",
             skinned: false,
             since_posed: 0,
@@ -5832,7 +5907,25 @@ impl Humans {
             // [ROLLBACK around-86] a bus or a lorry (not a car or a post) that the way leads
             // into: round its nearer end by its bounding box, not into its side and waiting
             let dir = want / speed;
-            let route = blocks.iter().filter(|b| b.vel.length() < 0.5 && b.half.max_element() >= 2.0).find_map(|b| around_box(b, here, dir));
+            // [ROLLBACK r4c-P5] one that lies along the way (a bus standing half on the pavement):
+            // along its free side within the path's width; round its end it was across the
+            // way, and the people paced to and fro in front of its nose (the bus held by them)
+            let big = |b: &&Block| b.vel.length() < 0.5 && b.half.max_element() >= 2.0;
+            let mut no_room = false;
+            let mut route = None;
+            for b in blocks.iter().filter(big) {
+                match along_box(b, here, dir, wants[i].corridor) {
+                    Along::Route(wp) => {
+                        route = Some(wp);
+                        break;
+                    }
+                    Along::NoRoom => no_room = true,
+                    Along::Across => {}
+                }
+            }
+            if route.is_none() && !no_room {
+                route = blocks.iter().filter(big).find_map(|b| around_box(b, here, dir));
+            }
             if let Some(wp) = route {
                 self.people[i].around = Some((wp, 0, 12.0));
                 self.people[i].detour = self.people[i].detour.max(0.3);
@@ -5847,6 +5940,32 @@ impl Humans {
             } else if self.people[i].detour <= 0.0 {
                 wants[i].vel = DVec2::ZERO;
             }
+        }
+        // [ROLLBACK r4c-P5] beside a standing vehicle nobody turns round more than once in
+        // PED_TURN_EVERY seconds (they stand instead)
+        for i in 0..self.people.len() {
+            if !matches!(self.people[i].state, State::Strolling(_)) || remove.contains(&i) {
+                continue;
+            }
+            let here = self.people[i].position.truncate();
+            let near_box = blocks.iter().any(|b| b.vel.length() < 0.5 && b.near(here, 3.0));
+            let p = &mut self.people[i];
+            p.turned += dt;
+            let v = wants[i].vel;
+            let speed = v.length();
+            if speed < 0.2 {
+                continue;
+            }
+            let dir = v / speed;
+            if p.want_dir.dot(dir) < -0.2 {
+                // (not on a crossing: turned back by the change, they go at once, P1)
+                if near_box && !p.on_crossing && !may_turn(p.turned) {
+                    wants[i].vel = DVec2::ZERO;
+                    continue;
+                }
+                p.turned = 0.0;
+            }
+            p.want_dir = dir;
         }
         // the crowd of the pavements (passengers outside stand in it as they are)
         let mut walkers: Vec<Walker> = Vec::with_capacity(self.people.len());
@@ -8375,6 +8494,131 @@ mod ped_tests {
         let c = crossing_span(&mut ped, &net, None, &mut roam, 1).unwrap();
         assert_eq!(roam.legs.iter().map(|l| l.lane).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
         assert_eq!(c.to, 4);
+    }
+
+    /// At the unlit kerb of `crossing` with `car` standing: the first decision.
+    fn kerb_with(car: SeenCar) -> Option<&'static str> {
+        let (net, mut ped) = crossing(false);
+        let mut walk = across();
+        walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+        let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+        let mut first = None;
+        for k in 0..20 {
+            frame(&net, &mut ped, None, &[car], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            first = first.or(m.decision);
+        }
+        first
+    }
+
+    #[test]
+    fn p5_only_a_box_over_the_way_holds_at_the_kerb() {
+        // a car standing in lane 0 with its front 0.95 m short of the crossing (its centre
+        // 3.2 m from where the crossing cuts the lane: within half its length and 1.5 m,
+        // which held them before): beside the way, no hold
+        let mut car = car_before(1.0);
+        car.yielding = false;
+        car.body.center = DVec2::new(-3.2, -1.75);
+        car.pos = car.body.center;
+        assert_eq!(kerb_with(car), Some("go"));
+        // the player's bus standing with its nose 1 m short of the way off the kerb: no hold
+        let bus = Block { center: DVec2::new(-7.25, -4.6), half: DVec2::new(1.25, 6.0), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let player = SeenCar { id: PLAYER_CAR, pos: bus.center, vel: DVec2::ZERO, half_len: 6.0, body: bus, yielding: false, stood: 30.0 };
+        assert_eq!(kerb_with(player), Some("go"));
+        // with its nose over the way it holds them (a few seconds)
+        let mut over = player;
+        over.body.center.x = -5.0;
+        assert_eq!(kerb_with(over), Some("a vehicle stands on the crossing"));
+    }
+
+    /// A walker going north along a pavement (axis x = 0, 2.1 m wide) past a bus standing
+    /// half on it (its box x -2.15..0.35, y -6..6): the game's steps round a standing box in
+    /// small (the route along its side, the turns capped), the crowd keeping them out of it.
+    /// Returns where they end up and how often they turned round.
+    fn past_the_bus(corridor_half: f64) -> (DVec2, usize, bool) {
+        let bus = Block { center: DVec2::new(-0.9, 0.0), half: DVec2::new(1.25, 6.0), heading: 0.0, vel: DVec2::ZERO };
+        let mut w = Walker::new(DVec2::new(0.0, -9.0), BODY_OUTSIDE, 0);
+        w.solid = true;
+        let params = CrowdParams::default();
+        let dt = 0.05;
+        let (mut around, mut want_dir, mut turned, mut turns, mut routed) = (None::<([DVec2; 2], usize)>, DVec2::ZERO, PED_TURN_EVERY, 0usize, false);
+        for _ in 0..800 {
+            let here = w.pos;
+            let corridor = Some((DVec2::new(0.0, here.y - 2.0), DVec2::new(0.0, here.y + 2.5), corridor_half));
+            let mut want = (DVec2::new(0.0, here.y + 1.3) - here).normalize_or_zero() * 1.2;
+            if let Some((wp, k)) = around {
+                let k = if (wp[k] - here).length() < 0.45 { k + 1 } else { k };
+                around = (k < 2).then_some((wp, k));
+                if let Some((wp, k)) = around {
+                    want = (wp[k] - here).normalize_or_zero() * 1.2;
+                }
+            } else {
+                let dir = want.normalize_or_zero();
+                let ahead = here + dir * 0.9;
+                if bus.near(ahead, BODY_OUTSIDE + 0.15) {
+                    match along_box(&bus, here, dir, corridor) {
+                        Along::Route(wp) => {
+                            routed = true;
+                            around = Some((wp, 0));
+                            want = (wp[0] - here).normalize_or_zero() * 1.2;
+                        }
+                        _ => {
+                            if let Some(wp) = around_box(&bus, here, dir) {
+                                around = Some((wp, 0));
+                                want = (wp[0] - here).normalize_or_zero() * 1.2;
+                            }
+                        }
+                    }
+                }
+            }
+            turned += dt as f32;
+            if want.length() > 0.2 {
+                let d = want.normalize();
+                if want_dir.dot(d) < -0.2 {
+                    if !may_turn(turned) {
+                        want = DVec2::ZERO;
+                    } else {
+                        turned = 0.0;
+                        turns += 1;
+                    }
+                }
+                if want.length() > 0.2 {
+                    want_dir = d;
+                }
+            }
+            w.want = want;
+            w.corridor = None;
+            crowd::step(std::slice::from_mut(&mut w), &[bus], &params, dt);
+        }
+        (w.pos, turns, routed)
+    }
+
+    #[test]
+    fn p5_a_bus_along_the_pavement_is_walked_past_on_its_free_side() {
+        let (end, turns, routed) = past_the_bus(1.05);
+        assert!(routed, "{end:?} {turns}");
+        assert!(end.y > 7.0, "past the bus: {end:?}");
+        assert_eq!(turns, 0, "no pacing in front of its nose");
+        // the route keeps to the pavement: beside the box by half a metre
+        let bus = Block { center: DVec2::new(-0.9, 0.0), half: DVec2::new(1.25, 6.0), heading: 0.0, vel: DVec2::ZERO };
+        let Along::Route(wp) = along_box(&bus, DVec2::new(0.0, -7.0), DVec2::Y, Some((DVec2::new(0.0, -9.0), DVec2::new(0.0, -4.5), 1.05))) else { panic!() };
+        assert!((wp[0].x - 0.85).abs() < 1e-9 && (wp[1].x - 0.85).abs() < 1e-9, "{wp:?}");
+        assert!(wp[1].y > 6.0);
+        // no room beside it within the path: not round its nose either
+        assert_eq!(along_box(&bus, DVec2::new(0.0, -7.0), DVec2::Y, Some((DVec2::new(0.0, -9.0), DVec2::new(0.0, -4.5), 0.4))), Along::NoRoom);
+        // a box across the way is gone round its end as before
+        let across = Block { heading: std::f64::consts::FRAC_PI_2, ..bus };
+        assert_eq!(along_box(&across, DVec2::new(0.0, -9.0), DVec2::Y, None), Along::Across);
+    }
+
+    #[test]
+    fn p5_turning_round_is_capped_beside_a_standing_vehicle() {
+        assert!(!may_turn(1.0));
+        assert!(!may_turn(4.9));
+        assert!(may_turn(5.0));
+        // a pavement too narrow to pass: the walker may turn once in five seconds at most,
+        // round the nose as before (which paced 10-14 times in 24 s)
+        let (_, turns, _) = past_the_bus(0.4);
+        assert!(turns <= 40 / 5 + 1, "{turns} turns in 40 s");
     }
 
     /// A car standing in lane 0 with its front 2.75 m before the crossing of `crossing`.
