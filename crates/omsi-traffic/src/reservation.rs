@@ -719,10 +719,13 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                             must_stop = true;
                         }
                     }
-                } else if (their_inside || o.committed) && !(zipper && !o.committed) {
+                } else if (their_inside || o.committed) && !(zipper && !o.committed) && !(c.clearing && o.clearing && !claims[ok].committed && !their_inside) {
                     // mine, but they are already in the way: let them out first (not a
                     // zipper partner behind me or level, that I go before: it comes in after
-                    // me, inside the long meeting place of two lanes converging or not)
+                    // me, inside the long meeting place of two lanes converging or not; nor,
+                    // clearing the box myself, one clearing it too that is not in the meeting
+                    // place: the table decides between two such, and it gives way to me; each
+                    // let the other out first and both stood)
                     if !they_are_first && wait_for.map(|w| their_out < w.1).unwrap_or(true) {
                         wait_for = Some((o.vehicle, their_out));
                     }
@@ -2223,6 +2226,26 @@ mod tests {
             let g = resolve(&js, &net, &c);
             let both = grant_of(&g, 1).go && grant_of(&g, 2).go;
             assert!(!both, "both go: {g:?}");
+        }
+        #[test]
+        fn review9_followup_two_clearing_claimants_the_table_decides_and_one_goes() {
+            // both clearing the box (committed to the others), neither in the meeting place:
+            // each let the other out first and both stood; the table decides between them
+            let (net, js) = four_way(192.0, 64.0);
+            let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+            let m0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+            let s0 = js.nodes[0].movements[side].foes.iter().find(|f| f.movement == main).unwrap().mine.0;
+            let mut a = claim(1, main, m0 - 1.0 - 2.0, 2.0);
+            a.clearing = true;
+            let mut b = claim(2, side, s0 - 1.0 - 2.0, 2.0);
+            b.clearing = true;
+            let g = resolve(&js, &net, &[a.clone(), b.clone()]);
+            assert!(grant_of(&g, 1).go && grant_of(&g, 2).wait_for == Some(1), "the main road goes, the side road waits: {g:?}");
+            // one of them committed by its own geometry (it cannot stop): the other waits for it
+            let mut b2 = b.clone();
+            b2.committed = true;
+            let g = resolve(&js, &net, &[a, b2]);
+            assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "{g:?}");
         }
     }
 }
