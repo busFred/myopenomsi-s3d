@@ -81,8 +81,9 @@ pub struct Context {
     /// not known to be exclusive.
     pub exclusive: hashbrown::HashMap<(usize, usize, usize), bool>,
     /// Per zipper merge (junction, the lower piece, the higher one): the piece and the id of
-    /// the vehicle that last won a tie there (`Grant::zip`). The next tie goes to the other
-    /// side.
+    /// the vehicle that went first there last (`Grant::zip`): it keeps going first while the
+    /// two are engaged, and the next tie goes to the other side. (The simulation rebuilds it
+    /// every frame from `Vehicle::zip_won`, so a keyframe carries it.)
     pub zipper: hashbrown::HashMap<(usize, usize, usize), (usize, u64)>,
 }
 
@@ -121,7 +122,7 @@ pub struct Grant {
     /// Waiting only for the vehicle ahead at a zipper merge, both rolling: follow it in
     /// rather than stop, (gap from my front to its rear along the merged way, its speed).
     pub follow: Option<(f32, f32)>,
-    /// Went first on a tie at a zipper merge: (the merge, my piece there).
+    /// Went first at a zipper merge: (the merge, my piece there).
     pub zip: Option<((usize, usize, usize), usize)>,
     /// Refused for a foe: where the first stretch it waits for begins, along the way
     /// through (the chain's distances). The car stops just before it (`plan`).
@@ -150,6 +151,9 @@ const START_DELAY: f32 = 1.5;
 /// At a zipper merge the front nearer the merge's end goes first; within this many metres
 /// of each other the two are level and take turns.
 pub const ZIP_TIE: f32 = 2.0;
+/// Once one of a zipper pair is this near the merge's end (m), the order stays as it is until
+/// one has gone through.
+pub const ZIP_FIXED: f32 = 2.0;
 /// Both faster than this (m/s): the one that goes second follows the other in at its gap
 /// instead of stopping dead at the merge.
 pub const ZIP_ROLLING: f32 = 1.5;
@@ -590,21 +594,34 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 let theirs_first = if zipper {
                     let d_me = foe.mine.1 - (c.s + c.front);
                     let d_them = foe.theirs.1 - (o.s + o.front);
-                    if (d_me - d_them).abs() > ZIP_TIE {
-                        d_them < d_me
-                    } else {
-                        let key = (c.junction, my_piece.min(foe.movement), my_piece.max(foe.movement));
-                        let theirs = match ctx.zipper.get(&key) {
-                            Some(&(_, id)) if id == o.id => true,
-                            Some(&(_, id)) if id == c.id => false,
-                            Some(&(piece, _)) => piece == my_piece,
+                    let key = (c.junction, my_piece.min(foe.movement), my_piece.max(foe.movement));
+                    let last = ctx.zipper.get(&key).copied();
+                    // the one of us that went first last frame, if either
+                    let held = match last {
+                        Some((_, id)) if id == o.id => Some(true),
+                        Some((_, id)) if id == c.id => Some(false),
+                        _ => None,
+                    };
+                    let level = (d_me - d_them).abs() <= ZIP_TIE;
+                    // the order is fixed once one is within ZIP_FIXED of the merge's end or
+                    // the two are abreast (the one behind with its front past the other's
+                    // rear), until one has gone through: the grant flipped from the car in
+                    // front to the one 1.9 m behind it, and the two met side by side (viz3
+                    // case03/04 #8927/#5315)
+                    let ahead_len = if d_me < d_them { c.front + c.rear } else { o.front + o.rear };
+                    let engaged = d_me.min(d_them) < ZIP_FIXED || (d_me - d_them).abs() < ahead_len;
+                    let theirs = match held {
+                        Some(t) if engaged || level => t,
+                        _ if !level => d_them < d_me,
+                        _ => match last {
+                            Some((piece, _)) => piece == my_piece,
                             None => o.vehicle < c.vehicle,
-                        };
-                        if !theirs {
-                            zip_tie = Some((key, my_piece));
-                        }
-                        theirs
+                        },
+                    };
+                    if !theirs {
+                        zip_tie = Some((key, my_piece));
                     }
+                    theirs
                 } else {
                     o.absolute || (foe.yields && !c.absolute) || (!foe.yields && !node.movements[foe.movement].foes.iter().any(|f| f.movement == my_piece && f.yields) && their_in < my_in)
                 };
@@ -1786,5 +1803,27 @@ mod tests {
         // (the old shift would put it 0.2 s later: still well inside my window)
         let g = resolve_with(&js, &net, &claims, &ctx);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "dropped a 10 m/s foe 0.2 s from its green: {g:?}");
+    }
+
+    /// Zipper hysteresis: A is 2.1 m nearer the merge's end and goes; a frame later (both
+    /// rolling, A 1.9 m nearer) the pair is "level", nobody won a tie there yet, and the lower
+    /// index (B) is given the merge: the grant flips from the car in front to the one behind
+    /// (viz3 case03/04 #8927/#5315: granted 340.4, refused 342.2, bodies 0.49 m into each other).
+    #[test]
+    fn review7_rule_b_zipper_grant_does_not_flip_to_the_car_behind() {
+        let (net, js) = zipper_object();
+        // B has the lower index (1), A (2)
+        let f1 = [zip_claim(&js, 2, 0, 6.0, 5.0), zip_claim(&js, 1, 1, 8.1, 5.0)];
+        let g = resolve(&js, &net, &f1);
+        assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "frame 1: {g:?}");
+        let mut ctx = Context::default();
+        for (gg, c) in g.iter().zip(&f1) {
+            if let (true, Some((key, piece))) = (gg.go, gg.zip) {
+                ctx.zipper.insert(key, (piece, c.id));
+            }
+        }
+        let f2 = [zip_claim(&js, 2, 0, 5.8, 5.0), zip_claim(&js, 1, 1, 7.7, 5.0)];
+        let g = resolve_with(&js, &net, &f2, &ctx);
+        assert!(grant_of(&g, 2).go, "frame 2: the grant went to the car 1.9 m behind: {g:?}");
     }
 }

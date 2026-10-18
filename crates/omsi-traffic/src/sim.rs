@@ -223,6 +223,11 @@ pub struct Vehicle {
     /// With `amber`: the odometer reading at the line it marks.
     #[serde(default)]
     pub amber_line: Option<f32>,
+    /// The zipper merge it last went first at: (the merge, its piece there, the time). The
+    /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
+    /// from these, so a keyframe restores it.
+    #[serde(default)]
+    pub zip_won: Option<((usize, usize, usize), usize, f64)>,
 }
 
 impl Vehicle {
@@ -254,6 +259,7 @@ impl Vehicle {
             claim_standing: false,
             passed_on_go: None,
             amber_line: None,
+            zip_won: None,
         }
     }
 
@@ -888,11 +894,26 @@ impl Simulation {
                 }
             }
         }
+        // who went first last at each zipper merge, from the vehicles (the latest per merge)
+        let mut last_won: HashMap<(usize, usize, usize), (f64, usize, u64)> = HashMap::new();
+        for v in vehicles.iter() {
+            if let Some((key, piece, t)) = v.zip_won {
+                if last_won.get(&key).map(|w| t > w.0 || (t == w.0 && v.id < w.2)).unwrap_or(true) {
+                    last_won.insert(key, (t, piece, v.id));
+                }
+            }
+        }
+        self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
-        // who went first on a tie at a zipper merge: the next tie there is the other side's
+        // who went first at a zipper merge: it keeps going first while the two are engaged,
+        // and the next tie there is the other side's
         for (g, c) in grants.iter().zip(&claims) {
             if let (true, Some((key, piece))) = (g.go, g.zip) {
-                self.signal_groups.zipper.insert(key, (piece, c.id));
+                // (a player's win is not remembered: no keyframe would carry it)
+                if let Some(v) = vehicles.get_mut(c.vehicle) {
+                    v.zip_won = Some((key, piece, self.time));
+                    self.signal_groups.zipper.insert(key, (piece, c.id));
+                }
             }
         }
 

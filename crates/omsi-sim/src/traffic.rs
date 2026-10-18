@@ -452,13 +452,21 @@ pub struct Approach {
     pub heading_change: f32,
     /// The heading `APPROACH_WINDOW` metres back (degrees).
     pub entry_heading: f32,
-    /// The lowest `[rule] trafficdensity` over the approach.
+    /// The lowest `[rule] trafficdensity` over the approach (lanes closed to cars or with no
+    /// density of their own left out; infinite when none is left).
     pub density: f32,
-    /// The most lanes abreast in its direction over the approach.
+    /// The first spline lane (source 1) of the approach, the road it comes off: None when the
+    /// approach runs on junction pieces only.
+    pub spline: Option<SplineClass>,
+}
+
+/// The road an approach comes off (`Approach::spline`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplineClass {
+    /// Lanes abreast in its direction.
     pub lanes: u32,
-    /// The highest speed limit of the spline lanes of the approach (km/h), None when it runs
-    /// on junction pieces only.
-    pub speed_kmh: Option<f32>,
+    pub density: f32,
+    pub speed_kmh: f32,
 }
 
 /// Where two lanes of a junction meet.
@@ -790,12 +798,12 @@ impl Network {
 
     /// Must a vehicle on lane `a` let one on lane `b` go first where they meet? In order:
     /// a train always goes first; the path with the higher `[rule] priority` goes first;
-    /// between equals (BeijingCity sets none at all), the fallbacks of
-    /// [`Network::right_of_way`]: a way out of a yard yields to the street, a movement merging
-    /// into the other's lane or turning yields to the one continuing its way, the minor road
-    /// yields to the major one; only then right before left (the German "rechts vor links"
-    /// the stock maps rely on wherever they set no priorities, mirrored on a left-hand-traffic
-    /// map), with a left turn waiting for the oncoming traffic.
+    /// between equals (BeijingCity sets none at all) a turn across the oncoming traffic waits
+    /// for it, then the fallbacks of [`Network::right_of_way`]: a way out of a yard or one
+    /// merging into the other's lane yields, a turning movement yields to the one going
+    /// straight on, the minor road yields to the major one; only then right before left (the
+    /// German "rechts vor links" the stock maps rely on wherever they set no priorities,
+    /// mirrored on a left-hand-traffic map).
     pub fn must_yield(&self, a: usize, b: usize) -> bool {
         let (la, lb) = (&self.lanes[a], &self.lanes[b]);
         if la.kind == LaneKind::Rail {
@@ -807,15 +815,20 @@ impl Network {
         if (la.priority - lb.priority).abs() > 0.5 {
             return la.priority < lb.priority;
         }
-        if let Some(y) = self.right_of_way(a, b) {
-            return y;
-        }
         let rel = wrap_deg(lb.start_heading() - la.start_heading());
         // (the turn across the oncoming traffic: left, or right when driving on the left)
         let across = if self.left_hand { 2 } else { 1 };
+        // oncoming: the turn across the other's way waits for it, before any fallback (the
+        // yard and road-class steps made a straight way yield to an oncoming left turner at
+        // 27 of 1237 BeijingCity junction pairs)
+        if rel.abs() > 135.0 && (la.turn == across) != (lb.turn == across) {
+            return la.turn == across;
+        }
+        if let Some(y) = self.right_of_way(a, b) {
+            return y;
+        }
         if rel.abs() > 135.0 {
-            // oncoming
-            return la.turn == across && lb.turn != across;
+            return false;
         }
         // `b` comes from the right when it travels to the left of `a`'s way (from the left,
         // travelling to its right, on a left-hand-traffic map)
@@ -830,9 +843,24 @@ impl Network {
         la.turn != 0 && lb.turn == 0
     }
 
+    /// Review: the baseline rule (9d814a7), for comparison.
+    pub fn must_yield_old(&self, a: usize, b: usize) -> bool {
+        let (la, lb) = (&self.lanes[a], &self.lanes[b]);
+        if la.kind == LaneKind::Rail { return false; }
+        if lb.kind == LaneKind::Rail { return true; }
+        if (la.priority - lb.priority).abs() > 0.5 { return la.priority < lb.priority; }
+        let rel = wrap_deg(lb.start_heading() - la.start_heading());
+        let across = if self.left_hand { 2 } else { 1 };
+        if rel.abs() > 135.0 { return la.turn == across && lb.turn != across; }
+        let rel = if self.left_hand { -rel } else { rel };
+        if rel < -30.0 { return true; }
+        if rel > 30.0 { return false; }
+        la.turn != 0 && lb.turn == 0
+    }
+
     /// Where lanes `a` and `b` meet, along `a` (the crossing point, or `a`'s end at a merge;
     /// `a`'s end when the network does not know the place), and whether it is a merge.
-    fn meeting_on(&self, a: usize, b: usize) -> (f32, bool) {
+    pub fn meeting_on(&self, a: usize, b: usize) -> (f32, bool) {
         match self.crossings.get(a).and_then(|v| v.iter().find(|c| c.other == b)) {
             Some(c) => (c.at, c.merge),
             None => (self.lanes[a].length(), false),
@@ -846,10 +874,21 @@ impl Network {
         let la = &self.lanes[a];
         let at = at.clamp(0.0, la.length());
         let h_meet = la.at(at).1;
-        let mut ap = Approach { turn: la.turn, heading_change: 0.0, entry_heading: 0.0, density: la.density, lanes: self.lanes_abreast(a), speed_kmh: None };
-        if la.source != 2 {
-            ap.speed_kmh = Some(la.speed_limit_kmh);
-        }
+        let mut ap = Approach { turn: la.turn, heading_change: 0.0, entry_heading: 0.0, density: f32::INFINITY, spline: None };
+        let note = |ap: &mut Approach, l: usize| {
+            let lane = &self.lanes[l];
+            // (a lane closed to cars, or with no density of its own - the app's reverse twins
+            // and timetable connectors carry 0 - says nothing about a yard)
+            if !lane.no_cars && lane.density > 0.0 {
+                ap.density = ap.density.min(lane.density);
+            }
+            // the road class from the first spline lane of the approach only: the pieces of a
+            // crossing object carry their author's spawn weights (0, 0.1, 1.0), no road class
+            if lane.source == 1 && ap.spline.is_none() {
+                ap.spline = Some(SplineClass { lanes: self.lanes_abreast(l), density: lane.density, speed_kmh: lane.speed_limit_kmh });
+            }
+        };
+        note(&mut ap, a);
         let mut left = APPROACH_WINDOW - at;
         let mut cur = a;
         let mut h_back = la.at((at - APPROACH_WINDOW).max(0.0)).1;
@@ -860,11 +899,7 @@ impl Network {
             let start_h = self.lanes[cur].start_heading();
             let Some(&p) = self.prev.get(cur).and_then(|v| v.iter().min_by(|&&x, &&y| wrap_deg(self.lanes[x].end_heading() - start_h).abs().total_cmp(&wrap_deg(self.lanes[y].end_heading() - start_h).abs()))) else { break };
             let lp = &self.lanes[p];
-            ap.density = ap.density.min(lp.density);
-            ap.lanes = ap.lanes.max(self.lanes_abreast(p));
-            if lp.source != 2 {
-                ap.speed_kmh = Some(ap.speed_kmh.unwrap_or(0.0).max(lp.speed_limit_kmh));
-            }
+            note(&mut ap, p);
             h_back = lp.at((lp.length() - left).max(0.0)).1;
             left -= lp.length();
             cur = p;
@@ -875,7 +910,7 @@ impl Network {
     }
 
     /// Lanes of the road side by side in `l`'s direction (the `left`/`right` chains).
-    fn lanes_abreast(&self, l: usize) -> u32 {
+    pub fn lanes_abreast(&self, l: usize) -> u32 {
         let mut n = 1;
         for side in [true, false] {
             let mut cur = l;
@@ -904,9 +939,10 @@ impl Network {
     /// 2. a turning movement (a turn flag, or more than `TURN_DEG` of heading change over its
     ///    approach) yields to one going on straight (not between oncoming ways: there the
     ///    left turn waits, step 4);
-    /// 3. the minor road yields to the major one: 2+ lanes abreast against 1, else
-    ///    `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO` times lower, else (for
-    ///    spline approaches) a speed limit `CLASS_SPEED_RATIO` times lower.
+    /// 3. the minor road yields to the major one, read from the spline lane each approach
+    ///    comes off within the window (none for one of them: no road class): 2+ lanes abreast
+    ///    against 1, else `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO` times
+    ///    lower, else a speed limit `CLASS_SPEED_RATIO` times lower.
     pub fn right_of_way(&self, a: usize, b: usize) -> Option<bool> {
         let (at_a, merge) = self.meeting_on(a, b);
         let (at_b, _) = self.meeting_on(b, a);
@@ -934,7 +970,7 @@ impl Network {
                 return Some(y);
             }
         }
-        // 2. turning against straight on (oncoming ways: step 4)
+        // 2. turning against straight on (oncoming ways: `must_yield`)
         let rel = wrap_deg(self.lanes[b].start_heading() - self.lanes[a].start_heading());
         if rel.abs() <= 135.0 {
             let turning = |p: &Approach| p.turn != 0 || p.heading_change > TURN_DEG;
@@ -942,20 +978,16 @@ impl Network {
                 return Some(y);
             }
         }
-        // 3. road class
-        if let Some(y) = decided(pa.lanes == 1 && pb.lanes >= 2, pb.lanes == 1 && pa.lanes >= 2) {
+        // 3. road class, from the spline approaches
+        let (Some(ca), Some(cb)) = (pa.spline, pb.spline) else { return None };
+        if let Some(y) = decided(ca.lanes == 1 && cb.lanes >= 2, cb.lanes == 1 && ca.lanes >= 2) {
             return Some(y);
         }
-        let (da, db) = (pa.density.max(1e-4), pb.density.max(1e-4));
+        let (da, db) = (ca.density.max(1e-4), cb.density.max(1e-4));
         if let Some(y) = decided(db > da * CLASS_DENSITY_RATIO, da > db * CLASS_DENSITY_RATIO) {
             return Some(y);
         }
-        if let (Some(va), Some(vb)) = (pa.speed_kmh, pb.speed_kmh) {
-            if let Some(y) = decided(vb >= va * CLASS_SPEED_RATIO, va >= vb * CLASS_SPEED_RATIO) {
-                return Some(y);
-            }
-        }
-        None
+        decided(cb.speed_kmh >= ca.speed_kmh * CLASS_SPEED_RATIO, ca.speed_kmh >= cb.speed_kmh * CLASS_SPEED_RATIO)
     }
 
     /// The lane beside `lane` at `s` that carries the traffic the other way (the other half
@@ -3773,21 +3805,58 @@ mod tests {
         flagged.turn = 1;
         let net = object_net(vec![a(), flagged]);
         assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the flagged turner yields");
-        // 3. road class: two lanes abreast against one
-        let mut net = object_net(vec![a(), b(), line(&[(3.5, -40.0), (3.5, 40.0)])]);
-        net.lanes[0].right = Some(2);
-        net.lanes[2].left = Some(0);
+        // 3. road class, from the spline lanes the approaches come off (pieces 10 m long
+        // meeting at x = y = 0, spline approaches 0 (north), 1 (west) before them)
+        let class_net = |main: (f32, bool), side: f32| -> Network {
+            let mut sa = line(&[(0.0, -200.0), (0.0, -10.0)]);
+            sa.density = main.0;
+            let mut sb = line(&[(200.0, 0.0), (10.0, 0.0)]);
+            sb.density = side;
+            let mut net = object_net(vec![line(&[(0.0, -10.0), (0.0, 40.0)]), line(&[(10.0, 0.0), (-40.0, 0.0)]), sa, sb, line(&[(3.5, -200.0), (3.5, -10.0)])]);
+            for l in 2..5 {
+                net.lanes[l].source = 1;
+                net.lanes[l].key = Some(LaneKey { tile: (0, 0), id: 100 + l as i64, path: 0 });
+            }
+            if main.1 {
+                net.lanes[2].right = Some(4);
+                net.lanes[4].left = Some(2);
+            }
+            net
+        };
+        let net = class_net((1.0, true), 1.0);
         assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "one lane yields to two");
         // ... density 3.0 against 0.5 (more than 3 times)
+        let net = class_net((3.0, false), 0.5);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the minor road yields");
+        // ... 0.5 against 1.0 is no clear difference: right before left
+        let net = class_net((1.0, false), 0.5);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0));
+        // ... and the densities of the junction pieces themselves are no road class
         let mut main = a();
         main.density = 3.0;
         let mut side = b();
         side.density = 0.5;
-        let net = object_net(vec![main, side.clone()]);
-        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the minor road yields");
-        // ... 0.5 against 1.0 is no clear difference: right before left
-        let net = object_net(vec![a(), side]);
-        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0));
+        let net = object_net(vec![main, side]);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "piece densities are spawn weights");
+    }
+
+    /// The oncoming case: a straight way through and a left turn across it from the other
+    /// direction. BeijingCity's object pieces carry `[rule] trafficdensity` 0.0-0.1 or 1.0
+    /// as the author set them (spawn weights, not road classes); 27 such pairs in the viz3
+    /// fixtures now make the straight yield to the oncoming left turner (density ratio > 3 or
+    /// yard <= 0.01, e.g. junction 32 lanes 12903/12938, junction 29 lanes 11329/11571).
+    #[test]
+    fn review7_right_of_way_the_oncoming_left_turn_still_waits_for_the_straight() {
+        // a northbound on x = 0 (density 0.1 on its piece); b southbound on x = -3.5 turning
+        // left (east) across a (turn flag 1, density 1.0)
+        let mut a = line(&[(0.0, -40.0), (0.0, 40.0)]);
+        a.density = 0.1;
+        let mut b = line(&[(-3.5, 40.0), (-3.5, 5.0), (0.0, 0.0), (5.0, -3.5), (40.0, -3.5)]);
+        b.turn = 1;
+        let net = object_net(vec![a, b]);
+        assert!(!net.crossings[0].is_empty(), "they cross");
+        assert!(net.must_yield_old(1, 0) && !net.must_yield_old(0, 1), "baseline: the turner yields");
+        assert!(net.must_yield(1, 0) && !net.must_yield(0, 1), "the left turner must still yield to the oncoming straight (fails on r4a: the straight yields)");
     }
 
     #[test]
