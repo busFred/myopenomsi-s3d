@@ -123,15 +123,18 @@ pub struct Grant {
     pub follow: Option<(f32, f32)>,
     /// Went first on a tie at a zipper merge: (the merge, my piece there).
     pub zip: Option<((usize, usize, usize), usize)>,
+    /// Refused for a foe: where the first stretch it waits for begins, along the way
+    /// through (the chain's distances). The car stops just before it (`plan`).
+    pub at: Option<f32>,
 }
 
 impl Grant {
     pub fn go(vehicle: usize) -> Grant {
-        Grant { vehicle, go: true, wait_for: None, hold: None, follow: None, zip: None }
+        Grant { vehicle, go: true, wait_for: None, hold: None, follow: None, zip: None, at: None }
     }
 
     pub fn refused(vehicle: usize, wait_for: Option<usize>, hold: Hold) -> Grant {
-        Grant { vehicle, go: false, wait_for, hold: Some(hold), follow: None, zip: None }
+        Grant { vehicle, go: false, wait_for, hold: Some(hold), follow: None, zip: None, at: None }
     }
 }
 
@@ -451,8 +454,16 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
         let mut follow: Option<(f32, f32)> = None;
         let mut must_stop = false;
         let mut zip_won: Option<((usize, usize, usize), usize)> = None;
+        // the first stretch waited for (rule D: the car stops just before it)
+        let mut hold_at = f32::INFINITY;
         for (my_piece, foe) in &my_foes {
             let my_piece = *my_piece;
+            // a meeting place I am in already: I am in the way of those coming, not they in
+            // mine (a car standing in the box short of a later stretch it waits for is
+            // committed to the stretches it is in, not to the later ones: `Claim::committed`)
+            // (a crossing: two lanes running into one another negotiate who is first at the end
+            // of their merge, however long the stretch where they converge)
+            let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 - 0.5 && c.s - c.rear <= foe.mine.1;
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
@@ -476,6 +487,9 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 let o = &shifted;
                 // lights before the table: held at a red that is never green with mine
                 if !their_inside && red_foe(ctx, c, o) {
+                    continue;
+                }
+                if me_in && !their_inside {
                     continue;
                 }
                 // behind me in my own lane, or merging in behind me: it
@@ -616,6 +630,7 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                                 }
                                 if !take_anyway {
                                     must_stop = true;
+                                    hold_at = hold_at.min(foe.mine.0);
                                 }
                                 continue;
                             }
@@ -631,6 +646,7 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                         if wait_for.map(|w| their_in < w.1).unwrap_or(true) {
                             wait_for = Some((o.vehicle, their_in));
                         }
+                        hold_at = hold_at.min(foe.mine.0);
                         // second at a zipper with both rolling: in behind it at my gap
                         let gap = (foe.mine.1 - (c.s + c.front)) - (foe.theirs.1 - (o.s + o.front)) - (o.front + o.rear);
                         if zipper && c.speed > ZIP_ROLLING && o.speed > ZIP_ROLLING && gap >= 1.0 && follow.map(|f| gap < f.0).unwrap_or(true) {
@@ -648,13 +664,14 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                     }
                     if !they_are_first {
                         must_stop = true;
+                        hold_at = hold_at.min(foe.mine.0);
                     }
                 }
                 let _ = (foe.kind == FoeKind::Merge, their_out);
             }
         }
         out[k] = Some(match wait_for {
-            Some((v, _)) => Grant { follow: if must_stop { None } else { follow }, ..Grant::refused(c.vehicle, Some(v), Hold::Foe) },
+            Some((v, _)) => Grant { follow: if must_stop { None } else { follow }, at: hold_at.is_finite().then_some(hold_at), ..Grant::refused(c.vehicle, Some(v), Hold::Foe) },
             None => Grant { zip: zip_won, ..Grant::go(c.vehicle) },
         });
     }

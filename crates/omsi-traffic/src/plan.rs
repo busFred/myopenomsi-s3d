@@ -4,7 +4,7 @@
 //! grant.
 
 use crate::driver::VehicleClass;
-use crate::perception::{NeighbourView, Perception, Seen, SignalView};
+use crate::perception::{JunctionView, NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
 use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network};
@@ -195,6 +195,35 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     }
 }
 
+/// Where a car refused for a foe stops (rule D): its front a metre before the first stretch
+/// it waits for (`waited`, along the way through), pulled back before any other meeting
+/// place ahead or pedestrian crossing its body would stand in ("keep the junction clear"; a
+/// meeting place it is in already it cannot leave but forward). A distance from the origin.
+fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, waited: f32) -> f32 {
+    let front = me.state.front;
+    let len = me.length();
+    // the stretches where it may not stand, as (from, to) distances of its front's stop
+    // and of the body: a meeting place a metre before it on, a crossing 2.5 m before it
+    // (the zebra stop) to 2 m past it
+    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
+    let node = &sim.junctions.nodes[j.junction];
+    for &(m, off) in &j.chain {
+        for &(_, sa, _) in net.walks.get(node.movements[m].lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let point = j.entry + off + sa;
+            bands.push((point - 2.5, point + 2.0));
+        }
+    }
+    let mut stop = j.entry + waited - 1.0;
+    for _ in 0..32 {
+        let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len).map(|b| b.0).fold(f32::INFINITY, f32::min);
+        if !hit.is_finite() {
+            break;
+        }
+        stop = hit;
+    }
+    stop
+}
+
 /// Decide for vehicle `i`.
 pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: &Perception, grant: Option<Grant>) -> Plan {
     let me = &vehicles[i];
@@ -232,7 +261,22 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // it; a line the bumper is already over drew an emergency stop for a frame)
             let at_line = j.entry - 0.3;
             let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
-            let at = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
+            let first = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
+            // refused for a foe: just before the first stretch it waits for, not short of the
+            // first meeting place of its way (viz3 case03: a car waiting for a stretch 22 m
+            // on stood 2.8 m in, on the fork shared with the turn pockets, and blocked the
+            // turners behind it)
+            let at = match (g.hold, g.at) {
+                (Some(Hold::Foe), Some(waited)) => {
+                    let at = hold_point(net, sim, me, j, waited);
+                    if at < first && first > st.front - 0.3 {
+                        first
+                    } else {
+                        at
+                    }
+                }
+                _ => first,
+            };
             if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {
                 // second at a zipper merge, both rolling: in behind the other at my gap
                 out.hold = g.hold;

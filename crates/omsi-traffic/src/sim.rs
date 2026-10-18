@@ -588,17 +588,22 @@ impl Simulation {
             if !j.inside && j.conflict_start - st.front > horizon {
                 continue;
             }
-            // committed: past the first meeting place of the way through, or too close to
-            // it to stop before it even braking hard. A driver who can still stop, if not
-            // comfortably, gives way as the rules say (two cars arriving together at an
-            // unmarked junction both took themselves for committed and met in the middle);
-            // one on the lead-in piece of a long object is inside but not yet committed.
-            // (at the line a driver stops hard if it must; one already inside does not
-            // slam on in the middle of the junction, it goes on unless it can stop gently)
-            let room = j.conflict_start - st.front - 0.6;
+            // committed: too close to the next meeting place it has not entered to stop before
+            // it even braking hard, or past every one it has (in the last it is in). A driver
+            // who can still stop, if not comfortably, gives way as the rules say (two cars
+            // arriving together at an unmarked junction both took themselves for committed
+            // and met in the middle); one on the lead-in piece of a long object is inside but
+            // not yet committed; one standing in the box short of a later stretch it waits
+            // for (`plan`: the stop before the stretch waited for) is committed to the ones it
+            // is in, not to that one (`reservation`: a meeting place I am in). (at the line a
+            // driver stops hard if it must; one already inside does not slam on in the middle
+            // of the junction, it goes on unless it can stop gently)
+            let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+            let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
+            let room = next - st.front - 0.6;
             let brake = if j.inside { st.decel * 1.5 } else { omsi_sim::traffic::MAX_BRAKE * 0.7 };
             let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
-            let committed = j.conflict_start - st.front <= 0.5 || cannot_stop;
+            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
             // the way before the first meeting place with another way, wherever the object

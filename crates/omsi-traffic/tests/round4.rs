@@ -1,0 +1,146 @@
+//! Headless scenarios for the junction rules of round 4: where a car held at a junction
+//! stops (before the stretch it waits for), the player's claim over the pieces ahead, and a
+//! car inside the box when its light turns red.
+
+use glam::DVec3;
+use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
+use omsi_traffic::{Simulation, Vehicle, VehicleClass, Why};
+
+const DT: f32 = 1.0 / 30.0;
+
+fn lane(pts: &[(f64, f64)], kind: LaneKind) -> omsi_sim::traffic::Lane {
+    LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), kind, 3.5)
+}
+
+/// A spline lane (source 1).
+fn road(pts: &[(f64, f64)], id: i64) -> omsi_sim::traffic::Lane {
+    let mut l = lane(pts, LaneKind::Street);
+    l.source = 1;
+    l.key = Some(LaneKey { tile: (0, 0), id, path: 0 });
+    l
+}
+
+/// A lane of crossing object 9 (source 2).
+fn piece(pts: &[(f64, f64)], path: u16, priority: f32) -> omsi_sim::traffic::Lane {
+    let mut l = lane(pts, LaneKind::Street);
+    l.source = 2;
+    l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+    l.priority = priority;
+    l
+}
+
+fn car(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
+    let mut st = AiState::new(lane, s, id);
+    st.speed = speed;
+    st.front = 2.0;
+    st.rear = 2.0;
+    st.length = 4.0;
+    st.max_speed_kmh = 100.0;
+    st.veh_type = 0;
+    let mut v = Vehicle::new(id, VehicleClass::Car, st, 0.9, id * 7919);
+    v.fresh = 0.0;
+    v
+}
+
+fn finish(mut net: Network) -> Network {
+    net.link(1.5);
+    net.compute_conflicts();
+    net
+}
+
+/// Run `secs`; `each` sees every frame. Returns the smallest gap between two bodies.
+fn run(net: &Network, sim: &mut Simulation, vehicles: &mut Vec<Vehicle>, secs: f32, mut each: impl FnMut(f32, &mut Simulation, &mut [Vehicle])) -> f32 {
+    let mut min_gap = f32::INFINITY;
+    let mut t = 0.0;
+    while t < secs {
+        sim.tick(net, DT, vehicles);
+        for &i in &sim.removed {
+            vehicles.remove(i);
+        }
+        for (a, va) in vehicles.iter().enumerate() {
+            for vb in vehicles.iter().skip(a + 1) {
+                min_gap = min_gap.min(va.obb().separation(&vb.obb()) as f32);
+            }
+        }
+        each(t, sim, vehicles.as_mut_slice());
+        t += DT;
+    }
+    min_gap
+}
+
+/// The front bumper's x of a car heading east.
+fn front_x(v: &Vehicle) -> f32 {
+    v.pos.x as f32 + v.state.front
+}
+
+/// An eastbound way through object 9 (piece 1, x -15..45) crossed by an unlit side road at
+/// x = 0 (piece 4, nobody on it), a zebra at x = 23 and a main road at x = 30 (piece 7,
+/// priority 192: the eastbound way gives way to it). Lanes: 0 the approach, 1 the piece,
+/// 2 the exit; 3/4/5 the side road; 6/7/8 the main road; 9 the zebra.
+fn long_way_through(lit: bool) -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1));
+    let mut p = piece(&[(-15.0, 0.0), (45.0, 0.0)], 0, 128.0);
+    if lit {
+        p.traffic_light = Some((0, 0));
+    }
+    net.lanes.push(p);
+    net.lanes.push(road(&[(45.0, 0.0), (400.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, -200.0), (0.0, -15.0)], 3));
+    net.lanes.push(piece(&[(0.0, -15.0), (0.0, 15.0)], 1, 128.0));
+    net.lanes.push(road(&[(0.0, 15.0), (0.0, 300.0)], 4));
+    net.lanes.push(road(&[(30.0, -400.0), (30.0, -15.0)], 5));
+    net.lanes.push(piece(&[(30.0, -15.0), (30.0, 15.0)], 2, 192.0));
+    net.lanes.push(road(&[(30.0, 15.0), (30.0, 600.0)], 6));
+    let mut zebra = lane(&[(23.0, -8.0), (23.0, 8.0)], LaneKind::Sidewalk);
+    zebra.source = 2;
+    zebra.key = Some(LaneKey { tile: (0, 0), id: 9, path: 3 });
+    net.lanes.push(zebra);
+    finish(net)
+}
+
+#[test]
+fn rule_d_a_held_car_stops_just_before_the_stretch_it_waits_for_and_off_the_zebra() {
+    let net = long_way_through(false);
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, mv) = js.movement(1).unwrap();
+    assert_eq!(mv.foes.len(), 2, "{:?}", mv.foes);
+    assert!(mv.foes.iter().all(|f| f.yields), "{:?}", mv.foes);
+    let mut sim = Simulation::new(&net, vec![]);
+    // the eastbound car rolls up; a main road stream (a car every 30 m at 12 m/s) keeps it
+    // waiting for the crossing at x = 30
+    let mut cars = vec![car(1, 0, 230.0, 10.0)];
+    for k in 0..8u64 {
+        cars.push(car(10 + k, 6, 330.0 - 30.0 * k as f32, 12.0));
+    }
+    let mut stood_at: Option<f32> = None;
+    let min_gap = run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if me.state.speed < 0.1 && me.last.why == Why::Junction && stood_at.is_none() {
+            stood_at = Some(front_x(me));
+        }
+    });
+    let at = stood_at.expect("the eastbound car never stood for the main road");
+    // past the side road's meeting place (x = 0, 2.6 m either side), its body off the zebra
+    // (x = 23, 2 m either side), short of the main road's stretch (x = 30 - 2.6)
+    assert!(at > 2.6 + 4.0 && at <= 23.0 - 2.5 + 0.2, "stood with its front at x = {at:.1}");
+    assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
+}
+
+#[test]
+fn rule_d_on_red_the_held_car_stops_at_its_line() {
+    let net = long_way_through(true);
+    // the eastbound light red for good
+    let ctl = TrafficLightController::new(vec![vec![(0, 60.0)]], 60.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 0, 230.0, 10.0)];
+    for k in 0..8u64 {
+        cars.push(car(10 + k, 6, 330.0 - 30.0 * k as f32, 12.0));
+    }
+    let mut furthest = f32::NEG_INFINITY;
+    run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        furthest = furthest.max(front_x(me));
+    });
+    assert!(furthest <= -15.0 + 0.3, "its front got to x = {furthest:.1}, past its red line at -15");
+}
