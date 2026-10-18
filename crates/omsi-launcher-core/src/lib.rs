@@ -1938,9 +1938,9 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             "ai_parked_pct" => v[&k] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| x.clamp(0.0, 100.0) as i64).unwrap_or(75)),
             "ai_max_humans" => v[&k] = json!(val.parse::<f64>().map(|x| x.max(1.0) as i64).unwrap_or(200)),
             // (people strolling the pavements about the player)
-            "pedestrians" => v[&k] = json!(val.parse::<f64>().map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
+            "pedestrians" => v[&k] = json!(val.parse::<f64>().map(|x| x.round().max(0.0) as i64).unwrap_or(100)),
             // (the per cent of before: 1 = 100 %, read as 100 people)
-            "ped_density" if !has_pedestrians => v["pedestrians"] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().clamp(0.0, 2000.0) as i64).unwrap_or(100)),
+            "ped_density" if !has_pedestrians => v["pedestrians"] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().max(0.0) as i64).unwrap_or(100)),
             "drive_keys" | "navigator_corner" | "boarding" | "render_scale" | "pax_voices" => v[&k] = json!(val),
             "ctrl_off" => v[&k] = json!(val),
             "rt_reflections" => {
@@ -2249,7 +2249,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
         n("ai_max_parked", 0).max(-1),
         n("ai_parked_pct", 75).clamp(0, 100),
         n("ai_max_humans", 200).max(1),
-        n("pedestrians", 100).clamp(0, 2000),
+        n("pedestrians", 100).max(0),
         b("use_real_time", false),
         b("use_real_date", false),
         b("use_real_year", false),
@@ -2898,7 +2898,7 @@ mod tests {
         assert!(!saved.lines().any(|l| l.starts_with("ped_density=")), "{saved}");
         assert_eq!(settings_from_text(Some("ped_density=1.5\n"))["pedestrians"], json!(150));
         assert_eq!(settings_from_text(Some("ped_density=200\n"))["pedestrians"], json!(200));
-        assert_eq!(settings_from_text(Some("pedestrians=9000\n"))["pedestrians"], json!(2000));
+        assert_eq!(settings_from_text(Some("pedestrians=90000\n"))["pedestrians"], json!(90000));
         let mut v = settings_from_text(None);
         v["pedestrians"] = json!(50);
         let text = settings_to_text(&v, None);

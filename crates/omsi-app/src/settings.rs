@@ -604,9 +604,9 @@ impl Settings {
                 "clouds" => s.clouds = b(v),
                 "pax_sit" => s.pax_sit = v.parse::<f32>().map(|x| x.clamp(0.0, 3.0)).unwrap_or(s.pax_sit),
                 "pax_density" | "aipassfactor" => s.pax_density = v.trim_end_matches('%').parse::<f32>().map(|x| if x > 5.0 { x / 100.0 } else { x }).map(|x| x.clamp(0.0, 3.0)).unwrap_or(s.pax_density),
-                "pedestrians" => s.pedestrians = v.trim_end_matches('%').parse::<f32>().map(|x| x.round().clamp(0.0, 2000.0) as u32).unwrap_or(s.pedestrians),
+                "pedestrians" => s.pedestrians = v.trim_end_matches('%').parse::<f32>().map(|x| x.round().max(0.0) as u32).unwrap_or(s.pedestrians),
                 // (the per cent of before: 1 = 100 %, read as 100 people)
-                "ped_density" if !has_pedestrians => s.pedestrians = v.trim_end_matches('%').parse::<f32>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().clamp(0.0, 2000.0) as u32).unwrap_or(s.pedestrians),
+                "ped_density" if !has_pedestrians => s.pedestrians = v.trim_end_matches('%').parse::<f32>().map(|x| if x <= 5.0 { x * 100.0 } else { x }).map(|x| x.round().max(0.0) as u32).unwrap_or(s.pedestrians),
                 "vol_ai" => s.vol_ai = v.parse::<f32>().map(|x| x.clamp(0.0, 1.0)).unwrap_or(s.vol_ai),
                 "vol_scenery" => s.vol_scenery = v.parse::<f32>().map(|x| x.clamp(0.0, 1.0)).unwrap_or(s.vol_scenery),
                 "doppler" | "sound_doppler" => s.doppler = b(v),
@@ -885,7 +885,7 @@ mod tests {
         // the current key wins over an old line a launcher carried over, wherever it stands
         assert_eq!(Settings::from_text("pedestrians=500\nfoo=1\nped_density=200\n").pedestrians, 500);
         assert_eq!(Settings::from_text("ped_density=200\npedestrians=500\n").pedestrians, 500);
-        assert_eq!(Settings::from_text("pedestrians=9000\n").pedestrians, 2000);
+        assert_eq!(Settings::from_text("pedestrians=90000\n").pedestrians, 90000);
         let s = Settings::from_text("pedestrians=25\n");
         assert_eq!(Settings::from_text(&s.to_text()).pedestrians, 25);
     }

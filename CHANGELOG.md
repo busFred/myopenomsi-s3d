@@ -143,6 +143,11 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   centred: the studio measures the real bus against the empty room. [ROLLBACK career-149]
 
 ### Fixed
+- The Pedestrians setting keeps any number: it was capped at 2000 by the launcher on save
+  and by the game on read, so 19000 came back as 2000 every start, and an old `ped_density`
+  line a launcher carried over reset the count again. The launcher drops the old key, and
+  the count is limited only at run time by the people pool (`ai_max_humans`) and the
+  pavement about the player. `settings.rs`, `omsi-launcher-core/src/lib.rs`.
 - The game menu's Time page sets the date too: a "Date" row to type it (2026-10-14, 14.10.2026
   or 20261014, Enter) and an "Adjust date" row with -1/+1 day, month and year (a day kept
   within the month it lands in, the year rolling over). Off while the real-time sync is on and
