@@ -562,27 +562,37 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
     let radius = (st.front + reach + 6.0) as f64;
     let mut best: Option<f32> = None;
+    // [ROLLBACK r4d-B4] a bus coming up to its own stop pulls in beside the people standing
+    // at the kerb: only one inside its footprint holds it (four waiting 2.5 m beside its
+    // nose - 1.3 m from its middle in the bay - stopped a bus 7.4 m short of its pole)
+    let own_stop = me.is_bus() && me.external.stop_at.is_some_and(|s| s - st.front < 40.0);
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
         let rel = p.pos - me.pos;
         if rel.truncate().length() > radius || rel.z.abs() > 2.5 {
             continue;
         }
+        let standing = p.vel.length() < 0.3;
+        let at_kerb_of_stop = own_stop && !p.on_crossing && (standing || p.waiting_for_bus);
         let half = if p.on_crossing {
             me.half_width + 1.5
         } else if p.waiting_for_bus && me.is_bus() {
             me.half_width - 0.3
+        } else if at_kerb_of_stop {
+            me.half_width
         } else {
             me.half_width + 0.3
         };
         let t = ((rel.truncate().length() as f32) / v.max(1.0)).min(2.0);
         let later = p.pos.truncate() + p.vel * t as f64;
+        // (where somebody waiting for a bus is, not where their shuffle would take them)
+        let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.is_bus()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
         for &(d, q, fwd) in &way.pts {
             if d > reach + st.front {
                 break;
             }
             let right = DVec2::new(fwd.y, -fwd.x);
-            for pos in [p.pos.truncate(), later] {
+            for &pos in positions {
                 let r = pos - q;
                 let along = r.dot(fwd);
                 let across = r.dot(right).abs();
@@ -595,7 +605,9 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                         continue;
                     }
                     // someone who has stood at the edge for a while does not hold a standing car
-                    if !p.on_crossing && v < 0.3 && p.still > 3.0 && (across as f32) > half - 0.9 {
+                    // (a bus at its stop: one inside its footprint does, or it crept on and
+                    // stopped by turns)
+                    if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && (across as f32) > half - 0.9 {
                         continue;
                     }
                     // (where the person really is relative to the sample, so that the stop

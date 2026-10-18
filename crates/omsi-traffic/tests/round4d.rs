@@ -87,3 +87,57 @@ fn a_timetable_bus_drives_off_a_dead_end_and_stops_at_a_route_end_that_goes_on()
     assert!(gone.is_empty());
     assert!((vs[0].state.s + vs[0].state.front - 150.0).abs() < 1.0, "at its stop: s {}", vs[0].state.s);
 }
+
+/// A bus on lane 0 (east along y = 0) coming up to its stop: its front comes to rest at
+/// x = 150, in the bay 1.23 m right of the lane (as the service asks).
+fn to_the_stop(v: &mut Vehicle) {
+    let front = v.state.s + v.state.front;
+    v.external.stop_at = Some(150.0 - v.state.s);
+    if 150.0 - front < 30.0 {
+        v.external.bay = Some(1.23);
+    }
+}
+
+fn person(x: f64, y: f64, waiting: bool) -> omsi_traffic::Person {
+    omsi_traffic::Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: waiting, at_kerb: false }
+}
+
+/// [ROLLBACK r4d-B4] Four people standing at the kerb 2.5 m beside the bus's nose (1.3 m
+/// from its middle in the bay) do not hold it short of its pole; one inside its footprint
+/// does, and once they are gone the bus creeps up to the pole. A creep under 0.5 m/s does
+/// not set its standing time back.
+#[test]
+fn a_bus_pulls_up_to_its_pole_beside_the_people_and_only_one_in_its_way_holds_it() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 8.0)];
+    sim.people = vec![person(149.0, -2.5, true), person(148.0, -2.5, true), person(146.0, -2.6, false), person(144.0, -2.5, false)];
+    run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| to_the_stop(&mut vs[0]));
+    let b = &vs[0];
+    assert!((b.state.s + b.state.front - 150.0).abs() < 0.6, "at its pole: front at {}", b.state.s + b.state.front);
+    assert!(b.state.speed < 0.1 && (b.state.lateral - 1.23).abs() < 0.1, "in the bay: {}", b.state.lateral);
+
+    // somebody standing inside its footprint 10 m before the pole: held short of them
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 8.0)];
+    sim.people = vec![person(140.0, -1.2, false)];
+    let (mut held_at, mut prev_stopped, mut reset_by_creep) = (None, 0.0f32, false);
+    run(&net, &mut sim, &mut vs, 80.0, |t, sim, vs| {
+        to_the_stop(&mut vs[0]);
+        let b = &vs[0];
+        if b.state.speed >= 0.3 && b.state.speed < 0.5 && b.stopped < prev_stopped {
+            reset_by_creep = true;
+        }
+        prev_stopped = b.stopped;
+        if held_at.is_none() && b.state.speed < 0.05 && b.stopped > 8.0 {
+            held_at = Some((t, b.state.s + b.state.front, b.last.why));
+            sim.people.clear();
+        }
+    });
+    let (_, front, why) = held_at.expect("held");
+    assert!(front < 139.0 && front > 130.0, "short of them: front at {front}");
+    assert_eq!(why, Why::People);
+    let b = &vs[0];
+    assert!((b.state.s + b.state.front - 150.0).abs() < 0.6, "crept up to its pole: front at {}", b.state.s + b.state.front);
+    assert!(!reset_by_creep);
+}

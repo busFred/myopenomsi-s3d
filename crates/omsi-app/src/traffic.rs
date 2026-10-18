@@ -3195,6 +3195,7 @@ impl Traffic {
                 });
                 let v_nom = net.lanes.get(car.ai.state.lane).map_or(13.9, |l| (l.speed_limit_kmh * car.ai.params.speed_factor).min(car.ai.state.max_speed_kmh).max(10.0) / 3.6);
                 let ctx = crate::bus_service::Ctx {
+                    people_hold: car.ai.last.why == Why::People,
                     v_nom,
                     roadside,
                     queue_behind_secs,

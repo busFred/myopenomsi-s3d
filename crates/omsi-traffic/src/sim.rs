@@ -1031,9 +1031,13 @@ impl Simulation {
         v.fresh = (v.fresh - dt).max(0.0);
         v.pull_out = (v.pull_out - dt).max(0.0);
         let standing = v.state.speed < 0.3;
+        // [ROLLBACK r4d-B4] a bus creeping up under 0.5 m/s has not moved off: its standing
+        // time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of its
+        // stop by people served the stop where it stood only after 12.7 s instead of 6)
+        let moving = if v.is_bus() { v.state.speed >= 0.5 } else { !standing };
         if standing && !v.external.at_stop {
             v.stopped += dt;
-        } else if !standing {
+        } else if moving {
             v.stopped = 0.0;
         }
         if (v.state.odometer - v.progress.0).abs() > 5.0 {

@@ -115,6 +115,9 @@ pub struct BusService {
     pub pace: f32,
     /// It leaves this stop early for the traffic behind it.
     left_early: bool,
+    /// [ROLLBACK r4d-B4] Held short of its stop by somebody in its way: it creeps up to the
+    /// pole once they are clear rather than serving the stop where it stands.
+    short_by_people: bool,
 }
 
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
@@ -361,6 +364,9 @@ const STOP_REACH: f32 = 80.0;
 const SKIP_DECIDE: f32 = 50.0;
 const EARLY_STOP: f64 = 120.0;
 const EARLY_STOP_SHORT: f64 = 20.0;
+/// [ROLLBACK r4d-B4] A bus held short of its pole by people serves the stop where it stands
+/// only after this long (s); before, it creeps up to the pole once they are clear.
+const PEOPLE_SERVE_MAX: f32 = 30.0;
 
 /// What the service needs of the world this frame.
 pub struct Ctx<'a> {
@@ -394,6 +400,8 @@ pub struct Ctx<'a> {
     /// [ROLLBACK r4d-B3] Its usual speed on the lane it is on (m/s: the limit at its driver's
     /// speed factor).
     pub v_nom: f32,
+    /// [ROLLBACK r4d-B4] What holds it is somebody in its way (`Why::People`).
+    pub people_hold: bool,
 }
 
 impl BusService {
@@ -426,6 +434,7 @@ impl BusService {
             ahead_by: 0.0,
             pace: 1.0,
             left_early: false,
+            short_by_people: false,
         }
     }
 
@@ -492,6 +501,7 @@ impl BusService {
     pub fn restart(&mut self, stops: Vec<Stop>, layover: bool) {
         self.near_d = f32::INFINITY;
         self.serve = None;
+        self.short_by_people = false;
         self.stops = stops.into();
         self.phase = Phase::Running;
         self.phase_t = 0.0;
@@ -533,6 +543,7 @@ impl BusService {
         // [ROLLBACK r4d-B2] back from round the block (or never away)
         self.away = None;
         self.this_layover = layover;
+        self.short_by_people = false;
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
         // [ROLLBACK waitstop-136] it stands out its time where the timetable says so, on its
         // layover and (a train) at its stations; elsewhere it goes when the people are done
@@ -601,6 +612,7 @@ impl BusService {
         }
         self.near_d = f32::INFINITY;
         self.serve = None;
+        self.short_by_people = false;
         let air = ctx.net.lanes[st.lane].kind == LaneKind::Air;
         if self.stops.is_empty() && !self.route_open && !air && self.away.is_none() {
             self.set_phase(Phase::TripDone);
@@ -712,6 +724,7 @@ impl BusService {
         self.layover = layover;
         self.near_d = f32::INFINITY;
         self.serve = None;
+        self.short_by_people = false;
         self.rerouted = true;
         self.set_phase(Phase::Running);
     }
@@ -854,6 +867,7 @@ impl BusService {
                 self.stops.pop_front();
                 self.near_d = f32::INFINITY;
                 self.serve = None;
+                self.short_by_people = false;
                 continue;
             }
             let d = st.route_distance(ctx.net, stop.ri, stop.s);
@@ -879,6 +893,7 @@ impl BusService {
                 self.stops.pop_front();
                 self.near_d = f32::INFINITY;
                 self.serve = None;
+                self.short_by_people = false;
                 crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
                 if !ctx.passing {
                     st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
@@ -917,7 +932,13 @@ impl BusService {
                 && ctx.stopped > 0.8
                 && d < 45.0
                 && d >= 2.0;
-            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0);
+            // [ROLLBACK r4d-B4] (not when people held it short: it creeps up to the pole once
+            // they are clear, unless it is within 2 m of it)
+            if ctx.people_hold && d >= 2.0 {
+                self.short_by_people = true;
+            }
+            let people_short = self.short_by_people && ctx.stopped < PEOPLE_SERVE_MAX;
+            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short);
             if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 - pull && crept_past) {
                 self.near_d = f32::INFINITY;
                 self.arrive(ctx, stop.depart, stop.id, (st.lane, st.s));
@@ -932,6 +953,7 @@ impl BusService {
                 self.stops.pop_front();
                 self.near_d = f32::INFINITY;
                 self.serve = None;
+                self.short_by_people = false;
                 continue;
             }
             if d < STOP_REACH {
@@ -1064,6 +1086,7 @@ mod tests {
             roadside,
             queue_behind_secs,
             v_nom: 13.9,
+            people_hold: false,
         };
         s.arrive(&ctx, 300.0, 7, (0, 0.0));
         (s, ctx)
@@ -1188,7 +1211,7 @@ mod tests {
     }
 
     fn ctx_on<'a>(net: &'a Network, way: &'a [(usize, f32)], day_time: f64, stopped: f32) -> Ctx<'a> {
-        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0, v_nom: 13.9 }
+        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0, v_nom: 13.9, people_hold: false }
     }
 
     /// The bus driven along its way by `AiState::drive` for `secs` from `t`, its service
@@ -1384,6 +1407,78 @@ mod tests {
         assert!(left == 0.0 && gone > 175.0, "waited out: {left}, on at {gone}");
         let (_, _, gone, _, left) = run(25.0, 0.0, 250.0);
         assert!(left > 30.0 && gone < 170.0, "not waited out in the lane: {left}, on at {gone}");
+    }
+
+    /// [ROLLBACK r4d-B4] Held short of its pole by somebody in its way, a bus does not serve
+    /// the stop where it stands after 6 s (as behind another bus) but creeps up to the pole
+    /// once they are clear; only after `PEOPLE_SERVE_MAX` does it serve it where it is. Off
+    /// the bay again it is back in the middle of its lane.
+    #[test]
+    fn a_bus_held_short_by_people_creeps_up_to_its_pole_and_leaves_the_bay_for_the_lane() {
+        use omsi_sim::traffic::LaneBuilder;
+        let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![glam::DVec3::ZERO, glam::DVec3::new(0.0, 300.0, 0.0)], LaneKind::Street, 3.5)], ..Default::default() };
+        net.link(1.5);
+        let mut v = test_vehicle();
+        let stop = || Stop { ri: 0, s: 100.0, bay: 1.2, depart: 500.0, id: 7, side: 0.0 };
+        let at = |s: f32| {
+            let mut st = AiState::new(0, s, 1);
+            st.front = 6.0;
+            st.rear = 6.0;
+            st.route = vec![0];
+            st
+        };
+        // 8 m short, standing 7 s, somebody in its way: not served here
+        let mut s = BusService::new(vec![stop(), Stop { id: 8, s: 250.0, ..stop() }]);
+        let mut st = at(92.0);
+        let way = [(0usize, -92.0f32)];
+        let mut ctx = ctx_on(&net, &way, 100.0, 7.0);
+        ctx.people_hold = true;
+        let target = s.step(&mut st, &mut v, &ctx).expect("its stop");
+        assert_eq!(s.phase, Phase::Running);
+        assert!((target - (8.0 + 6.0 - 0.3)).abs() < 0.01, "{target}");
+        // clear now, still standing (a creep does not reset the time): it goes on to the pole
+        ctx.people_hold = false;
+        ctx.stopped = 9.0;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Running);
+        // there: served
+        let mut st = at(99.0);
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+        // held for good: served where it stands after half a minute
+        let mut s = BusService::new(vec![stop()]);
+        let mut st = at(92.0);
+        ctx.people_hold = true;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Running);
+        ctx.stopped = PEOPLE_SERVE_MAX + 1.0;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+        // the counter-case: held by a vehicle ahead, served where it stands after 6 s
+        let mut s = BusService::new(vec![stop()]);
+        let mut st = at(92.0);
+        ctx.people_hold = false;
+        ctx.stopped = 7.0;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+
+        // in the bay at its pole; off again it is back in the middle of the lane
+        let mut s = BusService::new(vec![stop(), Stop { id: 8, s: 280.0, ..stop() }]);
+        let mut st = at(100.0);
+        st.lateral = 1.2;
+        st.lateral_target = 1.2;
+        st.lateral_ramp = (1.2, 1.2, 0.0, 1.0);
+        let ctx = ctx_on(&net, &way, 100.0, 0.0);
+        s.arrive(&ctx, 500.0, 7, (0, 100.0));
+        s.leave_at = 100.0;
+        let mut lateral_at = Vec::new();
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 60.0, |_, _, st| {
+            lateral_at.push((st.s, st.lateral));
+            st.s > 160.0
+        });
+        assert_eq!(st.lateral_target, 0.0);
+        assert!(lateral_at.iter().any(|&(s, l)| s < 101.0 && l > 1.1), "starts in the bay");
+        assert!(st.lateral.abs() < 0.05, "back in the lane: {}", st.lateral);
     }
 
     #[test]
