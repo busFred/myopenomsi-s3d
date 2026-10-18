@@ -452,9 +452,6 @@ pub struct Approach {
     pub heading_change: f32,
     /// The heading `APPROACH_WINDOW` metres back (degrees).
     pub entry_heading: f32,
-    /// The lowest `[rule] trafficdensity` over the approach (lanes closed to cars or with no
-    /// density of their own left out; infinite when none is left).
-    pub density: f32,
     /// The first spline lane (source 1) of the approach, the road it comes off: None when the
     /// approach runs on junction pieces only.
     pub spline: Option<SplineClass>,
@@ -874,17 +871,15 @@ impl Network {
         let la = &self.lanes[a];
         let at = at.clamp(0.0, la.length());
         let h_meet = la.at(at).1;
-        let mut ap = Approach { turn: la.turn, heading_change: 0.0, entry_heading: 0.0, density: f32::INFINITY, spline: None };
+        let mut ap = Approach { turn: la.turn, heading_change: 0.0, entry_heading: 0.0, spline: None };
         let note = |ap: &mut Approach, l: usize| {
             let lane = &self.lanes[l];
-            // (a lane closed to cars, or with no density of its own - the app's reverse twins
-            // and timetable connectors carry 0 - says nothing about a yard)
-            if !lane.no_cars && lane.density > 0.0 {
-                ap.density = ap.density.min(lane.density);
-            }
-            // the road class from the first spline lane of the approach only: the pieces of a
-            // crossing object carry their author's spawn weights (0, 0.1, 1.0), no road class
-            if lane.source == 1 && ap.spline.is_none() {
+            // the road from the first spline lane of the approach only (a yard, the road
+            // class): the pieces of a crossing object carry their author's spawn weights (0,
+            // 0.001, 0.1, 1.0), no road class (a piece of 0.001 behind a main road's lit stub
+            // made it a "yard", review9). (A lane closed to cars - the app's reverse twins and
+            // timetable connectors - is no road.)
+            if lane.source == 1 && !lane.no_cars && ap.spline.is_none() {
                 ap.spline = Some(SplineClass { lanes: self.lanes_abreast(l), density: lane.density, speed_kmh: lane.speed_limit_kmh });
             }
         };
@@ -931,9 +926,9 @@ impl Network {
     /// The right of way between two paths of equal `[rule] priority` before right before
     /// left: Some(true) when `a` yields to `b`, Some(false) when `b` yields to `a`, None when
     /// none of these says. In order:
-    /// 1. a way out of a yard, a car park, a garage or a bus bay (its last stretch carries
-    ///    `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and BeijingCity paths off the
-    ///    street say so; BeijingCity's garage exit 0.001 against 0.5 in the street) yields to
+    /// 1. a way out of a yard, a car park, a garage or a bus bay (the spline lane it comes off
+    ///    within the window carries `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and
+    ///    BeijingCity paths off the street say so) yields to
     ///    the street; at a merge, a way coming in at an angle to the way out (`MERGE_DEG` more
     ///    than the other, which comes within `TURN_DEG` of it) yields to the other;
     /// 2. a turning movement (a turn flag, or more than `TURN_DEG` of heading change over its
@@ -954,8 +949,9 @@ impl Network {
                 _ => None,
             }
         };
-        // 1. yards; merging into the other's lane
-        let yard = |p: &Approach| p.density <= YARD_DENSITY;
+        // 1. yards (from the spline the approach comes off within the window: none, no yard;
+        // a density of 0 says no random traffic, not a yard); merging into the other's lane
+        let yard = |p: &Approach| p.spline.is_some_and(|c| c.density > 0.0 && c.density <= YARD_DENSITY);
         if let Some(y) = decided(yard(&pa), yard(&pb)) {
             return Some(y);
         }
@@ -983,9 +979,13 @@ impl Network {
         if let Some(y) = decided(ca.lanes == 1 && cb.lanes >= 2, cb.lanes == 1 && ca.lanes >= 2) {
             return Some(y);
         }
-        let (da, db) = (ca.density.max(1e-4), cb.density.max(1e-4));
-        if let Some(y) = decided(db > da * CLASS_DENSITY_RATIO, da > db * CLASS_DENSITY_RATIO) {
-            return Some(y);
+        // (a density of 0 is no random traffic, no road class: BeijingCity's main road spline
+        // before case05's junction carries 0)
+        let (da, db) = (ca.density, cb.density);
+        if da > 0.0 && db > 0.0 {
+            if let Some(y) = decided(db > da * CLASS_DENSITY_RATIO, da > db * CLASS_DENSITY_RATIO) {
+                return Some(y);
+            }
         }
         decided(cb.speed_kmh >= ca.speed_kmh * CLASS_SPEED_RATIO, ca.speed_kmh >= cb.speed_kmh * CLASS_SPEED_RATIO)
     }
@@ -3785,15 +3785,12 @@ mod tests {
         let b = || line(&[(40.0, 0.0), (-40.0, 0.0)]);
         let net = object_net(vec![a(), b()]);
         assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "right before left");
-        // 1. b comes out of a yard (density 0.001): it yields to the street
-        let mut yard = b();
-        yard.density = 0.001;
-        let net = object_net(vec![a(), yard.clone()]);
-        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the yard yields");
-        // ... a [rule] priority still decides first
-        let mut net = object_net(vec![a(), yard]);
-        net.lanes[0].priority = 64.0;
-        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "[rule] priority first");
+        // 1. (yards: below, from the spline approaches) a piece of density 0.001 with no
+        // spline behind it is no yard: right before left
+        let mut piece_only = b();
+        piece_only.density = 0.001;
+        let net = object_net(vec![a(), piece_only]);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "a piece's density is no yard");
         // 2. b turns 45 degrees right before it crosses (no turn flag): it yields to a, which
         // goes straight on
         let turn = line(&[(40.0, 0.0), (10.0, 0.0), (0.0, 10.0), (-30.0, 40.0)]);
@@ -3823,6 +3820,16 @@ mod tests {
             }
             net
         };
+        // 1. b comes off a yard spline (density 0.001): it yields to the street
+        let net = class_net((1.0, false), 0.001);
+        assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "the yard yields");
+        // ... a [rule] priority still decides first
+        let mut net = class_net((1.0, false), 0.001);
+        net.lanes[0].priority = 64.0;
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "[rule] priority first");
+        // ... a spline of density 0 (no random traffic) is no yard
+        let net = class_net((1.0, false), 0.0);
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0), "density 0 is no yard");
         let net = class_net((1.0, true), 1.0);
         assert!(!net.must_yield(0, 1) && net.must_yield(1, 0), "one lane yields to two");
         // ... density 3.0 against 0.5 (more than 3 times)
