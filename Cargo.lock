@@ -3435,6 +3435,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "omsi-roadmask"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glam",
+ "log",
+ "omsi-cfg",
+ "omsi-geometry",
+ "omsi-map",
+ "omsi-model",
+ "omsi-o3d",
+ "omsi-scenery",
+ "omsi-sim",
+ "omsi-traffic",
+ "serde_json",
+]
+
+[[package]]
 name = "omsi-scenery"
 version = "0.1.0"
 dependencies = [

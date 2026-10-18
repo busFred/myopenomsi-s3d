@@ -1,0 +1,222 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>__TITLE__</title>
+<style>
+:root{color-scheme:light;--fg:#182536;--mut:#506176;--bd:#c8d2df;--cd:#ffffff;--ac:#075daf;--bg:#f2f5f9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);padding:28px 24px 40px}
+.tc{font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);max-width:1240px;margin:auto}
+.tc h1{font-size:clamp(22px,2.5vw,30px);line-height:1.25;letter-spacing:-.025em;margin:0 0 12px}
+.tc .row{display:grid;grid-template-columns:minmax(0,760px) minmax(280px,1fr);gap:16px;align-items:start}
+.tc canvas{display:block;width:100%;height:auto;aspect-ratio:760/560;border:1px solid #9cacc0;border-radius:10px;background:#1d2126;cursor:crosshair}
+.tc .side{min-width:0;border:1px solid var(--bd);border-radius:10px;background:var(--cd);padding:18px;max-height:560px;overflow:auto;scrollbar-color:#9cacc0 var(--cd)}
+.tc .ctl{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:20px 0 14px;padding:14px;border:1px solid var(--bd);border-radius:10px;background:var(--cd)}
+.tc .ctl input[type=range]{flex:1;min-width:120px;accent-color:#075daf;cursor:pointer;height:32px}
+.tc button,.tc select,.tc input[type=text]{font:inherit;color:var(--fg);background:#edf2f8;border:1px solid #9cacc0;border-radius:6px;padding:7px 12px;min-height:40px}
+.tc button{cursor:pointer;font-weight:600}
+.tc button:hover,.tc select:hover{background:#dce9f7;border-color:#075daf}
+.tc :is(button,select,input,a,summary):focus-visible{outline:3px solid #075daf;outline-offset:3px}
+.tc #play{background:#075daf;color:#ffffff;border-color:#075daf;min-width:76px}
+.tc #play:hover{background:#03467f}
+.tc input[type=text]{width:150px;min-width:0}
+.tc .mut{color:var(--mut)}
+.tc #sub{margin-bottom:20px;max-width:110ch}
+.tc table{border-collapse:collapse;width:100%;margin:12px 0;font-variant-numeric:tabular-nums;font-size:14px}
+.tc td{padding:5px 5px;border-bottom:1px solid var(--bd);vertical-align:top;overflow-wrap:anywhere}
+.tc td:first-child{color:var(--mut);white-space:nowrap;width:36%}
+.tc .lg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;margin:18px 0 12px;padding-top:14px;border-top:1px solid var(--bd);font-size:13px}
+.tc .lg b{grid-column:1/-1;margin-top:4px}
+.tc .sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tc .t{font:600 17px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;min-width:84px;color:#182536}
+.tc details{border:1px solid var(--bd);border-radius:10px;margin:14px 0;padding:14px 18px;background:var(--cd)}
+.tc summary{cursor:pointer;font-weight:650;color:#233e5d}
+.tc .note{font-size:13px;line-height:1.6;color:var(--mut);white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto}
+.tc kbd{font:600 12px ui-monospace,monospace;border:1px solid #9cacc0;border-radius:4px;padding:0 5px;background:#edf2f8}
+@media(max-width:1100px){.tc .row{grid-template-columns:minmax(0,760px);justify-content:center}.tc .side{max-height:none}}
+@media(max-width:600px){body{padding:18px 12px 28px}.tc .ctl{gap:10px;padding:12px}.tc .ctl input[type=range]{order:1;flex-basis:100%}}
+</style></head><body>
+<div class="tc">
+<h1>__TITLE__</h1>
+<div class="mut" id="sub"></div>
+<div class="ctl"><button id="play">Play</button><select id="spd" aria-label="Playback speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option></select><span class="t" id="time"></span><input type="range" id="scrub" aria-label="Timeline" min="0" value="0"><button id="fit" title="reset the view">Fit</button><button id="layer" title="M: lanes / visual edges / both"></button><button id="hgt" title="H: colour the drawn surfaces by their height above the spline">Heights: off</button><input type="text" id="find" aria-label="Find vehicle id" placeholder="vehicle id, Enter"></div>
+<div class="row"><canvas id="cv" width="760" height="560"></canvas>
+<div class="side"><div id="pin"></div><div class="lg" id="legend"></div></div></div>
+<details><summary>What could not be resolved</summary><div class="note" id="problems"></div></details>
+<details><summary>Keys and reading the page</summary><div class="note"><kbd>space</kbd> play / pause · <kbd>←</kbd> <kbd>→</kbd> one frame · <kbd>M</kbd> layers: lanes / visual edges / both · <kbd>H</kbd> height ramp · drag pans, wheel zooms · click pins a vehicle, a person, a lane or a drawn strip
+The lane layer is the simulation's: every lane's centreline ± width/2. The visual layer is the map's: each spline's .sli cross-section ([profile]/[profilepnt] x and z, textures) laid along the placed spline (position, heading, radius, mirror from the tile), so kerbs are where two profile points share an x at different heights, outer edges are the drawn extent, edges are changes of surface class or height, seams the texture joints within one surface. Crossing objects show their [path] arcs and the plan outline (convex hull) of their first-LOD meshes. Hover a vehicle or a person for its distance to the nearest visual edge (kerb/outer/edge lines, object outlines) and to the nearest lane edge.</div></details>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+const D=JSON.parse(document.getElementById('data').textContent);
+const M=D.meta,S=D.strs||[],VI=D.vinfo||{},PR=M.person_radius||0.28;
+const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+const W=760,H=560,dpr=window.devicePixelRatio||1;cv.width=W*dpr;cv.height=H*dpr;cx.scale(dpr,dpr);
+// ---- frames (people rows carried over by index)
+const F=[];let prevP=[];
+for(const f of D.frames){const P=(f.pk||[]).map(i=>prevP[i]).filter(Boolean).concat(f.p||[]);F.push({t:f.t,v:f.v,p:P,pl:f.pl||[]});prevP=P;}
+// ---- the lanes' footprints (lane row: [id, kind, width, pts, key, source, reversed, offset, file, sidx, oidx, one_way])
+const LI={};for(const L of D.lanes)LI[L[0]]=L;
+function offsetPoly(p,hw){p=p.filter((q,i)=>!i||Math.hypot(q[0]-p[i-1][0],q[1]-p[i-1][1])>1e-3);const n=p.length,l=[],r=[];if(n<2)return null;
+ const dir=[];for(let i=0;i<n-1;i++){const dx=p[i+1][0]-p[i][0],dy=p[i+1][1]-p[i][1],d=Math.hypot(dx,dy)||1e-9;dir.push([dx/d,dy/d]);}
+ for(let i=0;i<n;i++){const d0=dir[Math.max(0,i-1)],d1=dir[Math.min(n-2,i)];const n0=[d0[1],-d0[0]],n1=[d1[1],-d1[0]];let mx=n0[0]+n1[0],my=n0[1]+n1[1];const ml=Math.hypot(mx,my);
+  let k=1;if(ml<1e-6){mx=n1[0];my=n1[1];}else{mx/=ml;my/=ml;k=1/Math.max(0.5,mx*n1[0]+my*n1[1]);}
+  l.push([p[i][0]-mx*hw*k,p[i][1]-my*hw*k]);r.push([p[i][0]+mx*hw*k,p[i][1]+my*hw*k]);}
+ return {l,r};}
+const LC={fwd:'rgba(72,132,224,0.45)',rev:'rgba(52,190,160,0.45)',walk:'rgba(190,192,150,0.45)',rail:'rgba(160,112,70,0.5)'};
+function laneClass(L){if(L[1]==='R')return 'rail';if(L[1]==='W')return 'walk';return L[6]?'rev':'fwd';}
+const FP={};for(const L of D.lanes){const p=L[3];if(!p||p.length<2)continue;const w=L[2]||(L[1]==='W'?1.5:3);const o=offsetPoly(p,w/2);if(!o)continue;FP[L[0]]={L,cls:laneClass(L),hw:w/2,l:o.l,r:o.r,poly:o.l.concat(o.r.slice().reverse())};}
+const LANES=Object.values(FP).sort((a,b)=>({walk:0,rail:1,fwd:2,rev:2})[a.cls]-({walk:0,rail:1,fwd:2,rev:2})[b.cls]);
+// ---- the visual layer
+const SC={road:'rgba(78,82,92,0.85)',walk:'rgba(196,182,150,0.85)',raised:'rgba(170,146,108,0.85)',ground:'rgba(58,104,56,0.6)',other:'rgba(110,110,122,0.6)'};
+const EC={kerb:['#ffd33d',2.5,[]],outer:['#ffffff',1.5,[]],edge:['#9ecbff',1.2,[]],seam:['rgba(255,255,255,0.3)',1,[3,4]]};
+const STRIPS=[],EDGES=[],HULLS=[],OPATHS=[];
+D.splines.forEach((s,si)=>{for(const st of s.strips)STRIPS.push({si,s,st,poly:st.l.concat(st.r.slice().reverse())});for(const e of s.edges)EDGES.push({si,s,e,pts:e.pts,kind:e.kind});});
+D.objects.forEach((o,oi)=>{if(o.hull&&o.hull.length>2)HULLS.push({oi,o,poly:o.hull});for(const p of o.paths)OPATHS.push({oi,o,p});});
+const ZR=M.z_range||[0,0.2];
+function zCol(z){const t=Math.max(0,Math.min(1,(z-ZR[0])/Math.max(0.01,ZR[1]-ZR[0])));return `hsla(${Math.round(240-240*t)},80%,55%,0.85)`;}
+// ---- geometry helpers
+function inPoly(q,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const a=poly[i],b=poly[j];if((a[1]>q[1])!==(b[1]>q[1])&&q[0]<(b[0]-a[0])*(q[1]-a[1])/(b[1]-a[1])+a[0])c=!c;}return c;}
+function distToPoly(q,p,closed){let bd=1e18,bi=0;const n=p.length;for(let i=0;i<(closed?n:n-1);i++){const a=p[i],b=p[(i+1)%n];const dx=b[0]-a[0],dy=b[1]-a[1],l2=dx*dx+dy*dy||1e-9;const t=Math.max(0,Math.min(1,((q[0]-a[0])*dx+(q[1]-a[1])*dy)/l2));const d=Math.hypot(a[0]+dx*t-q[0],a[1]+dy*t-q[1]);if(d<bd){bd=d;bi=i;}}return [bd,bi];}
+function laneAt(q){let best=null;for(const f of LANES)if(inPoly(q,f.poly))best=f;return best;}
+function stripAt(q){let best=null;for(const s of STRIPS)if(inPoly(q,s.poly)){if(!best||(s.st.z0+s.st.z1)>(best.st.z0+best.st.z1))best=s;}return best;}
+// the nearest visual edge (kerb / outer / edge lines, object outlines) to any of the points: {d, what}
+function nearestVisual(points){let best=null;for(const e of EDGES){if(e.kind==='seam')continue;for(const q of points){const [d]=distToPoly(q,e.pts,false);if(!best||d<best.d)best={d,what:e.kind+' of '+base(e.s.file)+' at x '+fmt(e.e.x)+(e.kind==='kerb'?' (z '+e.e.z0+' → '+e.e.z1+')':'')};}}
+ for(const h of HULLS)for(const q of points){const [d]=distToPoly(q,h.poly,true);if(!best||d<best.d)best={d,what:'outline of '+base(h.o.file)};}return best;}
+// the nearest lane edge (every lane's ± width/2 line): {d, lane, side}
+function nearestLaneEdge(points,kinds){let best=null;for(const f of LANES){if(kinds&&!kinds.includes(f.L[1]))continue;for(const q of points){for(const [side,line] of [['left',f.l],['right',f.r]]){const [d]=distToPoly(q,line,false);if(!best||d<best.d)best={d,lane:f.L[0],side,f};}}}return best;}
+function corners(x,y,h,fr,re,hw){const a=h*Math.PI/180,fx=Math.sin(a),fy=Math.cos(a),rx=fy,ry=-fx;return [[x+fx*fr+rx*hw,y+fy*fr+ry*hw],[x+fx*fr-rx*hw,y+fy*fr-ry*hw],[x-fx*re+rx*hw,y-fy*re+ry*hw],[x-fx*re-rx*hw,y-fy*re-ry*hw]];}
+function base(f){return String(f||'').split(/[\\/]/).pop();}
+function fmt(v){return (v>=0?'+':'')+Number(v).toFixed(2);}
+function hms(t){t=Math.round(t);return [Math.floor(t/3600),Math.floor(t/60)%60,t%60].map(x=>String(x).padStart(2,'0')).join(':');}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function row(k,v){return `<tr><td>${k}</td><td>${v==null?'<span class="mut">-</span>':v}</td></tr>`;}
+// ---- the view
+const V={scale:250/((M.radius||100)*0.6),ox:0,oy:0};
+function fit(){V.scale=250/((M.radius||100)*0.6);V.ox=0;V.oy=0;}
+function sx(x){return W/2+(x-V.ox)*V.scale;}function sy(y){return H/2-(y-V.oy)*V.scale;}
+function path(p,closed){cx.beginPath();for(let i=0;i<p.length;i++){const X=sx(p[i][0]),Y=sy(p[i][1]);i?cx.lineTo(X,Y):cx.moveTo(X,Y);}if(closed)cx.closePath();}
+let hatch=null;function hatchPat(){if(hatch)return hatch;const c=document.createElement('canvas');c.width=c.height=8;const g=c.getContext('2d');g.strokeStyle='rgba(255,255,255,0.4)';g.lineWidth=1.2;g.beginPath();g.moveTo(-2,10);g.lineTo(10,-2);g.moveTo(-2,2);g.lineTo(2,-2);g.moveTo(6,10);g.lineTo(10,6);g.stroke();hatch=cx.createPattern(c,'repeat');return hatch;}
+// ---- state
+const LAYER_NAMES=['lanes','visual edges','lanes + visual'];
+let layer=2,heights=false,fi=0,playing=false,speed=1,lastTs=null,acc=0,hov=null;
+const st={pin:null};// {veh:id} | {ped:[x,y]} | {lane:id} | {strip:index}
+// ---- the texts
+const KIND={S:'street',W:'footpath',R:'rail',A:'air'};
+function laneRows(f){const L=f.L,k=L[4];const sp=L[9]!=null?D.splines[L[9]]:null,ob=L[10]!=null?D.objects[L[10]]:null;
+ const rows=[['kind',KIND[L[1]]||L[1]],['width',L[2]+' m (±'+(L[2]/2).toFixed(2)+')'],['direction',L[6]?'reversed twin':'path direction'],['one way',L[11]?'yes':'no'],['key',k?'tile '+k[0]+','+k[1]+' · id '+k[2]+' · path '+k[3]:null],['source',L[5]===1?'spline':L[5]===2?'crossing object':L[5]]];
+ if(sp)rows.push(['spline file',base(sp.file)+(sp.strips.length?'':' (.sli not found)')],['spline',sp.length+' m, radius '+(sp.radius||'straight')+(sp.mirror?', mirrored':'')],['path offset',L[7]+' m'+(k&&sp.paths[k[3]]?' (.sli path '+k[3]+': x '+sp.paths[k[3]][2]+', width '+sp.paths[k[3]][3]+', dir '+sp.paths[k[3]][4]+')':'')]);
+ else if(ob)rows.push(['object file',base(ob.file)],['object','heading '+ob.heading+'° · '+ob.footprint],['path index',k?k[3]:null]);
+ else rows.push(['map',L[8]||'not resolved (see problems)']);
+ return rows.filter(r=>r[1]!=null);}
+function stripRows(s){const st=s.st;return [['spline file',base(s.s.file)],['texture',st.tex||'-'],['class',st.cls],['x',st.x0+' .. '+st.x1+' m'],['z',st.z0+' .. '+st.z1+' m above the spline'],['lanes of this spline',s.s.lanes.join(', ')],['spline',s.s.length+' m'+(s.s.mirror?', mirrored':'')+', tile '+s.s.tile.join(',')+' id '+s.s.id]];}
+function vehRows(r){const inf=VI[r[0]]||[2.2,2.2,0.9];const pts=corners(r[1],r[2],r[3],inf[0],inf[1],inf[2]);const nv=nearestVisual(pts),nl=nearestLaneEdge(pts);const under=laneAt([r[1],r[2]]),su=stripAt([r[1],r[2]]);
+ const rows=[['type',(inf[4]||'')+' '+(inf[3]||'')],['size',(2*inf[2]).toFixed(2)+' m wide, '+(inf[0]+inf[1]).toFixed(1)+' m long'],['lane / s',r[4]+' / '+r[5]],['heading',r[3]+'°']];
+ if(under)rows.push(['footprint under centre','lane '+under.L[0]+' ('+KIND[under.L[1]]+', '+under.L[2]+' m)']);if(su)rows.push(['drawn surface under centre',su.st.cls+' · '+base(su.s.file)+' · '+(su.st.tex||'')]);
+ rows.push(['nearest visual edge',nv?nv.d.toFixed(2)+' m from the nearest corner · '+nv.what:'none in the window'],['nearest lane edge',nl?nl.d.toFixed(2)+' m from the nearest corner · lane '+nl.lane+' '+nl.side+' edge ('+KIND[nl.f.L[1]]+', '+nl.f.L[2]+' m)':'none']);return rows;}
+function pedRows(p){const q=[p[0],p[1]];const nv=nearestVisual([q]),nl=nearestLaneEdge([q]),under=laneAt(q),su=stripAt(q);
+ const rows=[['state',S[p[2]]+(p[3]!=null?' · '+S[p[3]]:'')+(p[4]?' · at kerb':'')+(p[5]?' · on crossing':'')],['walks lane',p[6]!=null?p[6]:null],['body radius',PR+' m']];
+ if(under)rows.push(['footprint under',(under.L[1]==='S'?'STREET lane ':'lane ')+under.L[0]+' ('+KIND[under.L[1]]+', '+under.L[2]+' m)']);else rows.push(['footprint under','none']);
+ rows.push(['drawn surface under',su?su.st.cls+' · '+base(su.s.file)+' · '+(su.st.tex||'')+' · z '+su.st.z0:'none']);
+ rows.push(['nearest visual edge',nv?(nv.d-PR).toFixed(2)+' m from the body ('+nv.d.toFixed(2)+' from the centre) · '+nv.what:'none in the window'],['nearest lane edge',nl?(nl.d-PR).toFixed(2)+' m from the body · lane '+nl.lane+' '+nl.side+' edge ('+KIND[nl.f.L[1]]+', '+nl.f.L[2]+' m)':'none']);return rows;}
+function playerRows(p){const pts=corners(p[0],p[1],p[2],p[4],p[4],p[5]);const nv=nearestVisual(pts),nl=nearestLaneEdge(pts,['S']);const under=laneAt([p[0],p[1]]),su=stripAt([p[0],p[1]]);
+ const rows=[['player bus',(2*p[5]).toFixed(2)+' m wide, '+(2*p[4]).toFixed(1)+' m long · heading '+p[2]+'° · '+p[3]+' m/s']];
+ if(under)rows.push(['footprint under centre','lane '+under.L[0]+' ('+KIND[under.L[1]]+', '+under.L[2]+' m)']);if(su)rows.push(['drawn surface under centre',su.st.cls+' · '+base(su.s.file)]);
+ rows.push(['nearest visual edge',nv?nv.d.toFixed(2)+' m from the nearest corner · '+nv.what:'none'],['nearest street lane edge',nl?nl.d.toFixed(2)+' m from the nearest corner · lane '+nl.lane+' '+nl.side+' edge ('+nl.f.L[2]+' m wide)':'none']);return rows;}
+// ---- drawing
+function draw(){const f=F[fi];cx.clearRect(0,0,W,H);cx.fillStyle='#1d2126';cx.fillRect(0,0,W,H);const scale=V.scale;cx.lineJoin='miter';cx.lineCap='butt';
+ if(layer!==0){for(const s of STRIPS){path(s.poly,true);cx.fillStyle=heights?zCol((s.st.z0+s.st.z1)/2):SC[s.st.cls]||SC.other;cx.fill();}}
+ if(layer!==1){for(const f2 of LANES){path(f2.poly,true);cx.fillStyle=LC[f2.cls];cx.fill();if(f2.L[5]===2){cx.fillStyle=hatchPat();cx.fill();}}
+  if(layer===2){cx.lineWidth=1;for(const f2 of LANES){cx.strokeStyle=f2.L[1]==='W'?'rgba(255,255,255,0.35)':'rgba(255,255,255,0.65)';path(f2.l);cx.stroke();path(f2.r);cx.stroke();}}
+  else{cx.lineWidth=1;cx.strokeStyle='rgba(255,255,255,0.5)';for(const f2 of LANES){path(f2.l);cx.stroke();path(f2.r);cx.stroke();}}
+  // the lanes' direction arrows
+  for(const f2 of LANES){const p=f2.L[3],n=p.length,a=p[n-2],b=p[n-1],ang=Math.atan2(-(b[1]-a[1]),b[0]-a[0]);cx.save();cx.translate(sx(b[0]),sy(b[1]));cx.rotate(ang);cx.fillStyle='rgba(230,237,243,0.6)';cx.beginPath();cx.moveTo(0,0);cx.lineTo(-5,-2.5);cx.lineTo(-5,2.5);cx.fill();cx.restore();}}
+ if(layer!==0){for(const e of EDGES){const [c,w,d]=EC[e.kind]||EC.edge;cx.strokeStyle=c;cx.lineWidth=e.kind==='kerb'?Math.max(w,0.15*scale):w;cx.setLineDash(d);path(e.pts);cx.stroke();}cx.setLineDash([]);
+  for(const h of HULLS){cx.strokeStyle='#00e5ff';cx.lineWidth=1.5;cx.setLineDash([6,4]);path(h.poly,true);cx.stroke();cx.setLineDash([]);}
+  for(const op of OPATHS){const p=op.p[4];if(!p||p.length<2)continue;cx.strokeStyle=op.p[1]===1?'rgba(255,200,80,0.8)':'rgba(255,140,0,0.8)';cx.lineWidth=1;cx.setLineDash([2,3]);path(p);cx.stroke();cx.setLineDash([]);}
+  for(const o of D.objects){cx.fillStyle='#00e5ff';cx.beginPath();cx.arc(sx(o.pos[0]),sy(o.pos[1]),3,0,7);cx.fill();}}
+ // the pinned / hovered lane or strip
+ const hl=(what)=>{if(!what)return;if(what.lane!=null&&FP[what.lane]){cx.strokeStyle='#fff';cx.lineWidth=2;cx.setLineDash([4,3]);path(FP[what.lane].poly,true);cx.stroke();cx.setLineDash([]);}
+  if(what.strip!=null&&STRIPS[what.strip]){cx.strokeStyle='#ff4fc8';cx.lineWidth=2;path(STRIPS[what.strip].poly,true);cx.stroke();}};
+ hl(st.pin);if(hov&&hov.veh==null&&!hov.ped&&hov.pl==null)hl(hov);
+ // people: the body circle, a square round somebody at a kerb, a ring on a crossing
+ for(const p of f.p){const X=sx(p[0]),Y=sy(p[1]),r=Math.max(2,PR*scale);cx.fillStyle=p[4]?'#ffd33d':'#e6edf3';cx.beginPath();cx.arc(X,Y,r,0,7);cx.fill();cx.strokeStyle='rgba(0,0,0,0.6)';cx.lineWidth=1;cx.stroke();
+  if(p[4]){const k=Math.max(4,(PR+0.15)*scale);cx.strokeStyle='#ffd33d';cx.strokeRect(X-k,Y-k,2*k,2*k);}if(p[5]){cx.strokeStyle='#b57edc';cx.lineWidth=1.5;cx.beginPath();cx.arc(X,Y,Math.max(5,0.7*scale),0,7);cx.stroke();}}
+ // vehicles
+ for(const r of f.v){const inf=VI[r[0]]||[2.2,2.2,0.9];const fr=inf[0],re=inf[1],hw=inf[2];cx.save();cx.translate(sx(r[1]),sy(r[2]));cx.rotate(r[3]*Math.PI/180);
+  cx.fillStyle='rgba(139,148,158,0.9)';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);cx.fillStyle='rgba(0,0,0,0.45)';cx.fillRect(-hw*scale,-fr*scale,2*hw*scale,Math.min(1,fr+re)*scale);
+  cx.strokeStyle=st.pin&&st.pin.veh===r[0]?'#ff4fc8':'rgba(255,255,255,0.85)';cx.lineWidth=st.pin&&st.pin.veh===r[0]?2:1;cx.strokeRect(-hw*scale,-fr*scale,2*hw*scale,(fr+re)*scale);cx.restore();
+  if(scale>4||(st.pin&&st.pin.veh===r[0])){cx.fillStyle='#c9d1d9';cx.font='10px system-ui';cx.fillText(r[0],sx(r[1])+hw*scale+2,sy(r[2])-2);}}
+ // players
+ for(const p of f.pl){cx.save();cx.translate(sx(p[0]),sy(p[1]));cx.rotate(p[2]*Math.PI/180);const hl2=p[4]||6,hw=p[5]||1.25;cx.fillStyle='#ffffff';cx.strokeStyle='#000';cx.lineWidth=1;cx.fillRect(-hw*scale,-hl2*scale,2*hw*scale,2*hl2*scale);cx.strokeRect(-hw*scale,-hl2*scale,2*hw*scale,2*hl2*scale);cx.fillStyle='#e5534b';cx.fillRect(-hw*scale,-hl2*scale,2*hw*scale,Math.min(1,2*hl2)*scale);cx.restore();}
+ // the tooltip
+ if(hov&&hov.at){let rows=null,head='';
+  if(hov.veh!=null){const r=f.v.find(v=>v[0]===hov.veh);if(r){head='vehicle '+r[0];rows=vehRows(r);}}
+  else if(hov.pl!=null&&f.pl[hov.pl]){head='player';rows=playerRows(f.pl[hov.pl]);}
+  else if(hov.ped){head='person';rows=pedRows(hov.ped);}
+  else if(hov.lane!=null&&FP[hov.lane]){head='lane '+hov.lane;rows=laneRows(FP[hov.lane]);}
+  else if(hov.strip!=null&&STRIPS[hov.strip]){head='drawn strip';rows=stripRows(STRIPS[hov.strip]);}
+  if(rows){const lines=[head].concat(rows.map(([k,v])=>k+': '+v));cx.font='11px system-ui';const w=Math.min(W-20,Math.max(...lines.map(l=>cx.measureText(l).width))+12),h=lines.length*14+8;let X=hov.at[0]+14,Y=hov.at[1]+14;if(X+w>W)X=Math.max(0,hov.at[0]-w-8);if(Y+h>H)Y=Math.max(0,H-h);
+   cx.fillStyle='rgba(10,14,20,0.92)';cx.fillRect(X,Y,w,h);cx.strokeStyle='#9cacc0';cx.lineWidth=1;cx.strokeRect(X+0.5,Y+0.5,w-1,h-1);cx.fillStyle='#e6edf3';lines.forEach((l,i)=>{cx.font=i?'11px system-ui':'bold 11px system-ui';cx.fillText(l,X+6,Y+15+i*14);});}}
+ document.getElementById('time').textContent=hms(f.t);scrub.value=fi;panel();}
+function panel(){const f=F[fi];const el=document.getElementById('pin');let h='';
+ if(st.pin&&st.pin.veh!=null){const r=f.v.find(v=>v[0]===st.pin.veh);h=r?'<b>vehicle '+r[0]+'</b><table>'+vehRows(r).map(([k,v])=>row(k,esc(v))).join('')+'</table>':'<b>vehicle '+st.pin.veh+'</b> <span class="mut">(not in view at this time)</span>';}
+ else if(st.pin&&st.pin.ped){const q=f.p.reduce((b,p)=>{const d=Math.hypot(p[0]-st.pin.ped[0],p[1]-st.pin.ped[1]);return !b||d<b[0]?[d,p]:b;},null);
+  if(q&&q[0]<2){st.pin.ped=[q[1][0],q[1][1]];h='<b>person</b> <span class="mut">at '+q[1][0]+', '+q[1][1]+'</span><table>'+pedRows(q[1]).map(([k,v])=>row(k,esc(v))).join('')+'</table>';}else h='<span class="mut">the pinned person is not near that place now</span>';}
+ else if(st.pin&&st.pin.lane!=null&&FP[st.pin.lane])h='<b>lane '+st.pin.lane+'</b><table>'+laneRows(FP[st.pin.lane]).map(([k,v])=>row(k,esc(v))).join('')+'</table>';
+ else if(st.pin&&st.pin.strip!=null&&STRIPS[st.pin.strip])h='<b>drawn strip</b><table>'+stripRows(STRIPS[st.pin.strip]).map(([k,v])=>row(k,esc(v))).join('')+'</table>';
+ else h='<span class="mut">Hover or click a vehicle, a person, a lane or a drawn strip. Drag to pan, wheel to zoom.</span><div style="margin-top:8px">'+D.lanes.length+' lanes · '+D.splines.length+' spline instances ('+D.splines.filter(s=>s.path).length+' with their .sli, '+D.splines.filter(s=>s.strips.length).length+' drawn) · '+D.objects.length+' crossing objects ('+HULLS.length+' with an outline)</div>';
+ el.innerHTML=h;}
+function legend(){const sw=(c,extra)=>`<span class="sw" style="background:${c};border:1px solid #777;${extra||''}"></span>`;let h='<b>Simulation lanes (±width/2)</b>';
+ h+=[['street lane (path direction)',LC.fwd],['street lane (reversed twin)',LC.rev],['pavement lane',LC.walk],['rail',LC.rail]].map(([n,c])=>'<span>'+sw(c)+n+'</span>').join('')+'<span>'+sw('repeating-linear-gradient(135deg,#999 0 2px,transparent 2px 5px)')+'crossing-object piece (hatched)</span>';
+ h+='<b>Visual (map) surfaces'+(heights?' — height ramp '+ZR[0]+' m (blue) → '+ZR[1]+' m (red)':'')+'</b>';
+ h+=heights?'<span>'+sw(zCol(ZR[0]))+'low</span><span>'+sw(zCol(ZR[1]))+'high</span>':[['road',SC.road],['pavement / kerbstone',SC.walk],['raised (unknown texture)',SC.raised],['grass / ground',SC.ground],['other',SC.other]].map(([n,c])=>'<span>'+sw(c)+n+'</span>').join('');
+ h+='<b>Visual edges</b>'+[['kerb face (same x, step in z)','#ffd33d',3],['outer edge of the drawn profile','#fff',2],['surface change','#9ecbff',2],['texture seam','rgba(255,255,255,0.4)',1]].map(([n,c,w])=>'<span><span class="sw" style="border-top:'+w+'px solid '+c+';height:'+(w+1)+'px;border-radius:0"></span>'+n+'</span>').join('');
+ h+='<span><span class="sw" style="border:2px dashed #00e5ff;background:none"></span>object mesh outline</span><span><span class="sw" style="border-top:2px dotted #ff8c00;height:3px;border-radius:0"></span>object [path] arc</span>';
+ h+='<b>Recording</b><span>'+sw('#8b949e')+'vehicle box</span><span>'+sw('#fff','border-top:3px solid #e5534b')+'player bus</span><span>'+sw('#e6edf3','border-radius:6px')+'person r 0.28 (yellow + square: at kerb; ring: on crossing)</span>';
+ document.getElementById('legend').innerHTML=h;}
+// ---- interaction
+const scrub=document.getElementById('scrub');scrub.max=F.length-1;
+document.getElementById('sub').textContent=`${M.map} · ${M.fixture} · window middle ${M.mid_hms} · centre (${M.center}) · radius ${M.radius} m · ${M.fps} fps · ${F.length} frames · root ${M.root}`;
+document.getElementById('problems').textContent=(M.problems&&M.problems.length)?M.problems.join('\n'):'everything resolved';
+function canvasPoint(e){const b=cv.getBoundingClientRect();return [(e.clientX-b.left-cv.clientLeft)*W/cv.clientWidth,(e.clientY-b.top-cv.clientTop)*H/cv.clientHeight];}
+function under(x,y){const f=F[fi],wx=(x-W/2)/V.scale+V.ox,wy=-(y-H/2)/V.scale+V.oy,q=[wx,wy];
+ let best=null;for(const r of f.v){const d=Math.hypot(r[1]-wx,r[2]-wy);if(d<Math.max(3,10/V.scale)&&(!best||d<best[0]))best=[d,r[0]];}
+ let bp=null;for(const p of f.p){const d=Math.hypot(p[0]-wx,p[1]-wy);if(d<Math.max(1,8/V.scale)&&(!bp||d<bp[0]))bp=[d,p];}
+ let pl=null;f.pl.forEach((p,i)=>{const d=Math.hypot(p[0]-wx,p[1]-wy);if(d<Math.max(4,10/V.scale)&&(!pl||d<pl[0]))pl=[d,i];});
+ if(bp&&(!best||bp[0]<best[0]*0.5))return {ped:bp[1]};if(best)return {veh:best[1]};if(pl)return {pl:pl[1]};
+ const L=layer!==1?laneAt(q):null;if(L)return {lane:L.L[0]};const s=layer!==0?stripAt(q):null;if(s)return {strip:STRIPS.indexOf(s)};return {};}
+let drag=null,moved=false;
+cv.onmousedown=e=>{drag=[...canvasPoint(e),V.ox,V.oy];moved=false;};window.addEventListener('mouseup',()=>{drag=null;});
+cv.onmousemove=e=>{const [x,y]=canvasPoint(e);if(drag){const dx=x-drag[0],dy=y-drag[1];if(Math.abs(dx)+Math.abs(dy)>3)moved=true;V.ox=drag[2]-dx/V.scale;V.oy=drag[3]+dy/V.scale;draw();return;}
+ const u=under(x,y);u.at=[x,y];hov=u;draw();};
+cv.onmouseleave=()=>{hov=null;draw();};
+cv.onwheel=e=>{e.preventDefault();const [x,y]=canvasPoint(e);const wx=(x-W/2)/V.scale+V.ox,wy=-(y-H/2)/V.scale+V.oy;V.scale*=e.deltaY<0?1.2:1/1.2;V.scale=Math.max(0.3,Math.min(60,V.scale));V.ox=wx-(x-W/2)/V.scale;V.oy=wy+(y-H/2)/V.scale;draw();};
+cv.onclick=e=>{if(moved)return;const [x,y]=canvasPoint(e);const u=under(x,y);st.pin=u.ped?{ped:[u.ped[0],u.ped[1]]}:u.veh!=null?{veh:u.veh}:u.lane!=null?{lane:u.lane}:u.strip!=null?{strip:u.strip}:null;draw();
+ history.replaceState(null,'','#'+`at=${V.ox.toFixed(1)},${V.oy.toFixed(1)}&zoom=${V.scale.toFixed(1)}&t=${hms(F[fi].t)}&layer=${layer}`+(st.pin&&st.pin.veh!=null?'&pin='+st.pin.veh:'')+(st.pin&&st.pin.lane!=null?'&lane='+st.pin.lane:''));};
+function setLayer(l){layer=((l|0)%3+3)%3;document.getElementById('layer').textContent='Layers: '+LAYER_NAMES[layer];}
+function setHeights(on){heights=!!on;document.getElementById('hgt').textContent='Heights: '+(heights?'on':'off');legend();}
+document.getElementById('layer').onclick=()=>{setLayer(layer+1);draw();};
+document.getElementById('hgt').onclick=()=>{setHeights(!heights);draw();};
+document.getElementById('fit').onclick=()=>{fit();draw();};
+document.getElementById('spd').onchange=e=>{speed=+e.target.value;};
+scrub.oninput=()=>{fi=+scrub.value;acc=0;draw();};
+function tick(ts){if(!playing){lastTs=null;return;}if(lastTs!=null)acc+=(ts-lastTs)/1000*speed;lastTs=ts;
+ while(fi<F.length-1&&acc>=F[fi+1].t-F[fi].t){acc-=F[fi+1].t-F[fi].t;fi++;}
+ if(fi>=F.length-1){playing=false;document.getElementById('play').textContent='Play';}draw();requestAnimationFrame(tick);}
+document.getElementById('play').onclick=()=>{playing=!playing;document.getElementById('play').textContent=playing?'Pause':'Play';if(playing){if(fi>=F.length-1)fi=0;acc=0;requestAnimationFrame(tick);}};
+function go(id,zoom){id=+id;if(!Number.isFinite(id))return;let b=-1;for(let i=0;i<F.length;i++)if(F[i].v.some(v=>v[0]===id)&&(b<0||Math.abs(i-fi)<Math.abs(b-fi)))b=i;if(b<0)return;fi=b;const r=F[fi].v.find(v=>v[0]===id);st.pin={veh:id};V.ox=r[1];V.oy=r[2];if(zoom)V.scale=+zoom;draw();}
+document.getElementById('find').onkeydown=e=>{if(e.key!=='Enter')return;const id=e.target.value.replace(/[^0-9]/g,'');if(id)go(id,4);};
+window.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type==='text')return;
+ if(e.key==='m'||e.key==='M'){setLayer(layer+1);draw();}else if(e.key==='h'||e.key==='H'){setHeights(!heights);draw();}
+ else if(e.key===' '){e.preventDefault();document.getElementById('play').click();}else if(e.key==='ArrowRight'){fi=Math.min(F.length-1,fi+1);acc=0;draw();}else if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);acc=0;draw();}});
+// #at=x,y&zoom=N&t=HH:MM:SS&layer=0|1|2&heights=1&pin=<vehicle>&lane=<id>&hover=x,y
+function applyHash(){const h=new URLSearchParams(location.hash.slice(1));if(h.get('layer')!=null)setLayer(+h.get('layer'));if(h.get('heights')!=null)setHeights(h.get('heights')==='1');
+ if(h.get('t')){const [hh,mm,ss]=h.get('t').split(':').map(Number);const tt=hh*3600+mm*60+(ss||0);let b=0;for(let i=0;i<F.length;i++)if(Math.abs(F[i].t-tt)<Math.abs(F[b].t-tt))b=i;fi=b;}
+ if(h.get('at')){const [x,y]=h.get('at').split(',').map(Number);if(Number.isFinite(x)&&Number.isFinite(y)){V.ox=x;V.oy=y;}}if(h.get('zoom'))V.scale=Math.max(0.3,Math.min(60,+h.get('zoom')));
+ if(h.get('pin'))go(h.get('pin'),h.get('zoom'));if(h.get('lane')!=null)st.pin={lane:+h.get('lane')};
+ if(h.get('hover')){const [x,y]=h.get('hover').split(',').map(Number);if(Number.isFinite(x)&&Number.isFinite(y)){const u=under(sx(x),sy(y));u.at=[sx(x),sy(y)];hov=u;}}draw();}
+window.addEventListener('hashchange',applyHash);
+let m=0;for(let i=0;i<F.length;i++)if(Math.abs(F[i].t-M.mid)<Math.abs(F[m].t-M.mid))m=i;fi=m;
+setLayer(2);setHeights(false);draw();applyHash();
+})();
+</script></body></html>

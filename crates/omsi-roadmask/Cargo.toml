@@ -1,0 +1,24 @@
+[package]
+name = "omsi-roadmask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone debug tool: the visual road and pavement edges of a recorded traffic window from the map's spline profiles, as a replayable mask page"
+
+[[bin]]
+name = "omsi-roadmask"
+path = "src/main.rs"
+
+[dependencies]
+omsi-cfg = { path = "../omsi-cfg" }
+omsi-map = { path = "../omsi-map" }
+omsi-scenery = { path = "../omsi-scenery" }
+omsi-model = { path = "../omsi-model" }
+omsi-geometry = { path = "../omsi-geometry" }
+omsi-o3d = { path = "../omsi-o3d" }
+omsi-sim = { path = "../omsi-sim" }
+omsi-traffic = { path = "../omsi-traffic" }
+glam.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde_json.workspace = true
