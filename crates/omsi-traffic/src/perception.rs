@@ -622,7 +622,10 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // (one keeping its lane - no change, no pass - comes no nearer sideways than its lane's
         // line lets it, `lane_room`: a car drifting half a metre in its own lane made the one
         // beside it brake hard, review11 re-check)
-        let lane_room = (o.state.change.is_none() && o.passing.is_none()).then_some(o.state.lateral_target - o.state.lateral);
+        let lane_room = (o.state.change.is_none() && o.passing.is_none()).then(|| {
+            let lh = (net.lanes[o.state.lane].at(o.state.s).1 as f64).to_radians();
+            (o.state.lateral_target - o.state.lateral, DVec2::new(lh.sin(), lh.cos()))
+        });
         let hit = match (hit, cut_in_hit(way, &ob, o_fwd, o.state.speed, o.last.stop.map(|sp| sp - o.state.front), lane_room, w, reach)) {
             (Some(h), Some(c)) if c.0 < h.0 => Some((c.0, h.1, c.1, c.2)),
             (None, Some(c)) => Some((c.0, c.0 + o.length(), c.1, c.2)),
@@ -777,7 +780,7 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
 /// in, braking as for one standing there until it is ahead of me); one merely beside me and
 /// parallel is not, nor one keeping its lane whose line lets it come no nearer (`lane_room`:
 /// how far its lane's line still takes it sideways, + = its right; see `lane_room_toward`).
-fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, lane_room: Option<f32>, w: f64) -> bool {
+fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, lane_room: Option<(f32, DVec2)>, w: f64) -> bool {
     let right = DVec2::new(f.y, -f.x);
     let (along, lat) = (rel.dot(f), rel.dot(right));
     if along <= 0.0 {
@@ -790,8 +793,13 @@ fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, lane_room: Option<
     if speed < 0.5 {
         return false;
     }
-    if lane_room_toward(lane_room, lat).is_some_and(|r| r < 0.05) {
-        return false;
+    // (one keeping its lane: not unless its line still takes it towards me, or its lane itself
+    // runs into my way)
+    if let Some((room, lane_fwd)) = lane_room {
+        let toward_lane = -(lane_fwd.dot(right)) * lat.signum();
+        if lane_room_toward(room, lat) < 0.05 && toward_lane <= (CUT_IN_DEG as f64).to_radians().sin() {
+            return false;
+        }
     }
     let toward = -(o_fwd.dot(right)) * lat.signum();
     if o_fwd.dot(f) < CUT_IN_MAX_DEG.to_radians().cos() as f64 {
@@ -807,7 +815,7 @@ fn cutting_in(o_fwd: DVec2, speed: f32, f: DVec2, rel: DVec2, lane_room: Option<
 /// It is my lead from there: seen only where it is, a bus cutting in at 6-15 degrees left the
 /// car half a second to brake, and its near edge in my lane ran back towards the car faster
 /// than its speed said (review11).
-fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>, lane_room: Option<f32>, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
+fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>, lane_room: Option<(f32, DVec2)>, w: f64, upto: f32) -> Option<(f32, usize, DVec2)> {
     if speed < 0.5 || way.pts.len() < 2 {
         return None;
     }
@@ -830,8 +838,17 @@ fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>
     // (no further than the stop it is braking for lets it: a car creeping up to the line it
     // waits at comes no nearer)
     let shift = (speed as f64 * toward * CUT_IN_TIME as f64).min(room.map(|r| r.max(0.0) as f64 * toward).unwrap_or(f64::INFINITY)).clamp(0.0, 3.0);
-    // (nor further than its lane's line takes one keeping its lane)
-    let shift = shift.min(lane_room_toward(lane_room, lat).unwrap_or(f64::INFINITY));
+    // (one keeping its lane: its lane's own run towards my way in full, `toward_lane`, and
+    // the rest - its drift within the lane - no further than its line takes it)
+    let shift = match lane_room {
+        Some((room, lane_fwd)) => {
+            let toward_lane = (-(lane_fwd.dot(right)) * lat.signum()).max(0.0);
+            let by_lane = speed as f64 * toward_lane * CUT_IN_TIME as f64;
+            let drift = (speed as f64 * (toward - toward_lane) * CUT_IN_TIME as f64).max(0.0).min(lane_room_toward(room, lat));
+            shift.min(by_lane + drift)
+        }
+        None => shift,
+    };
     if shift < 0.05 {
         return None;
     }
@@ -839,13 +856,12 @@ fn cut_in_hit(way: &WayPts, b: &Obb, o_fwd: DVec2, speed: f32, room: Option<f32>
     way.corridor_hit(&moved, w, upto)
 }
 
-/// How much further a body keeping its lane can come towards my way (m): its way's sideways
-/// offset still to go, `lane_room` (+ = its right, `AiState::lateral_target - lateral`), taken
-/// towards my way, which lies on its left when its offset from my way `lat` is positive (the
-/// two run within 45 degrees of each other, so its right is mine, about). Nothing: no limit
-/// (a lane change, a pass, the player).
-fn lane_room_toward(lane_room: Option<f32>, lat: f64) -> Option<f64> {
-    lane_room.map(|d| (d as f64 * -lat.signum()).max(0.0))
+/// How much further a body keeping its lane can drift towards my way within it (m): its way's
+/// sideways offset still to go, `room` (+ = its right, `AiState::lateral_target - lateral`),
+/// taken towards my way, which lies on its left when its offset from my way `lat` is positive
+/// (the two run within 45 degrees of each other, so its right is mine, about).
+fn lane_room_toward(room: f32, lat: f64) -> f64 {
+    (room as f64 * -lat.signum()).max(0.0)
 }
 
 /// Metres more than its gap a car keeps behind where a pass standing out beside the lane steps
@@ -1410,20 +1426,25 @@ mod cut_in_tests {
     fn a_car_keeping_its_lane_is_not_cutting_in() {
         let (o_fwd, speed, f, rel) = beside();
         assert!(cutting_in(o_fwd, speed, f, rel, None, 1.2));
+        // its lane runs parallel to my way
+        let par = DVec2::Y;
         // it sits 0.6 m left of its lane's line, drifted towards me, and goes back to it (I
         // am on its left: its line lies 0.6 m to its right)
-        assert!(!cutting_in(o_fwd, speed, f, rel, Some(0.6), 1.2));
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some((0.6, par)), 1.2));
         // its line is where it is: it stays
-        assert!(!cutting_in(o_fwd, speed, f, rel, Some(0.0), 1.2));
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some((0.0, par)), 1.2));
         // its line lies 1 m to its left, towards me: it comes
-        assert!(cutting_in(o_fwd, speed, f, rel, Some(-1.0), 1.2));
+        assert!(cutting_in(o_fwd, speed, f, rel, Some((-1.0, par)), 1.2));
         // its line lies 1 m to its right, away from me: it does not
-        assert!(!cutting_in(o_fwd, speed, f, rel, Some(1.0), 1.2));
-        assert_eq!(lane_room_toward(Some(-1.0), 2.6), Some(1.0));
-        assert_eq!(lane_room_toward(Some(1.0), 2.6), Some(0.0));
-        assert_eq!(lane_room_toward(Some(1.0), -2.6), Some(1.0));
-        assert_eq!(lane_room_toward(None, 2.6), None);
+        assert!(!cutting_in(o_fwd, speed, f, rel, Some((1.0, par)), 1.2));
+        // its lane itself runs 8 degrees into my way (lanes converging): it comes, whatever
+        // its line's offset says
+        assert!(cutting_in(o_fwd, speed, f, rel, Some((0.0, o_fwd)), 1.2));
+        assert!(cutting_in(o_fwd, speed, f, rel, Some((1.0, o_fwd)), 1.2));
+        assert_eq!(lane_room_toward(-1.0, 2.6), 1.0);
+        assert_eq!(lane_room_toward(1.0, 2.6), 0.0);
+        assert_eq!(lane_room_toward(1.0, -2.6), 1.0);
         // its middle already inside my corridor: in, whatever its line says
-        assert!(cutting_in(o_fwd, speed, f, DVec2::new(1.0, 3.0), Some(0.0), 1.2));
+        assert!(cutting_in(o_fwd, speed, f, DVec2::new(1.0, 3.0), Some((0.0, par)), 1.2));
     }
 }
