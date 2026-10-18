@@ -380,6 +380,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
+    // (eased off in a mutual hold: it stays where it stands until the other is through)
+    if let (Some(_), Some(g)) = (me.ease_for, grant) {
+        if !g.go {
+            out.hold = g.hold;
+            out.wait_for = g.wait_for;
+            min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::Junction);
+        }
+    }
+
     // 4. people
     min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
     min_stop(&mut out.stop, &mut out.why, p.zebra_stop, Why::Zebra);

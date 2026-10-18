@@ -768,3 +768,123 @@ fn cars_push(cars: &mut [Vehicle], v: Vehicle) {
         *slot = v;
     }
 }
+
+/// A crossing of object 9: the side road northbound (lanes 0/1/2, the piece 1 along x = 0,
+/// y -15..15) gives way to the main road eastbound (lanes 3/4/5, the piece 4 along y = 0,
+/// priority 192). Car 1 stands at the side road's line, car 2 at the main road's line with its
+/// front `b_front` short of the middle.
+fn side_and_main(b_front: f64) -> (Network, Vec<Vehicle>) {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -15.0)], 1));
+    net.lanes.push(piece(&[(0.0, -15.0), (0.0, 15.0)], 0));
+    net.lanes.push(road(&[(0.0, 15.0), (0.0, 300.0)], 2));
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 3));
+    let mut main = piece(&[(-15.0, 0.0), (15.0, 0.0)], 1);
+    main.priority = 192.0;
+    net.lanes.push(main);
+    net.lanes.push(road(&[(15.0, 0.0), (300.0, 0.0)], 4));
+    let net = finish(net);
+    let a = car(1, 1, 15.0 - 9.0 - 2.0, 0.0);
+    let b = car(2, 4, (15.0 - b_front - 2.0) as f32, 0.0);
+    (net, vec![a, b])
+}
+
+/// One frame of the two holding each other (each the other's `wait_for`, `body_block` too for
+/// the ones given), standing, then `Simulation::negotiate` for `secs`: who eased off.
+fn held_each_other(red: bool, blocked: &[u64], secs: f32) -> Option<(u64, u64, usize)> {
+    let (net, mut cars) = side_and_main(6.0);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.tick(&net, DT, &mut cars);
+    let claim_of: Vec<Option<usize>> = (0..cars.len()).map(|i| sim.claims.iter().position(|(c, _)| c.vehicle == i)).collect();
+    assert!(claim_of.iter().all(|c| c.is_some()), "both claim the junction");
+    for (c, _) in sim.claims.iter_mut() {
+        c.light_red = red;
+    }
+    let mut t = 0.0;
+    while t < secs {
+        for k in 0..2 {
+            let other = cars[1 - k].id;
+            let me = &mut cars[k];
+            me.state.speed = 0.0;
+            me.last.wait_for = Some(other);
+            me.last.body_block = blocked.contains(&me.id).then_some(other);
+        }
+        sim.negotiate(&mut cars, &claim_of, DT);
+        t += DT;
+    }
+    cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j)))
+}
+
+#[test]
+fn x7_a_mutual_hold_of_six_seconds_is_negotiated_by_the_pair_s_hash() {
+    use omsi_traffic::sim::eases_off;
+    assert_eq!(held_each_other(false, &[], 5.5), None, "too early");
+    let (who, other, j) = held_each_other(false, &[], 6.5).expect("nobody eased off");
+    assert_eq!(who, eases_off(1, 2, j), "not the hash's pick");
+    assert_eq!(other, 3 - who);
+    // the same in every run
+    assert_eq!(held_each_other(false, &[], 6.5), Some((who, other, j)));
+    // of two where only one is held by the other's body, that one eases off (the other waits
+    // for it at the junction only)
+    for blocked in [1u64, 2] {
+        assert_eq!(held_each_other(false, &[blocked], 6.5).map(|e| e.0), Some(blocked));
+    }
+    // never while either is held by a red light
+    assert_eq!(held_each_other(true, &[], 20.0), None, "a negotiation at a red light");
+}
+
+/// The side road car (1) and the main road car (2, eased off for it, `b_front` short of the
+/// middle) for `secs`: (the least gap between the bodies, car 1's front y at the end, car 2's
+/// ease at the end).
+fn eased_main(b_front: f64, secs: f32, eased: bool) -> (f32, f32, Option<(u64, usize, f32)>, f32) {
+    let (net, mut cars) = side_and_main(b_front);
+    if eased {
+        cars[1].ease_for = Some((1, 0, 0.0));
+    }
+    let mut sim = Simulation::new(&net, vec![]);
+    // (how far the main road car had moved by the time the side road car was across)
+    let mut moved_before = 0.0f32;
+    let start = -(b_front as f32) - 2.0;
+    let min_gap = run(&net, &mut sim, &mut cars, secs, |_, _, cars| {
+        let a = cars.iter().find(|c| c.id == 1).unwrap();
+        let b = cars.iter().find(|c| c.id == 2).unwrap();
+        if a.pos.y < 3.0 {
+            moved_before = moved_before.max(b.pos.x as f32 - start);
+        }
+    });
+    let a = cars.iter().find(|c| c.id == 1).unwrap();
+    (min_gap, a.pos.y as f32 + a.state.front, cars.iter().find(|c| c.id == 2).unwrap().ease_for, moved_before)
+}
+
+#[test]
+fn x7_the_one_eased_off_waits_and_the_other_goes_keeping_off_its_body() {
+    // the main road car 6 m short of the middle, eased off: the side road car, which would
+    // give way to it, goes; the main road car stays until it is through, then takes part again
+    let (_, _, _, moved) = eased_main(6.0, 12.0, false);
+    assert!(moved > 3.0, "not eased off, the main road car goes first: it moved {moved:.1} m");
+    let (min_gap, a_front, ease, moved) = eased_main(6.0, 12.0, true);
+    assert!(a_front > 10.0, "the side road car did not go: front at y = {a_front:.1}");
+    assert!(moved < 0.3, "the main road car moved {moved:.1} m before the side road car was across");
+    assert!(min_gap > 0.3, "bodies {min_gap:.2} m apart");
+    assert!(ease.is_none(), "still eased off once the other has left: {ease:?}");
+    // with its nose in the side road car's corridor (its front 0.7 m short of the side road's
+    // middle line, 0.2 m inside the corridor): the side road car is let go by the junction
+    // but not by the body, and stops short of it
+    let (min_gap, a_front, _, _) = eased_main(0.7, 12.0, true);
+    assert!(min_gap > 0.2, "it drove into the body: {min_gap:.2} m");
+    assert!(a_front < -0.9, "front at y = {a_front:.1}, past the body's edge");
+}
+
+#[test]
+fn x7_who_eases_off_is_a_hash_of_the_pair_and_the_junction() {
+    use omsi_traffic::sim::eases_off;
+    for (a, b, j) in [(1u64, 2u64, 0usize), (15110, 10813, 6), (7, 900, 31)] {
+        let e = eases_off(a, b, j);
+        assert!(e == a || e == b);
+        assert_eq!(e, eases_off(b, a, j), "not symmetric");
+        assert_eq!(e, eases_off(a, b, j), "not the same twice");
+    }
+    // (both sides come up)
+    let picks: Vec<bool> = (0..64usize).map(|j| eases_off(3, 4, j) == 3).collect();
+    assert!(picks.iter().any(|&p| p) && picks.iter().any(|&p| !p));
+}

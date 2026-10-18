@@ -4032,6 +4032,8 @@ struct Extra {
     pass_stranded_s: u64,
     /// `overlap_s` without the pairs that touched within 3 s of one of them coming on the road.
     overlap_nospawn_s: u64,
+    /// Mutual holds negotiated: a car eased off for the other (`Vehicle::ease_for`), whole map.
+    eases: u64,
     events: Vec<String>,
 }
 
@@ -4233,6 +4235,12 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
                     }
                     None => {
                         change_since.remove(&v.id);
+                    }
+                }
+                if let Some((oid, j, since)) = v.ease_for {
+                    if since == 0.0 {
+                        ex.eases += 1;
+                        ex.events.push(format!("EASE {} t={now:.1} #{} eases off for #{} at junction {j} (lane {}, s {:.1})", sc.name, v.id, oid, st.lane, st.s));
                     }
                 }
                 match v.passing {
@@ -4512,6 +4520,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("passes", format!("{}/{}", e.passes_unsignalled, e.passes)),
         ("pass_wrong_s", e.pass_wrong_side_s.to_string()),
         ("stranded_s", e.pass_stranded_s.to_string()),
+        ("eases", e.eases.to_string()),
     ]
 }
 
@@ -4532,6 +4541,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.passes_unsignalled += e.passes_unsignalled;
     t.pass_wrong_side_s += e.pass_wrong_side_s;
     t.pass_stranded_s += e.pass_stranded_s;
+    t.eases += e.eases;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]

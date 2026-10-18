@@ -253,6 +253,38 @@ pub struct Vehicle {
     /// (`AiState::settle_change`).
     #[serde(default)]
     pub change_still: (f32, f32),
+    /// Holding the vehicle with this id at a junction while it holds this one (each the
+    /// other's `wait_for` or `body_block`), and for how many seconds (`MUTUAL_HOLD`).
+    #[serde(default)]
+    pub mutual: Option<(u64, f32)>,
+    /// Eased off for the vehicle with this id at this junction, since then (s): it stays held
+    /// and its claim does not stand in the other's way (`Claim::yields_now`) until the other
+    /// has left the meeting places of the two.
+    #[serde(default)]
+    pub ease_for: Option<(u64, usize, f32)>,
+}
+
+/// Two vehicles holding each other this long (s) at a junction where they have a meeting place
+/// negotiate: one eases off (`Vehicle::ease_for`).
+pub const MUTUAL_HOLD: f32 = 6.0;
+/// An eased-off car takes part again after this long (s) whatever the other does.
+pub const EASE_MAX: f32 = 30.0;
+
+/// Which of two vehicles (ids `a`, `b`) in a mutual hold at junction `j` eases off: a hash of
+/// the lower id, the higher and the junction, the same in every run.
+pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    let mut x = lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi.rotate_left(21) ^ (j as u64).rotate_left(42);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    if x & 1 == 0 {
+        lo
+    } else {
+        hi
+    }
 }
 
 /// An aborted pass standing out there steps back into its lane at this pace (m/s) ...
@@ -295,6 +327,8 @@ impl Vehicle {
             amber_line: None,
             zip_won: None,
             change_still: (0.0, 0.0),
+            mutual: None,
+            ease_for: None,
         }
     }
 
@@ -802,6 +836,7 @@ impl Simulation {
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
+                yields_now: None,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -934,6 +969,7 @@ impl Simulation {
                 lanes: way,
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
+                yields_now: None,
             });
         }
         for (i, standing) in standing_now {
@@ -972,6 +1008,7 @@ impl Simulation {
             }
         }
         self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
+        self.eased_claims(vehicles, &mut claims, &claim_of, dt);
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
@@ -992,7 +1029,102 @@ impl Simulation {
             let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
             self.act(net, vehicles, i, plan, dt);
         }
+        self.negotiate(vehicles, &claim_of, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
+    }
+
+    /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
+    /// `yields_now` for the other while it has not left the meeting places of the two; the
+    /// ease ends when it has, when either is gone or no longer claims the junction, when either
+    /// is held by a red light, or after `EASE_MAX`.
+    fn eased_claims(&self, vehicles: &mut [Vehicle], claims: &mut [Claim], claim_of: &[Option<usize>], dt: f32) {
+        for i in 0..vehicles.len() {
+            let Some((oid, j, since)) = vehicles[i].ease_for else { continue };
+            let keep = (|| {
+                let k = claim_of[i]?;
+                let o = vehicles.iter().position(|v| v.id == oid)?;
+                let ko = claim_of[o]?;
+                let (mine, theirs) = (&claims[k], &claims[ko]);
+                if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
+                    return None;
+                }
+                // (the other still short of, or in, a meeting place of the two)
+                let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
+                let inside = pieces.iter().any(|(_, f)| theirs.chain.iter().any(|&(m, off)| m == f.movement && theirs.s - off - theirs.rear <= f.theirs.1));
+                inside.then_some((k, o))
+            })();
+            match keep {
+                Some((k, o)) => {
+                    claims[k].yields_now = Some(o);
+                    if let Some(e) = vehicles[i].ease_for.as_mut() {
+                        e.2 += dt;
+                    }
+                }
+                None => vehicles[i].ease_for = None,
+            }
+        }
+    }
+
+    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`) for
+    /// `MUTUAL_HOLD` at a junction where their ways meet, neither at a red light: one eases off
+    /// (`Vehicle::ease_for`), the other goes on by the ordinary rules - bodies, other foes and
+    /// all (round 4a's standoff break let the winner ignore the other's body and claim, and it
+    /// squeezed past at -0.01 m, review9). The one that eases off: of two where only one is
+    /// body-blocked by the other, that one (it cannot go anyway; the other waits for it at the
+    /// junction); else by `eases_off`, the same in every run.
+    pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
+        let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
+        let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
+        let mut timers: Vec<Option<(u64, f32)>> = Vec::with_capacity(vehicles.len());
+        for v in vehicles.iter() {
+            // (both standing: one rolling up to its stop is not held yet)
+            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
+            timers.push(other.map(|o| (o, match v.mutual {
+                Some((p, t)) if p == o => t + dt,
+                _ => dt,
+            })));
+        }
+        for (v, t) in vehicles.iter_mut().zip(&timers) {
+            v.mutual = *t;
+        }
+        for a in 0..vehicles.len() {
+            let Some((oid, t)) = vehicles[a].mutual else { continue };
+            let Some(&b) = by_id.get(&oid) else { continue };
+            if vehicles[a].id > oid || t < MUTUAL_HOLD || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
+                continue;
+            }
+            if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+                continue;
+            }
+            let (Some(ka), Some(kb)) = (claim_of[a], claim_of[b]) else { continue };
+            let (ca, cb) = (&self.claims[ka].0, &self.claims[kb].0);
+            if ca.junction != cb.junction || ca.light_red || cb.light_red || ca.vehicle != a || cb.vehicle != b {
+                continue;
+            }
+            let j = ca.junction;
+            let meet = self.junctions.foes_along_pieces(j, &ca.chain).iter().any(|(_, f)| cb.chain.iter().any(|&(m, _)| m == f.movement));
+            if !meet {
+                continue;
+            }
+            let (ida, idb) = (vehicles[a].id, vehicles[b].id);
+            let blocked_a = vehicles[a].last.body_block == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida);
+            let ease = if blocked_a != blocked_b {
+                if blocked_a {
+                    a
+                } else {
+                    b
+                }
+            } else if eases_off(ida, idb, j) == ida {
+                a
+            } else {
+                b
+            };
+            let other = if ease == a { idb } else { ida };
+            vehicles[ease].ease_for = Some((other, j, 0.0));
+            vehicles[a].mutual = None;
+            vehicles[b].mutual = None;
+        }
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {

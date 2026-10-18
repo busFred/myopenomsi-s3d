@@ -77,6 +77,10 @@ pub struct Claim {
     pub light: Option<(usize, usize)>,
     /// The vehicle's id (a player: `PLAYER_ID_BASE` + its id): who went last at a zipper.
     pub id: u64,
+    /// Eased off for the vehicle with this index (the caller's) after the two held each other
+    /// too long (`Simulation`'s negotiation): it is refused, waiting for that one, and that
+    /// one's windows do not see it. Every other foe of either stays as it is.
+    pub yields_now: Option<usize>,
 }
 
 /// What the resolver reads besides the claims: the light programs' signal groups.
@@ -459,6 +463,11 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         // (held at my red I am held by my light, and no foe matters: the plan stops me at
         // the line, before any meeting place)
+        // (eased off in a mutual hold: it waits for the other, where it stands)
+        if let Some(w) = c.yields_now {
+            out[k] = Some(Grant::refused(c.vehicle, Some(w), Hold::Foe));
+            continue;
+        }
         if c.committed || c.absolute || c.light_red {
             out[k] = Some(Grant::go(c.vehicle));
             continue;
@@ -489,6 +498,11 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
             for &(ok, _, shift) in expanded.iter().filter(|&&(k, m, _)| claims[k].junction == c.junction && m == foe.movement && claims[k].vehicle != c.vehicle) {
+                // (one eased off for me in a mutual hold: not in my way at the junction; its
+                // body still is, to the plan)
+                if claims[ok].yields_now == Some(c.vehicle) {
+                    continue;
+                }
                 // the foe as it stands on this piece of its way
                 let mut shifted = claims[ok].clone();
                 shifted.s -= shift;
@@ -505,7 +519,12 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 if shifted.speed < 0.3 && !their_inside {
                     shifted.committed = false;
                 }
-                if shifted.clearing {
+                // (clearing the box, it is committed to the others; not one standing outside this
+                // meeting place stuck behind a standing lead or people: it is not coming for as
+                // long as that holds, and when it moves off, the rules are the ordinary ones.
+                // Round 4b: a car clearing the box 11 s refused for one clearing too, stuck
+                // behind a third that waited for the first, made a ring of three, viz2 case08)
+                if shifted.clearing && !(shifted.stuck && !their_inside) {
                     shifted.committed = true;
                 }
                 let o = &shifted;
@@ -793,7 +812,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { yields_now: None, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2269,5 +2288,30 @@ mod tests {
             let g = resolve(&js, &net, &[a, b2]);
             assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "{g:?}");
         }
+    }
+
+    #[test]
+    fn x7_a_claim_eased_off_for_another_waits_for_it_and_is_out_of_its_way_only() {
+        // the side road car (1) gives way to the main road car (2) standing at its line; the
+        // main road car eased off for it (a mutual hold negotiated): it is refused, waiting for
+        // the side road car, which goes
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let m0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let s0 = js.nodes[0].movements[side].foes.iter().find(|f| f.movement == main).unwrap().mine.0;
+        let a = claim(1, side, s0 - 1.0 - 2.0, 0.0);
+        let b = claim(2, main, m0 - 1.0 - 2.0, 0.0);
+        let g = resolve(&js, &net, &[a.clone(), b.clone()]);
+        assert!(!grant_of(&g, 1).go && grant_of(&g, 2).go, "by the table: {g:?}");
+        let mut eased = b.clone();
+        eased.yields_now = Some(1);
+        let g = resolve(&js, &net, &[a.clone(), eased.clone()]);
+        assert!(grant_of(&g, 1).go, "the other goes: {g:?}");
+        assert!(!grant_of(&g, 2).go && grant_of(&g, 2).wait_for == Some(1), "the eased one waits for it: {g:?}");
+        // a third car on the main road, coming at 10 m/s 25 m out: the side road car still
+        // gives way to it (only the eased one is out of its way)
+        let c = claim(3, main, m0 - 25.0 - 2.0, 10.0);
+        let g = resolve(&js, &net, &[a, eased, c]);
+        assert!(!grant_of(&g, 1).go && grant_of(&g, 1).wait_for == Some(3), "{g:?}");
     }
 }
