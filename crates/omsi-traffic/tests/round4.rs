@@ -298,3 +298,38 @@ fn rule_e_the_player_standing_at_its_red_does_not_hold_a_green_stream() {
     assert!(!waited, "the green car waited for the player standing at its red");
     assert!(through.is_some_and(|t| t < 10.0), "through the box at {through:?}");
 }
+
+#[test]
+fn rule_d_a_held_car_stops_at_its_line_where_its_way_converges_with_another_lane_first() {
+    // lead-in piece 1 (x -20..0) and a second lead-in 4 starting 2.4 m beside it and running
+    // into its end (no merge to the network: their starts lie under 3 m apart), then piece 2
+    // (x 0..40) crossed at x = 20 by a main road (piece 7, priority 192) carrying a stream
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-20.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(-20.0, 0.0), (0.0, 0.0)], 0, 128.0)); // 1
+    net.lanes.push(piece(&[(0.0, 0.0), (40.0, 0.0)], 1, 128.0)); // 2
+    net.lanes.push(road(&[(40.0, 0.0), (400.0, 0.0)], 2)); // 3
+    net.lanes.push(piece(&[(-20.0, 2.4), (-10.0, 1.6), (0.0, 0.5)], 3, 128.0)); // 4
+    net.lanes.push(road(&[(20.0, -400.0), (20.0, -15.0)], 5)); // 5
+    net.lanes.push(road(&[(20.0, 15.0), (20.0, 600.0)], 6)); // 6
+    net.lanes.push(piece(&[(20.0, -15.0), (20.0, 15.0)], 2, 192.0)); // 7
+    let net = finish(net);
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, lead_in) = js.movement(1).unwrap();
+    assert!(lead_in.foes.iter().all(|f| js.nodes[0].movements[f.movement].lane != 4), "no foe between the two lead-ins: {:?}", lead_in.foes);
+    assert!(!lead_in.converge.is_empty(), "the convergence is known");
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 230.0, 10.0)];
+    for k in 0..8u64 {
+        cars.push(car(10 + k, 5, 330.0 - 30.0 * k as f32, 12.0));
+    }
+    let mut stood_at: Option<f32> = None;
+    run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if me.state.speed < 0.1 && me.last.why == Why::Junction && stood_at.is_none() {
+            stood_at = Some(front_x(me));
+        }
+    });
+    let at = stood_at.expect("the car never stood for the main road");
+    assert!(at <= -19.5, "stood with its front at x = {at:.1}, past the line into the converging lead-ins");
+}

@@ -62,6 +62,14 @@ pub struct Movement {
     /// The near end of the first conflict (m): before it the car is inside the junction
     /// but in nobody's way yet.
     pub conflict_start: f32,
+    /// Stretches of this lane (from, to; m from its start) where its centre line comes within
+    /// `MEET_DIST` of another way of the object that is no foe of it (no meeting place is
+    /// compiled between the two: lanes converging whose starts lie under 3 m apart are no
+    /// merge to `compute_conflicts`). A car held at the junction is not stopped in or past one
+    /// short of the stretch it waits for (`plan`). (Pieces of one way, and forks from one
+    /// point, are left out.)
+    #[serde(default)]
+    pub converge: Vec<(f32, f32)>,
 }
 
 /// Where a pedestrian crossing cuts a way through the junction.
@@ -240,7 +248,7 @@ impl Junctions {
                     }
                     frontier = nxt;
                 }
-                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY }
+                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY, converge: Vec::new() }
             })
             .collect();
         // foes from the network's crossings, both ways
@@ -269,6 +277,10 @@ impl Junctions {
             movements[mi].foes = foes;
             movements[mi].conflict_start = start;
             movements[mi].conflict_end = end;
+        }
+        let converge = Self::converging(net, lanes);
+        for (m, c) in movements.iter_mut().zip(converge) {
+            m.converge = c;
         }
         let crossings = Self::crossings(net, &movements);
         Junction { key, movements, crossings }
@@ -324,6 +336,69 @@ impl Junctions {
     /// gives way to the other): they take turns (`reservation`'s zipper).
     pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
         foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
+    }
+
+    /// Per lane of the object (in `lanes`' order): the stretches where its centre line comes
+    /// within `MEET_DIST` of another street lane of the object with no meeting place compiled
+    /// between them (`Movement::converge`; `traffic_cases converge` lists them).
+    fn converging(net: &Network, lanes: &[usize]) -> Vec<Vec<(f32, f32)>> {
+        let near = omsi_sim::traffic::MEET_DIST;
+        let street: Vec<usize> = lanes.iter().copied().filter(|&l| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2).collect();
+        let bbox = |l: usize| {
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for p in &net.lanes[l].points {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            (x0 - near, y0 - near, x1 + near, y1 + near)
+        };
+        let boxes: Vec<(f64, f64, f64, f64)> = street.iter().map(|&l| bbox(l)).collect();
+        let leads = |from: usize, to: usize| -> bool {
+            let mut at = vec![from];
+            for _ in 0..3 {
+                at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+                if at.contains(&to) {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut out: Vec<Vec<(f32, f32)>> = vec![Vec::new(); lanes.len()];
+        for (x, &a) in street.iter().enumerate() {
+            let la = &net.lanes[a];
+            for (y, &b) in street.iter().enumerate() {
+                if x == y {
+                    continue;
+                }
+                let (ba, bb) = (boxes[x], boxes[y]);
+                if ba.2 < bb.0 || bb.2 < ba.0 || ba.3 < bb.1 || bb.3 < ba.1 {
+                    continue;
+                }
+                let lb = &net.lanes[b];
+                if la.key.map(|k| k.path) == lb.key.map(|k| k.path) || net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b)) {
+                    continue;
+                }
+                if (la.start() - lb.start()).truncate().length() <= 0.5 || leads(a, b) || leads(b, a) {
+                    continue;
+                }
+                let (mut s0, mut s1) = (f32::INFINITY, f32::NEG_INFINITY);
+                let mut s = 0.0f32;
+                while s <= la.length() {
+                    if lb.nearest_point(la.at(s).0).is_some_and(|(_, d)| d < near) {
+                        s0 = s0.min(s);
+                        s1 = s1.max(s);
+                    }
+                    s += 0.5;
+                }
+                if s0.is_finite() {
+                    let k = lanes.iter().position(|&l| l == a).unwrap();
+                    out[k].push((s0, s1));
+                }
+            }
+        }
+        out
     }
 
     /// The pedestrian crossings of the object: every footpath lane that cuts a way through

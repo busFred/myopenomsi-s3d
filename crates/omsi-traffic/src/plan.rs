@@ -215,6 +215,7 @@ fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, w
             bands.push((point - 2.5, point + 2.0));
         }
     }
+    bands.extend(converge_bands(sim, j));
     let mut stop = j.entry + waited - 1.0;
     for _ in 0..32 {
         let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len).map(|b| b.0).fold(f32::INFINITY, f32::min);
@@ -224,6 +225,13 @@ fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, w
         stop = hit;
     }
     stop
+}
+
+/// The stretches of the way through where it converges with a lane of the junction that is no
+/// foe (`Movement::converge`), as (from a metre before, to) distances from the origin.
+fn converge_bands(sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
+    let node = &sim.junctions.nodes[j.junction];
+    j.chain.iter().flat_map(|&(m, off)| node.movements[m].converge.iter().map(move |&(a, b)| (j.entry + off + a - 1.0, j.entry + off + b))).collect()
 }
 
 /// Decide for vehicle `i`.
@@ -270,11 +278,19 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // first meeting place of its way (viz3 case03: a car waiting for a stretch 22 m
             // on stood 2.8 m in, on the fork shared with the turn pockets, and blocked the
             // turners behind it)
+            // (not where its way converges with another lane short of that stretch, that the
+            // junction knows no foe on: there it stops at the line, or short of the first
+            // meeting place, as before; review9: refused cars stood beside, and rolled into, the
+            // very car they waited for, on 5229/5231, 1430/1179, 10814/10625)
             let at = match (g.hold, g.at) {
                 (Some(Hold::Foe), Some(waited)) => {
                     let at = hold_point(net, sim, me, j, waited);
-                    if at < first && first > st.front - 0.3 {
+                    let converges = converge_bands(sim, j).iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear);
+                    if (at < first || converges) && first > st.front - 0.3 {
                         first
+                    } else if converges {
+                        // (past the line already: as soon as it can stop gently)
+                        at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
                     } else {
                         at
                     }

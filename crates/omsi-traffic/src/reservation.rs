@@ -476,7 +476,9 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
             // committed to the stretches it is in, not to the later ones: `Claim::committed`)
             // (a crossing: two lanes running into one another negotiate who is first at the end
             // of their merge, however long the stretch where they converge)
-            let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 - 0.5 && c.s - c.rear <= foe.mine.1;
+            // (in it as a foe sees one in it, `their_inside`: a front half a metre short of it
+            // counted as in, the foe saw it out, and both went; review9)
+            let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
@@ -2194,6 +2196,19 @@ mod tests {
             let wa = window(&claims[0], f0[0].mine.0, f0[0].mine.1);
             let wb = window(&claims[1], f1[0].mine.0, f1[0].mine.1);
             panic!("foes A {f0:?}\nfoes B {f1:?}\nA s {} B s {}\nwin A {wa:?} B {wb:?}\nplain {plain:?}\nfinal {g:?}", claims[0].s, claims[1].s);
+        }
+        #[test]
+        fn review9_d_standing_half_a_metre_short_of_a_crossing_counts_as_in_it() {
+            // (pre-existing in another form: at the baseline the same car was `committed`.) A side
+            // road car stands, uncommitted, its front 0.4 m short of the main road's meeting place
+            // (stopped by its lead, say); the main road car comes at 10 m/s 20 m out and sees it
+            // outside the meeting place and not committed.
+            let (net, js, mut c) = side_and_main(0.4, 0.0, 20.0, 10.0);
+            c[0].light = None;
+            c[1].light = None;
+            let g = resolve(&js, &net, &c);
+            let both = grant_of(&g, 1).go && grant_of(&g, 2).go;
+            assert!(!both, "both go: {g:?}");
         }
     }
 }
