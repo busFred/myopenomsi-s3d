@@ -261,6 +261,24 @@ pub const PARK_ROOM: f32 = 4.0;
 /// [ROLLBACK r4d-B2] A bus taken off the road as the last resort comes back this long (s)
 /// before its departure.
 pub const RESPAWN_LEAD: f64 = 60.0;
+/// [ROLLBACK r4d-B2] Placing a bus taken off the road back on it is tried again this often (s)
+/// until `RESPAWN_GIVE_UP` after its departure, when the trip is given up; and the tour's bus
+/// is not taken off the road again within `RESPAWN_COOLDOWN` of the last time (s).
+pub const RESPAWN_RETRY: f64 = 3.0;
+pub const RESPAWN_GIVE_UP: f64 = 120.0;
+pub const RESPAWN_COOLDOWN: f64 = 300.0;
+
+/// [ROLLBACK r4d-B2] A timetable bus taken off the road as the last resort: its trip comes back
+/// at stop `stop` at time `at`, for its departure `depart` from there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Respawned {
+    pub car: u64,
+    /// When it was taken off (seconds of the day).
+    pub removed: f64,
+    pub at: f64,
+    pub depart: f64,
+    pub stop: i64,
+}
 
 /// [ROLLBACK r4d-B2] Seconds a detour of `len` metres takes.
 fn detour_time(len: f32) -> f64 {

@@ -403,6 +403,8 @@ pub struct Schedule {
     retry_at: HashMap<usize, f64>,
     /// [ROLLBACK r4d-B1] Where the trips of buses taken off the road at a dead end go on.
     resumes: Resumes,
+    /// [ROLLBACK r4d-B2] Why the last placement failed (for a bus taken off the road).
+    fail_reason: Option<&'static str>,
     /// Vehicle sets being read ahead on the workers, with the type to upload them with, and
     /// those read and waiting for their upload.
     fleet_reading: HashMap<crate::scene::VehicleKey, Arc<VehicleType>>,
@@ -744,6 +746,7 @@ impl Schedule {
             car_departure: HashMap::new(),
             retry_at: HashMap::new(),
             resumes: Resumes::default(),
+            fail_reason: None,
             fleet_reading: HashMap::new(),
             fleet_ready: Default::default(),
             fleet_check: f64::NEG_INFINITY,
@@ -2069,11 +2072,13 @@ impl Schedule {
         }
         // [ROLLBACK r4d-B2] buses taken off the road as the last resort come back on their
         // timetable for their departure
-        for (id, at) in std::mem::take(&mut traffic.respawned) {
-            self.running.retain(|r| r.car != id);
+        for r in std::mem::take(&mut traffic.respawned) {
+            let id = r.car;
+            self.running.retain(|x| x.car != id);
             let dep = self.car_departure.remove(&id);
-            if let Some(i) = self.resumes.respawned(id, dep, at) {
-                self.retry_at.insert(i, at);
+            let tour = dep.map(|i| self.tour_key(i));
+            if let Some(i) = self.resumes.respawned(id, dep, r, tour) {
+                self.retry_at.insert(i, r.at);
                 self.waiting.push(i);
             }
         }
@@ -2131,7 +2136,34 @@ impl Schedule {
                 break;
             };
             tried += 1;
-            match self.spawn_departure(i, world, traffic, renderer, scene, day_time, None) {
+            self.fail_reason = None;
+            let placed = self.spawn_departure(i, world, traffic, renderer, scene, day_time, None);
+            // [ROLLBACK r4d-B2] a bus taken off the road as the last resort comes back however
+            // its placement fails, every few seconds until well past its departure
+            let before_its_time = self.resumes.respawn.get(&i).is_some_and(|r| day_time < r.at);
+            if !matches!(placed, Placed::Spawned) && !before_its_time {
+                let reason = self.fail_reason.take().unwrap_or("other");
+                match self.resumes.respawn_failed(i, reason, day_time) {
+                    Some(RespawnNext::Retry(t, new)) => {
+                        if new {
+                            log::info!("timetable: departure {i} (line {} tour {}), its bus taken off the road, not back yet: {reason}; again every {:.0} s", self.departures[i].line, self.departures[i].tour, crate::bus_service::RESPAWN_RETRY);
+                        }
+                        self.retry_at.insert(i, t);
+                        if !self.waiting.contains(&i) {
+                            self.waiting.push(i);
+                        }
+                        continue;
+                    }
+                    Some(RespawnNext::GiveUp) => {
+                        log::info!("timetable: departure {i} (line {} tour {}), its bus taken off the road, could not be put back by {:.0} s after its departure: given up", self.departures[i].line, self.departures[i].tour, crate::bus_service::RESPAWN_GIVE_UP);
+                        self.waiting.retain(|&x| x != i);
+                        self.retry_at.remove(&i);
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            match placed {
                 Placed::Spawned => spawned += 1,
                 Placed::Wait => self.waiting.push(i),
                 Placed::Busy => {
@@ -2343,6 +2375,7 @@ impl Schedule {
         // [ROLLBACK r4d-B1] a trip whose bus drove off a dead end goes on past it: from the
         // step after the dead end, once its timetable has the bus there
         let resume = if onto.is_none() { self.resumes.resume_from.get(&i).copied() } else { None };
+        let respawn_stop = if onto.is_none() { self.resumes.respawn_stop(i) } else { None };
         match self.resumes.decide(i, &slots, at, onto.is_some(), day_time) {
             ResumeAt::Until(t) => {
                 self.retry_at.insert(i, t);
@@ -2361,6 +2394,7 @@ impl Schedule {
             ResumeAt::Go => {}
         }
         if slots[at] == Slot::Waiting {
+            self.fail_reason = Some("tile unloaded");
             // when it reaches the next loaded step, at the pace of its leg
             let in_leg = |k: usize| track || steps[k].leg == leg;
             let leg_len: f64 = (0..steps.len())
@@ -2553,7 +2587,10 @@ impl Schedule {
             }
             let id = car.id;
             self.car_departure.insert(id, i);
-            self.resumes.placed(id, i, end_step);
+            let back = self.resumes.placed(id, i, end_step);
+            if let Some(t) = self.resumes.respawn_block(self.tour_key(i), day_time, back) {
+                traffic.respawn_block.insert(id, t);
+            }
             self.running.retain(|r| r.car != id);
             if open {
                 self.running.push(RunningTrip {
@@ -2643,11 +2680,18 @@ impl Schedule {
                 s = (ss - 0.5).max(0.0);
             }
         }
+        // [ROLLBACK r4d-B2] a bus taken off the road as the last resort comes back at the stop
+        // it was taken from (not at the start of its trip, 128 m before it)
+        if let Some((ri, ss)) = respawn_stop.and_then(|id| respawn_start(&stops, id)) {
+            start_index = ri;
+            s = ss;
+        }
         let at_pos = traffic.net.lanes[section[start_index]].at(s).0;
         // lanes stay in the network when their tile is unloaded: nothing is put on ground
         // that is not there (the departure waits for its tile)
         if !track_is_air(traffic, section[start_index]) && !world.has_ground(at_pos.x, at_pos.y) {
             log::debug!("trip {trip_name}: the bus would stand on an unloaded tile");
+            self.fail_reason = Some("tile unloaded");
             return Placed::Wait;
         }
         // not into a vehicle that happens to be there (the player's bus at its stop, a car),
@@ -2656,6 +2700,7 @@ impl Schedule {
         if traffic.blocked(&ty, at_pos, at_heading) || !traffic.spawn_clear(&ty, at_pos, at_heading)
         {
             log::debug!("trip {trip_name}: a vehicle stands where the bus would appear");
+            self.fail_reason = Some("no free lane");
             return Placed::Busy;
         }
         // A bus on its layover waits at the stand only when no other bus stands there or
@@ -2663,6 +2708,7 @@ impl Schedule {
         // had five buses queueing in the road for a quarter of an hour, and every bus
         // serving the stop and every car behind them waiting as well.)
         if departure > day_time + 30.0
+            && respawn_stop.is_none()
             && traffic
             .cars
             .iter()
@@ -2681,6 +2727,7 @@ impl Schedule {
         // of that moment that had to wait popped up in plain view minutes later)
         if !(self.startup.contains(&i) && traffic.loading_phase()) && !traffic.may_appear(world, at_pos) {
             log::debug!("trip {trip_name}: the bus would appear in view");
+            self.fail_reason = Some("too close to the player");
             return Placed::Busy;
         }
         self.startup.remove(&i);
@@ -2752,7 +2799,13 @@ impl Schedule {
         }
         set_ai_destination(&mut car.vehicle, hof.as_deref(), &line, &terminus, &names);
         log::info!("scheduled bus: line {line} tour {tour} trip {trip_name} {} #{:?} at {:.1} min, {} stops, at ({:.1}, {:.1}) heading {:.0}{}", ty.def.type_name, number.as_ref().map(|n| format!("{} plate {:?} paint {:?}", n.0, n.1, scheme.and_then(|i| ty.paint_schemes.get(i)).map(|p| p.name.as_str()))), day_time / 60.0, car.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), car.vehicle.position.x, car.vehicle.position.y, car.vehicle.heading, if end < slots.len() { format!(", route {} of {} steps so far", end - start, steps.len()) } else { String::new() });
-        self.resumes.placed(car.id, i, end_step);
+        let back = self.resumes.placed(car.id, i, end_step);
+        if back {
+            log::info!("timetable: departure {i} (line {} tour {}): its bus is back as {} at its stop, {:.0} s before its departure", self.departures[i].line, self.departures[i].tour, car.id, departure - day_time);
+        }
+        if let Some(t) = self.resumes.respawn_block(self.tour_key(i), day_time, back) {
+            traffic.respawn_block.insert(car.id, t);
+        }
         if open {
             self.running.push(RunningTrip {
                 car: car.id,
@@ -2863,9 +2916,32 @@ struct Resumes {
     /// comes back there when its timetable has it there, not before.
     resume_from: HashMap<usize, usize>,
     /// [ROLLBACK r4d-B2] Departures whose bus was taken off the road as the last resort (it
-    /// blocked a through lane and could go nowhere): not put on the road again before this
-    /// time of day.
-    held: HashMap<usize, f64>,
+    /// blocked a through lane and could go nowhere): put back at their stop from the time
+    /// given on, tried again every `RESPAWN_RETRY` s until `RESPAWN_GIVE_UP` after the
+    /// departure.
+    respawn: HashMap<usize, Respawn>,
+    /// [ROLLBACK r4d-B2] When each tour (`Schedule::tour_key`) last had its bus taken off.
+    tour_respawned: HashMap<u64, f64>,
+}
+
+/// [ROLLBACK r4d-B2] A departure whose bus was taken off the road as the last resort.
+#[derive(Debug, Clone, PartialEq)]
+struct Respawn {
+    /// Back at this stop (its map object), from this time of day, for this departure from it.
+    stop: i64,
+    at: f64,
+    depart: f64,
+    /// The reasons a placement failed that were logged already.
+    told: Vec<&'static str>,
+}
+
+/// [ROLLBACK r4d-B2] What becomes of a respawned departure whose placement failed.
+#[derive(Debug, PartialEq)]
+enum RespawnNext {
+    /// Again at this time; the reason is new (log it).
+    Retry(f64, bool),
+    /// Past its departure by `RESPAWN_GIVE_UP`: the trip is given up.
+    GiveUp,
 }
 
 /// What becomes of a departure put on the road again (`Resumes::decide`).
@@ -2883,9 +2959,11 @@ enum ResumeAt {
 
 impl Resumes {
     /// Bus `car` was put on the road for departure `dep`, its route up to step `end_step`.
-    fn placed(&mut self, car: u64, dep: usize, end_step: usize) {
+    /// Whether it was a departure whose bus had been taken off the road (`respawned`).
+    fn placed(&mut self, car: u64, dep: usize, end_step: usize) -> bool {
         self.route_end_step.insert(car, end_step);
         self.resume_from.remove(&dep);
+        self.respawn.remove(&dep).is_some()
     }
 
     /// Bus `car` (of departure `dep`, if it had one) drove off a dead end: the departure and
@@ -2899,21 +2977,53 @@ impl Resumes {
 
     /// [ROLLBACK r4d-B2] Bus `car` (of departure `dep`, if it had one) was taken off the road
     /// as the last resort: its trip comes back at `at`.
-    fn respawned(&mut self, car: u64, dep: Option<usize>, at: f64) -> Option<usize> {
+    fn respawned(&mut self, car: u64, dep: Option<usize>, r: crate::bus_service::Respawned, tour: Option<u64>) -> Option<usize> {
         self.route_end_step.remove(&car);
         let i = dep?;
-        self.held.insert(i, at);
+        self.respawn.insert(i, Respawn { stop: r.stop, at: r.at, depart: r.depart, told: Vec::new() });
+        if let Some(t) = tour {
+            self.tour_respawned.insert(t, r.removed);
+        }
         Some(i)
+    }
+
+    /// [ROLLBACK r4d-B2] The stop respawned departure `i` comes back at, if it is one.
+    fn respawn_stop(&self, i: usize) -> Option<i64> {
+        self.respawn.get(&i).map(|r| r.stop)
+    }
+
+    /// [ROLLBACK r4d-B2] Placing respawned departure `i` failed at `day_time` for `reason`.
+    fn respawn_failed(&mut self, i: usize, reason: &'static str, day_time: f64) -> Option<RespawnNext> {
+        let r = self.respawn.get_mut(&i)?;
+        if day_time > r.depart + crate::bus_service::RESPAWN_GIVE_UP {
+            self.respawn.remove(&i);
+            return Some(RespawnNext::GiveUp);
+        }
+        let new = !r.told.contains(&reason);
+        if new {
+            r.told.push(reason);
+        }
+        Some(RespawnNext::Retry(day_time + crate::bus_service::RESPAWN_RETRY, new))
+    }
+
+    /// [ROLLBACK r4d-B2] Until when a bus of tour `tour` placed at `day_time` (put back after
+    /// being taken off: `back`) may not be taken off the road again: `RESPAWN_COOLDOWN` after
+    /// it is back, or after the tour's last time.
+    fn respawn_block(&self, tour: u64, day_time: f64, back: bool) -> Option<f64> {
+        if back {
+            return Some(day_time + crate::bus_service::RESPAWN_COOLDOWN);
+        }
+        let t = self.tour_respawned.get(&tour)? + crate::bus_service::RESPAWN_COOLDOWN;
+        (day_time < t).then_some(t)
     }
 
     /// Departure `i` is to be placed at `day_time`, its timetable having the bus at step `at`
     /// of `slots`.
     fn decide(&mut self, i: usize, slots: &[Slot], at: usize, onto: bool, day_time: f64) -> ResumeAt {
-        if let Some(&t) = self.held.get(&i) {
-            if day_time < t && !onto {
-                return ResumeAt::Until(t);
+        if let Some(r) = self.respawn.get(&i) {
+            if day_time < r.at && !onto {
+                return ResumeAt::Until(r.at);
             }
-            self.held.remove(&i);
         }
         let Some(&r) = self.resume_from.get(&i).filter(|_| !onto) else { return ResumeAt::Go };
         if !slots.iter().skip(r).any(|s| *s != Slot::Absent) {
@@ -2926,6 +3036,13 @@ impl Resumes {
             ResumeAt::Go
         }
     }
+}
+
+/// [ROLLBACK r4d-B2] Where a bus taken off the road at stop `id` is put back: half a metre
+/// short of that stop's point (as a bus that would start a few metres short of its stop),
+/// on the route lane `stops` has it on.
+fn respawn_start(stops: &[(usize, f32, f32, f64, i64, f32)], id: i64) -> Option<(usize, f32)> {
+    stops.iter().find(|st| st.4 == id).map(|st| (st.0, (st.1 - 0.5).max(0.0)))
 }
 
 /// [ROLLBACK r4d-B1] When a bus at step `at.0` (`at.1` metres into it) on leg `leg` (from
@@ -5344,12 +5461,42 @@ pub(crate) mod tests {
         let slots = vec![Slot::Lane(0); 6];
         let mut r = Resumes::default();
         r.placed(21, 7, 6);
-        assert_eq!(r.respawned(21, Some(7), 1000.0), Some(7));
-        assert_eq!(r.decide(7, &slots, 0, false, 900.0), ResumeAt::Until(1000.0));
+        // taken off at 900 at stop 42, back from 1000 (its departure 1060 less 60 s)
+        let gone = crate::bus_service::Respawned { car: 21, removed: 900.0, at: 1000.0, depart: 1060.0, stop: 42 };
+        assert_eq!(r.respawned(21, Some(7), gone, Some(5)), Some(7));
+        assert_eq!(r.respawn_stop(7), Some(42));
+        assert_eq!(r.decide(7, &slots, 0, false, 950.0), ResumeAt::Until(1000.0));
         assert_eq!(r.decide(7, &slots, 0, false, 1000.0), ResumeAt::Go);
-        assert_eq!(r.decide(7, &slots, 0, false, 900.0), ResumeAt::Go, "once");
         // nor is it a dead end
         assert_eq!(r.dead_ended(21, Some(7)), None);
+        // (2) placing it fails: each reason told once, tried again every 3 s, given up 120 s
+        // after the departure
+        assert_eq!(r.respawn_failed(7, "no free lane", 1000.0), Some(RespawnNext::Retry(1003.0, true)));
+        assert_eq!(r.respawn_failed(7, "no free lane", 1003.0), Some(RespawnNext::Retry(1006.0, false)));
+        assert_eq!(r.respawn_failed(7, "too close to the player", 1006.0), Some(RespawnNext::Retry(1009.0, true)));
+        assert_eq!(r.respawn_failed(7, "no free lane", 1180.0), Some(RespawnNext::Retry(1183.0, false)));
+        assert_eq!(r.respawn_failed(7, "no free lane", 1181.0), Some(RespawnNext::GiveUp));
+        assert_eq!(r.respawn_stop(7), None, "given up");
+        assert_eq!(r.respawn_failed(7, "other", 1182.0), None);
+        // put back in time: no longer a respawn, and (3) not taken off again for 300 s
+        let mut r = Resumes::default();
+        r.respawned(21, Some(7), gone, Some(5));
+        assert!(r.placed(22, 7, 6), "back");
+        assert!(!r.placed(23, 8, 6), "an ordinary departure");
+        assert_eq!(r.respawn_block(5, 1000.0, true), Some(1300.0));
+        // another bus of the tour within 300 s of the removal (900): not before 1200
+        assert_eq!(r.respawn_block(5, 1100.0, false), Some(1200.0));
+        assert_eq!(r.respawn_block(5, 1250.0, false), None);
+        assert_eq!(r.respawn_block(6, 1100.0, false), None, "another tour");
+    }
+
+    /// [ROLLBACK r4d-B2] (1) A bus taken off at its stop comes back at it, half a metre short
+    /// of its point, not at the start of its trip.
+    #[test]
+    fn a_bus_taken_off_comes_back_at_its_stop() {
+        let stops = vec![(0usize, 40.0f32, 0.0f32, 100.0f64, 41i64, 0.0f32), (2, 28.0, 0.0, 200.0, 42, 0.0), (5, 10.0, 0.0, 300.0, 43, 0.0)];
+        assert_eq!(respawn_start(&stops, 42), Some((2, 27.5)));
+        assert_eq!(respawn_start(&stops, 44), None);
     }
 
     #[test]

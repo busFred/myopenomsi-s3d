@@ -582,7 +582,10 @@ pub struct Traffic {
     /// buses' layovers), and the timetable buses taken off the road as a last resort, with
     /// the time of day their trip is to be put on the road again.
     pub through: crate::bus_service::ThroughLanes,
-    pub respawned: Vec<(u64, f64)>,
+    pub respawned: Vec<crate::bus_service::Respawned>,
+    /// [ROLLBACK r4d-B2] Timetable buses not to be taken off the road as the last resort
+    /// before this time of day (the tour's bus was, a moment ago: `RESPAWN_COOLDOWN`).
+    pub respawn_block: HashMap<u64, f64>,
     /// One-way lanes that have had their reverse twin added (`add_reverse_twins`).
     twinned: hashbrown::HashSet<usize>,
     /// Bodies besides the AI vehicles' that no timetable vehicle may be put into: the
@@ -1173,6 +1176,7 @@ impl Traffic {
             riders_out: Vec::new(),
             through: Default::default(),
             respawned: Vec::new(),
+            respawn_block: HashMap::new(),
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
@@ -3104,7 +3108,7 @@ impl Traffic {
     /// way: when nobody sees it, the time of day its trip comes back on the road (its
     /// departure from the stop it waits for, less `bus_service::RESPAWN_LEAD`, at least half
     /// a minute on).
-    fn respawn_at(&self, i: usize) -> Option<f64> {
+    fn respawn_at(&self, i: usize) -> Option<crate::bus_service::Respawned> {
         let c = &self.cars[i];
         let b = c.bus.as_ref()?;
         let p = c.vehicle.position;
@@ -3112,10 +3116,16 @@ impl Traffic {
         if self.viewer.is_some_and(|v| (p - v.pos).length() < 80.0 || v.frames(p, r)) {
             return None;
         }
-        let depart = if b.at_stop() { b.leave_at } else { b.stops.front()?.depart };
+        // (not again for a while: the tour's bus put back for its departure was taken off
+        // again 36 s later at its next layover)
+        if self.respawn_block.get(&c.id).is_some_and(|&t| self.day_time < t) {
+            return None;
+        }
+        let stop = b.stops.front()?;
+        let depart = if b.at_stop() { b.leave_at.max(stop.depart) } else { stop.depart };
         let at = (depart - crate::bus_service::RESPAWN_LEAD).max(self.day_time + 30.0);
-        log::info!("t={:.1}: timetable bus {} taken off the road: no loop or room within range, {} queued behind it; its trip comes back at {:.1} min", self.day_time, c.id, self.queued_behind(i), at / 60.0);
-        Some(at)
+        log::info!("t={:.1}: timetable bus {} taken off the road: no loop or room within range, {} queued behind it; its trip comes back at its stop {} at {:.1} min (departure {:.1} min)", self.day_time, c.id, self.queued_behind(i), stop.id, at / 60.0, depart / 60.0);
+        Some(crate::bus_service::Respawned { car: c.id, removed: self.day_time, at, depart, stop: stop.id })
     }
 
     /// [ROLLBACK r4d-B2] Where on lane `l` timetable bus `me`, `len` metres long and
@@ -3250,9 +3260,9 @@ impl Traffic {
             // resort, out of anybody's sight - off the road, and back on its timetable for
             // its departure (as a bus off a dead end)
             if matches!(detour, Some(None)) {
-                if let Some(at) = self.respawn_at(i) {
+                if let Some(r) = self.respawn_at(i) {
                     respawn.push(i);
-                    self.respawned.push((self.cars[i].id, at));
+                    self.respawned.push(r);
                     detour = None;
                 }
             }
@@ -3509,7 +3519,7 @@ impl Traffic {
                 self.riders_out.push(c.id);
             }
             // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
-            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone && !self.respawned.iter().any(|r| r.0 == c.id) {
+            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone && !self.respawned.iter().any(|r| r.car == c.id) {
                 if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
                     log::info!("scheduled bus {}: off the dead end of lane {} at ({:.0}, {:.0})", c.id, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y);
                 }
