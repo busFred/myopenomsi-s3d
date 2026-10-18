@@ -4,8 +4,13 @@
 //! outlines), with the recorded vehicles and people replayed over them.
 //!
 //! ```text
-//! omsi-roadmask <window.rec> <out.html> [--root <omsi root>] [--center x,y] [--radius N] [--fps N] [--date YYYYMMDD] [--title T]
+//! omsi-roadmask [<recording.rec>] [<out.html>] [--list] [--at HH:MM] [--no-open] [--root <omsi root>] [--center x,y] [--radius N] [--fps N] [--date YYYYMMDD] [--title T]
 //! ```
+//!
+//! From a terminal without arguments: a file dialog (or `--list`, a numbered list) picks
+//! the recording under `~/.openomsi/traffic`, the page goes to
+//! `~/.openomsi/traffic/mask/<stem>-roadmask.html` and opens in the browser; a recording
+//! longer than three minutes is cut to a 90 s window round `--at` (asked for) first.
 //!
 //! The OMSI root is `--root`, else `OMSI_ROOT`, else the launcher's `root`
 //! (`~/.openomsi/launcher.json`); the game's `settings.cfg` is read and reported, never
@@ -15,6 +20,7 @@
 
 mod mapdata;
 mod profile;
+mod recording;
 
 use glam::DVec3;
 use omsi_sim::traffic::{arc_point, LaneKind};
@@ -33,15 +39,53 @@ const MARGIN: f64 = 30.0;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+const HELP: &str = "omsi-roadmask: the road and pavement boundaries of a recorded traffic window as one HTML page -
+the lanes' footprints as the simulation has them, and the map's visual kerb and road edges (from the
+splines' .sli cross-sections and the crossing objects' meshes), with the recording replayed over them.
+
+usage: omsi-roadmask [<recording.rec>] [<out.html>] [options]
+
+  <recording.rec>   a traffic recording (a `traffic_cases cut` window, or a session recording).
+                    None given: a file dialog opens in ~/.openomsi/traffic (or see --list).
+  <out.html>        the page; default ~/.openomsi/traffic/mask/<recording stem>-roadmask.html
+
+options:
+  --list            list the recordings in ~/.openomsi/traffic (newest first) and read a number
+  --at HH:MM        a recording longer than 3 minutes is cut to 90 s round this time first
+                    (asked for when not given; the cut .rec goes beside the page)
+  --no-open         do not open the page in the browser afterwards
+  --root <folder>   the OMSI 2 folder (else OMSI_ROOT, else the launcher's launcher.json)
+  --center x,y      the window's centre (world m; default: where the player was at its middle)
+  --radius N        metres round the centre (100)
+  --fps N           frames per second sampled (5)
+  --date YYYYMMDD   apply the map's chrono folders active on that day (none without it)
+  --title T         the page's title
+  -h, --help        this text
+
+Nothing under ~/.openomsi but the page (and the cut) is written. Keys on the page: space play/pause,
+arrows step, M layers (lanes / visual edges / both), H height ramp.
+";
+
+/// Options that take no value.
+const FLAGS: &[&str] = &["--list", "--no-open", "--help", "-h"];
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{HELP}");
+        return;
+    }
     let positional: Vec<&String> = {
         let mut out = Vec::new();
         let mut i = 0;
         while i < args.len() {
+            if FLAGS.contains(&args[i].as_str()) {
+                i += 1;
+                continue;
+            }
             if args[i].starts_with("--") {
                 i += 2;
                 continue;
@@ -51,14 +95,153 @@ fn main() {
         }
         out
     };
-    if positional.len() != 2 {
-        eprintln!("usage: omsi-roadmask <window.rec> <out.html> [--root <omsi root>] [--center x,y] [--radius N] [--fps N] [--date YYYYMMDD] [--title T]");
+    if positional.len() > 2 {
+        eprint!("{HELP}");
         std::process::exit(2);
     }
-    if let Err(e) = run(Path::new(positional[0]), Path::new(positional[1]), &args) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    let code = match prepare(&positional, &args)
+        .and_then(|(rec, out)| run(&rec, &out, &args).map(|_| out))
+    {
+        Ok(out) => {
+            if !args.iter().any(|a| a == "--no-open") {
+                match recording::open_in_browser(&out) {
+                    Ok(()) => println!("opened in the browser (--no-open leaves it)"),
+                    Err(e) => println!("could not open the browser ({e}): open {}", out.display()),
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// The recording to render and the page to write: the arguments, else the dialog or the
+/// list; a long recording cut to a window first.
+fn prepare(
+    positional: &[&String],
+    args: &[String],
+) -> Res<(std::path::PathBuf, std::path::PathBuf)> {
+    let traffic_dir = mapdata::data_dir().join("traffic");
+    let rec = match positional.first() {
+        Some(p) => std::path::PathBuf::from(p),
+        None if args.iter().any(|a| a == "--list") => {
+            let list = recording::list_recordings(&traffic_dir);
+            if list.is_empty() {
+                return Err(format!("no .rec files under {}", traffic_dir.display()).into());
+            }
+            println!("recordings in {} (newest first):", traffic_dir.display());
+            for (i, (p, _, size)) in list.iter().enumerate() {
+                let name = p.strip_prefix(&traffic_dir).unwrap_or(p).display();
+                match recording::header_info(p) {
+                    Ok(h) => println!(
+                        "{:>3}  {:>8.1} MB  {:<14} {:>6} lanes  started {}{}  {}",
+                        i + 1,
+                        *size as f64 / 1e6,
+                        h.map,
+                        h.lanes,
+                        hms(h.started),
+                        h.trigger
+                            .as_deref()
+                            .map(|t| format!(" ({t})"))
+                            .unwrap_or_default(),
+                        name
+                    ),
+                    Err(e) => println!(
+                        "{:>3}  {:>8.1} MB  (unreadable: {e})  {}",
+                        i + 1,
+                        *size as f64 / 1e6,
+                        name
+                    ),
+                }
+            }
+            let n: usize = ask(&format!("number (1-{}): ", list.len()))?
+                .trim()
+                .parse()?;
+            list.get(n.wrapping_sub(1))
+                .map(|x| x.0.clone())
+                .ok_or("no such number")?
+        }
+        None => {
+            println!("choose a recording (a file dialog; --list for a numbered list instead)");
+            recording::pick_recording(&traffic_dir).ok_or("no recording chosen")?
+        }
+    };
+    if !rec.is_file() {
+        return Err(format!("{} is not a file", rec.display()).into());
     }
+    let stem = rec
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("window")
+        .to_string();
+    let out = match positional.get(1) {
+        Some(o) => std::path::PathBuf::from(o),
+        None => traffic_dir
+            .join("mask")
+            .join(format!("{stem}-roadmask.html")),
+    };
+    if let Some(dir) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    // a long recording: a 90 s window round the time asked for
+    let (first, last, long) = recording::frame_span(&rec, recording::LONG_SECS)?;
+    if !long {
+        return Ok((rec, out));
+    }
+    let at = match opt(args, "--at") {
+        Some(t) => recording::parse_hhmm(t)?,
+        None => {
+            println!(
+                "{} runs from {} (game time) past {}, more than {} minutes: a 90 s window is cut first",
+                rec.display(),
+                hms(first),
+                hms(last),
+                (recording::LONG_SECS / 60.0) as i64
+            );
+            recording::parse_hhmm(&ask("the window's middle, HH:MM in game time (as the recording's clock, not the file name's): ")?)?
+        }
+    };
+    let cut_dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let cut = cut_dir.join(format!(
+        "{stem}-at{}.rec",
+        hms(at).replace(':', "")[..4].to_string()
+    ));
+    println!(
+        "cutting {} .. {} of {} into {} ...",
+        hms(at - recording::WINDOW_HALF),
+        hms(at + recording::WINDOW_HALF),
+        rec.display(),
+        cut.display()
+    );
+    let (a, b) = recording::cut_window(&rec, at, &cut)?;
+    println!("cut: frames {} .. {}", hms(a), hms(b));
+    let out = match positional.get(1) {
+        Some(_) => out,
+        None => cut_dir.join(format!(
+            "{}-roadmask.html",
+            cut.file_stem().and_then(|s| s.to_str()).unwrap_or(&stem)
+        )),
+    };
+    Ok((cut, out))
+}
+
+fn ask(prompt: &str) -> Res<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Err("no input".into());
+    }
+    Ok(line)
 }
 
 fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -68,7 +251,7 @@ fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|s| s.as_str())
 }
 
-fn hms(t: f64) -> String {
+pub(crate) fn hms(t: f64) -> String {
     let s = t.max(0.0).round() as i64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }

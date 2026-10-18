@@ -22,3 +22,6 @@ glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true
+flate2.workspace = true
+# (the file dialog when no recording is named)
+rfd.workspace = true

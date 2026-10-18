@@ -3439,6 +3439,7 @@ name = "omsi-roadmask"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "flate2",
  "glam",
  "log",
  "omsi-cfg",
@@ -3449,6 +3450,7 @@ dependencies = [
  "omsi-scenery",
  "omsi-sim",
  "omsi-traffic",
+ "rfd",
  "serde_json",
 ]
 
