@@ -2345,7 +2345,9 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     let next = walk.legs[c.from];
     let pace = me.pace;
     let held = walk.held;
-    let t_cross = next.len() as f64 / pace.max(0.5) + 1.0;
+    // [ROLLBACK r4c-L1] the whole crossing, kerb to kerb (the first piece alone was timed, and
+    // only where it cut a lane: a kerb stub cuts none, and nobody looked at the cars at all)
+    let t_cross = c.span as f64 / pace.max(0.5) + 1.0;
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
         if let Some((state, left)) = t.light_state(ctl, li) {
             if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
@@ -2383,7 +2385,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // [ROLLBACK r4c-P4] a vehicle that has stood at the crossing for a while, held by a stream
     // of people that never gaps (a station's crossing: heads stood 75 and 90 s): the people
     // arriving let it pass, for a few seconds; those on the carriageway go on across
-    let cuts: Vec<DVec2> = walk.legs[c.from..=c.to].iter().flat_map(|l| ped.crossings(net, l.lane).to_vec()).collect();
+    let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
     let stream = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q)| *id != me.id && (*q - me.pos).length() < PED_STREAM_GAP)).unwrap_or(false);
     for car in at.cars {
         if car.vel.length() >= 0.5 || car.stood <= PED_YIELD_AFTER || !stands_at(car, &cuts) {
@@ -2413,7 +2415,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             return Err("a vehicle stands on the crossing");
         }
     }
-    for x in ped.crossings(net, next.lane) {
+    for x in &cuts {
         for car in at.cars {
             // [ROLLBACK pedyield-1] a car stopping for people stops: when the car yields,
             // the pedestrian passes (a child and a taxi stood for each other for minutes,
@@ -2440,6 +2442,60 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
         }
     }
     Ok(())
+}
+
+/// [ROLLBACK r4c-L1] Where the pieces `legs` of a crossing cut a carriageway: the pieces' own
+/// cuts and those of the steps between them (a walk leaves every other 1 m piece out, and
+/// the piece over the lane may be one of those).
+fn span_cuts(ped: &mut PedNet, net: &Network, legs: &[Leg]) -> Vec<DVec2> {
+    let mut out: Vec<DVec2> = Vec::new();
+    let mut add = |x: DVec2, out: &mut Vec<DVec2>| {
+        if !out.iter().any(|q| (*q - x).length() < 1.5) {
+            out.push(x);
+        }
+    };
+    for l in legs {
+        for x in ped.crossings(net, l.lane).to_vec() {
+            add(x, &mut out);
+        }
+    }
+    for w in legs.windows(2) {
+        let (a, b) = (w[0].at(net, w[0].len()).0, w[1].at(net, 0.0).0);
+        if (b - a).truncate().length() > 0.05 {
+            for x in street_cuts(net, a, b) {
+                add(x, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Where the segment `a`-`b` crosses a carriageway lane.
+fn street_cuts(net: &Network, a: DVec3, b: DVec3) -> Vec<DVec2> {
+    let m = (a + b) * 0.5;
+    let (cx, cy) = ((m.x / 50.0).floor() as i32, (m.y / 50.0).floor() as i32);
+    let mut seen: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for &i in net.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let l = &net.lanes[i];
+                if l.kind != LaneKind::Street || seen.contains(&i) {
+                    continue;
+                }
+                seen.push(i);
+                for v in l.points.windows(2) {
+                    if (a.z - v[0].z).abs() > 3.0 {
+                        continue;
+                    }
+                    if let Some(x) = seg_cross(a.truncate(), b.truncate(), v[0].truncate(), v[1].truncate()) {
+                        out.push(x);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn seg_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<DVec2> {
@@ -8327,8 +8383,9 @@ mod ped_tests {
     pub(super) struct FakeLights {
         pub state: Cell<i32>,
         pub left: Cell<f32>,
-        /// The pieces of a crossing object's crossing (lit by light (0, 0)).
+        /// The pieces of a crossing object's crossing (lit by light (0, 0) unless `unlit`).
         pub pieces: Vec<usize>,
+        pub unlit: bool,
     }
 
     pub(super) const GREEN: i32 = 6;
@@ -8336,7 +8393,7 @@ mod ped_tests {
 
     impl FakeLights {
         pub fn new(state: i32, left: f32) -> FakeLights {
-            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new() }
+            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false }
         }
     }
 
@@ -8348,7 +8405,7 @@ mod ped_tests {
             Some(if omsi_sim::traffic::TrafficLightController::allows_go(self.state.get()) { 0.0 } else { 20.0 })
         }
         fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
-            self.pieces.contains(&lane).then_some((0, 0))
+            (!self.unlit && self.pieces.contains(&lane)).then_some((0, 0))
         }
         fn crossing_piece(&self, lane: usize) -> bool {
             self.pieces.contains(&lane)
@@ -8458,6 +8515,79 @@ mod ped_tests {
             t += dt;
         }
         (m.pos, longest, flagged, m.decision)
+    }
+
+    /// BeijingCity: a crossing object's crossing in 1 m pieces over the street of `crossing`
+    /// (y -5.5 to 5.5), most cutting no lane and none lit itself; the walk leaves every other
+    /// piece out (both ends of one are within the 1.2 m that make one node). Lane 2 the near
+    /// pavement; returns the pieces too.
+    pub(super) fn metre_pieces() -> (Network, PedNet, Vec<usize>) {
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(street(-1.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(1.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(vec![p(-20.0, -5.5), p(0.0, -5.5)], LaneKind::Sidewalk, 2.5));
+        let mut pieces = Vec::new();
+        for k in 0..11 {
+            pieces.push(net.lanes.len());
+            net.lanes.push(lane(vec![p(0.0, -5.5 + k as f64), p(0.0, -4.5 + k as f64)], LaneKind::Sidewalk, 2.0));
+        }
+        net.lanes.push(lane(vec![p(0.0, 5.5), p(20.0, 5.5)], LaneKind::Sidewalk, 2.5));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        (net, ped, pieces)
+    }
+
+    /// At the unlit kerb of `metre_pieces` with `car`, moving at its speed: the time of the
+    /// first "go", and the car's x then.
+    fn unlit_with_car(car: SeenCar) -> (Option<f32>, f64, Vec<&'static str>) {
+        let (net, mut ped, pieces) = metre_pieces();
+        let mut lights = FakeLights::new(GREEN, 60.0);
+        lights.pieces = pieces.clone();
+        lights.unlit = true;
+        let first = Leg { lane: 2, a: 19.5, b: 20.0 };
+        let mut walk = PedWalk::new(vec![first], true, 0.0);
+        let node = ped.end_node(&net, &first).unwrap();
+        let (l0, _) = *ped.out[node].iter().find(|(l, _)| pieces.contains(l)).unwrap();
+        walk.legs.push(Leg { lane: l0, a: 0.0, b: 1.0 });
+        let mut m = me(5, DVec2::new(-0.5, -5.5), 1.2);
+        let mut car = car;
+        let (mut went, mut car_x, mut said) = (None, 0.0, Vec::new());
+        for k in 0..200 {
+            let t = k as f32 * 0.05;
+            frame(&net, &mut ped, Some(&lights), &[car], t as f64, &mut m, &mut walk, 0.05);
+            if let Some(d) = m.decision {
+                if !said.contains(&d) {
+                    said.push(d);
+                }
+                if d == "go" && went.is_none() {
+                    went = Some(t);
+                    car_x = car.pos.x;
+                }
+            }
+            car.pos += car.vel * 0.05;
+            car.body.center = car.pos;
+        }
+        (went, car_x, said)
+    }
+
+    #[test]
+    fn l1_a_car_coming_holds_them_at_an_unlit_crossing_of_metre_pieces() {
+        let moving = |x: f64| {
+            let body = Block { center: DVec2::new(x, -1.75), half: DVec2::new(0.9, 2.25), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::new(12.0, 0.0) };
+            SeenCar { id: 3, pos: body.center, vel: body.vel, half_len: 2.25, body, yielding: false, stood: 0.0 }
+        };
+        // 30 m away at 12 m/s: they wait for it to pass, and go once it has
+        let (went, car_x, said) = unlit_with_car(moving(-30.0));
+        assert_eq!(said.first(), Some(&"waits for a car to pass"), "{said:?}");
+        let went = went.expect("they never went");
+        assert!(went > 2.0 && car_x > 2.25, "went at {went:.1} s with the car at x {car_x:.1}");
+        // far off (and gone past): across at once
+        let (went, _, said) = unlit_with_car(moving(-300.0));
+        assert_eq!(said.first(), Some(&"go"), "{said:?}");
+        assert!(went.unwrap() < 0.5);
+        let (went, _, _) = unlit_with_car(moving(10.0));
+        assert!(went.unwrap() < 0.5);
     }
 
     #[test]
