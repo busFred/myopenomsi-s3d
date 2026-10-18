@@ -104,9 +104,13 @@ pub struct PersonRecord {
     /// The footpath leg they walk: (lane, distance along it, the leg's length).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leg: Option<(usize, f32, f32)>,
-    /// The last decision at a kerb: "go", or why they wait ("red light", ...).
+    /// The last decision at a kerb: "go", or why they wait ("red light", ...), or what
+    /// they do on a crossing ("caught by the change: ...").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Cow<'static, str>>,
+    /// The pace they walk at now (m/s; 0 when not recorded).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pace: f32,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -126,7 +130,7 @@ impl PersonRecord {
 
     /// A record of somebody the game told nothing more about.
     pub fn from_person(p: &Person) -> PersonRecord {
-        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None }
+        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0 }
     }
 
     /// Take the frame's own values over (the extras stay).

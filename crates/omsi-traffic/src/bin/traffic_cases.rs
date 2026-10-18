@@ -704,8 +704,8 @@ struct VSample {
 struct Sample {
     t: f64,
     vehicles: Vec<VSample>,
-    /// (x, y, state, decision, still, on_crossing)
-    people: Vec<(f64, f64, String, Option<String>, f64, bool)>,
+    /// (x, y, state, decision, still, on_crossing, pace)
+    people: Vec<(f64, f64, String, Option<String>, f64, bool, f64)>,
     players: Vec<[f64; 5]>,
     lights: Vec<(usize, usize, i32)>,
     /// Every light's state, per controller.
@@ -878,6 +878,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 p.decision.as_ref().map(|d| d.to_string()),
                 p.still as f64,
                 p.on_crossing,
+                p.pace as f64,
             ));
         }
         let players = r
@@ -1114,7 +1115,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 now_rows.insert(vs.id, row);
             }
             prev_rows = now_rows;
-            // people: [x, y, state, decision, standing since (day time, 0 walking), on_crossing];
+            // people: [x, y, state, decision, standing since (day time, 0 walking), on_crossing, pace];
             // a row the same as one of the previous frame's goes by its index there (pk)
             let rows: Vec<Value> = s
                 .people
@@ -1131,7 +1132,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                         } else {
                             0
                         },
-                        p.5 as u8
+                        p.5 as u8,
+                        r1(p.6)
                     ])
                 })
                 .collect();
@@ -1222,7 +1224,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 "notes": notes,
                 "fields": {
                     "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null, blinker (0 off, 1 left, 2 right, 3 hazard as shown), intent [turn, lane, lane, ...]|null (the planned way: up to 6 lane ids after the current lane, cut at the first lane missing from \"lanes\"; turn = the turn flag of the first lane on the way, the current one included, that turns: 0 straight, 1 left, 2 right)], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
-                    "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
+                    "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing, pace (m/s, 0 not recorded)]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
                     "pl": "[x, y, heading_deg, speed, blinker]",
                     "l": "[ctl, light, state] when it changed (state: 0-2 red, 3-5 red+yellow, 6-8 green, 9-11 yellow)",
                     "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points]",

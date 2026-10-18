@@ -2128,6 +2128,11 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
         _ => false,
     };
     let crossing = lane.traffic_light.is_some() || crosses || me.on_crossing;
+    // [ROLLBACK r4c-P6] faster across when caught by the change, or with a vehicle standing for
+    // them close by, until off the carriageway
+    if me.on_crossing && (walk.cross.map(|c| c.caught).unwrap_or(false) || yielded_to(at.cars, pos2)) {
+        me.walk_pace = hurried(me.pace);
+    }
     let pace = me.walk_pace;
     // keep to the right of the pavement (less so on a crossing) - the left where the
     // traffic drives on the left
@@ -2199,6 +2204,34 @@ fn stands_at(car: &SeenCar, cuts: &[DVec2]) -> bool {
         along > -car.body.half.y && along < car.body.half.y + 6.0 && rel.perp_dot(fwd).abs() < 2.5
     })
 }
+
+/// [ROLLBACK r4c-P6] A person's own walking pace (m/s): 1.0..1.4, fixed by their id.
+fn pace_of(id: u32) -> f64 {
+    1.0 + 0.4 * hash01(id as u64, 0x5EED_9ACE)
+}
+
+/// [ROLLBACK r4c-P6] The pace across in a hurry: 1.4 times one's own, at most 1.8 m/s.
+fn hurried(pace: f64) -> f64 {
+    (pace * 1.4).min(1.8).max(pace)
+}
+
+/// [ROLLBACK r4c-P6] Whether a vehicle stands for somebody at `pos` within 6 m (one stopping for
+/// people).
+fn yielded_to(cars: &[SeenCar], pos: DVec2) -> bool {
+    cars.iter().any(|c| c.yielding && c.vel.length() < 0.5 && (c.body.closest(pos).0 - pos).length() < 6.0)
+}
+
+/// [ROLLBACK r4c-P6] Seconds somebody who has decided to go may stand still wanting to walk
+/// before they are planned again.
+const PED_GO_FROZEN: f32 = 2.0;
+
+/// [ROLLBACK r4c-P6] Whether somebody is frozen with "go": standing `still` s while wanting to walk
+/// at `wants` m/s.
+fn replan_frozen(decision: Option<&str>, still: f32, wants: f64) -> bool {
+    decision == Some("go") && still > PED_GO_FROZEN && wants > 0.2
+}
+
+const BACK_TO_KERB: &str = "a vehicle in the way: back to the kerb";
 
 /// [ROLLBACK r4c-P1] Decisions on a crossing as the recording shows them.
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
@@ -2494,6 +2527,9 @@ pub struct Person {
     /// Velocity in the plane the person walks in (ground or bus floor).
     vel: DVec2,
     pace: f64,
+    /// [ROLLBACK r4c-P6] The pace walked now (faster across when caught by the change or with
+    /// a vehicle standing for them), for the recording.
+    walk_pace: f64,
     activity: Activity,
     /// The animation: Omsi.exe's walk phase and joint angles (sub_626ae8).
     anim: OmsiAnim,
@@ -3418,6 +3454,7 @@ impl Humans {
                     waiting_for_bus: waiting,
                     leg,
                     decision: p.last_decision.map(Cow::Borrowed),
+                    pace: if matches!(p.state, State::Strolling(_)) { p.walk_pace as f32 } else { p.pace as f32 },
                 }
             })
             .collect()
@@ -3611,12 +3648,13 @@ impl Humans {
             let inst = renderer.add_instance(scene, id, position, Mat4::IDENTITY, mats);
             meshes.push((id, inst));
         }
-        // walking pace 1.1 m/s +- 0.2, as Omsi.exe draws it for everybody (0x625758:
-        // sub_7f08b0(0.2, 1.1)); `[walk_param]` holds the stride, not a speed
-        let pace = 1.1 + (self.rand_f() * 2.0 - 1.0) * 0.2;
         let age = ty.def.age.map(|a| a as f32).unwrap_or(40.0);
         let id = self.next_id;
         self.next_id += 1;
+        // [ROLLBACK r4c-P6] walking pace 1.0..1.4 m/s by the person (Omsi.exe draws 1.1 m/s +-
+        // 0.2 for everybody, 0x625758: sub_7f08b0(0.2, 1.1)); `[walk_param]` holds the stride,
+        // not a speed
+        let pace = pace_of(id);
         if debug_pax() {
             log::info!(
                 "pax #{id} ({}) appears at ({:.1}, {:.1}, {:.1}): {}{}",
@@ -3643,6 +3681,7 @@ impl Humans {
             place: Place::Ground,
             vel: DVec2::ZERO,
             pace,
+            walk_pace: pace,
             activity: Activity::Stand,
             anim: OmsiAnim::default(),
             state,
@@ -5933,12 +5972,34 @@ impl Humans {
                 self.people[i].car_wait = 0.0;
                 continue;
             }
+            // [ROLLBACK r4c-P6] (not for long: somebody who has decided to go and stands is
+            // planned again after PED_GO_FROZEN - back to the kerb when just off it, else
+            // round the vehicle; after 8 s, people stood frozen with "go" in the road)
             self.people[i].car_wait += dt;
-            if self.people[i].car_wait > 8.0 {
-                self.people[i].detour = self.people[i].detour.max(4.0);
+            if self.people[i].car_wait > PED_GO_FROZEN {
                 self.people[i].car_wait = 0.0;
+                let p = &mut self.people[i];
+                if let State::Strolling(walk) = &mut p.state {
+                    if let Some(c) = walk.cross.filter(|c| c.on(walk.leg) && !c.back) {
+                        if c.walked(walk) < 1.5 {
+                            walk.turn_back();
+                            p.last_decision = Some(BACK_TO_KERB);
+                            wants[i].vel = DVec2::ZERO;
+                            continue;
+                        }
+                    }
+                }
+                p.detour = p.detour.max(4.0);
             } else if self.people[i].detour <= 0.0 {
                 wants[i].vel = DVec2::ZERO;
+            }
+        }
+        // [ROLLBACK r4c-P6] nobody stands frozen with "go": released from the path's corridor for
+        // a moment, the crowd takes them round what holds them
+        for i in 0..self.people.len() {
+            let p = &mut self.people[i];
+            if matches!(p.state, State::Strolling(_)) && p.detour <= 0.0 && replan_frozen(p.last_decision, p.still, wants[i].vel.length()) {
+                p.detour = 2.0;
             }
         }
         // [ROLLBACK r4c-P5] beside a standing vehicle nobody turns round more than once in
@@ -6143,6 +6204,7 @@ impl Humans {
         p.on_crossing = me.on_crossing;
         p.last_decision = me.decision;
         p.why = me.why;
+        p.walk_pace = me.walk_pace;
         w
     }
 
@@ -8494,6 +8556,90 @@ mod ped_tests {
         let c = crossing_span(&mut ped, &net, None, &mut roam, 1).unwrap();
         assert_eq!(roam.legs.iter().map(|l| l.lane).collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
         assert_eq!(c.to, 4);
+    }
+
+    #[test]
+    fn p6_everybody_walks_at_their_own_pace() {
+        let paces: Vec<f64> = (1..2001u32).map(pace_of).collect();
+        assert!(paces.iter().all(|p| (1.0..=1.4).contains(p)));
+        let (lo, hi) = paces.iter().fold((9.0f64, 0.0f64), |(a, b), p| (a.min(*p), b.max(*p)));
+        assert!(lo < 1.03 && hi > 1.37, "{lo} {hi}");
+        let mean = paces.iter().sum::<f64>() / paces.len() as f64;
+        assert!((mean - 1.2).abs() < 0.02, "{mean}");
+        // the same person always the same
+        assert_eq!(pace_of(77), pace_of(77));
+        assert!((hurried(1.2) - 1.68).abs() < 1e-9);
+        assert!((hurried(1.4) - 1.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p6_caught_by_the_change_or_yielded_to_they_hurry() {
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = across();
+        let mut m = me(3, DVec2::new(-10.0, -5.5), 1.2);
+        let (mut before, mut after, mut off) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..600 {
+            if walk.cross.map(|c| c.walked(&walk) >= 6.0).unwrap_or(false) {
+                lights.state.set(RED);
+            }
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            let caught = lights.state.get() == RED;
+            match (m.on_crossing, caught) {
+                (true, false) => before.push(m.walk_pace),
+                (true, true) => after.push(m.walk_pace),
+                (false, true) => off.push(m.walk_pace),
+                _ => {}
+            }
+        }
+        assert!(!before.is_empty() && before.iter().all(|p| (*p - 1.2).abs() < 1e-9));
+        assert!(!after.is_empty() && after.iter().all(|p| (*p - 1.68).abs() < 1e-9), "{after:?}");
+        // off the carriageway their own pace again
+        assert!(off.iter().all(|p| (*p - 1.2).abs() < 1e-9));
+        // a car standing for them close by: faster across too, on green
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = across();
+        let mut m = me(3, DVec2::new(-10.0, -5.5), 1.2);
+        let mut car = car_before(3.0);
+        car.body.center.x = -4.0;
+        let mut hurried_on = 0;
+        for k in 0..400 {
+            frame(&net, &mut ped, Some(&lights), &[car], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if m.on_crossing && (m.walk_pace - 1.68).abs() < 1e-9 {
+                hurried_on += 1;
+            }
+        }
+        assert!(hurried_on > 20, "{hurried_on}");
+    }
+
+    #[test]
+    fn p6_nobody_stands_frozen_with_go() {
+        assert!(replan_frozen(Some("go"), 2.1, 1.2));
+        assert!(!replan_frozen(Some("go"), 1.5, 1.2));
+        // waiting by decision, or not wanting to walk, is not frozen
+        assert!(!replan_frozen(Some("red light"), 30.0, 1.2));
+        assert!(!replan_frozen(Some("go"), 30.0, 0.0));
+        // just off the kerb with a vehicle in the way: back to the kerb, never left on the
+        // carriageway
+        let (net, mut ped) = crossing(false);
+        let mut walk = across();
+        let mut m = me(3, DVec2::new(-10.0, -5.5), 1.2);
+        for k in 0..400 {
+            frame(&net, &mut ped, None, &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if walk.leg == 2 {
+                break;
+            }
+        }
+        assert!(walk.cross.map(|c| c.walked(&walk) < 1.6).unwrap_or(false));
+        walk.turn_back();
+        for k in 0..200 {
+            frame(&net, &mut ped, None, &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if walk.cross.is_none() {
+                break;
+            }
+        }
+        assert!(!in_road(m.pos) && m.pos.y < -5.0, "{:?}", m.pos);
     }
 
     /// At the unlit kerb of `crossing` with `car` standing: the first decision.

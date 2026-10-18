@@ -96,7 +96,7 @@ function makePane(cv,D,o){
   if(f.k)for(const id of f.k){if(prev[id])cur[id]=prev[id];}
   if(f.l){lights=Object.assign({},lights);for(const [c,li,st] of f.l)lights[c+'/'+li]=st;}
   const P=(f.pk||[]).map(i=>prevP[i]).filter(Boolean).concat(f.p||[]);
-  F.push({t:f.t,v:cur,p:P.map(q=>[q[0],q[1],q[2],q[3],q[4]?Math.max(0,Math.round(f.t-q[4])):0,q[5]]),pl:f.pl,l:lights});prev=cur;prevP=P;}
+  F.push({t:f.t,v:cur,p:P.map(q=>[q[0],q[1],q[2],q[3],q[4]?Math.max(0,Math.round(f.t-q[4])):0,q[5],q[6]]),pl:f.pl,l:lights});prev=cur;prevP=P;}
  const cross=new Set();for(const c of D.crossings)for(const l of c.lanes)cross.add(l);
  const LI={};for(const L of D.lanes)LI[L[0]]=L;
  // the lamps of an indicator state (1 left, 2 right, 3 hazard) at the front corners of a box already translated and rotated to the vehicle
@@ -174,7 +174,7 @@ function makePane(cv,D,o){
    return m+`<b>vehicle ${r[0]}</b> <span class="mut">${inf[3]||''} ${inf[4]||''}</span>`+dg+`<table>`+vehFields(r).map(([k,v])=>row(k,v)).join('')+'</table><div class="mut">chain: blue = lead, orange = wait_for, cyan = intended way</div>';}
   if(st.pinP){const p=f.p.reduce((b,q)=>{const d=Math.hypot(q[0]-st.pinP[0],q[1]-st.pinP[1]);return !b||d<b[0]?[d,q]:b;},null);
    if(!p||p[0]>3)return '<span class="mut">the pedestrian is not near the pinned place now</span>';const q=p[1];st.pinP=[q[0],q[1]];
-   return '<b>pedestrian</b><table>'+row('state',S[q[2]])+row('decision',q[3]==null?null:S[q[3]])+row('still',q[4]+' s')+row('on crossing',q[5]?'yes':'no')+row('at',q[0]+', '+q[1])+'</table>';}
+   return '<b>pedestrian</b><table>'+row('state',S[q[2]])+row('decision',q[3]==null?null:S[q[3]])+row('still',q[4]+' s')+row('on crossing',q[5]?'yes':'no')+(q[6]?row('pace',q[6]+' m/s'):'')+row('at',q[0]+', '+q[1])+'</table>';}
   const ls=Object.entries(f.l).map(([k,s])=>`<span style="color:${lightCol(s)}">●</span> ${k} ${lightName(s)}`).join('<br>');
   return m+'<span class="mut">Click a vehicle or a pedestrian. Drag to pan, wheel to zoom.</span><div style="margin-top:6px">Lights:<br>'+(ls||'<span class="mut">none</span>')+'</div>';}
  // the frame nearest day time t
