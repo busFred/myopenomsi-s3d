@@ -2555,6 +2555,10 @@ fn wait_at_kerb(mut ped: Option<&mut PedNet>, at: &Around, me: &Me, walk: &mut P
 /// waiting at the kerb keeps (m).
 const KERB_CLEAR: f64 = 0.3;
 
+/// [ROLLBACK r5-P7] The outermost of the crowd's spread spots at a kerb (m either side of the
+/// way: `wait_at_kerb` spreads by (id % 5 - 2) x 0.45).
+const KERB_SPREAD_MAX: f64 = 0.9;
+
 /// [ROLLBACK r4c-P3] The width a carriageway lane is taken to have at least (m): the pieces
 /// inside junctions say 1 m, and a bus is 2.5 m wide.
 const LANE_MIN_WIDTH: f64 = 2.5;
@@ -2597,6 +2601,13 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
     if !on_carriageway(net, first) {
         return first.truncate();
     }
+    // [ROLLBACK r5-P7] the other side of the way first - the pavement's, where the spread
+    // put them into a junction piece (2-5 people at "red light" 2-4 m inside the west arm
+    // of X10 j392 lost a car its green, case07; case01b's j3 kerbs)
+    let mirrored = end + (-right * spread - fwd * back).extend(0.0);
+    if !on_carriageway(net, mirrored) {
+        return mirrored.truncate();
+    }
     let mut last = end;
     let mut d = 0.25f32;
     for l in way {
@@ -2604,8 +2615,10 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
         while d <= len {
             let (q, _) = l.at(net, len - d);
             last = q;
-            for k in [0.5, 0.0] {
-                let c = q + (right * spread * k).extend(0.0);
+            // (own spread, halved, mirrored; then the crowd's outermost spread spots, each
+            // tested: a lane beside the way takes every spot on its side)
+            for off in [spread * 0.5, 0.0, -spread * 0.5, -spread, -KERB_SPREAD_MAX, KERB_SPREAD_MAX] {
+                let c = q + (right * off).extend(0.0);
                 if !on_carriageway(net, c) {
                     return c.truncate();
                 }
@@ -9943,6 +9956,39 @@ mod ped_tests {
         }
         assert!(on_carriageway(&net, DVec3::new(0.0, -3.6, 0.0)), "within the lane and 0.3 m");
         assert!(!on_carriageway(&net, DVec3::new(0.0, -3.9, 0.0)));
+    }
+
+    #[test]
+    fn r5p7_the_kerb_spot_keeps_out_of_a_junction_piece_beside_the_way() {
+        // the street of `p3_they_wait_off...` with its kerb outside the lanes (y -4), and a
+        // 1 m junction piece (counted 2.7 m wide here: its footprint reaches 1.65 m) running
+        // beside the pavement 1.6 m to the right of it: every spot on that side and the
+        // pavement's own line lie in its footprint, the far side does not. Before, the way
+        // walked was backed along for 8 m to its end for the spot; now a step to the other
+        // side does
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(street(-1.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(1.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(vec![p(0.0, -20.0), p(0.0, -4.0)], LaneKind::Sidewalk, 2.5)); // 2
+        net.lanes.push(lane(vec![p(0.0, -4.0), p(0.0, 4.0)], LaneKind::Sidewalk, 2.5)); // 3
+        net.lanes.push(lane(vec![p(1.6, -4.2), p(1.6, -12.0)], LaneKind::Street, 2.7)); // 4: the junction piece
+        net.lanes[3].traffic_light = Some((0, 0));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(RED, 30.0);
+        assert!(on_carriageway(&net, DVec3::new(0.0, -5.0, 0.0)) && !on_carriageway(&net, DVec3::new(-0.9, -5.0, 0.0)));
+        for id in 0..10u32 {
+            let mut walk = PedWalk::new(vec![Leg { lane: 2, a: 4.0, b: 16.0 }, Leg { lane: 3, a: 0.0, b: 8.0 }], false, 0.0);
+            let mut m = me(id, DVec2::new(0.0, -16.0), 1.2);
+            for k in 0..400 {
+                frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            }
+            assert_eq!(m.decision, Some("red light"));
+            assert!(!on_carriageway(&net, m.pos.extend(0.0)), "#{id} at {:?}", m.pos);
+            assert!(m.pos.y > -6.0 && m.pos.y < -3.9, "#{id} near the kerb, not backed away: {:?}", m.pos);
+            assert!(m.pos.x < -0.3, "#{id} on the pavement's side: {:?}", m.pos);
+        }
     }
 
     #[test]
