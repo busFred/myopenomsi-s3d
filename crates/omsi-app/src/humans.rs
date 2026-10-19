@@ -2145,7 +2145,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                     let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
                     let walked = c.walked(walk);
                     let rest = (c.total - walked).max(0.0) * if c.total > 0.1 { c.span / c.total } else { 1.0 };
-                    let clearance = ped.as_deref_mut().and_then(|p| cars_go_in(p, net, lights, &paths)).map(|g| (g, rest / hurried(me.pace) as f32));
+                    let clearance = ped.as_deref_mut().and_then(|p| cars_go_in(p, net, lights, &paths)).map(|g| (g, rest / hurried(me.id, me.pace) as f32));
                     match change_turns_back(walked, c.lead, &pieces, clearance) {
                         Clear::Back(i) => {
                             walk.turn_back_to(net, c.from + i);
@@ -2291,7 +2291,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
     // [ROLLBACK r4c-P6] faster across when caught by the change, or with a vehicle standing for
     // them close by, until off the carriageway
     if me.on_crossing && (walk.cross.map(|c| c.caught).unwrap_or(false) || yielded_to(at.cars, pos2)) {
-        me.walk_pace = hurried(me.pace);
+        me.walk_pace = hurried(me.id, me.pace);
     }
     let pace = me.walk_pace;
     // keep to the right of the pavement (less so on a crossing) - the left where the
@@ -2372,14 +2372,60 @@ fn stands_at(car: &SeenCar, cuts: &[DVec2]) -> bool {
     })
 }
 
-/// [ROLLBACK r4c-P6] A person's own walking pace (m/s): 1.0..1.4, fixed by their id.
-fn pace_of(id: u32) -> f64 {
-    1.0 + 0.4 * hash01(id as u64, 0x5EED_9ACE)
+/// [ROLLBACK r5-P4] The median of people's free walking pace (m/s). Bohannon 1997 (Age and
+/// Ageing 26(1):15-19, doi:10.1093/ageing/26.1.15) measured comfortable means of 1.27-1.46
+/// m/s by age and sex; the MUTCD (2009, 4E.06) designs pedestrian clearances for 3.5 ft/s
+/// = 1.07 m/s, a slow walker.
+const PED_PACE_MEDIAN: f64 = 1.35;
+/// [ROLLBACK r5-P4] The spread of the free pace in log space (sigma of ln pace): about 15 %
+/// either way for two thirds of the people, the spread of Bohannon's cohorts.
+const PED_PACE_SIGMA: f64 = 0.2;
+/// [ROLLBACK r5-P4] The slowest and the fastest free pace (m/s): the MUTCD design walker a
+/// quarter under, Bohannon's slowest "maximum" means (1.75) a little under.
+const PED_PACE_MIN: f64 = 0.8;
+const PED_PACE_MAX: f64 = 1.85;
+/// [ROLLBACK r5-P4] The factor a person hurries by when caught by the change or yielded to:
+/// 1.3..1.8 of their own pace, capped at PED_HURRY_MAX (Bohannon's maximum walking speeds
+/// 1.75-2.53 m/s are 1.4-1.7 times the comfortable ones).
+const PED_HURRY_MIN: f64 = 1.3;
+const PED_HURRY_MAX_FACTOR: f64 = 1.8;
+const PED_HURRY_MAX: f64 = 2.5;
+/// [ROLLBACK r5-P4] The share of people who jog across when caught, at PED_JOG_MIN..PED_JOG_MAX
+/// m/s (the top of Bohannon's maximum speeds and a little over: a jog, not a walk).
+const PED_JOG_SHARE: f64 = 0.05;
+const PED_JOG_MIN: f64 = 2.5;
+const PED_JOG_MAX: f64 = 3.0;
+
+/// [ROLLBACK r5-P4] A standard normal deviate fixed by `a` and `b` (Box-Muller on two hashes).
+fn hash_normal(a: u64, b: u64) -> f64 {
+    let u1 = hash01(a, b).max(1e-12);
+    let u2 = hash01(a, b ^ 0x9E37_79B9);
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
-/// [ROLLBACK r4c-P6] The pace across in a hurry: 1.4 times one's own, at most 1.8 m/s.
-fn hurried(pace: f64) -> f64 {
-    (pace * 1.4).min(1.8).max(pace)
+/// [ROLLBACK r4c-P6] A person's own walking pace (m/s), fixed by their id: [ROLLBACK r5-P4]
+/// log-normal about PED_PACE_MEDIAN with PED_PACE_SIGMA, within PED_PACE_MIN..PED_PACE_MAX
+/// (it was uniform 1.0..1.4, and nobody was as quick or as slow as people are).
+fn pace_of(id: u32) -> f64 {
+    (PED_PACE_MEDIAN * (PED_PACE_SIGMA * hash_normal(id as u64, 0x5EED_9ACE)).exp()).clamp(PED_PACE_MIN, PED_PACE_MAX)
+}
+
+/// [ROLLBACK r5-P4] Whether person `id` jogs across when caught by the change.
+fn jogger(id: u32) -> bool {
+    hash01(id as u64, 0x1066_D0D6) < PED_JOG_SHARE
+}
+
+/// [ROLLBACK r4c-P6] The pace across in a hurry: [ROLLBACK r5-P4] the person's own hurry
+/// factor (PED_HURRY_MIN..PED_HURRY_MAX_FACTOR, by id) times their pace, at most
+/// PED_HURRY_MAX; a jogger (PED_JOG_SHARE) at PED_JOG_MIN..PED_JOG_MAX. Never slower than the
+/// own pace.
+fn hurried(id: u32, pace: f64) -> f64 {
+    let h = hash01(id as u64, 0x4A6B_5E5A);
+    if jogger(id) {
+        return (PED_JOG_MIN + (PED_JOG_MAX - PED_JOG_MIN) * h).max(pace);
+    }
+    let factor = PED_HURRY_MIN + (PED_HURRY_MAX_FACTOR - PED_HURRY_MIN) * h;
+    (pace * factor).min(PED_HURRY_MAX).max(pace)
 }
 
 /// [ROLLBACK r4c-P6] Whether a vehicle stands for somebody at `pos` within 6 m (one stopping for
@@ -3947,9 +3993,9 @@ impl Humans {
         let age = ty.def.age.map(|a| a as f32).unwrap_or(40.0);
         let id = self.next_id;
         self.next_id += 1;
-        // [ROLLBACK r4c-P6] walking pace 1.0..1.4 m/s by the person (Omsi.exe draws 1.1 m/s +-
-        // 0.2 for everybody, 0x625758: sub_7f08b0(0.2, 1.1)); `[walk_param]` holds the stride,
-        // not a speed
+        // [ROLLBACK r4c-P6] walking pace by the person, for their life (Omsi.exe draws 1.1 m/s
+        // +- 0.2 for everybody, 0x625758: sub_7f08b0(0.2, 1.1)); `[walk_param]` holds the
+        // stride, not a speed; [ROLLBACK r5-P4] log-normal, see `pace_of`
         let pace = pace_of(id);
         if debug_pax() {
             log::info!(
@@ -9197,7 +9243,7 @@ mod ped_tests {
 
     #[test]
     fn r5p3_only_who_cannot_clear_in_the_clearance_turns_back() {
-        // caught 3 m into the 11 m crossing: 8 m at the hurried pace take 8 / 1.68 = 4.8 s
+        // caught 3 m into the 11 m crossing: 8 m at the hurried pace (1.56-2.16 m/s for a walker) take 3.7-5.1 s
         // (me(3) walks 1.2 m/s). With the cars' green 12 s off, on across; 5 s off, back;
         // with no car light programmed (`caught_at`), back before the middle as before
         let (end, stood, flagged, decision) = caught_at_with(3.0, 40.0, Some(12.0));
@@ -9246,16 +9292,37 @@ mod ped_tests {
 
     #[test]
     fn p6_everybody_walks_at_their_own_pace() {
+        // [ROLLBACK r5-P4] (the uniform 1.0..1.4 and the fixed 1.4 x hurry became a log-normal
+        // pace and a hurry of the person's own: the bounds and the middle are checked, not
+        // the old numbers)
         let paces: Vec<f64> = (1..2001u32).map(pace_of).collect();
-        assert!(paces.iter().all(|p| (1.0..=1.4).contains(p)));
+        assert!(paces.iter().all(|p| (PED_PACE_MIN..=PED_PACE_MAX).contains(p)));
         let (lo, hi) = paces.iter().fold((9.0f64, 0.0f64), |(a, b), p| (a.min(*p), b.max(*p)));
-        assert!(lo < 1.03 && hi > 1.37, "{lo} {hi}");
-        let mean = paces.iter().sum::<f64>() / paces.len() as f64;
-        assert!((mean - 1.2).abs() < 0.02, "{mean}");
+        assert!(lo < 0.9 && hi > 1.75, "{lo} {hi}");
+        let mut sorted = paces.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let median = sorted[sorted.len() / 2];
+        assert!((median - PED_PACE_MEDIAN).abs() < 0.03, "median {median}");
+        // two thirds within one sigma (15 %) of the median
+        let within = paces.iter().filter(|p| (p.ln() - PED_PACE_MEDIAN.ln()).abs() < PED_PACE_SIGMA).count() as f64 / paces.len() as f64;
+        assert!(within > 0.62 && within < 0.74, "{within}");
         // the same person always the same
         assert_eq!(pace_of(77), pace_of(77));
-        assert!((hurried(1.2) - 1.68).abs() < 1e-9);
-        assert!((hurried(1.4) - 1.8).abs() < 1e-9);
+        assert_eq!(hurried(77, pace_of(77)), hurried(77, pace_of(77)));
+        // hurrying: 1.3..1.8 times one's own, at most 2.5; joggers 2.5..3.0, about 5 %; and
+        // nobody below 0.8 or above 3.0 ever
+        let mut joggers = 0;
+        for id in 1..2001u32 {
+            let (p, h) = (pace_of(id), hurried(id, pace_of(id)));
+            assert!((PED_PACE_MIN..=PED_JOG_MAX).contains(&h), "#{id} hurries at {h}");
+            if jogger(id) {
+                joggers += 1;
+                assert!((PED_JOG_MIN..=PED_JOG_MAX).contains(&h), "#{id} jogs at {h}");
+            } else {
+                assert!(h >= p * PED_HURRY_MIN - 1e-9 && h <= (p * PED_HURRY_MAX_FACTOR).min(PED_HURRY_MAX) + 1e-9, "#{id} {p} -> {h}");
+            }
+        }
+        assert!((60..=140).contains(&joggers), "{joggers} joggers of 2000");
     }
 
     #[test]
@@ -9279,7 +9346,7 @@ mod ped_tests {
             }
         }
         assert!(!before.is_empty() && before.iter().all(|p| (*p - 1.2).abs() < 1e-9));
-        assert!(!after.is_empty() && after.iter().all(|p| (*p - 1.68).abs() < 1e-9), "{after:?}");
+        assert!(!after.is_empty() && after.iter().all(|p| (*p - hurried(3, 1.2)).abs() < 1e-9), "{after:?}");
         // off the carriageway their own pace again
         assert!(off.iter().all(|p| (*p - 1.2).abs() < 1e-9));
         // a car standing for them close by: faster across too, on green
@@ -9292,7 +9359,7 @@ mod ped_tests {
         let mut hurried_on = 0;
         for k in 0..400 {
             frame(&net, &mut ped, Some(&lights), &[car], k as f64 * 0.05, &mut m, &mut walk, 0.05);
-            if m.on_crossing && (m.walk_pace - 1.68).abs() < 1e-9 {
+            if m.on_crossing && (m.walk_pace - hurried(3, 1.2)).abs() < 1e-9 {
                 hurried_on += 1;
             }
         }
