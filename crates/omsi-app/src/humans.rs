@@ -1574,6 +1574,21 @@ fn core_piece(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, l
     net.lanes[lane].traffic_light.is_some() || lights.map(|t| t.crossing_piece(lane)).unwrap_or(false) || !ped.crossings(net, lane).is_empty()
 }
 
+/// [ROLLBACK r5-P1] Whether a stroller may be put down on pavement lane `l`: a path of the
+/// walking network longer than 4 m that unscheduled people may use, and no piece of a
+/// crossing: nothing that cuts a carriageway or carries a light. Strollers put down on a
+/// crossing piece walked off mid-road with no kerb decision, and once turned back by the
+/// change their "kerb" was the drop point in the road (a bus and 26 cars held 66 s by one
+/// man, X10 case09; BeijingCity case04; 22 drop-ins in 93 s at X10 j530, case12). A kerb
+/// piece that cuts no lane stays a candidate (the pavements of junction objects).
+fn stroll_candidate(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, l: usize) -> bool {
+    ped.ends.contains_key(&l)
+        && net.lanes[l].length() > 4.0
+        && !net.lanes[l].no_unsched // [ROLLBACK unsched-93]
+        && !core_piece(ped, net, lights, l)
+        && net.lanes[l].traffic_light.is_none()
+}
+
 /// [ROLLBACK r4c-P1] The crossing starting with `walk.legs[start]`: the pieces on from it that
 /// cut a carriageway or carry a light, with short pieces between them (a median); a stroll
 /// is planned on straight across where its legs run out. None when no such piece follows.
@@ -4343,20 +4358,23 @@ impl Humans {
         &mut self,
         world: &World,
         net: &Network,
+        lights: Option<&dyn PedLights>,
         renderer: &Renderer,
         scene: &mut Scene,
         dt: f32,
     ) {
-        let Some(ped) = self.ped.take() else { return };
-        self.populate_on_foot_with(&ped, world, net, renderer, scene, dt);
+        let Some(mut ped) = self.ped.take() else { return };
+        self.populate_on_foot_with(&mut ped, world, net, lights, renderer, scene, dt);
         self.ped = Some(ped);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn populate_on_foot_with(
         &mut self,
-        ped: &PedNet,
+        ped: &mut PedNet,
         world: &World,
         net: &Network,
+        lights: Option<&dyn PedLights>,
         renderer: &Renderer,
         scene: &mut Scene,
         _dt: f32,
@@ -4406,7 +4424,7 @@ impl Humans {
         let candidates: Vec<(usize, f32, Vec<usize>)> = lanes
             .iter()
             .copied()
-            .filter(|&l| ped.ends.contains_key(&l) && net.lanes[l].length() > 4.0 && !net.lanes[l].no_unsched) // [ROLLBACK unsched-93]
+            .filter(|&l| stroll_candidate(ped, net, lights, l))
             .filter_map(|l| {
                 let (metres, ks) = inside(l);
                 (metres > 0.5 && !ks.is_empty()).then_some((l, metres, ks))
@@ -5929,8 +5947,9 @@ impl Humans {
                 let c = self.center;
                 self.populate_with(world, Some(n), renderer, scene, c);
                 if !self.mirror {
-                    self.populate_on_foot(world, n, renderer, scene, 1.0);
-                    self.populate_lan_centers(world, n, renderer, scene);
+                    let lights = traffic.map(|t| t as &dyn PedLights);
+                    self.populate_on_foot(world, n, lights, renderer, scene, 1.0);
+                    self.populate_lan_centers(world, n, lights, renderer, scene);
                 }
             }
         }
@@ -7343,6 +7362,7 @@ impl Humans {
         &mut self,
         world: &World,
         net: &Network,
+        lights: Option<&dyn PedLights>,
         renderer: &Renderer,
         scene: &mut Scene,
     ) {
@@ -7355,7 +7375,7 @@ impl Humans {
                 continue;
             }
             self.populate_with(world, Some(net), renderer, scene, c);
-            self.populate_on_foot(world, net, renderer, scene, 1.0);
+            self.populate_on_foot(world, net, lights, renderer, scene, 1.0);
         }
         self.center = mine;
     }
@@ -8776,6 +8796,45 @@ mod ped_tests {
             assert!(!on_carriageway(&net, m.pos.extend(0.0)), "#{id} at {:?}", m.pos);
             assert!((m.pos - DVec2::new(25.0, -3.3)).length() < 4.0, "#{id} near the kerb: {:?}", m.pos);
         }
+    }
+
+    #[test]
+    fn r5p1_nobody_is_put_down_on_a_crossing_piece_or_a_lit_one() {
+        // the street of `crossing`; pavements, a 5 m kerb piece inside a lane's footprint
+        // that cuts no lane, an 8 m unlit piece across both lanes, a 6 m lit piece that
+        // cuts nothing, and a crossing object's 1 m pieces
+        let (mut net, _) = crossing(true);
+        net.lanes.push(lane(vec![p(20.0, -3.3), p(25.0, -3.3)], LaneKind::Sidewalk, 2.5)); // 8: kerb piece in the lane
+        net.lanes.push(lane(vec![p(30.0, -4.0), p(30.0, 4.0)], LaneKind::Sidewalk, 2.0)); // 9: unlit, cuts both lanes
+        net.lanes.push(lane(vec![p(40.0, -12.0), p(40.0, -6.0)], LaneKind::Sidewalk, 2.5)); // 10: lit, cuts nothing
+        net.lanes[10].traffic_light = Some((0, 2));
+        let mut pieces = Vec::new();
+        for k in 0..11 {
+            pieces.push(net.lanes.len());
+            net.lanes.push(lane(vec![p(50.0, -5.5 + k as f64), p(50.0, -4.5 + k as f64)], LaneKind::Sidewalk, 2.0));
+        }
+        net.lanes.push(lane(vec![p(20.0, -12.0), p(60.0, -12.0)], LaneKind::Sidewalk, 2.5)); // a boulevard pavement
+        let boulevard = net.lanes.len() - 1;
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let mut lights = FakeLights::new(GREEN, 60.0);
+        lights.pieces = pieces.clone();
+        let ok = |ped: &mut PedNet, l: usize| stroll_candidate(ped, &net, Some(&lights), l);
+        // long pavements and junction-object kerb pieces that cut no lane: candidates
+        for l in [2usize, 7, 8, boulevard] {
+            assert!(ok(&mut ped, l), "lane {l} should take strollers");
+        }
+        // lit stubs, pieces over the lanes, an unlit piece across the street, a lit piece
+        // that cuts nothing, a crossing object's pieces: never
+        for l in [3usize, 4, 5, 6, 9, 10] {
+            assert!(!ok(&mut ped, l), "lane {l} is a crossing piece");
+        }
+        for l in pieces {
+            assert!(!ok(&mut ped, l), "lane {l} is a crossing object's piece");
+        }
+        // without the traffic's crossing table the lanes' own cuts and lights still tell
+        assert!(!stroll_candidate(&mut ped, &net, None, 9) && !stroll_candidate(&mut ped, &net, None, 10));
+        assert!(stroll_candidate(&mut ped, &net, None, 8));
     }
 
     #[test]
