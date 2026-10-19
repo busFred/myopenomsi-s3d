@@ -136,15 +136,20 @@ fn standing_car_with(people: Vec<Person>) -> (f32, f32) {
     (people_s, cars[0].state.speed)
 }
 
-/// [round5 C2] Somebody level with a standing car's body, 1.1 m off its axis (inside the 0.3 m
-/// strip beside its 0.9 m half width, on the pavement's edge) and never `still`, does not
-/// hold it: it drives off. One standing in the strip ahead of its front does; and one
-/// stepping off the kerb toward the lane at 0.3 m/s ahead of the front still stops it.
+/// [round5 C2] Somebody level with a standing car's body, 1.3 m off its axis (outside its
+/// 0.9 m half width and their body, on the pavement's edge) shuffling toward it at 0.1 m/s
+/// (the projection puts them in the 1.2 m strip) and never `still`, does not hold it: it
+/// drives off (viz4 case01 #2827's eleven). One standing in the strip ahead of its front
+/// does; and one stepping off the kerb toward the lane at 0.3 m/s ahead of the front still
+/// stops it.
 #[test]
 fn c2_a_standing_car_is_not_held_by_somebody_level_with_its_body() {
-    // level with the body: 1 m behind the front plane
-    let (held, v) = standing_car_with(vec![person(101.0, 1.1), person(99.0, -1.1)]);
+    // level with the body: 1 m behind the front plane, shuffling toward the car
+    let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(0.0, -0.1), ..person(101.0, 1.3) }, Person { vel: glam::DVec2::new(0.0, 0.1), ..person(99.0, -1.3) }]);
     assert!(held < 0.5 && v > 2.0, "held {held:.1} s, speed {v:.1}");
+    // the same two inside the footprint (1.1 m): held - moving off would scrape them
+    let (held, v) = standing_car_with(vec![person(101.0, 1.1), person(99.0, -1.1)]);
+    assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
     // the same person 0.5 m ahead of the front: held, the car stands
     let (held, v) = standing_car_with(vec![person(102.5, 1.1)]);
     assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
@@ -225,3 +230,75 @@ fn c3_a_lead_rolling_to_rest_past_the_zebra_is_queued_behind_off_the_zebra_too()
         assert!(at > 21.5 && at < 23.0, "a plain road, me from s {my_s}, lead from x {lead_x}: front at x = {at:.1}");
     }
 }
+
+// review-r5c-safety -----------------------------------------------------------------------
+
+/// Distance (m) from a person's body edge to the car's body (the road along x).
+fn body_gap(v: &Vehicle, p: &Person) -> f64 {
+    let x0 = v.pos.x - v.state.rear as f64;
+    let x1 = v.pos.x + v.state.front as f64;
+    let dx = (x0 - p.pos.x).max(0.0).max(p.pos.x - x1);
+    let dy = (p.pos.y.abs() - v.half_width as f64).max(0.0);
+    (dx * dx + dy * dy).sqrt() - 0.28
+}
+
+struct Scene {
+    min_gap: f64,
+    v_min: f32,
+    people_s: f32,
+    /// My front's x when the gap was smallest.
+    front_at_min: f32,
+}
+
+/// Runs `secs` with car 0 watched; `each` moves the people and sets `sim.walkers`.
+fn scene(net: &Network, people: Vec<Person>, walkers: Vec<(usize, f32)>, mut cars: Vec<Vehicle>, secs: f32, mut each: impl FnMut(f32, &mut Simulation)) -> Scene {
+    let mut sim = Simulation::new(net, vec![]);
+    sim.people = people;
+    sim.walkers = walkers;
+    let mut o = Scene { min_gap: f64::INFINITY, v_min: f32::INFINITY, people_s: 0.0, front_at_min: 0.0 };
+    let mut t = 0.0f32;
+    while t < secs {
+        each(t, &mut sim);
+        sim.tick(net, DT, &mut cars);
+        let me = &cars[0];
+        for p in &sim.people {
+            let g = body_gap(me, p);
+            if g < o.min_gap {
+                o.min_gap = g;
+                o.front_at_min = me.pos.x as f32 + me.state.front;
+            }
+        }
+        o.v_min = o.v_min.min(me.state.speed);
+        if me.last.why == Why::People {
+            o.people_s += DT;
+        }
+        t += DT;
+    }
+    o
+}
+
+/// [review-r5c-safety A] A person level with my bumper (0.3 m behind the front plane), 1.0 m
+/// off my axis - inside my footprint and their body - stepping toward my lane at 0.3-1.0 m/s:
+/// a car at 3, 8 or 13 m/s brakes for them (C2's level-with-body release is for a body
+/// outside my footprint only).
+#[test]
+fn c2_a_stepper_beside_the_bumper_inside_my_footprint_is_braked_for() {
+    let net = road_with_a_zebra(false);
+    for &v in &[3.0f32, 8.0, 13.0] {
+        for &lat in &[0.3f64, 0.6, 1.0] {
+            // (the car at s = 300 on lane 0: its origin at x = 0, its front at 2.0)
+            let p = Person { vel: glam::DVec2::new(0.0, -lat), ..person(1.7, 1.0) };
+            let o = scene(&net, vec![p], vec![], vec![car(1, 0, 300.0, v)], 4.0, |_, sim| {
+                for p in sim.people.iter_mut() {
+                    p.pos += (p.vel * DT as f64).extend(0.0);
+                }
+            });
+            assert!(o.people_s > 0.1 && o.v_min < v - 1.0, "car at {v} m/s, stepper at {lat} m/s: held {:.2} s, slowest {:.2} m/s", o.people_s, o.v_min);
+        }
+    }
+    // the eleven of viz4 case01: level with the body 1.3 m off the axis, outside the footprint
+    // (0.9 + 0.28), standing: the car drives off
+    let o = scene(&net, vec![person(1.0, 1.3), person(-1.0, -1.3)], vec![], vec![car(1, 0, 300.0, 0.0)], 6.0, |_, _| {});
+    assert!(o.people_s < 0.5 && o.min_gap > 0.0, "held {:.1} s, gap {:.2}", o.people_s, o.min_gap);
+}
+
