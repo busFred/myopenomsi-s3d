@@ -1113,7 +1113,14 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let chain = js.chain_along(j, &way[k..]);
         let foes = js.foes_along(j, &chain);
         let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[js.nodes[j].movements[mm].lane].length()).sum();
-        let (first, last) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
+        // (the room past the conflicts is measured from the end of the last crossing or
+        // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
+        // a queueing lane, not a box to keep clear: counting it put the "box" of BeijingCity's
+        // twin stub chains 60 m on, where the exit queue's tail closed it for 25 s with the
+        // crossing itself clear, viz3 case03 #4436; the resolver's side-merge rules and the
+        // roll-up stop, `plan::roll_up_point`, keep a car off the one standing beside)
+        let first = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+        let last = foes.iter().filter(|f| !f.side).map(|f| f.mine.1).fold(0.0f32, f32::max);
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };
         let clear_from = d0 + if last > 0.0 { last } else { way_len };
         let need = me.length() + me.state.min_gap;

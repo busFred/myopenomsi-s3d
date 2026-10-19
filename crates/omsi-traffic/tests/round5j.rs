@@ -401,3 +401,28 @@ fn a_car_standing_half_a_metre_before_an_amber_line_does_not_take_it() {
     run(&net, &mut sim, &mut cars, 6.0, |_, _, _| {});
     assert!(front_x(&cars[0]) > 10.0, "a rolling car in the dilemma zone stopped: x = {:.1}", front_x(&cars[0]));
 }
+
+#[test]
+fn j5_a_side_merge_stretch_is_no_box_to_keep_clear() {
+    // the twin chains (J6's object): a car stands in B's last piece near its END (s 38 of 40),
+    // past the A3/B3 side stretch, its tail 1.5 m past that stretch's end: before, the exit
+    // was "full" (clear_from = the side stretch's end, 1.5 m of room) and the car stood at the
+    // entry; now the side stretch is no box: no exit hold, it drives on along A
+    let net = twin_chains(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut blocker = car(9, 8, 38.0, 0.0);
+    blocker.external.stop_at = Some(0.1);
+    let mut mine = car(1, 0, 120.0, 8.0);
+    mine.state.planned_next = Some(1);
+    mine.state.ahead = vec![2, 3, 4, 5];
+    let mut cars = vec![blocker, mine];
+    let mut held_exit = false;
+    run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+        let c = cars.iter().find(|c| c.id == 1).unwrap();
+        held_exit |= c.last.hold == Some(omsi_traffic::Hold::ExitFull);
+        cars.iter_mut().find(|c| c.id == 9).unwrap().state.speed = 0.0;
+    });
+    assert!(!held_exit, "held for a full exit by a car standing beside the side stretch's end");
+    let c = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(front_x(c) > 40.0, "did not drive on: front at x = {:.1}", front_x(c));
+}
