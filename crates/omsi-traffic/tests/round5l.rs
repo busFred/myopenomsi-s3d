@@ -157,14 +157,15 @@ fn squeeze_past_from(net: &Network, lane: usize, start: (f32, f32), player: Play
 
 #[test]
 fn l2_a_car_squeezes_past_the_players_bus_half_out_of_its_lane_on_a_road_with_a_neighbour_lane() {
-    // the right lane's drawn road reaches the left lane's painted edge (2.0 m) and a kerb at
-    // its own right edge; the bus stands 1.6 m right of the axis (half on the kerb): the
-    // squeeze needs 0.9 m to the left, 1.8 m of road from the axis - inside the drawn road
+    // the right lane's drawn road reaches 2.0 m to the left (the left lane's traffic keeps
+    // it to 3.5 - 1.5 - 0.3 = 1.7 m) and a kerb at its own right edge; the bus stands 1.8 m
+    // right of the axis (half on the kerb): the squeeze needs 0.7 m to the left, 1.6 m of
+    // road from the axis - inside the drawn road, no wheels over the line
     let net = two_lanes((2.0, 1.5), false);
-    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 1.6, 30.0), vec![], false);
+    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 1.8, 30.0), vec![], false);
     let pass = r.pass.expect("no squeeze on a road with a neighbour lane");
     assert!(pass.lane.is_none() && pass.beside.is_none(), "{pass:?}");
-    assert!((pass.side + 0.9).abs() < 0.05, "squeeze side {}", pass.side);
+    assert!((pass.side + 0.7).abs() < 0.05, "squeeze side {}", pass.side);
     assert!(r.least > 0.25, "came within {:.2} m of the bus", r.least);
     assert!(r.x_end > 215.0, "never got past the bus: x {:.1}", r.x_end);
     assert_eq!(r.on_lanes, vec![1], "registered on {:?}", r.on_lanes);
@@ -225,9 +226,9 @@ fn l1_a_lanes_drivable_extent_is_cut_at_a_lane_of_another_spline_alongside() {
     net.lanes.push(b);
     net.lanes.push(road(&[(100.0, -200.0), (100.0, 200.0)], 3));
     let net = finish(net);
-    // cut at the other's painted edge: 3.5 - 1.5 = 2.0 m; the crossing lane cuts nothing
-    assert_eq!(net.lanes[0].drivable(), (2.0, 5.0));
-    assert_eq!(net.lanes[1].drivable(), (2.0, 5.0));
+    // cut 1.5 + 0.3 short of the other's axis 3.5 m away: 1.7 m; the crossing lane cuts nothing
+    assert_eq!(net.lanes[0].drivable(), (1.7, 5.0));
+    assert_eq!(net.lanes[1].drivable(), (1.7, 5.0));
     assert_eq!(net.lanes[2].drivable(), (1.5, 1.5));
     // a lane added later (a tile streaming in) cuts the lane already there
     let mut net2 = Network::default();
@@ -240,13 +241,14 @@ fn l1_a_lanes_drivable_extent_is_cut_at_a_lane_of_another_spline_alongside() {
     let mut c = road(&[(0.0, -3.5), (300.0, -3.5)], 4);
     c.drivable = (5.0, 5.0);
     net2.extend(vec![c], 1.5);
-    assert_eq!(net2.lanes[0].drivable(), (5.0, 2.0));
-    assert_eq!(net2.lanes[1].drivable(), (2.0, 5.0));
+    assert_eq!(net2.lanes[0].drivable(), (5.0, 1.7));
+    assert_eq!(net2.lanes[1].drivable(), (1.7, 5.0));
 }
 
-/// One lane each way: 0 eastbound at y = 0 to x = 600, 1 westbound at y = 3; the eastbound
-/// lane's drawn road `right` m to its right (a parking strip, no kerb) and to the oncoming
-/// lane's painted edge on its left; a lit stub at `lit` if given.
+/// One lane each way: 0 eastbound at y = 0 to x = 600, 1 westbound at y = 3.6 (BeijingCity's
+/// spacing; the oncoming traffic keeps the eastbound lane's room to 3.6 - 1.5 - 0.3 = 1.8 m);
+/// the eastbound lane's drawn road `right` m to its right (a parking strip, no kerb) and 1.5 m
+/// to its left; a lit stub at `lit` if given.
 fn two_way(right: f32, lit: Option<f64>) -> Network {
     let mut net = Network::default();
     match lit {
@@ -268,7 +270,7 @@ fn two_way(right: f32, lit: Option<f64>) -> Network {
             net.lanes.push(a);
         }
     }
-    net.lanes.push(road(&[(600.0, 3.0), (0.0, 3.0)], 4));
+    net.lanes.push(road(&[(600.0, 3.6), (0.0, 3.6)], 4));
     finish(net)
 }
 
@@ -378,22 +380,22 @@ fn walker(x: f64, y: f64, vx: f64, vy: f64) -> Person {
 }
 
 /// JiananDong_1.sli as the Wuluju stop has it (round5 case01): a 1.9 m eastbound lane at
-/// y = 0 whose drawn road reaches the oncoming lane's painted edge 2.65 m to its left and
-/// the asphalt's end 4.6 m to its right (the pavement path lies on it, no kerb); the
-/// oncoming lane 3.6 m to the left.
+/// y = 0 whose drawn road reaches 2.3 m to its left (a car's half width + 0.3 short of the
+/// oncoming lane's axis 3.6 m away) and the asphalt's end 4.6 m to its right (the pavement
+/// path lies on it, no kerb).
 fn jianandong() -> Network {
     let mut net = Network::default();
     let mut a = lane(&[(0.0, 0.0), (600.0, 0.0)], LaneKind::Street, 1.9);
     a.source = 1;
     a.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
     a.offset = 1.8;
-    a.drivable = (2.65, 4.6);
+    a.drivable = (2.3, 4.6);
     net.lanes.push(a);
     let mut b = lane(&[(600.0, 3.6), (0.0, 3.6)], LaneKind::Street, 1.9);
     b.source = 1;
     b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 0 });
     b.offset = 1.8;
-    b.drivable = (2.65, 3.6);
+    b.drivable = (2.3, 3.6);
     net.lanes.push(b);
     finish(net)
 }
@@ -439,8 +441,8 @@ fn past_people(net: &Network, me: Vehicle, people: Vec<Person>, others: Vec<Vehi
 #[test]
 fn l3_a_car_shifts_half_a_metre_to_pass_walkers_on_the_kerbless_pavement_strip() {
     // round5 case01 #2827: the walkers 0.33-0.53 m off its flank beside the lane; the car
-    // eases half a metre towards the middle (1.2 m of road to the oncoming lane's edge) and
-    // drives past them without standing
+    // eases half a metre towards the middle (0.83 m of room left to the keep-off from the
+    // oncoming lane) and drives past them without standing
     let net = jianandong();
     let (lat, least, got_past, stood, me) = past_people(&net, sedan(1, 0, 190.0, 4.0), walkers_beside(205.0), vec![], 15.0, 215.0);
     assert!(got_past, "never got past the walkers: x {:.1} why {:?}", me.pos.x, me.last.why);

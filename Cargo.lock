@@ -3526,6 +3526,7 @@ dependencies = [
  "glam",
  "hashbrown 0.17.1",
  "log",
+ "omsi-scenery",
  "omsi-sim",
  "serde",
  "serde_json",

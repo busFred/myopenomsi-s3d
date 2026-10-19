@@ -19,6 +19,20 @@ pub const RAISED_ABOVE_ROAD: f32 = 0.05;
 /// A path lies on a strip when the drawn surface is within this (m) of the path's height
 /// (a path floats a centimetre or three over its asphalt; a deck 1 m up is another road).
 pub const PATH_ON_STRIP_DZ: f32 = 0.5;
+/// The drivable extent stops this far short of a neighbouring street lane's axis: a car's
+/// half width (the common 2.0 m car; a 1.9 m or 1.0 m BeijingCity lane is narrower than
+/// the cars on it, so its painted edge lies inside them) ...
+pub const NEIGHBOUR_CAR_HALF: f32 = 1.0;
+/// ... and this much clear of it (round 5 L safety review: squeezes to the painted edge of
+/// 1.9 m lanes met the vans there).
+pub const NEIGHBOUR_KEEP: f32 = 0.3;
+
+/// Where the drivable extent of a lane ends towards a neighbouring street lane whose axis
+/// lies `axis_dist` (> 0) away and that is `width` wide: a car's half width and
+/// `NEIGHBOUR_KEEP` short of its axis (its painted half width when that is more).
+pub fn neighbour_edge(axis_dist: f32, width: f32) -> f32 {
+    axis_dist - (width * 0.5).max(NEIGHBOUR_CAR_HALF) - NEIGHBOUR_KEEP
+}
 
 /// One drawn band of the cross-section between two profile points.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,10 +108,13 @@ pub fn classify_texture(name: &str) -> &'static str {
         "tiles",
         "fliese",
         "trottoir",
+        "trotuar",
         "chodnik",
+        "renxing",
     ];
+    // (OMSI's grass verge is `str_gruenstreifen`: "gruen" before the "str_" of the road list)
     const GROUND: &[&str] = &[
-        "grass", "gras", "rasen", "green", "dirt", "earth", "erde", "sand", "kies", "gravel",
+        "grass", "gras", "rasen", "green", "gruen", "grün", "dirt", "earth", "erde", "sand", "kies", "gravel",
         "schotter", "wiese", "boden", "ground",
     ];
     const ROAD: &[&str] = &[
@@ -313,9 +330,10 @@ impl CrossSection {
 
 /// The drivable extent of street path `path_index` of spline type `def` to the left and
 /// right of its axis in its direction of travel (metres): the drawn road's reach either
-/// side ([`CrossSection::drivable_extent`]), cut at the near edge of the next street path
-/// of the same spline on that side (the neighbour's or the oncoming lane's painted edge),
-/// never less than the path's own half width. `mirror`: the spline is placed mirrored
+/// side ([`CrossSection::drivable_extent`]), cut short of the next street path of the same
+/// spline on that side (the neighbour's or the oncoming lane: a car's half width and
+/// `NEIGHBOUR_KEEP` off its axis, [`neighbour_edge`]), never less than the path's own half
+/// width. `mirror`: the spline is placed mirrored
 /// (its cross-section turned over); `reversed`: the lane runs against the spline's
 /// direction. A path over no drawn road (an invisible helper spline, a Human_path) gets
 /// its half width either side.
@@ -334,9 +352,9 @@ pub fn lane_drivable(def: &Spline, path_index: usize, mirror: bool, reversed: bo
         }
         let ox = o.start[0];
         if ox > x {
-            pos = pos.min(ox - o.width * 0.5 - x);
+            pos = pos.min(neighbour_edge(ox - x, o.width));
         } else if ox < x {
-            neg = neg.min(x - (ox + o.width * 0.5));
+            neg = neg.min(neighbour_edge(x - ox, o.width));
         }
     }
     let (neg, pos) = (neg.max(half), pos.max(half));
@@ -449,17 +467,17 @@ mod tests {
         let mut def = kerbed();
         // the oncoming lane at +1.75 (3.5 m wide to the drawn end), mine at -1.75
         def.paths = vec![path(-1.75, 0.0, 3.0, 0), path(1.75, 0.0, 3.0, 1)];
-        // plain: left to the kerb (1.75), right to the oncoming lane's painted edge at
-        // 1.75 - 1.5 = 0.25 -> 2.0 m
-        assert_eq!(lane_drivable(&def, 0, false, false), (1.75, 2.0));
+        // plain: left to the kerb (1.75), right to 1.5 + 0.3 short of the oncoming lane's
+        // axis 3.5 m away -> 1.7 m
+        assert_eq!(lane_drivable(&def, 0, false, false), (1.75, 1.7));
         // the oncoming path runs backwards: its right is the spline's left, so the kerb
         // side is its left... from +1.75 the drawn end at 3.5 lies 1.75 m to +x and my
-        // edge at -0.25 lies 2.0 m to -x; reversed: (left, right) = (to +x, to -x)
-        assert_eq!(lane_drivable(&def, 1, false, true), (1.75, 2.0));
+        // lane's keep-off lies 1.7 m to -x; reversed: (left, right) = (to +x, to -x)
+        assert_eq!(lane_drivable(&def, 1, false, true), (1.75, 1.7));
         // mirrored (and the forward path then runs backwards, as the lane builder does):
         // the cross-section turned over, the kerb on the other side, the same numbers
-        assert_eq!(lane_drivable(&def, 0, true, true), (1.75, 2.0));
-        assert_eq!(lane_drivable(&def, 0, true, false), (2.0, 1.75));
+        assert_eq!(lane_drivable(&def, 0, true, true), (1.75, 1.7));
+        assert_eq!(lane_drivable(&def, 0, true, false), (1.7, 1.75));
         // never less than the path's own half width, even on a strip narrower than it
         def.paths[0].width = 5.0;
         assert_eq!(lane_drivable(&def, 0, false, false), (2.5, 2.5));
@@ -481,8 +499,27 @@ mod tests {
         }];
         def.paths = vec![path(-1.8, 0.1, 1.9, 1), path(1.8, 0.1, 1.9, 0), PathDef { kind: 1, ..path(3.845, 0.25, 1.567, 2) }];
         let (l, r) = lane_drivable(&def, 1, false, false);
-        assert!((l - 2.65).abs() < 1e-5 && (r - 4.6).abs() < 1e-5, "{l} {r}");
+        assert!((l - 2.3).abs() < 1e-5 && (r - 4.6).abs() < 1e-5, "{l} {r}");
         let (l, r) = lane_drivable(&def, 0, false, true);
-        assert!((l - 2.65).abs() < 1e-5 && (r - 3.6).abs() < 1e-5, "{l} {r}");
+        assert!((l - 2.3).abs() < 1e-5 && (r - 3.6).abs() < 1e-5, "{l} {r}");
+    }
+
+    #[test]
+    fn a_grass_verge_is_ground_not_road_and_the_extent_stops_at_it() {
+        // OMSI's `str_gruenstreifen.bmp` (round 5 L safety review: 194 crossings in 121 .sli)
+        assert_eq!(classify_texture("str_gruenstreifen.bmp"), "ground");
+        assert_eq!(classify_texture("Str_Gruenstreifen_02.jpg"), "ground");
+        assert_eq!(classify_texture("str_asphdrk.bmp"), "road");
+        assert_eq!(classify_texture("trotuar_01.bmp"), "walk");
+        // a road strip, a 4 m grass median at the same height, the oncoming road beyond
+        let mut def = Spline::default();
+        def.textures = vec![tex("str_asphdrk.bmp"), tex("str_gruenstreifen.bmp")];
+        def.profiles = vec![
+            SplineProfile { texture: 0, points: vec![pt(-7.0, 0.0), pt(-2.0, 0.0)] },
+            SplineProfile { texture: 1, points: vec![pt(-2.0, 0.0), pt(2.0, 0.0)] },
+            SplineProfile { texture: 0, points: vec![pt(2.0, 0.0), pt(7.0, 0.0)] },
+        ];
+        def.paths = vec![path(-4.5, 0.0, 3.0, 0), path(4.5, 0.0, 3.0, 1)];
+        assert_eq!(lane_drivable(&def, 0, false, false), (2.5, 2.5));
     }
 }

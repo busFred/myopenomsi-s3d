@@ -7,6 +7,7 @@ description = "AI road traffic: compiled junctions, driver model, perception/pla
 
 [dependencies]
 omsi-sim = { path = "../omsi-sim" }
+omsi-scenery = { path = "../omsi-scenery" }
 glam.workspace = true
 log.workspace = true
 hashbrown = { workspace = true, features = ["serde"] }

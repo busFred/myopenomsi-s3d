@@ -163,10 +163,10 @@ mod tests {
         assert!(!cs.edges.iter().any(|e| e.kind == "kerb"), "{:?}", cs.edges);
         let fwd = def.paths.iter().position(|p| p.kind == 0 && p.start[0] > 0.0).expect("the +1.8 path");
         let (l, r) = lane_drivable(&def, fwd, false, false);
-        assert!((l - 2.65).abs() < 1e-3 && (r - 4.6).abs() < 1e-3, "left {l} right {r}");
+        assert!((l - 2.3).abs() < 1e-3 && (r - 4.6).abs() < 1e-3, "left {l} right {r}");
         let back = def.paths.iter().position(|p| p.kind == 0 && p.start[0] < 0.0).expect("the -1.8 path");
         let (l, r) = lane_drivable(&def, back, false, true);
-        assert!((l - 2.65).abs() < 1e-3 && (r - 3.6).abs() < 1e-3, "left {l} right {r}");
+        assert!((l - 2.3).abs() < 1e-3 && (r - 3.6).abs() < 1e-3, "left {l} right {r}");
     }
 
     fn curve(radius: f64) -> SplineCurve {

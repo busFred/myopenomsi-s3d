@@ -1787,8 +1787,8 @@ impl Network {
 const ALONGSIDE_DEG: f32 = 35.0;
 
 impl Network {
-    /// [round 5 L1] The drivable extent of every street lane from `from` on is cut at the
-    /// near edge of any other street lane running alongside it, whatever spline or object
+    /// [round 5 L1] The drivable extent of every street lane from `from` on is cut short of
+    /// any other street lane running alongside it, whatever spline or object
     /// it belongs to (the cross-section knew its own spline's paths alone; BeijingCity lays
     /// a 10 m "noside" asphalt under a separate carriageway spline): the strip beyond a
     /// lane's own edge that a squeeze or a shift may use is the drawn road that belongs to
@@ -1796,9 +1796,23 @@ impl Network {
     pub fn clip_drivable(&mut self, from: usize) {
         let n = self.lanes.len();
         let mut clips: Vec<(usize, f32, f32)> = Vec::new();
+        // (what cuts a street lane: another street lane; a footpath of another spline - a
+        // raised pavement spline laid beside the road, BeijingCity's L_Roadside_5m - at its
+        // painted edge, its kerb; a footpath of the lane's own spline lies on the same asphalt
+        // and is no edge, the brief's JiananDong case)
+        let edge_for = |lane: &Lane, other: &Lane| -> bool {
+            match other.kind {
+                LaneKind::Street => true,
+                LaneKind::Sidewalk => match (lane.key, other.key) {
+                    (Some(ka), Some(kb)) => ka.tile != kb.tile || ka.id != kb.id || lane.source != other.source,
+                    _ => true,
+                },
+                _ => false,
+            }
+        };
         for i in from..n {
             let a = &self.lanes[i];
-            if a.kind != LaneKind::Street || a.points.len() < 2 {
+            if !matches!(a.kind, LaneKind::Street | LaneKind::Sidewalk) || a.points.len() < 2 {
                 continue;
             }
             let mut cand: Vec<usize> = Vec::new();
@@ -1817,13 +1831,15 @@ impl Network {
             }
             for j in cand {
                 let b = &self.lanes[j];
-                if b.kind != LaneKind::Street || b.points.len() < 2 {
+                if b.points.len() < 2 {
                     continue;
                 }
-                if let Some((l, r)) = Self::clip_by(a, b) {
-                    clips.push((i, l, r));
+                if a.kind == LaneKind::Street && edge_for(a, b) {
+                    if let Some((l, r)) = Self::clip_by(a, b) {
+                        clips.push((i, l, r));
+                    }
                 }
-                if j < from {
+                if j < from && b.kind == LaneKind::Street && edge_for(b, a) {
                     if let Some((l, r)) = Self::clip_by(b, a) {
                         clips.push((j, l, r));
                     }
@@ -1836,8 +1852,9 @@ impl Network {
         }
     }
 
-    /// Lane `a`'s drivable extent cut at the near edge of `b` where `b` runs alongside it:
-    /// the new (left, right), if `b` cuts anything.
+    /// Lane `a`'s drivable extent cut short of `b` where `b` runs alongside it (a car's half
+    /// width and `NEIGHBOUR_KEEP` off its axis, `omsi_scenery::profile::neighbour_edge`): the
+    /// new (left, right), if `b` cuts anything.
     fn clip_by(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
         let half = a.width * 0.5;
         let (mut l, mut r) = a.drivable();
@@ -1870,7 +1887,8 @@ impl Network {
             let hr = (h as f64).to_radians();
             let right = DVec2::new(hr.cos(), -hr.sin());
             let lat = (q - p).truncate().dot(right) as f32;
-            let edge = (lat.abs() - b.width * 0.5).max(half);
+            // (a street lane: a car's half width and 0.3 off its axis; a footpath: its edge)
+            let edge = if b.kind == LaneKind::Street { omsi_scenery::profile::neighbour_edge(lat.abs(), b.width) } else { lat.abs() - b.width * 0.5 }.max(half);
             if lat > 0.0 && edge < r {
                 r = edge;
                 changed = true;
