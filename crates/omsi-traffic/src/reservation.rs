@@ -664,6 +664,17 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 if o.blocked && !c.blocked && !c.light_red && o.standing() && !their_inside && !o.committed && my_out + CLEAR_MARGIN <= their_in + START_DELAY {
                     continue;
                 }
+                // standing in a merge's meeting place behind me (its front further from the
+                // merge's end than my rear) with me as its lead (through standing links,
+                // `held_by_standing`): it stopped behind me and waits for me, it is not in my
+                // way (a foe let through rolling up to my queue by `held_by_standing` stopped
+                // 2.2 m behind my rear with me as its lead, and held me 30 s as "standing in
+                // the meeting place", viz case14 #46608/#50444). Level with me or ahead, it
+                // holds me as before (`competitor_filter_my_follower_in_the_same_lane_is_no_foe`)
+                let behind_me = foe.kind == FoeKind::Merge && foe.theirs.1 - (o.s + o.front) > foe.mine.1 - (c.s - c.rear);
+                if their_inside && o.speed < 0.3 && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
+                    continue;
+                }
                 // standing in the meeting place, held by its own lead: it is not leaving
                 // on the schedule its acceleration would give it
                 if their_inside && o.held && o.speed < 0.3 {
@@ -2474,6 +2485,51 @@ mod tests {
         other[1].held = true;
         other[1].blocked = true;
         let g = resolve(&js, &net, &other);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    #[test]
+    fn j4_a_foe_standing_in_the_meeting_place_behind_me_with_me_as_its_lead_is_no_foe() {
+        // A (0) and B (1) merge into C (2); A gives way to B. The bus on B rolls at 2 m/s, its
+        // front a metre short of the merge; the car on A stands held inside its stretch with
+        // the bus as its lead (it rolled up to the bus's queue and stopped on its rear, viz
+        // case14 #46608/#50444)
+        let (net, js) = merge_a_gives_way();
+        let f = js.nodes[0].movements[1].foes.iter().find(|f| f.movement == 0).unwrap();
+        let (b0, a0) = (f.mine.0, f.theirs.0);
+        // (the bus's rear 3 m past the stretch's start, the car's front a metre in: 2 m behind
+        // that rear along the merged way)
+        let mut bus = claim(1, 1, b0 + 3.0 + 2.0, 2.0);
+        bus.chain = vec![(1, 0.0), (2, 10.0)];
+        let mut car = claim(2, 0, a0 + 1.0 - 2.0, 0.0);
+        car.chain = vec![(0, 0.0), (2, 10.0)];
+        car.held = true;
+        car.lead = Some(1);
+        let g = resolve(&js, &net, &[bus.clone(), car.clone()]);
+        assert!(grant_of(&g, 1).go, "held by a car that waits for me: {g:?}");
+        // level with me (its front past my rear): it holds me as before
+        let mut level = car.clone();
+        level.s = a0 + 4.0 - 2.0;
+        let g = resolve(&js, &net, &[bus.clone(), level]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // through a standing link: the car's lead stands behind the bus with the bus as lead
+        let mut link = claim(3, 0, a0 - 5.0 - 2.0, 0.0);
+        link.chain = vec![(0, 0.0), (2, 10.0)];
+        link.lead = Some(1);
+        let mut car2 = car.clone();
+        car2.lead = Some(3);
+        let g = resolve(&js, &net, &[bus.clone(), car2, link]);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // its lead somebody else: standing in the meeting place, it holds me as before
+        let mut other = car.clone();
+        other.lead = Some(99);
+        let g = resolve(&js, &net, &[bus.clone(), other]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // rolling inside with me as its lead (a lead is one frame's perception): as before
+        let mut rolling = car.clone();
+        rolling.speed = 1.0;
+        rolling.held = false;
+        let g = resolve(&js, &net, &[bus, rolling]);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
     }
 

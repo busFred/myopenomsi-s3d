@@ -1181,9 +1181,12 @@ impl Simulation {
             if !meet {
                 continue;
             }
+            // (behind the other: held by its body, or following it as its lead - that one
+            // cannot go anyway; the hash eased the one in front of a nose-to-tail pair, and it
+            // stood `EASE_MAX` for the one behind it, viz case14 #46608/#50444)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let blocked_a = vehicles[a].last.body_block == Some(idb);
-            let blocked_b = vehicles[b].last.body_block == Some(ida);
+            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].lead_id == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].lead_id == Some(ida);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a

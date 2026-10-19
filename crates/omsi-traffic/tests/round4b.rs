@@ -794,6 +794,11 @@ fn side_and_main(b_front: f64) -> (Network, Vec<Vehicle>) {
 /// says so; `blocked` names the cars held by the other's body, for `body_on` s of every
 /// `body_on + body_off` s (a flickering lead).
 fn held_each_other_as(red: bool, wait_for: &[u64], blocked: &[u64], body_on: f32, body_off: f32, secs: f32) -> Option<(u64, u64, usize, f32)> {
+    held_each_other_led(red, wait_for, blocked, &[], body_on, body_off, secs)
+}
+
+/// `held_each_other_as` with the cars in `led` following the other as their lead (`lead_id`).
+fn held_each_other_led(red: bool, wait_for: &[u64], blocked: &[u64], led: &[u64], body_on: f32, body_off: f32, secs: f32) -> Option<(u64, u64, usize, f32)> {
     let (net, mut cars) = side_and_main(6.0);
     let mut sim = Simulation::new(&net, vec![]);
     sim.tick(&net, DT, &mut cars);
@@ -811,6 +816,7 @@ fn held_each_other_as(red: bool, wait_for: &[u64], blocked: &[u64], body_on: f32
             me.state.speed = 0.0;
             me.last.wait_for = wait_for.contains(&me.id).then_some(other);
             me.last.body_block = (blocked.contains(&me.id) && body_now).then_some(other);
+            me.lead_id = led.contains(&me.id).then_some(other);
         }
         sim.negotiate(&mut cars, &claim_of, DT);
         if let Some(e) = cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j, t))) {
@@ -843,6 +849,11 @@ fn x7_a_mutual_refusal_is_negotiated_at_once_by_the_pair_s_hash() {
     }
     // never while either is held by a red light
     assert_eq!(held_each_other(true, &[], 20.0), None, "a negotiation at a red light");
+    // of two refused for each other where one follows the other as its lead (nose to tail), the
+    // one behind eases off, whatever the hash says (viz case14 #46608/#50444)
+    for led in [1u64, 2] {
+        assert_eq!(held_each_other_led(false, &[1, 2], &[], &[led], 1.0, 0.0, 0.2).map(|e| e.0), Some(led));
+    }
 }
 
 #[test]
