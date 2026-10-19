@@ -137,7 +137,7 @@ impl JunctionView {
 /// lane leading into it, at most eight pieces or 80 m. (controller, light, distance from the
 /// origin to the lit lane's start; `back` is the distance to `lane`'s start, <= 0.) None when
 /// none is found or two different lights are (the way it came is not known).
-fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
+fn light_behind(net: &Network, sim: &Simulation, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
     let mut found: Option<(usize, usize, f32)> = None;
     let mut ambiguous = false;
     // (lane, distance from the origin to its start, steps)
@@ -155,7 +155,7 @@ fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32,
             }
             let Some(pl) = net.lanes.get(p) else { continue };
             let dp = d - pl.length();
-            if let Some((ctl, li)) = pl.traffic_light {
+            if let Some((ctl, li)) = stop_light(net, sim, p) {
                 match found {
                     Some((c, i, _)) if (c, i) != (ctl, li) => ambiguous = true,
                     Some(_) => {}
@@ -1036,6 +1036,21 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     best
 }
 
+/// Light `li` of controller `ctl` is a detector, not a stop line: its program is one constant
+/// green phase (X10's "Loop", "HVZ" and "Nacht" lights on 1 m paths before the real line, that
+/// the program's `[traffic_light_jump]` points test through the lane's `[approachdist]` request).
+/// Nobody stops at it and it hides no later line (x10 case04: 14 of the 16 red crossings of
+/// 54 min had one 1 m before the real line, which came into view only over the bumper). The
+/// lane's request is raised as for any lit lane (`Simulation::update_lights`).
+pub fn detector_light(sim: &Simulation, ctl: usize, li: usize) -> bool {
+    sim.lights.get(ctl).and_then(|c| c.lights.get(li)).is_some_and(|phases| phases.len() == 1 && matches!(TrafficLightController::aspect(phases[0].0), Aspect::Green))
+}
+
+/// The light on lane `l`, unless it is a detector (`detector_light`).
+pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, usize)> {
+    net.lanes.get(l)?.traffic_light.filter(|&(ctl, li)| !detector_light(sim, ctl, li))
+}
+
 /// The next light on the way within 150 m. A second light of the same junction object on a
 /// straight run holds nobody: the car has passed its line.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
@@ -1045,7 +1060,7 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
             break;
         }
         let lane = &net.lanes[l];
-        let Some((ctl, li)) = lane.traffic_light else { continue };
+        let Some((ctl, li)) = stop_light(net, sim, l) else { continue };
         let key = lane.key.map(|k| (k.tile, k.id));
         if let (Some(k), Some((sk, sh))) = (key, seen_object) {
             if k == sk && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
@@ -1068,6 +1083,16 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
     None
 }
 
+/// A vehicle slower than this (m/s) past the junction's conflicts is standing there as far
+/// as the room on the exit goes (a car moving off is past 2 m/s within a second; a crawl is
+/// not moving off). Was 1.5: x10 case06, a third left-turner entered behind one crawling at
+/// 0.5-2 m/s, stopped with its tail across the through lane and held it 11 s.
+const EXIT_SLOW: f32 = 2.0;
+/// The exit's first metres past the conflicts: a vehicle crawling there, or rolling up to a
+/// standing lead there, is a queue forming, and the box is not entered behind it (x10 case06;
+/// the figure `heads` reports the exit's state over).
+const EXIT_NEAR: f32 = 15.0;
+
 /// The next junction on the way (or the one the car is in), with the room past its
 /// conflicts measured along the car's own way: a vehicle standing inside the piece past the
 /// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
@@ -1085,7 +1110,14 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let chain = js.chain_along(j, &way[k..]);
         let foes = js.foes_along(j, &chain);
         let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[js.nodes[j].movements[mm].lane].length()).sum();
-        let (first, last) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
+        // (the room past the conflicts is measured from the end of the last crossing or
+        // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
+        // a queueing lane, not a box to keep clear: counting it put the "box" of BeijingCity's
+        // twin stub chains 60 m on, where the exit queue's tail closed it for 25 s with the
+        // crossing itself clear, viz3 case03 #4436; the resolver's side-merge rules and the
+        // roll-up stop, `plan::roll_up_point`, keep a car off the one standing beside)
+        let first = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+        let last = foes.iter().filter(|f| !f.side).map(|f| f.mine.1).fold(0.0f32, f32::max);
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };
         let clear_from = d0 + if last > 0.0 { last } else { way_len };
         let need = me.length() + me.state.min_gap;
@@ -1100,14 +1132,36 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
                 let o = &vehicles[occ.vehicle];
                 let tail = wd + occ.s - o.state.rear;
-                if o.state.speed < 1.5 && tail > clear_from - 0.5 {
+                if o.state.speed < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
+                // a queue forming in the exit's first metres: one crawling there (rolling under
+                // `EXIT_SLOW`) leaves no room behind it whatever the gap to its tail now (not a
+                // bus serving its stop there: it leaves on its own schedule);
+                // one standing there, or rolling up to a standing lead, closes the box when
+                // the place I would queue in behind it - my need behind its tail where it stops,
+                // `predicted_tail` - lies inside those first metres: x10 case06 #11146 entered
+                // behind #11131 rolling at 4.6 m/s towards a queue 18 m ahead, and stood with
+                // its tail across the through lane; a queue tail 40 m past a crossing, viz3
+                // case03/16, leaves the box open)
+                let crawling = o.state.speed >= 0.3 && o.state.speed < EXIT_SLOW;
+                let standing_lead = o.last.lead.filter(|l| l.speed < 0.3);
+                let queueing = o.state.speed < 0.3 || standing_lead.is_some();
+                let predicted_tail = tail + standing_lead.map(|l| (l.gap - o.state.min_gap).max(0.0)).unwrap_or(0.0);
+                if !o.external.at_stop && tail > clear_from - 0.5 && ((crawling && tail - clear_from < EXIT_NEAR) || (queueing && predicted_tail - clear_from < EXIT_NEAR + need)) {
+                    room = 0.0;
+                }
             }
-            for &(k, s, _) in sim.player_occupancy.get(&wl).map(|v| v.as_slice()).unwrap_or(&[]) {
+            for &(k, s, lateral) in sim.player_occupancy.get(&wl).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let p = &sim.players[k];
+                // (a player snapped to this lane from beside it, its body clear of the lane by
+                // the kerb margin, as `Simulation::player_parked_beside`: in a queue 3.5 m to the
+                // left of the exit lane, the player's bus closed the box for 25 s, viz3 case03)
+                if lateral.abs() - p.half_width > net.lanes[wl].width * 0.5 + crate::sim::PARKED_CLEAR {
+                    continue;
+                }
                 let tail = wd + s - p.half_len;
-                if p.speed.abs() < 1.5 && tail > clear_from - 0.5 {
+                if p.speed.abs() < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
             }
@@ -1140,13 +1194,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             if wd > light_line + 1.0 {
                 break;
             }
-            if let Some((ctl, li)) = net.lanes[wl].traffic_light {
+            if let Some((ctl, li)) = stop_light(net, sim, wl) {
                 light = Some((ctl, li, wd));
                 break;
             }
         }
         if light.is_none() && inside && k == 0 {
-            light = light_behind(net, js, j, l, d0, me.state.prev_lane);
+            light = light_behind(net, sim, js, j, l, d0, me.state.prev_lane);
         }
         let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
         let turned = light.is_some_and(|(ctl, li, _)| sim.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), Aspect::Green | Aspect::GreenYellow | Aspect::Dark)));

@@ -257,6 +257,10 @@ pub struct Vehicle {
     /// other's `wait_for` or `body_block`), and for how many seconds (`MUTUAL_HOLD`).
     #[serde(default)]
     pub mutual: Option<(u64, f32)>,
+    /// Seconds since the mutual hold (`mutual`) was last seen: the partner is kept over a gap
+    /// shorter than `MUTUAL_GAP` (a lead flickering between a body and none).
+    #[serde(default)]
+    pub mutual_gap: f32,
     /// Eased off for the vehicle with this id at this junction, since then (s): it stays held
     /// and its claim does not stand in the other's way (`Claim::yields_now`) until the other
     /// has left the meeting places of the two.
@@ -264,9 +268,30 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
-/// Two vehicles holding each other this long (s) at a junction where they have a meeting place
-/// negotiate: one eases off (`Vehicle::ease_for`).
+/// Two vehicles holding each other at a junction where they have a meeting place negotiate:
+/// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
+/// by the junction (`Decision::wait_for` both ways: the resolver's answer will not change by
+/// itself); a pair held by a body (`body_block`) on one side negotiates after this long (s),
+/// times the driver's `mutual_jitter`. (Round 4's 6 s clock for every pair never fired in a
+/// drive: four pairs stood 157 pair-seconds creeping at 0.2 m/s, review r5.)
 pub const MUTUAL_HOLD: f32 = 6.0;
+/// A mutual hold not seen for less than this (s) keeps its partner and its clock: a lead
+/// flickering every 0.4 s between a body and none restarted the clock each time (x10 case03,
+/// the dice rolled once in 54 min).
+pub const MUTUAL_GAP: f32 = 1.0;
+/// `MUTUAL_HOLD` is scaled per driver by a factor in this range (the lower id's, seeded by
+/// its id) so that unrelated pairs do not tick in lockstep.
+pub const MUTUAL_JITTER: (f32, f32) = (0.5, 1.5);
+
+/// The factor of `MUTUAL_JITTER` for the driver with vehicle id `id`, the same in every run.
+pub fn mutual_jitter(id: u64) -> f32 {
+    let mut x = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    let u = (x >> 40) as f32 / (1u64 << 24) as f32;
+    MUTUAL_JITTER.0 + (MUTUAL_JITTER.1 - MUTUAL_JITTER.0) * u
+}
 /// An eased-off car takes part again after this long (s) whatever the other does.
 pub const EASE_MAX: f32 = 30.0;
 
@@ -285,6 +310,21 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     } else {
         hi
     }
+}
+
+/// Seconds a player stands before it counts as held where it is: blocked to the junction
+/// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
+pub const PLAYER_STILL: f32 = 2.0;
+/// A standing player whose body is this far (m) clear of the lane's edge makes no junction
+/// claim: what a car keeps off a kerb (`perception::KERB_CLEAR`).
+pub const PARKED_CLEAR: f32 = 0.3;
+
+/// The lateral offset (m, right positive) of player `p` from lane `lane` at `s` along it.
+fn player_lateral(net: &Network, lane: usize, s: f32, p: &PlayerView) -> f32 {
+    let (q, h) = net.lanes[lane].at(s.min(net.lanes[lane].length()));
+    let hr = (h as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    (p.pos - q).truncate().dot(right) as f32
 }
 
 /// An aborted pass standing out there steps back into its lane at this pace (m/s) ...
@@ -328,6 +368,7 @@ impl Vehicle {
             zip_won: None,
             change_still: (0.0, 0.0),
             mutual: None,
+            mutual_gap: 0.0,
             ease_for: None,
         }
     }
@@ -562,11 +603,7 @@ impl Simulation {
         for k in 0..self.players.len() {
             let p = self.players[k];
             let Some((lane, s)) = self.player_lane(net, &p) else { continue };
-            let (q, h) = net.lanes[lane].at(s.min(net.lanes[lane].length()));
-            let hr = (h as f64).to_radians();
-            let right = DVec2::new(hr.cos(), -hr.sin());
-            let lateral = (p.pos - q).truncate().dot(right) as f32;
-            self.player_occupancy.entry(lane).or_default().push((k, s, lateral));
+            self.player_occupancy.entry(lane).or_default().push((k, s, player_lateral(net, lane, s, &p)));
         }
     }
 
@@ -619,6 +656,16 @@ impl Simulation {
     fn player_lane(&self, net: &Network, p: &PlayerView) -> Option<(usize, f32)> {
         let (l, s, _) = net.lane_along(p.pos, p.heading as f64, LaneKind::Street, 6.0, 45.0)?;
         Some((l, s))
+    }
+
+    /// A player standing (`PLAYER_STILL`) with its body wholly beside the lane it is snapped
+    /// to, by more than `PARKED_CLEAR`: parked beside the lanes, it is a body to perception
+    /// (`player_on_way`) but no junction contender. (x10 case10: a bus 0.75 m clear of the
+    /// lane, snapped to the right-turn piece 3.3 m away, was "standing in the merge" and held
+    /// 9 cars 106 s.)
+    fn player_parked_beside(net: &Network, lane: usize, s: f32, p: &PlayerView) -> bool {
+        let lateral = player_lateral(net, lane, s, p);
+        p.still > PLAYER_STILL && p.speed.abs() < 0.3 && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
     }
 
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
@@ -843,6 +890,8 @@ impl Simulation {
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
                 yields_now: None,
+                // (where people, a zebra or a standing lead will stop the front)
+                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -858,6 +907,10 @@ impl Simulation {
             // the way: (lane, distance from the vehicle's origin to the lane's start)
             let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {
+                // (parked beside the lane: no claim, `player_parked_beside`)
+                if Self::player_parked_beside(net, lane, s, p) {
+                    continue;
+                }
                 way.push((lane, -s));
                 let mut d = net.lanes[lane].length() - s;
                 let mut cur = lane;
@@ -926,10 +979,11 @@ impl Simulation {
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
-            // (not a stretch it runs side by side with another lane before its light, `Foe::side`)
+            // (not a stretch it runs side by side with another lane before its light, `Foe::side`;
+            // nor a detector, `perception::detector_light`)
             let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
-            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
@@ -946,7 +1000,7 @@ impl Simulation {
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
-            let blocked = p.still > 2.0 && p.speed.abs() < 0.3 && !light_red;
+            let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
             claims.push(Claim {
                 chain,
                 was_standing: false,
@@ -967,7 +1021,7 @@ impl Simulation {
                 exit_room: true,
                 impatience: Impatience::default(),
                 absolute: p.priority,
-                held: p.still > 2.0,
+                held: p.still > PLAYER_STILL,
                 blocked,
                 stuck: false,
                 clearing: false,
@@ -976,6 +1030,7 @@ impl Simulation {
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
+                clear_ahead: f32::INFINITY,
             });
         }
         for (i, standing) in standing_now {
@@ -1071,35 +1126,52 @@ impl Simulation {
         }
     }
 
-    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`) for
-    /// `MUTUAL_HOLD` at a junction where their ways meet, neither at a red light: one eases off
+    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`), both
+    /// standing, at a junction where their ways meet, neither at a red light: one eases off
     /// (`Vehicle::ease_for`), the other goes on by the ordinary rules - bodies, other foes and
     /// all (round 4a's standoff break let the winner ignore the other's body and claim, and it
-    /// squeezed past at -0.01 m, review9). The one that eases off: of two where only one is
-    /// body-blocked by the other, that one (it cannot go anyway; the other waits for it at the
-    /// junction); else by `eases_off`, the same in every run.
+    /// squeezed past at -0.01 m, review9). When: at the first frame both are refused for each
+    /// other by the junction (`wait_for` both ways; the resolver's answer will not change by
+    /// itself, and it took 6 s before: `MUTUAL_HOLD`), else, one of them held by the other's
+    /// body only, after `MUTUAL_HOLD` times the lower id's `mutual_jitter`; a hold not seen
+    /// for less than `MUTUAL_GAP` keeps its clock. The one that eases off: of two where only
+    /// one is body-blocked by the other, that one (it cannot go anyway; the other waits for it
+    /// at the junction); else by `eases_off`, the same in every run.
     pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
         let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
-        let mut timers: Vec<Option<(u64, f32)>> = Vec::with_capacity(vehicles.len());
+        let mut timers: Vec<(Option<(u64, f32)>, f32)> = Vec::with_capacity(vehicles.len());
         for v in vehicles.iter() {
             // (both standing: one rolling up to its stop is not held yet)
             let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
-            timers.push(other.map(|o| (o, match v.mutual {
-                Some((p, t)) if p == o => t + dt,
-                _ => dt,
-            })));
+            timers.push(match (other, v.mutual) {
+                (Some(o), Some((p, t))) if p == o => (Some((o, t + dt)), 0.0),
+                (Some(o), _) => (Some((o, dt)), 0.0),
+                // (not seen this frame: kept over a short gap while it stands)
+                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < 0.3 => (Some((p, t + dt)), v.mutual_gap + dt),
+                (None, _) => (None, 0.0),
+            });
         }
-        for (v, t) in vehicles.iter_mut().zip(&timers) {
+        for (v, (t, gap)) in vehicles.iter_mut().zip(&timers) {
             v.mutual = *t;
+            v.mutual_gap = *gap;
         }
         for a in 0..vehicles.len() {
             let Some((oid, t)) = vehicles[a].mutual else { continue };
             let Some(&b) = by_id.get(&oid) else { continue };
-            if vehicles[a].id > oid || t < MUTUAL_HOLD || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
+            if vehicles[a].id > oid || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
                 continue;
             }
             if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+                continue;
+            }
+            // (only at a frame the hold is seen: who is body-blocked is read from this frame)
+            if vehicles[a].mutual_gap > 0.0 || vehicles[b].mutual_gap > 0.0 {
+                continue;
+            }
+            // the first mutual refusal, or the body-held pair's clock
+            let refused = vehicles[a].last.wait_for == Some(oid) && vehicles[b].last.wait_for == Some(vehicles[a].id);
+            if !refused && t < MUTUAL_HOLD * mutual_jitter(vehicles[a].id) {
                 continue;
             }
             let (Some(ka), Some(kb)) = (claim_of[a], claim_of[b]) else { continue };
@@ -1112,9 +1184,12 @@ impl Simulation {
             if !meet {
                 continue;
             }
+            // (behind the other: held by its body, or following it as its lead - that one
+            // cannot go anyway; the hash eased the one in front of a nose-to-tail pair, and it
+            // stood `EASE_MAX` for the one behind it, viz case14 #46608/#50444)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let blocked_a = vehicles[a].last.body_block == Some(idb);
-            let blocked_b = vehicles[b].last.body_block == Some(ida);
+            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].lead_id == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].lead_id == Some(ida);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a
@@ -1130,6 +1205,8 @@ impl Simulation {
             vehicles[ease].ease_for = Some((other, j, 0.0));
             vehicles[a].mutual = None;
             vehicles[b].mutual = None;
+            vehicles[a].mutual_gap = 0.0;
+            vehicles[b].mutual_gap = 0.0;
         }
     }
 
