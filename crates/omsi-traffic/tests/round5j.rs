@@ -259,3 +259,74 @@ fn j5_a_car_crawling_in_the_exits_first_metres_closes_the_box_a_bus_at_its_stop_
     let (held, _) = enters_behind(15.0, 0.0, true, false);
     assert!(held, "the car entered the box behind one standing 12 m past the conflict");
 }
+
+// ---- J6: the side-merge hold rolls up behind the queue in the twin chain ----
+
+/// viz4 case02's object: the lead-in piece (1) forks into two chains running side by side to
+/// two exit lanes: A (2, 3, 4: x 0..6, 6..20, 20..60, bending right to y = -2.8) and B (6, 7,
+/// 8, straight along y = 0; the chains 1.6 m apart, linked along themselves only); approach
+/// 0, exits 5 (A) and 9 (B). With `pocket`, a side road (10) comes in from the north into B's
+/// last piece: another entry into the chain.
+fn twin_chains(pocket: bool) -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-200.0, 0.0), (-10.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(-10.0, 0.0), (0.0, 0.0)], 0, 128.0)); // 1
+    net.lanes.push(piece(&[(0.0, 0.0), (6.0, -1.6)], 1, 128.0)); // 2
+    net.lanes.push(piece(&[(6.0, -1.6), (20.0, -1.6)], 2, 128.0)); // 3
+    net.lanes.push(piece(&[(20.0, -1.6), (60.0, -2.8)], 3, 128.0)); // 4
+    net.lanes.push(road(&[(60.0, -2.8), (300.0, -2.8)], 2)); // 5
+    net.lanes.push(piece(&[(0.0, 0.0), (6.0, 0.0)], 4, 128.0)); // 6
+    net.lanes.push(piece(&[(6.0, 0.0), (20.0, 0.0)], 5, 128.0)); // 7
+    net.lanes.push(piece(&[(20.0, 0.0), (60.0, 0.0)], 6, 128.0)); // 8
+    net.lanes.push(road(&[(60.0, 0.0), (300.0, 0.0)], 3)); // 9
+    if pocket {
+        net.lanes.push(road(&[(10.0, 200.0), (16.0, 1.5), (20.0, 0.0)], 4)); // 10
+    }
+    finish(net)
+}
+
+/// A car stands held in B's last piece 12 m in; the car on the approach, bound for A, comes
+/// up at 8 m/s: where its front stands at the end (x), and whether it ever waited for the
+/// standing one.
+fn rolls_up_in_twin_chains(pocket: bool) -> (f32, bool) {
+    let net = twin_chains(pocket);
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, a3) = js.movement(4).unwrap();
+    assert!(a3.foes.iter().any(|f| f.side && js.nodes[0].movements[f.movement].lane == 8), "A3/B3 a side merge: {:?}", a3.foes);
+    let (_, a2) = js.movement(3).unwrap();
+    assert!(a2.foes.iter().any(|f| f.side && js.nodes[0].movements[f.movement].lane == 7), "A2/B2 a side merge: {:?}", a2.foes);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut blocker = car(9, 8, 12.0, 0.0);
+    blocker.external.stop_at = Some(0.1);
+    let mut mine = car(1, 0, 120.0, 8.0);
+    mine.state.planned_next = Some(1);
+    mine.state.ahead = vec![2, 3, 4, 5];
+    let mut cars = vec![blocker, mine];
+    let mut waited = false;
+    let min_gap = run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+        let c = cars.iter().find(|c| c.id == 1).unwrap();
+        waited |= c.last.wait_for == Some(9);
+        cars.iter_mut().find(|c| c.id == 9).unwrap().state.speed = 0.0;
+    });
+    assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
+    let c = cars.iter().find(|c| c.id == 1).unwrap();
+    (front_x(c), waited)
+}
+
+#[test]
+fn j6_refused_for_the_twin_chains_queue_the_car_rolls_up_behind_it_not_to_the_line() {
+    let (x, waited) = rolls_up_in_twin_chains(false);
+    assert!(waited, "never refused for the standing car");
+    // a metre before the A3/B3 stretch (x = 20), well past where it stood before (x = 5, the
+    // bands of the chains contiguous from +15 on, pulled back to the first)
+    assert!(x > 17.0 && x <= 19.5, "stood with its front at x = {x:.1}");
+}
+
+#[test]
+fn j6_a_chain_with_another_entry_keeps_the_hold_at_the_line() {
+    // (viz3 case03: a stretch shared with turn pockets that have their own entries)
+    let (x, waited) = rolls_up_in_twin_chains(true);
+    assert!(waited, "never refused for the standing car");
+    assert!(x < 8.0, "rolled up to x = {x:.1} although a side road comes into the chain");
+}
+

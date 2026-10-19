@@ -73,6 +73,9 @@ pub struct Movement {
     /// point, are left out.)
     #[serde(default)]
     pub converge: Vec<(f32, f32)>,
+    /// Per stretch of `converge`, the movement it converges with.
+    #[serde(default)]
+    pub converge_with: Vec<usize>,
 }
 
 /// Where a pedestrian crossing cuts a way through the junction.
@@ -251,7 +254,7 @@ impl Junctions {
                     }
                     frontier = nxt;
                 }
-                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY, converge: Vec::new() }
+                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY, converge: Vec::new(), converge_with: Vec::new() }
             })
             .collect();
         // foes from the network's crossings, both ways
@@ -283,7 +286,8 @@ impl Junctions {
         }
         let converge = Self::converging(net, lanes);
         for (m, c) in movements.iter_mut().zip(converge) {
-            m.converge = c;
+            m.converge = c.iter().map(|&(a, b, _)| (a, b)).collect();
+            m.converge_with = c.iter().map(|&(_, _, with)| with).collect();
         }
         let crossings = Self::crossings(net, &movements);
         Junction { key, movements, crossings }
@@ -343,8 +347,9 @@ impl Junctions {
 
     /// Per lane of the object (in `lanes`' order): the stretches where its centre line comes
     /// within `MEET_DIST` of another street lane of the object with no meeting place compiled
-    /// between them (`Movement::converge`; `traffic_cases converge` lists them).
-    fn converging(net: &Network, lanes: &[usize]) -> Vec<Vec<(f32, f32)>> {
+    /// between them, and that lane's movement (`Movement::converge`, `converge_with`;
+    /// `traffic_cases converge` lists them).
+    fn converging(net: &Network, lanes: &[usize]) -> Vec<Vec<(f32, f32, usize)>> {
         let near = omsi_sim::traffic::MEET_DIST;
         let street: Vec<usize> = lanes.iter().copied().filter(|&l| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2).collect();
         let bbox = |l: usize| {
@@ -368,7 +373,7 @@ impl Junctions {
             }
             false
         };
-        let mut out: Vec<Vec<(f32, f32)>> = vec![Vec::new(); lanes.len()];
+        let mut out: Vec<Vec<(f32, f32, usize)>> = vec![Vec::new(); lanes.len()];
         for (x, &a) in street.iter().enumerate() {
             let la = &net.lanes[a];
             for (y, &b) in street.iter().enumerate() {
@@ -397,7 +402,8 @@ impl Junctions {
                 }
                 if s0.is_finite() {
                     let k = lanes.iter().position(|&l| l == a).unwrap();
-                    out[k].push((s0, s1));
+                    let with = lanes.iter().position(|&l| l == b).unwrap();
+                    out[k].push((s0, s1, with));
                 }
             }
         }
