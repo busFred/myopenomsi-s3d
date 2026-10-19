@@ -258,11 +258,16 @@ fn shifted_body(net: &Network, me: &Vehicle, d: f32, side: f32) -> Obb {
     Obb::vehicle(p + right * side as f64, h, st.front as f64, st.rear as f64, me.half_width as f64)
 }
 
-/// Is the corridor of a squeeze `side` metres out, from `from` to `level` metres ahead of the
-/// origin and easing back to the axis over `back` metres more, clear of every other body
-/// (vehicles, players, parked cars, people) by `SQUEEZE_CLEARANCE`?
-fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, way: &[(usize, f32)], side: f32, from: f32, level: f32, back: f32) -> bool {
+/// Is the corridor of a squeeze clear of every other body (vehicles, players, parked cars,
+/// people) by `SQUEEZE_CLEARANCE`: from where the car stands, pulling `side` metres out over
+/// the first `out_len` metres of way (the bent way starts at the car, `Passing::curve`),
+/// level with the obstacle to `level` metres ahead of the origin, and easing back to the axis
+/// over `back` metres more? (Review r5l safety, pass 3: sampled from `real - out_len` only,
+/// a car standing level or just ahead on the squeeze side was missed; BJ #3878 yawed into
+/// #4203 standing 0.2 m beside it.)
+fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, way: &[(usize, f32)], side: f32, out_len: f32, level: f32, back: f32) -> bool {
     let to = level + back;
+    let from = 0.0f32;
     let near = sim.vehicles_near(me.pos, (to + 30.0) as f64);
     let clearance = SQUEEZE_CLEARANCE as f64;
     let mut parked: Vec<Obb> = Vec::new();
@@ -282,9 +287,15 @@ fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         }
     }
     let people = sim.people_near(me.pos, (to + 15.0) as f64);
-    let mut d = from.max(0.0);
+    let mut d = from;
     loop {
-        let side_d = if d <= level { side } else { side * (1.0 - (d - level) / back.max(0.1)).max(0.0) };
+        let side_d = if d < out_len {
+            side * (d / out_len.max(0.1))
+        } else if d <= level {
+            side
+        } else {
+            side * (1.0 - (d - level) / back.max(0.1)).max(0.0)
+        };
         let b = shifted_body(net, me, d, side_d);
         // (nobody on foot in the corridor: a squeeze stopped for people mid-ramp stands half
         // out, its body in the car it passes - the BeijingCity 08:16 pair #376/#450)
@@ -708,7 +719,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             && !player_out
             && lateral_settled(sim, vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
-            && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, real - squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
+            && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
         let room = out_len + 1.0;

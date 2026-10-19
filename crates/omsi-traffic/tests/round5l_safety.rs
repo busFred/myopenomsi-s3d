@@ -526,3 +526,40 @@ fn r4_a_footpath_of_another_spline_alongside_cuts_the_extent_at_its_edge() {
     net.extend(vec![foreign], 1.5);
     assert_eq!(net.lanes[0].drivable(), (2.3, 2.0));
 }
+
+#[test]
+fn s10_a_car_standing_level_or_just_ahead_on_the_squeeze_side_stops_the_squeeze() {
+    // BJ new3 08:21 #3878/#4203: a car stranded 1.96 m out stood 0.21 m beside #3878, which
+    // started a squeeze to that side past a lead 19 m ahead and yawed into it. Here: the lead
+    // stands 1.7 m right of the axis 6 m ahead of the car's front (the squeeze goes left), and
+    // another car stands out on the left, 1.96 m from the axis, level with the car / 3 m / 6 m
+    // ahead: no squeeze starts into it; without it (the control) the squeeze goes. (A car
+    // stands on the oncoming lane 40 m on, so that no pass on the oncoming lane is possible:
+    // that pass has no body sweep of its own - pre-existing, outside this review's ask.)
+    for ahead in [Some(0.0f32), Some(3.0), Some(6.0), None] {
+        let (net, lead) = one_lane_strip(1.7);
+        let mut me = car(1, 0, 190.0, 0.0);
+        me.stopped = 5.0;
+        let mut oncoming = car(7, 1, 600.0 - 230.0, 0.0);
+        oncoming.stopped = 30.0;
+        oncoming.pull_out = 1000.0;
+        let mut others = vec![lead, oncoming];
+        if let Some(a) = ahead {
+            let mut beside = car(6, 0, 190.0 + a, 0.0);
+            beside.stopped = 30.0;
+            beside.pull_out = 1000.0;
+            beside.state.lateral = -1.96;
+            beside.state.lateral_target = -1.96;
+            beside.state.lateral_ramp = (-1.96, -1.96, 0.0, 1.0);
+            beside.external.bay = Some(-1.96);
+            others.push(beside);
+        }
+        let r = watch(&net, me, None, others, vec![], 20.0);
+        eprintln!("S10 beside {ahead:?} m ahead: pass {:?} out_at {:?} least_other {:.2} at t {:.1} max_lat {:.2} x_end {:.1}", r.pass.map(|p| (p.side, p.lane)), r.out_at, r.least_other, r.least_other_t, r.max_lat, r.x_end);
+        assert!(r.least_other > 0.0, "beside {ahead:?} m ahead: contact {:.2}", r.least_other);
+        match ahead {
+            Some(_) => assert!(r.pass.is_none(), "beside {ahead:?} m ahead: set out into it: {:?}", r.pass),
+            None => assert!(r.pass.is_some_and(|p| p.lane.is_none() && p.side < 0.0) && r.x_end > 210.0, "control: {:?} x {:.1}", r.pass, r.x_end),
+        }
+    }
+}
