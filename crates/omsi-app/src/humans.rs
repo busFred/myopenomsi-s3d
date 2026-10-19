@@ -1536,13 +1536,46 @@ fn refuge(net: &Network, leg: &Leg) -> bool {
     true
 }
 
+/// [ROLLBACK r5-P3] Seconds of the clearance somebody going on across at the change leaves
+/// unused: the two seconds `pedestrian_window` allows where no car light is programmed, a
+/// step onto the far kerb.
+const PED_CLEAR_MARGIN: f32 = 2.0;
+
+/// [ROLLBACK r5-P3] Seconds until a vehicle may drive over the footpath lanes `paths` by the
+/// lights of the carriageway lanes they cross and of the lanes leading into those (the
+/// soonest; 0 with one showing green now); None where none of them carries a light - the
+/// program gives no clearance.
+fn cars_go_in(ped: &mut PedNet, net: &Network, traffic: &dyn PedLights, paths: &[usize]) -> Option<f32> {
+    let crossed: Vec<usize> = paths.iter().flat_map(|&p| ped.crossed_lanes(net, p).to_vec()).collect();
+    let mut soonest: Option<f32> = None;
+    for &s in &crossed {
+        let feeding = net.prev.get(s).map(|p| p.as_slice()).unwrap_or(&[]);
+        for &l in std::iter::once(&s).chain(feeding) {
+            let Some((c, li)) = net.lanes[l].traffic_light else {
+                continue;
+            };
+            if let Some(g) = traffic.light_until_go(c, li) {
+                soonest = Some(soonest.map(|v: f32| v.min(g)).unwrap_or(g));
+            }
+        }
+    }
+    soonest
+}
+
 /// [ROLLBACK r4c-P1] Caught by the change at `walked` metres (from the first piece's start,
 /// `lead` m from the kerb behind it) of a crossing of `pieces` (length, whether a refuge):
-/// to the nearest safe place of the near kerb, a refuge of the crossing and the far kerb
-/// (the far kerb on a tie: the old rule, back before the middle).
-fn change_turns_back(walked: f32, lead: f32, pieces: &[(f32, bool)]) -> Clear {
+/// [ROLLBACK r5-P3] on across when the far kerb is reached in the clearance (seconds until
+/// the cars go, seconds the rest takes at the hurried pace) less PED_CLEAR_MARGIN; else, or
+/// with no clearance programmed, to the nearest safe place of the near kerb, a refuge of
+/// the crossing and the far kerb (the far kerb on a tie: the old rule, back before the middle).
+fn change_turns_back(walked: f32, lead: f32, pieces: &[(f32, bool)], clearance: Option<(f32, f32)>) -> Clear {
     let last = pieces.len().saturating_sub(1);
     let total: f32 = pieces.iter().map(|p| p.0).sum();
+    if let Some((cars_in, rest_takes)) = clearance {
+        if rest_takes <= cars_in - PED_CLEAR_MARGIN {
+            return Clear::On(last);
+        }
+    }
     let mut options = vec![(total - walked, Clear::On(last)), (walked + lead, Clear::Back(0))];
     let mut r0 = 0.0f32;
     for (j, &(len, is_refuge)) in pieces.iter().enumerate() {
@@ -2104,9 +2137,16 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
             if let Some((state, _)) = c.light.and_then(|(ctl, li)| lights.light_state(ctl, li)) {
                 if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
                     // [ROLLBACK r5-P2] to the nearest safe place: the near kerb, a median that
-                    // lies in no lane, the far kerb
+                    // lies in no lane, the far kerb - [ROLLBACK r5-P3] or on across, hurrying,
+                    // when the clearance the controller gives allows it (at a 5.6 s green with a
+                    // 12 s clearance everybody who had started on green was turned back, and ten
+                    // stood on the zebra with "go" through the cars' green: X10 case13)
                     let pieces: Vec<(f32, bool)> = walk.legs[c.from..=c.to].iter().map(|l| (l.len(), refuge(net, l))).collect();
-                    match change_turns_back(c.walked(walk), c.lead, &pieces) {
+                    let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
+                    let walked = c.walked(walk);
+                    let rest = (c.total - walked).max(0.0) * if c.total > 0.1 { c.span / c.total } else { 1.0 };
+                    let clearance = ped.as_deref_mut().and_then(|p| cars_go_in(p, net, lights, &paths)).map(|g| (g, rest / hurried(me.pace) as f32));
+                    match change_turns_back(walked, c.lead, &pieces, clearance) {
                         Clear::Back(i) => {
                             walk.turn_back_to(net, c.from + i);
                             me.decision = Some(TURNS_BACK);
@@ -8593,6 +8633,8 @@ mod ped_tests {
         pub unlit: bool,
         /// The state of light (0, 1), a second group.
         pub second: Cell<i32>,
+        /// Seconds until a car light goes green while the pedestrians' light is not.
+        pub car_go: Cell<f32>,
     }
 
     pub(super) const GREEN: i32 = 6;
@@ -8600,7 +8642,7 @@ mod ped_tests {
 
     impl FakeLights {
         pub fn new(state: i32, left: f32) -> FakeLights {
-            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false, second: Cell::new(state) }
+            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false, second: Cell::new(state), car_go: Cell::new(20.0) }
         }
     }
 
@@ -8609,7 +8651,7 @@ mod ped_tests {
             Some((if li == 1 { self.second.get() } else { self.state.get() }, self.left.get()))
         }
         fn light_until_go(&self, _c: usize, _li: usize) -> Option<f32> {
-            Some(if omsi_sim::traffic::TrafficLightController::allows_go(self.state.get()) { 0.0 } else { 20.0 })
+            Some(if omsi_sim::traffic::TrafficLightController::allows_go(self.state.get()) { 0.0 } else { self.car_go.get() })
         }
         fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
             (!self.unlit && self.pieces.contains(&lane)).then_some((0, 0))
@@ -8699,8 +8741,18 @@ mod ped_tests {
     /// returns where they end up after `secs`, the longest they stood on the carriageway and
     /// whether they were `on_crossing` everywhere between the kerbs.
     fn caught_at(red_at: f32, secs: f32) -> (DVec2, f32, bool, Option<&'static str>) {
-        let (net, mut ped) = crossing(true);
+        caught_at_with(red_at, secs, None)
+    }
+
+    /// `caught_at` with the near lane lit by a car light that goes green `car_go` s after the
+    /// pedestrians' red (None: no car light programmed, as `crossing` has it).
+    fn caught_at_with(red_at: f32, secs: f32, car_go: Option<f32>) -> (DVec2, f32, bool, Option<&'static str>) {
+        let (mut net, mut ped) = crossing(true);
+        if car_go.is_some() {
+            net.lanes[0].traffic_light = Some((0, 5));
+        }
         let lights = FakeLights::new(GREEN, 60.0);
+        lights.car_go.set(car_go.unwrap_or(20.0));
         let mut walk = across();
         let mut m = me(3, DVec2::new(-10.0, -5.5), 1.2);
         let dt = 0.05;
@@ -9101,17 +9153,17 @@ mod ped_tests {
         assert!(!refuge(&net, &legs1[4]), "a 1 m painted island is not");
         let pieces = |m: f32| vec![(1.5, false), (4.0, false), (3.5, false), (m, m >= 2.0), (3.5, false), (3.5, false), (1.5, false)];
         // 8 m of 20.5 walked, the median 1 m on: on to it (before: back 8 m to the near kerb)
-        assert_eq!(change_turns_back(8.0, 0.0, &pieces(3.0)), Clear::On(3));
+        assert_eq!(change_turns_back(8.0, 0.0, &pieces(3.0), None), Clear::On(3));
         // 13 m walked, the median 1 m behind: back to its far end
-        assert_eq!(change_turns_back(13.0, 0.0, &pieces(3.0)), Clear::Back(4));
+        assert_eq!(change_turns_back(13.0, 0.0, &pieces(3.0), None), Clear::Back(4));
         // on the median itself: stay on it (to its end)
-        assert_eq!(change_turns_back(10.0, 0.0, &pieces(3.0)), Clear::On(3));
+        assert_eq!(change_turns_back(10.0, 0.0, &pieces(3.0), None), Clear::On(3));
         // 2 m walked: the near kerb; 19 m: the far kerb; no refuge with a 1 m island
-        assert_eq!(change_turns_back(2.0, 0.0, &pieces(3.0)), Clear::Back(0));
-        assert_eq!(change_turns_back(19.0, 0.0, &pieces(3.0)), Clear::On(6));
-        assert_eq!(change_turns_back(8.0, 0.0, &pieces(1.0)), Clear::Back(0));
+        assert_eq!(change_turns_back(2.0, 0.0, &pieces(3.0), None), Clear::Back(0));
+        assert_eq!(change_turns_back(19.0, 0.0, &pieces(3.0), None), Clear::On(6));
+        assert_eq!(change_turns_back(8.0, 0.0, &pieces(1.0), None), Clear::Back(0));
         // put down 6 m into a 12 m piece and caught 0.3 m on: 6.3 of 12 from the kerb, on
-        assert_eq!(change_turns_back(0.3, 6.0, &[(6.0, false)]), Clear::On(0));
+        assert_eq!(change_turns_back(0.3, 6.0, &[(6.0, false)], None), Clear::On(0));
         // walked: caught 8 m across, they wait on the median with "red light", in no lane
         let (end, decision, stood) = caught_two_stage(3.0, 8.0, 40.0);
         assert!(end.y > 3.8 && end.y < 6.2, "on the median: {end:?}");
@@ -9141,6 +9193,29 @@ mod ped_tests {
             frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
         }
         assert!(m.pos.y > 14.5, "across the second street on its green: {:?} {:?}", m.pos, m.decision);
+    }
+
+    #[test]
+    fn r5p3_only_who_cannot_clear_in_the_clearance_turns_back() {
+        // caught 3 m into the 11 m crossing: 8 m at the hurried pace take 8 / 1.68 = 4.8 s
+        // (me(3) walks 1.2 m/s). With the cars' green 12 s off, on across; 5 s off, back;
+        // with no car light programmed (`caught_at`), back before the middle as before
+        let (end, stood, flagged, decision) = caught_at_with(3.0, 40.0, Some(12.0));
+        assert!(end.y > 5.3, "on across within the clearance: {end:?} {decision:?}");
+        assert!(stood < 0.2 && flagged);
+        let (end, stood, _, decision) = caught_at_with(3.0, 40.0, Some(5.0));
+        assert!(end.y < -5.0, "back, the clearance too short: {end:?} {decision:?}");
+        assert!(stood < 0.2);
+        assert_eq!(decision, Some("red light"));
+        let (end, ..) = caught_at_with(3.0, 40.0, None);
+        assert!(end.y < -5.0, "back, no clearance programmed: {end:?}");
+        // the rule itself: 4 s needed, 7 s given: on; 5.9 s given (margin 2): back
+        let pieces = [(1.5, false), (4.0, false), (4.0, false), (1.5, false)];
+        assert_eq!(change_turns_back(3.0, 0.0, &pieces, Some((7.0, 4.0))), Clear::On(3));
+        assert_eq!(change_turns_back(3.0, 0.0, &pieces, Some((5.9, 4.0))), Clear::Back(0));
+        assert_eq!(change_turns_back(3.0, 0.0, &pieces, Some((0.0, 4.0))), Clear::Back(0), "the cars have green already");
+        assert_eq!(change_turns_back(3.0, 0.0, &pieces, None), Clear::Back(0));
+        assert_eq!(change_turns_back(6.0, 0.0, &pieces, None), Clear::On(3));
     }
 
     #[test]
