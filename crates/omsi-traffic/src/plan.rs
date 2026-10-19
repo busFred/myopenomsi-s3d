@@ -415,7 +415,10 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
         // (a car standing with its bumper over the line waits like one behind it: at a
         // standstill nothing is "too late to stop")
         Aspect::Red | Aspect::RedYellow => {
-            let go = (marked && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
+            // ([round6 J3] the mark lets it on only while it rolls, as on yellow: an eased car
+            // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
+            // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
+            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
             LightCall { go, mark: false, marked_through: marked && gap < comfortable }
         }
     }
@@ -529,6 +532,10 @@ fn entry_roots(sim: &Simulation, j: usize, m: usize) -> Vec<usize> {
     roots.sort_unstable();
     roots
 }
+
+/// [round6 J3] Under this speed (m/s) an eased-off car stands, and is pinned where it is
+/// (`Claim::standing`'s 0.3 m/s).
+const EASE_STANDING: f32 = 0.3;
 
 /// A standing vehicle this far (m) off a piece of my way (its origin to the piece's centre
 /// line) is on a lane running side by side with it, and its rear is projected on my way.
@@ -792,11 +799,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // (eased off in a mutual hold: it stays where it stands until the other is through)
+    // [round6 J3] pinned there only while it stands and its grant offers no follow; with one
+    // (the other rolls on into a merge of the two ahead) it rolls in behind it, the follow
+    // branch above; rolling with none, it stops gently (case03: #5424 stood pinned 13 s with
+    // the follow behind #8417 ready 9 of them; case06 #13911 10 s on the zebra)
     if let (Some(_), Some(g)) = (me.ease_for, grant) {
         if !g.go {
             out.hold = g.hold;
             out.wait_for = g.wait_for;
-            min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::Junction);
+            if g.follow.is_none() {
+                let at = if v < EASE_STANDING { st.front + 0.1 } else { st.front + v * v / (2.0 * dp.comfort_brake) + 0.3 };
+                min_stop(&mut out.stop, &mut out.why, Some(at), Why::Junction);
+            }
         }
     }
 

@@ -1101,9 +1101,11 @@ impl Simulation {
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
-        // and the next tie there is the other side's
+        // and the next tie there is the other side's ([round6 J3] written at the first
+        // decision, not only on go: refused for a third, the winner stays first, and the pair's
+        // order does not flip as their distances change)
         for (g, c) in grants.iter().zip(&claims) {
-            if let (true, Some((key, piece))) = (g.go, g.zip) {
+            if let Some((key, piece)) = g.zip {
                 // (a player's win is not remembered: no keyframe would carry it)
                 if let Some(v) = vehicles.get_mut(c.vehicle) {
                     v.zip_won = Some((key, piece, self.time));
@@ -1137,9 +1139,15 @@ impl Simulation {
                 if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
                     return None;
                 }
-                // (the other still short of, or in, a meeting place of the two)
+                // (the other still short of, or in, the first meeting place of the two beyond
+                // where I stand, its rear not yet `CLEAR_MARGIN` s of its speed past that
+                // stretch's end. [round6 J3] Not every meeting place of the chain: two merging
+                // run on along one way, and the ease held the one behind until the other had
+                // left the whole object, review-r6 case03/06)
                 let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
-                let inside = pieces.iter().any(|(_, f)| theirs.chain.iter().any(|&(m, off)| m == f.movement && theirs.s - off - theirs.rear <= f.theirs.1));
+                let my_front = mine.s + mine.front;
+                let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
+                let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::CLEAR_MARGIN * theirs.speed.max(0.0));
                 inside.then_some((k, o))
             })();
             match keep {

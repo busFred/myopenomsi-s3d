@@ -143,7 +143,8 @@ pub struct Grant {
     /// Waiting only for the vehicle ahead at a zipper merge, both rolling: follow it in
     /// rather than stop, (gap from my front to its rear along the merged way, its speed).
     pub follow: Option<(f32, f32)>,
-    /// Went first at a zipper merge: (the merge, my piece there).
+    /// Went first at a zipper merge: (the merge, my piece there). (Round 6: also when refused
+    /// for another foe: the order of the two is decided, and remembered from then on.)
     pub zip: Option<((usize, usize, usize), usize)>,
     /// Refused for a foe: where the first stretch it waits for begins, along the way
     /// through (the chain's distances). The car stops just before it (`plan`).
@@ -165,7 +166,7 @@ impl Grant {
 
 /// Seconds a vehicle inside the junction keeps as its margin before a foe may follow it
 /// into the meeting place.
-const CLEAR_MARGIN: f32 = 0.6;
+pub const CLEAR_MARGIN: f32 = 0.6;
 /// [round6 J1] A vehicle standing this long (s) stands for good as far as far claimants go
 /// (`Claim::standing_long`; review-r6 fix 3: the layover bus of case11 stood minutes, the Dongdan
 /// cluster's foes 30 s and more).
@@ -547,18 +548,20 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
         // (eased off in a mutual hold: it waits for the other, where it stands; where the other
         // rolls on into a merge of the two ahead of it, it follows it in rather than standing,
         // `eased_follow`)
-        if let Some(w) = c.yields_now {
-            let follow = claim_of.get(&w).and_then(|&ok| eased_follow(&my_foes, c, &claims[ok]));
-            out[k] = Some(Grant { follow, ..Grant::refused(c.vehicle, Some(w), Hold::Foe) });
-            continue;
-        }
-        if c.committed || c.absolute || c.light_red {
-            out[k] = Some(Grant::go(c.vehicle));
-            continue;
-        }
-        if !c.exit_room && squeeze.is_none() {
-            out[k] = Some(Grant::refused(c.vehicle, None, Hold::ExitFull));
-            continue;
+        // ([round6 J3] the follow only when no other foe holds it: the rest of its foes are
+        // decided as for anybody, below; one that refuses it keeps it where it stands, as before.
+        // Following its partner in, an eased car rolled into a third merging between them, viz3
+        // case13 #36205/#36201)
+        let eased_for = c.yields_now;
+        if eased_for.is_none() {
+            if c.committed || c.absolute || c.light_red {
+                out[k] = Some(Grant::go(c.vehicle));
+                continue;
+            }
+            if !c.exit_room && squeeze.is_none() {
+                out[k] = Some(Grant::refused(c.vehicle, None, Hold::ExitFull));
+                continue;
+            }
         }
         let mut wait_for: Option<(usize, f32)> = None;
         // (zipper merges) following the one ahead in, while it is the only one waited for;
@@ -570,6 +573,8 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
         let mut hold_at = f32::INFINITY;
         // [round6 J1] the nearest stretch of a far foe standing for good (foe, stretch start)
         let mut far: Option<(usize, f32)> = None;
+        // (the zipper order decided per foe: [round6 J3])
+        let mut zip_order: hashbrown::HashMap<usize, (bool, Option<((usize, usize, usize), usize)>)> = hashbrown::HashMap::new();
         for (my_piece, foe) in &my_foes {
             let my_piece = *my_piece;
             // a meeting place I am in already: I am in the way of those coming, not they in
@@ -583,7 +588,7 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
             let their_lane = node.movements[foe.movement].lane;
             let _ = net.lanes.get(their_lane);
             let (my_in, my_out) = window(c, foe.mine.0, foe.mine.1);
-            for &(ok, shift) in expanded.get(&(c.junction, foe.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle) {
+            for &(ok, shift) in expanded.get(&(c.junction, foe.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle && Some(claims[k].vehicle) != eased_for) {
                 // (one eased off for me in a mutual hold: not in my way at the junction; its
                 // body still is, to the plan)
                 if claims[ok].yields_now == Some(c.vehicle) {
@@ -755,58 +760,82 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 let zipper = !c.absolute && !o.absolute && js.is_zipper(c.junction, my_piece, foe);
                 let mut zip_tie = None;
                 let theirs_first = if zipper {
-                    let d_me = foe.mine.1 - (c.s + c.front);
-                    let d_them = foe.theirs.1 - (o.s + o.front);
-                    let key = (c.junction, my_piece.min(foe.movement), my_piece.max(foe.movement));
-                    let last = ctx.zipper.get(&key).copied();
-                    // the one of us that went first last frame, if either
-                    let held = match last {
-                        Some((_, id)) if id == o.id => Some(true),
-                        Some((_, id)) if id == c.id => Some(false),
-                        _ => None,
-                    };
-                    let level = (d_me - d_them).abs() <= ZIP_TIE;
-                    // the order is fixed once one is within ZIP_FIXED of the merge's end or
-                    // the two are abreast (the one behind with its front past the other's
-                    // rear), until one has gone through: the grant flipped from the car in
-                    // front to the one 1.9 m behind it, and the two met side by side (viz3
-                    // case03/04 #8927/#5315)
-                    let ahead_len = if d_me < d_them { c.front + c.rear } else { o.front + o.rear };
-                    let engaged = d_me.min(d_them) < ZIP_FIXED || (d_me - d_them).abs() < ahead_len;
-                    // (where our ways meet elsewhere too and the table says there who gives way,
-                    // that holds here: the garage way of viz3 case14 meets the street with its
-                    // piece 10094, giving way, and again with 10096, a zipper; each car waited
-                    // for the other, one at either meeting place)
-                    let table = {
-                        let oc = &claims[ok].chain;
-                        let mut t = None;
-                        for (mp, f) in &my_foes {
-                            if !oc.iter().any(|&(m, _)| m == f.movement) {
-                                continue;
-                            }
-                            if f.yields {
-                                t = Some(true);
-                                break;
-                            }
-                            if node.movements[f.movement].foes.iter().any(|g| g.movement == *mp && g.yields) {
-                                t = Some(false);
-                            }
-                        }
+                    // [round6 J3] one order per pair of ways: the pair's first zipper stretch
+                    // still ahead of both decides (the least sum of the two fronts' distances to
+                    // its end: the same stretch from either side), for every stretch of the two;
+                    // per-stretch keys gave opposite answers, 894x897 putting #5424 first and
+                    // 638x897 #8417, and both were refused (review-r6 case03)
+                    if let Some(&(t, tie)) = zip_order.get(&ok) {
+                        zip_tie = tie;
                         t
-                    };
-                    let theirs = match (table, held) {
-                        (Some(t), _) => t,
-                        (None, Some(t)) if engaged || level => t,
-                        _ if !level => d_them < d_me,
-                        _ => match last {
-                            Some((piece, _)) => piece == my_piece,
-                            None => o.vehicle < c.vehicle,
-                        },
-                    };
-                    if !theirs && table.is_none() {
-                        zip_tie = Some((key, my_piece));
+                    } else {
+                        let decisive = my_foes
+                            .iter()
+                            .filter(|(mp, f)| js.is_zipper(c.junction, *mp, f) && c.s - c.rear <= f.mine.1)
+                            .filter_map(|(mp, f)| {
+                                let &(_, off) = claims[ok].chain.iter().find(|&&(m, _)| m == f.movement)?;
+                                let them = claims[ok].s - off;
+                                (them - claims[ok].rear <= f.theirs.1).then(|| ((f.mine.1 - (c.s + c.front)) + (f.theirs.1 - (them + claims[ok].front)), *mp, *f, off))
+                            })
+                            .min_by(|a, b| a.0.total_cmp(&b.0).then((a.1.min(a.2.movement), a.1.max(a.2.movement)).cmp(&(b.1.min(b.2.movement), b.1.max(b.2.movement)))))
+                            .map(|(_, mp, f, off)| (mp, f, off));
+                        let (my_piece, foe, d_them) = match decisive {
+                            Some((mp, f, off)) => (mp, f, f.theirs.1 - (claims[ok].s - off + claims[ok].front)),
+                            None => (my_piece, *foe, foe.theirs.1 - (o.s + o.front)),
+                        };
+                        let foe = &foe;
+                        let d_me = foe.mine.1 - (c.s + c.front);
+                        let key = (c.junction, my_piece.min(foe.movement), my_piece.max(foe.movement));
+                        let last = ctx.zipper.get(&key).copied();
+                        // the one of us that went first last frame, if either
+                        let held = match last {
+                            Some((_, id)) if id == o.id => Some(true),
+                            Some((_, id)) if id == c.id => Some(false),
+                            _ => None,
+                        };
+                        let level = (d_me - d_them).abs() <= ZIP_TIE;
+                        // the order is fixed once one is within ZIP_FIXED of the merge's end or
+                        // the two are abreast (the one behind with its front past the other's
+                        // rear), until one has gone through: the grant flipped from the car in
+                        // front to the one 1.9 m behind it, and the two met side by side (viz3
+                        // case03/04 #8927/#5315)
+                        let ahead_len = if d_me < d_them { c.front + c.rear } else { o.front + o.rear };
+                        let engaged = d_me.min(d_them) < ZIP_FIXED || (d_me - d_them).abs() < ahead_len;
+                        // (where our ways meet elsewhere too and the table says there who gives way,
+                        // that holds here: the garage way of viz3 case14 meets the street with its
+                        // piece 10094, giving way, and again with 10096, a zipper; each car waited
+                        // for the other, one at either meeting place)
+                        let table = {
+                            let oc = &claims[ok].chain;
+                            let mut t = None;
+                            for (mp, f) in &my_foes {
+                                if !oc.iter().any(|&(m, _)| m == f.movement) {
+                                    continue;
+                                }
+                                if f.yields {
+                                    t = Some(true);
+                                    break;
+                                }
+                                if node.movements[f.movement].foes.iter().any(|g| g.movement == *mp && g.yields) {
+                                    t = Some(false);
+                                }
+                            }
+                            t
+                        };
+                        let theirs = match (table, held) {
+                            (Some(t), _) => t,
+                            (None, Some(t)) if engaged || level => t,
+                            _ if !level => d_them < d_me,
+                            _ => match last {
+                                Some((piece, _)) => piece == my_piece,
+                                None => o.vehicle < c.vehicle,
+                            },
+                        };
+                        let tie = if !theirs && table.is_none() { Some((key, my_piece)) } else { None };
+                        zip_order.insert(ok, (theirs, tie));
+                        zip_tie = tie;
+                        theirs
                     }
-                    theirs
                 } else {
                     o.absolute || (foe.yields && !c.absolute) || (!foe.yields && !node.movements[foe.movement].foes.iter().any(|f| f.movement == my_piece && f.yields) && their_in < my_in)
                 };
@@ -922,8 +951,15 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 let _ = (foe.kind == FoeKind::Merge, their_out);
             }
         }
+        if let Some(w) = eased_for {
+            let follow = if wait_for.is_some() { None } else { claim_of.get(&w).and_then(|&ok| eased_follow(&my_foes, c, &claims[ok])) };
+            out[k] = Some(Grant { follow, ..Grant::refused(c.vehicle, Some(w), Hold::Foe) });
+            continue;
+        }
         out[k] = Some(match wait_for {
-            Some((v, _)) => Grant { follow: if must_stop { None } else { follow }, at: hold_at.is_finite().then_some(hold_at), ..Grant::refused(c.vehicle, Some(v), Hold::Foe) },
+            // ([round6 J3] a zipper order won is reported refused too: the memory is written at
+            // the first decision, `Simulation::tick`)
+            Some((v, _)) => Grant { follow: if must_stop { None } else { follow }, at: hold_at.is_finite().then_some(hold_at), zip: zip_won, ..Grant::refused(c.vehicle, Some(v), Hold::Foe) },
             None => Grant { zip: zip_won, ..Grant::go(c.vehicle) },
         });
         // [round6 J1] held by a far foe only: refused, rolling up to its stretch
@@ -2733,5 +2769,62 @@ mod tests {
         let mut short = foe.clone();
         short.standing_long = false;
         assert!(!grant(100.0, 0.0, 5.6, &short).roll_up, "a foe not standing for good gave a roll-up");
+    }
+
+    /// [round6 J3] Two ways side by side over two zipper stretches (a side merge, then the
+    /// merge into one): one order per pair, decided at the pair's first stretch, so the two
+    /// stretches never refuse each car for the other (review-r6 case03: 894x897 put #5424 first,
+    /// 638x897 #8417, and both stood).
+    #[test]
+    fn j3_one_zipper_order_per_pair_of_ways() {
+        let (net, js) = object(&[(&[(-30.0, -1.4), (-12.0, -1.0)], 0), (&[(-12.0, -1.0), (0.0, 0.0)], 0), (&[(-30.0, 1.0), (-12.0, 0.9), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
+        let n = &js.nodes[0].movements;
+        assert!(n[2].foes.len() == 2 && n[2].foes.iter().all(|f| f.kind == FoeKind::Merge && js.is_zipper(0, 2, f)), "{:?}", n[2].foes);
+        let mut both = Vec::new();
+        for speed in [0.0f32, 3.0] {
+            for k in 0..40 {
+                let fa = 1.0 + 0.5 * k as f32;
+                for lead in [-3.0f32, -1.0, 1.0, 3.0] {
+                    let fb = fa + lead;
+                    for (ia, ib) in [(1usize, 2usize), (2, 1)] {
+                        let mut a = claim(ia, 0, fa - 2.0, speed);
+                        a.chain = vec![(0, 0.0), (1, 18.0), (3, 30.0)];
+                        let mut b = claim(ib, 2, fb - 2.0, speed);
+                        b.chain = vec![(2, 0.0), (3, 30.0)];
+                        let g = resolve(&js, &net, &[a, b]);
+                        if grant_of(&g, ia).wait_for == Some(ib) && grant_of(&g, ib).wait_for == Some(ia) {
+                            both.push((speed, fa, fb, ia));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(both.is_empty(), "both refused for each other at (speed, A's front, B's front, A's index): {both:?}");
+    }
+
+    /// [round6 J3] An eased car follows its rolling partner into their merge only when no other
+    /// foe holds it: a third coming into the same merge with the right of way keeps it where it
+    /// stands (viz3 case13: following its partner, #36205 rolled into #36201 merging between).
+    #[test]
+    fn j3_the_eased_one_follows_its_partner_only_when_no_third_holds_it() {
+        let (mut net, _) = object(&[(&[(-10.0, -3.0), (0.0, 0.0)], 0), (&[(-10.0, 3.0), (0.0, 0.0)], 0), (&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
+        net.lanes[2].priority = 192.0;
+        let js = Junctions::compile(&net);
+        let end = |m: usize| js.nodes[0].movements[m].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap().mine.1;
+        let at = |v: usize, m: usize, to_end: f32, speed: f32| {
+            let mut c = claim(v, m, end(m) - to_end - 2.0, speed);
+            c.chain = vec![(m, 0.0), (3, end(m) + 0.2)];
+            c
+        };
+        let mut eased = at(1, 0, 8.0, 0.0);
+        eased.yields_now = Some(2);
+        let partner = at(2, 1, 3.0, 4.0);
+        let g = resolve(&js, &net, &[eased.clone(), partner.clone()]);
+        assert!(grant_of(&g, 1).follow.is_some() && grant_of(&g, 1).wait_for == Some(2), "no follow behind the partner alone: {g:?}");
+        // a third with the right of way 6 m from the merge at 6 m/s
+        let third = at(3, 2, 6.0, 6.0);
+        let g = resolve(&js, &net, &[eased, partner, third]);
+        let mine = grant_of(&g, 1);
+        assert!(!mine.go && mine.follow.is_none() && mine.wait_for == Some(2), "followed in with a third coming: {g:?}");
     }
 }

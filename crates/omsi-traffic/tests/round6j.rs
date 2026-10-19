@@ -172,3 +172,82 @@ fn j2_the_waited_vehicle_standing_in_a_far_convergence_stops_the_car_at_its_line
     let at = waited_beside(30.0, 2.0);
     assert!(at > 5.0 && at <= 25.0, "stood with its front at x = {at:.1}");
 }
+
+/// J3: two lanes of object 9 merging at x = 0 (piece 1 from the south-west, piece 4 from the
+/// north-west, 20 m each, then piece 2 to x = 30). Lanes: 0 and 3 the approaches, 1 and 4 the
+/// merging pieces, 2 the merged way, 5 the exit.
+fn merge_pair() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, -6.0), (-20.0, -6.0)], 1)); // 0
+    net.lanes.push(piece(&[(-20.0, -6.0), (0.0, 0.0)], 0, 128.0, 3.0)); // 1
+    net.lanes.push(piece(&[(0.0, 0.0), (30.0, 0.0)], 2, 128.0, 3.0)); // 2
+    net.lanes.push(road(&[(-300.0, 6.0), (-20.0, 6.0)], 3)); // 3
+    net.lanes.push(piece(&[(-20.0, 6.0), (0.0, 0.0)], 1, 128.0, 3.0)); // 4
+    net.lanes.push(road(&[(30.0, 0.0), (400.0, 0.0)], 4)); // 5
+    finish(net)
+}
+
+/// Car 1 on piece 1, eased off for car 2 on piece 4 (2 m nearer the merge, at `speed`): (how
+/// far car 1 moved in `secs`, when it first moved 0.3 m, the least gap between the bodies).
+fn eased_for_partner(speed: f32, secs: f32) -> (f32, Option<f32>, f32) {
+    let net = merge_pair();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut a = car(1, 1, 8.0, 0.0);
+    a.ease_for = Some((2, 0, 0.0));
+    let mut b = car(2, 4, 10.0, speed);
+    if speed == 0.0 {
+        // (standing for good: something of its own holds it, a parked lead ahead on its piece)
+        b.state.max_speed_kmh = 0.0;
+    }
+    let mut cars = vec![a, b];
+    let start = cars[0].state.odometer;
+    let mut moved_at = None;
+    let min_gap = run(&net, &mut sim, &mut cars, secs, |t, _, cars| {
+        let a = cars.iter().find(|c| c.id == 1).unwrap();
+        if moved_at.is_none() && a.state.odometer - start > 0.3 {
+            moved_at = Some(t);
+        }
+    });
+    let a = cars.iter().find(|c| c.id == 1).unwrap();
+    (a.state.odometer - start, moved_at, min_gap)
+}
+
+#[test]
+fn j3_an_eased_car_follows_its_rolling_partner_in_and_stays_pinned_for_a_standing_one() {
+    // the partner rolls on into the merge at 3 m/s: the eased car rolls in behind it within 2 s
+    // (it was pinned at front + 0.1 until the partner had left the whole object, review-r6
+    // case03 #5424 13 s), keeping off its body
+    let (moved, at, gap) = eased_for_partner(3.0, 8.0);
+    assert!(at.is_some_and(|t| t < 2.0), "moved off at {at:?} s");
+    assert!(moved > 5.0, "moved {moved:.1} m");
+    assert!(gap > 0.3, "touched: {gap:.2} m");
+    // a standing partner (x10 case03 #587/#3221): no follow, it stays where it stands
+    let (moved, _, _) = eased_for_partner(0.0, 4.0);
+    assert!(moved < 0.3, "moved {moved:.2} m off its pin with the partner standing");
+}
+
+#[test]
+fn j3_a_marked_car_standing_at_a_red_line_waits_for_its_green() {
+    // one lit piece after the approach, red for 60 s; the car stands 0.5 m before the line with
+    // the light's mark (it took it rolling up behind a partner it followed in, then braked to a
+    // stand: viz case07 #18558 set off over the line on red, review-r6j)
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-10.0, 0.0)], 1));
+    let mut lit = piece(&[(-10.0, 0.0), (10.0, 0.0)], 0, 128.0, 3.0);
+    lit.traffic_light = Some((0, 0));
+    net.lanes.push(lit);
+    net.lanes.push(road(&[(10.0, 0.0), (300.0, 0.0)], 2));
+    let net = finish(net);
+    let mut sim = Simulation::new(&net, vec![TrafficLightController::new(vec![vec![(0, 60.0), (6, 6.0)]], 66.0)]);
+    // (just come to a stand, 0.1 m/s; the mark given after the first frame, once the light is
+    // seen, as a car that took it rolling has it)
+    let mut cars = vec![car(1, 0, 290.0 - 0.5 - 2.0, 0.1)];
+    run(&net, &mut sim, &mut cars, 10.0, |t, _, cars| {
+        if t < DT * 0.5 {
+            cars[0].amber = Some((0, 0));
+            cars[0].amber_line = Some(cars[0].state.odometer + 0.5);
+        }
+    });
+    let front = front_x(&cars[0]);
+    assert!(front <= -10.0 + 0.3, "set off over its red line from a stand with the mark: front at x = {front:.1}");
+}
