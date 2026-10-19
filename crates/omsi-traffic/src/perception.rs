@@ -1092,9 +1092,6 @@ const EXIT_SLOW: f32 = 2.0;
 /// standing lead there, is a queue forming, and the box is not entered behind it (x10 case06;
 /// the figure `heads` reports the exit's state over).
 const EXIT_NEAR: f32 = 15.0;
-/// A standing lead within this (m) of a vehicle in the exit's first metres makes it a queue
-/// forming (the `Claim::stuck` figure).
-const QUEUE_LEAD: f32 = 12.0;
 
 /// The next junction on the way (or the one the car is in), with the room past its
 /// conflicts measured along the car's own way: a vehicle standing inside the piece past the
@@ -1139,19 +1136,19 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                     room = room.min(tail - clear_from);
                 }
                 // a queue forming in the exit's first metres: one crawling there (rolling under
-                // `EXIT_SLOW`), or one with a standing lead within `QUEUE_LEAD` ahead of it,
-                // leaves no room behind it whatever the gap to its tail now (not a bus serving
-                // its stop there: it leaves on its own schedule). One standing there with no
-                // such lead (the head of a red-light queue) counts by the gap to its tail
-                // alone, as before: holding for it kept a car at the box entry 25 s with the
-                // box clear and 7 m of room past it, viz3 case03 #4436 (regression review)
-                // (and one standing there that leaves less than my need between its tail and
-                // the end of those first metres: queued behind it I would stand in them with
-                // my tail across the conflicts' side, x10 case06 #11146 behind #11131 13 m past)
+                // `EXIT_SLOW`) leaves no room behind it whatever the gap to its tail now (not a
+                // bus serving its stop there: it leaves on its own schedule);
+                // one standing there, or rolling up to a standing lead, closes the box when
+                // the place I would queue in behind it - my need behind its tail where it stops,
+                // `predicted_tail` - lies inside those first metres: x10 case06 #11146 entered
+                // behind #11131 rolling at 4.6 m/s towards a queue 18 m ahead, and stood with
+                // its tail across the through lane; a queue tail 40 m past a crossing, viz3
+                // case03/16, leaves the box open)
                 let crawling = o.state.speed >= 0.3 && o.state.speed < EXIT_SLOW;
-                let queue_forming = o.last.lead.is_some_and(|l| l.speed < 0.3 && l.gap < QUEUE_LEAD);
-                let standing_near_end = o.state.speed < 0.3 && clear_from + EXIT_NEAR - tail < need;
-                if (crawling || queue_forming || standing_near_end) && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
+                let standing_lead = o.last.lead.filter(|l| l.speed < 0.3);
+                let queueing = o.state.speed < 0.3 || standing_lead.is_some();
+                let predicted_tail = tail + standing_lead.map(|l| (l.gap - o.state.min_gap).max(0.0)).unwrap_or(0.0);
+                if !o.external.at_stop && tail > clear_from - 0.5 && ((crawling && tail - clear_from < EXIT_NEAR) || (queueing && predicted_tail - clear_from < EXIT_NEAR + need)) {
                     room = 0.0;
                 }
             }
