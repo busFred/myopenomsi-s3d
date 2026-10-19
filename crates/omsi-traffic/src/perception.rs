@@ -1092,6 +1092,9 @@ const EXIT_SLOW: f32 = 2.0;
 /// standing lead there, is a queue forming, and the box is not entered behind it (x10 case06;
 /// the figure `heads` reports the exit's state over).
 const EXIT_NEAR: f32 = 15.0;
+/// A standing lead within this (m) of a vehicle in the exit's first metres makes it a queue
+/// forming (the `Claim::stuck` figure).
+const QUEUE_LEAD: f32 = 12.0;
 
 /// The next junction on the way (or the one the car is in), with the room past its
 /// conflicts measured along the car's own way: a vehicle standing inside the piece past the
@@ -1128,11 +1131,16 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 if o.state.speed < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
-                // a queue forming in the exit's first metres: one crawling there, or rolling up
-                // to a standing lead, leaves no room behind it whatever the gap to its tail
-                // now (not a bus serving its stop there: it leaves on its own schedule)
-                let queueing = o.state.speed < EXIT_SLOW || o.last.lead.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0);
-                if queueing && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
+                // a queue forming in the exit's first metres: one crawling there (rolling under
+                // `EXIT_SLOW`), or one with a standing lead within `QUEUE_LEAD` ahead of it,
+                // leaves no room behind it whatever the gap to its tail now (not a bus serving
+                // its stop there: it leaves on its own schedule). One standing there with no
+                // such lead (the head of a red-light queue) counts by the gap to its tail
+                // alone, as before: holding for it kept a car at the box entry 25 s with the
+                // box clear and 7 m of room past it, viz3 case03 #4436 (regression review)
+                let crawling = o.state.speed >= 0.3 && o.state.speed < EXIT_SLOW;
+                let queue_forming = o.last.lead.is_some_and(|l| l.speed < 0.3 && l.gap < QUEUE_LEAD);
+                if (crawling || queue_forming) && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
                     room = 0.0;
                 }
             }

@@ -219,9 +219,15 @@ fn cross_with_exit() -> Network {
 
 /// A vehicle on the exit lane with its tail at x = `tail` (the crossing's conflict ends about
 /// 2.6 m past the middle; the exit's first 15 m reach x = 17.6) at `kmh` (its top speed, so
-/// it keeps crawling), a bus at its stop when `at_stop`; the car comes up the main road at
+/// it keeps crawling), standing when `stands`, a bus at its stop when `at_stop`, with another
+/// car standing `lead_gap` m ahead of it when given; the car comes up the main road at
 /// 10 m/s, 40 m out. (held for the full exit at all, the car's x at the end)
-fn enters_behind(tail: f32, kmh: f32, stands: bool, at_stop: bool) -> (bool, f32) {
+fn enters_behind(tail: f32, kmh: f32, stands: bool, at_stop: bool, lead_gap: Option<f32>) -> (bool, f32) {
+    enters_behind_from(40.0, tail, kmh, stands, at_stop, lead_gap)
+}
+
+/// `enters_behind` with the car `out` m before the box.
+fn enters_behind_from(out: f32, tail: f32, kmh: f32, stands: bool, at_stop: bool, lead_gap: Option<f32>) -> (bool, f32) {
     let net = cross_with_exit();
     let mut sim = Simulation::new(&net, vec![]);
     let mut ahead = car(9, 2, tail - 15.0 + 2.0, kmh / 3.6);
@@ -232,7 +238,12 @@ fn enters_behind(tail: f32, kmh: f32, stands: bool, at_stop: bool) -> (bool, f32
         ahead.external.stop_at = Some(0.1);
         ahead.state.speed = 0.0;
     }
-    let mut cars = vec![ahead, car(1, 0, 285.0 - 40.0 - 2.0, 10.0)];
+    let mut cars = vec![ahead, car(1, 0, 285.0 - out - 2.0, 10.0)];
+    if let Some(gap) = lead_gap {
+        let mut lead = car(8, 2, tail - 15.0 + 2.0 + 2.0 + gap + 2.0, 0.0);
+        lead.external.stop_at = Some(0.1);
+        cars.push(lead);
+    }
     let mut held_exit = false;
     run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
         let c = cars.iter().find(|c| c.id == 1).unwrap();
@@ -246,18 +257,33 @@ fn j5_a_car_crawling_in_the_exits_first_metres_closes_the_box_a_bus_at_its_stop_
     // crawling at 1 m/s, its tail 7.4 m past the conflict when the car is 40 m out (room
     // enough by the gap alone, 7.4 >= 4 + 2): the box is not entered until it has crawled out
     // of the first 15 m
-    let (held, x) = enters_behind(10.0, 3.6, false, false);
+    let (held, x) = enters_behind(10.0, 3.6, false, false, None);
     assert!(held, "the car entered the box behind a crawler (x = {x:.1})");
     assert!(x > 15.0, "the car never went on after the crawler left: x = {x:.1}");
+    // at 1.7 m/s too (EXIT_SLOW 2.0, was 1.5): its tail 6.1 m past the conflict (room by the
+    // gap alone), the car 20 m out; when the car is at the line the crawler is 12 m past
+    let (held, _) = enters_behind_from(20.0, 8.7, 1.7 * 3.6, false, false, None);
+    assert!(held, "the car entered the box behind a 1.7 m/s crawler");
     // rolling at 3 m/s: a queue moving off, entered as before
-    let (held, _) = enters_behind(10.0, 10.8, false, false);
+    let (held, _) = enters_behind(10.0, 10.8, false, false, None);
     assert!(!held, "held for the exit behind a car rolling at 3 m/s");
     // a bus serving its stop 12 m past the conflict: entered as before
-    let (held, _) = enters_behind(15.0, 0.0, true, true);
+    let (held, _) = enters_behind(15.0, 0.0, true, true, None);
     assert!(!held, "held for the exit behind a bus at its stop");
-    // a car standing there (not at a stop): no room, as before
-    let (held, _) = enters_behind(15.0, 0.0, true, false);
-    assert!(held, "the car entered the box behind one standing 12 m past the conflict");
+}
+
+#[test]
+fn j5_a_car_standing_in_the_exit_counts_by_the_gap_to_its_tail_unless_a_queue_forms_behind_its_lead() {
+    // standing 12.4 m past the conflict with nobody ahead (the head of a red-light queue):
+    // room by the gap alone (12.4 >= 6), entered as before (viz3 case03 #4436's lead)
+    let (held, _) = enters_behind(15.0, 0.0, true, false, None);
+    assert!(!held, "held for the exit behind a lone standing car with 12 m of room");
+    // the same car with another standing 5 m ahead of it: a queue forming, no room
+    let (held, _) = enters_behind(15.0, 0.0, true, false, Some(5.0));
+    assert!(held, "the car entered the box behind a queue forming in the exit");
+    // standing 4 m past the conflict: no room by the gap, as before
+    let (held, _) = enters_behind(6.6, 0.0, true, false, None);
+    assert!(held, "the car entered the box with 4 m of room past the conflict");
 }
 
 // ---- J6: the side-merge hold rolls up behind the queue in the twin chain ----
