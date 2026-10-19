@@ -320,6 +320,9 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     }
 }
 
+/// [round6 J4] A player keeps the light of its lit lane until its rear is this far (m) past the
+/// lane's start (`perception::signal_ahead`'s half metre for an AI car).
+pub const PLAYER_LINE_PAST: f32 = 0.5;
 /// Seconds a player stands before it counts as held where it is: blocked to the junction
 /// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
 pub const PLAYER_STILL: f32 = 2.0;
@@ -1009,7 +1012,10 @@ impl Simulation {
             // nor a detector, `perception::detector_light`)
             let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
-            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
+            // ([round6 J4] until its REAR is half a metre past the lit lane's start, as an AI
+            // car's `signal_ahead`: the front 0.8 m past its stub, the player's bus lost its red,
+            // stood blocked and held a green stream, case07 #37076 21 s)
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d + p.half_len > -PLAYER_LINE_PAST).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);

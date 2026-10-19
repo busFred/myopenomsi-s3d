@@ -251,3 +251,61 @@ fn j3_a_marked_car_standing_at_a_red_line_waits_for_its_green() {
     let front = front_x(&cars[0]);
     assert!(front <= -10.0 + 0.3, "set off over its red line from a stand with the mark: front at x = {front:.1}");
 }
+
+/// J4: an eastbound way (approach 0, lit piece 1 x -20..20 under light (0, 0), exit 2) crossed
+/// by a northbound one (approach 3, lit piece 4 y -20..20 under (0, 1), exit 5), equal
+/// priorities (the northbound way comes from the eastbound's right). Eastbound green 0-10 s,
+/// yellow 10-13, red 13-40; northbound red 0-15, green 15-37, yellow 37-40.
+fn signalled_cross() -> (Network, TrafficLightController) {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-20.0, 0.0)], 1));
+    let mut a = piece(&[(-20.0, 0.0), (20.0, 0.0)], 0, 128.0, 3.5);
+    a.traffic_light = Some((0, 0));
+    net.lanes.push(a);
+    net.lanes.push(road(&[(20.0, 0.0), (300.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -20.0)], 3));
+    let mut b = piece(&[(0.0, -20.0), (0.0, 20.0)], 1, 128.0, 3.5);
+    b.traffic_light = Some((0, 1));
+    net.lanes.push(b);
+    net.lanes.push(road(&[(0.0, 20.0), (0.0, 300.0)], 4));
+    let ctl = TrafficLightController::new(vec![vec![(6, 10.0), (9, 3.0), (0, 27.0)], vec![(0, 15.0), (6, 22.0), (9, 3.0)]], 40.0);
+    (finish(net), ctl)
+}
+
+/// The player's bus standing at its northbound red with its front `past` m over the lit
+/// piece's start, still `still` s; the eastbound car on its green: (whether the car waited for
+/// the player, when it was through the box, the player's claim's light_red).
+fn player_over_its_line(past: f64, still: f32) -> (bool, Option<f32>, bool) {
+    let (net, ctl) = signalled_cross();
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 0, 280.0 - 2.0 - 60.0, 10.0)];
+    let player = PlayerView { id: 7, pos: DVec3::new(0.0, -20.0 + past - 6.0, 0.0), heading: 0.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still, blinker: 0, signalling: 0.0, priority: false };
+    let (mut waited, mut through, mut red) = (false, None, false);
+    sim.players = vec![player];
+    run(&net, &mut sim, &mut cars, 12.0, |t, sim, cars| {
+        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
+        if through.is_none() && front_x(&cars[0]) > 20.0 {
+            through = Some(t);
+        }
+        red |= sim.claims.iter().any(|(c, _)| c.vehicle >= usize::MAX - 64 && c.light_red);
+        sim.players = vec![player];
+    });
+    (waited, through, red)
+}
+
+#[test]
+fn j4_the_player_keeps_its_red_until_its_rear_is_past_its_line() {
+    // its front 0.8 m past the red stub, standing 3 s (blocked): still held by its red, the
+    // green car does not wait for it (case07: the bus lost its light and held #37076 21 s)
+    let (waited, through, red) = player_over_its_line(0.8, 3.0);
+    assert!(red, "the player's claim has no red light");
+    assert!(!waited, "the green car waited for the player at its red");
+    assert!(through.is_some_and(|t| t < 10.0), "through the box at {through:?}");
+    // at its line (round 4's rule E, unchanged)
+    let (waited, _, red) = player_over_its_line(-0.2, 3.0);
+    assert!(red && !waited);
+    // its rear past the line (it drove through on red; put down there): no light, the
+    // ordinary rules (blocked, standing, from rest when it moves)
+    let (_, _, red) = player_over_its_line(12.6, 3.0);
+    assert!(!red, "a player whose rear is past its line kept its red");
+}
