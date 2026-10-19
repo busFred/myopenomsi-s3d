@@ -890,6 +890,8 @@ impl Simulation {
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
                 yields_now: None,
+                // (where people, a zebra or a standing lead will stop the front)
+                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -1028,6 +1030,7 @@ impl Simulation {
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
+                clear_ahead: f32::INFINITY,
             });
         }
         for (i, standing) in standing_now {

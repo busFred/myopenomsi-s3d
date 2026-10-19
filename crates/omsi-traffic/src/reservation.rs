@@ -81,6 +81,10 @@ pub struct Claim {
     /// too long (`Simulation`'s negotiation): it is refused, waiting for that one, and that
     /// one's windows do not see it. Every other foe of either stays as it is.
     pub yields_now: Option<usize>,
+    /// Distance from the origin to where the front will have to stop for people, a zebra or
+    /// a standing lead ahead (INFINITY: nothing seen): a yielding merger is let into a merge
+    /// ahead of the foe only when nothing stops it inside the stretch (`gap_ok`).
+    pub clear_ahead: f32,
 }
 
 /// What the resolver reads besides the claims: the light programs' signal groups.
@@ -833,11 +837,16 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                     // stopped a metre inside the stretch, where the lane beside it runs into
                     // it, viz3 case15 #46680; not with the margin alone: a side car let go 0.5 m
                     // short of the end had a 14 m/s main car braking hard, review4 C2.)
+                    // (and only with nothing ahead that stops me inside the stretch,
+                    // `Claim::clear_ahead`: let in by the window, a turner slowed for people in
+                    // the stretch and stood with its nose over the lane beside, viz3 case15)
                     let merge_window = foe.kind == FoeKind::Merge && foe.yields && !c.absolute && !their_inside && !o.committed && {
                         let my_start_out = window(c, foe.mine.0, foe.mine.0).1;
                         let their_in_end = window(o, foe.theirs.1, foe.theirs.1).0;
-                        let in_front = c.s + c.front >= foe.mine.0 && my_out + c.gap <= their_in_end;
-                        in_front || (my_start_out + c.gap <= their_in && my_out + CLEAR_MARGIN <= their_in_end)
+                        let clear = c.clear_ahead >= foe.mine.1 - c.s + c.front + c.rear;
+                        let front_in = c.s + c.front >= foe.mine.0;
+                        let in_front = front_in && my_out + c.gap <= their_in_end;
+                        in_front || (!front_in && clear && my_start_out + c.gap <= their_in && my_out + CLEAR_MARGIN <= their_in_end)
                     };
                     let gap_ok = (my_out + c.gap <= their_in && !their_inside && !o.committed) || merge_window || they_are_first;
                     if !gap_ok {
@@ -905,7 +914,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, red_hysteresis: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2385,45 +2394,57 @@ mod tests {
 
     #[test]
     fn j7_a_yielding_merger_goes_when_its_rear_is_past_the_stretch_start_its_gap_ahead_of_the_foe() {
-        // A (0) and B (1) merge into C (2); A gives way to B. The stretch on A runs its last
-        // 2.5 m or so to the end. The car on A rolls at 4.9 m/s, its front 2.6 m short of the
-        // stretch; the bus on B comes at 9.4 m/s, 80 m off: in about 6.4 s (viz4 case06 #20248
-        // and the player, 83 m off: their_in 6.6 s, the merger's rear past the start in 1.7 s
-        // + gap 4 s = 5.7 s)
-        let (net, js) = merge_a_gives_way();
-        let f = js.nodes[0].movements[0].foes.iter().find(|f| f.movement == 1).unwrap();
-        let (a0, b0) = (f.mine.0, f.theirs.0);
+        // Two lanes converging over 14 m into one (A, 0, gives way to B, 1, priority 192).
+        // The car on A rolls at 4.9 m/s, its front 2.6 m short of the stretch: its rear is
+        // past the start in 1.2 s, past the end in 2.9 s. The through car on B comes at
+        // 9.4 m/s (accel 1.2 to 14), its front 68 m from the start: 5.5 s, 6.5 s to the end
+        // (viz4 case06 #20248 and the player: 3.1 + 4 > 6.6 by the end rule, 1.7 + 4 <= 6.6
+        // by the start rule). The end rule refuses (2.9 + 4 > 5.5), `merging_behind` too
+        // (6.5 < 6.9), the start rule grants (1.2 + 4 <= 5.5; out of the end 2.9 + 0.6 <= 6.5)
+        let (mut net, _) = object(&[(&[(-30.0, 2.2), (0.0, 0.0)], 0), (&[(-30.0, -2.2), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
+        net.lanes[1].priority = 192.0;
+        let js = Junctions::compile(&net);
+        let f = *js.nodes[0].movements[0].foes.iter().find(|f| f.movement == 1).unwrap();
+        assert!(f.yields && f.kind == FoeKind::Merge && f.mine.1 - f.mine.0 > 10.0, "{f:?}");
+        let (a0, b0, b1) = (f.mine.0, f.theirs.0, f.theirs.1);
         let mut merger = claim(1, 0, a0 - 2.6 - 2.0, 4.9);
-        merger.chain = vec![(0, 0.0), (2, 10.0)];
-        let through = |out: f32, v: f32| {
-            let mut c = claim(2, 1, b0 - out - 2.0, v);
-            c.chain = vec![(1, 0.0), (2, 10.0)];
+        merger.chain = vec![(0, 0.0), (2, 30.0)];
+        // the through car with its front `to_start` m before its stretch's start
+        let through = |to_start: f32, v: f32| {
+            let mut c = claim(2, 1, b0 - to_start - 2.0, v);
+            c.chain = vec![(1, 0.0), (2, 30.0)];
             c.v_max = 14.0;
             c.accel = 1.2;
             c
         };
-        let g = resolve(&js, &net, &[merger.clone(), through(80.0, 9.4)]);
-        assert!(grant_of(&g, 1).go, "refused with the through car 6.4 s off: {g:?}");
+        let g = resolve(&js, &net, &[merger.clone(), through(68.0, 9.4)]);
+        assert!(grant_of(&g, 1).go, "refused with the through car 5.5 s off (the end rule's 2.9 + 4 > 5.5): {g:?}");
+        // people, a zebra or a standing lead stopping it inside the stretch (its front 10 m
+        // on, the stretch's end 18.6 m + its length): refused, it would stand in the merge
+        let mut blocked_ahead = merger.clone();
+        blocked_ahead.clear_ahead = 10.0;
+        let g = resolve(&js, &net, &[blocked_ahead, through(68.0, 9.4)]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "let into the stretch with people in it: {g:?}");
         // 2-3 s off: refused still (review-r4a case11, the turner vs the player)
         let g = resolve(&js, &net, &[merger.clone(), through(25.0, 9.4)]);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
-        // from rest it needs longer: 2.7 s to the start + 4 s = 6.7 > 6.4, refused
+        // from rest it needs longer: 2.7 s to the start + 4 s = 6.7 > 5.5, refused
         let mut rest = merger.clone();
         rest.speed = 0.0;
-        let g = resolve(&js, &net, &[rest, through(80.0, 9.4)]);
+        let g = resolve(&js, &net, &[rest, through(68.0, 9.4)]);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
         // with its front a metre into the stretch already (let go by the window, stopped as
         // the foe sped up): it goes on when its rear is out of the end its gap ahead of the
-        // foe (its rear 7.5 m from the end from rest: 2.9 s + 4 s; the foe 90 m from the end:
-        // 7.4 s)
+        // foe's front there: from rest 17 m to the end, 4.3 s + 4 s; the foe 112 m from the
+        // end, 8.6 s (7.6 s to the start: the end rule would refuse, 8.3 > 7.6)
         let mut inside = merger.clone();
         inside.s = a0 + 1.0 - 2.0;
         inside.speed = 0.0;
-        let g = resolve(&js, &net, &[inside.clone(), through(90.0 - (f.theirs.1 - b0), 9.4)]);
-        assert!(grant_of(&g, 1).go, "a merger inside the stretch stood for a foe 7.4 s from its end: {g:?}");
-        // ... not within its gap (50 m, 4.7 s): it stands, as before (review4 C2: a side car
-        // let go 0.5 m short of the end had a 14 m/s main car braking hard)
-        let g = resolve(&js, &net, &[inside, through(50.0 - (f.theirs.1 - b0), 9.4)]);
+        let g = resolve(&js, &net, &[inside.clone(), through(112.0 - (b1 - b0), 9.4)]);
+        assert!(grant_of(&g, 1).go, "a merger inside the stretch stood for a foe 8.6 s from its end: {g:?}");
+        // ... not within its gap (the foe 90 m from the end, 7.0 s): it stands, as before
+        // (review4 C2: a side car let go 0.5 m short of the end had a 14 m/s main car braking)
+        let g = resolve(&js, &net, &[inside, through(90.0 - (b1 - b0), 9.4)]);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
         // the guard: a longer stretch (14 m, two lanes converging) that the foe's front would
         // reach the end of before my rear is past it. A slow merger (3 m/s, its rear a metre
