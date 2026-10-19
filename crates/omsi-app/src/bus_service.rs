@@ -298,6 +298,136 @@ pub fn covers_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) ->
     net.lanes.get(lane).is_some_and(|l| lateral.abs() < half_width + l.width * 0.5 - 0.5)
 }
 
+/// [round 6 B1] A bus standing across the fan of lanes of a junction object holds up the
+/// traffic of the lanes beside its own (review-r6-cases case11: the layover bus on junction
+/// piece 12074 stood over the stretches of j30 while B2 looked at its own lane only). A lane
+/// of its object is covered when a car driving on its axis would come within this much (m)
+/// of the bus's body: `covers_lane`'s 0.5 m margin ...
+pub const FAN_COVER: f32 = 0.5;
+/// [round 6 B1] ... with the car this wide either side of the axis (m: the parked cars'
+/// half width the traffic plans with, `Traffic::tick`'s `Parked { half_width: 0.9 }`, and
+/// round a typical town car's 1.8 m). A lane 2.7 m or more off the axis of a 2.5 m bus is
+/// then not covered (a bus in a bay beside the through lane stays).
+pub const FAN_CAR_HALF: f32 = 0.9;
+/// [round 6 B1] A vehicle standing on a covered lane, or whose way runs into one within
+/// this far of its front (m), and held by the bus (it waits for it, follows it or is held
+/// by its body), queues behind the bus (the gap list's 40 m horizon of a junction approach,
+/// review-r6-cases section 1 case11).
+pub const FAN_QUEUE_REACH: f32 = 40.0;
+/// [round 6 B1] Lane samples are tested against the body this far apart (m).
+const FAN_STEP: f64 = 0.5;
+
+/// [round 6 B1] The other street lanes of the junction object whose piece `own` the bus
+/// stands on that its body covers: a car of `FAN_CAR_HALF` on the lane's axis would come
+/// within `FAN_COVER` of the body (origin `pos`, `heading` degrees clockwise from north,
+/// `front`/`rear` from the origin, `half_width`), and `through` says other vehicles drive
+/// the lane. None on a lane of a spline: the lanes beside it there are its own road's
+/// (`ThroughLanes::through` and `covers_lane` already judge it).
+#[allow(clippy::too_many_arguments)]
+pub fn fan_lanes_covered(net: &Network, own: usize, pos: glam::DVec2, heading: f32, front: f32, rear: f32, half_width: f32, through: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    let Some(here) = net.lanes.get(own) else { return Vec::new() };
+    let Some(key) = here.key.filter(|_| here.source == 2) else { return Vec::new() };
+    let h = (heading as f64).to_radians();
+    let (fwd, right) = (glam::DVec2::new(h.sin(), h.cos()), glam::DVec2::new(h.cos(), -h.sin()));
+    let (mid, half_len) = (((front - rear) * 0.5) as f64, ((front + rear) * 0.5) as f64);
+    // (a car's flank on the axis within FAN_COVER of the body: the axis within this of it)
+    let reach = (FAN_CAR_HALF + FAN_COVER) as f64;
+    // (the distance of a point from the body's rectangle)
+    let near_body = |q: glam::DVec2| {
+        let r = q - pos;
+        let along = (r.dot(fwd) - mid).abs() - half_len;
+        let across = r.dot(right).abs() - half_width as f64;
+        glam::DVec2::new(along.max(0.0), across.max(0.0)).length() < reach
+    };
+    let span = half_len + mid.abs() + reach + 1.0;
+    let cell = |v: f64| (v / 50.0).floor() as i32;
+    let mut out: Vec<usize> = Vec::new();
+    for cx in cell(pos.x - span)..=cell(pos.x + span) {
+        for cy in cell(pos.y - span)..=cell(pos.y + span) {
+            for &i in net.grid.get(&(cx, cy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let l = &net.lanes[i];
+                if i == own || out.contains(&i) || l.kind != LaneKind::Street || l.source != 2 || l.key.is_none_or(|k| (k.tile, k.id) != (key.tile, key.id)) {
+                    continue;
+                }
+                let covered = l.points.windows(2).any(|w| {
+                    let (a, b) = (w[0].truncate(), w[1].truncate());
+                    let n = ((b - a).length() / FAN_STEP).ceil().max(1.0) as usize;
+                    (0..=n).any(|k| near_body(a + (b - a) * (k as f64 / n as f64)))
+                });
+                if covered && through(i) {
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// [round 6 B1] One of the others for `fan_queue`.
+#[derive(Debug, Clone, Default)]
+pub struct FanOther {
+    pub id: u64,
+    /// The lane it is on, and its way's lanes with the distance of each one's start from
+    /// its front.
+    pub lane: usize,
+    pub way: Vec<(usize, f32)>,
+    pub speed: f32,
+    /// Seconds it has stood.
+    pub stood: f32,
+    /// The vehicle it follows.
+    pub lead: Option<u64>,
+    /// It stands at a stop of its own (a timetable bus serving its berth, or done with its
+    /// trip there): it waits for nobody.
+    pub serving: bool,
+    /// The bus is what holds it: it waits for the bus at a junction, follows it, or the
+    /// bus's body holds it (`Decision::wait_for` / `lead_id` / `body_block`).
+    pub held_by_bus: bool,
+}
+
+/// [round 6 B1] The queue at the lanes a bus covers (`fan_lanes_covered`): of the vehicles
+/// `others` the ones standing on a covered lane or whose way runs into one within
+/// `FAN_QUEUE_REACH` and that the bus holds, and the ones standing queued behind those (as
+/// far back as 30): the longest any of the first has stood, and how many stand in all.
+/// One standing there for anything else - a red light, a give-way, people - is no queue of
+/// the bus's (a bus off its stop over two fan lanes had five standing 60 s behind a light
+/// there, none for it: review-r6b-regression b1c-after bus 252), nor a bus at a stop of its
+/// own (two layovers at the berths of one fan would send each other round the block).
+pub fn fan_queue(fan: &[usize], others: &[FanOther]) -> (f32, usize) {
+    if fan.is_empty() {
+        return (0.0, 0);
+    }
+    let standing = |o: &FanOther| o.speed < 0.3 && !o.serving;
+    let mut chain: Vec<u64> = Vec::new();
+    let mut secs = 0.0f32;
+    for o in others.iter().filter(|o| standing(o) && o.held_by_bus) {
+        if fan.contains(&o.lane) || o.way.iter().any(|&(l, d)| d <= FAN_QUEUE_REACH && fan.contains(&l)) {
+            chain.push(o.id);
+            secs = secs.max(o.stood);
+        }
+    }
+    let mut k = 0;
+    while k < chain.len() && chain.len() <= 30 {
+        let id = chain[k];
+        for o in others.iter().filter(|o| standing(o)) {
+            if o.lead == Some(id) && !chain.contains(&o.id) {
+                chain.push(o.id);
+            }
+        }
+        k += 1;
+    }
+    (secs, chain.len())
+}
+
+/// [round 6 B1] A layover bus blocks the traffic and the queue asks it to go
+/// (`Traffic::bus_detour`): it covers its own through lane (`covers_through_lane`) and the
+/// queue behind it asks (`queue_asks_to_go`: `behind_secs` stood behind it, `behind` in the
+/// queue), or it covers lanes of its fan and the queue held there asks (`fan_queue`'s
+/// `fan_secs`, `fan_queued`).
+pub fn layover_asked_to_go(covers_own: bool, behind_secs: f32, behind: usize, fan: &[usize], fan_secs: f32, fan_queued: usize) -> bool {
+    (covers_own && queue_asks_to_go(behind_secs, behind)) || (!fan.is_empty() && queue_asks_to_go(fan_secs, fan_queued))
+}
+
 /// [ROLLBACK r4d-B2] The through lanes, as the traffic has driven them: a street lane is one
 /// when a vehicle of the random traffic has been on it, when another timetable vehicle's
 /// route runs over it, or when it has a lane beside it (a road of several lanes). The lane
@@ -2087,5 +2217,111 @@ mod tests {
         s.phase = Phase::Boarding;
         s.stops.clear();
         assert_eq!(s.at_station_side(), 0.0);
+    }
+
+    /// [round 6 B1] A fan of a junction object: lane 0 runs north from the origin, lane 1
+    /// leaves the same point to the north-west, lane 2 lies 10 m to the east (all pieces of
+    /// object 12074), lane 3 is another object's on top of lane 1, lane 4 a spline's.
+    fn fan() -> Network {
+        use omsi_sim::traffic::{LaneBuilder, LaneKey};
+        let p = |x: f64, y: f64| glam::DVec3::new(x, y, 0.0);
+        let piece = |pts: Vec<glam::DVec3>, id: i64, path: u16, source: u32| {
+            let mut l = LaneBuilder::polyline(pts, LaneKind::Street, 3.0);
+            l.key = Some(LaneKey { tile: (0, 0), id, path });
+            l.source = source;
+            l
+        };
+        let mut net = Network {
+            lanes: vec![
+                piece(vec![p(0.0, 0.0), p(0.0, 30.0)], 12074, 0, 2),
+                piece(vec![p(0.0, 0.0), p(-8.0, 30.0)], 12074, 1, 2),
+                piece(vec![p(10.0, 0.0), p(10.0, 30.0)], 12074, 2, 2),
+                piece(vec![p(0.0, 0.0), p(-8.0, 30.0)], 999, 0, 2),
+                piece(vec![p(0.0, -40.0), p(0.0, 0.0)], 5, 0, 1),
+            ],
+            ..Default::default()
+        };
+        net.link(1.5);
+        net
+    }
+
+    #[test]
+    fn b1_a_layover_bus_across_a_junction_fan_covers_the_lanes_beside_its_own() {
+        let net = fan();
+        let all = |_: usize| true;
+        // a 12 m bus 8 m into lane 0: its body lies over lane 1 where that leaves lane 0
+        let at = |x: f64, y: f64| glam::DVec2::new(x, y);
+        assert_eq!(fan_lanes_covered(&net, 0, at(0.0, 8.0), 0.0, 6.0, 6.0, 1.25, &all), vec![1], "lane 1 of its object; not lane 2 10 m off, nor another object's");
+        // the lane only counts when the traffic drives it
+        assert!(fan_lanes_covered(&net, 0, at(0.0, 8.0), 0.0, 6.0, 6.0, 1.25, &|l| l != 1).is_empty());
+        // pulled 3.2 m into a bay to the right: clear of lane 1 (counter-case: it stays)
+        assert!(fan_lanes_covered(&net, 0, at(3.2, 8.0), 0.0, 6.0, 6.0, 1.25, &all).is_empty());
+        // further up, where lane 1 is more than half a metre off its flank: nothing
+        assert!(fan_lanes_covered(&net, 0, at(0.0, 26.0), 0.0, 4.0, 4.0, 1.25, &all).is_empty());
+        // on a spline's lane: the lanes beside are its road's, `covers_lane` judges them
+        assert!(fan_lanes_covered(&net, 4, at(0.0, -20.0), 0.0, 6.0, 6.0, 1.25, &all).is_empty());
+        // a lane of its object alongside: covered while a car (0.9 m) on its axis would come
+        // within 0.5 m of the body, not when it is 2.7 m or more off the bus's axis
+        let beside = |x: f64| {
+            use omsi_sim::traffic::{LaneBuilder, LaneKey};
+            let piece = |x0: f64, path: u16| {
+                let mut l = LaneBuilder::polyline(vec![glam::DVec3::new(x0, 0.0, 0.0), glam::DVec3::new(x0, 30.0, 0.0)], LaneKind::Street, 3.0);
+                l.key = Some(LaneKey { tile: (0, 0), id: 12074, path });
+                l.source = 2;
+                l
+            };
+            let mut n = Network { lanes: vec![piece(0.0, 0), piece(x, 1)], ..Default::default() };
+            n.link(1.5);
+            fan_lanes_covered(&n, 0, at(0.0, 15.0), 0.0, 6.0, 6.0, 1.25, &all)
+        };
+        assert_eq!(beside(2.5), vec![1], "0.35 m from a car on it");
+        assert!(beside(2.7).is_empty() && beside(2.9).is_empty(), "a car there is 0.55 m or more clear");
+    }
+
+    #[test]
+    fn b1_the_queue_at_a_covered_fan_lane_counts_who_the_bus_holds_there_and_behind() {
+        let fan = [1usize];
+        let o = |id: u64, lane: usize, way: Vec<(usize, f32)>, speed: f32, stood: f32, lead: Option<u64>, held_by_bus: bool| FanOther { id, lane, way, speed, stood, lead, serving: false, held_by_bus };
+        let others: Vec<FanOther> = vec![
+            // waiting for the bus on the covered lane 25 s, and one behind it
+            o(10, 1, vec![(1, -3.0)], 0.0, 25.0, None, true),
+            o(11, 7, vec![(7, -2.0), (1, 6.0)], 0.0, 12.0, Some(10), false),
+            // held by it 30 m before the lane on its way, and 50 m before it (too far)
+            o(12, 8, vec![(8, -5.0), (1, 30.0)], 0.1, 8.0, None, true),
+            o(13, 9, vec![(9, -5.0), (1, 50.0)], 0.0, 90.0, None, true),
+            // driving onto it: no queue
+            o(14, 9, vec![(9, -5.0), (1, 10.0)], 4.0, 0.0, None, true),
+            // another bus at its own berth on the covered lane: waits for nobody
+            FanOther { serving: true, ..o(15, 1, vec![(1, -12.0)], 0.0, 300.0, None, true) },
+            // standing on the covered lane 60 s for a light, not for the bus (b1c-after bus 252)
+            o(16, 1, vec![(1, -20.0)], 0.0, 60.0, None, false),
+            o(17, 6, vec![(6, -2.0), (1, 4.0)], 0.0, 60.0, Some(16), false),
+        ];
+        let (secs, n) = fan_queue(&fan, &others);
+        assert_eq!(n, 3, "10, 11 and 12");
+        assert!((secs - 25.0).abs() < 1e-6, "{secs}");
+        assert!(queue_asks_to_go(secs, n), "past LAYOVER_QUEUE");
+        // nobody it holds at a covered lane: no queue (a roadside layover with nobody behind
+        // stays), however many stand there for something else
+        assert_eq!(fan_queue(&fan, &others[3..]), (0.0, 0), "nor a bus at its own berth there");
+        assert_eq!(fan_queue(&[], &others), (0.0, 0));
+        assert!(!queue_asks_to_go(0.0, 0));
+    }
+
+    /// [round 6 B1] `Traffic::bus_detour`'s ask: the own lane's queue only while the bus
+    /// covers its own through lane, the fan's only with a fan; neither mixed into the other.
+    #[test]
+    fn b1_a_layover_is_asked_to_go_by_the_queue_of_what_it_covers() {
+        // its own through lane, 25 s stood behind it
+        assert!(layover_asked_to_go(true, 25.0, 1, &[], 0.0, 0));
+        // in a bay (its own lane not covered): the queue behind is not its
+        assert!(!layover_asked_to_go(false, 25.0, 4, &[], 0.0, 0));
+        // its fan, the queue it holds there
+        assert!(layover_asked_to_go(false, 0.0, 0, &[3], 21.0, 1));
+        assert!(layover_asked_to_go(false, 0.0, 0, &[3], 5.0, 4));
+        assert!(!layover_asked_to_go(false, 0.0, 0, &[3], 5.0, 3));
+        // a fan queue without a fan, or the own lane's queue with only the fan covered: no
+        assert!(!layover_asked_to_go(false, 0.0, 0, &[], 30.0, 5));
+        assert!(!layover_asked_to_go(false, 30.0, 5, &[3], 0.0, 0));
     }
 }
