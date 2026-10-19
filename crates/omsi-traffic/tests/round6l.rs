@@ -398,3 +398,145 @@ fn r6l2_no_bypass_with_somebody_on_foot_in_its_corridor() {
     assert_eq!(r.starts, 0, "started round into the person");
     assert!(r.least_person > 0.3);
 }
+
+/// Car 1 on the right lane of `two_lanes` changing over to the left one, frozen 55 % of
+/// the way behind car 2 standing in the right lane just ahead and car 4 in the left lane,
+/// which drives off after 6 s: settled done in place on the left lane, 1.5 m right of its
+/// middle, car 2's corner in its corridor, the left lane free (viz5 case05 #18836 behind
+/// #20220, which had given up its own change into that lane).
+fn settled_beside() -> (Network, Vec<Vehicle>) {
+    // (case05's lanes 4916/4919 lie 2.9 m apart)
+    let mut net = Network::default();
+    let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
+    a.offset = 0.0;
+    let mut b = road(&[(0.0, -2.9), (600.0, -2.9)], 1);
+    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+    b.offset = 2.9;
+    net.lanes.push(a);
+    net.lanes.push(b);
+    let net = finish(net);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 0, t: 0.55, length: 12.0, s_to: 100.0, dir: 1, wait: 0.0, bypass: false });
+    me.state.change_cooldown = 0.0;
+    let mut ahead = car(2, 1, 105.5, 0.0);
+    ahead.pull_out = 1000.0;
+    ahead.stopped = 60.0;
+    let mut leaves = car(4, 0, 105.5, 0.0);
+    leaves.pull_out = 6.0;
+    (net, vec![me, ahead, leaves])
+}
+
+#[test]
+fn r6l3_a_change_settled_standing_eases_its_offset_in_place_and_drives_on() {
+    let (net, mut cars) = settled_beside();
+    let mut sim = Simulation::new(&net, vec![]);
+    let (mut settled, mut least, mut gone_at, mut lat_at_settle) = (None, f32::INFINITY, None, 0.0f32);
+    run(&net, &mut sim, &mut cars, 30.0, |t, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        let other = cars.iter().find(|c| c.id == 2).unwrap();
+        least = least.min(me.obb().separation(&other.obb()) as f32);
+        if settled.is_none() && me.state.change.is_none() {
+            settled = Some(t);
+            lat_at_settle = me.state.lateral;
+        }
+        if gone_at.is_none() && me.pos.x > 115.0 {
+            gone_at = Some(t);
+        }
+    });
+    let settled = settled.expect("never settled");
+    eprintln!("settled at {settled:.1} s, lateral {lat_at_settle:.2}; past the car at {gone_at:?}; least {least:.2}");
+    assert!(lat_at_settle.abs() > 1.0, "settled at lateral {lat_at_settle:.2}");
+    let gone = gone_at.expect("stood behind the car beside with its lane free");
+    assert!(gone - settled < 10.0, "drove on only {:.1} s after settling", gone - settled);
+    assert!(least > 0.15, "came {least:.2} m to the car beside");
+}
+
+#[test]
+fn r6l3_the_offset_eases_no_nearer_than_0_2_m_to_a_car_beside_in_the_lane() {
+    // (viz case06) two cars side by side in one lane: once car 1 has settled 1.5 m right of
+    // the left lane's middle (car 4 ahead stays), car 3 stands beside it 1 m left of that
+    // middle: the offset eases in place until the bodies are 0.2 m apart, no further
+    let (net, mut cars) = settled_beside();
+    cars[2].pull_out = 1000.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut t = 0.0f32;
+    while cars[0].state.change.is_some() && t < 8.0 {
+        sim.tick(&net, DT, &mut cars);
+        t += DT;
+    }
+    assert!(cars[0].state.change.is_none() && cars[0].state.lane == 0, "not settled into the left lane");
+    let mut beside = car(3, 0, cars[0].state.s, 0.0);
+    beside.pull_out = 1000.0;
+    beside.stopped = 60.0;
+    beside.state.lateral = -1.0;
+    beside.state.lateral_target = -1.0;
+    beside.state.lateral_ramp = (-1.0, -1.0, 0.0, 1.0);
+    beside.external.bay = Some(-1.0);
+    cars.push(beside);
+    let mut least = f32::INFINITY;
+    run(&net, &mut sim, &mut cars, 15.0, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let other = cars.iter().find(|c| c.id == 3).unwrap();
+        least = least.min(me.obb().separation(&other.obb()) as f32);
+    });
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    eprintln!("lane {} lateral {:.2} least {least:.2}", me.state.lane, me.state.lateral);
+    assert!(least > 0.15, "eased to {least:.2} m of the car beside");
+    assert!(me.state.lateral < 1.45, "no easing at all: lateral {:.2}", me.state.lateral);
+}
+
+#[test]
+fn r6l3_a_car_pulling_out_of_the_strip_with_its_offset_does_not_slide() {
+    // (review r6l, x10 case08 #11387) a car put down standing 2.9 m right of its lane's
+    // middle in the parking strip (a fresh car: `AiState::new`'s lane-change cooldown), held
+    // by a car standing in the strip 2 m ahead: its offset is no settled change's, it stays
+    let net = two_lanes((1.5, 4.0), false);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.lateral = 2.9;
+    me.state.lateral_target = 0.0;
+    me.state.lateral_ramp = (2.9, 0.0, 0.0, 30.0);
+    me.pull_out = 4.0;
+    assert!(me.state.change_cooldown > 0.0);
+    let mut ahead = car(2, 1, 106.0, 0.0);
+    ahead.state.lateral = 2.9;
+    ahead.state.lateral_target = 2.9;
+    ahead.state.lateral_ramp = (2.9, 2.9, 0.0, 1.0);
+    ahead.external.bay = Some(2.9);
+    ahead.pull_out = 1000.0;
+    ahead.stopped = 60.0;
+    let mut cars = vec![me, ahead];
+    let mut sim = Simulation::new(&net, vec![]);
+    run(&net, &mut sim, &mut cars, 5.0, |_, _, _| {});
+    assert!((cars[0].state.lateral - 2.9).abs() < 0.01, "slid to lateral {:.2}", cars[0].state.lateral);
+}
+
+#[test]
+fn r6l3_the_offset_does_not_ease_into_a_person_beside() {
+    // (review r6l) car 1 settled 1.2 m off the left lane's middle, car 4 ahead stays; a
+    // person stands 0.4 m off the side it eases towards: no nearer than 0.2 m
+    let (net, mut cars) = settled_beside();
+    cars[2].pull_out = 1000.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut t = 0.0f32;
+    while cars[0].state.change.is_some() && t < 8.0 {
+        sim.tick(&net, DT, &mut cars);
+        t += DT;
+    }
+    let me = &cars[0];
+    assert!(me.state.settled_offset && me.state.lateral.abs() > 1.0, "not settled with an offset");
+    let h = (me.heading as f64).to_radians();
+    let right = glam::DVec2::new(h.cos(), -h.sin());
+    let lat = me.state.lateral as f64;
+    let q = me.pos.truncate() - right * (lat.signum() * (me.half_width as f64 + 0.28 + 0.4));
+    sim.people = vec![walker(q.x, q.y, 0.0, 0.0)];
+    let mut least = f32::INFINITY;
+    run(&net, &mut sim, &mut cars, 10.0, |_, sim, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        for q in &sim.people {
+            least = least.min(me.obb().separation(&omsi_sim::collision::Obb::point(q.pos, 0.28)) as f32);
+        }
+    });
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    eprintln!("person: lateral {:.2} least {least:.2}", me.state.lateral);
+    assert!(least > 0.15, "eased to {least:.2} m of the person");
+}

@@ -2846,6 +2846,12 @@ pub struct AiState {
     /// At most this much acceleration for now (m/s²): edging out round something standing
     /// close ahead.
     pub accel_cap: Option<f32>,
+    /// A frozen lane change was settled where the body stood (`settle_change`) and the
+    /// offset it left has not eased off yet: standing, the traffic eases it in place. Only
+    /// `settle_change` sets it (a fresh car, a pull-out from a bay or a parking strip, a
+    /// swerve have offsets too, and must not slide).
+    #[serde(default)]
+    pub settled_offset: bool,
 }
 
 /// What a car keeps its distance to: the gap from its front bumper to the thing (m), how
@@ -3022,7 +3028,7 @@ impl LaneSeq {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3350,6 +3356,7 @@ impl AiState {
         self.lateral = off;
         self.lateral_target = 0.0;
         self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
+        self.settled_offset = true;
     }
 
     /// Pull out into `to` from behind a standing obstacle: a short, steep move over
