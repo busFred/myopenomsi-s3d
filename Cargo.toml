@@ -22,6 +22,7 @@ members = [
     "crates/omsi-ui",
     "crates/omsi-launcher-core",
     "crates/omsi-roadmask",
+    "crates/omsi-roadmask3d",
     "crates/omsi-app",
     "tools/omsi-check",
 ]

@@ -116,6 +116,8 @@ mod weather_setup;
 mod weather_cycle;
 mod weather_model;
 mod world_load;
+// the game's scene for standalone tools (omsi-roadmask3d); nothing in the game uses it
+pub mod tool;
 
 // the interface's translations (locales/app.yml; the English text is the key)
 rust_i18n::i18n!("locales");

@@ -18,9 +18,7 @@
 //! not carry the date; without it, none). Standalone: the game binaries do not depend on
 //! this crate.
 
-mod mapdata;
-mod profile;
-mod recording;
+use omsi_roadmask::{hms, mapdata, profile, recording};
 
 use glam::DVec3;
 use omsi_sim::traffic::{arc_point, LaneKind};
@@ -249,11 +247,6 @@ fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
-}
-
-pub(crate) fn hms(t: f64) -> String {
-    let s = t.max(0.0).round() as i64;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
 fn r2(v: f64) -> f64 {

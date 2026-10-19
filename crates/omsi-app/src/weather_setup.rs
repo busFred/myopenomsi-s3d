@@ -184,16 +184,28 @@ pub(crate) fn setup_sky(
     envir: Option<&omsi_content::Envir>,
     weather: Option<&omsi_content::weather::Weather>,
 ) {
+    setup_sky_at(&args.root, renderer, scene, envir, weather)
+}
+
+/// [`setup_sky`] for an installation at `root` (the tools without a command line of the
+/// game's, see `crate::tool`).
+pub(crate) fn setup_sky_at(
+    root: &Path,
+    renderer: &Renderer,
+    scene: &mut Scene,
+    envir: Option<&omsi_content::Envir>,
+    weather: Option<&omsi_content::weather::Weather>,
+) {
     const STOCK: [&str; 3] = ["Texture\\himmel01.bmp", "Texture\\himmel04.bmp", "Texture\\himmel05.bmp"];
     let names = envir.map(|e| e.sky_textures.clone()).unwrap_or_else(|| STOCK.map(String::from));
     let mut ids = Vec::new();
     for (n, stock) in names.iter().zip(STOCK) {
-        let p = omsi_cfg::resolve_path(&args.root, n);
+        let p = omsi_cfg::resolve_path(root, n);
         // a sky pack's picture that cannot be read leaves the stock one in its place: giving
         // up here took the clouds with it, whatever the weather (#749)
         let img = omsi_texture::decode_file(&p).or_else(|e| {
             log::warn!("sky texture {}: {e}", p.display());
-            omsi_texture::decode_file(&omsi_cfg::resolve_path(&args.root, stock))
+            omsi_texture::decode_file(&omsi_cfg::resolve_path(root, stock))
         });
         match img {
             Ok(img) => ids.push(renderer.add_texture(scene, &img, false)),
@@ -206,8 +218,8 @@ pub(crate) fn setup_sky(
     // the weather's cloud type (Weather/clouds.cfg: Cumulus 1..3, Overcast 1) with its own
     // texture, whose alpha is the clouds' shape; `Texture\clouds.tga` when there is none
     let kind = weather.map(|w| w.clouds.0.trim().to_string()).unwrap_or_default();
-    let typed = cloud_texture(&args.root, &kind);
-    let cover = typed.or_else(|| omsi_texture::decode_file(&omsi_cfg::resolve_path(&args.root, "Texture\\clouds.tga")).ok());
+    let typed = cloud_texture(root, &kind);
+    let cover = typed.or_else(|| omsi_texture::decode_file(&omsi_cfg::resolve_path(root, "Texture\\clouds.tga")).ok());
     let t = std::time::Instant::now();
     let field = cloud_field(cover.as_ref());
     log::debug!("cloud field made in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
