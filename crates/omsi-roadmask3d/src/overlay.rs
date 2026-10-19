@@ -162,7 +162,18 @@ impl Overlay {
 
     /// Build the static part. Every colour the dynamic part uses is made here too, so that
     /// nothing is added to the materials after the static marker.
-    pub fn build_static(&mut self, renderer: &Renderer, scene: &mut Scene, tl: &Timeline, profile: &[ProfileEdge]) {
+    ///
+    /// The lanes are laid on the ground the scene has (`World::walk_height`, the road and
+    /// pavement meshes) where that is within 1.5 m of the recorded height: a lane's own
+    /// points may lie a few centimetres under the road mesh, and the mask would be under
+    /// the road with them (a bridge's lane, far over the ground, keeps its own height).
+    pub fn build_static(&mut self, renderer: &Renderer, scene: &mut Scene, world: &World, tl: &Timeline, profile: &[ProfileEdge]) {
+        let ground = |p: DVec3| -> DVec3 {
+            match world.walk_height(p.x, p.y) {
+                Some(g) if (g - p.z).abs() < 1.5 => DVec3::new(p.x, p.y, g.max(p.z)),
+                _ => p,
+            }
+        };
         for s in VehicleState::ALL {
             self.material(renderer, scene, s.colour());
         }
@@ -172,13 +183,20 @@ impl Overlay {
         for c in [C_PLAYER, C_PIN, C_STRIP, C_WAY, C_ATTENTION, C_AT_KERB] {
             self.material(renderer, scene, c);
         }
+        // OMSI_MASK3D_DEBUG=1: the lanes near the middle against the scene's heights
+        if std::env::var_os("OMSI_MASK3D_DEBUG").is_some() {
+            for lane in &tl.lanes {
+                let Some(p) = lane.points.iter().find(|p| (p.x - tl.centre.x).abs() < 40.0 && (p.y - tl.centre.y).abs() < 40.0) else { continue };
+                eprintln!("lane {} {:?} w {:.2} at ({:.1}, {:.1}) z {:.2}: walk {:?} ground {:?}", lane.index, lane.class, lane.width, p.x, p.y, p.z, world.walk_height(p.x, p.y).map(|z| (z * 100.0).round() / 100.0), world.ground_height(p.x, p.y).map(|z| (z * 100.0).round() / 100.0));
+            }
+        }
         // footprints by class, the bands over crossings and junction pieces
         let classes = LaneClass::ALL;
         let mut fill = Builder::new(classes.len());
         let mut bands = Builder::new(2);
         let mut edges = Builder::new(1);
         for lane in &tl.lanes {
-            let centre: Vec<Vec3> = lane.points.iter().map(|p| self.rel(*p, LIFT_FILL)).collect();
+            let centre: Vec<Vec3> = lane.points.iter().map(|p| self.rel(ground(*p), LIFT_FILL)).collect();
             let slot = classes.iter().position(|c| *c == lane.class).unwrap_or(0);
             let (l, r) = geometry::footprint_edges(&centre, lane.width);
             fill.ribbon(slot, &l, &r);
@@ -240,7 +258,7 @@ impl Overlay {
                 let (s, c) = h.to_radians().sin_cos();
                 let fwd = Vec3::new(s, c, 0.0);
                 let right = Vec3::new(c, -s, 0.0) * lane.width * 0.5;
-                let at = self.rel(p, LIFT_STOPS);
+                let at = self.rel(ground(p), LIFT_STOPS);
                 stops.quad(0, at - right, at + right, at + right + fwd * 0.2, at - right + fwd * 0.2);
                 // the 0.6 m a car's front keeps before the line
                 let gap = at + fwd * 0.6;
@@ -249,7 +267,7 @@ impl Overlay {
             }
         }
         for k in &tl.kerb_spots {
-            let at = self.rel(*k, LIFT_STOPS + 0.02);
+            let at = self.rel(ground(*k), LIFT_STOPS + 0.02);
             stops.disc(2, at, 0.28, 4);
         }
         self.counts.kerb_spots = tl.kerb_spots.len();
@@ -309,7 +327,10 @@ impl Overlay {
     /// Lay out one frame: the vehicles as blocks by state, the player's bus as a wire box,
     /// the people as capsules, and for the hovered and pinned vehicle its people strip, its
     /// attention line to its lead and its intended way.
-    pub fn update_frame(&mut self, renderer: &Renderer, scene: &mut Scene, world: &World, tl: &Timeline, frame: &FrameSnap, hovered: Option<u64>, pinned: Option<u64>) {
+    ///
+    /// `player_box` false leaves the player's wire box out (the camera sits in it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_frame(&mut self, renderer: &Renderer, scene: &mut Scene, world: &World, tl: &Timeline, frame: &FrameSnap, hovered: Option<u64>, pinned: Option<u64>, player_box: bool) {
         self.clear_dynamic(renderer, scene);
         let ground = |p: DVec3| -> f64 {
             match world.walk_height(p.x, p.y) {
@@ -335,7 +356,7 @@ impl Overlay {
 
         // the player's bus: a wire box
         let mut pl = Builder::new(1);
-        for p in &frame.players {
+        for p in frame.players.iter().filter(|_| player_box) {
             let foot = self.rel(DVec3::new(p.pos.x, p.pos.y, ground(p.pos)), 0.06);
             let base = geometry::box_corners(foot, p.heading, p.half_len, p.half_len, p.half_width);
             let top: Vec<Vec3> = base.iter().map(|c| *c + Vec3::Z * 3.0).collect();
@@ -373,10 +394,14 @@ impl Overlay {
             }
             if Some(v.id) == pinned {
                 // the attention line to what it follows or waits for
-                let target = v.lead_id.or(v.wait_for).and_then(|id| frame.vehicles.iter().find(|o| o.id == id));
+                // (a player waited for: PLAYER_ID_BASE + its index among the players)
+                let target = v.lead_id.or(v.wait_for).and_then(|id| match id.checked_sub(omsi_traffic::sim::PLAYER_ID_BASE) {
+                    Some(n) => frame.players.get(n as usize).map(|p| p.pos),
+                    None => frame.vehicles.iter().find(|o| o.id == id).map(|o| o.pos),
+                });
                 if let Some(o) = target {
                     let a = self.rel(DVec3::new(v.pos.x, v.pos.y, ground(v.pos)), 1.2);
-                    let b = self.rel(DVec3::new(o.pos.x, o.pos.y, ground(o.pos)), 1.2);
+                    let b = self.rel(DVec3::new(o.x, o.y, ground(o)), 1.2);
                     geometry::line_ribbon(&mut lines, 3, &[a, b], 0.12);
                     // a vertical tick at the target
                     geometry::line_ribbon(&mut lines, 3, &[b, b + Vec3::Z * 1.5], 0.12);

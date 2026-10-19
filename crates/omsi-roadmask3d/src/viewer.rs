@@ -29,6 +29,8 @@ pub struct Pending {
     pub title: String,
     pub start_time: Option<f64>,
     pub start_mode: CamMode,
+    /// `--adapter`: a part of the graphics adapter's name.
+    pub adapter: Option<String>,
 }
 
 pub struct Viewer {
@@ -104,8 +106,12 @@ impl Viewer {
         let renderer = {
             let surface = self.instance.create_surface(window.clone()).context("create_surface")?;
             let mut made: Option<Renderer> = None;
+            let wanted = self.pending.adapter.as_deref().map(|a| a.to_ascii_lowercase());
             for adapter in Renderer::adapters_for(&self.instance, &surface) {
                 let name = adapter.get_info().name;
+                if wanted.as_deref().is_some_and(|w| !name.to_ascii_lowercase().contains(w)) {
+                    continue;
+                }
                 match pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options.clone())) {
                     Ok(r) => {
                         log::info!("graphics: {name}");
@@ -300,7 +306,7 @@ impl Viewer {
             Some((cx, cy)) if !self.looking => s.pick(&cam, &frame, cx, cy, w, h),
             _ => (None, None),
         };
-        s.lay_frame(self.frame, self.hovered.0, self.pinned);
+        s.lay_frame(self.frame, self.hovered.0, self.pinned, self.mode);
         s.hud.begin(&s.renderer, &mut s.scene);
         s.draw_hud(&cam, self.frame, self.mode, self.speed, self.playing, self.pinned, self.hovered, self.cursor, self.legend, w, h, self.help);
         let (Some(surface), Some(window)) = (self.surface.as_mut(), self.window.as_ref()) else { return };

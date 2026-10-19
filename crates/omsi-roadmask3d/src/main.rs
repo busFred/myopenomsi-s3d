@@ -15,8 +15,9 @@
 //! distance (`--radius` metres otherwise) and drawn by the game's renderer in a window at
 //! the settings' resolution. `--shot` renders pictures headlessly instead (`--cam` per shot,
 //! in order; `--t` the moment). Nothing under `~/.openomsi` is written but the output folder
-//! `~/.openomsi/traffic/mask3d/` (the shots, a cut). Standalone: no game binary depends on
-//! this crate.
+//! `~/.openomsi/traffic/mask3d/` (the shots, a cut). `OMSI_MASK3D_DEBUG=1` lists the lanes
+//! near the window's middle against the scene's heights on stderr. Standalone: no game
+//! binary depends on this crate.
 
 mod geometry;
 mod hud;
@@ -56,6 +57,8 @@ options:
                     follow:N, or x,y,z,yaw,pitch[,fov] as the game's --cam; default seat
   --t HH:MM:SS      the moment of the shot(s) (default: the window's middle)
   --size WxH        the shot's size (default: the settings' resolution, else 1600x900)
+  --adapter NAME    draw on the graphics adapter whose name contains NAME (e.g. Intel): a card
+                    whose memory other programs hold runs out of it while the map loads
   -h, --help        this text
 
 keys: space play/pause · , . step a frame · [ ] ±5 s · - = speed 0.25x-4x · Home/End
@@ -214,8 +217,14 @@ fn profile_edges(root: &Path, tl: &Timeline, date: Option<i32>) -> Vec<ProfileEd
 
 /// A renderer without a window: the graphics card first, then the processor's graphics,
 /// a software renderer last (a card whose memory other programs hold is passed over).
-fn headless_renderer(instance: &wgpu::Instance, options: &omsi_render::RenderOptions) -> Result<omsi_render::Renderer> {
+fn headless_renderer(instance: &wgpu::Instance, options: &omsi_render::RenderOptions, name: Option<&str>) -> Result<omsi_render::Renderer> {
     let mut adapters: Vec<wgpu::Adapter> = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    if let Some(n) = name {
+        adapters.retain(|a| a.get_info().name.to_ascii_lowercase().contains(&n.to_ascii_lowercase()));
+        if adapters.is_empty() {
+            anyhow::bail!("no graphics adapter named like {n:?}");
+        }
+    }
     adapters.sort_by_key(|a| match a.get_info().device_type {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
@@ -276,7 +285,7 @@ fn run(args: &[String]) -> Result<()> {
     if shots.is_empty() {
         let start_time = opt(args, "--start").map(recording::parse_hhmm).transpose().map_err(|e| anyhow::anyhow!("{e}"))?;
         let start_mode = opt(args, "--view").map(|v| CamMode::parse(v).context("--view free|seat|top[:H]|follow:N")).transpose()?.unwrap_or(CamMode::Seat);
-        return viewer::Viewer::run(viewer::Pending { root, settings, timeline: Some(tl), profile, date, radius_m, title, start_time, start_mode });
+        return viewer::Viewer::run(viewer::Pending { root, settings, timeline: Some(tl), profile, date, radius_m, title, start_time, start_mode, adapter: opt(args, "--adapter").map(str::to_string) });
     }
 
     // headless pictures
@@ -293,7 +302,7 @@ fn run(args: &[String]) -> Result<()> {
     };
     let cams = opts(args, "--cam");
     let instance = openomsi_game::tool::graphics_instance();
-    let renderer = headless_renderer(&instance, &settings.render)?;
+    let renderer = headless_renderer(&instance, &settings.render, opt(args, "--adapter"))?;
     println!("adapter: {}", renderer.adapter_name);
     println!("loading the map round the window (radius {radius_m:.0} m) ...");
     let mut s = Session::new(renderer, &root, settings, tl, profile, date, radius_m)?;
@@ -317,7 +326,7 @@ fn run(args: &[String]) -> Result<()> {
             None => (CamMode::Free, openomsi_game::tool::parse_cam(cam_text)?),
         };
         let pinned = if let CamMode::Follow(id) = mode { Some(id) } else { None };
-        s.lay_frame(frame_ix, None, pinned);
+        s.lay_frame(frame_ix, None, pinned, mode);
         s.hud.begin(&s.renderer, &mut s.scene);
         s.draw_hud(&cam, frame_ix, mode, 1.0, false, pinned, (None, None), None, true, w as f32, h as f32, false);
         // (the first picture warms the textures up; the second is the one kept)
@@ -333,7 +342,7 @@ fn run(args: &[String]) -> Result<()> {
             std::fs::create_dir_all(dir)?;
         }
         image::save_buffer(&path, &pixels, w, h, image::ColorType::Rgba8)?;
-        println!("{}: {w}x{h} at {} from {}", path.display(), hms(t), mode.name());
+        println!("{}: {w}x{h} at {} from {} - camera ({:.1}, {:.1}, {:.2}) yaw {:.0} pitch {:.0}", path.display(), hms(t), mode.name(), cam.position.x, cam.position.y, cam.position.z, cam.yaw, cam.pitch);
     }
     Ok(())
 }

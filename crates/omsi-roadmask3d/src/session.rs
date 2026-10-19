@@ -126,7 +126,7 @@ impl Session {
         let lighting = tool::lighting(&daylight, &weather, &settings);
         renderer.prepare(&mut scene);
         let mut overlay = Overlay::new(DVec3::new(centre.x, centre.y, 0.0));
-        overlay.build_static(&renderer, &mut scene, &timeline, &profile);
+        overlay.build_static(&renderer, &mut scene, &world, &timeline, &profile);
         Ok(Session {
             settings,
             renderer,
@@ -158,9 +158,9 @@ impl Session {
     }
 
     /// The frame's dynamic overlay.
-    pub fn lay_frame(&mut self, frame: usize, hovered: Option<u64>, pinned: Option<u64>) {
+    pub fn lay_frame(&mut self, frame: usize, hovered: Option<u64>, pinned: Option<u64>, mode: CamMode) {
         let f = &self.timeline.frames[frame];
-        self.overlay.update_frame(&self.renderer, &mut self.scene, &self.world, &self.timeline, f, hovered, pinned);
+        self.overlay.update_frame(&self.renderer, &mut self.scene, &self.world, &self.timeline, f, hovered, pinned, mode != CamMode::Seat);
         self.world.finish_texture_upgrades(&self.renderer, &mut self.scene);
     }
 
@@ -313,13 +313,15 @@ impl Session {
                     if x < -50.0 || y < -50.0 || x > w + 50.0 || y > h + 50.0 {
                         continue;
                     }
-                    let dist = (top - cam.position).length();
-                    if dist > 160.0 && Some(v.id) != pinned {
+                    let dist = (top - cam.position).length() as f32;
+                    if dist > 90.0 && Some(v.id) != pinned {
                         continue;
                     }
                     let text = if v.why.is_empty() || v.state == crate::geometry::VehicleState::Moving { format!("#{}", v.id) } else { format!("#{} {}", v.id, v.why) };
                     let colour = if Some(v.id) == pinned { [1.0, 0.3, 0.85, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
-                    self.hud.label(&self.renderer, &mut self.scene, &text, px * 0.85, x, y - px, colour);
+                    // (smaller with distance, down to two thirds)
+                    let size = px * 0.85 * (1.0 - 0.33 * (dist / 90.0).min(1.0));
+                    self.hud.label(&self.renderer, &mut self.scene, &text, size, x, y - size, colour);
                 }
             }
         }
@@ -332,7 +334,7 @@ impl Session {
                     format!("lane {} s {:.1} m  speed {:.1} km/h  heading {:.0}", v.lane, v.s, v.speed * 3.6, v.heading),
                     format!("box front {:.2} rear {:.2} half width {:.2} m", v.front, v.rear, v.half_width),
                     format!("why: {}  standing {:.1} s", if v.why.is_empty() { "-" } else { v.why }, v.standing_for),
-                    format!("lead {}  waits for {}  stop in {}", v.lead_id.map(|x| format!("#{x}")).unwrap_or("-".into()), v.wait_for.map(|x| format!("#{x}")).unwrap_or("-".into()), v.stop_in.map(|x| format!("{x:.1} m")).unwrap_or("-".into())),
+                    format!("lead {}  waits for {}  stop in {}", v.lead_id.map(|x| format!("#{x}")).unwrap_or("-".into()), v.wait_for.map(id_name).unwrap_or("-".into()), v.stop_in.map(|x| format!("{x:.1} m")).unwrap_or("-".into())),
                     format!("way ahead: {}", if v.ahead.is_empty() { "-".to_string() } else { v.ahead.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" › ") }),
                     format!("pos ({:.1}, {:.1}, {:.2})", v.pos.x, v.pos.y, v.pos.z),
                 ],
@@ -372,6 +374,14 @@ impl Session {
     }
 }
 
+/// A vehicle id as text: a player's (`PLAYER_ID_BASE` + its id) as "player N".
+pub fn id_name(id: u64) -> String {
+    match id.checked_sub(omsi_traffic::sim::PLAYER_ID_BASE) {
+        Some(n) => format!("player {n}"),
+        None => format!("#{id}"),
+    }
+}
+
 /// `HH:MM:SS.t` of a day time.
 pub fn hms_frac(t: f64) -> String {
     let s = t.max(0.0);
@@ -390,6 +400,8 @@ mod tests {
         assert_eq!(parse_date(20231231), Some((2023, 365)));
         assert_eq!(parse_date(20231301), None);
         assert_eq!(hms_frac(8.0 * 3600.0 + 14.0 * 60.0 + 3.25), "08:14:03.2");
+        assert_eq!(id_name(12), "#12");
+        assert_eq!(id_name(omsi_traffic::sim::PLAYER_ID_BASE), "player 0");
     }
 
     #[test]
