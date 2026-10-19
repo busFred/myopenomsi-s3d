@@ -408,7 +408,7 @@ impl Shooter {
         let pinned = if let CamMode::Follow(id) = self.mode { Some(id) } else { None };
         if std::env::var_os("OMSI_MASK3D_DEBUG").is_some() {
             for v in frame.vehicles.iter().filter(|v| (v.pos - cam.position).truncate().length() < 60.0) {
-                eprintln!("{} #{} ({:.1}, {:.1}) hd {:.0} v {:.1} {}", crate::session::hms_frac(frame.day_time), v.id, v.pos.x, v.pos.y, v.heading, v.speed, v.why);
+                eprintln!("{} #{} ({:.1}, {:.1}) hd {:.0} v {:.1} {}{}", crate::session::hms_frac(frame.day_time), v.id, v.pos.x, v.pos.y, v.heading, v.speed, v.why, if v.gone { " gone" } else { "" });
             }
         }
         s.lay_frame(frame_ix, None, pinned, self.mode);

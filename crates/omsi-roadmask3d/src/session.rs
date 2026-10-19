@@ -423,7 +423,7 @@ impl Session {
                     format!("pinned #{} {} {}", v.id, v.class, v.type_name),
                     format!("lane {} s {:.1} m  speed {:.1} km/h  heading {:.0}", v.lane, v.s, v.speed * 3.6, v.heading),
                     format!("box front {:.2} rear {:.2} half width {:.2} m", v.front, v.rear, v.half_width),
-                    format!("why: {}  standing {:.1} s", if v.why.is_empty() { "-" } else { v.why }, v.standing_for),
+                    format!("why: {}  standing {:.1} s{}", if v.why.is_empty() { "-" } else { v.why }, v.standing_for, if v.gone { "  (gone: taken away once out of sight)" } else { "" }),
                     format!("lead {}  waits for {}  stop in {}", v.lead_id.map(|x| format!("#{x}")).unwrap_or("-".into()), v.wait_for.map(id_name).unwrap_or("-".into()), v.stop_in.map(|x| format!("{x:.1} m")).unwrap_or("-".into())),
                     format!("way ahead: {}", if v.ahead.is_empty() { "-".to_string() } else { v.ahead.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" › ") }),
                     format!("pos ({:.1}, {:.1}, {:.2})", v.pos.x, v.pos.y, v.pos.z),

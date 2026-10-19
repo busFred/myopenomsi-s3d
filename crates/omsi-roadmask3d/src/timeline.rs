@@ -44,6 +44,8 @@ pub struct VehicleSnap {
     /// The lanes it means to go on into, in order.
     pub ahead: Vec<usize>,
     pub standing_for: f32,
+    /// It stood too long and asks to be taken away once out of sight (`Vehicle::gone`).
+    pub gone: bool,
 }
 
 #[derive(Clone)]
@@ -150,6 +152,7 @@ impl Timeline {
                         stop_in: v.last.stop,
                         ahead,
                         standing_for: v.stopped,
+                        gone: v.gone,
                     }
                 })
                 .collect();
