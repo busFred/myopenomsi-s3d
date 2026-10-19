@@ -1069,7 +1069,9 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                     lane.name.rsplit(['/', '\\']).next().unwrap_or(""),
                     r1(lane.speed_limit_kmh as f64),
                     r2(lane.offset as f64),
-                    lane.no_unsched as u8
+                    lane.no_unsched as u8,
+                    // (round 5 L1) the drawn road's reach left and right of the axis
+                    [r2(lane.drivable().0 as f64), r2(lane.drivable().1 as f64)]
                 ])
             })
             .collect()
@@ -1290,7 +1292,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                     "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing, pace (m/s, 0 not recorded), at_kerb]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
                     "pl": "[x, y, heading_deg, speed, blinker]",
                     "l": "[ctl, light, state] when it changed (state: 0-2 red, 3-5 red+yellow, 6-8 green, 9-11 yellow)",
-                    "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points, no_cars, source (1 spline, 2 crossing object), reversed, one_way, stop_line (m from the lane's start where a car's front stops: -0.6 = the gap before the line; null no stop line), junction|null, foes|null, left|null, right|null, next[], prev[], file, speed_kmh, offset, no_unsched] (an older trace stops after points)",
+                    "lanes": "[index, kind S/W/R, width, light [ctl,li]|null, no_overtaking, density, turn, bus, points, no_cars, source (1 spline, 2 crossing object), reversed, one_way, stop_line (m from the lane's start where a car's front stops: -0.6 = the gap before the line; null no stop line), junction|null, foes|null, left|null, right|null, next[], prev[], file, speed_kmh, offset, no_unsched, drivable [left, right] (m from the axis: the drawn road to the kerb, the pavement or the next lane's edge)] (an older trace stops after points)",
                     "vinfo": "id: [front, rear, half_width, class, type]",
                     "stops": "[x, y, heading_deg, lane, light|null]",
                     "crossings": "{j, lanes (footpath pieces), light|null, cuts [[street lane, at (m along it), foot lane, foot at]]}",

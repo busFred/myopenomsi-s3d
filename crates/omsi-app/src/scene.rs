@@ -13364,6 +13364,8 @@ fn spline_lanes(
         let priority = rule_of("priority");
         let mut push = |pts: Vec<DVec3>, reversed: bool| {
             let mut l = LaneBuilder::polyline(pts, kind, p.width);
+            // the drawn road's reach either side of the path, from the spline's cross-section
+            l.drivable = omsi_scenery::profile::lane_drivable(def, pi, s.mirror, reversed);
             if let Some(v) = priority {
                 l.priority = v;
             }

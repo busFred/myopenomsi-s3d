@@ -1,6 +1,7 @@
 //! Scenery objects (`.sco`) and splines (`.sli`).
 
 pub mod sco;
+pub mod profile;
 pub mod sli;
 
 pub use sco::{SceneryObject, TrafficLight, TrafficLightPhase};

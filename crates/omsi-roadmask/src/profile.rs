@@ -1,242 +1,11 @@
-//! The visual cross-section of a spline type, from its `.sli`: the drawn strips
-//! (`[profile]` / `[profilepnt]`: x across, z up, texture) sorted into road, pavement
-//! and the rest, the kerb faces (two consecutive points at the same x and different
-//! heights) and every edge between strips; and how such an x offset is laid along a
-//! placed spline's centreline ([`lay_along`]).
+//! The visual cross-section of a spline type and how an x offset of it is laid along a
+//! placed spline's centreline ([`lay_along`]). The cross-section itself (the drawn strips,
+//! the kerb faces, the edges, a path's drivable extent) is `omsi_scenery::profile`, shared
+//! with the game's lane builder; it is re-exported here.
 
 use glam::DVec3;
 use omsi_geometry::SplineCurve;
-use omsi_scenery::Spline;
-
-/// A vertical face in a profile counts as a kerb from this height difference (m).
-pub const KERB_MIN_STEP: f32 = 0.02;
-/// Two profile points closer than this across (m) are one x.
-pub const SAME_X: f32 = 0.05;
-/// A strip of unknown texture this much above the lowest road strip is "raised".
-pub const RAISED_ABOVE_ROAD: f32 = 0.05;
-
-/// One drawn band of the cross-section between two profile points.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Strip {
-    pub x0: f32,
-    pub x1: f32,
-    /// Heights above the spline at `x0` and `x1`.
-    pub z0: f32,
-    pub z1: f32,
-    pub texture: String,
-    /// "road", "walk", "ground", "raised" or "other" (see [`classify_texture`]).
-    pub class: &'static str,
-}
-
-/// A line along the spline at one x of the cross-section.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgeLine {
-    pub x: f32,
-    pub z0: f32,
-    pub z1: f32,
-    /// "kerb": a vertical face; "outer": the drawn extent's edge; "edge": a change of
-    /// surface class or height; "seam": a texture seam within one surface (a lane line).
-    pub kind: &'static str,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CrossSection {
-    pub strips: Vec<Strip>,
-    pub edges: Vec<EdgeLine>,
-    pub x_min: f32,
-    pub x_max: f32,
-}
-
-/// What a spline texture's name says it is.
-pub fn classify_texture(name: &str) -> &'static str {
-    let n = name.to_ascii_lowercase();
-    const WALK: &[&str] = &[
-        "gehweg",
-        "sidewalk",
-        "side_walk",
-        "walk",
-        "fuss",
-        "fuß",
-        "pave",
-        "pflaster",
-        "platte",
-        "bord",
-        "kerb",
-        "curb",
-        "buerger",
-        "bürger",
-        "footway",
-        "ped",
-        "plaster",
-        "tiles",
-        "fliese",
-        "trottoir",
-        "chodnik",
-    ];
-    const GROUND: &[&str] = &[
-        "grass", "gras", "rasen", "green", "dirt", "earth", "erde", "sand", "kies", "gravel",
-        "schotter", "wiese", "boden", "ground",
-    ];
-    const ROAD: &[&str] = &[
-        "asph",
-        "street",
-        "str_",
-        "road",
-        "lane",
-        "teer",
-        "fahrbahn",
-        "strasse",
-        "straße",
-        "spur",
-        "beton",
-        "concrete",
-        "kopfstein",
-        "cobble",
-        "tarmac",
-        "rq_",
-        "mark",
-        "line",
-        "arrow",
-        "pfeil",
-    ];
-    if WALK.iter().any(|k| n.contains(k)) {
-        "walk"
-    } else if GROUND.iter().any(|k| n.contains(k)) {
-        "ground"
-    } else if ROAD.iter().any(|k| n.contains(k)) {
-        "road"
-    } else {
-        "other"
-    }
-}
-
-/// The cross-section of a spline type.
-pub fn cross_section(def: &Spline) -> CrossSection {
-    let mut cs = CrossSection::default();
-    let tex_name = |i: usize| {
-        def.textures
-            .get(i)
-            .map(|t| t.file.clone())
-            .unwrap_or_default()
-    };
-    let mut any = false;
-    for prof in &def.profiles {
-        let tex = tex_name(prof.texture);
-        for w in prof.points.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            if !(a.x.is_finite() && b.x.is_finite() && a.z.is_finite() && b.z.is_finite()) {
-                continue;
-            }
-            for p in [a, b] {
-                if !any {
-                    cs.x_min = p.x;
-                    cs.x_max = p.x;
-                    any = true;
-                }
-                cs.x_min = cs.x_min.min(p.x);
-                cs.x_max = cs.x_max.max(p.x);
-            }
-            if (b.x - a.x).abs() < SAME_X {
-                if (b.z - a.z).abs() >= KERB_MIN_STEP {
-                    cs.edges.push(EdgeLine {
-                        x: (a.x + b.x) * 0.5,
-                        z0: a.z.min(b.z),
-                        z1: a.z.max(b.z),
-                        kind: "kerb",
-                    });
-                }
-                continue;
-            }
-            let (lo, hi) = if a.x < b.x { (a, b) } else { (b, a) };
-            cs.strips.push(Strip {
-                x0: lo.x,
-                x1: hi.x,
-                z0: lo.z,
-                z1: hi.z,
-                texture: tex.clone(),
-                class: classify_texture(&tex),
-            });
-        }
-    }
-    // a strip of unknown texture that stands above the road is a raised surface (a pavement
-    // whose texture says nothing)
-    let road_z = cs
-        .strips
-        .iter()
-        .filter(|s| s.class == "road")
-        .map(|s| s.z0.min(s.z1))
-        .fold(f32::INFINITY, f32::min);
-    let road_z = if road_z.is_finite() {
-        road_z
-    } else {
-        cs.strips
-            .iter()
-            .map(|s| s.z0.min(s.z1))
-            .fold(f32::INFINITY, f32::min)
-    };
-    if road_z.is_finite() {
-        for s in &mut cs.strips {
-            if s.class == "other" && s.z0.min(s.z1) >= road_z + RAISED_ABOVE_ROAD {
-                s.class = "raised";
-            }
-        }
-    }
-    // the edges between strips: every strip end that is not a kerb already
-    let mut xs: Vec<(f32, f32)> = cs
-        .strips
-        .iter()
-        .flat_map(|s| [(s.x0, s.z0), (s.x1, s.z1)])
-        .collect();
-    xs.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut i = 0;
-    while i < xs.len() {
-        let (x, z) = xs[i];
-        let mut j = i + 1;
-        while j < xs.len() && (xs[j].0 - x).abs() < SAME_X {
-            j += 1;
-        }
-        i = j;
-        if cs
-            .edges
-            .iter()
-            .any(|e| e.kind == "kerb" && (e.x - x).abs() < SAME_X)
-        {
-            continue;
-        }
-        let kind = if (x - cs.x_min).abs() < SAME_X || (x - cs.x_max).abs() < SAME_X {
-            "outer"
-        } else {
-            let left: Vec<&Strip> = cs
-                .strips
-                .iter()
-                .filter(|s| (s.x1 - x).abs() < SAME_X)
-                .collect();
-            let right: Vec<&Strip> = cs
-                .strips
-                .iter()
-                .filter(|s| (s.x0 - x).abs() < SAME_X)
-                .collect();
-            let changes = left.iter().any(|l| {
-                right
-                    .iter()
-                    .any(|r| l.class != r.class || (l.z1 - r.z0).abs() >= KERB_MIN_STEP)
-            });
-            if left.is_empty() || right.is_empty() || changes {
-                "edge"
-            } else {
-                "seam"
-            }
-        };
-        cs.edges.push(EdgeLine {
-            x,
-            z0: z,
-            z1: z,
-            kind,
-        });
-    }
-    cs.edges.sort_by(|a, b| a.x.total_cmp(&b.x));
-    cs
-}
+pub use omsi_scenery::profile::*;
 
 /// How many stations a placed spline's cross-section lines are laid with: one every 2 m,
 /// and in a curve one every 1.5 degrees of turn at least.
@@ -264,69 +33,8 @@ pub fn lay_along(curve: &SplineCurve, x: f64, z: f64, side: f64, n: usize) -> Ve
 mod tests {
     use super::*;
     use glam::DVec2;
-    use omsi_scenery::{SplineProfile, SplineProfilePoint};
+    use omsi_scenery::Spline;
     use std::path::{Path, PathBuf};
-
-    fn pt(x: f32, z: f32) -> SplineProfilePoint {
-        SplineProfilePoint {
-            x,
-            z,
-            u: 0.0,
-            v_scale: 0.1,
-        }
-    }
-
-    #[test]
-    fn kerb_and_edges_of_a_hand_made_profile() {
-        // pavement 2.5 m wide at +0.12, a 0.12 m kerb face, a 3.5 m road lane, a seam, another lane
-        let mut def = Spline::default();
-        def.textures = vec![
-            omsi_scenery::sli::SplineTexture {
-                file: "str_gehweg06.bmp".into(),
-                ..Default::default()
-            },
-            omsi_scenery::sli::SplineTexture {
-                file: "str_asphdrk_1line.bmp".into(),
-                ..Default::default()
-            },
-        ];
-        def.profiles = vec![
-            SplineProfile {
-                texture: 0,
-                points: vec![pt(-6.0, 0.12), pt(-3.5, 0.12)],
-            },
-            SplineProfile {
-                texture: 0,
-                points: vec![pt(-3.5, 0.12), pt(-3.5, 0.0)],
-            },
-            SplineProfile {
-                texture: 1,
-                points: vec![pt(-3.5, 0.0), pt(0.0, 0.0)],
-            },
-            SplineProfile {
-                texture: 1,
-                points: vec![pt(0.0, 0.0), pt(3.5, 0.0)],
-            },
-        ];
-        let cs = cross_section(&def);
-        assert_eq!(cs.x_min, -6.0);
-        assert_eq!(cs.x_max, 3.5);
-        assert_eq!(cs.strips.len(), 3);
-        assert_eq!(cs.strips[0].class, "walk");
-        assert_eq!(cs.strips[1].class, "road");
-        let kinds: Vec<(f32, &str)> = cs.edges.iter().map(|e| (e.x, e.kind)).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                (-6.0, "outer"),
-                (-3.5, "kerb"),
-                (0.0, "seam"),
-                (3.5, "outer")
-            ]
-        );
-        let kerb = &cs.edges[1];
-        assert!((kerb.z0 - 0.0).abs() < 1e-6 && (kerb.z1 - 0.12).abs() < 1e-6);
-    }
 
     /// The OMSI root as the tool finds it (`--root` has no say in a test): `OMSI_ROOT`, else
     /// the launcher's `root`. None: the test is skipped.
@@ -398,6 +106,14 @@ mod tests {
                 .strips
                 .iter()
                 .any(|s| s.class == "road" && s.x0 >= -7.7 && s.x1 <= 7.7));
+            // every street path's drivable extent ends at those kerbs (or at the next lane):
+            // from the outermost lanes the kerb side reaches 7.6 - |x|
+            for (i, p) in def.paths.iter().enumerate().filter(|(_, p)| p.kind == 0) {
+                let (l, r) = lane_drivable(&def, i, false, false);
+                let x = p.start[0];
+                assert!(l <= 7.6 + x + 1e-3 && r <= 7.6 - x + 1e-3, "path {i} at {x}: {l} {r}");
+                assert!(l >= p.width * 0.5 && r >= p.width * 0.5, "path {i} at {x}: {l} {r}");
+            }
         }
         // and any kerbed spline type of the installation
         let mut budget = 400;
@@ -424,6 +140,33 @@ mod tests {
         for s in &cs.strips {
             assert!(s.x0 < s.x1 && s.x0 >= cs.x_min - 1e-4 && s.x1 <= cs.x_max + 1e-4);
         }
+    }
+
+    /// BeijingCity's JiananDong_1.sli (round 5 case01, the Wuluju stop): one road strip
+    /// -5.4 .. 6.4 with no kerb, two 1.9 m street paths at ±1.8 and a pavement path at
+    /// 3.845 laid on the asphalt. The eastbound lane at +1.8 may use the road out to the
+    /// far strip edge on its right (4.6 m) and to the oncoming lane's painted edge on its
+    /// left (2.65 m); the pavement path is no edge.
+    #[test]
+    fn jianandong_lane_reaches_the_far_road_strip_edge() {
+        let Some(root) = root() else {
+            eprintln!("skipped: no OMSI root");
+            return;
+        };
+        let file = omsi_cfg::resolve_path(&root, "Splines\\Beijing_splines\\JiananDong_1.sli");
+        if !file.is_file() {
+            eprintln!("skipped: {} not installed", file.display());
+            return;
+        }
+        let def = Spline::load(&file).expect("the .sli reads");
+        let cs = cross_section(&def);
+        assert!(!cs.edges.iter().any(|e| e.kind == "kerb"), "{:?}", cs.edges);
+        let fwd = def.paths.iter().position(|p| p.kind == 0 && p.start[0] > 0.0).expect("the +1.8 path");
+        let (l, r) = lane_drivable(&def, fwd, false, false);
+        assert!((l - 2.65).abs() < 1e-3 && (r - 4.6).abs() < 1e-3, "left {l} right {r}");
+        let back = def.paths.iter().position(|p| p.kind == 0 && p.start[0] < 0.0).expect("the -1.8 path");
+        let (l, r) = lane_drivable(&def, back, false, true);
+        assert!((l - 2.65).abs() < 1e-3 && (r - 3.6).abs() < 1e-3, "left {l} right {r}");
     }
 
     fn curve(radius: f64) -> SplineCurve {

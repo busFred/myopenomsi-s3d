@@ -108,6 +108,14 @@ pub struct Lane {
     /// or into this lane, and no passing on the oncoming lane beside it (a timetable route
     /// still moves over where it must).
     pub no_overtaking: bool,
+    /// How far the drawn road goes on left and right of the lane's axis (m) before a kerb,
+    /// a pavement, the asphalt's end or the next street lane's painted edge, from the
+    /// spline's `[profile]` cross-section (`omsi_scenery::profile::lane_drivable`): what a
+    /// car may use to squeeze past something or to ease off a walker. Zero (a recording
+    /// made before it, a junction object's piece with no edge data): the lane's half width
+    /// either side, see [`Lane::drivable`].
+    #[serde(default)]
+    pub drivable: (f32, f32),
 }
 
 /// Priority of a path without a `[rule] priority`.
@@ -137,6 +145,16 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
 }
 
 impl Lane {
+    /// The drivable extent (left, right) of the lane's axis in metres ([`Lane::drivable`]
+    /// as stored, else the lane's half width either side).
+    pub fn drivable(&self) -> (f32, f32) {
+        if self.drivable.0 > 0.0 && self.drivable.1 > 0.0 {
+            self.drivable
+        } else {
+            (self.width * 0.5, self.width * 0.5)
+        }
+    }
+
     /// Are two same-direction paths of one spline next to each other, so that a vehicle
     /// may change between them? By their edges, not by their middles: ordinary lanes are
     /// 3 to 4 m apart middle to middle with their painted widths 0.6 to 1.8 m apart at the
@@ -346,7 +364,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5) }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the

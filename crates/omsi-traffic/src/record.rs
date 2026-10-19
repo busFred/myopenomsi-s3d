@@ -31,8 +31,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// The format's version (the header's first field). 2: vehicles carry their claim
-/// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it.
-pub const VERSION: u32 = 2;
+/// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it. 3: the
+/// lanes carry their drivable extent (`Lane::drivable`, round 5 L1); a recording without it
+/// reads back the lanes' half widths.
+pub const VERSION: u32 = 3;
 /// The rules a recording is made with, as its header names them (`Header::switches`): the
 /// rule changes once tried behind switches and accepted, now always on, and the junction
 /// rules of round 4 (a recording made before them replays under them, not bit-exactly).
