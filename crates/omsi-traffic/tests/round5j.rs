@@ -274,12 +274,17 @@ fn j5_a_car_crawling_in_the_exits_first_metres_closes_the_box_a_bus_at_its_stop_
 
 #[test]
 fn j5_a_car_standing_in_the_exit_counts_by_the_gap_to_its_tail_unless_a_queue_forms_behind_its_lead() {
-    // standing 12.4 m past the conflict with nobody ahead (the head of a red-light queue):
-    // room by the gap alone (12.4 >= 6), entered as before (viz3 case03 #4436's lead)
+    // standing 12.4 m past the conflict with nobody ahead: 12.4 m of room by the gap, but
+    // queued behind it I would stand inside the exit's first 15 m (2.6 m short of their end,
+    // less than my 6 m): no room (x10 case06 #11146 entered behind #11131 standing 13 m past
+    // and stood with its tail across the through lane)
     let (held, _) = enters_behind(15.0, 0.0, true, false, None);
-    assert!(!held, "held for the exit behind a lone standing car with 12 m of room");
+    assert!(held, "the car entered the box behind a car standing 12 m past the conflict");
+    // standing 8 m past: 8 m of room, 7 m to the end of the first 15 m: entered, as before
+    let (held, _) = enters_behind(10.6, 0.0, true, false, None);
+    assert!(!held, "held for the exit behind a lone standing car with 8 m of room and 7 m to the zone's end");
     // the same car with another standing 5 m ahead of it: a queue forming, no room
-    let (held, _) = enters_behind(15.0, 0.0, true, false, Some(5.0));
+    let (held, _) = enters_behind(10.6, 0.0, true, false, Some(5.0));
     assert!(held, "the car entered the box behind a queue forming in the exit");
     // standing 4 m past the conflict: no room by the gap, as before
     let (held, _) = enters_behind(6.6, 0.0, true, false, None);

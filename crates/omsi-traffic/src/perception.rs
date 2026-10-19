@@ -1145,9 +1145,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 // such lead (the head of a red-light queue) counts by the gap to its tail
                 // alone, as before: holding for it kept a car at the box entry 25 s with the
                 // box clear and 7 m of room past it, viz3 case03 #4436 (regression review)
+                // (and one standing there that leaves less than my need between its tail and
+                // the end of those first metres: queued behind it I would stand in them with
+                // my tail across the conflicts' side, x10 case06 #11146 behind #11131 13 m past)
                 let crawling = o.state.speed >= 0.3 && o.state.speed < EXIT_SLOW;
                 let queue_forming = o.last.lead.is_some_and(|l| l.speed < 0.3 && l.gap < QUEUE_LEAD);
-                if (crawling || queue_forming) && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
+                let standing_near_end = o.state.speed < 0.3 && clear_from + EXIT_NEAR - tail < need;
+                if (crawling || queue_forming || standing_near_end) && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
                     room = 0.0;
                 }
             }
