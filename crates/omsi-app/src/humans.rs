@@ -1697,10 +1697,21 @@ const PED_GROUP_GAP_MEDIAN: f64 = 1.0;
 const PED_GROUP_GAP_SIGMA: f64 = 0.6;
 /// The members' paces lie within this share of the leader's (they walk together).
 const PED_GROUP_PACE_SPREAD: f64 = 0.05;
-/// A candidate is refused while another stroller on its lane is nearer than a log-normal
-/// gap of this median and sigma (m): right-skewed gaps between groups, tight ones inside.
+/// A candidate is refused while another stroller on its lane walking the same way is nearer
+/// than a log-normal gap of sigma PED_GAP_SIGMA (m) whose median is `gap_median`: at most
+/// PED_GAP_MEDIAN, at least PED_GAP_MIN - right-skewed gaps between groups, tight ones inside.
+/// [ROLLBACK r5-P6b] (a fixed 6 m median accepted 1-4 % of the draws at the density the
+/// `pedestrians` setting asks for and halved the strollers within 200 m: review r5p)
 const PED_GAP_MEDIAN: f64 = 6.0;
+const PED_GAP_MIN: f64 = 0.8;
 const PED_GAP_SIGMA: f64 = 1.0;
+
+/// [ROLLBACK r5-P6b] The median gap (m) for `target` strollers on `pavement_m` metres of pavement
+/// in the circle: half the pavement per person wanted, within PED_GAP_MIN..PED_GAP_MEDIAN, so
+/// that the count the setting asks for is reached while the gaps keep their skew.
+fn gap_median(pavement_m: f32, target: usize) -> f64 {
+    (pavement_m as f64 / (2.0 * target.max(1) as f64)).clamp(PED_GAP_MIN, PED_GAP_MEDIAN)
+}
 
 /// [ROLLBACK r5-P6] The size of a group from a standard normal deviate `z`.
 fn group_size(z: f64) -> usize {
@@ -4786,18 +4797,19 @@ impl Humans {
                     rej_ground += 1;
                     continue;
                 }
+                let fwd = self.rand_f() < 0.5;
                 // [ROLLBACK r5-P6] spaced: not within a log-normal gap of another stroller on
-                // this lane
+                // this lane walking the same way
                 let z = self.rand_normal();
-                let gap = lognormal(PED_GAP_MEDIAN, PED_GAP_SIGMA, z);
+                let gap = lognormal(gap_median(metres, target), PED_GAP_SIGMA, z);
                 let too_near = self.people.iter().any(|q| {
-                    matches!(&q.state, State::Strolling(w) if w.legs.get(w.leg).map(|l| l.lane == lane).unwrap_or(false)) && (q.position - p).length() < gap
+                    matches!(&q.state, State::Strolling(w) if w.legs.get(w.leg).map(|l| l.lane == lane && (l.b >= l.a) == fwd).unwrap_or(false))
+                        && (q.position - p).length() < gap
                 });
                 if too_near {
                     rej_gap += 1;
                     continue;
                 }
-                let fwd = self.rand_f() < 0.5;
                 let heading = if fwd { h as f64 } else { h as f64 + 180.0 };
                 // [ROLLBACK r5-P6] a group: the leader and its members behind, on the same
                 // lane the same way, at log-normal gaps, their paces within a few per cent
@@ -9661,6 +9673,16 @@ mod ped_tests {
             first = first.or(m.decision);
         }
         assert_eq!(first, Some(STANDS_ON));
+    }
+
+    #[test]
+    fn r5p6b_the_gap_median_follows_the_strollers_wanted() {
+        // 4852 m of pavement for 20000 wanted (pedestrians=19000): the floor; 700 m for 50:
+        // the 6 m ceiling; 2000 m for 500: 2 m
+        assert_eq!(gap_median(4852.0, 20000), PED_GAP_MIN);
+        assert_eq!(gap_median(700.0, 50), PED_GAP_MEDIAN);
+        assert!((gap_median(2000.0, 500) - 2.0).abs() < 1e-9);
+        assert_eq!(gap_median(100.0, 0), PED_GAP_MEDIAN);
     }
 
     #[test]
