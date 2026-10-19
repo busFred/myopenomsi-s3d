@@ -306,7 +306,7 @@ fn standing_order(js: &Junctions, claims: &[Claim], plain: &[Grant]) -> Vec<Stan
 /// for me at the junction is the second pass's ordering of standing claimants.
 fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
     let mut at = k;
-    for _ in 0..4 {
+    for _ in 0..LEAD_CHAIN {
         let lead = claims[at].lead;
         let waits = if at == k { None } else { plain.and_then(|p| p[at].wait_for) };
         if lead == Some(me) || waits == Some(me) {
@@ -319,6 +319,31 @@ fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain:
     }
     false
 }
+
+/// A rolling foe `k` is no competitor when it rolls up to a queue that waits for me: its lead
+/// chain (up to `LEAD_CHAIN` links) ends at `me` through at least one standing vehicle (every
+/// intermediate under 0.3 m/s). It cannot be at the meeting place before the standing one
+/// ahead of it moves, and that one waits for me. A foe whose DIRECT lead is me (no standing
+/// link between) stays a foe at any speed (`review_lead_is_me_drops_a_rolling_foe_2m_...`:
+/// a lead is one frame's perception).
+fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, k: usize, me: usize) -> bool {
+    let mut at = k;
+    for step in 0..LEAD_CHAIN {
+        let Some(lead) = claims[at].lead else { return false };
+        if lead == me {
+            return step >= 1;
+        }
+        let Some(&next) = claim_of.get(&lead) else { return false };
+        if next == k || claims[next].speed >= 0.3 {
+            return false;
+        }
+        at = next;
+    }
+    false
+}
+
+/// Links of a lead chain followed by `held_by` and `held_by_standing` (a three-car ring).
+const LEAD_CHAIN: usize = 4;
 
 /// The standing claim `k` cannot come while what holds it holds (rule C): it is stuck itself
 /// (people, a zebra, a standing lead in front of it), or it stands refused by the junction
@@ -588,7 +613,12 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 // (the follower only while it stands: a lead is one frame's perception and
                 // flickers between two cars side by side into a merge; one rolling at 3 m/s
                 // 2 m from the meeting place was dropped on it, and the two touched)
-                if !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < 0.3 && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle)))) {
+                // (rolling, it is dropped when it rolls up to a queue that waits for me: its
+                // lead chain reaches me through a standing vehicle, `held_by_standing`; x10
+                // case05: a bus at the head of the queue it had just left waited 8.6 s for
+                // three cars rolling up behind it, each a competitor from its own speed until
+                // it had come to a full stop)
+                if !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < 0.3 && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
                     continue;
                 }
                 // a foe standing at its red light is not coming before its light goes:
@@ -2322,6 +2352,44 @@ mod tests {
             let g = resolve(&js, &net, &[a, b2]);
             assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "{g:?}");
         }
+    }
+
+    #[test]
+    fn j4_a_rolling_foe_behind_a_standing_queue_that_waits_for_me_is_no_foe() {
+        // the side road car (1) stands at its line with its nose over the main road; the main
+        // road car (7) stands right at it with the side car as its lead; a third (2) rolls up
+        // at 3 m/s, 20 m out, behind 7 (x10 case05's queue behind the bus)
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mine0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let mut first = claim(7, main, mine0 - 3.0 - 2.0, 0.0);
+        first.lead = Some(1);
+        let mut rolling = claim(2, main, mine0 - 20.0 - 2.0, 3.0);
+        rolling.lead = Some(7);
+        let claims = [claim(1, side, -1.0, 0.0), first, rolling];
+        let g = resolve(&js, &net, &claims);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // through two standing links (a fourth car rolling up behind the third, standing)
+        let mut third = claims[2].clone();
+        third.speed = 0.0;
+        let mut fourth = claim(3, main, mine0 - 40.0 - 2.0, 6.0);
+        fourth.lead = Some(2);
+        let g = resolve(&js, &net, &[claims[0].clone(), claims[1].clone(), third, fourth]);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // the one between rolling too (the queue is moving off): a competitor, as before
+        let mut moving = claims.clone();
+        moving[1].speed = 1.0;
+        let g = resolve(&js, &net, &moving);
+        assert!(!grant_of(&g, 1).go, "{g:?}");
+        // the chain ends at somebody else (the standing one 30 m out so that it alone, held by
+        // its lead, would be dropped by `START_DELAY`): the rolling one is a competitor
+        let mut other = claims.clone();
+        other[1].lead = Some(99);
+        other[1].s = mine0 - 30.0 - 2.0;
+        other[1].held = true;
+        other[1].blocked = true;
+        let g = resolve(&js, &net, &other);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
     }
 
     #[test]
