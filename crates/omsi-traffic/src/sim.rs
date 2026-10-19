@@ -257,6 +257,10 @@ pub struct Vehicle {
     /// other's `wait_for` or `body_block`), and for how many seconds (`MUTUAL_HOLD`).
     #[serde(default)]
     pub mutual: Option<(u64, f32)>,
+    /// Seconds since the mutual hold (`mutual`) was last seen: the partner is kept over a gap
+    /// shorter than `MUTUAL_GAP` (a lead flickering between a body and none).
+    #[serde(default)]
+    pub mutual_gap: f32,
     /// Eased off for the vehicle with this id at this junction, since then (s): it stays held
     /// and its claim does not stand in the other's way (`Claim::yields_now`) until the other
     /// has left the meeting places of the two.
@@ -264,9 +268,30 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
-/// Two vehicles holding each other this long (s) at a junction where they have a meeting place
-/// negotiate: one eases off (`Vehicle::ease_for`).
+/// Two vehicles holding each other at a junction where they have a meeting place negotiate:
+/// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
+/// by the junction (`Decision::wait_for` both ways: the resolver's answer will not change by
+/// itself); a pair held by a body (`body_block`) on one side negotiates after this long (s),
+/// times the driver's `mutual_jitter`. (Round 4's 6 s clock for every pair never fired in a
+/// drive: four pairs stood 157 pair-seconds creeping at 0.2 m/s, review r5.)
 pub const MUTUAL_HOLD: f32 = 6.0;
+/// A mutual hold not seen for less than this (s) keeps its partner and its clock: a lead
+/// flickering every 0.4 s between a body and none restarted the clock each time (x10 case03,
+/// the dice rolled once in 54 min).
+pub const MUTUAL_GAP: f32 = 1.0;
+/// `MUTUAL_HOLD` is scaled per driver by a factor in this range (the lower id's, seeded by
+/// its id) so that unrelated pairs do not tick in lockstep.
+pub const MUTUAL_JITTER: (f32, f32) = (0.5, 1.5);
+
+/// The factor of `MUTUAL_JITTER` for the driver with vehicle id `id`, the same in every run.
+pub fn mutual_jitter(id: u64) -> f32 {
+    let mut x = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    let u = (x >> 40) as f32 / (1u64 << 24) as f32;
+    MUTUAL_JITTER.0 + (MUTUAL_JITTER.1 - MUTUAL_JITTER.0) * u
+}
 /// An eased-off car takes part again after this long (s) whatever the other does.
 pub const EASE_MAX: f32 = 30.0;
 
@@ -343,6 +368,7 @@ impl Vehicle {
             zip_won: None,
             change_still: (0.0, 0.0),
             mutual: None,
+            mutual_gap: 0.0,
             ease_for: None,
         }
     }
@@ -1097,35 +1123,52 @@ impl Simulation {
         }
     }
 
-    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`) for
-    /// `MUTUAL_HOLD` at a junction where their ways meet, neither at a red light: one eases off
+    /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`), both
+    /// standing, at a junction where their ways meet, neither at a red light: one eases off
     /// (`Vehicle::ease_for`), the other goes on by the ordinary rules - bodies, other foes and
     /// all (round 4a's standoff break let the winner ignore the other's body and claim, and it
-    /// squeezed past at -0.01 m, review9). The one that eases off: of two where only one is
-    /// body-blocked by the other, that one (it cannot go anyway; the other waits for it at the
-    /// junction); else by `eases_off`, the same in every run.
+    /// squeezed past at -0.01 m, review9). When: at the first frame both are refused for each
+    /// other by the junction (`wait_for` both ways; the resolver's answer will not change by
+    /// itself, and it took 6 s before: `MUTUAL_HOLD`), else, one of them held by the other's
+    /// body only, after `MUTUAL_HOLD` times the lower id's `mutual_jitter`; a hold not seen
+    /// for less than `MUTUAL_GAP` keeps its clock. The one that eases off: of two where only
+    /// one is body-blocked by the other, that one (it cannot go anyway; the other waits for it
+    /// at the junction); else by `eases_off`, the same in every run.
     pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
         let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
-        let mut timers: Vec<Option<(u64, f32)>> = Vec::with_capacity(vehicles.len());
+        let mut timers: Vec<(Option<(u64, f32)>, f32)> = Vec::with_capacity(vehicles.len());
         for v in vehicles.iter() {
             // (both standing: one rolling up to its stop is not held yet)
             let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
-            timers.push(other.map(|o| (o, match v.mutual {
-                Some((p, t)) if p == o => t + dt,
-                _ => dt,
-            })));
+            timers.push(match (other, v.mutual) {
+                (Some(o), Some((p, t))) if p == o => (Some((o, t + dt)), 0.0),
+                (Some(o), _) => (Some((o, dt)), 0.0),
+                // (not seen this frame: kept over a short gap while it stands)
+                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < 0.3 => (Some((p, t + dt)), v.mutual_gap + dt),
+                (None, _) => (None, 0.0),
+            });
         }
-        for (v, t) in vehicles.iter_mut().zip(&timers) {
+        for (v, (t, gap)) in vehicles.iter_mut().zip(&timers) {
             v.mutual = *t;
+            v.mutual_gap = *gap;
         }
         for a in 0..vehicles.len() {
             let Some((oid, t)) = vehicles[a].mutual else { continue };
             let Some(&b) = by_id.get(&oid) else { continue };
-            if vehicles[a].id > oid || t < MUTUAL_HOLD || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
+            if vehicles[a].id > oid || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
                 continue;
             }
             if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+                continue;
+            }
+            // (only at a frame the hold is seen: who is body-blocked is read from this frame)
+            if vehicles[a].mutual_gap > 0.0 || vehicles[b].mutual_gap > 0.0 {
+                continue;
+            }
+            // the first mutual refusal, or the body-held pair's clock
+            let refused = vehicles[a].last.wait_for == Some(oid) && vehicles[b].last.wait_for == Some(vehicles[a].id);
+            if !refused && t < MUTUAL_HOLD * mutual_jitter(vehicles[a].id) {
                 continue;
             }
             let (Some(ka), Some(kb)) = (claim_of[a], claim_of[b]) else { continue };
@@ -1156,6 +1199,8 @@ impl Simulation {
             vehicles[ease].ease_for = Some((other, j, 0.0));
             vehicles[a].mutual = None;
             vehicles[b].mutual = None;
+            vehicles[a].mutual_gap = 0.0;
+            vehicles[b].mutual_gap = 0.0;
         }
     }
 

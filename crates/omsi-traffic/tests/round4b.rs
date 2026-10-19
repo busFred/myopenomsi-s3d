@@ -789,9 +789,11 @@ fn side_and_main(b_front: f64) -> (Network, Vec<Vehicle>) {
     (net, vec![a, b])
 }
 
-/// One frame of the two holding each other (each the other's `wait_for`, `body_block` too for
-/// the ones given), standing, then `Simulation::negotiate` for `secs`: who eased off.
-fn held_each_other(red: bool, blocked: &[u64], secs: f32) -> Option<(u64, u64, usize)> {
+/// The two holding each other, standing, for `secs`, then `Simulation::negotiate` each frame:
+/// who eased off. Car `k` (ids 1 and 2) waits for the other at the junction when `wait_for`
+/// says so; `blocked` names the cars held by the other's body, for `body_on` s of every
+/// `body_on + body_off` s (a flickering lead).
+fn held_each_other_as(red: bool, wait_for: &[u64], blocked: &[u64], body_on: f32, body_off: f32, secs: f32) -> Option<(u64, u64, usize, f32)> {
     let (net, mut cars) = side_and_main(6.0);
     let mut sim = Simulation::new(&net, vec![]);
     sim.tick(&net, DT, &mut cars);
@@ -802,35 +804,68 @@ fn held_each_other(red: bool, blocked: &[u64], secs: f32) -> Option<(u64, u64, u
     }
     let mut t = 0.0;
     while t < secs {
+        let body_now = (t % (body_on + body_off)) < body_on;
         for k in 0..2 {
             let other = cars[1 - k].id;
             let me = &mut cars[k];
             me.state.speed = 0.0;
-            me.last.wait_for = Some(other);
-            me.last.body_block = blocked.contains(&me.id).then_some(other);
+            me.last.wait_for = wait_for.contains(&me.id).then_some(other);
+            me.last.body_block = (blocked.contains(&me.id) && body_now).then_some(other);
         }
         sim.negotiate(&mut cars, &claim_of, DT);
+        if let Some(e) = cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j, t))) {
+            return Some(e);
+        }
         t += DT;
     }
-    cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j)))
+    None
+}
+
+/// Both refused for each other by the junction (`wait_for` both ways), `blocked` held by the
+/// other's body too.
+fn held_each_other(red: bool, blocked: &[u64], secs: f32) -> Option<(u64, u64, usize)> {
+    held_each_other_as(red, &[1, 2], blocked, 1.0, 0.0, secs).map(|(a, b, j, _)| (a, b, j))
 }
 
 #[test]
-fn x7_a_mutual_hold_of_six_seconds_is_negotiated_by_the_pair_s_hash() {
+fn x7_a_mutual_refusal_is_negotiated_at_once_by_the_pair_s_hash() {
     use omsi_traffic::sim::eases_off;
-    assert_eq!(held_each_other(false, &[], 5.5), None, "too early");
-    let (who, other, j) = held_each_other(false, &[], 6.5).expect("nobody eased off");
+    // (round 5: at the first frame both stand refused for each other, not after 6 s)
+    let (who, other, j) = held_each_other(false, &[], 0.2).expect("nobody eased off");
     assert_eq!(who, eases_off(1, 2, j), "not the hash's pick");
     assert_eq!(other, 3 - who);
     // the same in every run
-    assert_eq!(held_each_other(false, &[], 6.5), Some((who, other, j)));
+    assert_eq!(held_each_other(false, &[], 0.2), Some((who, other, j)));
     // of two where only one is held by the other's body, that one eases off (the other waits
     // for it at the junction only)
     for blocked in [1u64, 2] {
-        assert_eq!(held_each_other(false, &[blocked], 6.5).map(|e| e.0), Some(blocked));
+        assert_eq!(held_each_other(false, &[blocked], 0.2).map(|e| e.0), Some(blocked));
     }
     // never while either is held by a red light
     assert_eq!(held_each_other(true, &[], 20.0), None, "a negotiation at a red light");
+}
+
+#[test]
+fn x7_a_pair_held_by_a_body_on_one_side_negotiates_after_the_jittered_hold() {
+    use omsi_traffic::sim::{mutual_jitter, MUTUAL_HOLD, MUTUAL_JITTER};
+    // car 1 waits for car 2 at the junction; car 2 is held by car 1's body only: no refusal
+    // both ways, the clock decides, scaled by the lower id's jitter
+    let hold = MUTUAL_HOLD * mutual_jitter(1);
+    assert!(hold >= MUTUAL_HOLD * MUTUAL_JITTER.0 && hold <= MUTUAL_HOLD * MUTUAL_JITTER.1);
+    assert_eq!(held_each_other_as(false, &[1], &[2], 1.0, 0.0, hold - 0.5), None, "too early");
+    let (who, _, _, at) = held_each_other_as(false, &[1], &[2], 1.0, 0.0, hold + 1.0).expect("nobody eased off");
+    assert!((at - hold).abs() < 0.2, "eased at {at:.2} s, the hold is {hold:.2} s");
+    assert_eq!(who, 2, "the body-blocked one eases off");
+    // the body seen for 0.6 s of every second (a flickering lead): the clock runs on over the
+    // gaps (MUTUAL_GAP) and it eases off at about the same time
+    let (who, _, _, at) = held_each_other_as(false, &[1], &[2], 0.6, 0.4, hold + 2.0).expect("the flicker reset the clock");
+    assert!(who == 2 && at < hold + 1.0, "eased at {at:.2} s, who {who}");
+    // a gap longer than MUTUAL_GAP resets it: body seen 0.5 s of every 2 s, nothing in 3 holds
+    assert_eq!(held_each_other_as(false, &[1], &[2], 0.5, 1.5, 3.0 * hold), None, "a hold gapped 1.5 s at a time eased off");
+    // the jitter varies between drivers and stays within its range
+    let js: Vec<f32> = (1..200u64).map(mutual_jitter).collect();
+    assert!(js.iter().all(|&j| (MUTUAL_JITTER.0..=MUTUAL_JITTER.1).contains(&j)));
+    assert!(js.iter().any(|&j| j < 0.8) && js.iter().any(|&j| j > 1.2));
 }
 
 /// The side road car (1) and the main road car (2, eased off for it, `b_front` short of the

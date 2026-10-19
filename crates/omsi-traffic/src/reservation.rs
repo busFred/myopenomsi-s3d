@@ -410,6 +410,30 @@ fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
     their_at >= my_out + margin
 }
 
+/// The claimant `c`, eased off for `o` in a mutual hold, follows `o` in where the two merge
+/// and `o` rolls (over the standing speed): (the gap from `c`'s front to `o`'s rear along the
+/// merged way, `o`'s speed), as the second of a zipper does (`Grant::follow`), when that gap
+/// is at least a metre. None at a crossing (nothing to follow in behind) or while `o` stands:
+/// then it waits where it is (`must_stop`). (Round 5: "when a complete stop is expected, roll
+/// earlier and let one slow down".)
+fn eased_follow(my_foes: &[(usize, crate::junction::Foe)], c: &Claim, o: &Claim) -> Option<(f32, f32)> {
+    if o.speed < 0.3 {
+        return None;
+    }
+    let mut best: Option<(f32, f32)> = None;
+    for (_, foe) in my_foes {
+        if foe.kind != FoeKind::Merge {
+            continue;
+        }
+        let Some(&(_, off)) = o.chain.iter().find(|&&(m, _)| m == foe.movement) else { continue };
+        let gap = (foe.mine.1 - (c.s + c.front)) - (foe.theirs.1 - (o.s - off + o.front)) - (o.front + o.rear);
+        if gap >= 1.0 && best.map(|b| gap < b.0).unwrap_or(true) {
+            best = Some((gap, o.speed));
+        }
+    }
+    best
+}
+
 /// One pass over the claims; `plain` is the first pass's answer in the second pass. Both
 /// drop followers and those behind on the same way; `standing` (the second pass) drops
 /// standing refused foes, the contenders decided in their order.
@@ -465,9 +489,12 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         // (held at my red I am held by my light, and no foe matters: the plan stops me at
         // the line, before any meeting place)
-        // (eased off in a mutual hold: it waits for the other, where it stands)
+        // (eased off in a mutual hold: it waits for the other, where it stands; where the other
+        // rolls on into a merge of the two ahead of it, it follows it in rather than standing,
+        // `eased_follow`)
         if let Some(w) = c.yields_now {
-            out[k] = Some(Grant::refused(c.vehicle, Some(w), Hold::Foe));
+            let follow = claim_of.get(&w).and_then(|&ok| eased_follow(&my_foes, c, &claims[ok]));
+            out[k] = Some(Grant { follow, ..Grant::refused(c.vehicle, Some(w), Hold::Foe) });
             continue;
         }
         if c.committed || c.absolute || c.light_red {
@@ -525,8 +552,13 @@ fn decide_in(ctx: &Context, js: &Junctions, net: &Network, claims: &[Claim], pla
                 // meeting place stuck behind a standing lead or people: it is not coming for as
                 // long as that holds, and when it moves off, the rules are the ordinary ones.
                 // Round 4b: a car clearing the box 11 s refused for one clearing too, stuck
-                // behind a third that waited for the first, made a ring of three, viz2 case08)
-                if shifted.clearing && !(shifted.stuck && !their_inside) {
+                // behind a third that waited for the first, made a ring of three, viz2 case08.
+                // Nor one standing outside it that waits for me, through its lead or the
+                // junction's answer, `held_by`: it is not coming before I go. X10 case03: a car
+                // past its line on amber, standing 8 m short of the merge with the bus as its
+                // lead, was committed to the bus, which let it out first; each waited for the
+                // other 46 s)
+                if shifted.clearing && !(shifted.stuck && !their_inside) && !(shifted.speed < 0.3 && !their_inside && held_by(claims, &claim_of, plain, ok, c.vehicle)) {
                     shifted.committed = true;
                 }
                 let o = &shifted;
@@ -2290,6 +2322,77 @@ mod tests {
             let g = resolve(&js, &net, &[a, b2]);
             assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "{g:?}");
         }
+    }
+
+    #[test]
+    fn j3_a_clearing_foe_standing_outside_the_merge_that_waits_for_me_is_not_committed() {
+        // A (0) and B (1) merge into C (2); A gives way to B. The bus on B stands held with its
+        // front a metre into the merge; the car on A is past its line on amber ("clearing"),
+        // standing a metre short of the merge with the bus's body as its lead (x10 case03
+        // #587/#3221: the car waited for the bus inside the stretch, the bus for the car
+        // "committed" by its clearing, 46 s)
+        let (net, js) = merge_a_gives_way();
+        let f = js.nodes[0].movements[1].foes.iter().find(|f| f.movement == 0).unwrap();
+        let (b0, a0) = (f.mine.0, f.theirs.0);
+        let mut bus = claim(1, 1, b0 + 1.0 - 2.0, 0.0);
+        bus.held = true;
+        bus.chain = vec![(1, 0.0), (2, 10.0)];
+        let mut car = claim(2, 0, a0 - 1.0 - 2.0, 0.0);
+        car.chain = vec![(0, 0.0), (2, 10.0)];
+        car.clearing = true;
+        car.lead = Some(1);
+        let g = resolve(&js, &net, &[bus.clone(), car.clone()]);
+        assert!(grant_of(&g, 1).go, "the bus waits for a car that waits for it: {g:?}");
+        assert_eq!(grant_of(&g, 2).wait_for, Some(1), "the car still waits for the bus: {g:?}");
+        // the same car not held by the bus (its lead somebody else, or none): clearing the box, it
+        // is committed to the others as before (round 4: whoever is in the box gets out first)
+        let mut free = car.clone();
+        free.lead = None;
+        let g = resolve(&js, &net, &[bus.clone(), free]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // rolling (not standing), with the bus as its lead: committed too
+        let mut rolling = car.clone();
+        rolling.speed = 2.0;
+        let g = resolve(&js, &net, &[bus, rolling]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    #[test]
+    fn j3_the_eased_one_follows_its_partner_into_a_merge_where_it_rolls_and_stands_elsewhere() {
+        // A (0) and B (1) merge into C (2); A gives way to B. Both stood at the merge; A eased
+        // off for B. B rolls on at 2 m/s, its front 3 m from the merge's end; A's front is 10 m
+        // from it: 3 m behind B's rear along the merged way
+        let (net, js) = merge_a_gives_way();
+        let f = js.nodes[0].movements[0].foes.iter().find(|f| f.movement == 1).unwrap();
+        let (a1, b1) = (f.mine.1, f.theirs.1);
+        let mut on_a = claim(1, 0, a1 - 10.0 - 2.0, 0.0);
+        on_a.chain = vec![(0, 0.0), (2, 10.0)];
+        on_a.yields_now = Some(2);
+        let mut on_b = claim(2, 1, b1 - 3.0 - 2.0, 2.0);
+        on_b.chain = vec![(1, 0.0), (2, 10.0)];
+        let g = resolve(&js, &net, &[on_a.clone(), on_b.clone()]);
+        let ga = grant_of(&g, 1);
+        assert!(!ga.go && ga.wait_for == Some(2), "{g:?}");
+        let (gap, speed) = ga.follow.expect("the eased one follows the rolling partner in");
+        assert!((gap - 3.0).abs() < 0.3 && speed == 2.0, "follow {gap:.1} m at {speed} m/s");
+        assert!(grant_of(&g, 2).go, "the partner goes: {g:?}");
+        // the partner standing: the eased one waits where it is
+        let mut standing = on_b.clone();
+        standing.speed = 0.0;
+        let g = resolve(&js, &net, &[on_a.clone(), standing]);
+        assert_eq!(grant_of(&g, 1).follow, None, "{g:?}");
+        // the partner rolling but level with me (its rear not a metre ahead of my front): no follow
+        let mut level = on_b.clone();
+        level.s = b1 - 7.0 - 2.0;
+        let g = resolve(&js, &net, &[on_a, level]);
+        assert_eq!(grant_of(&g, 1).follow, None, "{g:?}");
+        // at a crossing there is nothing to follow in behind
+        let (net, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let mut eased = claim(1, side, -3.0, 0.0);
+        eased.yields_now = Some(2);
+        let g = resolve(&js, &net, &[eased, claim(2, main, -3.0, 2.0)]);
+        assert!(!grant_of(&g, 1).go && grant_of(&g, 1).follow.is_none(), "{g:?}");
     }
 
     #[test]
