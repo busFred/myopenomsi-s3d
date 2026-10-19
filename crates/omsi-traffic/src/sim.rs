@@ -555,8 +555,8 @@ impl Simulation {
                 continue;
             }
             let p = v.state.way_point(net, 0.0);
-            let a = v.state.way_point(net, -1.5);
-            let b = v.state.way_point(net, 1.5);
+            let a = v.state.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
+            let b = v.state.way_point(net, omsi_sim::traffic::HEADING_CHORD);
             let d = (b - a).truncate();
             v.pos = p;
             if d.length_squared() > 1e-6 {
@@ -1279,9 +1279,9 @@ impl Simulation {
                     v.state.start_change(net, to, dir);
                 }
             }
-            Some(Start::Bypass { to, dir }) => {
+            Some(Start::Bypass { to, dir, out_len }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
-                    v.state.start_bypass(net, to, dir);
+                    v.state.start_bypass(net, to, dir, out_len);
                     v.stopped = 0.0;
                 }
             }

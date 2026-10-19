@@ -52,7 +52,8 @@ impl Why {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Start {
     Change { to: usize, dir: i32 },
-    Bypass { to: usize, dir: i32 },
+    /// Round something standing closer than the usual 8 m move: over `out_len` m.
+    Bypass { to: usize, dir: i32, out_len: f32 },
     RouteChange { to: usize, dir: i32 },
     Pass(Passing),
     AbortPass { hold: f32 },
@@ -354,7 +355,7 @@ fn pausing_player(l: &crate::perception::Headway) -> bool {
 /// Could the car get round the standing `lead` into the lane beside, `nb` (`Start::Bypass`,
 /// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
 /// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
-/// the thing standing and a gap it accepts.
+/// the thing standing and nobody passing on it the wrong way. (What the keep-back asks.)
 fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
     let lane = &net.lanes[me.state.lane];
     if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < 40.0 {
@@ -365,7 +366,168 @@ fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView,
         return false;
     }
     let _ = p;
-    nb.ahead.map(|a| a.0 > lead.gap + lead.length + 6.0).unwrap_or(true) && gap_accepted(me, nb)
+    // (the gap there is the start's to accept, `change_desire`, and a car driving on ahead
+    // there leaves the room: one going by in that lane now does not make the car roll up to 2 m behind the obstacle, from where it can never
+    // steer out - fix pass 2, the queue behind a bus at its stop)
+    nb.ahead.map(|a| a.1 > QUEUE_SPEED * 2.0 || a.0 > lead.gap + lead.length + 6.0).unwrap_or(true) && !nb.foreign
+}
+
+/// The move of a bypass from rest (m, `AiState::start_bypass`'s): a short, steep move.
+pub const BYPASS_LENGTH: f32 = 8.0;
+/// What the move keeps short of the obstacle's rear (m): the pass's `gap - 0.3`.
+pub const BYPASS_GAP_MARGIN: f32 = 0.3;
+/// A car's wheelbase as a share of its length (a 4.5 m saloon's 2.7 m; a 12 m bus's 6-7 m).
+pub const WHEELBASE_SHARE: f32 = 0.6;
+/// The largest road-wheel angle a driver steers when pulling out from rest (degrees; a
+/// passenger car's full lock is about 35-40, its turning circle about 10.5-11 m).
+pub const MAX_STEER_DEG: f32 = 35.0;
+
+/// The shortest move over `side` metres the body can drive (m): the S-curve's tightest
+/// bends, at its ends, have a radius of length² / (6 |side|), no tighter than the turning
+/// radius `wheelbase / tan(MAX_STEER_DEG)`. (Round 6 L2 fix pass 1: a 2 m move over 3.5 m
+/// pivoted the car 40-70 degrees on the spot, viz5 case08 #45474 178 -> 138 degrees in
+/// 0.5 m; for a 4.6 m car over 3.5 m this is 9.1 m, its steepest yaw 30 degrees.)
+pub fn bypass_min_len(length: f32, side: f32) -> f32 {
+    let radius = WHEELBASE_SHARE * length / MAX_STEER_DEG.to_radians().tan();
+    (6.0 * side.abs() * radius).sqrt()
+}
+
+/// The bypass round the standing `lead` into `nb`, from rest: the move ends `BYPASS_GAP_MARGIN`
+/// short of its rear, no longer than `BYPASS_LENGTH` and no shorter than the body can steer
+/// (`bypass_min_len`), and it starts only when that move clears the obstacle and every other
+/// body: `squeeze_clear` (a car standing in the lane beside level or just ahead, people)
+/// and `bypass_sweep_clear` (the body turned along the curve, the obstacle's corner too);
+/// where the gap is too short for it, the car does not set out (the 8 m move from 1.5 m
+/// behind a bus ran its way into the bus's corner and froze six times, viz5 case08 #45474;
+/// a car does not reverse out). Not round a bus indicating out of its stop or a vehicle
+/// moving off (it is let out).
+fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> Option<Start> {
+    let st = &me.state;
+    let obstacle = match lead.what {
+        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.id),
+        Seen::Player(id) => Some(crate::sim::PLAYER_ID_BASE + id as u64),
+        Seen::Parked => None,
+    };
+    if obstacle.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, moves)| moves || (bus && signals)) {
+        return None;
+    }
+    let target = &net.lanes[nb.lane];
+    let (ts, _) = target.nearest_point(me.pos)?;
+    let hr = (me.heading as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    let side = (target.at(ts).0 - me.pos).truncate().dot(right) as f32;
+    let shortest = bypass_min_len(me.length(), side);
+    let out_len = (lead.gap - BYPASS_GAP_MARGIN).clamp(shortest.min(BYPASS_LENGTH), BYPASS_LENGTH).max(shortest);
+    let (obstacle_len, _) = obstacle_run(p, lead, me.length() + out_len + PASS_ROOM);
+    let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
+    (squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, level, 0.0) && bypass_sweep_clear(net, sim, vehicles, me, side, out_len, level)).then_some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len })
+}
+
+/// The gap (m) behind the standing `lead` from which a bypass into `nb` clears it as the body
+/// can steer (`bypass_min_len`): the S-curve has moved the body off the obstacle by both half
+/// widths and `SQUEEZE_CLEARANCE`, and `BYPASS_TURN_MARGIN` for the corner of a turned body,
+/// by the time the front is level with its rear. A car that closes up nearer cannot get out
+/// without reversing (round 6 L2 fix pass 1: cars rolled up to 1.9 m behind and never could).
+fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> Option<f32> {
+    let target = &net.lanes[nb.lane];
+    let (ts, _) = target.nearest_point(me.pos)?;
+    let hr = (me.heading as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    let side = ((target.at(ts).0 - me.pos).truncate().dot(right) as f32).abs();
+    let need = me.half_width + lead.half_width + SQUEEZE_CLEARANCE + BYPASS_TURN_MARGIN;
+    if side <= need {
+        return None;
+    }
+    // (smoothstep inverted by halving: the share of the move at which it is `need` across)
+    let frac = need / side;
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..24 {
+        let t = 0.5 * (lo + hi);
+        if t * t * (3.0 - 2.0 * t) < frac {
+            lo = t;
+        } else {
+            hi = t;
+        }
+    }
+    Some(hi * bypass_min_len(me.length(), side).max(BYPASS_LENGTH.min(bypass_min_len(me.length(), side))))
+}
+
+/// A car closing in on the room a bypass needs holds there from this far inside it (m: the
+/// stop lands within half a metre of where it was aimed).
+pub const BYPASS_HOLD_SLACK: f32 = 0.5;
+
+/// Seconds a vehicle at the head of a queue stands, held by nothing, before the queue counts
+/// as one behind an obstacle (`Headway::standing_obstacle`'s 4 s for one standing unheld).
+pub const QUEUE_OBSTACLE_STAND: f32 = 4.0;
+/// Vehicles of a queue looked along for its head (`behind_an_obstacle`).
+pub const QUEUE_LOOK: usize = 6;
+
+/// Is the standing `lead` the tail of a queue whose head is an obstacle - a bus held at its
+/// stop (`External::at_stop`, `Why::Service`), a vehicle at the end of its way, or one that
+/// stands `QUEUE_OBSTACLE_STAND` s held by nothing - rather than a queue that is the road (a
+/// red light, a junction, a zebra: their heads are held by them)? The car approaching it is
+/// then kept back at the room a bypass needs before the queue packs to 2 m (round 6 L2 fix
+/// pass 2: behind bus #22368 at its stop, viz5 case07, four cars closed up to 1.8-2.2 m and
+/// stood 60 s and more, none able to steer out).
+fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
+    if lead.speed >= 0.3 {
+        return false;
+    }
+    let (Seen::Vehicle(mut j) | Seen::Body(mut j)) = lead.what else { return false };
+    for _ in 0..QUEUE_LOOK {
+        let Some(o) = vehicles.get(j) else { return false };
+        if o.state.speed >= 0.3 || o.passing.is_some() || o.state.change.is_some() {
+            return false;
+        }
+        let why = o.last.why;
+        if o.external.at_stop || matches!(why, Why::Service | Why::End) || (!o.last.held && why != Why::Lead && o.stopped >= QUEUE_OBSTACLE_STAND) {
+            return o.blinker_shown.0 == 0;
+        }
+        if why != Why::Lead {
+            return false;
+        }
+        let Some(next) = o.lead_id.and_then(|id| vehicles.iter().position(|v| v.id == id)) else { return false };
+        j = next;
+    }
+    false
+}
+
+/// What the corner of a body turned on the bypass's curve reaches beyond its shifted box (m):
+/// half a metre at 30 degrees for a 2 m front overhang.
+pub const BYPASS_TURN_MARGIN: f32 = 0.5;
+
+/// Does the body clear every other body by `SQUEEZE_CLEARANCE` on the bypass's S-curve
+/// (`AiState::start_bypass`'s move: `side` metres over `out_len`, the body turned along the
+/// curve, not only shifted as `squeeze_clear` has it), up to `level` metres on?
+fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, side: f32, out_len: f32, level: f32) -> bool {
+    let st = &me.state;
+    let near = sim.vehicles_near(me.pos, (level + 20.0) as f64);
+    let clearance = SQUEEZE_CLEARANCE as f64;
+    let mut d = 0.0f32;
+    while d <= level {
+        let t = (d / out_len.max(0.1)).clamp(0.0, 1.0);
+        let lat = side * t * t * (3.0 - 2.0 * t);
+        let slope = side * 6.0 * t * (1.0 - t) / out_len.max(0.1);
+        let p = st.way_point(net, d).truncate();
+        let p2 = st.way_point(net, d + 1.0).truncate();
+        let f = (p2 - p).normalize_or_zero();
+        let hr = (me.heading as f64).to_radians();
+        let f = if f.length_squared() < 0.5 { DVec2::new(hr.sin(), hr.cos()) } else { f };
+        let right = DVec2::new(f.y, -f.x);
+        let dir = (f + right * slope as f64).normalize();
+        let b = Obb::vehicle(p + right * lat as f64, dir.x.atan2(dir.y).to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+        for &j in &near {
+            let o = &vehicles[j];
+            if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 && o.obb().separation(&b) < clearance {
+                return false;
+            }
+        }
+        if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+            return false;
+        }
+        d += 0.5;
+    }
+    true
 }
 
 /// What the driver does about the light ahead this frame.
@@ -777,8 +939,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
         let threshold = 0.4 - 0.2 * me.impatience.value;
         if let Some((_, nb)) = best.filter(|b| b.0 >= threshold) {
-            let standing = p.leader.map(|l| l.standing_obstacle() && l.gap < 25.0).unwrap_or(false);
-            out.start = Some(if standing && v < 1.0 { Start::Bypass { to: nb.lane, dir: nb.dir } } else { Start::Change { to: nb.lane, dir: nb.dir } });
+            let standing = p.leader.filter(|l| l.standing_obstacle() && l.gap < 25.0);
+            out.start = match standing {
+                Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, p, &nb, &l),
+                _ => Some(Start::Change { to: nb.lane, dir: nb.dir }),
+            };
         }
     }
 
@@ -844,10 +1009,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
         }
-    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle() || pausing_player(&l)) {
+    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle() || pausing_player(l) || behind_an_obstacle(vehicles, l)) {
         // (the player's bus pausing 1.5 s is squeezed past inside the lane; everything else
-        // waits for it to be a standing obstacle)
-        let standing = l.standing_obstacle();
+        // waits for it to be a standing obstacle; a car standing in a queue behind one is only
+        // kept back from, for a bypass round them, `behind_an_obstacle`)
+        let queue_only = !(l.standing_obstacle() || pausing_player(&l));
+        let standing = l.standing_obstacle() || queue_only;
         let can_pass = !me.is_rail() && me.class != VehicleClass::Air && st.change.is_none() && out.start.is_none();
         // (the oncoming lane is used only on a road with one lane each way; not across a
         // solid line: a pass there stays a squeeze within the drawn road)
@@ -955,16 +1122,26 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
+        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
-        let bypass_possible = standing && !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
+        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, p, nb, &l));
+        let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
+        // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
+        let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {
+            Some(nb) => bypass_room(net, me, &nb, &l).unwrap_or(room),
+            None => room,
+        };
         // keep back: room to pull out again, where the car can still stop there gently - only
         // where a pass (or a bypass) could start now; behind a standing player at a red 40 m
         // on, or a queue at a junction, the car closes up to its queue gap (viz3 review: 4785
         // keyframe rows 6 m back behind AI leads and 56 behind the player where no pass could
         // ever start)
-        if (pass_possible || bypass_possible) && !(me.is_bus() && l.at_stop) && l.gap > room + 0.5 {
-            let dist = l.gap - room;
+        // (a bypass's room is held once reached: closing in from 0.5 m beyond it, the car rolled
+        // on to 2 m behind a bus at its stop and could never steer out, viz5 case07 #37625)
+        let bypass_room_held = bypass_possible && !pass_possible;
+        let slack = if bypass_room_held { -BYPASS_HOLD_SLACK } else { 0.5 };
+        if (pass_possible || bypass_possible) && !(me.is_bus() && l.at_stop) && l.gap > room + slack {
+            let dist = (l.gap - room).max(0.0);
             let need_brake = v * v / (2.0 * dist.max(0.1));
             if need_brake <= dp.comfort_brake * 1.5 {
                 min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);

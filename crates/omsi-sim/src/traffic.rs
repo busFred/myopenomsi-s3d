@@ -2935,6 +2935,10 @@ pub struct LaneChange {
     pub bypass: bool,
 }
 
+/// A vehicle's heading is that of the chord of its way this far behind and ahead of it (m,
+/// `Simulation::update_positions`).
+pub const HEADING_CHORD: f32 = 1.5;
+
 /// Smoothstep 0..1.
 fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -3348,11 +3352,12 @@ impl AiState {
         self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
     }
 
-    /// Pull out into `to` from behind a standing obstacle: a short, steep move.
-    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32) {
+    /// Pull out into `to` from behind a standing obstacle: a short, steep move over
+    /// `length` metres (8, less from close behind it).
+    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32) {
         self.start_change(net, to, dir);
         if let Some(c) = self.change.as_mut() {
-            c.length = 8.0;
+            c.length = length;
             c.bypass = true;
             // (pulling out round something: the old signal time)
             c.wait = c.wait.min(1.2);
@@ -3708,7 +3713,10 @@ impl AiState {
                 to_len = net.lanes.get(c.to).map(|l| l.length()).unwrap_or(0.0);
             }
             let from_ends = self.s >= from_len && (self.planned_next.is_none() || !carry_on);
-            if c.t >= 1.0 || from_ends || c.s_to >= to_len {
+            // (a bypass's short S-curve ends once the heading's chord behind the car is off it
+            // too: ended at its end, the heading jumped back 40 degrees in a frame, review r6l)
+            let tail = if c.bypass { HEADING_CHORD / c.length.max(0.1) } else { 0.0 };
+            if c.t >= 1.0 + tail || from_ends || c.s_to >= to_len {
                 // arrived on the new lane: it has no joint behind the car, and the way on
                 // is planned afresh from there
                 if self.route.get(self.route_index + 1) == Some(&c.to) {
@@ -3859,7 +3867,7 @@ mod tests {
         car.speed = 3.0;
         car.plan_next(&net);
         assert_eq!(car.planned_next, Some(2));
-        car.start_bypass(&net, 1, 1);
+        car.start_bypass(&net, 1, 1, 8.0);
         let dt = 1.0 / 30.0;
         let mut at = car.way_point(&net, 0.0);
         for _ in 0..300 {
