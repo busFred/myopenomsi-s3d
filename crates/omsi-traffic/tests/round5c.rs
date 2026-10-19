@@ -157,3 +157,71 @@ fn c2_a_standing_car_is_not_held_by_somebody_level_with_its_body() {
     let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(0.0, -0.3), ..person(105.0, 1.6) }]);
     assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
 }
+
+// C3 ----------------------------------------------------------------------------------
+
+/// My car (id 1, from x = -70) rolls up at 10 m/s behind a lead (id 2) held by its service
+/// with its rear at x = `lead_rear`; returns where my front came to rest and my hold then.
+fn queue_behind(net: &Network, lead_rear: f32) -> (f32, Why) {
+    queue_behind_from(net, lead_rear, 230.0, None)
+}
+
+/// `queue_behind`, my car `s` into lane 0; `rolling`: the lead starts at x = `rolling` (on the
+/// piece) at 3 m/s and comes to rest with its rear at `lead_rear`.
+fn queue_behind_from(net: &Network, lead_rear: f32, s: f32, rolling: Option<f32>) -> (f32, Why) {
+    let mut sim = Simulation::new(&net, vec![]);
+    // (the lead: on piece 1 from x = -15, or on lane 2 from x = 45)
+    let lead = match rolling {
+        Some(x) => car(2, 1, x + 15.0, 3.0),
+        None if lead_rear + 4.0 <= 45.0 => car(2, 1, lead_rear + 2.0 + 15.0, 0.0),
+        None => car(2, 2, lead_rear + 2.0 - 45.0, 0.0),
+    };
+    let mut cars = vec![car(1, 0, s, 10.0), lead];
+    let mut stood: Option<(f32, Why)> = None;
+    run(net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+        for c in cars.iter_mut() {
+            if c.id == 2 {
+                // (its front comes to rest 4 m ahead of where its rear is to stand)
+                c.external.stop_at = Some(lead_rear + 4.0 - c.pos.x as f32);
+            }
+        }
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if me.state.speed < 0.05 && stood.is_none() {
+            stood = Some((front_x(me), me.last.why));
+        }
+    });
+    stood.expect("never came to rest behind the lead")
+}
+
+/// [round5 C3] Behind a lead standing 1.5 m past the zebra (x = 23) my body would stand on it
+/// (front at 22.6, as before this rule): I stop at the zebra stop, 2.5 m before the cut, as a
+/// refused car does. Where the lead stands far past it (rear at x = 34, my body off the
+/// zebra) and on a plain road without a crossing the queue is unchanged: my front 1.9 m (the
+/// queue gap) behind it.
+#[test]
+fn c3_a_queue_over_a_zebra_stops_at_the_zebra_stop_a_plain_queue_does_not() {
+    let net = road_with_a_zebra(true);
+    let (at, why) = queue_behind(&net, 24.5);
+    assert!(at > 19.5 && at <= 23.0 - 2.5 + 0.2, "stood with its front at x = {at:.1} ({why:?})");
+    assert_eq!(why, Why::Lead);
+    let (at, _) = queue_behind(&net, 34.0);
+    assert!(at > 31.0 && at < 33.0, "the plain queue behind a lead off the zebra: front at x = {at:.1}");
+    let net = road_with_a_zebra(false);
+    let (at, _) = queue_behind(&net, 24.5);
+    assert!(at > 21.5 && at < 23.0, "a plain road: front at x = {at:.1}");
+}
+
+/// [round5 C3] The lead still rolling (3 m/s, held by its service) past the zebra as I come up,
+/// coming to rest 1.5 m past it: I stop short of the cut all the same (x10 case15: the lead
+/// stood only once I was on the zebra). On a plain road I queue up behind it as before.
+#[test]
+fn c3_a_lead_rolling_to_rest_past_the_zebra_is_queued_behind_off_the_zebra_too() {
+    for (my_s, lead_x) in [(215.0, 5.0), (230.0, 10.0), (200.0, 0.0)] {
+        let net = road_with_a_zebra(true);
+        let (at, why) = queue_behind_from(&net, 24.5, my_s, Some(lead_x));
+        assert!(at > 18.0 && at <= 23.0 - 0.3, "me from s {my_s}, lead from x {lead_x}: stood with its front at x = {at:.1} ({why:?})");
+        let net = road_with_a_zebra(false);
+        let (at, _) = queue_behind_from(&net, 24.5, my_s, Some(lead_x));
+        assert!(at > 21.5 && at < 23.0, "a plain road, me from s {my_s}, lead from x {lead_x}: front at x = {at:.1}");
+    }
+}

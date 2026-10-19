@@ -45,9 +45,26 @@ pub struct Headway {
     pub at_stop: bool,
     /// Where its middle lies across my lane (m, + right of the lane's middle).
     pub lateral: f32,
+    /// [round5 C3] Where its rear comes to rest (m from my origin) when it brakes for a stop of
+    /// its own (its plan's `stop`): a queue forming ahead of me, before it stands.
+    pub rest: Option<f32>,
 }
 
 impl Headway {
+    /// Where vehicle `o`'s rear comes to rest, `gap` ahead of my front (`front`): at the stop of
+    /// its own it brakes for, or behind its own standing lead at its queue gap, whichever is
+    /// nearer (x10 case15: the lead braked for its exit-full line but stood 8 m short of it
+    /// behind a bus at its stop); `None` with neither.
+    fn rest_of(o: &Vehicle, gap: f32, front: f32) -> Option<f32> {
+        let by_stop = o.last.stop.map(|s| (s - o.state.front).max(0.0));
+        let by_lead = o.last.lead.filter(|l| l.speed < 0.3).map(|l| (l.gap - o.state.min_gap).max(0.0));
+        let on = match (by_stop, by_lead) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        on.map(|d| gap + front + d)
+    }
+
     fn nearer(a: Option<Headway>, b: Option<Headway>) -> Option<Headway> {
         match (a, b) {
             (Some(x), Some(y)) => Some(if y.gap < x.gap { y } else { x }),
@@ -487,7 +504,7 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
         }
         let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
         let held = o.last.held || o.last.stop.is_some();
-        let h = Headway { gap, speed: if occ.foreign { -o.state.speed } else { o.state.speed }, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for, half_width: o.half_width, length: o.length(), held, at_stop: o.external.at_stop, lateral: occ.lateral };
+        let h = Headway { gap, speed: if occ.foreign { -o.state.speed } else { o.state.speed }, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for, half_width: o.half_width, length: o.length(), held, at_stop: o.external.at_stop, lateral: occ.lateral, rest: Headway::rest_of(o, gap, st.front) };
         if best.map(|b| h.gap < b.gap).unwrap_or(true) {
             *best = Some(h);
         }
@@ -691,7 +708,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let acc = if along > 0.7 { o.state.acc * along } else { 0.0 };
         let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
         let held = o.last.held || o.last.stop.is_some();
-        let hw = Headway { gap, speed, acc, what: if on_way { Seen::Vehicle(j) } else { Seen::Body(j) }, standing_for, half_width: o.half_width, length: o.length(), held, at_stop: o.external.at_stop, lateral };
+        let hw = Headway { gap, speed, acc, what: if on_way { Seen::Vehicle(j) } else { Seen::Body(j) }, standing_for, half_width: o.half_width, length: o.length(), held, at_stop: o.external.at_stop, lateral, rest: Headway::rest_of(o, gap, st.front) };
         if on_way {
             on_lane = Headway::nearer(on_lane, Some(hw));
         } else {
@@ -715,7 +732,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 continue;
             }
             let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
-            let hw = Headway { gap, speed: if occ.foreign { -o.state.speed } else { o.state.speed }, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for, half_width: o.half_width, length: o.length(), held: o.last.held || o.last.stop.is_some(), at_stop: o.external.at_stop, lateral: occ.lateral };
+            let hw = Headway { gap, speed: if occ.foreign { -o.state.speed } else { o.state.speed }, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for, half_width: o.half_width, length: o.length(), held: o.last.held || o.last.stop.is_some(), at_stop: o.external.at_stop, lateral: occ.lateral, rest: Headway::rest_of(o, gap, st.front) };
             on_lane = Headway::nearer(on_lane, Some(hw));
         }
     }
@@ -765,7 +782,7 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
                 continue;
             }
             let gap = (d_me - d_them - o.state.rear - st.front).max(0.3);
-            let h = Headway { gap, speed: o.state.speed, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for: o.stopped, half_width: o.half_width, length: o.length(), held: true, at_stop: false, lateral: 0.0 };
+            let h = Headway { gap, speed: o.state.speed, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for: o.stopped, half_width: o.half_width, length: o.length(), held: true, at_stop: false, lateral: 0.0, rest: Headway::rest_of(o, gap, st.front) };
             best = Headway::nearer(best, Some(h));
         }
     }
@@ -920,7 +937,7 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
             let right = DVec2::new(fwd.y, -fwd.x);
             let q = way.pts[k].1;
             let lateral = (p.pos.truncate() - q).dot(right) as f32 + st.lateral_ahead(way.pts[k].0);
-            let hw = Headway { gap, speed, acc: 0.0, what: Seen::Player(p.id), standing_for: p.still, half_width: p.half_width, length: p.half_len * 2.0, held: false, at_stop: false, lateral };
+            let hw = Headway { gap, speed, acc: 0.0, what: Seen::Player(p.id), standing_for: p.still, half_width: p.half_width, length: p.half_len * 2.0, held: false, at_stop: false, lateral, rest: None };
             best = Headway::nearer(best, Some(hw));
         }
     }
@@ -954,7 +971,7 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
                 }
             } else if need.abs() > 1.1 {
                 let gap = along - p.half_len - st.front - 2.0;
-                let h = Headway { gap, speed: 0.0, acc: 0.0, what: Seen::Parked, standing_for: f32::INFINITY, half_width: p.half_width, length: p.half_len * 2.0, held: false, at_stop: false, lateral: p.lateral };
+                let h = Headway { gap, speed: 0.0, acc: 0.0, what: Seen::Parked, standing_for: f32::INFINITY, half_width: p.half_width, length: p.half_len * 2.0, held: false, at_stop: false, lateral: p.lateral, rest: None };
                 lead = Headway::nearer(lead, Some(h));
             }
         }
