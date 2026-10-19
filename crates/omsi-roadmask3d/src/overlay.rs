@@ -78,6 +78,8 @@ const C_STRIP: [f32; 4] = [1.0, 0.55, 0.82, 0.95];
 const C_WAY: [f32; 4] = [0.0, 0.90, 1.0, 0.70];
 const C_ATTENTION: [f32; 4] = [1.0, 0.25, 0.25, 0.95];
 const C_AT_KERB: [f32; 4] = [1.0, 0.83, 0.24, 0.90];
+/// `--compare`: the recorded vehicles' wire boxes.
+pub const C_RECORDED: [f32; 4] = [1.0, 0.95, 0.10, 0.95];
 /// The height tint has this many steps.
 const HEIGHT_STEPS: usize = 8;
 
@@ -180,7 +182,7 @@ impl Overlay {
         for s in PersonState::ALL {
             self.material(renderer, scene, s.colour());
         }
-        for c in [C_PLAYER, C_PIN, C_STRIP, C_WAY, C_ATTENTION, C_AT_KERB] {
+        for c in [C_PLAYER, C_PIN, C_STRIP, C_WAY, C_ATTENTION, C_AT_KERB, C_RECORDED] {
             self.material(renderer, scene, c);
         }
         // OMSI_MASK3D_DEBUG=1: the lanes near the middle against the scene's heights
@@ -329,8 +331,10 @@ impl Overlay {
     /// attention line to its lead and its intended way.
     ///
     /// `player_box` false leaves the player's wire box out (the camera sits in it).
+    /// `recorded` (`--compare`): the recording's vehicles of the same moment, drawn as wire
+    /// boxes over the free run's solid ones.
     #[allow(clippy::too_many_arguments)]
-    pub fn update_frame(&mut self, renderer: &Renderer, scene: &mut Scene, world: &World, tl: &Timeline, frame: &FrameSnap, hovered: Option<u64>, pinned: Option<u64>, player_box: bool) {
+    pub fn update_frame(&mut self, renderer: &Renderer, scene: &mut Scene, world: &World, tl: &Timeline, frame: &FrameSnap, recorded: Option<&FrameSnap>, hovered: Option<u64>, pinned: Option<u64>, player_box: bool) {
         self.clear_dynamic(renderer, scene);
         let ground = |p: DVec3| -> f64 {
             match world.walk_height(p.x, p.y) {
@@ -367,6 +371,26 @@ impl Overlay {
             }
         }
         self.place_dynamic(renderer, scene, Layer::Vehicles, pl.finish(), &[C_PLAYER]);
+
+        // --compare: the recorded vehicles as wire boxes
+        if let Some(rf) = recorded {
+            let mut wire = Builder::new(1);
+            for v in &rf.vehicles {
+                let foot = self.rel(DVec3::new(v.pos.x, v.pos.y, ground(v.pos)), 0.07);
+                let base = geometry::box_corners(foot, v.heading, v.front, v.rear, v.half_width);
+                let height = match v.class.as_str() {
+                    "Bus" | "ScheduledBus" | "Truck" | "Rail" => 3.0,
+                    _ => 1.5,
+                };
+                let top: Vec<Vec3> = base.iter().map(|c| *c + Vec3::Z * height).collect();
+                geometry::outline(&mut wire, 0, &base, W_OUTLINE);
+                geometry::outline(&mut wire, 0, &top, W_OUTLINE);
+                for k in 0..4 {
+                    geometry::line_ribbon(&mut wire, 0, &[base[k], top[k]], W_OUTLINE);
+                }
+            }
+            self.place_dynamic(renderer, scene, Layer::Vehicles, wire.finish(), &[C_RECORDED]);
+        }
 
         // the hovered and pinned vehicles' lines
         let mut lines = Builder::new(4);
@@ -446,6 +470,7 @@ impl Overlay {
             rows.push((s.colour(), s.name().to_string()));
         }
         rows.push((C_PLAYER, "player's bus (wire box)".into()));
+        rows.push((C_RECORDED, "recorded vehicle (--compare: wire box)".into()));
         rows.push((C_PIN, "pinned / hovered vehicle".into()));
         rows.push((C_STRIP, "its people strip (half width + 0.3 m)".into()));
         rows.push((C_WAY, "its intended way".into()));

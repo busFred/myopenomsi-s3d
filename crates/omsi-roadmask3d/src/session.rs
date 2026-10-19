@@ -54,6 +54,38 @@ impl CamMode {
     }
 }
 
+/// What the vehicles shown are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// The recording's positions (the replay reset to them at every keyframe).
+    Recorded,
+    /// `--free`: a free run from the first keyframe with the rules of this build.
+    Free,
+    /// `--compare`: the free run solid, the recording as wire boxes, on one clock.
+    Compare,
+}
+
+impl RunMode {
+    pub fn from_args(free: bool, compare: bool) -> RunMode {
+        if compare {
+            RunMode::Compare
+        } else if free {
+            RunMode::Free
+        } else {
+            RunMode::Recorded
+        }
+    }
+
+    /// The HUD's words for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RunMode::Recorded => "recorded",
+            RunMode::Free => "free run (rules of this build)",
+            RunMode::Compare => "compare: solid = free run (rules of this build), yellow wire = recorded",
+        }
+    }
+}
+
 pub struct Session {
     pub settings: ToolSettings,
     pub renderer: Renderer,
@@ -69,6 +101,10 @@ pub struct Session {
     lit_at: f64,
     pub tiles_loaded: usize,
     pub load_secs: f32,
+    /// What `timeline` is (the recording, or a free run).
+    pub run: RunMode,
+    /// `--compare`: the recorded replay beside the free run of `timeline`.
+    pub recorded: Option<Timeline>,
 }
 
 /// `YYYYMMDD` as (year, day of the year).
@@ -142,6 +178,8 @@ impl Session {
             lighting,
             tiles_loaded: tiles.len(),
             load_secs: t0.elapsed().as_secs_f32(),
+            run: RunMode::Recorded,
+            recorded: None,
         })
     }
 
@@ -157,10 +195,23 @@ impl Session {
         }
     }
 
+    /// Show the free run `timeline` as `run` (Free or Compare; `recorded` the recorded
+    /// replay for Compare).
+    pub fn set_run(&mut self, run: RunMode, recorded: Option<Timeline>) {
+        self.run = run;
+        self.recorded = recorded;
+    }
+
+    /// The recorded replay's frame at the moment of `timeline`'s frame `frame` (--compare).
+    pub fn recorded_frame(&self, frame: usize) -> Option<&FrameSnap> {
+        recorded_at(self.recorded.as_ref(), self.timeline.frames[frame].day_time)
+    }
+
     /// The frame's dynamic overlay.
     pub fn lay_frame(&mut self, frame: usize, hovered: Option<u64>, pinned: Option<u64>, mode: CamMode) {
         let f = &self.timeline.frames[frame];
-        self.overlay.update_frame(&self.renderer, &mut self.scene, &self.world, &self.timeline, f, hovered, pinned, mode != CamMode::Seat);
+        let rf = recorded_at(self.recorded.as_ref(), f.day_time);
+        self.overlay.update_frame(&self.renderer, &mut self.scene, &self.world, &self.timeline, f, rf, hovered, pinned, mode != CamMode::Seat);
         self.world.finish_texture_upgrades(&self.renderer, &mut self.scene);
     }
 
@@ -291,6 +342,10 @@ impl Session {
                 if self.overlay.heights { "  heights" } else { "" }
             ),
             format!("{} · {} vehicles, {} people, {} lanes · player {} · tiles {} ({:.1}s) · cam ({:.0}, {:.0}, {:.1}) yaw {:.0} pitch {:.0}", self.timeline.map, frame.vehicles.len(), frame.people.len(), self.overlay.counts.lanes, frame.players.first().map(|p| format!("{:.1} km/h", p.speed * 3.6)).unwrap_or("-".into()), self.tiles_loaded, self.load_secs, cam.position.x, cam.position.y, cam.position.z, cam.yaw, cam.pitch),
+            match self.run {
+                RunMode::Recorded => "vehicles: recorded".to_string(),
+                _ => format!("vehicles: {} · {}", self.run.name(), self.timeline.free_summary),
+            },
         ];
         if keys_help {
             lines.push("space play · , . step · [ ] ±5 s · - = speed · Home start · L legend · H heights · P / click pin · N next vehicle · F1 free F2 seat F3 follow F4 top · PgUp/PgDn height · F5 hide this · Esc quit".into());
@@ -317,12 +372,47 @@ impl Session {
                     if dist > 90.0 && Some(v.id) != pinned {
                         continue;
                     }
-                    let text = if v.why.is_empty() || v.state == crate::geometry::VehicleState::Moving { format!("#{}", v.id) } else { format!("#{} {}", v.id, v.why) };
+                    let text = match self.run {
+                        // the live simulation's reason and what it waits for, moving or not
+                        RunMode::Free | RunMode::Compare => live_label(v),
+                        RunMode::Recorded if v.why.is_empty() || v.state == crate::geometry::VehicleState::Moving => format!("#{}", v.id),
+                        RunMode::Recorded => format!("#{} {}", v.id, v.why),
+                    };
                     let colour = if Some(v.id) == pinned { [1.0, 0.3, 0.85, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
                     // (smaller with distance, down to two thirds)
                     let size = px * 0.85 * (1.0 - 0.33 * (dist / 90.0).min(1.0));
                     self.hud.label(&self.renderer, &mut self.scene, &text, size, x, y - size, colour);
                 }
+            }
+        }
+
+        // --compare: the recorded vehicles the free run has elsewhere (over 1 m off) or not at all
+        if self.overlay.layers_on[Layer::Labels as usize] {
+            let recorded: Vec<crate::timeline::VehicleSnap> = self.recorded_frame(frame_ix).map(|f| f.vehicles.clone()).unwrap_or_default();
+            for v in &recorded {
+                let off = match frame.vehicles.iter().find(|o| o.id == v.id) {
+                    Some(o) => {
+                        let d = (o.pos - v.pos).truncate().length();
+                        if d < 1.0 {
+                            continue;
+                        }
+                        format!("{d:.0} m off")
+                    }
+                    None => "not in the free run".to_string(),
+                };
+                let top = DVec3::new(v.pos.x, v.pos.y, v.pos.z + 0.5);
+                let Some((x, y)) = self.project(cam, top, w, h) else { continue };
+                if x < -50.0 || y < -50.0 || x > w + 50.0 || y > h + 50.0 {
+                    continue;
+                }
+                let dist = (top - cam.position).length() as f32;
+                if dist > 90.0 {
+                    continue;
+                }
+                let text = format!("rec #{} {}{}", v.id, if v.state == crate::geometry::VehicleState::Moving { String::new() } else { format!("{} · ", v.why) }, off);
+                let size = px * 0.75 * (1.0 - 0.33 * (dist / 90.0).min(1.0));
+                let c = crate::overlay::C_RECORDED;
+                self.hud.label(&self.renderer, &mut self.scene, &text, size, x, y, [c[0], c[1], c[2], 1.0]);
             }
         }
 
@@ -372,6 +462,30 @@ impl Session {
             self.hud.legend(&self.renderer, &mut self.scene, &rows, px * 0.85, 8.0, h * 0.2);
         }
     }
+}
+
+/// The frame of `rec` at day time `t` (none more than half a second off).
+fn recorded_at(rec: Option<&Timeline>, t: f64) -> Option<&FrameSnap> {
+    let rec = rec?;
+    let f = &rec.frames[rec.frame_at(t + 1e-6)];
+    ((f.day_time - t).abs() < 0.5).then_some(f)
+}
+
+/// A free run's label: the id, the planner's reason and what it waits for (`#12 yield > #7`).
+pub fn live_label(v: &crate::timeline::VehicleSnap) -> String {
+    let mut t = format!("#{}", v.id);
+    if !v.why.is_empty() {
+        t.push(' ');
+        t.push_str(v.why);
+    }
+    if let Some(w) = v.wait_for {
+        t.push_str(" > ");
+        t.push_str(&id_name(w));
+    }
+    if v.state != crate::geometry::VehicleState::Moving && v.standing_for >= 1.0 {
+        t.push_str(&format!(" {:.0}s", v.standing_for));
+    }
+    t
 }
 
 /// A vehicle id as text: a player's (`PLAYER_ID_BASE` + its id) as "player N".

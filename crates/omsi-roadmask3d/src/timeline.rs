@@ -84,13 +84,19 @@ pub struct Timeline {
     /// The lanes' extent (min, max) in world metres.
     pub extent: (DVec3, DVec3),
     pub net: Network,
+    /// A free run's summary: the spawns put off and dropped, the largest drift from the
+    /// recording at a keyframe.
+    pub free_summary: String,
 }
 
 impl Timeline {
     /// Replay `path` whole (a cut window) and keep what the overlay draws within `radius`
-    /// metres of its middle.
-    pub fn load(path: &Path, radius: f64, centre_override: Option<(f64, f64)>) -> Result<Timeline, Box<dyn std::error::Error>> {
+    /// metres of its middle. `free`: a free run (`Replay::free_run`, as `traffic_cases
+    /// trace --free`): on from the first keyframe with the current rules and no resets, the
+    /// people replayed as recorded; else the recorded replay (reset at every keyframe).
+    pub fn load(path: &Path, radius: f64, centre_override: Option<(f64, f64)>, free: bool) -> Result<Timeline, Box<dyn std::error::Error>> {
         let mut r = Replay::load(path)?;
+        r.free_run = free;
         if !r.at(0) {
             return Err("the recording has no keyframe".into());
         }
@@ -107,10 +113,12 @@ impl Timeline {
         let mut frames = Vec::new();
         while r.step() {
             r.sim.update_positions(&r.net, &mut r.vehicles);
+            // (a `gone` car - one that stood too long - is still on the road until the game
+            // takes it away out of sight, a `Remove` record: it is drawn until then)
             let vehicles = r
                 .vehicles
                 .iter()
-                .filter(|v| !v.gone && near(v.pos, radius + 20.0))
+                .filter(|v| near(v.pos, radius + 20.0))
                 .map(|v| {
                     let standing = v.state.speed.abs() < 0.05;
                     let why = v.last.why.name();
@@ -230,7 +238,20 @@ impl Timeline {
             hi = DVec3::new(cx + radius, cy + radius, 0.0);
         }
         let z = frames.iter().flat_map(|f| f.players.iter().map(|p| p.pos.z)).next().unwrap_or((lo.z + hi.z) * 0.5);
-        Ok(Timeline { map: r.header.map.clone(), lanes, kerb_spots, frames, centre: DVec3::new(cx, cy, z), extent: (lo, hi), net: r.net })
+        let free_summary = if free {
+            // (the drift is measured at the keyframes, on the replay's clock: to day time)
+            let to_day = r.sim.day_time - r.sim.time;
+            let worst = r.divergence.iter().copied().fold(None, |b: Option<(f64, f32, u64)>, d| if b.map(|b| d.1 > b.1).unwrap_or(true) { Some(d) } else { b });
+            let drift = match worst {
+                Some((t, d, id)) if d >= 0.01 => format!("largest drift from the recording at a keyframe {d:.1} m (#{id} at {})", omsi_roadmask::hms(t + to_day)),
+                Some(_) => format!("where the recording has it at all {} keyframes (made under these rules)", r.divergence.len()),
+                None => "no later keyframe to compare".to_string(),
+            };
+            format!("{} spawns put off, {} dropped; {}{}", r.deferred_spawns, r.dropped_spawns, drift, if r.missing.is_empty() { String::new() } else { format!("; {} vehicles missing or extra at keyframes", r.missing.len()) })
+        } else {
+            String::new()
+        };
+        Ok(Timeline { map: r.header.map.clone(), lanes, kerb_spots, frames, centre: DVec3::new(cx, cy, z), extent: (lo, hi), net: r.net, free_summary })
     }
 
     /// The index of the frame at or just before day time `t` (the first for an earlier t).

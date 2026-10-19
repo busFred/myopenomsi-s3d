@@ -7,6 +7,8 @@
 //! omsi-roadmask3d [<window.rec>] [--list] [--at HH:MM] [--root <omsi root>] [--radius M]
 //!                 [--center x,y] [--date YYYYMMDD] [--start HH:MM:SS]
 //!                 [--shot <png> --t HH:MM:SS --cam seat|top[:H]|follow:N|x,y,z,yaw,pitch[,fov] [--size WxH]]
+//!                 [--video <out.mp4> [--fps 15] [--from HH:MM:SS] [--to HH:MM:SS] [--cam ..] [--size WxH]]
+//!                 [--free | --compare]
 //! ```
 //!
 //! Without a recording a file dialog (or `--list`) picks one under `~/.openomsi/traffic`;
@@ -14,9 +16,14 @@
 //! round the window's middle are loaded with the game's scene code within the game's view
 //! distance (`--radius` metres otherwise) and drawn by the game's renderer in a window at
 //! the settings' resolution. `--shot` renders pictures headlessly instead (`--cam` per shot,
-//! in order; `--t` the moment). Nothing under `~/.openomsi` is written but the output folder
-//! `~/.openomsi/traffic/mask3d/` (the shots, a cut). `OMSI_MASK3D_DEBUG=1` lists the lanes
-//! near the window's middle against the scene's heights on stderr. Standalone: no game
+//! in order; `--t` the moment); `--video` renders every frame so and encodes them with
+//! `ffmpeg` (else GStreamer's x264enc; else the PNGs are kept). `--free` shows a free run
+//! with the rules of this build (`omsi_traffic::replay`, as `traffic_cases trace --free`)
+//! instead of the recorded positions; `--compare` both, the recording as wire boxes.
+//! Nothing under `~/.openomsi` is written but the output folder
+//! `~/.openomsi/traffic/mask3d/` (the shots, the videos and their frames while encoding, a cut). `OMSI_MASK3D_DEBUG=1` lists the lanes
+//! near the window's middle against the scene's heights on stderr (and a shot's or a video
+//! frame's vehicles within 60 m of the camera). Standalone: no game
 //! binary depends on this crate.
 
 mod geometry;
@@ -29,7 +36,7 @@ mod viewer;
 use anyhow::{Context, Result};
 use omsi_roadmask::{hms, mapdata, profile, recording};
 use overlay::ProfileEdge;
-use session::{CamMode, Session};
+use session::{CamMode, RunMode, Session};
 use std::path::{Path, PathBuf};
 use timeline::Timeline;
 
@@ -56,7 +63,18 @@ options:
   --cam MODE        the camera of the shot(s), in order (the last one repeats): seat, top[:H],
                     follow:N, or x,y,z,yaw,pitch[,fov] as the game's --cam; default seat
   --t HH:MM:SS      the moment of the shot(s) (default: the window's middle)
-  --size WxH        the shot's size (default: the settings' resolution, else 1600x900)
+  --size WxH        the shot's size (default: the settings' resolution, else 1600x900; a video's
+                    1280x720)
+  --video <mp4>     render the window (or --from..--to) headlessly into a video: the frames as
+                    --shot draws them (--cam the camera, the first one), encoded by ffmpeg (else
+                    GStreamer's x264enc; with neither the PNG sequence is kept and named)
+  --fps N           the video's frames per second (default 15)
+  --from HH:MM:SS   the video's first moment (default: the window's first frame)
+  --to HH:MM:SS     the video's last moment (default: the window's last frame)
+  --free            the vehicles of a FREE RUN with the rules of this build instead of the recorded
+                    ones: on from the first keyframe with no resets, people replayed as recorded
+                    (as traffic_cases trace --free); the labels say the live why / wait_for
+  --compare         both on one clock: the free run as solid blocks, the recording as wire boxes
   --adapter NAME    draw on the graphics adapter whose name contains NAME (e.g. Intel): a card
                     whose memory other programs hold runs out of it while the map loads
   -h, --help        this text
@@ -67,7 +85,7 @@ keys: space play/pause · , . step a frame · [ ] ±5 s · - = speed 0.25x-4x ·
       F1 free (WASD/QE, shift fast, right drag looks) · F2 player seat · F3 follow · F4 top-down (PgUp/PgDn, wheel)
 ";
 
-const FLAGS: &[&str] = &["--list", "--help", "-h"];
+const FLAGS: &[&str] = &["--list", "--help", "-h", "--free", "--compare"];
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
@@ -275,74 +293,217 @@ fn run(args: &[String]) -> Result<()> {
     println!("settings.cfg: resolution {}, view distance {:.0} m, enhanced {}, shadows {} (read, not written)", settings.resolution.map(|(w, h)| format!("{w}x{h}")).unwrap_or("automatic".into()), settings.view_distance, settings.enhanced, settings.shadows);
     let radius_m = radius_opt.unwrap_or(settings.view_distance);
 
-    println!("reading {} ...", rec.display());
-    let tl = Timeline::load(&rec, 150.0, centre).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let run = RunMode::from_args(args.iter().any(|a| a == "--free"), args.iter().any(|a| a == "--compare"));
+    println!("reading {} ...{}", rec.display(), if run == RunMode::Recorded { "" } else { " (a free run with the rules of this build)" });
+    let tl = Timeline::load(&rec, 150.0, centre, run != RunMode::Recorded).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if run != RunMode::Recorded {
+        println!("free run: {}", tl.free_summary);
+    }
+    let recorded = if run == RunMode::Compare {
+        println!("reading {} again as recorded (--compare) ...", rec.display());
+        Some(Timeline::load(&rec, 150.0, Some((tl.centre.x, tl.centre.y)), false).map_err(|e| anyhow::anyhow!("{e}"))?)
+    } else {
+        None
+    };
     println!("map {} · {} frames {} .. {} · centre ({:.1}, {:.1}) · {} lanes over ({:.0}, {:.0})..({:.0}, {:.0}), {} kerb spots", tl.map, tl.frames.len(), hms(tl.first_time()), hms(tl.last_time()), tl.centre.x, tl.centre.y, tl.lanes.len(), tl.extent.0.x, tl.extent.0.y, tl.extent.1.x, tl.extent.1.y, tl.kerb_spots.len());
     let profile = profile_edges(&root, &tl, date);
     let title = format!("{} · road mask 3D", rec.file_stem().and_then(|s| s.to_str()).unwrap_or("window"));
 
     let shots = opts(args, "--shot");
-    if shots.is_empty() {
+    let video = opt(args, "--video");
+    if shots.is_empty() && video.is_none() {
         let start_time = opt(args, "--start").map(recording::parse_hhmm).transpose().map_err(|e| anyhow::anyhow!("{e}"))?;
         let start_mode = opt(args, "--view").map(|v| CamMode::parse(v).context("--view free|seat|top[:H]|follow:N")).transpose()?.unwrap_or(CamMode::Seat);
-        return viewer::Viewer::run(viewer::Pending { root, settings, timeline: Some(tl), profile, date, radius_m, title, start_time, start_mode, adapter: opt(args, "--adapter").map(str::to_string) });
+        return viewer::Viewer::run(viewer::Pending { root, settings, timeline: Some(tl), profile, date, radius_m, title, start_time, start_mode, adapter: opt(args, "--adapter").map(str::to_string), run, recorded });
     }
 
     // headless pictures
-    let (w, h) = match opt(args, "--size") {
+    let size = match opt(args, "--size") {
         Some(s) => {
             let (a, b) = s.split_once('x').context("--size WxH")?;
-            (a.parse()?, b.parse()?)
+            Some((a.parse::<u32>()?, b.parse::<u32>()?))
         }
-        None => settings.resolution.unwrap_or((1600, 900)),
+        None => None,
     };
-    let t = match opt(args, "--t") {
-        Some(t) => recording::parse_hhmm(t).map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => (tl.first_time() + tl.last_time()) * 0.5,
-    };
+    let parse_t = |name: &str| opt(args, name).map(recording::parse_hhmm).transpose().map_err(|e| anyhow::anyhow!("{name}: {e}"));
+    let t = parse_t("--t")?.unwrap_or((tl.first_time() + tl.last_time()) * 0.5);
     let cams = opts(args, "--cam");
     let instance = openomsi_game::tool::graphics_instance();
     let renderer = headless_renderer(&instance, &settings.render, opt(args, "--adapter"))?;
     println!("adapter: {}", renderer.adapter_name);
     println!("loading the map round the window (radius {radius_m:.0} m) ...");
+    let shot_size = size.or(settings.resolution).unwrap_or((1600, 900));
     let mut s = Session::new(renderer, &root, settings, tl, profile, date, radius_m)?;
+    s.set_run(run, recorded);
     println!("{} tiles in {:.1} s; {} lanes, {} stop lines, {} kerb spots, {} profile edges", s.tiles_loaded, s.load_secs, s.overlay.counts.lanes, s.overlay.counts.stop_lines, s.overlay.counts.kerb_spots, s.overlay.counts.profile_edges);
     let t = t.clamp(s.timeline.first_time(), s.timeline.last_time());
-    let frame_ix = s.timeline.frame_at(t);
-    s.set_time(t);
+    let (w, h) = shot_size;
     for (i, shot) in shots.iter().enumerate() {
         let cam_text = cams.get(i).or(cams.last()).copied().unwrap_or("seat");
-        let frame = s.timeline.frames[frame_ix].clone();
-        let free = s.start_camera();
-        let (mode, cam) = match CamMode::parse(cam_text) {
-            Some(m) => {
-                let mut free = free;
-                if let CamMode::TopDown(_) = m {
-                    free.position = s.timeline.centre;
-                    free.yaw = 0.0;
-                }
-                (m, s.camera(m, &frame, &free))
-            }
-            None => (CamMode::Free, openomsi_game::tool::parse_cam(cam_text)?),
-        };
-        let pinned = if let CamMode::Follow(id) = mode { Some(id) } else { None };
-        s.lay_frame(frame_ix, None, pinned, mode);
-        s.hud.begin(&s.renderer, &mut s.scene);
-        s.draw_hud(&cam, frame_ix, mode, 1.0, false, pinned, (None, None), None, true, w as f32, h as f32, false);
-        // (the first picture warms the textures up; the second is the one kept)
-        let lighting = s.lighting.clone();
-        let _ = s.renderer.render_to_image(&mut s.scene, w, h, &cam, &lighting)?;
-        s.world.finish_texture_upgrades(&s.renderer, &mut s.scene);
-        let pixels = s.renderer.render_to_image(&mut s.scene, w, h, &cam, &lighting)?;
-        let path = {
-            let p = PathBuf::from(shot);
-            if p.is_absolute() || p.components().count() > 1 { p } else { out_dir().join(p) }
-        };
+        let shooter = Shooter::new(&s, cam_text)?;
+        let (pixels, mode, cam) = shooter.render(&mut s, t, w, h, true)?;
+        let path = out_path(shot);
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
         image::save_buffer(&path, &pixels, w, h, image::ColorType::Rgba8)?;
         println!("{}: {w}x{h} at {} from {} - camera ({:.1}, {:.1}, {:.2}) yaw {:.0} pitch {:.0}", path.display(), hms(t), mode.name(), cam.position.x, cam.position.y, cam.position.z, cam.yaw, cam.pitch);
     }
+    if let Some(v) = video {
+        let fps: f64 = opt(args, "--fps").map(|s| s.parse()).transpose().context("--fps N")?.unwrap_or(15.0);
+        if !(fps > 0.0 && fps <= 120.0) {
+            anyhow::bail!("--fps {fps}: 0 < fps <= 120");
+        }
+        let (t0, t1) = (s.timeline.first_time(), s.timeline.last_time());
+        let from = parse_t("--from")?.unwrap_or(t0).clamp(t0, t1);
+        let to = parse_t("--to")?.unwrap_or(t1).clamp(from, t1);
+        // (even sides: the encoder's 4:2:0 wants them)
+        let (vw, vh) = size.unwrap_or((1280, 720));
+        let (vw, vh) = (vw & !1, vh & !1);
+        let cam_text = cams.first().copied().unwrap_or("seat");
+        render_video(&mut s, &out_path(v), cam_text, from, to, fps, vw, vh)?;
+    }
     Ok(())
+}
+
+/// A bare file name goes to the output folder; a path stays as given.
+fn out_path(name: &str) -> PathBuf {
+    let p = PathBuf::from(name);
+    if p.is_absolute() || p.components().count() > 1 { p } else { out_dir().join(p) }
+}
+
+/// A headless camera: `--cam`'s mode (seat, top[:H], follow:N, or a fixed x,y,z,yaw,pitch).
+struct Shooter {
+    mode: CamMode,
+    /// The hand camera the mode starts from (a top-down one over the window's middle).
+    free: omsi_render::Camera,
+    /// A fixed camera given by numbers.
+    fixed: Option<omsi_render::Camera>,
+    /// The HUD shows it playing (a video) or paused (a still).
+    playing: bool,
+}
+
+impl Shooter {
+    fn new(s: &Session, cam_text: &str) -> Result<Shooter> {
+        let mut free = s.start_camera();
+        match CamMode::parse(cam_text) {
+            Some(m) => {
+                if let CamMode::TopDown(_) = m {
+                    free.position = s.timeline.centre;
+                    free.yaw = 0.0;
+                }
+                Ok(Shooter { mode: m, free, fixed: None, playing: false })
+            }
+            None => Ok(Shooter { mode: CamMode::Free, free, fixed: Some(openomsi_game::tool::parse_cam(cam_text)?), playing: false }),
+        }
+    }
+
+    /// The picture of moment `t`: the overlay of its frame, the HUD, rendered offscreen.
+    /// `warm`: render twice (the first one loads the textures; the second is kept).
+    fn render(&self, s: &mut Session, t: f64, w: u32, h: u32, warm: bool) -> Result<(Vec<u8>, CamMode, omsi_render::Camera)> {
+        let frame_ix = s.timeline.frame_at(t);
+        s.set_time(t);
+        let frame = s.timeline.frames[frame_ix].clone();
+        let cam = self.fixed.unwrap_or_else(|| s.camera(self.mode, &frame, &self.free));
+        let pinned = if let CamMode::Follow(id) = self.mode { Some(id) } else { None };
+        if std::env::var_os("OMSI_MASK3D_DEBUG").is_some() {
+            for v in frame.vehicles.iter().filter(|v| (v.pos - cam.position).truncate().length() < 60.0) {
+                eprintln!("{} #{} ({:.1}, {:.1}) hd {:.0} v {:.1} {}", crate::session::hms_frac(frame.day_time), v.id, v.pos.x, v.pos.y, v.heading, v.speed, v.why);
+            }
+        }
+        s.lay_frame(frame_ix, None, pinned, self.mode);
+        s.hud.begin(&s.renderer, &mut s.scene);
+        s.draw_hud(&cam, frame_ix, self.mode, 1.0, self.playing, pinned, (None, None), None, true, w as f32, h as f32, false);
+        let lighting = s.lighting.clone();
+        if warm {
+            let _ = s.renderer.render_to_image(&mut s.scene, w, h, &cam, &lighting)?;
+            s.world.finish_texture_upgrades(&s.renderer, &mut s.scene);
+        }
+        let pixels = s.renderer.render_to_image(&mut s.scene, w, h, &cam, &lighting)?;
+        Ok((pixels, self.mode, cam))
+    }
+}
+
+/// The video's frames' folder, removed when dropped unless kept.
+struct FrameDir {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for FrameDir {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Whether `program` runs (`args` a harmless query such as `-version`).
+fn runs(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program).args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Render `from..=to` at `fps` into PNGs under `~/.openomsi/traffic/mask3d/tmp-<pid>/` and
+/// encode them into `out` (ffmpeg; else GStreamer's x264enc); the frames are deleted after.
+/// With no encoder the PNGs are moved to `<out without extension>-frames/` and named.
+#[allow(clippy::too_many_arguments)]
+fn render_video(s: &mut Session, out: &Path, cam_text: &str, from: f64, to: f64, fps: f64, w: u32, h: u32) -> Result<()> {
+    let n = ((to - from) * fps).floor() as usize + 1;
+    let dir = FrameDir { path: out_dir().join(format!("tmp-{}", std::process::id())), keep: false };
+    std::fs::create_dir_all(&dir.path)?;
+    if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d)?;
+    }
+    let shooter = Shooter { playing: true, ..Shooter::new(s, cam_text)? };
+    println!("video: {n} frames {} .. {} at {fps} fps, {w}x{h}, camera {} ({}) -> {}", hms(from), hms(to), cam_text, s.run.name(), dir.path.display());
+    let started = std::time::Instant::now();
+    for k in 0..n {
+        let t = from + k as f64 / fps;
+        let (pixels, _, _) = shooter.render(s, t, w, h, k == 0)?;
+        image::save_buffer(dir.path.join(format!("f{k:05}.png")), &pixels, w, h, image::ColorType::Rgba8)?;
+        if (k + 1) % (n / 10).max(1) == 0 || k + 1 == n {
+            println!("  {}/{n} frames ({:.0} s)", k + 1, started.elapsed().as_secs_f32());
+        }
+    }
+    let pattern = dir.path.join("f%05d.png");
+    let fps_text = format!("{fps}");
+    let how = if runs("ffmpeg", &["-version"]) {
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-framerate", &fps_text, "-i"])
+            .arg(&pattern)
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart"])
+            .arg(out)
+            .status()?
+            .success();
+        ok.then_some("ffmpeg (libx264)")
+    } else if runs("gst-inspect-1.0", &["x264enc"]) && runs("gst-inspect-1.0", &["mp4mux"]) {
+        println!("ffmpeg is not installed: encoding with GStreamer's x264enc instead");
+        // (the frame rate as a fraction: 15 -> 15/1, 12.5 -> 25/2)
+        let (num, den) = if fps.fract() == 0.0 { (fps as u64, 1) } else { ((fps * 1000.0).round() as u64, 1000) };
+        let ok = std::process::Command::new("gst-launch-1.0")
+            .args(["-q", "-e", "multifilesrc"])
+            .arg(format!("location={}", pattern.display()))
+            .args(["index=0", &format!("caps=image/png,framerate={num}/{den}"), "!", "pngdec", "!", "videoconvert", "!", "video/x-raw,format=I420", "!", "x264enc", "pass=quant", "quantizer=20", "speed-preset=medium", "!", "mp4mux", "faststart=true", "!", "filesink"])
+            .arg(format!("location={}", out.display()))
+            .stdout(std::process::Stdio::null())
+            .status()?
+            .success();
+        ok.then_some("GStreamer (x264enc)")
+    } else {
+        None
+    };
+    match how {
+        Some(how) => {
+            let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            println!("{}: {n} frames, {:.1} s at {fps} fps, {w}x{h}, {:.1} MB, encoded by {how}; the frames deleted", out.display(), n as f64 / fps, size as f64 / 1e6);
+            Ok(())
+        }
+        None => {
+            let keep = out.with_extension("").with_file_name(format!("{}-frames", out.file_stem().and_then(|s| s.to_str()).unwrap_or("video")));
+            let _ = std::fs::remove_dir_all(&keep);
+            std::fs::rename(&dir.path, &keep)?;
+            println!("no video made (ffmpeg is not installed or failed; GStreamer's x264enc + mp4mux neither): the {n} frames are kept as a PNG sequence in {} (f00000.png .., {fps} fps); `ffmpeg -framerate {fps} -i f%05d.png -pix_fmt yuv420p {}` makes the video", keep.display(), out.display());
+            Ok(())
+        }
+    }
 }

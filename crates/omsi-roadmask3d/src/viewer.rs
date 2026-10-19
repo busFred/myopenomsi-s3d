@@ -2,7 +2,7 @@
 //! keys and the mouse (see the status line's help, key F1..F4, 1-7, space, L, H, P, N).
 
 use crate::overlay::{Layer, ProfileEdge};
-use crate::session::{CamMode, Session};
+use crate::session::{CamMode, RunMode, Session};
 use crate::timeline::Timeline;
 use anyhow::{Context, Result};
 use glam::DVec3;
@@ -31,6 +31,9 @@ pub struct Pending {
     pub start_mode: CamMode,
     /// `--adapter`: a part of the graphics adapter's name.
     pub adapter: Option<String>,
+    /// `--free` / `--compare`: what `timeline` is; the recorded replay for `--compare`.
+    pub run: RunMode,
+    pub recorded: Option<Timeline>,
 }
 
 pub struct Viewer {
@@ -130,7 +133,8 @@ impl Viewer {
         let timeline = self.pending.timeline.take().context("the timeline was taken")?;
         let profile = std::mem::take(&mut self.pending.profile);
         println!("loading the map round the window ({} tiles radius {:.0} m) ...", timeline.map, self.pending.radius_m);
-        let session = Session::new(renderer, &self.pending.root, self.pending.settings.clone(), timeline, profile, self.pending.date, self.pending.radius_m)?;
+        let mut session = Session::new(renderer, &self.pending.root, self.pending.settings.clone(), timeline, profile, self.pending.date, self.pending.radius_m)?;
+        session.set_run(self.pending.run, self.pending.recorded.take());
         println!("{} tiles in {:.1} s; {} lanes, {} stop lines, {} kerb spots, {} profile edges", session.tiles_loaded, session.load_secs, session.overlay.counts.lanes, session.overlay.counts.stop_lines, session.overlay.counts.kerb_spots, session.overlay.counts.profile_edges);
         self.free = session.start_camera();
         self.t = self.pending.start_time.unwrap_or(session.timeline.first_time()).clamp(session.timeline.first_time(), session.timeline.last_time());
