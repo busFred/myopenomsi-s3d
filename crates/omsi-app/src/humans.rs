@@ -1941,13 +1941,20 @@ impl PedNet {
             }
         }
         cands.sort_by(|a, b| a.2.total_cmp(&b.2));
+        // [ROLLBACK r5-P6b] never a piece of a crossing: one that carries a light or cuts a
+        // street (somebody off a bus beside a zebra got it for their first leg and walked
+        // off mid-piece with no kerb decision: the j530 appearances of review r5p)
+        let cuts_street = |i: usize| {
+            let pts = &net.lanes[i].points;
+            pts.windows(2).any(|w| !street_cuts(net, w[0], w[1]).is_empty())
+        };
+        cands.retain(|&(i, _, _)| net.lanes[i].traffic_light.is_none() && !cuts_street(i));
         let first = cands.first().copied();
         cands
             .into_iter()
             .find(|&(i, s, _)| {
                 let (q, _) = net.lanes[i].at(s);
                 !crosses_street(net, p.truncate(), q.truncate())
-                    && !self.crossings.get(&i).map(|x| !x.is_empty()).unwrap_or(false)
             })
             // on an island between carriageways: the nearest after all
             .or(first)
@@ -9683,6 +9690,23 @@ mod ped_tests {
         assert_eq!(gap_median(700.0, 50), PED_GAP_MEDIAN);
         assert!((gap_median(2000.0, 500) - 2.0).abs() < 1e-9);
         assert_eq!(gap_median(100.0, 0), PED_GAP_MEDIAN);
+    }
+
+    #[test]
+    fn r5p6b_the_nearest_pavement_is_never_a_crossing_piece() {
+        // off a bus 0.3 m from the piece over the near lane of `crossing`, 1 m from the lit
+        // stub and 2.5 m from the pavement: the pavement
+        let (net, ped) = crossing(true);
+        let (lane, _, _) = ped.nearest(&net, DVec3::new(0.3, -3.0, 0.0), 12.0).unwrap();
+        assert_eq!(lane, 2);
+        // in the middle of the road: a pavement still, never a piece
+        let (lane, _, _) = ped.nearest(&net, DVec3::new(0.2, 0.3, 0.0), 12.0).unwrap();
+        assert!(lane == 2 || lane == 7, "{lane}");
+        // an unlit crossing's piece over the lane is no candidate either (its unlit kerb
+        // stub, which cuts nothing, is a pavement)
+        let (net, ped) = crossing(false);
+        let (lane, _, _) = ped.nearest(&net, DVec3::new(0.3, -3.0, 0.0), 12.0).unwrap();
+        assert!(lane == 2 || lane == 3, "{lane}");
     }
 
     #[test]
