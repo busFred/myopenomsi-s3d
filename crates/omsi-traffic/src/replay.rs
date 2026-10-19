@@ -355,7 +355,15 @@ impl Replay {
         sim.time_scale = f.time_scale;
         sim.players.clone_from(&f.players);
         sim.people = f.people.iter().map(|p| p.person()).collect();
-        sim.walkers.clone_from(&f.walkers);
+        // [round5 C1] the walkers as `Humans::strollers()` lists them now, rebuilt from the
+        // people records (their footpath leg; not a kerb waiter on a red light): the recorded
+        // list is the game's at recording time, so a change of that rule showed in no replay
+        // (a recording without the legs keeps its own list)
+        if f.people.iter().any(|p| p.leg.is_some()) {
+            sim.walkers = f.people.iter().filter(|p| !(p.at_kerb && p.decision.as_deref() == Some("red light"))).filter_map(|p| p.leg.map(|(l, s, _)| (l, s))).collect();
+        } else {
+            sim.walkers.clone_from(&f.walkers);
+        }
         if let Some(order) = &f.order {
             let mut by_id: HashMap<u64, Vehicle> = self.vehicles.drain(..).map(|v| (v.id, v)).collect();
             for id in order {

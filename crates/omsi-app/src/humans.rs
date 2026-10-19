@@ -2982,6 +2982,21 @@ enum Place {
 
 
 
+/// [round5 C2] Below this speed (m/s) somebody counts as standing and `Person::still` runs:
+/// standers pressed by a crowd jitter at 0.05-0.1 m/s (viz4 case01: eleven on a pavement
+/// beside a car kept `still` at 0 for 34 s at the old 0.05, and the car's "stood at the edge
+/// 3 s" exemption never fired).
+const STILL_BELOW: f32 = 0.15;
+
+/// `Person::still` after a frame of `dt` at `speed`.
+fn still_after(still: f32, speed: f32, dt: f32) -> f32 {
+    if speed < STILL_BELOW {
+        still + dt
+    } else {
+        0.0
+    }
+}
+
 pub struct Person {
     id: u32,
     ty: Arc<HumanType>,
@@ -3943,9 +3958,15 @@ impl Humans {
             .collect()
     }
 
+    /// Who walks the footpaths, for the cars' zebra check (`perception::zebra_ahead`): the
+    /// lane and distance along it of each stroller's leg. Not somebody standing at a kerb on
+    /// a red light: off the carriageway, they hold nobody (one at a 3 m kerb stub held the
+    /// exit of a green junction 56 s, viz4 case01 #138; x10 case14 #35715 its whole green);
+    /// one standing inside a lane's footprint the cars' people check still catches.
     pub fn strollers(&self) -> Vec<(usize, f32)> {
         self.people
             .iter()
+            .filter(|p| !(p.at_kerb() && p.last_decision == Some("red light")))
             .filter_map(|p| match &p.state {
                 State::Strolling(walk) => walk
                     .legs
@@ -6599,6 +6620,11 @@ impl Humans {
         for (k, w) in ground {
             let i = who[k];
             if matches!(self.people[i].state, State::Pax(_)) {
+                // [round5 C2] (the passengers' engine moves them; their standing time runs
+                // here: a bus waiter's `still` stayed 0 for ever, and a car beside their stop
+                // was never let go, viz4 case03 #12135 88 s)
+                let p = &mut self.people[i];
+                p.still = still_after(p.still, p.vel.length() as f32, dt);
                 continue;
             }
             moved[i] = true;
@@ -6762,11 +6788,7 @@ impl Humans {
         let time = self.time;
         let p = &mut self.people[i];
         let speed = w.vel.length();
-        if speed < 0.05 {
-            p.still += dt;
-        } else {
-            p.still = 0.0;
-        }
+        p.still = still_after(p.still, speed as f32, dt);
         // somebody pressed against somebody else for seconds slips past them
         if want.vel.length() > 0.2 && speed < 0.08 {
             p.stuck += dt;
@@ -8852,6 +8874,16 @@ mod tests {
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.1), 3);
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.9), 7);
         assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.999_999), 7);
+    }
+
+    /// [round5 C2] Standing time runs under a crowd's jitter (0.1 m/s), not under a walk; a
+    /// person who stood 3 s and shuffles at 0.1 m/s keeps counting.
+    #[test]
+    fn c2_still_runs_under_the_crowds_jitter() {
+        assert_eq!(still_after(0.0, 0.1, 0.5), 0.5);
+        assert_eq!(still_after(3.0, 0.14, 0.5), 3.5);
+        assert_eq!(still_after(3.0, 0.2, 0.5), 0.0);
+        assert_eq!(still_after(3.0, 1.2, 0.5), 0.0);
     }
 }
 

@@ -268,6 +268,24 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     }
 }
 
+/// The zebra band a car keeps its body out of: its front ZEBRA_STOP m before a pedestrian
+/// crossing's cut of its way (the zebra stop, as `perception::zebra_ahead`) to ZEBRA_PAST m
+/// past it (the crossing's width and a step; `hold_point`'s band since round 4).
+const ZEBRA_STOP: f32 = 2.5;
+const ZEBRA_PAST: f32 = 2.0;
+
+/// A lead slower than this (m/s) is a queue I come to rest behind, not one I follow through
+/// (`light_call`'s `queued`: under 1 m/s behind a lead).
+const QUEUE_SPEED: f32 = 1.0;
+/// A lead under this speed (m/s) that is itself held (a lead, a light, a junction) is coming
+/// to rest in a queue too, and so is one braking for a stop of its own at any speed
+/// (`Headway::rest`; x10 case15: the lead rolled at 1.4-3 m/s past the cut to its exit-full
+/// line while I was a car length short of it, and stood the moment I was on the zebra).
+const QUEUE_COMING: f32 = 3.0;
+/// The brake (m/s²) such a lead is taken to come to rest with, for where its rear will stand
+/// (a comfortable brake, `AiState::decel`'s 3 m/s² default is its hardest liking).
+const QUEUE_BRAKE: f32 = 2.0;
+
 /// Where a car refused for a foe stops (rule D): its front a metre before the first stretch
 /// it waits for (`waited`, along the way through), pulled back before any other meeting
 /// place ahead or pedestrian crossing its body would stand in ("keep the junction clear"; a
@@ -302,7 +320,7 @@ fn walk_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f3
     for &(m, off) in &j.chain {
         for &(_, sa, _) in net.walks.get(node.movements[m].lane).map(|v| v.as_slice()).unwrap_or(&[]) {
             let point = j.entry + off + sa;
-            out.push((point - 2.5, point + 2.0));
+            out.push((point - ZEBRA_STOP, point + ZEBRA_PAST));
         }
     }
     out
@@ -453,6 +471,38 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.lead = Some(l.lead());
         out.lead_seen = Some(l.what);
         out.body_block = p.body_block;
+        // [round5 C3] a queue over a pedestrian crossing: behind a lead standing past a cut of
+        // my way, where closing up to it would put my body in the zebra band, I stop at the
+        // zebra stop instead, as `hold_point` keeps a refused car off it (x10 case15 #35611
+        // followed its lead onto the crossing and stood there, the stream through the 2.2 m
+        // gap in front of it)
+        let coming = l.rest.is_some() || l.speed < QUEUE_SPEED || (l.held && l.speed < QUEUE_COMING);
+        if coming && !matches!(l.what, Seen::Parked) {
+            // (its rear where it comes to rest: at the stop of its own it brakes for, else
+            // where a comfortable brake puts it)
+            let lead_rear = l.rest.unwrap_or(st.front + l.gap + l.speed.max(0.0).powi(2) / (2.0 * QUEUE_BRAKE));
+            let my_front = lead_rear - st.min_gap;
+            for &(wl, d0) in &p.way {
+                if d0 > lead_rear {
+                    break;
+                }
+                for &(_, sa, _) in net.walks.get(wl).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    let cut = d0 + sa;
+                    if !(cut < lead_rear && my_front > cut - ZEBRA_STOP && my_front - me.length() < cut + ZEBRA_PAST) {
+                        continue;
+                    }
+                    // (past the zebra stop already: where it can stop gently, while that is
+                    // still short of the cut - as `hold_point` does for a refused car)
+                    let mut at = cut - ZEBRA_STOP;
+                    if at <= st.front - 0.3 {
+                        at = st.front + v * v / (2.0 * dp.comfort_brake) + 0.3;
+                    }
+                    if at > st.front - 0.3 && at <= cut - 0.3 {
+                        min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
+                    }
+                }
+            }
+        }
     }
 
     // 2. lights (not the one whose line it passed while it clears the box: in it when that
