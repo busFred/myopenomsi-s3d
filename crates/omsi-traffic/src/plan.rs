@@ -693,6 +693,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (a side-merge stretch of my own fork that a vehicle stands in: up to it, behind
             // that vehicle, `roll_up_point`)
             let at = match (g.hold, g.at) {
+                // [round6 J1] held only by a foe standing for good far ahead: up to its stretch
+                (Some(Hold::Foe), Some(waited)) if g.roll_up => hold_point(net, sim, me, j, waited),
                 (Some(Hold::Foe), Some(waited)) => match roll_up_point(net, sim, vehicles, me, j, waited) {
                     Some(at) => at,
                     None => {

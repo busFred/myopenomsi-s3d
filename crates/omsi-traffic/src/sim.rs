@@ -913,6 +913,11 @@ impl Simulation {
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
                 clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                // (held by its service, or standing `FAR_FOE_STOOD` s or more)
+                // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
+                // from its first frame, review-r6j)
+                standing_long: st.speed < 0.3 && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
+                brake,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -1052,6 +1057,8 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
+                standing_long: false,
+                brake: omsi_sim::traffic::MAX_BRAKE * 0.7,
             });
         }
         for (i, standing) in standing_now {
