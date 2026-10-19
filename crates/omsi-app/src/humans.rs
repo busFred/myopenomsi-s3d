@@ -1684,6 +1684,34 @@ fn core_piece(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, l
     net.lanes[lane].traffic_light.is_some() || lights.map(|t| t.crossing_piece(lane)).unwrap_or(false) || !ped.crossings(net, lane).is_empty()
 }
 
+/// [ROLLBACK r5-P6] How strollers are put down in groups and spaced (/tmp/round5x/streams-report.md:
+/// the spawner sprinkled one person at a time with no spacing law, so the gaps between
+/// walkers were exponential, 21 % under a metre, and nobody walked in a pair or a knot).
+/// The size of a group: round(exp(N(0, PED_GROUP_SIGMA))), 1..PED_GROUP_MAX (median 1, mean
+/// about 1.4, a tail to six).
+const PED_GROUP_SIGMA: f64 = 0.8;
+const PED_GROUP_MAX: usize = 6;
+/// The gap from one member of a group to the next along the pavement (m): log-normal with
+/// this median and sigma (a pair walks a metre apart).
+const PED_GROUP_GAP_MEDIAN: f64 = 1.0;
+const PED_GROUP_GAP_SIGMA: f64 = 0.6;
+/// The members' paces lie within this share of the leader's (they walk together).
+const PED_GROUP_PACE_SPREAD: f64 = 0.05;
+/// A candidate is refused while another stroller on its lane is nearer than a log-normal
+/// gap of this median and sigma (m): right-skewed gaps between groups, tight ones inside.
+const PED_GAP_MEDIAN: f64 = 6.0;
+const PED_GAP_SIGMA: f64 = 1.0;
+
+/// [ROLLBACK r5-P6] The size of a group from a standard normal deviate `z`.
+fn group_size(z: f64) -> usize {
+    ((PED_GROUP_SIGMA * z).exp().round() as usize).clamp(1, PED_GROUP_MAX)
+}
+
+/// [ROLLBACK r5-P6] A log-normal value of `median` and `sigma` from a standard normal deviate `z`.
+fn lognormal(median: f64, sigma: f64, z: f64) -> f64 {
+    median * (sigma * z).exp()
+}
+
 /// [ROLLBACK r5-P1] Whether a stroller may be put down on pavement lane `l`: a path of the
 /// walking network longer than 4 m that unscheduled people may use, and no piece of a
 /// crossing: nothing that cuts a carriageway or carries a light. Strollers put down on a
@@ -2468,6 +2496,13 @@ fn replan_frozen(decision: Option<&str>, still: f32, wants: f64) -> bool {
 }
 
 const BACK_TO_KERB: &str = "a vehicle in the way: back to the kerb";
+/// A vehicle's box over the way at the kerb ([ROLLBACK r4c-P5]) or over any cut of the
+/// crossing ([ROLLBACK r5-P6]).
+const STANDS_ON: &str = "a vehicle stands on the crossing";
+/// [ROLLBACK r5-P6] Seconds of a vehicle's standing on the crossing after which the kerb no
+/// longer waits for it (people step round it, as P5 has them): a car abandoned on a zebra
+/// (X10 case15, a 90 s queue) does not hold the kerb for good.
+const PED_OCCUPIED_CAP: f32 = 20.0;
 
 /// [ROLLBACK r4c-P1] Decisions on a crossing as the recording shows them.
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
@@ -2626,31 +2661,40 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // [ROLLBACK r4c-L1] the whole crossing, kerb to kerb (the first piece alone was timed, and
     // only where it cut a lane: a kerb stub cuts none, and nobody looked at the cars at all)
     let t_cross = c.span as f64 / pace.max(0.5) + 1.0;
+    let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
+    // [ROLLBACK r5-P6] nobody starts across while a vehicle stands on the crossing - its box
+    // over any of its cuts, under 0.5 m/s, not one stopping for people - for PED_OCCUPIED_CAP
+    // of its standing at most; those on the carriageway keep P1 and P5. (At a lit crossing
+    // on green nobody looked at the vehicles at all: 339 step-ons in a minute while a bus
+    // stood with two pieces under its body, X10 streams report; a lead-following car on the
+    // zebra had 118 step-ons round its nose.)
+    let occupied = || {
+        at.cars.iter().any(|car| car.vel.length() < 0.5 && !car.yielding && car.stood < PED_OCCUPIED_CAP && cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)))
+    };
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
         if let Some((state, left)) = t.light_state(ctl, li) {
             if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
                 return Err("red light");
             }
-            if held > 150.0 {
-                return Ok(());
-            }
-            // A pedestrian green is short (8 s at Grundorf for an 11.6 m crossing that
-            // takes 10.7 s): who starts on green crosses in the clearance time after
-            // it, until the cars get their green. Only the green alone was counted, so
-            // nobody ever started on green and everybody went across on red after
-            // 150 s, in front of moving cars.
-            // [ROLLBACK r4c-P2] the whole crossing, kerb to kerb (the next piece alone was
-            // counted: people stepped onto a 28 s crossing 1-4 s before the red)
-            let arrival = c.span as f64 / pace.max(0.5) + 1.0;
-            let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
-            let window = pedestrian_window(Some(&mut *ped), net, t, &paths, left);
-            if !makes_it(left, window, arrival) {
+            if held <= 150.0 {
+                // A pedestrian green is short (8 s at Grundorf for an 11.6 m crossing that
+                // takes 10.7 s): who starts on green crosses in the clearance time after
+                // it, until the cars get their green. Only the green alone was counted, so
+                // nobody ever started on green and everybody went across on red after
+                // 150 s, in front of moving cars.
+                // [ROLLBACK r4c-P2] the whole crossing, kerb to kerb (the next piece alone was
+                // counted: people stepped onto a 28 s crossing 1-4 s before the red)
+                let arrival = c.span as f64 / pace.max(0.5) + 1.0;
+                let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
+                let window = pedestrian_window(Some(&mut *ped), net, t, &paths, left);
                 // (a few go anyway, so that a crowd does not freeze all at once; the change
                 // then turns them back or sends them on, P1)
-                if left > 2.0 && late_stepper(me.id, c.key) {
-                    return Ok(());
+                if !makes_it(left, window, arrival) && !(left > 2.0 && late_stepper(me.id, c.key)) {
+                    return Err("the green ends before they would be across");
                 }
-                return Err("the green ends before they would be across");
+            }
+            if occupied() {
+                return Err(STANDS_ON);
             }
             return Ok(());
         }
@@ -2663,7 +2707,6 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // [ROLLBACK r4c-P4] a vehicle that has stood at the crossing for a while, held by a stream
     // of people that never gaps (a station's crossing: heads stood 75 and 90 s): the people
     // arriving let it pass, for a few seconds; those on the carriageway go on across
-    let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
     let stream = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q, _)| *id != me.id && (*q - me.pos).length() < PED_STREAM_GAP)).unwrap_or(false);
     // [ROLLBACK r5-P5] a dense stream yields for longer: until the vehicle is through the
     // cut (it is no longer `stands_at` then), 2 x PED_YIELD_MAX at most, under PED_YIELD_CAP
@@ -2708,6 +2751,9 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             None => {}
         }
     }
+    if occupied() {
+        return Err(STANDS_ON);
+    }
     // [ROLLBACK r4c-P5] a vehicle whose box covers the first 1.5 m of the way across: one that
     // stands there holds them for a few seconds only, then they step round it (a car held in
     // a queue on the zebra and the people waiting for it to move stood for each other for
@@ -2719,7 +2765,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     for car in at.cars {
         let speed = car.vel.length();
         if (speed >= 0.5 || held < 5.0) && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
-            return Err("a vehicle stands on the crossing");
+            return Err(STANDS_ON);
         }
     }
     for x in &cuts {
@@ -3663,6 +3709,13 @@ impl Humans {
     }
     fn rand_f(&mut self) -> f64 {
         (self.rand() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// [ROLLBACK r5-P6] A standard normal deviate (Box-Muller on two draws).
+    fn rand_normal(&mut self) -> f64 {
+        let u1 = self.rand_f().max(1e-12);
+        let u2 = self.rand_f();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
     /// [ROLLBACK strollers-2] May somebody be put down at `p` without the player seeing it:
@@ -4648,7 +4701,7 @@ impl Humans {
             .iter()
             .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
             .count();
-        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         if have < target && !candidates.is_empty() {
             // weighted by the metres inside, and by lying ahead of the player: somebody put
             // down beside or behind a moving bus never gets in front of it, and the street
@@ -4664,8 +4717,10 @@ impl Humans {
                 })
                 .collect();
             let total: f32 = weights.iter().sum();
+            // (12 a second at most, the members of a group counted)
+            let cap = (target - have).min(12);
             for _ in 0..((target - have) * 3).min(36) {
-                if placed >= (target - have).min(12) {
+                if placed >= cap {
                     break;
                 }
                 let mut x = self.rand_f() as f32 * total;
@@ -4698,32 +4753,76 @@ impl Humans {
                     rej_ground += 1;
                     continue;
                 }
+                // [ROLLBACK r5-P6] spaced: not within a log-normal gap of another stroller on
+                // this lane
+                let z = self.rand_normal();
+                let gap = lognormal(PED_GAP_MEDIAN, PED_GAP_SIGMA, z);
+                let too_near = self.people.iter().any(|q| {
+                    matches!(&q.state, State::Strolling(w) if w.legs.get(w.leg).map(|l| l.lane == lane).unwrap_or(false)) && (q.position - p).length() < gap
+                });
+                if too_near {
+                    rej_gap += 1;
+                    continue;
+                }
                 let fwd = self.rand_f() < 0.5;
-                let leg = if fwd {
-                    Leg { lane, a: s, b: len }
-                } else {
-                    Leg { lane, a: s, b: 0.0 }
-                };
-                let side = 0.3 + self.rand_f() as f32 * 0.4;
                 let heading = if fwd { h as f64 } else { h as f64 + 180.0 };
-                if let Some(i) = self.spawn(
-                    world,
-                    renderer,
-                    scene,
-                    p,
-                    heading,
-                    State::Strolling(PedWalk::new(vec![leg], true, side)),
-                ) {
-                    self.people[i].activity = Activity::Walk;
-                    placed += 1;
-                } else {
-                    rej_spawn += 1;
+                // [ROLLBACK r5-P6] a group: the leader and its members behind, on the same
+                // lane the same way, at log-normal gaps, their paces within a few per cent
+                // of the leader's
+                let z = self.rand_normal();
+                let members = group_size(z);
+                let mut at_s = s;
+                let mut leader_pace: Option<f64> = None;
+                for k in 0..members {
+                    if placed >= cap {
+                        break;
+                    }
+                    if k > 0 {
+                        let z = self.rand_normal();
+                        let off = lognormal(PED_GROUP_GAP_MEDIAN, PED_GROUP_GAP_SIGMA, z) as f32;
+                        at_s = if fwd { at_s - off } else { at_s + off };
+                        if at_s < 0.5 || at_s > len - 0.5 {
+                            break;
+                        }
+                    }
+                    let (p, _) = l.at(at_s);
+                    if k > 0 && (!self.may_appear(world, p) || !world.has_ground(p.x, p.y)) {
+                        continue;
+                    }
+                    let leg = if fwd {
+                        Leg { lane, a: at_s, b: len }
+                    } else {
+                        Leg { lane, a: at_s, b: 0.0 }
+                    };
+                    let side = 0.3 + self.rand_f() as f32 * 0.4;
+                    if let Some(i) = self.spawn(
+                        world,
+                        renderer,
+                        scene,
+                        p,
+                        heading,
+                        State::Strolling(PedWalk::new(vec![leg], true, side)),
+                    ) {
+                        self.people[i].activity = Activity::Walk;
+                        placed += 1;
+                        match leader_pace {
+                            None => leader_pace = Some(self.people[i].pace),
+                            Some(lp) => {
+                                let spread = (2.0 * hash01(self.people[i].id as u64, 0x06E0_D09A) - 1.0) * PED_GROUP_PACE_SPREAD;
+                                let pace = (lp * (1.0 + spread)).clamp(PED_PACE_MIN, PED_PACE_MAX);
+                                self.people[i].pace = pace;
+                                self.people[i].walk_pace = pace;
+                            }
+                        }
+                    } else {
+                        rej_spawn += 1;
+                    }
                 }
             }
         }
         if debug_pax() && (have < target || placed > 0) {
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked, curve {:.2}, pavement {:.2} of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, no figure {rej_spawn}",
+                "t={:.1} strollers: {have} of {target} wanted ({} asked, curve {:.2}, pavement {:.2} of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
                 self.time, self.pedestrians, self.density, pavement, metres, candidates.len()
             );
         }
@@ -9438,6 +9537,76 @@ mod ped_tests {
             first = first.or(m.decision);
         }
         first
+    }
+
+    /// At the lit kerb of `crossing` on green with `car` standing: the first decision.
+    fn lit_kerb_with(car: SeenCar) -> Option<&'static str> {
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = across();
+        walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
+        let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+        let mut first = None;
+        for k in 0..20 {
+            frame(&net, &mut ped, Some(&lights), &[car], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            first = first.or(m.decision);
+        }
+        first
+    }
+
+    #[test]
+    fn r5p6_nobody_starts_onto_an_occupied_crossing() {
+        // a car standing 5 s with its box over the near lane's cut (0, -1.75): refused at a
+        // lit kerb on green (where no vehicle was looked at before) and at an unlit one
+        let mut on = car_before(5.0);
+        on.yielding = false;
+        on.body.center = DVec2::new(0.0, -1.75);
+        on.pos = on.body.center;
+        assert_eq!(lit_kerb_with(on), Some(STANDS_ON));
+        assert_eq!(kerb_with(on), Some(STANDS_ON));
+        // over the far lane's cut as well
+        let mut far = on;
+        far.body.center = DVec2::new(0.0, 1.75);
+        far.pos = far.body.center;
+        assert_eq!(lit_kerb_with(far), Some(STANDS_ON));
+        // standing there 25 s (abandoned): go, round it
+        let mut old = on;
+        old.stood = 25.0;
+        assert_eq!(lit_kerb_with(old), Some("go"));
+        // one stopping for people (pedyield-1): go
+        let mut yielding = on;
+        yielding.yielding = true;
+        assert_eq!(lit_kerb_with(yielding), Some("go"));
+        // its front 0.95 m short of the cut (p5): go
+        let mut short = on;
+        short.body.center = DVec2::new(-3.2, -1.75);
+        short.pos = short.body.center;
+        assert_eq!(lit_kerb_with(short), Some("go"));
+        assert_eq!(kerb_with(short), Some("go"));
+    }
+
+    #[test]
+    fn r5p6_groups_and_gaps_follow_their_laws() {
+        let zs: Vec<f64> = (1..4001u64).map(|k| hash_normal(k, 7)).collect();
+        let mean = zs.iter().sum::<f64>() / zs.len() as f64;
+        let sd = (zs.iter().map(|z| (z - mean) * (z - mean)).sum::<f64>() / zs.len() as f64).sqrt();
+        assert!(mean.abs() < 0.06 && (sd - 1.0).abs() < 0.06, "normal: {mean} {sd}");
+        let sizes: Vec<usize> = zs.iter().map(|z| group_size(*z)).collect();
+        assert!(sizes.iter().all(|s| (1..=PED_GROUP_MAX).contains(s)));
+        let mean = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
+        assert!(mean > 1.25 && mean < 1.6, "group mean {mean}");
+        // round(exp(0.8 z)) is 1 for z < 0.507: 69 %
+        let ones = sizes.iter().filter(|s| **s == 1).count() as f64 / sizes.len() as f64;
+        assert!(ones > 0.62 && ones < 0.76, "singles {ones}");
+        assert!(sizes.iter().any(|s| *s >= 4) && sizes.iter().filter(|s| **s == 6).count() < 100);
+        let mut gaps: Vec<f64> = zs.iter().map(|z| lognormal(PED_GAP_MEDIAN, PED_GAP_SIGMA, *z)).collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let median = gaps[gaps.len() / 2];
+        assert!((median - 6.0).abs() < 0.5, "gap median {median}");
+        assert!(gaps[0] < 1.0 && gaps[gaps.len() - 1] > 40.0, "{} {}", gaps[0], gaps[gaps.len() - 1]);
+        let mut offs: Vec<f64> = zs.iter().map(|z| lognormal(PED_GROUP_GAP_MEDIAN, PED_GROUP_GAP_SIGMA, *z)).collect();
+        offs.sort_by(|a, b| a.total_cmp(b));
+        assert!((offs[offs.len() / 2] - 1.0).abs() < 0.1);
     }
 
     #[test]
