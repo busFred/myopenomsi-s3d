@@ -138,19 +138,56 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
         }
         // a faster lane
         let slow = l.speed < 0.7 * p.v_want && l.gap < 45.0 && l.gap > 8.0 && l.speed < st.speed + 1.0;
-        if slow && !near_junction && st.speed >= 4.0 && nb.ahead.map(|a| a.0 > 50.0).unwrap_or(true) {
+        if slow && !near_junction && st.speed >= 4.0 && nb.ahead.map(|a| a.0 > 50.0).unwrap_or(true) && open_on(net, me, nb.lane, st.s) {
             desire = desire.max(dp.lc_speed_gain);
         }
     }
-    // keep to the side when the road is clear
+    // keep to the side when the road is clear (the target lane reaching `KEEP_SIDE_REACH` on,
+    // and open to me along the move and on: `open_on`; the target piece's own run-on of 40 m
+    // cut keep-right 21-34 %, 201 of 446 went onto pieces under 40 m of lanes cut into short
+    // spline pieces, review r6l)
     let keep_side = if sim.left_hand { 1 } else { 2 };
-    if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > 200.0 {
+    if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > KEEP_SIDE_REACH && open_on(net, me, nb.lane, st.s) {
         desire = desire.max(dp.lc_keep_right);
     }
     if nb.runs_on < 40.0 {
         return (0.0, false);
     }
     (desire, gap_accepted(me, nb))
+}
+
+/// A keep-to-the-side change needs the target lane to reach this far on (m,
+/// `NeighbourView::runs_on`: round 5's rule) ...
+pub const KEEP_SIDE_REACH: f32 = 200.0;
+/// ... and the lanes it runs into (one after the other, while each has a single next) open
+/// to the car for the move's length and this many metres more (m: what a driver sees of the
+/// lane markings ahead; viz5 case04 #5644 changed onto 3470's bus lane, which runs into
+/// 3474's, closed to it).
+pub const KEEP_SIDE_OPEN_AHEAD: f32 = 60.0;
+
+/// Is `lane` (from beside distance `s` of my lane) and the chain of lanes it runs into open
+/// to me (`access::is_open`) for a lane change's length and `KEEP_SIDE_OPEN_AHEAD` more? The
+/// chain ends at a fork or a dead end; a junction object's piece (no rules: source 2) is not
+/// asked, the way through is the junction's.
+fn open_on(net: &Network, me: &Vehicle, lane: usize, s: f32) -> bool {
+    let st = &me.state;
+    // (`AiState::start_change`'s move: 2.8 to 4 s at the speed now, at least 12 m)
+    let change_len = (st.speed * (4.0 - st.speed * 0.04).clamp(2.8, 4.0)).max(12.0);
+    let need = change_len + KEEP_SIDE_OPEN_AHEAD;
+    let mut cur = lane;
+    let mut d = -net.beside_s(st.lane, lane, s);
+    for _ in 0..16 {
+        let l = &net.lanes[cur];
+        if l.source != 2 && !crate::access::is_open(l, me) {
+            return false;
+        }
+        d += l.length();
+        if d >= need || l.next.len() != 1 {
+            return true;
+        }
+        cur = l.next[0];
+    }
+    true
 }
 
 /// Metres a pass needs past the obstacle besides the car's own length and the way back in

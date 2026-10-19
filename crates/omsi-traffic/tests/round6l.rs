@@ -540,3 +540,171 @@ fn r6l3_the_offset_does_not_ease_into_a_person_beside() {
     eprintln!("person: lateral {:.2} least {least:.2}", me.state.lateral);
     assert!(least > 0.15, "eased to {least:.2} m of the person");
 }
+
+/// Three pieces of a two-lane road along x (BeijingCity's AnwaiDajie splines 3466, 3470,
+/// 3474): the left lane (y 0) open to all, the right lane (y -3.5) a bus lane closed to the
+/// normal cars by its density on the first piece (0..200) and the last (221..600), but the
+/// 21 m piece between (3470) without rules. Lanes: 0/1 the first piece's left/right, 2/3 the
+/// rule-less piece's, 4/5 the last piece's.
+fn bus_lane_with_a_ruleless_piece() -> Network {
+    let mut net = Network::default();
+    for (k, (x0, x1)) in [(0.0, 200.0), (200.0, 221.0), (221.0, 600.0)].into_iter().enumerate() {
+        let mut a = road(&[(x0, 0.0), (x1, 0.0)], 10 + k as i64);
+        a.offset = 0.0;
+        let mut b = road(&[(x0, -3.5), (x1, -3.5)], 10 + k as i64);
+        b.key = Some(LaneKey { tile: (0, 0), id: 10 + k as i64, path: 1 });
+        b.offset = 3.5;
+        if k != 1 {
+            b.density = 0.0;
+        }
+        net.lanes.push(a);
+        net.lanes.push(b);
+    }
+    finish(net)
+}
+
+/// A car on the left lane of the first piece at `s` and 14 m/s, keen to keep right.
+fn keen(s: f32) -> Vehicle {
+    let mut me = car(1, 0, s, 14.0);
+    me.state.change_cooldown = 0.0;
+    me.params.lc_keep_right = 1.0;
+    me.state.max_speed_kmh = 50.4;
+    me
+}
+
+#[test]
+fn r6l4_no_keep_right_onto_a_ruleless_piece_that_runs_into_a_closed_one() {
+    // viz5 case04 #5644: from spline 3470's left lane over onto its rule-less bus lane, which
+    // runs into 3474's, closed to it
+    let net = bus_lane_with_a_ruleless_piece();
+    assert!(net.lanes[2].right == Some(3) || net.lanes[3].left == Some(2), "the pieces' lanes are neighbours");
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![keen(150.0)];
+    let mut onto = Vec::new();
+    run(&net, &mut sim, &mut cars, 12.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        if let Some(c) = me.state.change {
+            onto.push(c.to);
+        }
+        if me.state.lane % 2 == 1 {
+            onto.push(me.state.lane);
+        }
+    });
+    onto.dedup();
+    assert!(onto.is_empty(), "changed onto the bus lane: {onto:?}");
+}
+
+#[test]
+fn r6l4_keep_right_still_goes_onto_an_open_lane_that_runs_on() {
+    // the control: the bus lane's rules dropped from the last piece too, it runs on open:
+    // the car keeps right onto it (now from the first lane whose own piece runs on 40 m)
+    let mut net = bus_lane_with_a_ruleless_piece();
+    net.lanes[5].density = 1.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![keen(150.0)];
+    let mut right = false;
+    run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        right |= me.state.lane == 5 && me.state.change.is_none();
+    });
+    assert!(right, "no keep-right onto the open lane");
+}
+
+#[test]
+fn r6l4_keep_right_goes_onto_a_short_piece_of_a_lane_that_runs_on_open() {
+    // (review r6l: 201 of 446 keep-right changes of viz5/viz4 went onto a target piece under
+    // 40 m of a lane cut into short spline pieces) the bus lane opened on the last piece too:
+    // the 21 m piece is taken as the lane it is, open for 400 m on
+    let mut net = bus_lane_with_a_ruleless_piece();
+    net.lanes[5].density = 1.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = keen(190.0);
+    me.state.lane = 2;
+    me.state.s = 1.0;
+    let mut cars = vec![me];
+    let mut first_target = None;
+    run(&net, &mut sim, &mut cars, 1.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        if first_target.is_none() {
+            first_target = me.state.change.map(|c| c.to);
+        }
+    });
+    assert_eq!(first_target, Some(3), "no keep-right onto the 21 m piece");
+}
+
+#[test]
+fn r6l4_a_change_whose_target_runs_on_into_a_closed_lane_is_given_up() {
+    // a change begun on the rule-less piece, its target moving on into the closed one before
+    // the body is half over: given up, back on the left lane
+    let net = bus_lane_with_a_ruleless_piece();
+    let mut me = keen(12.0);
+    me.state.lane = 2;
+    me.state.s = 12.0;
+    me.params.lc_keep_right = 0.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.update_positions(&net, std::slice::from_mut(&mut me));
+    me.state.start_change(&net, 3, 2);
+    me.state.change.as_mut().unwrap().wait = 0.0;
+    let mut cars = vec![me];
+    let (mut on_closed, mut least_k_seen) = (false, 0.0f32);
+    run(&net, &mut sim, &mut cars, 6.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        on_closed |= me.state.lane == 5;
+        if let Some(c) = me.state.change {
+            if c.to == 5 {
+                least_k_seen = least_k_seen.max(c.t);
+            }
+        }
+    });
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(!on_closed, "ended on the closed lane");
+    assert!(me.state.change.is_none() && me.state.lane % 2 == 0, "lane {} change {:?}", me.state.lane, me.state.change);
+}
+
+#[test]
+fn r6l4_a_timetable_bus_takes_its_route_onto_the_closed_lane() {
+    // a scheduled bus's route runs onto the bus lane: open anywhere its route goes
+    let net = bus_lane_with_a_ruleless_piece();
+    let mut bus = ai_bus(1, 0, 150.0, 10.0);
+    bus.state.set_route(&net, vec![0, 2, 3, 5], 150.0);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![bus];
+    let mut reached = false;
+    run(&net, &mut sim, &mut cars, 15.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        reached |= me.state.lane == 5;
+    });
+    assert!(reached, "the bus never got onto its route's bus lane");
+}
+
+#[test]
+fn r6l4_a_strategic_change_into_a_junction_piece_stays_allowed() {
+    // a double right turn: both lanes run into right-turn pieces of a crossing object (source
+    // 2, no rules); the car on the left lane moves over for the turn as before
+    let mut net = Network::default();
+    let mut a = road(&[(0.0, 0.0), (200.0, 0.0)], 1);
+    a.offset = 0.0;
+    let mut b = road(&[(0.0, -3.5), (200.0, -3.5)], 1);
+    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
+    b.offset = 3.5;
+    net.lanes.push(a);
+    net.lanes.push(b);
+    for (k, y) in [(0u16, 0.0), (1, -3.5)] {
+        let mut j = lane(&[(200.0, y), (210.0, y - 2.0), (212.0, y - 12.0)], LaneKind::Street, 3.0);
+        j.source = 2;
+        j.turn = 2;
+        j.key = Some(LaneKey { tile: (0, 0), id: 9, path: k });
+        net.lanes.push(j);
+    }
+    let net = finish(net);
+    let mut me = car(1, 0, 60.0, 10.0);
+    me.state.change_cooldown = 0.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![me];
+    let mut changed = false;
+    run(&net, &mut sim, &mut cars, 12.0, |_, _, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        changed |= me.state.lane == 1 || me.state.lane == 3;
+    });
+    assert!(changed, "no strategic change for the turn");
+}
