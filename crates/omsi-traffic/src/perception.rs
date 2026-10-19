@@ -230,8 +230,12 @@ pub struct Perception {
     pub route_change: Option<(usize, i32)>,
     /// Metres the way runs on before it ends.
     pub road_left: f32,
-    /// A parked car the way should swerve round: the lateral offset needed.
+    /// A parked car the way should swerve round, or [round 5 L3] people on a kerbless
+    /// pavement strip beside the lane: the lateral offset needed.
     pub kerb_swerve: Option<f32>,
+    /// [round 5 L3] `kerb_swerve` is (also) the shift past people beside the lane: the car
+    /// eases past them.
+    pub people_swerve: bool,
     pub oncoming: Option<OncomingView>,
     /// A player's vehicle ahead indicating to pull out towards the traffic: the distance
     /// from my origin to its rear.
@@ -970,17 +974,69 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 /// people standing at the kerb.
 const KERB_CLEAR: f32 = 0.3;
 
-fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
+/// [round 5 L3] A car shifts inside the drawn road to pass people on a kerbless pavement
+/// strip beside its lane (BeijingCity's Wuluju stop, round5 case01: walkers on the inner half
+/// of a pavement path laid on the asphalt, 0.3-0.5 m off the car's flank, held #2827 for 50 s)
+/// rather than standing: at least this far (m) - half a metre clears walkers at 1.3-1.5 m of
+/// the axis even with the two-second projection of their shuffle ...
+const PEOPLE_SWERVE_MIN: f32 = 0.5;
+/// ... and at most this far (the brief: a metre; beyond that it is a lane change).
+const PEOPLE_SWERVE_MAX: f32 = 1.0;
+/// What the shifted body keeps off the drawn road's far edge on the free side (m).
+const SWERVE_EDGE_KEEP: f32 = 0.3;
+/// Over how many metres of way the shift builds up (`AiState::lateral_target`'s S-curve is
+/// 8 m at least): a moving car's shift has got this far at a person ahead.
+const SWERVE_RAMP: f32 = 8.0;
+/// Below this speed (m/s) the car is creeping: the shift it has planned counts in full
+/// (standing, the ramp cannot build up at all).
+const SWERVE_CREEP: f32 = 0.5;
+
+/// Somebody in the strip of the car's (bent) way: where the stop point is, how far along,
+/// where they are across the lane's axis (signed, + right) and whether a shift inside the
+/// drawn road could clear them.
+struct Holder {
+    stop: f32,
+    along: f32,
+    axis: f32,
+    swervable: bool,
+}
+
+/// The shift of `swerve` the car has `along` metres on before its S-curve is laid
+/// (`SWERVE_RAMP`): the whole of it level with the body or creeping, the curve's share ahead.
+fn shift_at(swerve: f32, along: f32, v: f32) -> f32 {
+    if v < SWERVE_CREEP || along <= 0.0 {
+        return swerve;
+    }
+    let t = (along / SWERVE_RAMP).clamp(0.0, 1.0);
+    swerve * t * t * (3.0 - 2.0 * t)
+}
+
+/// The people in the strip ahead: where to stop for them, and the shift inside the drawn
+/// road that lets the car past the ones beside its lane instead, with where to stop once
+/// shifted (for whom the shift does not clear). `parked_swerve`: a swerve round a parked car
+/// already asked for (a shift the other way is not added to it).
+///
+/// The way is the car's bent way (`AiState::way_points` lays its lateral curve on): a person
+/// holds the car where its body will really go. The shift is planned on the lane's axis, so
+/// that it does not wander with the way it bends.
+fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, parked_swerve: Option<f32>) -> (Option<f32>, Option<(f32, Option<f32>)>) {
     let st = &me.state;
     let v = st.speed;
     let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
     let radius = (st.front + reach + 6.0) as f64;
-    let mut best: Option<f32> = None;
+    // who holds the car on its way, and who would on the lane's axis (the shift's candidates)
+    let mut holders: Vec<Holder> = Vec::new();
+    let mut on_axis: Vec<Holder> = Vec::new();
     // [ROLLBACK r4d-B4] a bus coming up to its own stop pulls in beside the people standing
     // at the kerb: only one inside its footprint and `KERB_CLEAR` round it holds it, where
     // they stand (where their shuffle would take them stopped a bus 7.4 m short of its pole),
     // and with no "stood at the edge a while" exemption (it crept on and stopped by turns)
     let own_stop = me.is_bus() && me.external.stop_at.is_some_and(|s| s - st.front < 40.0);
+    // the current lane's footprint and drawn road (the shift is planned on it alone)
+    let lane = net.lanes.get(st.lane);
+    let lane_half = lane.map(|l| l.width * 0.5).unwrap_or(f32::INFINITY);
+    let (drivable_left, drivable_right) = lane.map(|l| l.drivable()).unwrap_or((0.0, 0.0));
+    let lane_left = lane.map(|l| l.length() - st.s).unwrap_or(0.0);
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
         let rel = p.pos - me.pos;
@@ -1008,35 +1064,127 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                 break;
             }
             let right = DVec2::new(fwd.y, -fwd.x);
+            // (the way's offset from the lane's axis here: across the axis = across the way + it)
+            let lat = st.lateral_ahead(d);
+            let now_axis = (p.pos.truncate() - q).dot(right) as f32 + lat;
+            let later_axis = (later - q).dot(right) as f32 + lat;
+            // [round 5 L3] one beside the lane - outside its footprint now and after their
+            // step, inside the drawn road - on the car's own lane: a shift inside the drawn
+            // road may clear them (a bus pulls in beside its people; one on a crossing, or
+            // stepping into the lane, holds the car)
+            let strip = if now_axis < 0.0 { drivable_left } else { drivable_right };
+            let swervable = |along: f32| {
+                !me.is_bus()
+                    && !p.on_crossing
+                    && along <= lane_left
+                    && now_axis.abs() > lane_half
+                    && later_axis.abs() > lane_half
+                    && now_axis.abs() < strip
+                    && now_axis.signum() == later_axis.signum()
+            };
             for &pos in positions {
                 let r = pos - q;
                 let along = r.dot(fwd);
-                let across = r.dot(right).abs();
-                if along.abs() <= WAY_STEP as f64 * 0.5 + 0.05 && (across as f32) < half {
-                    // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
-                    // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
-                    // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
-                    // with a stream on the crossing they let the vehicle go first (P4)
-                    if p.at_kerb && !p.on_crossing && (across as f32) >= me.half_width + 0.28 {
-                        continue;
-                    }
-                    // someone who has stood at the edge for a while does not hold a standing car
-                    // (a bus at its stop: one inside its footprint does, or it crept on and
-                    // stopped by turns)
-                    if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && (across as f32) > half - 0.9 {
-                        continue;
-                    }
-                    // (where the person really is relative to the sample, so that the stop
-                    // point does not jump with the sampling)
-                    let stop = d + along as f32 - 1.5;
-                    if best.map(|b| stop < b).unwrap_or(true) {
-                        best = Some(stop);
-                    }
+                let across_way = r.dot(right) as f32;
+                let across = across_way.abs();
+                if along.abs() > WAY_STEP as f64 * 0.5 + 0.05 {
+                    continue;
+                }
+                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
+                // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
+                // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
+                // with a stream on the crossing they let the vehicle go first (P4)
+                if p.at_kerb && !p.on_crossing && across >= me.half_width + 0.28 {
+                    continue;
+                }
+                // someone who has stood at the edge for a while does not hold a standing car
+                // (a bus at its stop: one inside its footprint does, or it crept on and
+                // stopped by turns)
+                if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && across > half - 0.9 {
+                    continue;
+                }
+                // (where the person really is relative to the sample, so that the stop
+                // point does not jump with the sampling)
+                let stop = d + along as f32 - 1.5;
+                let axis = across_way + lat;
+                let h = Holder { stop, along: d + along as f32, axis, swervable: swervable(d + along as f32) };
+                if across < half {
+                    holders.push(Holder { ..h });
+                }
+                if axis.abs() < half {
+                    on_axis.push(h);
                 }
             }
         }
     }
-    best
+    if holders.is_empty() && on_axis.is_empty() {
+        return (None, None);
+    }
+    // the shift: everybody who would hold the car on the axis is beside the lane on one side,
+    // there is room for it on the other, and no swerve round a parked car goes the other way
+    let swerve = (|| {
+        if on_axis.is_empty() || !on_axis.iter().all(|h| h.swervable) {
+            return None;
+        }
+        let side = on_axis[0].axis.signum();
+        if on_axis.iter().any(|h| h.axis.signum() != side) {
+            return None;
+        }
+        let half = me.half_width + 0.3;
+        let need = on_axis.iter().map(|h| half - h.axis.abs()).fold(0.0f32, f32::max).clamp(PEOPLE_SWERVE_MIN, PEOPLE_SWERVE_MAX);
+        let room = if side > 0.0 { drivable_left } else { drivable_right };
+        if room - me.half_width - need < SWERVE_EDGE_KEEP {
+            return None;
+        }
+        let swerve = -side * need;
+        if parked_swerve.is_some_and(|s| s.signum() != swerve.signum() && s.abs() > 0.05) {
+            return None;
+        }
+        Some(swerve)
+    })();
+    // (with the shift, whoever it clears holds nothing: level with the body or creeping, by
+    // the shift as planned; ahead of a moving car by the way as it is bent already, or by the
+    // curve's share while the curve is not laid yet)
+    let half = me.half_width + 0.3;
+    let nearest = |stops: &mut dyn Iterator<Item = f32>| {
+        let s = stops.fold(f32::INFINITY, f32::min);
+        s.is_finite().then_some(s)
+    };
+    let stop = nearest(&mut holders.iter().map(|h| h.stop));
+    let shifted = swerve.map(|sw| {
+        let laid = (st.lateral_target - sw).abs() < 0.01 && (st.lateral_ramp.1 - sw).abs() < 0.01;
+        let cleared = |h: &Holder| h.swervable && (v < SWERVE_CREEP || h.along <= 0.0 || !laid) && (h.axis - shift_at(sw, h.along, v)).abs() >= half;
+        (sw, nearest(&mut holders.iter().filter(|h| !cleared(h)).map(|h| h.stop)))
+    });
+    (stop, shifted)
+}
+
+/// How far ahead (m from the origin) the farthest person within the car's strip stands:
+/// what a shift past them has to cover.
+fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {
+    let st = &me.state;
+    let v = st.speed;
+    let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
+    let radius = (st.front + reach + 6.0) as f64;
+    let half = (me.half_width + 0.3) as f64;
+    let mut far = 0.0f32;
+    for k in sim.people_near(me.pos, radius) {
+        let p = &sim.people[k];
+        if (p.pos - me.pos).truncate().length() > radius {
+            continue;
+        }
+        for &(d, q, fwd) in &way.pts {
+            if d > reach + st.front {
+                break;
+            }
+            let r = p.pos.truncate() - q;
+            let right = DVec2::new(fwd.y, -fwd.x);
+            if r.dot(fwd).abs() <= WAY_STEP as f64 * 0.5 + 0.05 && r.dot(right).abs() < half {
+                far = far.max(d + r.dot(fwd) as f32);
+            }
+        }
+    }
+    far
 }
 
 /// The next light on the way within 150 m. A second light of the same junction object on a
@@ -1399,8 +1547,32 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         }
         p.ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.leader = Headway::nearer(p.leader, parked);
-        p.kerb_swerve = swerve;
-        p.people_stop = people_ahead(sim, me, &way);
+        let (people_stop, shifted) = people_ahead(net, sim, me, &way, swerve);
+        // [round 5 L3] the shift past people beside the lane, towards the middle only while
+        // the oncoming lane is clear for its length (the shifted body may touch the oncoming
+        // lane's painted edge)
+        let shifted = shifted.filter(|&(sw, _)| {
+            if sw.signum() != sim.oncoming_sign() {
+                return true;
+            }
+            let pass_len = reach_of_people(sim, me, &way) + me.length() + 6.0;
+            match oncoming(net, sim, vehicles, i, pass_len) {
+                None => true,
+                Some(o) => {
+                    let v_cap = p.v_want.clamp(4.0, 14.0);
+                    !o.blocked && o.clear_for > arrival_time(pass_len, st.speed, st.accel, v_cap) + 1.5
+                }
+            }
+        });
+        p.kerb_swerve = match (swerve, shifted) {
+            (Some(a), Some((b, _))) => Some(if b.abs() > a.abs() { b } else { a }),
+            (a, b) => a.or(b.map(|s| s.0)),
+        };
+        p.people_swerve = shifted.is_some();
+        p.people_stop = match shifted {
+            Some((_, stop)) => stop,
+            None => people_stop,
+        };
         p.signal = signal_ahead(net, sim, &p.way, st.rear);
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
         p.zebra_stop = zebra_ahead(net, sim, st, &p.way);

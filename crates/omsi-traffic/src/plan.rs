@@ -645,6 +645,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             out.lateral = Some(bay);
         } else if !me.is_bus() {
             out.lateral = Some(p.kerb_swerve.unwrap_or(0.0));
+            // [round 5 L3] easing past people beside the lane: gently, as a car edging out
+            if p.people_swerve && v < 3.0 && out.accel_cap.is_none() {
+                out.accel_cap = Some(omsi_sim::ai_motion::PULL_OUT_ACCEL);
+            }
         } else {
             out.lateral = Some(0.0);
         }
