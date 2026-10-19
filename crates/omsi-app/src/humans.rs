@@ -1708,7 +1708,9 @@ const PED_GAP_SIGMA: f64 = 1.0;
 
 /// [ROLLBACK r5-P6b] The median gap (m) for `target` strollers on `pavement_m` metres of pavement
 /// in the circle: half the pavement per person wanted, within PED_GAP_MIN..PED_GAP_MEDIAN, so
-/// that the count the setting asks for is reached while the gaps keep their skew.
+/// that the count the setting asks for is reached while the gaps keep their skew. At the top
+/// of the `pedestrians` slider the median sits on the 0.8 m floor and the law is off by
+/// design: the slider is the density, and only the group draw shapes the gaps there.
 fn gap_median(pavement_m: f32, target: usize) -> f64 {
     (pavement_m as f64 / (2.0 * target.max(1) as f64)).clamp(PED_GAP_MIN, PED_GAP_MEDIAN)
 }
@@ -2519,9 +2521,10 @@ const BACK_TO_KERB: &str = "a vehicle in the way: back to the kerb";
 const STANDS_ON: &str = "a vehicle stands on the crossing";
 /// [ROLLBACK r5-P6b] Metres of the way across within which a vehicle standing on a cut holds
 /// the kerb: a kerb stub and a two-lane carriageway (the far lane's cut lies 7.25 m from the
-/// kerb of the test crossing). A junction object's crossing has cuts across the whole
-/// junction, and 1050 person-s were refused at one kerb for cars standing on cuts 20 m away
-/// (BJ 0821, review r5p).
+/// kerb of the test crossing) - the kerb holds for its first two lanes; a vehicle on a
+/// farther lane is met mid-crossing and dealt with by P1/P5. A junction object's crossing
+/// has cuts across the whole junction, and 1050 person-s were refused at one kerb for cars
+/// standing on cuts 20 m away (BJ 0821, review r5p).
 const PED_OCCUPIED_REACH: f64 = 8.0;
 
 /// [ROLLBACK r5-P6b] Whether a vehicle stopping for `why` is one stopping for people on foot: for
@@ -2720,7 +2723,13 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     let occupied = || {
         at.cars
             .iter()
-            .any(|car| car.vel.length() < PED_CREEP_SPEED && !car.yielding && car.stood < PED_OCCUPIED_CAP && near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)))
+            // (the "abandoned car" exemption past the cap is for one that stands: a car that
+            // stood 19 s on the cut and then crept 2.2 m at 0.4-0.7 m/s kept its clock past
+            // the cap and 56 people stepped on at a lit green, X10 0837 car 485)
+            .any(|car| {
+                let speed = car.vel.length();
+                speed < PED_CREEP_SPEED && !car.yielding && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5) && near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR))
+            })
     };
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
         if let Some((state, left)) = t.light_state(ctl, li) {
@@ -9651,6 +9660,17 @@ mod ped_tests {
         creep.body.vel = creep.vel;
         assert_eq!(lit_kerb_with(creep), Some(STANDS_ON));
         assert_eq!(kerb_with(creep), Some(STANDS_ON));
+        // one that stood 25 s on the cut and now creeps on at 0.6 m/s: the abandoned-car
+        // exemption is for a car that stands, so still refused; standing 25 s: go (round it)
+        let mut rolls = creep;
+        rolls.stood = 25.0;
+        rolls.vel = DVec2::new(0.6, 0.0);
+        rolls.body.vel = rolls.vel;
+        assert_eq!(lit_kerb_with(rolls), Some(STANDS_ON));
+        let mut stands = rolls;
+        stands.vel = DVec2::ZERO;
+        stands.body.vel = DVec2::ZERO;
+        assert_eq!(lit_kerb_with(stands), Some("go"));
         // a car on a cut 13.75 m down the way (the second street of `two_stage`): go
         let (net, mut ped, legs) = two_stage(3.0);
         let lights = FakeLights::new(GREEN, 60.0);
