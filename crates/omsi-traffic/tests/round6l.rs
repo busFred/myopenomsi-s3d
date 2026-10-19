@@ -2,7 +2,7 @@
 //! standing obstacle, the settled offset of a frozen change, keep-right into closed pieces.
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
-use omsi_traffic::{Person, PlayerView, Simulation, Vehicle, VehicleClass};
+use omsi_traffic::{Person, Simulation, Vehicle, VehicleClass};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -32,11 +32,6 @@ fn car(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
     v.fresh = 0.0;
     v
 }
-fn van(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
-    let mut v = car(id, lane, s, speed);
-    v.half_width = 1.25;
-    v
-}
 fn ai_bus(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
     let mut st = AiState::new(lane, s, id);
     st.speed = speed;
@@ -48,9 +43,6 @@ fn ai_bus(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
     let mut v = Vehicle::new(id, VehicleClass::Bus, st, 1.25, id * 7919);
     v.fresh = 0.0;
     v
-}
-fn bus(x: f64, y_axis: f64, lateral: f64, still: f32) -> PlayerView {
-    PlayerView { id: 7, pos: DVec3::new(x, y_axis - lateral, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still, blinker: 0, signalling: 0.0, priority: false }
 }
 fn two_lanes(drivable: (f32, f32), solid: bool) -> Network {
     let mut net = Network::default();
@@ -67,51 +59,8 @@ fn two_lanes(drivable: (f32, f32), solid: bool) -> Network {
 }
 /// Two same-direction 1.9 m lanes 3.6 m apart (BeijingCity's narrow lanes): 0 left at y=0, 1
 /// right at y=-3.6; the right lane's extent to the left lane's painted edge (3.6-0.95=2.65).
-fn two_narrow() -> Network {
-    let mut net = Network::default();
-    let mut a = lane(&[(0.0, 0.0), (600.0, 0.0)], LaneKind::Street, 1.9);
-    a.source = 1;
-    a.key = Some(LaneKey { tile: (0, 0), id: 1, path: 0 });
-    a.offset = 0.0;
-    a.drivable = (0.95, 2.65);
-    let mut b = lane(&[(0.0, -3.6), (600.0, -3.6)], LaneKind::Street, 1.9);
-    b.source = 1;
-    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
-    b.offset = 3.6;
-    b.drivable = (2.65, 0.95);
-    net.lanes.push(a);
-    net.lanes.push(b);
-    finish(net)
-}
-fn jianandong() -> Network {
-    let mut net = Network::default();
-    let mut a = lane(&[(0.0, 0.0), (600.0, 0.0)], LaneKind::Street, 1.9);
-    a.source = 1;
-    a.key = Some(LaneKey { tile: (0, 0), id: 1, path: 1 });
-    a.offset = 1.8;
-    a.drivable = (2.65, 4.6);
-    net.lanes.push(a);
-    let mut b = lane(&[(600.0, 3.6), (0.0, 3.6)], LaneKind::Street, 1.9);
-    b.source = 1;
-    b.key = Some(LaneKey { tile: (0, 0), id: 1, path: 0 });
-    b.offset = 1.8;
-    b.drivable = (2.65, 3.6);
-    net.lanes.push(b);
-    finish(net)
-}
-fn sedan(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
-    let mut v = car(id, lane, s, speed);
-    v.half_width = 0.97;
-    v.state.front = 2.42;
-    v.state.rear = 2.2;
-    v.state.length = 4.62;
-    v
-}
 fn walker(x: f64, y: f64, vx: f64, vy: f64) -> Person {
     Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false }
-}
-fn walkers_beside(x0: f64) -> Vec<Person> {
-    (0..4).map(|k| walker(x0 + k as f64 * 0.7, -1.3 - 0.07 * k as f64, 0.0, 0.1)).collect()
 }
 
 
@@ -707,4 +656,52 @@ fn r6l4_a_strategic_change_into_a_junction_piece_stays_allowed() {
         changed |= me.state.lane == 1 || me.state.lane == 3;
     });
     assert!(changed, "no strategic change for the turn");
+}
+
+/// A junction object's merge (viz5 case01, AnwaiDajie at object 384): the south-bound
+/// carriageway piece (lane 1, after a lit stub, lane 0) and the ramp piece from its right
+/// (lane 2, no light) run into one way out (lane 3). `ramp_priority`: the ramp piece's
+/// `[rule] priority` (128 the default).
+fn ramp_merge(ramp_priority: f32) -> Network {
+    let piece = |pts: &[(f64, f64)], path: u16| {
+        let mut l = lane(pts, LaneKind::Street, 3.0);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 384, path });
+        l
+    };
+    let mut net = Network::default();
+    let mut stub = piece(&[(0.0, 31.0), (0.0, 30.0)], 0);
+    stub.traffic_light = Some((0, 0));
+    net.lanes.push(stub); // 0
+    net.lanes.push(piece(&[(0.0, 30.0), (0.0, 0.0)], 1)); // 1 carriageway
+    let mut ramp = piece(&[(-20.0, 20.0), (-8.0, 8.0), (0.0, 0.0)], 2);
+    ramp.priority = ramp_priority;
+    net.lanes.push(ramp); // 2 ramp, from the carriageway's right
+    net.lanes.push(road(&[(0.0, 0.0), (0.0, -200.0)], 5)); // 3 way out
+    net.lanes.push(road(&[(0.0, 200.0), (0.0, 31.0)], 6)); // 4 carriageway in
+    net.lanes.push(road(&[(-200.0, 200.0), (-20.0, 20.0)], 7)); // 5 ramp in
+    finish(net)
+}
+
+/// Whether movement `a` gives way to `b` in the compiled junction.
+fn yields(sim: &Simulation, a: usize, b: usize) -> Option<bool> {
+    let (j, mv) = sim.junctions.movement(a)?;
+    mv.foes.iter().find(|f| j.movements[f.movement].lane == b).map(|f| f.yields)
+}
+
+#[test]
+fn r6l5_a_ramp_priority_rule_makes_the_unlit_ramp_give_way_and_an_unlit_line_alone_does_not() {
+    // equal priorities: the ramp from the right goes first, stop line or not (no generic
+    // "an unlit stop line gives way": unlit stop lines inside lit objects are common, viz5
+    // case06's lane 5060 would yield its own green)
+    let net = ramp_merge(128.0);
+    let sim = Simulation::new(&net, vec![]);
+    assert_eq!(yields(&sim, 1, 2), Some(true), "the carriageway gives way to the ramp from its right");
+    assert_eq!(yields(&sim, 2, 1), Some(false));
+    // the map's [rule] priority 64 on the ramp piece (the patch for AnwaiDajie's ramp): the
+    // ramp gives way
+    let net = ramp_merge(64.0);
+    let sim = Simulation::new(&net, vec![]);
+    assert_eq!(yields(&sim, 1, 2), Some(false), "the carriageway goes first");
+    assert_eq!(yields(&sim, 2, 1), Some(true), "the ramp gives way");
 }
