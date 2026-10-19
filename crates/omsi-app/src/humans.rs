@@ -2496,9 +2496,22 @@ fn replan_frozen(decision: Option<&str>, still: f32, wants: f64) -> bool {
 }
 
 const BACK_TO_KERB: &str = "a vehicle in the way: back to the kerb";
-/// A vehicle's box over the way at the kerb ([ROLLBACK r4c-P5]) or over any cut of the
-/// crossing ([ROLLBACK r5-P6]).
+/// A vehicle's box over the way at the kerb ([ROLLBACK r4c-P5]) or over a cut of the
+/// crossing near the kerb ([ROLLBACK r5-P6]).
 const STANDS_ON: &str = "a vehicle stands on the crossing";
+/// [ROLLBACK r5-P6b] Metres of the way across within which a vehicle standing on a cut holds
+/// the kerb: a kerb stub and a two-lane carriageway (the far lane's cut lies 7.25 m from the
+/// kerb of the test crossing). A junction object's crossing has cuts across the whole
+/// junction, and 1050 person-s were refused at one kerb for cars standing on cuts 20 m away
+/// (BJ 0821, review r5p).
+const PED_OCCUPIED_REACH: f64 = 8.0;
+
+/// [ROLLBACK r5-P6b] Whether a vehicle stopping for `why` is one stopping for people on foot: for
+/// a person in front or for the zebra (a car holding for the zebra with its nose over a cut
+/// counted as "not yielding" and held the kerb 20 s while both waited: X10 0837, cars 68/129).
+fn yields_to_people(why: omsi_traffic::Why) -> bool {
+    matches!(why, omsi_traffic::Why::People | omsi_traffic::Why::Zebra)
+}
 /// [ROLLBACK r5-P6] Seconds of a vehicle's standing on the crossing after which the kerb no
 /// longer waits for it (people step round it, as P5 has them): a car abandoned on a zebra
 /// (X10 case15, a 90 s queue) does not hold the kerb for good.
@@ -2681,8 +2694,15 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // on green nobody looked at the vehicles at all: 339 step-ons in a minute while a bus
     // stood with two pieces under its body, X10 streams report; a lead-following car on the
     // zebra had 118 step-ons round its nose.)
+    // ([ROLLBACK r5-P6b] the cuts of the first metres of the way only, and a vehicle creeping
+    // onto one at under PED_CREEP_SPEED counts as standing on it: a queue car rolling onto the
+    // crossing at 0.5-0.7 m/s at a lit green passed, X10 #485, 25 step-ons)
+    let start = next.at(net, 0.0).0.truncate();
+    let near_cuts: Vec<DVec2> = cuts.iter().copied().filter(|x| (*x - start).length() <= PED_OCCUPIED_REACH).collect();
     let occupied = || {
-        at.cars.iter().any(|car| car.vel.length() < 0.5 && !car.yielding && car.stood < PED_OCCUPIED_CAP && cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)))
+        at.cars
+            .iter()
+            .any(|car| car.vel.length() < PED_CREEP_SPEED && !car.yielding && car.stood < PED_OCCUPIED_CAP && near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)))
     };
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
         if let Some((state, left)) = t.light_state(ctl, li) {
@@ -6329,7 +6349,7 @@ impl Humans {
                     vel: fwd * c.ai.state.speed as f64,
                     half_len: bb[1] as f64 * 0.5,
                     body,
-                    yielding: c.ai.last.why == omsi_traffic::Why::People,
+                    yielding: yields_to_people(c.ai.last.why),
                     stood: 0.0,
                 });
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
@@ -9596,6 +9616,51 @@ mod ped_tests {
         short.pos = short.body.center;
         assert_eq!(lit_kerb_with(short), Some("go"));
         assert_eq!(kerb_with(short), Some("go"));
+    }
+
+    #[test]
+    fn r5p6b_the_kerb_rule_counts_zebra_holds_creepers_and_near_cuts_only() {
+        // a car holding for the zebra is one stopping for people
+        assert!(yields_to_people(omsi_traffic::Why::People) && yields_to_people(omsi_traffic::Why::Zebra));
+        assert!(!yields_to_people(omsi_traffic::Why::Lead) && !yields_to_people(omsi_traffic::Why::Light));
+        // a queue car creeping onto the near cut at 0.7 m/s: refused, lit and unlit
+        let mut creep = car_before(5.0);
+        creep.yielding = false;
+        creep.body.center = DVec2::new(0.0, -1.75);
+        creep.pos = creep.body.center;
+        creep.vel = DVec2::new(0.7, 0.0);
+        creep.body.vel = creep.vel;
+        assert_eq!(lit_kerb_with(creep), Some(STANDS_ON));
+        assert_eq!(kerb_with(creep), Some(STANDS_ON));
+        // a car on a cut 13.75 m down the way (the second street of `two_stage`): go
+        let (net, mut ped, legs) = two_stage(3.0);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut far = car_before(5.0);
+        far.yielding = false;
+        far.body.center = DVec2::new(0.0, 3.5 + 3.0 + 1.75);
+        far.pos = far.body.center;
+        let mut walk = PedWalk::new(legs, false, 0.0);
+        walk.legs[0] = Leg { lane: 4, a: 19.5, b: 20.0 };
+        let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+        let mut first = None;
+        for k in 0..20 {
+            frame(&net, &mut ped, Some(&lights), &[far], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            first = first.or(m.decision);
+        }
+        assert_eq!(first, Some("go"), "a car on a far cut does not hold the kerb");
+        // the same car on the near street's far lane (3.5 m in): refused
+        far.body.center = DVec2::new(0.0, 1.75);
+        far.pos = far.body.center;
+        let (net, mut ped, legs) = two_stage(3.0);
+        let mut walk = PedWalk::new(legs, false, 0.0);
+        walk.legs[0] = Leg { lane: 4, a: 19.5, b: 20.0 };
+        let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
+        let mut first = None;
+        for k in 0..20 {
+            frame(&net, &mut ped, Some(&lights), &[far], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            first = first.or(m.decision);
+        }
+        assert_eq!(first, Some(STANDS_ON));
     }
 
     #[test]
