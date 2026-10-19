@@ -320,6 +320,18 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     }
 }
 
+/// [round6 J5] A standing player's claim names as its lead the AI vehicle in its corridor
+/// within this many metres of its front (review-r6 fix 7: a queue's gap, 2-3 m).
+pub const PLAYER_LEAD_REACH: f32 = 3.0;
+/// [round6 J5] ... its centre within this many metres of the player's axis (`traffic_cases
+/// heads`' 2.5 m corridor for the queue in front of the player).
+pub const PLAYER_LEAD_ACROSS: f32 = 2.5;
+/// [round6 J5] ... or within this many metres when it moves off ahead of the player (`heads`'
+/// 12 m from one car of a queue to the next).
+pub const PLAYER_LEAD_AWAY: f32 = 12.0;
+/// [round6 J5] ... and its box reaching no more than this far (m) back past the player's front
+/// (review-r6j: a car alongside counted as the lead).
+pub const PLAYER_LEAD_OVERLAP: f32 = 0.5;
 /// [round6 J4] A player keeps the light of its lit lane until its rear is this far (m) past the
 /// lane's start (`perception::signal_ahead`'s half metre for an AI car).
 pub const PLAYER_LINE_PAST: f32 = 0.5;
@@ -1033,12 +1045,52 @@ impl Simulation {
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
             let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
+            // [round6 J5] standing, its lead: the AI vehicle in its corridor, its box
+            // within `PLAYER_LEAD_REACH` ahead of the front and its centre within
+            // `PLAYER_LEAD_ACROSS` of the axis (`traffic_cases heads`' queue in front of the
+            // player), so that a foe the player stands behind does not wait for it (`reservation`:
+            // a standing foe whose lead is me; case01: coach #4252 waited for PLAYER0 standing
+            // 1 m behind its tail)
+            let player_foes: Vec<usize> = foes.iter().map(|f| f.movement).collect();
+            let meets = |k: usize| claim_of[k].is_some_and(|ck| claims[ck].junction == j && !claims[ck].chain.iter().any(|&(cm, _)| cm == m) && claims[ck].chain.iter().any(|&(cm, _)| player_foes.contains(&cm)));
+            let lead = (p.still > PLAYER_STILL && p.speed.abs() < 0.3)
+                .then(|| {
+                    let fwd = p.fwd();
+                    let right = DVec2::new(fwd.y, -fwd.x);
+                    let o = p.pos.truncate();
+                    // (at any speed of its own: the coach creeping off in front of the standing
+                    // player was refused for it again at 0.6-1.8 m/s, stop and go)
+                    self.vehicles_near(p.pos, (p.half_len + PLAYER_LEAD_REACH) as f64 + 20.0)
+                        .into_iter()
+                        .filter_map(|k| {
+                            let b = vehicles[k].obb();
+                            let along = b.corners().map(|c| (c - o).dot(fwd) - p.half_len as f64);
+                            let lo = along.iter().copied().fold(f64::INFINITY, f64::min);
+                            // (one moving off from in front of it keeps it as its lead for
+                            // `PLAYER_LEAD_AWAY`: refused again 3 m on, it stood and went)
+                            let hk = (vehicles[k].heading as f64).to_radians();
+                            let away = vehicles[k].state.speed >= 0.3 && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
+                            let reach = if away { PLAYER_LEAD_AWAY } else { PLAYER_LEAD_REACH };
+                            // (wholly ahead of its front, but for half a metre: not a car alongside
+                            // in a narrow piece beside it with its front just past the player's)
+                            (lo > -PLAYER_LEAD_OVERLAP as f64 && lo < reach as f64 && (b.center - o).dot(right).abs() < PLAYER_LEAD_ACROSS as f64).then_some((k, lo.max(0.0)))
+                        })
+                        // (of two side by side in its corridor, one whose way meets the player's
+                        // at this junction and is not on the player's own piece (one ahead on its
+                        // way comes first anyway, `reservation::behind_on_my_way`), else the
+                        // nearest: case01, the player stood 2 m behind #5348 on its own piece and
+                        // 1-2 m behind the tail of coach #4252 beside it, which waited for the
+                        // player at their zipper)
+                        .min_by(|a, b| (!meets(a.0), a.1).partial_cmp(&(!meets(b.0), b.1)).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(k, _)| k)
+                })
+                .flatten();
             claims.push(Claim {
                 chain,
                 was_standing: false,
                 light_red,
                 until_go,
-                lead: None,
+                lead,
                 vehicle: usize::MAX - k,
                 junction: j,
                 movement: m,

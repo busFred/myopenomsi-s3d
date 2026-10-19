@@ -309,3 +309,62 @@ fn j4_the_player_keeps_its_red_until_its_rear_is_past_its_line() {
     let (_, _, red) = player_over_its_line(12.6, 3.0);
     assert!(!red, "a player whose rear is past its line kept its red");
 }
+
+/// J5: the player's northbound way (approach 0 to y = -20, piece 1 to the merge at (0, 40),
+/// priority 192) and a piece of the AI's (2, from (3.5, -20), 3.5 m to the right to y = 0, then
+/// bending in to the merge, priority 64: it gives way; they meet from y = 10), then the way on
+/// 3 and 4 (outside the object: the two ways share no piece, as case01's); the AI's approach 5.
+fn diagonal_merge() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -20.0)], 1)); // 0
+    net.lanes.push(piece(&[(0.0, -20.0), (0.0, 40.0)], 0, 192.0, 2.0)); // 1
+    net.lanes.push(piece(&[(3.5, -20.0), (3.5, 0.0), (0.0, 40.0)], 1, 64.0, 2.0)); // 2
+    net.lanes.push(road(&[(0.0, 40.0), (0.0, 60.0)], 3)); // 3
+    net.lanes.push(road(&[(0.0, 60.0), (0.0, 400.0)], 4)); // 4
+    net.lanes.push(road(&[(3.5, -300.0), (3.5, -20.0)], 5)); // 5
+    finish(net)
+}
+
+/// The AI car standing on piece 2 with its rear at y = 4 (its centre 2.2 m right of the
+/// player's axis, x = 0.9); the player's bus (12 m) standing `still` s (or rolling at `speed`)
+/// with its front `gap` m behind that rear: whether the car
+/// waited for the player in `secs`, and the player's claim's lead at the first frame.
+fn behind_the_tail(gap: f64, still: f32, speed: f32, secs: f32) -> (bool, Option<usize>) {
+    let net = diagonal_merge();
+    let mut sim = Simulation::new(&net, vec![]);
+    // (a slow one, 10 km/h: out of the merge only well after the player could be in it)
+    let mut me = car(1, 2, 24.0 + 2.0, 0.0);
+    me.state.max_speed_kmh = 10.0;
+    let mut cars = vec![me];
+    let player = PlayerView { id: 7, pos: DVec3::new(0.9, 4.0 - gap - 6.0, 0.0), heading: 0.0, half_len: 6.0, half_width: 1.25, speed, still, blinker: 0, signalling: 0.0, priority: false };
+    sim.players = vec![player];
+    let (mut waited, mut lead, mut first) = (false, None, true);
+    run(&net, &mut sim, &mut cars, secs, |_, sim, cars| {
+        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
+        if first {
+            lead = sim.claims.iter().find(|(c, _)| c.vehicle >= usize::MAX - 64).and_then(|(c, _)| c.lead);
+            first = false;
+        }
+        sim.players = vec![player];
+    });
+    (waited, lead)
+}
+
+#[test]
+fn j5_a_standing_player_behind_a_car_s_tail_names_it_as_its_lead() {
+    // the player stands 1.5 m behind the tail of the car beside-ahead of it (its centre 2 m
+    // across): the car, which gives way to the player's way at their merge, does not wait for
+    // it (case01: coach #4252 waited for PLAYER0 standing behind its tail)
+    let (waited, lead) = behind_the_tail(1.5, 5.0, 0.0, 2.0);
+    assert!(!waited, "the car waited for the player standing behind it");
+    assert_eq!(lead, Some(0), "the player's claim names no lead");
+    // standing for a second only (not blocked yet): no lead
+    let (_, lead) = behind_the_tail(1.5, 1.0, 0.0, 0.5);
+    assert_eq!(lead, None);
+    // rolling (viz3 case11: a rolling player still meets the foes it meets): no lead
+    let (_, lead) = behind_the_tail(1.5, 0.0, 4.0, 0.2);
+    assert_eq!(lead, None);
+    // 4 m behind the tail: out of reach, no lead
+    let (_, lead) = behind_the_tail(4.0, 5.0, 0.0, 0.5);
+    assert_eq!(lead, None);
+}
