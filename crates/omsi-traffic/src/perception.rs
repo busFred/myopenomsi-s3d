@@ -967,6 +967,9 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 /// people standing at the kerb.
 const KERB_CLEAR: f32 = 0.3;
 
+/// A person's body radius (m, `humans::BODY_OUTSIDE`).
+const BODY_RADIUS: f32 = 0.28;
+
 fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     let st = &me.state;
     let v = st.speed;
@@ -1014,7 +1017,18 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                     // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
                     // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
                     // with a stream on the crossing they let the vehicle go first (P4)
-                    if p.at_kerb && !p.on_crossing && (across as f32) >= me.half_width + 0.28 {
+                    if p.at_kerb && !p.on_crossing && (across as f32) >= me.half_width + BODY_RADIUS {
+                        continue;
+                    }
+                    // [round5 C2] somebody level with my body (their body behind my front
+                    // plane, now and where their step takes them within 2 s, `later`) holds
+                    // nothing: my front never reaches them; one ahead of the front, or stepping
+                    // there, holds as before (viz4 case01 #2827: eleven on the pavement 0.3 m
+                    // off its flank, level with its body, held it 34 s). At any speed, not only
+                    // standing: let go below 0.3 m/s alone, the car was held again the moment
+                    // it rolled and crept at 0.1 m/s (test c2_*: 2.3 s held of 6). Not a bus
+                    // pulling in at its stop (B4).
+                    if !at_kerb_of_stop && d + (along as f32) < st.front - BODY_RADIUS {
                         continue;
                     }
                     // someone who has stood at the edge for a while does not hold a standing car

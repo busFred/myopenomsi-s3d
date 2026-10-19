@@ -117,3 +117,43 @@ fn c1_a_walker_on_the_far_half_of_the_zebra_holds_nobody_one_in_my_lane_does() {
         }
     }
 }
+
+// C2 ----------------------------------------------------------------------------------
+
+/// A standing car (speed 0) on the road at x = 100 (its front at 102); `people` stand or step
+/// about it. Returns how long it was held why=people over 6 s and its speed at the end.
+fn standing_car_with(people: Vec<Person>) -> (f32, f32) {
+    let net = road_with_a_zebra(false);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.people = people;
+    let mut cars = vec![car(1, 0, 400.0, 0.0)];
+    let mut people_s = 0.0f32;
+    run(&net, &mut sim, &mut cars, 6.0, |_, _, cars| {
+        if cars[0].last.why == Why::People {
+            people_s += DT;
+        }
+    });
+    (people_s, cars[0].state.speed)
+}
+
+/// [round5 C2] Somebody level with a standing car's body, 1.1 m off its axis (inside the 0.3 m
+/// strip beside its 0.9 m half width, on the pavement's edge) and never `still`, does not
+/// hold it: it drives off. One standing in the strip ahead of its front does; and one
+/// stepping off the kerb toward the lane at 0.3 m/s ahead of the front still stops it.
+#[test]
+fn c2_a_standing_car_is_not_held_by_somebody_level_with_its_body() {
+    // level with the body: 1 m behind the front plane
+    let (held, v) = standing_car_with(vec![person(101.0, 1.1), person(99.0, -1.1)]);
+    assert!(held < 0.5 && v > 2.0, "held {held:.1} s, speed {v:.1}");
+    // the same person 0.5 m ahead of the front: held, the car stands
+    let (held, v) = standing_car_with(vec![person(102.5, 1.1)]);
+    assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
+    // level with the body but hurrying forward along the car at 2 m/s: their step takes them
+    // ahead of the front within the look-ahead (1.2 s here) - held
+    let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(2.0, 0.0), ..person(100.5, 1.1) }]);
+    assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
+    // stepping off the kerb toward the lane at 0.3 m/s, 3 m ahead of the front, 1.6 m off the
+    // axis now (outside the strip): held
+    let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(0.0, -0.3), ..person(105.0, 1.6) }]);
+    assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
+}
