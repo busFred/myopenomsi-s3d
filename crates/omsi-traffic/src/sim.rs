@@ -287,6 +287,21 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     }
 }
 
+/// Seconds a player stands before it counts as held where it is: blocked to the junction
+/// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
+pub const PLAYER_STILL: f32 = 2.0;
+/// A standing player whose body is this far (m) clear of the lane's edge makes no junction
+/// claim: what a car keeps off a kerb (`perception::KERB_CLEAR`).
+pub const PARKED_CLEAR: f32 = 0.3;
+
+/// The lateral offset (m, right positive) of player `p` from lane `lane` at `s` along it.
+fn player_lateral(net: &Network, lane: usize, s: f32, p: &PlayerView) -> f32 {
+    let (q, h) = net.lanes[lane].at(s.min(net.lanes[lane].length()));
+    let hr = (h as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    (p.pos - q).truncate().dot(right) as f32
+}
+
 /// An aborted pass standing out there steps back into its lane at this pace (m/s) ...
 pub const SIDESTEP_SPEED: f32 = 0.5;
 /// ... until it is this near its lane's middle (m).
@@ -562,11 +577,7 @@ impl Simulation {
         for k in 0..self.players.len() {
             let p = self.players[k];
             let Some((lane, s)) = self.player_lane(net, &p) else { continue };
-            let (q, h) = net.lanes[lane].at(s.min(net.lanes[lane].length()));
-            let hr = (h as f64).to_radians();
-            let right = DVec2::new(hr.cos(), -hr.sin());
-            let lateral = (p.pos - q).truncate().dot(right) as f32;
-            self.player_occupancy.entry(lane).or_default().push((k, s, lateral));
+            self.player_occupancy.entry(lane).or_default().push((k, s, player_lateral(net, lane, s, &p)));
         }
     }
 
@@ -619,6 +630,16 @@ impl Simulation {
     fn player_lane(&self, net: &Network, p: &PlayerView) -> Option<(usize, f32)> {
         let (l, s, _) = net.lane_along(p.pos, p.heading as f64, LaneKind::Street, 6.0, 45.0)?;
         Some((l, s))
+    }
+
+    /// A player standing (`PLAYER_STILL`) with its body wholly beside the lane it is snapped
+    /// to, by more than `PARKED_CLEAR`: parked beside the lanes, it is a body to perception
+    /// (`player_on_way`) but no junction contender. (x10 case10: a bus 0.75 m clear of the
+    /// lane, snapped to the right-turn piece 3.3 m away, was "standing in the merge" and held
+    /// 9 cars 106 s.)
+    fn player_parked_beside(net: &Network, lane: usize, s: f32, p: &PlayerView) -> bool {
+        let lateral = player_lateral(net, lane, s, p);
+        p.still > PLAYER_STILL && p.speed.abs() < 0.3 && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
     }
 
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
@@ -858,6 +879,10 @@ impl Simulation {
             // the way: (lane, distance from the vehicle's origin to the lane's start)
             let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {
+                // (parked beside the lane: no claim, `player_parked_beside`)
+                if Self::player_parked_beside(net, lane, s, p) {
+                    continue;
+                }
                 way.push((lane, -s));
                 let mut d = net.lanes[lane].length() - s;
                 let mut cur = lane;
@@ -947,7 +972,7 @@ impl Simulation {
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
-            let blocked = p.still > 2.0 && p.speed.abs() < 0.3 && !light_red;
+            let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
             claims.push(Claim {
                 chain,
                 was_standing: false,
@@ -968,7 +993,7 @@ impl Simulation {
                 exit_room: true,
                 impatience: Impatience::default(),
                 absolute: p.priority,
-                held: p.still > 2.0,
+                held: p.still > PLAYER_STILL,
                 blocked,
                 stuck: false,
                 clearing: false,

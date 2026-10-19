@@ -142,3 +142,62 @@ fn j1_a_multi_phase_light_held_green_by_a_stop_point_is_a_stop_line_not_a_detect
     assert_eq!(seen, Some((0, 0)), "a real first light is the one seen");
     assert!(front > -10.0, "with a real green first line it drives on past the second (same object, straight): front {front:.1}");
 }
+
+// ---- J2: a parked player beside the lane makes no junction claim ----
+
+/// A side road piece (3) merging into the main road's piece (1) at its end, giving way to it;
+/// the main road approach (0) and exit (2), the side approach (4).
+fn side_merge() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-200.0, 0.0), (-10.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(-10.0, 0.0), (10.0, 0.0)], 0, 192.0)); // 1
+    net.lanes.push(road(&[(10.0, 0.0), (300.0, 0.0)], 2)); // 2
+    net.lanes.push(piece(&[(-10.0, -8.0), (10.0, 0.0)], 1, 64.0)); // 3
+    net.lanes.push(road(&[(-200.0, -8.0), (-10.0, -8.0)], 3)); // 4
+    finish(net)
+}
+
+/// The player's bus stands (10 s) at `(x, y)` heading east; the merger rolls up the side road.
+/// (how far east the merger got in 20 s, whether it ever waited for the player)
+fn merger_past_standing_player(x: f64, y: f64) -> (f32, bool) {
+    let net = side_merge();
+    let js = omsi_traffic::Junctions::compile(&net);
+    let (_, side) = js.movement(3).unwrap();
+    assert!(side.foes.iter().any(|f| f.yields && f.kind == omsi_traffic::FoeKind::Merge), "{:?}", side.foes);
+    let mut sim = Simulation::new(&net, vec![]);
+    let player = PlayerView { id: 7, pos: DVec3::new(x, y, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 10.0, blinker: 0, signalling: 0.0, priority: false };
+    sim.players = vec![player];
+    let mut cars = vec![car(1, 4, 130.0, 8.0)];
+    let mut waited = false;
+    run(&net, &mut sim, &mut cars, 20.0, |_, sim, cars| {
+        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
+        sim.players = vec![player];
+    });
+    (cars[0].pos.x as f32, waited)
+}
+
+#[test]
+fn j2_a_player_standing_3m4_beside_the_merging_piece_holds_no_merger() {
+    // the bus's centre 3.4 m left of the main piece's axis (its right side 2.15 m off, the
+    // lane's edge at 1.5): parked beside the lane, as x10 case10's bus on the cycle track
+    // (left, away from the side road: its body is in nobody's corridor)
+    let (x, waited) = merger_past_standing_player(5.0, 3.4);
+    assert!(!waited, "the merger waited for the parked player");
+    assert!(x > 30.0, "the merger got only to x = {x:.1}");
+    // (and further off)
+    let (x, waited) = merger_past_standing_player(5.0, 4.5);
+    assert!(!waited && x > 30.0, "4.5 m off: waited {waited}, x = {x:.1}");
+}
+
+#[test]
+fn j2_a_player_stopped_in_the_box_keeps_its_claim() {
+    // the bus stands with its body over the lane (0.8 m off the axis): the merger waits for
+    // it and does not come in beside it
+    let (x, waited) = merger_past_standing_player(5.0, -0.8);
+    assert!(waited, "the merger never waited for the bus standing in the lane");
+    assert!(x < 8.0, "the merger drove on to x = {x:.1} with the bus standing in the merge");
+    // body clear of the lane's edge by less than PARKED_CLEAR: still a claim
+    let (_, waited) = merger_past_standing_player(5.0, 1.5 + 1.25 + 0.2);
+    assert!(waited, "a bus 0.2 m off the lane's edge is not parked beside it");
+}
+
