@@ -197,6 +197,34 @@ fn obstacle_bus(sim: &Simulation, vehicles: &[Vehicle], id: u64) -> Option<(bool
 /// Within this many metres of a junction (from the front to where its object begins) a car
 /// does not pull out to pass, nor keeps back to be able to.
 pub const JUNCTION_KEEP: f32 = 40.0;
+/// An in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when what it squeezes past
+/// stands within this many metres (Sobol's `sq_junction_m`: 25 m beyond the bus's tail).
+pub const SQUEEZE_NEAR: f32 = 25.0;
+/// No light or junction within this many metres past the thing an in-lane squeeze goes
+/// round (Sobol's 25 m; the pass on the oncoming lane keeps 60 m behind the player).
+pub const SQUEEZE_ZONE: f32 = 25.0;
+/// Seconds the player's bus has stood before a car squeezes past it inside the lane
+/// (Sobol's `player_squeeze` fired at 1.5 s; the oncoming-lane pass waits for 4 s and 3 s
+/// stopped itself).
+pub const PLAYER_SQUEEZE_STAND: f32 = 1.5;
+/// A squeeze past the player's bus starts once the car has slowed to this (m/s): closing
+/// up behind it, not swerving out at speed 40 m back.
+pub const SQUEEZE_START_SPEED: f32 = 3.0;
+/// Seconds of indicator before an in-lane squeeze pulls out (round 5 L2: Sobol's squeeze
+/// showed none; a real pass signals `SIGNAL_BEFORE_CHANGE`).
+pub const SQUEEZE_SIGNAL: f32 = 0.5;
+/// Metres the driver-side wheels may go over the line into a free neighbour lane when the
+/// drawn road beside the obstacle is not quite enough for the squeeze ("the driver side
+/// wheels step into the left neighbouring lane while most of the car remains in the
+/// current lane"; round 5 L2).
+pub const WHEELS_OVER_LINE: f32 = 0.6;
+
+/// The player's bus pausing in the lane: squeezed past inside the lane after
+/// `PLAYER_SQUEEZE_STAND` (`Headway::standing_obstacle` waits 4 s for the pass on the
+/// oncoming lane).
+fn pausing_player(l: &crate::perception::Headway) -> bool {
+    matches!(l.what, Seen::Player(_)) && l.standing_for > PLAYER_SQUEEZE_STAND
+}
 
 /// Could the car get round the standing `lead` into the lane beside, `nb` (`Start::Bypass`,
 /// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
@@ -489,16 +517,21 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // the thing being passed no longer holds the car (the bent way clears it)
             if let Some(l) = p.leader {
                 // (not one standing on the line the pass takes: that holds it)
-                let passing_it = l.standing_obstacle() && st.odometer + l.gap + st.front < pass.until + 1.0 && l.lateral.abs() < (l.lateral - pass.side).abs();
+                let passing_it = (l.standing_obstacle() || pausing_player(&l)) && st.odometer + l.gap + st.front < pass.until + 1.0 && l.lateral.abs() < (l.lateral - pass.side).abs();
                 if passing_it {
                     out.lead = None;
                     out.lead_seen = None;
                 }
             }
         }
-    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle()) {
-        // (not across a solid line: a pass there stays a squeeze within the lane)
-        let can_pass = !me.is_rail() && me.class != VehicleClass::Air && st.change.is_none() && out.start.is_none() && lane.left.is_none() && lane.right.is_none();
+    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle() || pausing_player(&l)) {
+        // (the player's bus pausing 1.5 s is squeezed past inside the lane; everything else
+        // waits for it to be a standing obstacle)
+        let standing = l.standing_obstacle();
+        let can_pass = !me.is_rail() && me.class != VehicleClass::Air && st.change.is_none() && out.start.is_none();
+        // (the oncoming lane is used only on a road with one lane each way; not across a
+        // solid line: a pass there stays a squeeze within the drawn road)
+        let two_lane = lane.left.is_none() && lane.right.is_none();
         let solid = lane.no_overtaking;
         let player = matches!(l.what, Seen::Player(_));
         let player_out = player && sim.players.iter().any(|pl| pl.blinker as i32 == out_side && pl.signalling < 1.0);
@@ -512,28 +545,60 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let bus_out = obstacle_id.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, _)| bus && signals);
         // a bus does not pass what stands at its own next stop
         let own_stop = me.external.stop_at.map(|s| s < l.gap + l.length + st.front + 15.0).unwrap_or(false);
-        // how far the car has to swing out: past the thing inside the lane if the lane
-        // leaves room beside where it stands, else onto the oncoming lane
+        let real = l.gap + if player { 0.5 } else { 0.0 };
+        // how far the car has to swing out: past the thing inside the drawn road if that
+        // leaves room beside where it stands (the lane's drivable extent on that side, L1:
+        // to the kerb, the pavement or the next lane's painted edge), else onto the
+        // oncoming lane
         let need = me.half_width + l.half_width + 0.35;
         let towards_middle = sim.oncoming_sign();
         let squeeze_side = if l.lateral * towards_middle > 0.3 { l.lateral - towards_middle * need } else { l.lateral + towards_middle * need };
-        let squeeze = squeeze_side.abs() + me.half_width <= lane.width.max(3.0) * 0.5 + 0.3 && !player_out;
+        let (drivable_left, drivable_right) = lane.drivable();
+        let extent = if squeeze_side < 0.0 { drivable_left } else { drivable_right };
+        let reach = squeeze_side.abs() + me.half_width;
+        // not quite enough drawn road: the driver-side wheels may go `WHEELS_OVER_LINE` over
+        // the line into the neighbour lane on that side when it is the car's to drive, nobody
+        // passes on it the wrong way, no solid line, and it is free for the squeeze's length
+        // (ahead past what is passed and the way back in, behind the gap the driver accepts)
+        let over_line = if reach > extent && reach <= extent + WHEELS_OVER_LINE && !solid {
+            let nb = if squeeze_side < 0.0 { p.left } else { p.right };
+            nb.filter(|nb| {
+                let out_len = Passing::out_len_for(squeeze_side);
+                let (obstacle_len, _) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
+                nb.allowed && !nb.foreign && !net.lanes[nb.lane].no_overtaking && nb.ahead.is_none_or(|a| a.0 > real + obstacle_len + out_len + PASS_ROOM) && gap_accepted(me, nb)
+            })
+        } else {
+            None
+        };
+        let squeeze = (reach <= extent || over_line.is_some()) && !player_out;
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
         let room = out_len + 1.0;
         // what a pass would need, now: no light or junction just past the obstacle (within
         // `JUNCTION_KEEP` of the front, a junction), the road going on, and the oncoming lane
-        // (or the lane's own width) free for it
-        let real = l.gap + if player { 0.5 } else { 0.0 };
+        // (or the lane's own drawn road) free for it
         // what stands right behind it is passed with it, and beyond them the lane must have
         // room to come back in: my length, the way to pull back in and 4 m (`PASS_ROOM`; a car
         // or player standing or slower than 2 m/s there takes it; viz case09 #30816 pulled out
         // round two standing cars with three more beyond and stood out there 110 s)
         let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
-        let zone = if player { 60.0 } else { 25.0 };
+        let zone = if squeeze { SQUEEZE_ZONE } else if player { 60.0 } else { 25.0 };
         let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
-        let junction_near = p.junction.as_ref().map(|j| (j.entry < real + st.front + obstacle_len + zone || j.entry - st.front < JUNCTION_KEEP) && !matches!(l.what, Seen::Parked)).unwrap_or(false);
+        // (an in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when the obstacle
+        // stands within `SQUEEZE_NEAR`, and inside the junction already it may go where its
+        // stretch - out, past the obstacle and back in - keeps clear of the foe stretches)
+        let squeeze_end = real + obstacle_len + st.front + st.rear + 2.0 + Passing::back_len_for(side);
+        let junction_near = p.junction.as_ref().map(|j| {
+            if matches!(l.what, Seen::Parked) {
+                return false;
+            }
+            if squeeze && j.inside {
+                return squeeze_end > j.conflict_start && j.conflict_end > -st.rear;
+            }
+            let keep = j.entry - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
+            j.entry < real + st.front + obstacle_len + zone || keep
+        }).unwrap_or(false);
         let road_ok = p.road_left > pass_len + real + 30.0;
         let oncoming = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked);
         // TODO(review11, pre-existing): `clear_for` is the oncoming car's time to the passer's
@@ -543,9 +608,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || oncoming_free);
+        let pass_possible = can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
-        let bypass_possible = !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
+        let bypass_possible = standing && !light_near && !junction_near && [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, me, p, &nb, &l));
         // keep back: room to pull out again, where the car can still stop there gently - only
         // where a pass (or a bypass) could start now; behind a standing player at a red 40 m
         // on, or a queue at a junction, the car closes up to its queue gap (viz3 review: 4785
@@ -561,12 +626,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // (a car that ended up too close - the thing stopped in front of it - pulls out
         // over what room it has once it has stood a while, rather than for ever)
         let too_close = l.gap < room - 1.0;
-        let ready = (me.stopped >= 3.0 || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
+        // a squeeze past the player's bus starts as soon as the bus has paused and the car
+        // has closed up (no 3 s stop of its own); a pass waits for 3 s stopped
+        let early = squeeze && player && v < SQUEEZE_START_SPEED;
+        let ready = (me.stopped >= 3.0 || early || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
         if pass_possible && ready {
             let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
             let lane = if squeeze { None } else { oncoming.map(|o| o.lane) };
-            out.start = Some(Start::Pass(Passing { lane, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0, wait: omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, obstacle: obstacle_id }));
+            let wait = if squeeze { SQUEEZE_SIGNAL } else { omsi_sim::traffic::SIGNAL_BEFORE_CHANGE };
+            out.start = Some(Start::Pass(Passing { lane, side, until, block: st.odometer + real, out_len, back_len: Passing::back_len_for(side), aborted: false, hold: 0.0, wait, obstacle: obstacle_id, beside: over_line.map(|nb| nb.lane) }));
         }
     }
 

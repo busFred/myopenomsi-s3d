@@ -76,6 +76,10 @@ pub struct Parked {
     pub half_len: f32,
 }
 
+/// A squeeze is registered on the neighbour lane its wheels go over the line into from this
+/// much lateral offset (m): out of its lane's middle enough for the body to be over the line.
+const WHEELS_OUT: f32 = 0.3;
+
 /// Overtaking on the oncoming lane, or squeezing past something inside the lane.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Passing {
@@ -101,6 +105,10 @@ pub struct Passing {
     /// The vehicle passed (its id; a player's: `PLAYER_ID_BASE` + its id), if one.
     #[serde(default)]
     pub obstacle: Option<u64>,
+    /// The neighbour lane the driver-side wheels go over the line into for an in-lane squeeze
+    /// (`plan::WHEELS_OVER_LINE`): the body is registered there too while it is out.
+    #[serde(default)]
+    pub beside: Option<usize>,
 }
 
 impl Passing {
@@ -547,6 +555,19 @@ impl Simulation {
                     if let Some(ol) = net.lanes.get(opp) {
                         if let Some((os, _)) = ol.nearest_point(v.pos) {
                             self.occupancy.entry(opp).or_default().push(Occupant { vehicle: i, s: os, lateral: 0.0, foreign: true });
+                        }
+                    }
+                }
+                // (a squeeze with its wheels over the line: on the neighbour lane too, where its
+                // body is from that lane's axis, so the cars there see it)
+                if let (Some(b), true) = (p.beside, st.lateral.abs() > WHEELS_OUT) {
+                    if let Some(bl) = net.lanes.get(b) {
+                        if let Some((bs, _)) = bl.nearest_point(v.pos) {
+                            let (q, h) = bl.at(bs.min(bl.length()));
+                            let hr = (h as f64).to_radians();
+                            let right = DVec2::new(hr.cos(), -hr.sin());
+                            let lateral = (v.pos - q).truncate().dot(right) as f32;
+                            self.occupancy.entry(b).or_default().push(Occupant { vehicle: i, s: bs, lateral, foreign: false });
                         }
                     }
                 }

@@ -96,6 +96,9 @@ pub struct JunctionView {
     /// Distance from the origin to the first meeting place on the way through (the end
     /// of the way through when it has no foe).
     pub conflict_start: f32,
+    /// Distance from the origin to the end of the last meeting place on the way through
+    /// (the end of the way through when it has no foe).
+    pub conflict_end: f32,
     /// Room past the junction's conflicts for this vehicle, measured along its own way.
     pub exit_room: bool,
     /// Distance from the origin to the first place where the way meets another way (not
@@ -1157,7 +1160,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let to_line = light_line - me.state.front - 0.6;
         let cannot_stop = me.state.speed > 1.0 && to_line < me.state.speed * me.state.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
         let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
+        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }
     None
 }

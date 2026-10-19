@@ -705,7 +705,7 @@ fn x6_a_pass_comes_back_in_only_where_nobody_is_beside_it() {
     let mut me = car(1, 0, 100.0, 8.0);
     me.state.max_speed_kmh = 30.0;
     let odo = me.state.odometer;
-    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo, block: odo - 12.0, out_len: 9.0, back_len: 18.0, aborted: false, hold: 0.0, wait: 0.0, obstacle: None });
+    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo, block: odo - 12.0, out_len: 9.0, back_len: 18.0, aborted: false, hold: 0.0, wait: 0.0, obstacle: None, beside: None });
     me.state.lateral = -3.0;
     me.state.lateral_curve = vec![(odo, -3.0), (odo + 18.0, 0.0)];
     let mut beside = car(2, 0, 99.0, 8.0);
@@ -1037,7 +1037,7 @@ fn x2_an_ai_car_beside_me_cutting_in_is_let_in() {
 fn out_on_a_pass(s: f32, lat: f32, aborted: bool, until: f32, obstacle: Option<u64>) -> Vehicle {
     let mut me = car(1, 0, s, 0.0);
     let odo = me.state.odometer;
-    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo + until, block: odo - 4.0, out_len: 9.0, back_len: 18.0, aborted, hold: odo, wait: 0.0, obstacle });
+    me.passing = Some(omsi_traffic::Passing { lane: Some(3), side: -3.0, until: odo + until, block: odo - 4.0, out_len: 9.0, back_len: 18.0, aborted, hold: odo, wait: 0.0, obstacle, beside: None });
     me.state.lateral = lat;
     me.state.lateral_target = lat;
     me.state.lateral_ramp = (lat, lat, 0.0, 1.0);
