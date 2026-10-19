@@ -227,6 +227,9 @@ pub struct LightCall {
     pub marked_through: bool,
 }
 
+/// Under this speed (m/s) a car is standing: it does not take a yellow (`light_call`).
+const STANDING_SPEED: f32 = 0.3;
+
 /// The driver's call at the light: through on green, the dilemma zone on yellow, on red
 /// only with the mark close to the line or too late to stop.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
@@ -249,8 +252,11 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // out ("had the mark" alone let a car two places back in a queue go).
             // One already braking for the light stays on the brake: slowing, it
             // came within "comfortable" of the line again and set off across on red.
+            // (and never from a standstill: at rest nothing is "too late to stop", as on red
+            // below; a car released from a junction hold standing 0.5 m before an amber line
+            // took the mark and crept over on red, viz case07 #18558)
             let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-            let go = !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
+            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
             LightCall { go, mark: go, marked_through: marked && gap < comfortable + 6.0 }
         }
         // (a car standing with its bumper over the line waits like one behind it: at a

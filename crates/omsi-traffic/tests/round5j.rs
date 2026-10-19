@@ -330,3 +330,29 @@ fn j6_a_chain_with_another_entry_keeps_the_hold_at_the_line() {
     assert!(x < 8.0, "rolled up to x = {x:.1} although a side road comes into the chain");
 }
 
+
+// ---- follow-up: a standing car at an amber line stays ----
+
+#[test]
+fn a_car_standing_half_a_metre_before_an_amber_line_does_not_take_it() {
+    // one lit piece after the approach; the light yellow for 6 s, then red; the car stands
+    // with its front 0.5 m before the line (released there from a hold)
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-10.0, 0.0)], 1));
+    let mut lit = piece(&[(-10.0, 0.0), (10.0, 0.0)], 0, 128.0);
+    lit.traffic_light = Some((0, 0));
+    net.lanes.push(lit);
+    net.lanes.push(road(&[(10.0, 0.0), (300.0, 0.0)], 2));
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(9, 6.0), (0, 60.0)]], 66.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 0, 290.0 - 0.5 - 2.0, 0.0)];
+    run(&net, &mut sim, &mut cars, 12.0, |_, _, _| {});
+    let front = front_x(&cars[0]);
+    assert!(front <= -10.0 + 0.3, "took the amber from a standstill: front at x = {front:.1}");
+    // rolling up at 8 m/s with 10 m to go (comfortable stop ~12 m): it takes the yellow
+    let mut sim = Simulation::new(&net, vec![TrafficLightController::new(vec![vec![(9, 6.0), (0, 60.0)]], 66.0)]);
+    let mut cars = vec![car(1, 0, 290.0 - 10.0 - 2.0, 8.0)];
+    run(&net, &mut sim, &mut cars, 6.0, |_, _, _| {});
+    assert!(front_x(&cars[0]) > 10.0, "a rolling car in the dilemma zone stopped: x = {:.1}", front_x(&cars[0]));
+}
