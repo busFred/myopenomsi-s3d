@@ -1521,6 +1521,7 @@ impl Network {
             }
         }
         log::info!("lanes: {} neighbouring lane pairs (lane changes)", neighbours);
+        self.clip_drivable(0);
         let cell = 4.0;
         let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, l) in self.lanes.iter().enumerate() {
@@ -1781,6 +1782,107 @@ impl Network {
     }
 }
 
+/// Lanes of other splines or objects running alongside a lane are within this many degrees
+/// of its heading (either way).
+const ALONGSIDE_DEG: f32 = 35.0;
+
+impl Network {
+    /// [round 5 L1] The drivable extent of every street lane from `from` on is cut at the
+    /// near edge of any other street lane running alongside it, whatever spline or object
+    /// it belongs to (the cross-section knew its own spline's paths alone; BeijingCity lays
+    /// a 10 m "noside" asphalt under a separate carriageway spline): the strip beyond a
+    /// lane's own edge that a squeeze or a shift may use is the drawn road that belongs to
+    /// no lane. The lanes already there are cut by the new ones too.
+    pub fn clip_drivable(&mut self, from: usize) {
+        let n = self.lanes.len();
+        let mut clips: Vec<(usize, f32, f32)> = Vec::new();
+        for i in from..n {
+            let a = &self.lanes[i];
+            if a.kind != LaneKind::Street || a.points.len() < 2 {
+                continue;
+            }
+            let mut cand: Vec<usize> = Vec::new();
+            for c in Self::lane_cells(a) {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if let Some(list) = self.grid.get(&(c.0 + dx, c.1 + dy)) {
+                            for &j in list {
+                                if j != i && !cand.contains(&j) {
+                                    cand.push(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for j in cand {
+                let b = &self.lanes[j];
+                if b.kind != LaneKind::Street || b.points.len() < 2 {
+                    continue;
+                }
+                if let Some((l, r)) = Self::clip_by(a, b) {
+                    clips.push((i, l, r));
+                }
+                if j < from {
+                    if let Some((l, r)) = Self::clip_by(b, a) {
+                        clips.push((j, l, r));
+                    }
+                }
+            }
+        }
+        for (i, l, r) in clips {
+            let cur = self.lanes[i].drivable();
+            self.lanes[i].drivable = (cur.0.min(l), cur.1.min(r));
+        }
+    }
+
+    /// Lane `a`'s drivable extent cut at the near edge of `b` where `b` runs alongside it:
+    /// the new (left, right), if `b` cuts anything.
+    fn clip_by(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
+        let half = a.width * 0.5;
+        let (mut l, mut r) = a.drivable();
+        if l <= half + 0.01 && r <= half + 0.01 {
+            return None;
+        }
+        let reach = (l.max(r) + b.width * 0.5 + 0.5) as f64;
+        let mut changed = false;
+        // (b sampled every 3 m along its segments: a straight lane has points at its ends only)
+        let mut samples: Vec<(DVec3, f32)> = Vec::new();
+        for w in b.points.windows(2) {
+            let seg = w[1] - w[0];
+            let hb = (seg.x.atan2(seg.y).to_degrees()) as f32;
+            let n = (seg.truncate().length() / 3.0).ceil().max(1.0) as usize;
+            for k in 0..=n {
+                samples.push((w[0].lerp(w[1], k as f64 / n as f64), hb));
+            }
+        }
+        for (q, hb) in samples {
+            let Some((s, d)) = a.nearest_point(q) else { continue };
+            // (beside the lane, not beyond its ends: the lane ahead or behind is no edge)
+            if d > reach || s <= 0.5 || s >= a.length() - 0.5 || (q.z - a.at(s).0.z).abs() > 3.0 {
+                continue;
+            }
+            let (p, h) = a.at(s);
+            let dh = wrap_deg(hb - h).abs();
+            if dh > ALONGSIDE_DEG && dh < 180.0 - ALONGSIDE_DEG {
+                continue;
+            }
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            let lat = (q - p).truncate().dot(right) as f32;
+            let edge = (lat.abs() - b.width * 0.5).max(half);
+            if lat > 0.0 && edge < r {
+                r = edge;
+                changed = true;
+            } else if lat < 0.0 && edge < l {
+                l = edge;
+                changed = true;
+            }
+        }
+        changed.then_some((l, r))
+    }
+}
+
 /// Growing the network while the map streams in: the lanes of newly loaded tiles are
 /// appended (existing indices stay valid for the cars and routes that hold them) and linked
 /// to what is there, with the same rules as [`Network::link`].
@@ -1889,6 +1991,7 @@ impl Network {
         // every lane now leads (a dead end may go on into the new tiles)
         self.conflicts_from(first);
         self.update_reach_from(first);
+        self.clip_drivable(first);
         first..end
     }
 

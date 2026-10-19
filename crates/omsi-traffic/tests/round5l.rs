@@ -197,6 +197,53 @@ fn l2_the_driver_side_wheels_go_over_the_line_into_a_free_neighbour_lane_not_a_t
     assert!(r.pass.is_none(), "squeezed 0.7 m over the line: {:?}", r.pass);
 }
 
+#[test]
+fn l2_no_squeeze_into_a_body_standing_on_the_strip_beside_the_obstacle() {
+    // as the first test, but a car stands on the left lane 1.3 m right of its axis - on the
+    // strip the squeeze would use, level with the bus: the corridor is not clear, no squeeze
+    let net = two_lanes((2.0, 1.5), false);
+    let mut beside = broken_down(5, 0, 203.0);
+    beside.state.lateral = 1.3;
+    beside.state.lateral_target = 1.3;
+    beside.state.lateral_ramp = (1.3, 1.3, 0.0, 1.0);
+    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 1.6, 30.0), vec![beside], false);
+    assert!(r.pass.is_none(), "squeezed into a body on the strip: {:?}", r.pass);
+    assert!(r.least > 0.25, "least {:.2}", r.least);
+    assert!(r.x_end < 194.0, "x {:.1}", r.x_end);
+}
+
+#[test]
+fn l1_a_lanes_drivable_extent_is_cut_at_a_lane_of_another_spline_alongside() {
+    // lane 0 (spline 1) eastbound at y = 0 with 5 m of drawn road either side; lane 1
+    // (spline 2) westbound 3.5 m to its left; lane 2 (spline 3) crosses at x = 100
+    let mut net = Network::default();
+    let mut a = road(&[(0.0, 0.0), (300.0, 0.0)], 1);
+    a.drivable = (5.0, 5.0);
+    net.lanes.push(a);
+    let mut b = road(&[(300.0, 3.5), (0.0, 3.5)], 2);
+    b.drivable = (5.0, 5.0);
+    net.lanes.push(b);
+    net.lanes.push(road(&[(100.0, -200.0), (100.0, 200.0)], 3));
+    let net = finish(net);
+    // cut at the other's painted edge: 3.5 - 1.5 = 2.0 m; the crossing lane cuts nothing
+    assert_eq!(net.lanes[0].drivable(), (2.0, 5.0));
+    assert_eq!(net.lanes[1].drivable(), (2.0, 5.0));
+    assert_eq!(net.lanes[2].drivable(), (1.5, 1.5));
+    // a lane added later (a tile streaming in) cuts the lane already there
+    let mut net2 = Network::default();
+    let mut a = road(&[(0.0, 0.0), (300.0, 0.0)], 1);
+    a.drivable = (5.0, 5.0);
+    net2.lanes.push(a);
+    let net2 = finish(net2);
+    assert_eq!(net2.lanes[0].drivable(), (5.0, 5.0));
+    let mut net2 = net2;
+    let mut c = road(&[(0.0, -3.5), (300.0, -3.5)], 4);
+    c.drivable = (5.0, 5.0);
+    net2.extend(vec![c], 1.5);
+    assert_eq!(net2.lanes[0].drivable(), (5.0, 2.0));
+    assert_eq!(net2.lanes[1].drivable(), (2.0, 5.0));
+}
+
 /// One lane each way: 0 eastbound at y = 0 to x = 600, 1 westbound at y = 3; the eastbound
 /// lane's drawn road `right` m to its right (a parking strip, no kerb) and to the oncoming
 /// lane's painted edge on its left; a lit stub at `lit` if given.
