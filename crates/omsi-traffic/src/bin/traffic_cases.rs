@@ -92,6 +92,7 @@ fn main() {
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
+        Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
         }
@@ -5294,6 +5295,45 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 let sep = r.vehicles[a].obb().separation(&r.vehicles[b].obb());
                 println!("t={t:.1}   #{}/#{} boxes {sep:.2} m apart", r.vehicles[a].id, r.vehicles[b].id);
             }
+        }
+    }
+    Ok(())
+}
+
+/// `lights <fixture> [--bus]`: every light of the fixture's programs with the lanes it is bound
+/// to: the phases, whether it is a detector (`perception::detector_light`: one constant green
+/// phase, no stop line), and the lanes' access rules (`--bus`: only lights on lanes closed to
+/// cars or open to buses by `[rule]`, the bus priority lamps).
+fn lights(fixture: &Path, args: &[String]) -> Res<()> {
+    let bus_only = args.iter().any(|a| a == "--bus");
+    let (r, _) = grown(fixture, true)?;
+    let net = &r.net;
+    let mut by_light: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    for (i, l) in net.lanes.iter().enumerate() {
+        if let Some(tl) = l.traffic_light {
+            by_light.entry(tl).or_default().push(i);
+        }
+    }
+    for ((ctl, li), lanes) in &by_light {
+        let bus = lanes.iter().any(|&l| net.lanes[l].rule_bus || net.lanes[l].no_cars);
+        if bus_only && !bus {
+            continue;
+        }
+        let Some(c) = r.sim.lights.get(*ctl) else { continue };
+        let phases: Vec<String> = c.lights.get(*li).map(|p| p.iter().map(|(s, d)| format!("{}:{d:.0}", aspect_name(*s))).collect()).unwrap_or_default();
+        let detector = omsi_traffic::perception::detector_light(&r.sim, *ctl, *li);
+        println!(
+            "light {ctl}.{li} cycle {:.0} approach {:.0} phases [{}]{}{}",
+            c.cycle_len(),
+            c.approach_dist(*li),
+            phases.join(" "),
+            if detector { " DETECTOR" } else { "" },
+            if bus { " BUS-LANE" } else { "" }
+        );
+        for &l in lanes {
+            let ln = &net.lanes[l];
+            let flags = [(ln.rule_bus, "bus"), (ln.no_cars, "no_cars"), (ln.rule_trucks, "trucks"), (ln.no_unsched, "no_unsched")].iter().filter(|f| f.0).map(|f| f.1).collect::<Vec<_>>().join(",");
+            println!("  lane {l} {:?} {:.1} m at ({:.1},{:.1}) object {:?} turn {} [{flags}]", ln.kind, ln.length(), ln.start().x, ln.start().y, ln.key.map(|k| (k.tile, k.id, k.path)), ln.turn);
         }
     }
     Ok(())

@@ -8,7 +8,7 @@ use glam::{DVec2, DVec3};
 use hashbrown::HashMap;
 use omsi_render::{Renderer, Scene};
 use omsi_sim::ai_motion::{AiBody, MotionKind};
-use omsi_sim::traffic::{AiState, Aspect, LaneKind, Network, TrafficLightController};
+use omsi_sim::traffic::{AiState, Aspect, LaneKind, Lead, Network, TrafficLightController};
 use omsi_sim::vehicle::AiFrame;
 use omsi_sim::{VehicleInstance, VehicleType};
 use omsi_traffic::{External, Parked, Person, PlayerView, Seen, Vehicle as AiVehicle, VehicleClass, Why};
@@ -104,6 +104,36 @@ const PRIORITY_WARN_GAP: f32 = 60.0;
 /// A car that gave up and has stood this long (s) held by nothing anybody can see goes even
 /// in view (see `Traffic::populate_seen`).
 const PHANTOM_WAIT: f32 = 90.0;
+
+/// [round5 C4] A lead standing within this (m) makes a car that gave up a queued car, not a
+/// phantom against an invisible wall (x10 case15: the two cars in front of the player went at
+/// 90 s with their leads 2.2 m ahead; a queue gap is 2-7 m, a car held by nothing has no lead).
+const QUEUE_LEAD: f32 = 10.0;
+
+/// [round5 C4] Whether a car follows a vehicle standing now (`standing`: the ids) within
+/// `QUEUE_LEAD`: in a queue, whatever its own hold reads.
+fn in_a_queue(lead_id: Option<u64>, lead: Option<Lead>, standing: &hashbrown::HashSet<u64>) -> bool {
+    lead_id.is_some_and(|id| standing.contains(&id)) && lead.is_some_and(|l| l.gap < QUEUE_LEAD)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::{in_a_queue, QUEUE_LEAD};
+    use omsi_sim::traffic::Lead;
+
+    /// The no-lead car against an invisible wall still goes; one behind a standing vehicle
+    /// within QUEUE_LEAD stays; behind a moving one, or one farther off, it goes.
+    #[test]
+    fn c4_a_car_behind_a_standing_lead_is_queued_not_a_phantom() {
+        let standing: hashbrown::HashSet<u64> = [7u64].into_iter().collect();
+        let lead = |gap: f32| Some(Lead { gap, speed: 0.0, acc: 0.0 });
+        assert!(!in_a_queue(None, None, &standing));
+        assert!(in_a_queue(Some(7), lead(2.2), &standing));
+        assert!(in_a_queue(Some(7), lead(QUEUE_LEAD - 0.5), &standing));
+        assert!(!in_a_queue(Some(7), lead(QUEUE_LEAD + 0.5), &standing));
+        assert!(!in_a_queue(Some(8), lead(2.2), &standing));
+    }
+}
 
 /// What makes a new car a timetable bus (`Traffic::create_car`).
 pub struct BusSetup {
@@ -1753,6 +1783,15 @@ impl Traffic {
         self.advance_dormant();
         // the cars somebody stands behind
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.lead_id).collect();
+        // [round5 C4] the vehicles standing now, the players too: a car that gave up behind
+        // one of them is in a queue, not a phantom
+        let standing: hashbrown::HashSet<u64> = self
+            .cars
+            .iter()
+            .filter(|c| c.ai.state.speed.abs() < 0.3)
+            .map(|c| c.id)
+            .chain(self.sim.players.iter().filter(|p| p.speed.abs() < 0.3).map(|p| omsi_traffic::sim::PLAYER_ID_BASE + p.id as u64))
+            .collect();
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1821,10 +1860,13 @@ impl Traffic {
                 // nobody it gives way to - goes then: whatever held it, it stood against
                 // an invisible wall with the traffic queued up behind it for as long as the
                 // player looked)
+                // [round5 C4] (not one behind a standing vehicle within QUEUE_LEAD: a queue,
+                // whatever its own hold reads - x10 case15: two cars 6 m in front of the
+                // player, why=people behind leads 2.2 m ahead, vanished at 90 s)
                 (dist > VISIBLE_RANGE * 1.3 && from_eye > NEAR_HIDE)
                     || self.hidden(world, p, r)
                     || (c.ai.gone && c.ai.stopped > 240.0 && from_eye > 40.0)
-                    || (c.ai.gone && c.ai.progress.1 > PHANTOM_WAIT && matches!(c.ai.last.why, Why::None | Why::People) && from_eye > 25.0)
+                    || (c.ai.gone && c.ai.progress.1 > PHANTOM_WAIT && matches!(c.ai.last.why, Why::None | Why::People) && from_eye > 25.0 && !in_a_queue(c.ai.lead_id, c.ai.last.lead, &standing))
             } else {
                 false
             };

@@ -380,6 +380,9 @@ pub struct LightCall {
     pub marked_through: bool,
 }
 
+/// Under this speed (m/s) a car is standing: it does not take a yellow (`light_call`).
+const STANDING_SPEED: f32 = 0.3;
+
 /// The driver's call at the light: through on green, the dilemma zone on yellow, on red
 /// only with the mark close to the line or too late to stop.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
@@ -402,8 +405,11 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // out ("had the mark" alone let a car two places back in a queue go).
             // One already braking for the light stays on the brake: slowing, it
             // came within "comfortable" of the line again and set off across on red.
+            // (and never from a standstill: at rest nothing is "too late to stop", as on red
+            // below; a car released from a junction hold standing 0.5 m before an amber line
+            // took the mark and crept over on red, viz case07 #18558)
             let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-            let go = !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
+            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
             LightCall { go, mark: go, marked_through: marked && gap < comfortable + 6.0 }
         }
         // (a car standing with its bumper over the line waits like one behind it: at a
@@ -415,26 +421,40 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     }
 }
 
+/// The zebra band a car keeps its body out of: its front ZEBRA_STOP m before a pedestrian
+/// crossing's cut of its way (the zebra stop, as `perception::zebra_ahead`) to ZEBRA_PAST m
+/// past it (the crossing's width and a step; `hold_point`'s band since round 4).
+const ZEBRA_STOP: f32 = 2.5;
+const ZEBRA_PAST: f32 = 2.0;
+
+/// A lead slower than this (m/s) is a queue I come to rest behind, not one I follow through
+/// (`light_call`'s `queued`: under 1 m/s behind a lead).
+const QUEUE_SPEED: f32 = 1.0;
+/// A lead under this speed (m/s) that is itself held (a lead, a light, a junction) is coming
+/// to rest in a queue too, and so is one braking for a stop of its own at any speed
+/// (`Headway::rest`; x10 case15: the lead rolled at 1.4-3 m/s past the cut to its exit-full
+/// line while I was a car length short of it, and stood the moment I was on the zebra).
+const QUEUE_COMING: f32 = 3.0;
+/// The brake (m/s²) such a lead is taken to come to rest with, for where its rear will stand
+/// (a comfortable brake, `AiState::decel`'s 3 m/s² default is its hardest liking).
+const QUEUE_BRAKE: f32 = 2.0;
+
 /// Where a car refused for a foe stops (rule D): its front a metre before the first stretch
 /// it waits for (`waited`, along the way through), pulled back before any other meeting
 /// place ahead or pedestrian crossing its body would stand in ("keep the junction clear"; a
 /// meeting place it is in already it cannot leave but forward). A distance from the origin.
 fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, waited: f32) -> f32 {
+    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
+    bands.extend(walk_bands(net, sim, j));
+    bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
+    pulled_back(&bands, me, j.entry + waited - 1.0)
+}
+
+/// `stop` (a distance from the origin, the front's) pulled back before every band of
+/// `bands` (from, to) the body would stand in, a band at a time.
+fn pulled_back(bands: &[(f32, f32)], me: &Vehicle, mut stop: f32) -> f32 {
     let front = me.state.front;
     let len = me.length();
-    // the stretches where it may not stand, as (from, to) distances of its front's stop
-    // and of the body: a meeting place a metre before it on, a crossing 2.5 m before it
-    // (the zebra stop) to 2 m past it
-    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
-    let node = &sim.junctions.nodes[j.junction];
-    for &(m, off) in &j.chain {
-        for &(_, sa, _) in net.walks.get(node.movements[m].lane).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let point = j.entry + off + sa;
-            bands.push((point - 2.5, point + 2.0));
-        }
-    }
-    bands.extend(converge_bands(sim, j));
-    let mut stop = j.entry + waited - 1.0;
     for _ in 0..32 {
         let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len).map(|b| b.0).fold(f32::INFINITY, f32::min);
         if !hit.is_finite() {
@@ -445,11 +465,149 @@ fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, w
     stop
 }
 
-/// The stretches of the way through where it converges with a lane of the junction that is no
-/// foe (`Movement::converge`), as (from a metre before, to) distances from the origin.
-fn converge_bands(sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
+/// The pedestrian crossings cutting the way through, as bands the body may not stand in:
+/// 2.5 m before the cut (the zebra stop) to 2 m past it, distances from the origin.
+fn walk_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
     let node = &sim.junctions.nodes[j.junction];
-    j.chain.iter().flat_map(|&(m, off)| node.movements[m].converge.iter().map(move |&(a, b)| (j.entry + off + a - 1.0, j.entry + off + b))).collect()
+    let mut out = Vec::new();
+    for &(m, off) in &j.chain {
+        for &(_, sa, _) in net.walks.get(node.movements[m].lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let point = j.entry + off + sa;
+            out.push((point - ZEBRA_STOP, point + ZEBRA_PAST));
+        }
+    }
+    out
+}
+
+/// The stretches of the way through where it converges with a lane of the junction that is no
+/// foe (`Movement::converge`), as (from a metre before, to, the movement converged with)
+/// distances from the origin.
+fn converge_bands(sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32, usize)> {
+    let node = &sim.junctions.nodes[j.junction];
+    j.chain.iter().flat_map(|&(m, off)| node.movements[m].converge.iter().zip(&node.movements[m].converge_with).map(move |(&(a, b), &with)| (j.entry + off + a - 1.0, j.entry + off + b, with))).collect()
+}
+
+/// The lanes outside junction `j` from which movement `m` is reached: its own entries and
+/// those of the inner pieces leading into it (a way through chains pieces, the later ones
+/// have no entry of their own).
+fn entry_roots(sim: &Simulation, j: usize, m: usize) -> Vec<usize> {
+    let node = &sim.junctions.nodes[j];
+    let mut roots: Vec<usize> = Vec::new();
+    let mut seen = vec![m];
+    let mut frontier = vec![m];
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for &x in &frontier {
+            for &e in &node.movements[x].entries {
+                if !roots.contains(&e) {
+                    roots.push(e);
+                }
+            }
+            for (p, mv) in node.movements.iter().enumerate() {
+                if mv.continues.contains(&x) && !seen.contains(&p) {
+                    seen.push(p);
+                    next.push(p);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    roots.sort_unstable();
+    roots
+}
+
+/// A standing vehicle this far (m) off a piece of my way (its origin to the piece's centre
+/// line) is on a lane running side by side with it, and its rear is projected on my way.
+const BESIDE_MAX: f64 = 4.0;
+
+/// A car refused for a side-merge stretch (`Foe::side`) that a vehicle stands held in rolls up
+/// to it instead of standing at the line, when every band between the line and that stretch
+/// is a side merge or a convergence with a piece of its own fork: a piece entered from the
+/// same lanes as its own way (`entry_roots`), so that nobody who is not already behind it in
+/// its lane can come in beside it there. Its stop: the lesser of a metre before the stretch
+/// and its gap (`min_gap`) behind the rear of every standing vehicle on those pieces,
+/// projected on its way; then pulled back before any crossing. None where the rule does not
+/// apply: the line as before. (viz4 case02: twin 1 m stub chains forking from one lead-in
+/// run side by side 39 m to the two exit lanes; a car waiting for the queue in the other
+/// chain stood at the object's entry, 48 m behind the car it waited for, level with the
+/// player's rear bumper, 57 s; viz3 case03: a stretch shared with turn pockets that have
+/// their own entries keeps the line.)
+fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, waited: f32) -> Option<f32> {
+    let js = &sim.junctions;
+    let node = &js.nodes[j.junction];
+    let foes = js.foes_along_pieces(j.junction, &j.chain);
+    let mine = entry_roots(sim, j.junction, j.movement);
+    if mine.is_empty() {
+        return None;
+    }
+    let own_fork = |m: usize| m != j.movement && !j.chain.iter().any(|&(c, _)| c == m) && entry_roots(sim, j.junction, m) == mine;
+    // the stretch waited for: a side merge with a piece of my own fork, a vehicle standing in it
+    let waited_side = foes.iter().any(|(_, f)| (f.mine.0 - waited).abs() < 0.05 && f.side && own_fork(f.movement));
+    if !waited_side {
+        return None;
+    }
+    let me_k = me_index(vehicles, me);
+    let standing_in = |m: usize, from: f32, to: f32| -> bool {
+        sim.claims.iter().any(|(c, _)| c.vehicle != me_k && c.speed < 0.3 && c.junction == j.junction && c.chain.iter().any(|&(cm, off)| cm == m && c.s - off + c.front >= from && c.s - off - c.rear <= to))
+    };
+    if !foes.iter().any(|(_, f)| (f.mine.0 - waited).abs() < 0.05 && f.side && standing_in(f.movement, f.theirs.0, f.theirs.1)) {
+        return None;
+    }
+    // every band between the line and the stretch: a side merge or a convergence with my own fork
+    let mut partners: Vec<usize> = Vec::new();
+    for (_, f) in &foes {
+        if f.mine.0 < waited - 0.05 && f.mine.1 > 0.0 {
+            if !(f.side && own_fork(f.movement)) {
+                return None;
+            }
+            partners.push(f.movement);
+        } else if (f.mine.0 - waited).abs() < 0.05 {
+            partners.push(f.movement);
+        }
+    }
+    for (a, _, with) in converge_bands(sim, j) {
+        if a < j.entry + waited - 1.0 {
+            if !own_fork(with) {
+                return None;
+            }
+            partners.push(with);
+        }
+    }
+    // the stop: a metre before the stretch, and behind every standing vehicle on the
+    // partner pieces projected on my way (the queue's tail, as a lead would be)
+    let mut stop = j.entry + waited - 1.0;
+    let rear_on_my_way = |pos: glam::DVec3, rear: f32| -> Option<f32> {
+        j.chain.iter().filter_map(|&(m, off)| net.lanes.get(node.movements[m].lane)?.nearest_point(pos).filter(|&(_, d)| d < BESIDE_MAX).map(|(s, _)| j.entry + off + s - rear)).fold(None, |a: Option<f32>, b| Some(a.map_or(b, |a| a.min(b))))
+    };
+    for &m in &partners {
+        let lane = node.movements[m].lane;
+        for occ in sim.occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let o = &vehicles[occ.vehicle];
+            if o.id == me.id || o.state.speed >= 0.3 {
+                continue;
+            }
+            if let Some(r) = rear_on_my_way(o.pos, o.state.rear) {
+                stop = stop.min(r - me.state.min_gap);
+            }
+        }
+        for &(k, _, _) in sim.player_occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let p = &sim.players[k];
+            if p.speed.abs() < 0.3 {
+                if let Some(r) = rear_on_my_way(p.pos, p.half_len) {
+                    stop = stop.min(r - me.state.min_gap);
+                }
+            }
+        }
+    }
+    Some(pulled_back(&walk_bands(net, sim, j), me, stop))
+}
+
+/// The index of `me` among `vehicles` (the claims name vehicles by index).
+fn me_index(vehicles: &[Vehicle], me: &Vehicle) -> usize {
+    vehicles.iter().position(|v| v.id == me.id).unwrap_or(usize::MAX)
 }
 
 /// Decide for vehicle `i`.
@@ -466,6 +624,38 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.lead = Some(l.lead());
         out.lead_seen = Some(l.what);
         out.body_block = p.body_block;
+        // [round5 C3] a queue over a pedestrian crossing: behind a lead standing past a cut of
+        // my way, where closing up to it would put my body in the zebra band, I stop at the
+        // zebra stop instead, as `hold_point` keeps a refused car off it (x10 case15 #35611
+        // followed its lead onto the crossing and stood there, the stream through the 2.2 m
+        // gap in front of it)
+        let coming = l.rest.is_some() || l.speed < QUEUE_SPEED || (l.held && l.speed < QUEUE_COMING);
+        if coming && !matches!(l.what, Seen::Parked) {
+            // (its rear where it comes to rest: at the stop of its own it brakes for, else
+            // where a comfortable brake puts it)
+            let lead_rear = l.rest.unwrap_or(st.front + l.gap + l.speed.max(0.0).powi(2) / (2.0 * QUEUE_BRAKE));
+            let my_front = lead_rear - st.min_gap;
+            for &(wl, d0) in &p.way {
+                if d0 > lead_rear {
+                    break;
+                }
+                for &(_, sa, _) in net.walks.get(wl).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    let cut = d0 + sa;
+                    if !(cut < lead_rear && my_front > cut - ZEBRA_STOP && my_front - me.length() < cut + ZEBRA_PAST) {
+                        continue;
+                    }
+                    // (past the zebra stop already: where it can stop gently, while that is
+                    // still short of the cut - as `hold_point` does for a refused car)
+                    let mut at = cut - ZEBRA_STOP;
+                    if at <= st.front - 0.3 {
+                        at = st.front + v * v / (2.0 * dp.comfort_brake) + 0.3;
+                    }
+                    if at > st.front - 0.3 && at <= cut - 0.3 {
+                        min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
+                    }
+                }
+            }
+        }
     }
 
     // 2. lights (not the one whose line it passed while it clears the box: in it when that
@@ -500,19 +690,24 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // junction knows no foe on: there it stops at the line, or short of the first
             // meeting place, as before; review9: refused cars stood beside, and rolled into, the
             // very car they waited for, on 5229/5231, 1430/1179, 10814/10625)
+            // (a side-merge stretch of my own fork that a vehicle stands in: up to it, behind
+            // that vehicle, `roll_up_point`)
             let at = match (g.hold, g.at) {
-                (Some(Hold::Foe), Some(waited)) => {
-                    let at = hold_point(net, sim, me, j, waited);
-                    let converges = converge_bands(sim, j).iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear);
-                    if (at < first || converges) && first > st.front - 0.3 {
-                        first
-                    } else if converges {
-                        // (past the line already: as soon as it can stop gently)
-                        at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
-                    } else {
-                        at
+                (Some(Hold::Foe), Some(waited)) => match roll_up_point(net, sim, vehicles, me, j, waited) {
+                    Some(at) => at,
+                    None => {
+                        let at = hold_point(net, sim, me, j, waited);
+                        let converges = converge_bands(sim, j).iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear);
+                        if (at < first || converges) && first > st.front - 0.3 {
+                            first
+                        } else if converges {
+                            // (past the line already: as soon as it can stop gently)
+                            at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
+                        } else {
+                            at
+                        }
                     }
-                }
+                },
                 _ => first,
             };
             if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {

@@ -1,0 +1,33 @@
+[package]
+name = "omsi-roadmask3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone debug tool: a recorded traffic window replayed inside the real 3D scene with a segmentation-mask overlay (lanes, vehicles, people) and a free camera"
+
+[[bin]]
+name = "omsi-roadmask3d"
+path = "src/main.rs"
+
+[dependencies]
+# the game as a library: the map's scene, the renderer's sky and lighting, the settings
+openomsi_game = { package = "omsi-app", path = "../omsi-app" }
+omsi-render = { path = "../omsi-render" }
+omsi-geometry = { path = "../omsi-geometry" }
+omsi-texture = { path = "../omsi-texture" }
+omsi-content = { path = "../omsi-content" }
+omsi-cfg = { path = "../omsi-cfg" }
+omsi-sim = { path = "../omsi-sim" }
+omsi-map = { path = "../omsi-map" }
+omsi-traffic = { path = "../omsi-traffic" }
+omsi-ui = { path = "../omsi-ui" }
+# the recording's reader and cut, the OMSI root, the map's spline profiles
+omsi-roadmask = { path = "../omsi-roadmask" }
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+image.workspace = true
