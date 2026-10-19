@@ -449,6 +449,16 @@ fn runs(program: &str, args: &[&str]) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn render_video(s: &mut Session, out: &Path, cam_text: &str, from: f64, to: f64, fps: f64, w: u32, h: u32) -> Result<()> {
     let n = ((to - from) * fps).floor() as usize + 1;
+    // (the frames of a render that was killed: their process is gone; /proc tells on Linux)
+    for e in std::fs::read_dir(out_dir()).into_iter().flatten().flatten().filter(|_| cfg!(target_os = "linux")) {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(pid) = name.strip_prefix("tmp-").and_then(|p| p.parse::<u32>().ok()) {
+            if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() && e.path().is_dir() {
+                println!("removing the frames of an unfinished video: {}", e.path().display());
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
     let dir = FrameDir { path: out_dir().join(format!("tmp-{}", std::process::id())), keep: false };
     std::fs::create_dir_all(&dir.path)?;
     if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
