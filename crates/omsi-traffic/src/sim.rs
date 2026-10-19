@@ -926,10 +926,11 @@ impl Simulation {
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
-            // (not a stretch it runs side by side with another lane before its light, `Foe::side`)
+            // (not a stretch it runs side by side with another lane before its light, `Foe::side`;
+            // nor a detector, `perception::detector_light`)
             let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
-            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| net.lanes[l].traffic_light.map(|lt| (lt, d)));
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);

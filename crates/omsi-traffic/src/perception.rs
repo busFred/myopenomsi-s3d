@@ -137,7 +137,7 @@ impl JunctionView {
 /// lane leading into it, at most eight pieces or 80 m. (controller, light, distance from the
 /// origin to the lit lane's start; `back` is the distance to `lane`'s start, <= 0.) None when
 /// none is found or two different lights are (the way it came is not known).
-fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
+fn light_behind(net: &Network, sim: &Simulation, js: &Junctions, j: usize, lane: usize, back: f32, prev_lane: Option<usize>) -> Option<(usize, usize, f32)> {
     let mut found: Option<(usize, usize, f32)> = None;
     let mut ambiguous = false;
     // (lane, distance from the origin to its start, steps)
@@ -155,7 +155,7 @@ fn light_behind(net: &Network, js: &Junctions, j: usize, lane: usize, back: f32,
             }
             let Some(pl) = net.lanes.get(p) else { continue };
             let dp = d - pl.length();
-            if let Some((ctl, li)) = pl.traffic_light {
+            if let Some((ctl, li)) = stop_light(net, sim, p) {
                 match found {
                     Some((c, i, _)) if (c, i) != (ctl, li) => ambiguous = true,
                     Some(_) => {}
@@ -1036,6 +1036,21 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     best
 }
 
+/// Light `li` of controller `ctl` is a detector, not a stop line: its program is one constant
+/// green phase (X10's "Loop", "HVZ" and "Nacht" lights on 1 m paths before the real line, that
+/// the program's `[traffic_light_jump]` points test through the lane's `[approachdist]` request).
+/// Nobody stops at it and it hides no later line (x10 case04: 14 of the 16 red crossings of
+/// 54 min had one 1 m before the real line, which came into view only over the bumper). The
+/// lane's request is raised as for any lit lane (`Simulation::update_lights`).
+pub fn detector_light(sim: &Simulation, ctl: usize, li: usize) -> bool {
+    sim.lights.get(ctl).and_then(|c| c.lights.get(li)).is_some_and(|phases| phases.len() == 1 && matches!(TrafficLightController::aspect(phases[0].0), Aspect::Green))
+}
+
+/// The light on lane `l`, unless it is a detector (`detector_light`).
+pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, usize)> {
+    net.lanes.get(l)?.traffic_light.filter(|&(ctl, li)| !detector_light(sim, ctl, li))
+}
+
 /// The next light on the way within 150 m. A second light of the same junction object on a
 /// straight run holds nobody: the car has passed its line.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
@@ -1045,7 +1060,7 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
             break;
         }
         let lane = &net.lanes[l];
-        let Some((ctl, li)) = lane.traffic_light else { continue };
+        let Some((ctl, li)) = stop_light(net, sim, l) else { continue };
         let key = lane.key.map(|k| (k.tile, k.id));
         if let (Some(k), Some((sk, sh))) = (key, seen_object) {
             if k == sk && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
@@ -1140,13 +1155,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             if wd > light_line + 1.0 {
                 break;
             }
-            if let Some((ctl, li)) = net.lanes[wl].traffic_light {
+            if let Some((ctl, li)) = stop_light(net, sim, wl) {
                 light = Some((ctl, li, wd));
                 break;
             }
         }
         if light.is_none() && inside && k == 0 {
-            light = light_behind(net, js, j, l, d0, me.state.prev_lane);
+            light = light_behind(net, sim, js, j, l, d0, me.state.prev_lane);
         }
         let past_line = light.is_some_and(|(_, _, d)| d + 0.5 < me.state.front);
         let turned = light.is_some_and(|(ctl, li, _)| sim.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), Aspect::Green | Aspect::GreenYellow | Aspect::Dark)));
