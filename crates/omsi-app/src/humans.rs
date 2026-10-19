@@ -1772,6 +1772,16 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
             if group.map(|h| h != g).unwrap_or(false) {
                 break;
             }
+            // a lit stub at a kerb after unlit crossing pieces (a corner piece, a slip lane
+            // before the island) begins its own crossing, decided at the stub (Taijichang's
+            // 18.2 stub after four unlit pieces, case09); a lit stub at the far kerb, onto
+            // the pavement, ends the crossing it is on
+            if group.is_none() && last_core.is_some() && net.lanes[leg.lane].traffic_light.is_some() {
+                let next = net.lanes[leg.lane].next.clone();
+                if next.into_iter().any(|n| core_piece(ped, net, lights, n)) {
+                    break;
+                }
+            }
             group = Some(g);
         }
         if core_piece(ped, net, lights, leg.lane) {
@@ -1804,6 +1814,14 @@ fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>
         key: pieces.iter().map(|l| l.lane).min().unwrap_or(0),
     })
 }
+
+/// Path ends closer than this (m) are one node of the walking network (the grid of
+/// `PedNet::cells` is 1.5 m, so a search of the 3x3 cells around finds them all).
+const PED_NODE_MERGE: f64 = 1.2;
+/// The far end of a short lit piece joins only a node this close (m): a 1.005 m stub keeps
+/// its two ends apart (the review of case09; the stock maps' stubs meet the next piece
+/// end to start, within centimetres).
+const LIT_FAR_MERGE: f64 = 0.3;
 
 /// The pavement paths as a walking network: path ends closer than a metre are one
 /// junction, whatever their heading (the road network joins lane ends only when they
@@ -1849,21 +1867,38 @@ impl PedNet {
     }
 
     /// Take in the lanes the network gained since the last call (tiles streamed in).
+    ///
+    /// The lit pieces go first, each short one with a node of its own at its far end, so
+    /// that a 1 m lit stub is walked and its light is met (dropped as a piece with both
+    /// ends in one node, BeijingCity's crossings were walked from the kerb straight onto
+    /// the piece beyond the stub: 44 of its 84 lit foot pieces are under 1.2 m, case09).
     fn extend(&mut self, net: &Network) -> usize {
         let from = self.built.min(net.lanes.len());
         let before = self.ends.len();
+        let walkable = |l: &omsi_sim::traffic::Lane| l.kind == LaneKind::Sidewalk && l.points.len() >= 2 && l.length() >= 0.3;
+        let lit: Vec<usize> = (from..net.lanes.len()).filter(|&i| walkable(&net.lanes[i]) && net.lanes[i].traffic_light.is_some()).collect();
+        let mut nodes: HashMap<usize, (usize, usize)> = HashMap::new();
+        for &i in &lit {
+            let l = &net.lanes[i];
+            let a = self.node_of(l.start(), PED_NODE_MERGE, None);
+            let far = if (l.length() as f64) < 2.0 * PED_NODE_MERGE { LIT_FAR_MERGE } else { PED_NODE_MERGE };
+            let b = self.node_of(l.end(), far, Some(a));
+            nodes.insert(i, (a, b));
+        }
         for i in from..net.lanes.len() {
             let l = &net.lanes[i];
             if l.kind == LaneKind::Street && from > 0 {
                 // a new carriageway may cross pavement paths that are in already
                 self.crossings.clear();
             }
-            if l.kind != LaneKind::Sidewalk || l.points.len() < 2 || l.length() < 0.3 {
+            if !walkable(l) {
                 continue;
             }
-            let a = self.node_of(l.start());
-            let b = self.node_of(l.end());
-            if a == b && l.length() < 3.0 {
+            let (a, b) = match nodes.get(&i) {
+                Some(&ab) => ab,
+                None => (self.node_of(l.start(), PED_NODE_MERGE, None), self.node_of(l.end(), PED_NODE_MERGE, None)),
+            };
+            if a == b && l.length() < 3.0 && l.traffic_light.is_none() {
                 continue;
             }
             self.ends.insert(i, (a, b));
@@ -1890,21 +1925,26 @@ impl PedNet {
         self.ends.len() - before
     }
 
-    /// The junction at `p`, a new one when there is none within a metre.
-    fn node_of(&mut self, p: DVec3) -> usize {
+    /// The junction at `p`: the nearest within `radius` (but `not`), a new one when there
+    /// is none. (The first found within reach, not the nearest, joined the piece beyond a
+    /// 1 m lit stub to the stub's kerb end.)
+    fn node_of(&mut self, p: DVec3, radius: f64, not: Option<usize>) -> usize {
         let (cx, cy) = ((p.x / 1.5).floor() as i64, (p.y / 1.5).floor() as i64);
+        let mut best: Option<(f64, usize)> = None;
         for dx in -1..=1 {
             for dy in -1..=1 {
                 if let Some(list) = self.cells.get(&(cx + dx, cy + dy)) {
                     for &n in list {
-                        if (self.nodes[n] - p).truncate().length() < 1.2
-                            && (self.nodes[n].z - p.z).abs() < 2.5
-                        {
-                            return n;
+                        let d = (self.nodes[n] - p).truncate().length();
+                        if d < radius && (self.nodes[n].z - p.z).abs() < 2.5 && Some(n) != not && best.is_none_or(|(bd, _)| d < bd) {
+                            best = Some((d, n));
                         }
                     }
                 }
             }
+        }
+        if let Some((_, n)) = best {
+            return n;
         }
         self.nodes.push(p);
         self.out.push(Vec::new());
@@ -9169,6 +9209,111 @@ mod ped_tests {
             frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
         }
         assert!(m.pos.y > 17.5, "across on its green: {:?}", m.pos);
+    }
+
+    /// The lights as the traffic has them: the crossing pieces' lights from the compiled
+    /// junctions (`Junctions::crossing_light`), each light's state set by the test.
+    struct JunctionLights<'a> {
+        net: &'a Network,
+        junctions: omsi_traffic::Junctions,
+        states: Vec<Cell<i32>>,
+    }
+
+    impl PedLights for JunctionLights<'_> {
+        fn light_state(&self, _c: usize, li: usize) -> Option<(i32, f32)> {
+            Some((self.states[li].get(), 60.0))
+        }
+        fn light_until_go(&self, _c: usize, _li: usize) -> Option<f32> {
+            Some(20.0)
+        }
+        fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
+            self.junctions.crossing_light(self.net, lane)
+        }
+        fn crossing_piece(&self, lane: usize) -> bool {
+            self.junctions.crossing_of(lane).is_some()
+        }
+    }
+
+    #[test]
+    fn r6l1_a_metre_lit_stub_is_walked_and_its_light_holds_them_at_its_kerb() {
+        // Taijichang j28 (case09): a kerb corner piece, a 1.005 m stub lit 18.2, the pieces
+        // over the road; the chain's other side is lit 18.1 (here: a second street beyond an
+        // island, its stub lit (0, 1)). The stub's two ends lay within the 1.2 m of one node,
+        // so it was dropped, and the stream walked from the corner piece onto the road on
+        // the other side's light.
+        let mut net = Network::default();
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        let object = |mut l: omsi_sim::traffic::Lane, path: u16| {
+            l.source = 2;
+            l.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 9, path });
+            l
+        };
+        net.lanes.push(object(lane(street(-1.75, -15.0, 15.0), LaneKind::Street, 3.5), 0)); // 0
+        net.lanes.push(object(lane(street(1.75, 15.0, -15.0), LaneKind::Street, 3.5), 1)); // 1
+        net.lanes.push(lane(vec![p(-20.0, -7.005), p(0.0, -7.005)], LaneKind::Sidewalk, 2.5)); // 2 pavement
+        let piece = |a: (f64, f64), b: (f64, f64), path: u16| object(lane(vec![p(a.0, a.1), p(b.0, b.1)], LaneKind::Sidewalk, 2.0), path);
+        net.lanes.push(piece((0.0, -7.005), (0.0, -5.005), 2)); // 3 corner piece, unlit
+        net.lanes.push(piece((0.0, -5.005), (0.0, -4.0), 3)); // 4 the 1.005 m stub, lit (0, 2)
+        net.lanes.push(piece((0.0, -4.0), (0.0, 4.0), 4)); // 5 across the street
+        net.lanes.push(piece((0.0, 4.0), (0.0, 7.0), 5)); // 6 island
+        net.lanes.push(piece((0.0, 7.0), (0.0, 8.0), 6)); // 7 stub lit (0, 1)
+        net.lanes.push(piece((0.0, 8.0), (0.0, 16.0), 7)); // 8 across the second street
+        net.lanes.push(object(lane(street(10.25, -15.0, 15.0), LaneKind::Street, 3.5), 8)); // 9
+        net.lanes.push(object(lane(street(13.75, 15.0, -15.0), LaneKind::Street, 3.5), 9)); // 10
+        net.lanes.push(lane(vec![p(0.0, 16.0), p(20.0, 16.0)], LaneKind::Sidewalk, 2.5)); // 11 far pavement
+        for l in [3, 4, 5, 6, 7, 8] {
+            net.lanes[l].one_way = true;
+        }
+        net.lanes[4].traffic_light = Some((0, 2));
+        net.lanes[7].traffic_light = Some((0, 1));
+        net.link(1.5);
+        net.compute_conflicts();
+        let junctions = omsi_traffic::Junctions::compile(&net);
+        assert_eq!(junctions.nodes.len(), 1);
+        assert_eq!(junctions.crossing_light(&net, 5), Some((0, 2)), "the piece after the stub has the stub's light");
+        assert_eq!(junctions.crossing_light(&net, 8), Some((0, 1)));
+        let mut ped = PedNet::build(&net);
+        let (a, b) = ped.ends[&4];
+        assert_ne!(a, b, "the 1.005 m lit stub keeps its two ends");
+        assert_eq!(ped.ends[&3].1, a, "the corner piece ends where the stub starts");
+        assert_eq!(ped.ends[&5].0, b, "the piece across starts where the stub ends");
+        assert!(ped.out[a].iter().any(|&(l, fwd)| l == 4 && fwd));
+        assert!(!ped.out[a].iter().any(|&(l, _)| l == 5), "no way past the stub onto the road");
+        let lights = JunctionLights { net: &net, junctions, states: (0..3).map(|_| Cell::new(GREEN)).collect() };
+        lights.states[2].set(RED);
+        let legs = vec![
+            Leg { lane: 2, a: 10.0, b: 20.0 },
+            Leg { lane: 3, a: 0.0, b: 2.0 },
+            Leg { lane: 4, a: 0.0, b: 1.005 },
+            Leg { lane: 5, a: 0.0, b: 8.0 },
+            Leg { lane: 6, a: 0.0, b: 3.0 },
+            Leg { lane: 7, a: 0.0, b: 1.0 },
+            Leg { lane: 8, a: 0.0, b: 8.0 },
+            Leg { lane: 11, a: 0.0, b: 20.0 },
+        ];
+        // the corner piece is a crossing of its own (unlit, it cuts nothing); the stub begins
+        // the crossing of the first street under its light
+        let mut walk = PedWalk::new(legs.clone(), false, 0.0);
+        let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 1).unwrap();
+        assert_eq!((c.from, c.to, c.light), (1, 1, None));
+        let c = crossing_span(&mut ped, &net, Some(&lights), &mut walk, 2).unwrap();
+        assert_eq!((c.from, c.to, c.light), (2, 4, Some((0, 2))), "to the island");
+        // walked: they wait at the stub's kerb on (0, 2)'s red with (0, 1) green
+        let mut walk = PedWalk::new(legs, false, 0.0);
+        let mut m = me(5, DVec2::new(-10.0, -7.005), 1.2);
+        let mut on_road = false;
+        for k in 0..800 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            on_road |= m.pos.y > -3.5;
+        }
+        assert!(!on_road, "walked onto the street on its red: {:?}", m.pos);
+        assert!(m.pos.y > -7.5 && m.pos.y < -3.5, "waits at the kerb: {:?} ({:?})", m.pos, m.decision);
+        assert_eq!(m.decision, Some("red light"));
+        lights.states[2].set(GREEN);
+        for k in 800..1600 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert!(m.pos.y > 15.5, "across on the greens: {:?}", m.pos);
     }
 
     #[test]

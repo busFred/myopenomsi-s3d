@@ -92,14 +92,20 @@ pub struct Cut {
 
 /// A pedestrian crossing of the junction: the footpath pieces across the carriageway
 /// (the lit stub at the kerb, the pieces over each lane, a median) and where they cut the
-/// ways through. The light is the one any of its pieces carries; the pieces without one
-/// are governed by it too (BeijingCity lights a 1 m stub at the kerb and nothing else).
+/// ways through. The light is the first any of its pieces carries; each piece without one
+/// is governed by the lit stub before it (BeijingCity lights a 1 m stub at the kerb and
+/// nothing else, and joins the four sides of a junction into one chain: Taijichang j28's
+/// 56 pieces carry lights 18.0 to 18.3).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PedCrossing {
     pub foot_lanes: Vec<usize>,
     pub cuts: Vec<Cut>,
     /// (controller, light index), None for a zebra or an unlit crossing.
     pub light: Option<(usize, usize)>,
+    /// Per piece of `foot_lanes`: the light governing it (`piece_lights`). (Empty in a
+    /// recording from before them: then `light` governs every piece.)
+    #[serde(default)]
+    pub lights: Vec<Option<(usize, usize)>>,
 }
 
 /// A crossing object as a node of the traffic network.
@@ -219,7 +225,15 @@ impl Junctions {
     /// The light that governs footpath lane `lane`: its own, else that of the crossing it
     /// is a piece of (the unlit pieces over the lanes beyond the lit stub at the kerb).
     pub fn crossing_light(&self, net: &Network, lane: usize) -> Option<(usize, usize)> {
-        net.lanes.get(lane)?.traffic_light.or_else(|| self.crossing_of(lane)?.light)
+        if let Some(own) = net.lanes.get(lane)?.traffic_light {
+            return Some(own);
+        }
+        let &(j, c) = self.of_foot_lane.get(&lane)?;
+        let c = self.nodes.get(j)?.crossings.get(c)?;
+        match c.foot_lanes.iter().position(|&f| f == lane).and_then(|k| c.lights.get(k)) {
+            Some(&l) => l,
+            None => c.light,
+        }
     }
 
     fn build(net: &Network, key: ((i32, i32), i64), lanes: &[usize]) -> Junction {
@@ -457,10 +471,55 @@ impl Junctions {
                 k += 1;
             }
             let light = chain.iter().find_map(|&l| net.lanes[l].traffic_light);
+            let lights = Self::piece_lights(net, &chain);
             let mine: Vec<Cut> = cuts.iter().copied().filter(|x| chain.contains(&x.foot_lane)).collect();
-            out.push(PedCrossing { foot_lanes: chain, cuts: mine, light });
+            out.push(PedCrossing { foot_lanes: chain, cuts: mine, light, lights });
         }
         out
+    }
+
+    /// The light governing each piece of a crossing chain: its own, else that of the
+    /// nearest lit piece before it along the chain (walking back towards the kerb its walk
+    /// starts at). A piece with no lit piece before it has the chain's light when the
+    /// chain has one light group, and none when it has several: it lies before the stubs
+    /// (a corner piece at the kerb), whose own lights govern what follows them. (The
+    /// chain's first light for every piece put 18.1 on Taijichang's 18.2 side, case09;
+    /// 7 of BeijingCity's 59 lit crossings carry several groups.)
+    fn piece_lights(net: &Network, chain: &[usize]) -> Vec<Option<(usize, usize)>> {
+        let mut groups: Vec<(usize, usize)> = chain.iter().filter_map(|&l| net.lanes[l].traffic_light).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let single = (groups.len() == 1).then(|| groups[0]);
+        chain
+            .iter()
+            .map(|&l| {
+                if let Some(own) = net.lanes[l].traffic_light {
+                    return Some(own);
+                }
+                // (shortest walk back over the chain's own pieces, metres)
+                let mut best: Option<(f32, (usize, usize))> = None;
+                let mut frontier: Vec<(usize, f32)> = vec![(l, 0.0)];
+                let mut reached: Vec<(usize, f32)> = vec![(l, 0.0)];
+                while let Some((at, d)) = frontier.pop() {
+                    for &p in net.prev.get(at).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let dp = d + net.lanes[p].length();
+                        if !chain.contains(&p) || reached.iter().any(|&(r, rd)| r == p && rd <= dp) {
+                            continue;
+                        }
+                        reached.push((p, dp));
+                        match net.lanes[p].traffic_light {
+                            Some(g) => {
+                                if best.is_none_or(|(bd, _)| dp < bd) {
+                                    best = Some((dp, g));
+                                }
+                            }
+                            None => frontier.push((p, dp)),
+                        }
+                    }
+                }
+                best.map(|b| b.1).or(single)
+            })
+            .collect()
     }
 
     /// The junction and movement that lane `lane` is part of.

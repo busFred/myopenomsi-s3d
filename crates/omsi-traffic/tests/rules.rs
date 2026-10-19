@@ -450,6 +450,120 @@ fn an_unlit_crossing_piece_is_governed_by_the_lit_stub_at_the_kerb() {
     assert_eq!(sim.crossing_light(&net, 0), None, "the street piece is no crossing's");
 }
 
+/// A crossing chain over two streets of one object (along x at y 0 and y 9): an unlit
+/// 2 m piece at the kerb, a 1.005 m stub lit `a`, the piece over the first street, a 2 m
+/// piece on the island, a 1 m stub lit `b`, the piece over the second street.
+/// Lanes: 0, 1 the streets; 2 the kerb piece; 3 stub a; 4 across; 5 island; 6 stub b; 7 across.
+fn two_stub_chain(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> (Network, Simulation) {
+    let mut net = Network::default();
+    net.lanes.push(bent_piece(&[(-15.0, 0.0), (15.0, 0.0)], 0));
+    net.lanes.push(bent_piece(&[(15.0, 9.0), (-15.0, 9.0)], 1));
+    let walk = |pts: &[(f64, f64)], path: u16, light: Option<(usize, usize)>| {
+        let mut l = bent_piece(pts, path);
+        l.kind = LaneKind::Sidewalk;
+        l.traffic_light = light;
+        l
+    };
+    net.lanes.push(walk(&[(0.0, -6.005), (0.0, -4.005)], 2, None));
+    net.lanes.push(walk(&[(0.0, -4.005), (0.0, -3.0)], 3, a));
+    net.lanes.push(walk(&[(0.0, -3.0), (0.0, 3.0)], 4, None));
+    net.lanes.push(walk(&[(0.0, 3.0), (0.0, 5.0)], 5, None));
+    net.lanes.push(walk(&[(0.0, 5.0), (0.0, 6.0)], 6, b));
+    net.lanes.push(walk(&[(0.0, 6.0), (0.0, 12.0)], 7, None));
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(0, 10.0)], vec![(0, 10.0)], vec![(0, 10.0)]], 10.0);
+    let sim = Simulation::new(&net, vec![ctl]);
+    (net, sim)
+}
+
+#[test]
+fn each_crossing_piece_takes_the_light_of_the_lit_stub_before_it() {
+    // Taijichang j28 (case09): one chain of 56 pieces under lights 18.0..18.3, and every
+    // unlit piece got the first, 18.1
+    let (net, sim) = two_stub_chain(Some((0, 1)), Some((0, 2)));
+    assert_eq!(sim.junctions.nodes.len(), 1);
+    let xs = &sim.junctions.nodes[0].crossings;
+    assert_eq!(xs.len(), 1, "one chain: {xs:?}");
+    assert_eq!(xs[0].foot_lanes.len(), 6);
+    let light = |l: usize| sim.crossing_light(&net, l);
+    assert_eq!(light(3), Some((0, 1)));
+    assert_eq!(light(4), Some((0, 1)), "the piece after stub a");
+    assert_eq!(light(5), Some((0, 1)), "the island piece after it");
+    assert_eq!(light(6), Some((0, 2)));
+    assert_eq!(light(7), Some((0, 2)), "the piece after stub b, not a's");
+    assert_eq!(light(2), None, "before every stub in a chain of two groups");
+    // one group: every piece has it, the kerb piece too (as before)
+    let (net, sim) = two_stub_chain(Some((0, 1)), Some((0, 1)));
+    for l in 2..8 {
+        assert_eq!(sim.crossing_light(&net, l), Some((0, 1)), "piece {l}");
+    }
+    // a zebra: no light anywhere
+    let (net, sim) = two_stub_chain(None, None);
+    assert_eq!(sim.junctions.nodes[0].crossings.len(), 1);
+    for l in 2..8 {
+        assert_eq!(sim.crossing_light(&net, l), None, "piece {l}");
+    }
+    // only the second stub lit: what lies before it has its light (one group)
+    let (net, sim) = two_stub_chain(None, Some((0, 2)));
+    assert_eq!(sim.crossing_light(&net, 4), Some((0, 2)));
+    assert_eq!(sim.crossing_light(&net, 7), Some((0, 2)));
+}
+
+#[test]
+fn a_long_crossing_of_two_metre_pieces_between_lit_stubs_stays_one_chain() {
+    // X10 j530: 1.35 m stubs lit at both kerbs and a 33 m crossing of 2 m pieces over four
+    // lanes
+    let mut net = Network::default();
+    for (k, y) in [-12.0, -4.0, 4.0, 12.0].into_iter().enumerate() {
+        net.lanes.push(bent_piece(&[(-20.0, y), (20.0, y)], k as u16));
+    }
+    let walk = |a: f64, b: f64, path: u16| {
+        let mut l = bent_piece(&[(0.0, a), (0.0, b)], path);
+        l.kind = LaneKind::Sidewalk;
+        l
+    };
+    let first = net.lanes.len();
+    let mut stub = walk(-17.85, -16.5, 10);
+    stub.traffic_light = Some((0, 0));
+    net.lanes.push(stub);
+    for k in 0..16 {
+        net.lanes.push(walk(-16.5 + 2.0 * k as f64, -14.5 + 2.0 * k as f64, 11 + k as u16));
+    }
+    let mut far = walk(15.5, 16.85, 30);
+    far.traffic_light = Some((0, 0));
+    net.lanes.push(far);
+    let last = net.lanes.len() - 1;
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(0, 10.0)]], 10.0);
+    let sim = Simulation::new(&net, vec![ctl]);
+    let xs = &sim.junctions.nodes[0].crossings;
+    assert_eq!(xs.len(), 1, "one chain");
+    assert_eq!(xs[0].foot_lanes.len(), 18);
+    for l in first..=last {
+        assert_eq!(sim.crossing_light(&net, l), Some((0, 0)), "piece {l}");
+    }
+}
+
+#[test]
+fn a_long_lit_piece_governs_itself_and_the_piece_after_it() {
+    // Grundorf: an 11.6 m lit crossing, then a short unlit piece onto the kerb
+    let mut net = Network::default();
+    net.lanes.push(bent_piece(&[(-15.0, 0.0), (15.0, 0.0)], 0));
+    let mut lit = bent_piece(&[(0.0, -5.8), (0.0, 5.8)], 1);
+    lit.kind = LaneKind::Sidewalk;
+    lit.traffic_light = Some((0, 0));
+    net.lanes.push(lit);
+    let mut kerb = bent_piece(&[(0.0, 5.8), (0.0, 7.0)], 2);
+    kerb.kind = LaneKind::Sidewalk;
+    net.lanes.push(kerb);
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(0, 10.0)]], 10.0);
+    let sim = Simulation::new(&net, vec![ctl]);
+    assert_eq!(sim.junctions.nodes[0].crossings.len(), 1);
+    assert_eq!(sim.crossing_light(&net, 1), Some((0, 0)));
+    assert_eq!(sim.crossing_light(&net, 2), Some((0, 0)));
+}
+
 // 9 -----------------------------------------------------------------------------------
 
 /// Two lanes of a road running to x = `end`, where each leads into a junction piece
