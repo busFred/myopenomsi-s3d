@@ -2352,6 +2352,29 @@ const PED_YIELD_MAX: f32 = 6.0;
 /// [ROLLBACK r4c-L4] All the yields to one standing vehicle lie within this many seconds of the
 /// first (3 x PED_YIELD_MAX).
 const PED_YIELD_CAP: f32 = 3.0 * PED_YIELD_MAX;
+/// [ROLLBACK r5-P5] A stream of this many people per metre of the crossing is dense: the
+/// arrivals let the standing vehicle go for twice PED_YIELD_MAX (six seconds could not empty
+/// a 10 m piece with 26-37 people on it: X10 case01, the player's bus 20 s).
+const PED_DENSE_STREAM: f32 = 1.0;
+/// [ROLLBACK r5-P5] A vehicle's stood clock survives a creep: it resets only once the vehicle
+/// has moved this far (m) from where it last stood, or ...
+const PED_CREEP_DIST: f64 = 2.0;
+/// ... exceeds this speed (m/s). A car rolling through a zebra at 1-1.5 m/s covers the 2 m
+/// in under two seconds and earns no yield (PED_YIELD_AFTER is 8 s); a driver inching
+/// forward five times in 20 s (X10 case01: the yield came at 17 s instead of 8) keeps it.
+const PED_CREEP_SPEED: f64 = 1.5;
+
+/// [ROLLBACK r5-P5] The stood clock of a vehicle at `pos` moving at `speed` after `dt` s, from
+/// its previous reading and the place it last stood: (seconds stood, that place). Under 0.5
+/// m/s it stands; a creep from there keeps the clock running until PED_CREEP_DIST or
+/// PED_CREEP_SPEED, which reset it.
+fn stood_clock(prev: Option<(f32, DVec2)>, pos: DVec2, speed: f64, dt: f32) -> (f32, DVec2) {
+    let standing = speed < 0.5;
+    match prev {
+        Some((s, anchor)) if s > 0.0 && speed <= PED_CREEP_SPEED && (pos - anchor).length() <= PED_CREEP_DIST => (s + dt, if standing { pos } else { anchor }),
+        _ => (if standing { dt } else { 0.0 }, pos),
+    }
+}
 /// The people on the carriageway of each crossing (by its key): id, position, velocity.
 type Streams = HashMap<usize, Vec<(u32, DVec2, DVec2)>>;
 /// The vehicles yielded to: the start of the current window and of the first.
@@ -2642,6 +2665,10 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // arriving let it pass, for a few seconds; those on the carriageway go on across
     let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
     let stream = at.streams.get(&c.key).map(|v| v.iter().any(|(id, q, _)| *id != me.id && (*q - me.pos).length() < PED_STREAM_GAP)).unwrap_or(false);
+    // [ROLLBACK r5-P5] a dense stream yields for longer: until the vehicle is through the
+    // cut (it is no longer `stands_at` then), 2 x PED_YIELD_MAX at most, under PED_YIELD_CAP
+    let dense = at.streams.get(&c.key).map(|v| v.len() as f32 >= PED_DENSE_STREAM * c.total.max(1.0)).unwrap_or(false);
+    let window = if dense { 2.0 * PED_YIELD_MAX } else { PED_YIELD_MAX };
     for car in at.cars {
         if car.vel.length() >= 0.5 || car.stood <= PED_YIELD_AFTER || !stands_at(car, &cuts) {
             continue;
@@ -2660,7 +2687,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             // (all the yields to one vehicle, resets and renewals too, within PED_YIELD_CAP of
             // the first)
             Some((_, first)) if at.time - first >= PED_YIELD_CAP as f64 => {}
-            Some((since, first)) if at.time - since < PED_YIELD_MAX as f64 => {
+            Some((since, first)) if at.time - since < window as f64 => {
                 if in_front {
                     yields.insert(car.id, (at.time, first));
                 }
@@ -3078,7 +3105,8 @@ pub struct Humans {
     started: bool,
     ped: Option<PedNet>,
     /// [ROLLBACK r4c-P4] Seconds each vehicle near has stood, by id.
-    car_stood: HashMap<u64, f32>,
+    /// [ROLLBACK r5-P5] Per vehicle: its stood clock and where it last stood (`stood_clock`).
+    car_stood: HashMap<u64, (f32, DVec2)>,
     /// [ROLLBACK r4c-P4] The vehicles people at an unlit crossing yield to, and since when.
     yields: Yields,
     /// [ROLLBACK r4c-P4] The people on the carriageway of each crossing (by its key) this frame.
@@ -6219,16 +6247,19 @@ impl Humans {
             blocks.extend(bodies);
         }
         // [ROLLBACK r4c-P4] how long each vehicle has stood; the yields to those that move again end
+        // ([ROLLBACK r5-P5] a creep does not count as moving again: `stood_clock`)
         {
-            let mut stood: HashMap<u64, f32> = HashMap::new();
+            let mut stood: HashMap<u64, (f32, DVec2)> = HashMap::new();
             for c in cars.iter_mut() {
-                let s = if c.vel.length() < 0.5 { self.car_stood.get(&c.id).copied().unwrap_or(0.0) + dt } else { 0.0 };
+                let (s, anchor) = stood_clock(self.car_stood.get(&c.id).copied(), c.pos, c.vel.length(), dt);
                 c.stood = s;
-                stood.insert(c.id, s);
+                if s > 0.0 {
+                    stood.insert(c.id, (s, anchor));
+                }
             }
             self.car_stood = stood;
             let car_stood = &self.car_stood;
-            self.yields.retain(|id, _| car_stood.get(id).map(|s| *s > 0.0).unwrap_or(false));
+            self.yields.retain(|id, _| car_stood.contains_key(id));
             // and who is on the carriageway of which crossing
             let mut streams: Streams = HashMap::new();
             for p in &self.people {
@@ -9530,14 +9561,24 @@ mod ped_tests {
     /// (`stream`) and the car of `car_before` standing there `stood` s: their decisions over
     /// `secs` (time, decision), where they end up and the yields.
     fn arrive_at(lit: bool, stood: f32, stream: bool, secs: f32) -> (Vec<(f32, Option<&'static str>)>, Me, Yields) {
+        arrive_with(lit, stood, if stream { 1 } else { 0 }, secs)
+    }
+
+    /// `arrive_at` with `stream_n` people on the crossing: one just ahead at the kerb, the
+    /// rest spread over the far lane's piece (not in front of the car).
+    fn arrive_with(lit: bool, stood: f32, stream_n: usize, secs: f32) -> (Vec<(f32, Option<&'static str>)>, Me, Yields) {
         let (net, mut ped) = crossing(lit);
         let lights = FakeLights::new(GREEN, 60.0);
         let mut walk = across();
         walk.legs[0] = Leg { lane: 2, a: 19.5, b: 20.0 };
         let mut m = me(1, DVec2::new(-0.5, -5.5), 1.2);
         let mut streams: Streams = HashMap::new();
-        if stream {
-            streams.insert(3, vec![(50, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
+        if stream_n > 0 {
+            let mut v = vec![(50, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))];
+            for k in 1..stream_n {
+                v.push((50 + k as u32, DVec2::new(0.0, 0.2 + 3.6 * k as f64 / stream_n as f64), DVec2::new(0.0, 1.2)));
+            }
+            streams.insert(3, v);
         }
         let mut yields = HashMap::new();
         let mut car = car_before(stood);
@@ -9568,6 +9609,68 @@ mod ped_tests {
         assert_eq!(seen.last().unwrap().1, Some(YIELDS));
         assert!(!m.on_crossing);
         assert!((m.pos.y + 1.75).abs() > 0.9 + 0.3, "{:?}", m.pos);
+    }
+
+    #[test]
+    fn r5p5_the_stood_clock_survives_a_creep_but_not_a_roll_through() {
+        let o = DVec2::ZERO;
+        // standing 8 s, then a creep of 0.7 m/s for a second (0.7 m), standing again: the
+        // clock runs on
+        let mut c = (0.0f32, o);
+        for _ in 0..160 {
+            c = stood_clock(Some(c), o, 0.0, 0.05);
+        }
+        assert!((c.0 - 8.0).abs() < 1e-3);
+        let mut pos = o;
+        for _ in 0..20 {
+            pos += DVec2::new(0.7 * 0.05, 0.0);
+            c = stood_clock(Some(c), pos, 0.7, 0.05);
+        }
+        assert!(c.0 > 8.9, "the creep reset it: {}", c.0);
+        c = stood_clock(Some(c), pos, 0.0, 0.05);
+        assert!(c.0 > 8.9 && (c.1 - pos).length() < 1e-9, "stands at the new place: {c:?}");
+        // then 1.2 m/s for 2.5 s (3 m): reset
+        for _ in 0..50 {
+            pos += DVec2::new(1.2 * 0.05, 0.0);
+            c = stood_clock(Some(c), pos, 1.2, 0.05);
+        }
+        assert_eq!(c.0, 0.0);
+        // a car rolling through at 1.0-1.5 m/s never earns PED_YIELD_AFTER
+        for speed in [1.0f64, 1.2, 1.5] {
+            let mut c = (0.0f32, o);
+            let mut pos = o;
+            let mut most = 0.0f32;
+            for _ in 0..400 {
+                pos += DVec2::new(speed * 0.05, 0.0);
+                c = stood_clock(Some(c), pos, speed, 0.05);
+                most = most.max(c.0);
+            }
+            assert!(most < 2.5, "{speed} m/s: {most} s");
+        }
+        // a speed over PED_CREEP_SPEED resets at once
+        let c = stood_clock(Some((8.0, o)), o, 1.6, 0.05);
+        assert_eq!(c.0, 0.0);
+        // from nothing: standing starts the clock, moving does not
+        assert!(stood_clock(None, o, 0.1, 0.05).0 > 0.0);
+        assert_eq!(stood_clock(None, o, 0.7, 0.05).0, 0.0);
+    }
+
+    #[test]
+    fn r5p5_a_dense_stream_yields_until_the_cap() {
+        // twelve on the 11 m crossing: the arrivals let the car go for 2 x 6 s, renewed under
+        // the 18 s cap, then across; one person ahead (the thin stream): 6 s as before
+        let (seen, m, _) = arrive_with(false, 10.0, 12, 25.0);
+        let at = |t: f32| seen.iter().find(|(s, _)| *s >= t).unwrap().1;
+        assert_eq!(at(1.0), Some(YIELDS));
+        assert_eq!(at(8.0), Some(YIELDS));
+        assert_eq!(at(11.5), Some(YIELDS));
+        assert_eq!(at(14.0), Some(YIELDS));
+        assert_eq!(at(18.5), Some("go"));
+        assert!(m.pos.y > 2.0, "{:?}", m.pos);
+        let (seen, ..) = arrive_with(false, 10.0, 1, 10.0);
+        let at = |t: f32| seen.iter().find(|(s, _)| *s >= t).unwrap().1;
+        assert_eq!(at(5.0), Some(YIELDS));
+        assert_eq!(at(6.5), Some("go"));
     }
 
     #[test]
