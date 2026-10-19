@@ -602,6 +602,11 @@ pub(super) struct PaxStop {
     /// stop name and the termini of the buses that go there.
     pub dests: Vec<(String, f32)>,
     pub lines: Vec<(String, HashSet<String>)>,
+    /// [round 6 B3] Its waiting places have been moved clear of the street lanes
+    /// (`humans::clear_of_lanes`; a stop set up before the network was there is cleared
+    /// once it is), and how far its point moved for those who wait at it with no place.
+    pub cleared: bool,
+    pub kerb_shift: DVec3,
 }
 
 impl PaxStop {
@@ -2387,7 +2392,8 @@ impl Humans {
                 let sp = stop
                     .zip(spot)
                     .and_then(|(s, k)| self.stops.get(&s).and_then(|s| s.spots.get(k)).cloned());
-                let stop_pos = stop.and_then(|s| self.stops.get(&s)).map(|s| s.pos);
+                // ([round 6 B3] the stop's point as cleared of the street lanes)
+                let stop_pos = stop.and_then(|s| self.stops.get(&s)).map(|s| s.pos + s.kerb_shift);
                 // (no place free: at the stop's point - spread along the kerb by who they
                 // are, or everybody without a place stood in one another there)
                 let along = ((self.people[i].id % 7) as f64 - 3.0) * 0.7;
@@ -3669,6 +3675,8 @@ mod tests {
             buses: Vec::new(),
             dests: Vec::new(),
             lines: Vec::new(),
+            cleared: false,
+            kerb_shift: DVec3::ZERO,
         }
     }
 
@@ -3991,6 +3999,8 @@ mod tests {
             buses: Vec::new(),
             dests: Vec::new(),
             lines: Vec::new(),
+            cleared: false,
+            kerb_shift: DVec3::ZERO,
         }
     }
 

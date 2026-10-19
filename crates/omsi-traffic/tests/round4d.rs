@@ -191,3 +191,35 @@ fn a_bus_pulls_up_to_its_pole_beside_the_people_and_only_one_in_its_way_holds_it
     assert!((b.state.s + b.state.front - 150.0).abs() < 0.6, "crept up to its pole: front at {}", b.state.s + b.state.front);
     assert!(!reset_by_creep);
 }
+
+/// [round 6 B3] Why bus waiters' places keep `max(w, 2.6)/2 + 0.58` m off a lane's axis
+/// (humans.rs `clear_of_lanes`): an 11.6 m coach of the random traffic (car class, 1.26 m
+/// half width: BeijingCity's Daba HHF.ovh) in the middle of a 1 m bus lane is held by one
+/// standing 1.46-1.55 m off its way (case02's waiters, 148 s), as by any car - their body
+/// within 0.3 m of its flank - and passes one standing where the places are moved to, 1.88 m.
+#[test]
+fn b3_a_coach_passes_bus_waiters_standing_clear_of_the_lane() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
+    let pass = |off: f64| {
+        let mut st = AiState::new(0, 40.0, 1);
+        st.speed = 8.0;
+        st.front = 5.8;
+        st.rear = 5.8;
+        st.length = 11.6;
+        st.max_speed_kmh = 50.0;
+        let mut v = Vehicle::new(1, VehicleClass::Car, st, 1.26, 7919);
+        v.fresh = 0.0;
+        let mut sim = Simulation::new(&net, vec![]);
+        sim.people = (0..9).map(|k| person(80.0 + k as f64 * 0.8, -off, true)).collect();
+        let mut vs = vec![v];
+        let mut held = false;
+        run(&net, &mut sim, &mut vs, 12.0, |_, _, vs| held |= vs[0].last.why == Why::People);
+        (held, vs[0].state.s)
+    };
+    for off in [1.0, 1.46, 1.55] {
+        let (held, s) = pass(off);
+        assert!(held && s + 5.8 < 80.0, "held by them {off} m off: s {s}");
+    }
+    let (held, s) = pass(1.3 + 0.28 + 0.3);
+    assert!(!held && s > 90.0, "past them at 1.88 m: s {s}");
+}
