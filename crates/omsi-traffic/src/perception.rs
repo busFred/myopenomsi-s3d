@@ -1162,15 +1162,29 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
     None
 }
 
-/// A pedestrian at a crossing of the junction ahead.
-fn zebra_ahead(net: &Network, sim: &Simulation, st: &AiState, way: &[(usize, f32)]) -> Option<f32> {
+/// How far beside my lane's footprint (m) a walker on a crossing still holds me at the zebra:
+/// half a metre, their body and a step; one farther off - a lane width away, on the far
+/// half of the crossing - does not, and a right turn goes (review-r5x merged list 4: within 3 m
+/// along the walk lane either side, a kerb waiter 1.9 m from the axis held a car 56 s).
+const ZEBRA_BESIDE: f32 = 0.5;
+
+/// A pedestrian at a crossing of the junction ahead: on the crossing within my lane's
+/// footprint (my own width where the lane is narrower) and `ZEBRA_BESIDE` either side of it.
+fn zebra_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> Option<f32> {
+    let st = &me.state;
     let mut best: Option<f32> = None;
     for &(l, d0) in way {
         if d0 > 40.0 {
             break;
         }
-        for &(w, sa, sw) in net.walks.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let near = sim.walkers.iter().any(|&(wl, ws)| wl == w && (ws - sw).abs() < 3.0);
+        let Some(lane) = net.lanes.get(l) else { continue };
+        let half = (lane.width * 0.5).max(me.half_width) + ZEBRA_BESIDE;
+        for &(w, sa, _) in net.walks.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let Some(walk) = net.lanes.get(w) else { continue };
+            let (q, h) = lane.at(sa);
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            let near = sim.walkers.iter().any(|&(wl, ws)| wl == w && ((walk.at(ws).0 - q).truncate().dot(right).abs() as f32) < half);
             if !near {
                 continue;
             }
@@ -1400,7 +1414,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.people_stop = people_ahead(sim, me, &way);
         p.signal = signal_ahead(net, sim, &p.way, st.rear);
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
-        p.zebra_stop = zebra_ahead(net, sim, st, &p.way);
+        p.zebra_stop = zebra_ahead(net, sim, me, &p.way);
         p.letting_out = letting_out(sim, me);
         if lane.kind == LaneKind::Street && !me.is_rail() {
             if let Some(l) = lane.left {

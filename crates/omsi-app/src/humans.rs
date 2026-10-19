@@ -3612,9 +3612,15 @@ impl Humans {
             .collect()
     }
 
+    /// Who walks the footpaths, for the cars' zebra check (`perception::zebra_ahead`): the
+    /// lane and distance along it of each stroller's leg. Not somebody standing at a kerb on
+    /// a red light: off the carriageway, they hold nobody (one at a 3 m kerb stub held the
+    /// exit of a green junction 56 s, viz4 case01 #138; x10 case14 #35715 its whole green);
+    /// one standing inside a lane's footprint the cars' people check still catches.
     pub fn strollers(&self) -> Vec<(usize, f32)> {
         self.people
             .iter()
+            .filter(|p| !(p.at_kerb() && p.last_decision == Some("red light")))
             .filter_map(|p| match &p.state {
                 State::Strolling(walk) => walk
                     .legs
