@@ -302,3 +302,56 @@ fn c2_a_stepper_beside_the_bumper_inside_my_footprint_is_braked_for() {
     assert!(o.people_s < 0.5 && o.min_gap > 0.0, "held {:.1} s, gap {:.2}", o.people_s, o.min_gap);
 }
 
+/// [review-r5c-safety C2 sweep] A stander on the zebra's leg 2.35 m off my axis (0.3 m behind
+/// the kerb spot, a walker, not yet on the crossing) who steps on at 1.4 m/s when the car
+/// (10 m/s from x = -70) is 1.5-2.5 s out: the car stops for them, nobody is touched.
+#[test]
+fn c1_a_stander_behind_the_kerb_spot_stepping_on_late_is_stopped_for() {
+    for &t0 in &[5.5f32, 6.0, 6.25, 6.5, 6.75, 7.0, 7.25] {
+        let net = road_with_a_zebra(true);
+        let y0 = 2.35f64;
+        let o = scene(&net, vec![person(23.0, -y0)], vec![(3, 8.0 - y0 as f32)], vec![car(1, 0, 230.0, 10.0)], 16.0, |t, sim| {
+            let p = &mut sim.people[0];
+            if t >= t0 {
+                p.vel = glam::DVec2::new(0.0, 1.4);
+            }
+            p.pos += (p.vel * DT as f64).extend(0.0);
+            // (the game sets the flag 0.3 m onto the lane)
+            p.on_crossing = p.pos.y.abs() < 1.75 + 0.3;
+            if p.pos.y > 8.0 {
+                p.pos.y = 8.0;
+                p.vel = glam::DVec2::ZERO;
+            }
+            let y = p.pos.y as f32;
+            sim.walkers = vec![(3, 8.0 + y)];
+        });
+        assert!(o.min_gap > 0.5, "steps on at t0 {t0}: body gap {:.2} m (front at {:.1})", o.min_gap, o.front_at_min);
+    }
+}
+
+/// [review-r5c-safety D] A red-light kerb waiter (`at_kerb`, standing for good) on the cut
+/// INSIDE my footprint, 0.5-1.1 m off my axis, whom the zebra check lists no more: the car
+/// stops short of them and never crawls through (the standing-car exemption is for someone
+/// outside my footprint).
+#[test]
+fn c1_a_red_light_waiter_inside_my_footprint_is_never_crawled_through() {
+    for &y in &[0.0f64, 0.5, 0.9, 1.1] {
+        let net = road_with_a_zebra(true);
+        let p = Person { at_kerb: true, still: 10.0, ..person(23.0, y) };
+        let o = scene(&net, vec![p], vec![], vec![car(1, 0, 230.0, 10.0)], 30.0, |_, sim| {
+            for p in sim.people.iter_mut() {
+                p.still += DT;
+            }
+        });
+        assert!(o.min_gap > 0.5 && o.front_at_min < 22.5, "waiter at y {y}: body gap {:.2} m, my front got to x = {:.1}", o.min_gap, o.front_at_min);
+    }
+    // one 1.4 m off the axis, outside the footprint: passed
+    let net = road_with_a_zebra(true);
+    let p = Person { at_kerb: true, still: 10.0, ..person(23.0, 1.4) };
+    let o = scene(&net, vec![p], vec![], vec![car(1, 0, 230.0, 10.0)], 30.0, |_, sim| {
+        for p in sim.people.iter_mut() {
+            p.still += DT;
+        }
+    });
+    assert!(o.min_gap > 0.0 && o.front_at_min > 23.0, "waiter at y 1.4: gap {:.2}, front {:.1}", o.min_gap, o.front_at_min);
+}
