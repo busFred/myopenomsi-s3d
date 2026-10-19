@@ -286,6 +286,25 @@ fn j5_a_car_standing_in_the_exit_counts_by_the_gap_to_its_tail_unless_a_queue_fo
     assert!(held, "the car entered the box with 4 m of room past the conflict");
 }
 
+#[test]
+fn j5_the_players_bus_beside_the_exit_lane_does_not_close_the_box_in_it_does() {
+    // the player's bus standing with its tail 4 m past the conflict, 3.5 m left of the exit
+    // lane's axis (a queue in the lane beside, snapped to this one): room; in the lane: none
+    for (lateral, expect_held) in [(3.5f64, false), (0.0, true)] {
+        let net = cross_with_exit();
+        let mut sim = Simulation::new(&net, vec![]);
+        let player = PlayerView { id: 7, pos: DVec3::new(6.6 + 6.0, lateral, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 10.0, blinker: 0, signalling: 0.0, priority: false };
+        sim.players = vec![player];
+        let mut cars = vec![car(1, 0, 285.0 - 40.0 - 2.0, 10.0)];
+        let mut held_exit = false;
+        run(&net, &mut sim, &mut cars, 12.0, |_, sim, cars| {
+            held_exit |= cars[0].state.speed < 0.3 && cars[0].last.why == Why::ExitFull;
+            sim.players = vec![player];
+        });
+        assert_eq!(held_exit, expect_held, "player {lateral} m beside the exit lane: held for the exit {held_exit}");
+    }
+}
+
 // ---- J6: the side-merge hold rolls up behind the queue in the twin chain ----
 
 /// viz4 case02's object: the lead-in piece (1) forks into two chains running side by side to
