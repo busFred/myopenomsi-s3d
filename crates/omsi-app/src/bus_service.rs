@@ -129,6 +129,10 @@ pub struct BusService {
     pull: f32,
     pull_to: Option<f32>,
     pulled_here: bool,
+    /// [round 6 B2] Its trip ended at the end of its route with no stop there (a track that
+    /// ends on a lane with a way on): it drives on until the timetable hands it the tour's
+    /// next trip or lets it go, rather than standing at the lane's end.
+    track_end: bool,
 }
 
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
@@ -734,6 +738,7 @@ impl BusService {
             pull: 0.0,
             pull_to: None,
             pulled_here: false,
+            track_end: false,
         }
     }
 
@@ -756,6 +761,27 @@ impl BusService {
         self.phase == Phase::TripDone
     }
 
+    /// [round 6 B2] Its trip is over at the end of its track, and it drives on off the end
+    /// of its route (the planner does not hold it there: `External::trip_over`).
+    pub fn drives_off(&self) -> bool {
+        self.phase == Phase::TripDone && self.track_end
+    }
+
+    /// [round 6 B2] Driving with no stop left, it has reached the last lane of its route,
+    /// a street lane with a way on, and the route is complete (not `route_open`) and its own
+    /// (not round the block or to a place with room).
+    fn track_ends(&self, st: &AiState, net: &Network) -> bool {
+        self.phase == Phase::Running
+            && self.stops.is_empty()
+            && !self.route_open
+            && self.away.is_none()
+            && self.pending.is_none()
+            && !st.route.is_empty()
+            && st.route_index + 1 >= st.route.len()
+            && st.route.last() == Some(&st.lane)
+            && net.lanes.get(st.lane).is_some_and(|l| l.kind == LaneKind::Street && !l.next.is_empty())
+    }
+
     /// [ROLLBACK aiparked-73] Standing out a long layover with the engine off: it starts again
     /// `PARKED_START` before the doors open for the departure.
     pub fn parked(&self, day_time: f64) -> bool {
@@ -763,7 +789,7 @@ impl BusService {
         // the line waits for its next trip with the engine off, as one placed there does
         // (it stood with the engine running until the next trip was handed to it)
         if self.phase == Phase::TripDone {
-            return self.phase_t > TRIP_DONE_PARK;
+            return !self.track_end && self.phase_t > TRIP_DONE_PARK;
         }
         matches!(self.phase, Phase::Waiting | Phase::Boarding) && self.long_wait && self.leave_at - day_time > PARKED_START
     }
@@ -782,6 +808,7 @@ impl BusService {
             Phase::Boarding => self.boarding.max(0.0) + 2.0 + wait,
             Phase::Waiting => wait + 2.0,
             Phase::Closing => 1.0,
+            Phase::TripDone if self.track_end => 0.0,
             Phase::TripDone => 600.0,
         }
     }
@@ -817,6 +844,7 @@ impl BusService {
         self.pace = 1.0;
         self.pace_target = None;
         self.left_early = false;
+        self.track_end = false;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -1125,6 +1153,8 @@ impl BusService {
         self.phase_t += ctx.dt;
         let here = Some(st.front);
         match self.phase {
+            // [round 6 B2] (at the end of its track it drives on: no stop)
+            Phase::TripDone if self.track_end => None,
             Phase::TripDone => here,
             Phase::Waiting => {
                 self.wait(ctx);
@@ -1184,6 +1214,18 @@ impl BusService {
             let Some(stop) = self.stops.front().copied() else {
                 if !ctx.passing {
                     st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
+                }
+                // [round 6 B2] the end of its track with no stop left: its trip is over here
+                // (the timetable hands it the tour's next trip where it is, or lets it go),
+                // as at its last stop - not on at a tile edge (`route_open`: it waits for the
+                // tiles), nor round the block, nor at a dead end (the road ends: it drives
+                // off it and its trip comes back past it, r4d-B1)
+                if self.track_ends(st, ctx.net) {
+                    self.track_end = true;
+                    self.set_phase(Phase::TripDone);
+                    st.signal = 0;
+                    st.signal_time = 0.0;
+                    log::info!("t={:.1}: timetable bus {} at the end of its track on lane {} with no stop left: its trip is over", ctx.day_time, ctx.id, st.lane);
                 }
                 return None;
             };
@@ -2323,5 +2365,87 @@ mod tests {
         // a fan queue without a fan, or the own lane's queue with only the fan covered: no
         assert!(!layover_asked_to_go(false, 0.0, 0, &[], 30.0, 5));
         assert!(!layover_asked_to_go(false, 30.0, 5, &[3], 0.0, 0));
+    }
+
+    /// [round 6 B2] Lane 0 north 200 m into lane 1 (100 m) and on into lane 3, and lane 2 that
+    /// runs into nothing.
+    fn track() -> Network {
+        use omsi_sim::traffic::LaneBuilder;
+        let p = |x: f64, y: f64| glam::DVec3::new(x, y, 0.0);
+        let mut net = Network {
+            lanes: vec![
+                LaneBuilder::polyline(vec![p(0.0, 0.0), p(0.0, 200.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(0.0, 200.0), p(0.0, 300.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(50.0, 0.0), p(50.0, 200.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(0.0, 300.0), p(0.0, 400.0)], LaneKind::Street, 3.5),
+            ],
+            ..Default::default()
+        };
+        net.link(1.5);
+        net
+    }
+
+    fn bus_on(route: Vec<usize>, s: f32) -> AiState {
+        let mut st = AiState::new(route[0], s, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.speed = 8.0;
+        st.max_speed_kmh = 50.0;
+        st.route = route;
+        st.plan_next(&track());
+        st
+    }
+
+    #[test]
+    fn b2_a_bus_at_the_end_of_its_track_with_no_stop_left_has_done_its_trip_and_drives_on() {
+        let net = track();
+        assert_eq!((net.lanes[0].next.as_slice(), net.lanes[1].next.as_slice()), (&[1][..], &[3][..]));
+        let mut v = test_vehicle();
+        // T11's case: no stop left, the route complete, the last lane goes on
+        let mut s = BusService::new(Vec::new());
+        let mut st = bus_on(vec![0, 1], 150.0);
+        let t = drive(&mut s, &mut st, &mut v, &net, 100.0, 60.0, |_, s, _| s.trip_done());
+        assert!(s.trip_done() && s.drives_off(), "trip over on its last lane: {:?} lane {}", s.phase, st.lane);
+        assert_eq!(st.lane, 1);
+        assert!(st.speed > 5.0, "no stop on the way: {}", st.speed);
+        // it drives on (no stop asked for), engine running, nobody waits for it to go
+        let way = omsi_traffic::perception::way_lanes(&net, &st, 200.0);
+        let mut ctx = ctx_on(&net, &way, t + 30.0, 0.0);
+        ctx.dt = 30.0;
+        assert_eq!(s.step(&mut st, &mut v, &ctx), None);
+        assert!(!s.parked(t + 30.0) && s.standing_for(t + 30.0) == 0.0);
+        // the tour's next trip handed over: an ordinary trip again
+        s.restart(vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 400.0, id: 9, side: 0.0 }], true);
+        assert!(!s.trip_done() && !s.drives_off());
+
+        // counter-case: at the edge of the loaded map (`route_open`) it waits for the tiles
+        let mut s = BusService::new(Vec::new());
+        s.route_open = true;
+        let mut st = bus_on(vec![0, 1], 150.0);
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 15.0, |_, _, st| st.lane == 1 && st.s > 30.0);
+        assert_eq!((st.lane, s.phase), (1, Phase::Running));
+
+        // counter-case: a dead end (lane 2 runs into nothing) - it drives off it, its trip
+        // comes back past it (r4d-B1): not over
+        let mut s = BusService::new(Vec::new());
+        let mut st = bus_on(vec![2], 100.0);
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 10.0, |_, _, st| st.s > 160.0);
+        assert_eq!(s.phase, Phase::Running);
+    }
+
+    #[test]
+    fn b2_a_terminus_stop_on_the_last_lane_is_served_before_the_trip_is_over() {
+        let net = track();
+        let mut v = test_vehicle();
+        let mut s = BusService::new(vec![Stop { ri: 1, s: 50.0, bay: 0.0, depart: 130.0, id: 9, side: 0.0 }]);
+        let mut st = bus_on(vec![0, 1], 150.0);
+        let mut served = false;
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 120.0, |_, s, _| {
+            served |= s.at_stop();
+            s.trip_done()
+        });
+        assert!(served, "it stopped at its terminus first");
+        assert!(s.trip_done() && !s.drives_off(), "then its trip is over there, standing (as before round 6)");
+        assert!(st.lane == 1 && (st.s - 50.0).abs() < 2.5 && st.speed < 0.3, "at its stop: s {} speed {}", st.s, st.speed);
     }
 }

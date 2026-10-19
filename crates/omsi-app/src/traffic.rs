@@ -3457,6 +3457,8 @@ impl Traffic {
                     None => {}
                 }
                 ext.stop_at = service.step(&mut car.ai.state, &mut car.vehicle, &ctx);
+                // [round 6 B2] its trip over at the end of its track: on off the route's end
+                ext.trip_over = service.drives_off();
                 if std::mem::take(&mut service.rerouted) {
                     // (the route it drives now, for the recording)
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);

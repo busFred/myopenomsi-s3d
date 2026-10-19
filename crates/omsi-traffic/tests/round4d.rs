@@ -88,6 +88,40 @@ fn a_timetable_bus_drives_off_a_dead_end_and_stops_at_a_route_end_that_goes_on()
     assert!((vs[0].state.s + vs[0].state.front - 150.0).abs() < 1.0, "at its stop: s {}", vs[0].state.s);
 }
 
+/// [round 6 B2] A timetable bus whose trip is over at the end of its track
+/// (`External::trip_over`: no stop left, the route complete) is not held at the end of its
+/// route where the road goes on (case08: T11's bus stood 11.7 min at Why::End on lane
+/// 10871, next [10468]): it drives on as off a dead end; without the flag (a route still
+/// open at a tile edge, a stop pending) it stops there as before.
+#[test]
+fn b2_a_bus_whose_trip_is_over_at_its_track_end_is_not_held_there() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (200.0, 0.0)]), lane(&[(200.0, 0.0), (300.0, 0.0)])]);
+    assert_eq!(net.lanes[0].next, vec![1]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 10.0)];
+    let mut whys = Vec::new();
+    let gone = run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| {
+        for v in vs.iter_mut() {
+            v.external.trip_over = true;
+        }
+        whys.extend(vs.iter().map(|v| v.last.why));
+    });
+    assert!(!whys.contains(&Why::End), "never held at the end");
+    assert_eq!(gone.len(), 1, "off the end of its route");
+    assert!(gone[0].2 > 6.0, "at its speed: {:?}", gone[0]);
+    // (the flag is the planner's only exemption: a stop of the service still holds it)
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 10.0)];
+    let gone = run(&net, &mut sim, &mut vs, 60.0, |_, _, vs| {
+        if let Some(v) = vs.first_mut() {
+            v.external.trip_over = true;
+            v.external.stop_at = Some(150.0 - v.state.s);
+        }
+    });
+    assert!(gone.is_empty());
+    assert!((vs[0].state.s + vs[0].state.front - 150.0).abs() < 1.0, "at its stop: s {}", vs[0].state.s);
+}
+
 /// A bus on lane 0 (east along y = 0) coming up to its stop: its front comes to rest at
 /// x = 150, in the bay 1.23 m right of the lane (as the service asks).
 fn to_the_stop(v: &mut Vehicle) {

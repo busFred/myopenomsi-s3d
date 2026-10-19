@@ -1007,10 +1007,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //     drive` finds no way on), as a plain car at a dead end; the timetable puts it back
     //     where its track goes on. Held 0.5 m before the end, two buses on the Anwai bridge
     //     (BeijingCity) stood for up to half an hour with fifty cars behind them.
+    //     [round 6 B2] Nor where its trip is over at the end of its track on a lane with a way
+    //     on (`External::trip_over`): T11's bus stood 11.7 min at Why::End on lane 10871 with
+    //     its next trip never handed over (review-r6-cases case08).
     if !st.route.is_empty() && st.route_index + 1 >= st.route.len() && st.planned_next.is_none() {
         let end = lane.length() - st.s - 0.5;
         let dead_end = lane.next.is_empty() && lane.kind == omsi_sim::traffic::LaneKind::Street;
-        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus && !dead_end {
+        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
             min_stop(&mut out.stop, &mut out.why, Some(end.max(0.0)), Why::End);
         }
     }
