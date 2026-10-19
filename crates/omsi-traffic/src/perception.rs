@@ -1083,6 +1083,16 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
     None
 }
 
+/// A vehicle slower than this (m/s) past the junction's conflicts is standing there as far
+/// as the room on the exit goes (a car moving off is past 2 m/s within a second; a crawl is
+/// not moving off). Was 1.5: x10 case06, a third left-turner entered behind one crawling at
+/// 0.5-2 m/s, stopped with its tail across the through lane and held it 11 s.
+const EXIT_SLOW: f32 = 2.0;
+/// The exit's first metres past the conflicts: a vehicle crawling there, or rolling up to a
+/// standing lead there, is a queue forming, and the box is not entered behind it (x10 case06;
+/// the figure `heads` reports the exit's state over).
+const EXIT_NEAR: f32 = 15.0;
+
 /// The next junction on the way (or the one the car is in), with the room past its
 /// conflicts measured along the car's own way: a vehicle standing inside the piece past the
 /// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
@@ -1115,14 +1125,21 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
                 let o = &vehicles[occ.vehicle];
                 let tail = wd + occ.s - o.state.rear;
-                if o.state.speed < 1.5 && tail > clear_from - 0.5 {
+                if o.state.speed < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
+                }
+                // a queue forming in the exit's first metres: one crawling there, or rolling up
+                // to a standing lead, leaves no room behind it whatever the gap to its tail
+                // now (not a bus serving its stop there: it leaves on its own schedule)
+                let queueing = o.state.speed < EXIT_SLOW || o.last.lead.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0);
+                if queueing && !o.external.at_stop && tail > clear_from - 0.5 && tail - clear_from < EXIT_NEAR {
+                    room = 0.0;
                 }
             }
             for &(k, s, _) in sim.player_occupancy.get(&wl).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let p = &sim.players[k];
                 let tail = wd + s - p.half_len;
-                if p.speed.abs() < 1.5 && tail > clear_from - 0.5 {
+                if p.speed.abs() < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
             }

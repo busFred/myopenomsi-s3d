@@ -201,3 +201,61 @@ fn j2_a_player_stopped_in_the_box_keeps_its_claim() {
     assert!(waited, "a bus 0.2 m off the lane's edge is not parked beside it");
 }
 
+
+// ---- J5: box entry behind a queue forming on the exit ----
+
+/// A main road (approach 0, piece 1 x -15..15, exit 2) crossed by a side road (approach 3,
+/// piece 4 y -15..15, exit 5); the main road has the right of way.
+fn cross_with_exit() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1));
+    net.lanes.push(piece(&[(-15.0, 0.0), (15.0, 0.0)], 0, 192.0));
+    net.lanes.push(road(&[(15.0, 0.0), (600.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -15.0)], 3));
+    net.lanes.push(piece(&[(0.0, -15.0), (0.0, 15.0)], 1, 64.0));
+    net.lanes.push(road(&[(0.0, 15.0), (0.0, 300.0)], 4));
+    finish(net)
+}
+
+/// A vehicle on the exit lane with its tail at x = `tail` (the crossing's conflict ends about
+/// 2.6 m past the middle; the exit's first 15 m reach x = 17.6) at `kmh` (its top speed, so
+/// it keeps crawling), a bus at its stop when `at_stop`; the car comes up the main road at
+/// 10 m/s, 40 m out. (held for the full exit at all, the car's x at the end)
+fn enters_behind(tail: f32, kmh: f32, stands: bool, at_stop: bool) -> (bool, f32) {
+    let net = cross_with_exit();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut ahead = car(9, 2, tail - 15.0 + 2.0, kmh / 3.6);
+    ahead.state.max_speed_kmh = kmh;
+    ahead.state.desire = 1.0;
+    if stands {
+        ahead.external.at_stop = at_stop;
+        ahead.external.stop_at = Some(0.1);
+        ahead.state.speed = 0.0;
+    }
+    let mut cars = vec![ahead, car(1, 0, 285.0 - 40.0 - 2.0, 10.0)];
+    let mut held_exit = false;
+    run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+        let c = cars.iter().find(|c| c.id == 1).unwrap();
+        held_exit |= c.state.speed < 0.3 && c.last.why == Why::ExitFull;
+    });
+    (held_exit, cars.iter().find(|c| c.id == 1).unwrap().pos.x as f32)
+}
+
+#[test]
+fn j5_a_car_crawling_in_the_exits_first_metres_closes_the_box_a_bus_at_its_stop_does_not() {
+    // crawling at 1 m/s, its tail 7.4 m past the conflict when the car is 40 m out (room
+    // enough by the gap alone, 7.4 >= 4 + 2): the box is not entered until it has crawled out
+    // of the first 15 m
+    let (held, x) = enters_behind(10.0, 3.6, false, false);
+    assert!(held, "the car entered the box behind a crawler (x = {x:.1})");
+    assert!(x > 15.0, "the car never went on after the crawler left: x = {x:.1}");
+    // rolling at 3 m/s: a queue moving off, entered as before
+    let (held, _) = enters_behind(10.0, 10.8, false, false);
+    assert!(!held, "held for the exit behind a car rolling at 3 m/s");
+    // a bus serving its stop 12 m past the conflict: entered as before
+    let (held, _) = enters_behind(15.0, 0.0, true, true);
+    assert!(!held, "held for the exit behind a bus at its stop");
+    // a car standing there (not at a stop): no room, as before
+    let (held, _) = enters_behind(15.0, 0.0, true, false);
+    assert!(held, "the car entered the box behind one standing 12 m past the conflict");
+}
