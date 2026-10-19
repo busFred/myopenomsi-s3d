@@ -219,7 +219,7 @@ fn c3_a_lead_rolling_to_rest_past_the_zebra_is_queued_behind_off_the_zebra_too()
     for (my_s, lead_x) in [(215.0, 5.0), (230.0, 10.0), (200.0, 0.0)] {
         let net = road_with_a_zebra(true);
         let (at, why) = queue_behind_from(&net, 24.5, my_s, Some(lead_x));
-        assert!(at > 18.0 && at <= 23.0 - 0.3, "me from s {my_s}, lead from x {lead_x}: stood with its front at x = {at:.1} ({why:?})");
+        assert!(at > 18.0 && at <= 23.0 - 2.5 + 0.2, "me from s {my_s}, lead from x {lead_x}: stood with its front at x = {at:.1} ({why:?})");
         let net = road_with_a_zebra(false);
         let (at, _) = queue_behind_from(&net, 24.5, my_s, Some(lead_x));
         assert!(at > 21.5 && at < 23.0, "a plain road, me from s {my_s}, lead from x {lead_x}: front at x = {at:.1}");

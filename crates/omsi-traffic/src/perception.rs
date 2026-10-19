@@ -987,6 +987,11 @@ const KERB_CLEAR: f32 = 0.3;
 /// A person's body radius (m, `humans::BODY_OUTSIDE`).
 const BODY_RADIUS: f32 = 0.28;
 
+/// How far ahead (s) a person's step toward my lane is followed, at most: the time I need to
+/// reach them, at least 2 s (review-r5c-safety: at `dist / v` alone, 0.15 s at 13 m/s, a
+/// stepper beside the bumper was never braked for); 4 s covers my reach of 45 m at 11 m/s.
+const STEP_LOOK: f32 = 4.0;
+
 fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
     let st = &me.state;
     let v = st.speed;
@@ -1016,7 +1021,13 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
         } else {
             me.half_width + 0.3
         };
-        let t = ((rel.truncate().length() as f32) / v.max(1.0)).min(2.0);
+        // (one stepping toward my lane: followed for the time I need to reach them, 2 s at
+        // least; anyone else for that time at most)
+        let dist = rel.truncate().length() as f32;
+        let hr = (me.heading as f64).to_radians();
+        let my_right = DVec2::new(hr.cos(), -hr.sin());
+        let toward = p.vel.dot(my_right) * rel.truncate().dot(my_right) < -0.01;
+        let t = if toward { (dist / v.max(1.0)).clamp(2.0, STEP_LOOK) } else { (dist / v.max(1.0)).min(2.0) };
         let later = p.pos.truncate() + p.vel * t as f64;
         // (where somebody waiting for a bus is, not where their shuffle would take them)
         let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.is_bus()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
@@ -1025,6 +1036,10 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                 break;
             }
             let right = DVec2::new(fwd.y, -fwd.x);
+            // (where their body is now, off my axis: the exemptions below are for somebody
+            // outside my footprint, which a projected shuffle must not decide)
+            let now_across = (p.pos.truncate() - q).dot(right).abs() as f32;
+            let outside = now_across >= me.half_width + BODY_RADIUS;
             for &pos in positions {
                 let r = pos - q;
                 let along = r.dot(fwd);
@@ -1038,20 +1053,25 @@ fn people_ahead(sim: &Simulation, me: &Vehicle, way: &WayPts) -> Option<f32> {
                         continue;
                     }
                     // [round5 C2] somebody level with my body (their body behind my front
-                    // plane, now and where their step takes them within 2 s, `later`) holds
-                    // nothing: my front never reaches them; one ahead of the front, or stepping
-                    // there, holds as before (viz4 case01 #2827: eleven on the pavement 0.3 m
-                    // off its flank, level with its body, held it 34 s). At any speed, not only
-                    // standing: let go below 0.3 m/s alone, the car was held again the moment
-                    // it rolled and crept at 0.1 m/s (test c2_*: 2.3 s held of 6). Not a bus
-                    // pulling in at its stop (B4).
-                    if !at_kerb_of_stop && d + (along as f32) < st.front - BODY_RADIUS {
+                    // plane, now and where their step takes them, `later`) and outside my
+                    // footprint holds nothing: my front never reaches them; one ahead of the
+                    // front, or stepping there, holds as before (viz4 case01 #2827: eleven on
+                    // the pavement 0.3 m off its flank, level with its body, held it 34 s). At
+                    // any speed, not only standing: let go below 0.3 m/s alone, the car was
+                    // held again the moment it rolled and crept at 0.1 m/s (test c2_*: 2.3 s
+                    // held of 6). One level with my body INSIDE my footprint is being hit:
+                    // held as before (review-r5c-safety: 25 new contacts at across 0.7-1.5 m,
+                    // 1-7 m/s). Not a bus pulling in at its stop (B4).
+                    if !at_kerb_of_stop && outside && d + (along as f32) < st.front - BODY_RADIUS {
                         continue;
                     }
                     // someone who has stood at the edge for a while does not hold a standing car
                     // (a bus at its stop: one inside its footprint does, or it crept on and
-                    // stopped by turns)
-                    if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && (across as f32) > half - 0.9 {
+                    // stopped by turns) - at the edge: outside my footprint and their body
+                    // (review-r5c-safety: at `half - 0.9` a red-light waiter standing 0.5-1.1 m
+                    // off my axis was crawled through at 0.25 m/s once the zebra check no longer
+                    // listed them)
+                    if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && outside {
                         continue;
                     }
                     // (where the person really is relative to the sample, so that the stop
@@ -1194,10 +1214,12 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
 }
 
 /// How far beside my lane's footprint (m) a walker on a crossing still holds me at the zebra:
-/// half a metre, their body and a step; one farther off - a lane width away, on the far
-/// half of the crossing - does not, and a right turn goes (review-r5x merged list 4: within 3 m
-/// along the walk lane either side, a kerb waiter 1.9 m from the axis held a car 56 s).
-const ZEBRA_BESIDE: f32 = 0.5;
+/// the kerb spot (0.3 m off the lane's edge) and half a step back from it (review-r5c-safety:
+/// a stander 0.3 m behind the spot who stepped on 1.5-2.2 s before a 14 m/s car was counted
+/// too late at 0.5); one farther off - a lane width away, on the far half of the crossing -
+/// does not, and a right turn goes (review-r5x merged list 4: within 3 m along the walk lane
+/// either side, a kerb waiter 1.9 m from the axis held a car 56 s).
+const ZEBRA_BESIDE: f32 = 0.8;
 
 /// A pedestrian at a crossing of the junction ahead: on the crossing within my lane's
 /// footprint (my own width where the lane is narrower) and `ZEBRA_BESIDE` either side of it.
