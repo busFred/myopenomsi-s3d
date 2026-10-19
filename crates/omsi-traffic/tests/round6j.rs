@@ -368,3 +368,52 @@ fn j5_a_standing_player_behind_a_car_s_tail_names_it_as_its_lead() {
     let (_, lead) = behind_the_tail(4.0, 5.0, 0.0, 0.5);
     assert_eq!(lead, None);
 }
+
+/// J6: a lane join (piece 1, x -15..0, and piece 4 from the south-west, both ending at the
+/// origin; no crossing in the object) and its exit 2; with `crossed`, a side road (piece 6)
+/// crosses piece 1 at x = -7 as well. Lanes: 0 the approach, 3 the joining approach, 5/6/7 the
+/// side road.
+fn lane_join(crossed: bool) -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(-15.0, 0.0), (0.0, 0.0)], 0, 192.0, 3.0)); // 1
+    net.lanes.push(road(&[(0.0, 0.0), (600.0, 0.0)], 2)); // 2
+    net.lanes.push(road(&[(-300.0, -20.0), (-15.0, -8.0)], 3)); // 3
+    net.lanes.push(piece(&[(-15.0, -8.0), (0.0, 0.0)], 1, 64.0, 3.0)); // 4
+    if crossed {
+        net.lanes.push(road(&[(-7.0, -300.0), (-7.0, -20.0)], 5)); // 5
+        net.lanes.push(piece(&[(-7.0, -20.0), (-7.0, 20.0)], 2, 64.0, 3.0)); // 6
+        net.lanes.push(road(&[(-7.0, 20.0), (-7.0, 300.0)], 6)); // 7
+    }
+    finish(net)
+}
+
+/// A car standing on the exit with its tail `tail` m past the join; the car comes up the main
+/// way at 10 m/s 40 m out: whether it was held for a full exit.
+fn joins_behind(crossed: bool, tail: f32) -> bool {
+    let net = lane_join(crossed);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut ahead = car(9, 2, tail + 2.0, 0.0);
+    ahead.external.stop_at = Some(0.1);
+    let mut cars = vec![ahead, car(1, 0, 285.0 - 40.0 - 2.0, 10.0)];
+    let mut held_exit = false;
+    run(&net, &mut sim, &mut cars, 15.0, |_, _, cars| {
+        let c = cars.iter().find(|c| c.id == 1).unwrap();
+        held_exit |= c.state.speed < 0.3 && c.last.why == Why::ExitFull;
+    });
+    held_exit
+}
+
+#[test]
+fn j6_a_merge_only_lane_join_keeps_the_ordinary_room_rule() {
+    let js = Junctions::compile(&lane_join(false));
+    assert!(js.nodes.iter().flat_map(|n| n.movements.iter()).flat_map(|m| m.foes.iter()).all(|f| f.kind == omsi_traffic::FoeKind::Merge));
+    // a car standing 11 m past the join: room by the gap (11 >= 4 + 2); at a merge-only join
+    // the queue-place term (EXIT_NEAR) does not apply, the car joins behind it (case10: taxis
+    // stood exit-full 22 s each at the j31 join)
+    assert!(!joins_behind(false, 11.0), "held for a full exit at a lane join with 11 m of room");
+    // no room by the gap: held as before
+    assert!(joins_behind(false, 4.0), "joined with 4 m of room");
+    // with a crossing on the way through (x10 case06 #11146): the box is kept clear as before
+    assert!(joins_behind(true, 11.0), "a box with a crossing was entered behind a queue 11 m past it");
+}
