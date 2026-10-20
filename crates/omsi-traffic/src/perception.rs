@@ -1126,13 +1126,19 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let later = p.pos.truncate() + p.vel * t as f64;
         // (where somebody waiting for a bus is, not where their shuffle would take them)
         let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.serves_stops()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
-        // ([fix pass 1, 2] somebody on a crossing over my body - beside it or behind the front
-        // plane, now or where their step takes them - holds the car where it stands until
-        // they are clear of it: the way's samples start at the front and let a car move off
-        // into a walker crossing through its flank, x10 case03 #2786 0.85-1.36 m)
-        if on_crossing {
+        // ([fix pass 1, 2; pass 2, 3] anybody whose body is over mine - beside it or behind
+        // the front plane, now or where their step takes them - holds the car where it stands
+        // until they are clear of it (SUMO: vehicles brake for persons on their lane): the
+        // way's samples start at the front and let a car move off into a walker crossing
+        // through its flank, x10 case03 #2786 0.85-1.36 m, and a coach creep through somebody
+        // 0.9 m behind its reference point, viz3 case08 #11190)
+        {
             let body = me.obb();
-            if positions.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0) {
+            // (where they are; where their step takes them only for one stepping - a shuffle
+            // is no step, round 5 C2)
+            let stepping = on_crossing || p.vel.length() >= STEP_SPEED as f64;
+            let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
+            if at.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0) {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
         }

@@ -4533,7 +4533,12 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     let sep = omsi_sim::collision::Obb::point(p.pos, 0.28).separation(&b);
                     if sep < -0.01 {
                         let coach = v.class == omsi_traffic::VehicleClass::Car && v.state.length >= 10.0;
-                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y);
+                        // (severe: deeper than a body radius, or moving over 1 m/s more than
+                        // 5 cm deep - the reviewers' gate; a car letting a player's passengers
+                        // out stands beside where the game put them: a replay artefact)
+                        let severe = -sep > 0.28 || (st.speed > 1.0 && -sep > 0.05);
+                        let note = if v.last.why == Why::LetOut { " artefact: passengers placed by the recording beside the run's car" } else { "" };
+                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
                     }
                 }
             }
