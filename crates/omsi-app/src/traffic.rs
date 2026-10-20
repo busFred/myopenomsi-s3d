@@ -1768,10 +1768,12 @@ impl Traffic {
             off_ground += unloaded as usize;
             let random = !c.is_bus() || c.ai.gone;
             let r = (c.ai.state.length as f64 * 0.5).max(2.0);
-            // standing at the end of the network (the map's edge): Omsi.exe never lets a
-            // random car stand there - once 0x71dc9c finds no next segment (0x612e10) its
-            // segment stays -1 and 0x6fe3fc deletes it the same frame (0x703bb0); a bus
-            // that gave up goes once out of sight, or too far off for the renderer to draw it
+            // standing on the last lane of the network (the map's edge), given up: a random
+            // car that reaches the end is taken off by the traffic itself as Omsi.exe does
+            // (`AiState::drive` finds no way on: once 0x71dc9c finds no next segment
+            // (0x612e10) its segment stays -1 and 0x6fe3fc deletes it the same frame,
+            // 0x703bb0); one held short of it goes as below, out of sight or far off, after
+            // a long while, or in view once others queue behind it
             let at_end = c.ai.gone
                 && c.ai.stopped > if c.is_bus() { 20.0 } else { 0.5 }
                 && c.ai.state.route.is_empty()
@@ -1793,7 +1795,7 @@ impl Traffic {
                 self.hidden(world, p, r) || (c.ai.stopped > 8.0 && from_eye > 180.0) || c.ai.stopped > 150.0
             } else if !random {
                 false
-            } else if at_end && (!c.is_bus() || self.hidden(world, p, r) || (c.ai.stopped > 8.0 && from_eye > 180.0) || c.ai.stopped > 150.0 || (c.ai.stopped > 25.0 && queued.contains(&c.id) && from_eye > 25.0)) {
+            } else if at_end && (self.hidden(world, p, r) || (c.ai.stopped > 8.0 && from_eye > 180.0) || c.ai.stopped > 150.0 || (c.ai.stopped > 25.0 && queued.contains(&c.id) && from_eye > 25.0)) {
                 // (and in view too once others wait behind it: a fire engine at the end of a
                 // dead-end street held a queue of fourteen cars for two and a half minutes)
                 // (taken at once it vanished in plain view 300 m ahead; but a car kept
@@ -2111,8 +2113,8 @@ impl Traffic {
         // candidate lanes of this kind near the centre
         // (every lane of the kind, dead-end stubs included: a map maker leaves an open-ended
         // road on purpose and sets its [rule] trafficdensity, and OMSI spawns on it like any
-        // other; a car that runs off the end of the network is taken away there, see `at_end`
-        // in `populate_seen`)
+        // other; a car that runs off the end of the network is taken away there by the
+        // traffic, `AiState::drive`)
         let candidates: Vec<(usize, f32)> = nearby.iter().copied()
             .map(|i| (i, &self.net.lanes[i]))
             .filter(|(_, l)| {
