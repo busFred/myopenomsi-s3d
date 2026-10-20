@@ -103,6 +103,10 @@ pub struct Replay {
     free_stops: HashMap<u64, (f32, f32)>,
     /// [round 7 E2] Free run, per vehicle: the lateral ramp the game had last (`Steer`).
     free_ramps: HashMap<u64, (f32, f32, f32, f32)>,
+    /// [fix pass 3, 10] Free run: where the game had each vehicle at the last keyframe (lane,
+    /// s), for the first frame after it: a stop the game asks for then is laid at its route
+    /// place, found from there (`free_inputs`).
+    game_at: HashMap<u64, (usize, f32)>,
 }
 
 /// [round 7 E2] A recorded stop distance (`External::stop_at`) growing by more than this (m)
@@ -154,7 +158,7 @@ impl Replay {
         }
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new() };
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new(), game_at: HashMap::new() };
         r.stub_links();
         r
     }
@@ -253,6 +257,9 @@ impl Replay {
             Record::Frame(f) => self.frame(f),
             Record::Keyframe { time, vehicles } => {
                 self.compare(*time, vehicles);
+                if self.free_run {
+                    self.game_at = vehicles.iter().map(|v| (v.id, (v.state.lane, v.state.s))).collect();
+                }
                 if !self.free_run {
                     let mut vs = vehicles.clone();
                     self.keep_standing(&mut vs);
@@ -360,14 +367,22 @@ impl Replay {
     /// appears or grows by `NEW_STOP`), and so counts the distance from its own place; a
     /// lateral ramp the game laid (`Steer::lateral_ramp`, other than the vehicle's) is laid
     /// from the run's own place and offset, not the game's odometer.
-    fn free_inputs(vehicles: &mut [Vehicle], free_stops: &mut HashMap<u64, (f32, f32)>, free_ramps: &mut HashMap<u64, (f32, f32, f32, f32)>, ext: &HashMap<u64, External>, steer: &HashMap<u64, crate::record::Steer>) {
+    #[allow(clippy::too_many_arguments)]
+    fn free_inputs(net: &Network, vehicles: &mut [Vehicle], free_stops: &mut HashMap<u64, (f32, f32)>, free_ramps: &mut HashMap<u64, (f32, f32, f32, f32)>, game_at: &HashMap<u64, (usize, f32)>, ext: &HashMap<u64, External>, steer: &HashMap<u64, crate::record::Steer>) {
         let mut stops: HashMap<u64, (f32, f32)> = HashMap::new();
         for v in vehicles.iter_mut() {
             let mut e = ext.get(&v.id).copied().unwrap_or_default();
             if let Some(d) = e.stop_at {
                 let odo = v.state.odometer;
-                let at = match free_stops.get(&v.id) {
-                    Some(&(last, at)) if d <= last + NEW_STOP => at,
+                // ([fix pass 3, 10] at the frame after a keyframe, where the game had the
+                // vehicle is known: the stop is laid at its route place, `d` on from there along
+                // the route, whatever the run's vehicle's own place - laid from the run's
+                // odometer instead, x10 case11's bus #18542 ahead of the game ran off its
+                // lane's end with its stop 76 m on)
+                let placed = game_at.get(&v.id).and_then(|&(lane, s)| route_place(net, &v.state, lane, s, d)).map(|ahead| odo + ahead);
+                let at = match (placed, free_stops.get(&v.id)) {
+                    (Some(at), _) => at,
+                    (None, Some(&(last, at))) if d <= last + NEW_STOP => at,
                     _ => odo + d,
                 };
                 stops.insert(v.id, (d, at));
@@ -488,7 +503,8 @@ impl Replay {
         let ext: HashMap<u64, External> = f.externals.iter().copied().collect();
         let steer: HashMap<u64, crate::record::Steer> = f.steer.iter().copied().collect();
         if self.free_run {
-            Self::free_inputs(&mut self.vehicles, &mut self.free_stops, &mut self.free_ramps, &ext, &steer);
+            let game_at = std::mem::take(&mut self.game_at);
+            Self::free_inputs(&self.net, &mut self.vehicles, &mut self.free_stops, &mut self.free_ramps, &game_at, &ext, &steer);
         } else {
             for v in &mut self.vehicles {
                 v.external = ext.get(&v.id).copied().unwrap_or_default();
@@ -572,6 +588,20 @@ impl Replay {
 /// Whether the vehicle is where the recording has `rec` (same lane, within `IN_SYNC` m).
 fn in_step(o: &Vehicle, rec: &Vehicle) -> bool {
     o.state.lane == rec.state.lane && (o.state.s - rec.state.s).abs() <= IN_SYNC
+}
+
+/// [fix pass 3, 10] How far along `st`'s route (m from its origin) lies the place `d` metres
+/// on from (`lane`, `s`) along the same route - the route place the game's stop distance
+/// names, counted from where the game had the vehicle; None off the route.
+fn route_place(net: &Network, st: &omsi_sim::traffic::AiState, lane: usize, s: f32, d: f32) -> Option<f32> {
+    let route = &st.route;
+    let k0 = route.iter().position(|&l| l == lane)?;
+    let k1 = route.iter().position(|&l| l == st.lane)?;
+    let len = |k: usize| net.lanes.get(route[k]).map(|l| l.length()).unwrap_or(0.0);
+    // (the game's place, then mine, as distances from the start of route[min(k0, k1)])
+    let base = k0.min(k1);
+    let along = |k: usize, s: f32| (base..k).map(len).sum::<f32>() + s;
+    Some(along(k0, s) + d - along(k1, st.s))
 }
 
 /// A free run's vehicle `o` gets the way the game changed (`rec`): the route and where in it

@@ -1357,7 +1357,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if !st.route.is_empty() && st.route_index + 1 >= st.route.len() && st.planned_next.is_none() {
         let end = lane.length() - st.s - 0.5;
         let dead_end = lane.next.is_empty() && lane.kind == omsi_sim::traffic::LaneKind::Street;
-        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
+        // ([fix pass 3, 10] nor where the stop it is asked for lies beyond the end of its
+        // route: the route's next part is not loaded yet, it waits at the end - a bus whose
+        // stop lay 76 m past its route's end drove off it, x10 case11 #18542)
+        let stop_beyond = me.external.stop_at.is_none_or(|sa| sa > end + st.front + 0.5);
+        if end < 150.0 && stop_beyond && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
             min_stop(&mut out.stop, &mut out.why, Some(end.max(0.0)), Why::End);
         }
     }
