@@ -304,6 +304,13 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
+/// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
+/// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
+/// and how far ahead it looks for one (`perception::junction_ahead`).
+pub fn claim_horizon(speed: f32) -> f32 {
+    (8.0 * speed + 30.0).clamp(60.0, 220.0)
+}
+
 /// [ROLLBACK r4d-B4] A timetable bus creeping up to its stop slower than this (m/s) has not
 /// moved off: its standing time (`Vehicle::stopped`) runs on (`STANDING_SPEED` would reset
 /// it in a 0.3-0.4 m/s creep).
@@ -916,10 +923,10 @@ impl Simulation {
             }
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
-            // a claim is filed from eight seconds before the meeting place (at least 60 m,
-            // at most 220 m): the drivers who give way to this one see it coming in time
-            // to stop, not only once it is a braking distance from its own line
-            let horizon = (8.0 * st.speed + 30.0).clamp(60.0, 220.0);
+            // a claim is filed from `claim_horizon` before the meeting place: the drivers who
+            // give way to this one see it coming in time to stop, not only once it is a
+            // braking distance from its own line
+            let horizon = claim_horizon(st.speed);
             if !j.inside && j.conflict_start - st.front > horizon {
                 continue;
             }
@@ -1038,7 +1045,7 @@ impl Simulation {
         // starting ahead of it, on its first piece
         for p in self.players.iter() {
             let v = p.speed.max(0.0);
-            let horizon = (8.0 * v + 30.0).clamp(60.0, 220.0);
+            let horizon = claim_horizon(v);
             // the way: (lane, distance from the vehicle's origin to the lane's start)
             let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {

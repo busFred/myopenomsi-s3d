@@ -1367,14 +1367,16 @@ const EXIT_SLOW: f32 = 2.0;
 /// the figure `heads` reports the exit's state over).
 const EXIT_NEAR: f32 = 15.0;
 
-/// The next junction on the way (or the one the car is in), with the room past its
-/// conflicts measured along the car's own way: a vehicle standing inside the piece past the
+/// The next junction on the way (or the one the car is in), up to the claim horizon
+/// (`sim::claim_horizon`, [round 7 A8]: a fixed 120 m started the claims 5.4 s out at
+/// 22 m/s, not 8), with the room past its conflicts measured along the car's own way: a vehicle standing inside the piece past the
 /// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
 fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<JunctionView> {
     let me = &vehicles[i];
     let js: &Junctions = &sim.junctions;
+    let horizon = crate::sim::claim_horizon(me.state.speed);
     for (k, &(l, d0)) in way.iter().enumerate() {
-        if d0 > 120.0 {
+        if d0 - me.state.front > horizon {
             break;
         }
         let Some(&(j, m)) = js.of_lane.get(&l) else { continue };
