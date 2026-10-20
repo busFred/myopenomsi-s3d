@@ -60,21 +60,62 @@ const PULL_OUT_CHANCE: f64 = 0.035;
 /// How far ahead an emergency vehicle warns what holds it up (`TrafficPriorityWarningNeeded`,
 /// m).
 const PRIORITY_WARN_GAP: f32 = 60.0;
-/// A random car that has stood this long (s) held by nothing anybody can see goes even in
-/// view (see `Traffic::populate_seen`): the crate's own clock of standing held by nothing,
-/// `omsi_traffic::Vehicle::waiting` ([round 7 B1]: it was the seconds without 5 m
-/// of progress, which a long red or a queue ran up too).
-const PHANTOM_WAIT: f32 = 90.0;
+
+/// [round 7 B5] The removal rules of `Traffic::populate_seen`, named (their reasons are the
+/// comments there). A car finished (given up, or a timetable bus let go) on the last lane of
+/// the network goes after standing this long (s): at once, as Omsi.exe deletes a car with no
+/// next segment the same frame (0x6fe3fc) ...
+const AT_END_STAND: f32 = 0.5;
+/// ... a timetable bus let go there after this long (s).
+const AT_END_STAND_BUS: f32 = 20.0;
+/// Standing this long (s) beyond `FAR_OFF_DIST` (m) from the eye, too far for the
+/// renderer to draw it plainly: a bus stood with its passengers at the far end of a
+/// straight road for good (r4d).
+const FAR_OFF_STAND: f32 = 8.0;
+const FAR_OFF_DIST: f64 = 180.0;
+/// Standing this long (s) at a dead end or the loaded route's end goes in any case.
+const STOOD_LONG: f32 = 150.0;
+/// At a dead end with a queue behind it, in view too after this long (s), beyond
+/// `QUEUE_BEHIND_DIST` (m): a fire engine at the end of a dead-end street held fourteen cars
+/// for two and a half minutes.
+const QUEUE_BEHIND_STAND: f32 = 25.0;
+const QUEUE_BEHIND_DIST: f64 = 25.0;
+/// A car that gave up (or a timetable bus let go) goes in view too once the crate's give-up
+/// clock (`Vehicle::waiting`, the one clock) has run this much (s) past
+/// `GIVE_UP_UNSEEN`, beyond `GAVE_UP_DIST` (m) and not in a queue: kept until nobody saw it,
+/// a jam at a junction the player watched never cleared. (The grace is the round-4 rule's
+/// three minutes between giving up and going in view, 60 s and 240 s; the in-view removal is
+/// never earlier than giving up.)
+const IN_VIEW_GRACE: f32 = 180.0;
+const GAVE_UP_DIST: f64 = 40.0;
+/// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
+/// eye): a margin over what is drawn.
+const OUT_OF_RANGE: f64 = 1.3;
 
 /// [round5 C4] A lead standing within this (m) makes a car that gave up a queued car, not a
 /// phantom against an invisible wall (x10 case15: the two cars in front of the player went at
 /// 90 s with their leads 2.2 m ahead; a queue gap is 2-7 m, a car held by nothing has no lead).
 const QUEUE_LEAD: f32 = 10.0;
 
-/// [round5 C4] Whether a car follows a vehicle standing now (`standing`: the ids) within
-/// `QUEUE_LEAD`: in a queue, whatever its own hold reads.
+/// [round5 C4] Whether a car follows a vehicle standing now (`standing`: the ids, players as
+/// `PLAYER_ID_BASE` + id) within `QUEUE_LEAD`: in a queue, whatever its own hold reads.
+/// [round 7 B5] SUMO's rule for the in-view removal: only the car at the front of a blocked
+/// queue goes - one whose own lead does not stand (or that has none); every car behind a
+/// standing lead stays, given up or not, the lead given up or not (each link of the chain
+/// is asked of its own lead, so the chain is never cut in its middle). A gridlock with no
+/// front car is removed only out of sight.
 fn in_a_queue(lead_id: Option<u64>, lead: Option<Lead>, standing: &hashbrown::HashSet<u64>) -> bool {
     lead_id.is_some_and(|id| standing.contains(&id)) && lead.is_some_and(|l| l.gap < QUEUE_LEAD)
+}
+
+/// [round 7 B5] The id of what decision `d` follows: an AI vehicle's (`Decision::lead_id`) or
+/// a player's, as `PLAYER_ID_BASE` + its id (the crate names a player lead in `lead_seen`
+/// only; `plan::bypass_start` forms the id the same way).
+fn lead_of(d: &omsi_traffic::Decision) -> Option<u64> {
+    d.lead_id.or(match d.lead_seen {
+        Some(Seen::Player(id)) => Some(omsi_traffic::sim::PLAYER_ID_BASE + id as u64),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +179,27 @@ mod queue_tests {
 
     /// The no-lead car against an invisible wall still goes; one behind a standing vehicle
     /// within QUEUE_LEAD stays; behind a moving one, or one farther off, it goes.
+    /// [round 7 B5] The queue of fix2-jzk600 at t=595: player <- #150 <- #119 <- #163 (given
+    /// up) <- #101 <- #112, all standing 2-6 m apart. No car of it may go in view: #150 follows
+    /// the player, the rest follow standing cars, the given-up #163 too and #101 behind it.
+    /// With the player gone the front car #150 is the only one that may.
+    #[test]
+    fn b5_only_the_front_car_of_a_standing_queue_may_go_in_view() {
+        use super::lead_of;
+        use omsi_traffic::{sim::PLAYER_ID_BASE, Decision, Seen};
+        let gap = |g: f32| Some(Lead { gap: g, speed: 0.0, acc: 0.0 });
+        let follows = |id: Option<u64>, player: Option<u32>| Decision { lead_id: id, lead_seen: player.map(Seen::Player), lead: gap(3.0), ..Default::default() };
+        let chain = [(150u64, follows(None, Some(0))), (119, follows(Some(150), None)), (163, follows(Some(119), None)), (101, follows(Some(163), None)), (112, follows(Some(101), None))];
+        let mut standing: hashbrown::HashSet<u64> = chain.iter().map(|c| c.0).collect();
+        standing.insert(PLAYER_ID_BASE);
+        assert_eq!(lead_of(&chain[0].1), Some(PLAYER_ID_BASE));
+        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(lead_of(d), d.lead, &standing)).map(|c| c.0).collect();
+        assert!(removable.is_empty(), "{removable:?}");
+        standing.remove(&PLAYER_ID_BASE);
+        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(lead_of(d), d.lead, &standing)).map(|c| c.0).collect();
+        assert_eq!(removable, vec![150]);
+    }
+
     #[test]
     fn c4_a_car_behind_a_standing_lead_is_queued_not_a_phantom() {
         let standing: hashbrown::HashSet<u64> = [7u64].into_iter().collect();
@@ -182,6 +244,10 @@ pub struct AiCar {
     pub sounds: Option<omsi_audio::SoundSet>,
     /// Parking: the free space it drives into (see `Traffic::park_in`).
     pub park: Option<ParkPlan>,
+    /// [round 7 B5] A timetable bus whose trip is over, let go (`Traffic::release`): it
+    /// drives on as random traffic and leaves once nobody sees it. (It was the crate's
+    /// `gone`, which means "stood too long" only.)
+    pub released: bool,
     /// A rail vehicle: the track it has come along, (odometer, point), oldest first -
     /// where its rear bogie and its coupled cars and sections run (see `rail_behind`).
     pub rail_trail: std::collections::VecDeque<(f64, DVec3)>,
@@ -1874,7 +1940,9 @@ impl Traffic {
                 .unwrap_or(false);
             let unloaded = !flying && !world.has_ground(p.x, p.y);
             off_ground += unloaded as usize;
-            let random = !c.serves_stops() || c.ai.gone;
+            let random = !c.serves_stops() || c.released;
+            // (done: given up by the traffic, or a timetable bus let go after its trip)
+            let finished = c.ai.gone || c.released;
             let r = (c.ai.state.length as f64 * 0.5).max(2.0);
             // standing on the last lane of the network (the map's edge), given up: a random
             // car that reaches the end is taken off by the traffic itself as Omsi.exe does
@@ -1882,8 +1950,8 @@ impl Traffic {
             // (0x612e10) its segment stays -1 and 0x6fe3fc deletes it the same frame,
             // 0x703bb0); one held short of it goes as below, out of sight or far off, after
             // a long while, or in view once others queue behind it
-            let at_end = c.ai.gone
-                && c.ai.stopped > if c.serves_stops() { 20.0 } else { 0.5 }
+            let at_end = finished
+                && c.ai.stopped > if c.serves_stops() { AT_END_STAND_BUS } else { AT_END_STAND }
                 && c.ai.state.route.is_empty()
                 && self.net.lanes[c.ai.state.lane].next.is_empty();
             let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(dist);
@@ -1894,7 +1962,7 @@ impl Traffic {
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
-            let sleeps_instead = random && !c.ai.gone && !c.serves_stops() && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
+            let sleeps_instead = !c.serves_stops() && !c.ai.gone && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
             // (the first rule that takes it, for the log)
             // (the rules are asked in order, lazily: `hidden` casts rays)
             let first = |rules: &[(&dyn Fn() -> bool, &'static str)]| rules.iter().find(|r| r.0()).map(|r| r.1);
@@ -1904,10 +1972,10 @@ impl Traffic {
             } else if at_edge {
                 // (its trip comes back with the tiles; kept until nobody saw it, a bus stood
                 // with its passengers at the far end of a straight road for good)
-                first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > 8.0 && from_eye > 180.0, "at the loaded route's end, far off"), (&|| c.ai.stopped > 150.0, "at the loaded route's end, long")])
+                first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
             } else if !random {
                 None
-            } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > 8.0 && from_eye > 180.0, "at a dead end, far off"), (&|| c.ai.stopped > 150.0, "at a dead end, long"), (&|| c.ai.stopped > 25.0 && queued.contains(&c.id) && from_eye > 25.0, "at a dead end, a queue behind it")])).flatten() {
+            } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at a dead end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at a dead end, long"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
                 // (and in view too once others wait behind it: a fire engine at the end of a
                 // dead-end street held a queue of fourteen cars for two and a half minutes)
                 // (taken at once it vanished in plain view 300 m ahead; but a car kept
@@ -1915,34 +1983,28 @@ impl Traffic {
                 // road in view, and the queue behind it - timetable buses with their
                 // passengers among them - never moved again)
                 Some(why)
-            } else if c.ai.gone || dist > far || c.ai.waiting > PHANTOM_WAIT {
+            } else if finished || dist > far {
                 // in plain view a car stays until the renderer leaves it out anyway, and
                 // close by (the mirrors, a turn of the head) it stays in any case
-                // (one that gave up in a gridlock goes after four minutes even in view,
-                // unless right beside the viewer: kept until nobody saw it, a jam at a
-                // junction the player watched never cleared; and one held for a minute and
-                // a half by nothing anybody can see - no car, bus or light in front of it,
-                // nobody it gives way to - goes then: whatever held it, it stood against
-                // an invisible wall with the traffic queued up behind it for as long as the
-                // player looked)
+                // (one that gave up goes in view too, IN_VIEW_GRACE after giving up, unless
+                // right beside the viewer: kept until nobody saw it, a jam at a junction the
+                // player watched never cleared)
                 // [round5 C4] (not one behind a standing vehicle within QUEUE_LEAD: a queue,
                 // whatever its own hold reads - x10 case15: two cars 6 m in front of the
                 // player, why=people behind leads 2.2 m ahead, vanished at 90 s)
-                // [round 7 B1] (the phantom clock is the crate's: any hold - a light, a
-                // junction, a lead, people - or moving restarts it, so no car goes at the
-                // first frame after its red; one that gave up (`gone`, five minutes of it) goes
-                // once out of sight, or past 40 m after four minutes standing)
+                // [round 7 B1] (one clock, the crate's: `gone` at GIVE_UP_UNSEEN of
+                // `waiting`, SUMO's waiting time: every hold but a red light and its own stop; the round-4
+                // phantom rule's own 90 s in view is gone with the second clock)
                 first(&[
-                    (&|| dist > VISIBLE_RANGE * 1.3 && from_eye > NEAR_HIDE, "out of range"),
-                    (&|| hidden(), if c.ai.gone { "gave up, out of sight" } else { "out of sight" }),
-                    (&|| c.ai.gone && c.ai.stopped > 240.0 && from_eye > 40.0, "gave up, stood four minutes"),
-                    (&|| c.ai.waiting > PHANTOM_WAIT && from_eye > 25.0 && !in_a_queue(c.ai.last.lead_id, c.ai.last.lead, &standing), "held by nothing (phantom)"),
+                    (&|| dist > VISIBLE_RANGE * OUT_OF_RANGE && from_eye > NEAR_HIDE, "out of range"),
+                    (&|| hidden(), if finished { "finished, out of sight" } else { "out of sight" }),
+                    (&|| finished && c.ai.waiting > omsi_traffic::sim::GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(lead_of(&c.ai.last), c.ai.last.lead, &standing), "finished, in view after its grace"),
                 ])
             } else {
                 None
             };
             let remove = reason.is_some();
-            if remove && sleeps_instead && !at_end {
+            if remove && sleeps_instead {
                 let c = self.cars.swap_remove(i);
                 asleep += 1;
                 self.dormant.push(DormantCar {
@@ -2105,8 +2167,6 @@ impl Traffic {
             };
             let car = &mut self.cars[i];
             car.park = Some(ParkPlan { key, lane: l, s, lat, ramped: false, done: false });
-            // (it parks: no more route to plan than to here)
-            car.ai.gone = false;
             if debug {
                 log::info!("car {} parks in the space of parked car {key} ({:.0} m ahead, {lat:.1} m right of lane {l})", car.id, d);
             }
@@ -2788,6 +2848,7 @@ impl Traffic {
             ai_secs: 0.0,
             consist_reversed: false,
             park: None,
+            released: false,
             seed,
             scheme,
         });
@@ -3341,7 +3402,7 @@ impl Traffic {
     fn note_through_lanes(&mut self) {
         self.through.routes.clear();
         for c in &self.cars {
-            if c.bus.is_none() || c.ai.gone {
+            if c.bus.is_none() || c.released {
                 self.through.driven.insert(c.ai.state.lane);
             } else {
                 let st = &c.ai.state;
@@ -3709,7 +3770,7 @@ impl Traffic {
                 self.riders_out.push(c.id);
             }
             // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
-            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.ai.gone && !self.respawned.iter().any(|r| r.car == c.id) {
+            if c.bus.as_ref().is_some_and(|b| !b.trip_done()) && !c.released && !self.respawned.iter().any(|r| r.car == c.id) {
                 if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
                     log::info!("scheduled bus {}: off the dead end of lane {} at ({:.0}, {:.0})", c.id, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y);
                 }
@@ -4265,7 +4326,7 @@ impl Traffic {
         car.ai.state.planned_next = None;
         car.ai.state.ahead.clear();
         car.ai.state.plan_next(net);
-        car.ai.gone = false;
+        car.released = false;
         self.note_vehicle_changed(ci);
         let car = &mut self.cars[ci];
         let stops = stops.into_iter().map(crate::bus_service::Stop::from_tuple).collect();
@@ -4293,7 +4354,7 @@ impl Traffic {
         if let Some(b) = car.bus.as_mut() {
             b.restart(Vec::new(), false);
         }
-        car.ai.gone = true;
+        car.released = true;
         self.note_vehicle_changed(ci);
     }
 
@@ -4431,7 +4492,7 @@ impl Traffic {
         let dt = self.last_dt.max(1.0 / 120.0);
         let mut keep: Vec<u64> = Vec::new();
         for c in &self.cars {
-            if !c.serves_stops() || c.ai.gone {
+            if !c.serves_stops() || c.released {
                 continue;
             }
             let d = (c.vehicle.position - eye).length();
@@ -5027,6 +5088,7 @@ impl Traffic {
             ai_secs: 0.0,
             consist_reversed: false,
             park: None,
+            released: false,
         });
         self.cars.len() - 1
     }

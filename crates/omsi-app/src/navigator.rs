@@ -748,7 +748,7 @@ impl Navigator {
         let Some(t) = f.traffic else { return };
         let mut by_lane: HashMap<usize, (f32, u32)> = HashMap::new();
         for c in &t.cars {
-            if c.ai.gone || (c.vehicle.position - f.bus).truncate().length() > 1200.0 {
+            if c.released || (c.vehicle.position - f.bus).truncate().length() > 1200.0 {
                 continue;
             }
             let e = by_lane.entry(c.ai.state.lane).or_insert((0.0, 0));
@@ -1125,7 +1125,7 @@ impl Navigator {
         let mut lines: Vec<(DVec3, Color, String)> = Vec::new();
         if let Some(t) = f.traffic.filter(|_| self.show_ai) {
             for c in &t.cars {
-                if c.ai.gone || (c.vehicle.position - f.bus).truncate().length() > self.zoom * 3.5 + 150.0 {
+                if c.released || (c.vehicle.position - f.bus).truncate().length() > self.zoom * 3.5 + 150.0 {
                     continue;
                 }
                 let (color, line) = traffic_kind(c);
@@ -2511,7 +2511,7 @@ impl Navigator {
         let mut dots = Painter::new();
         let mut lines: Vec<(DVec3, Color, String)> = Vec::new();
         if let Some(t) = f.traffic.filter(|_| self.show_ai) {
-            for car in t.cars.iter().filter(|c| !c.ai.gone) {
+            for car in t.cars.iter().filter(|c| !c.released) {
                 let (color, line) = traffic_kind(car);
                 if color == DOT {
                     dots.world_disc(rel(car.vehicle.position), 2.2, 3.4, Color::rgba(8, 8, 8, 0.9));
