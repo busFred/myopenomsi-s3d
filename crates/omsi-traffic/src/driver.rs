@@ -5,6 +5,10 @@
 
 use omsi_sim::traffic::AiState;
 
+/// A fed-up driver (`Impatience::claims_after`) takes a way they would yield on when the foe
+/// is still this many seconds away (s; the figure since b9568aa, not jittered per driver).
+pub const FED_UP_AFTER: f32 = 2.5;
+
 /// What kind of vehicle the driver is in: sets the preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VehicleClass {
@@ -70,10 +74,9 @@ pub struct DriverParams {
     /// Gap accepted in the lane changed into (s, to the car behind there).
     pub lc_gap: f32,
     /// Lane-change motivation weights (LMRS / LC2013): the route needing it, a faster
-    /// lane, letting a neighbour in, keeping right.
+    /// lane, keeping right. (LC2013's cooperative weight has no rule here yet.)
     pub lc_strategic: f32,
     pub lc_speed_gain: f32,
-    pub lc_cooperate: f32,
     pub lc_keep_right: f32,
     /// How fast impatience grows while waiting (per second) and where it caps.
     pub impatience_rate: f32,
@@ -98,7 +101,6 @@ impl DriverParams {
             lc_gap: 1.5,
             lc_strategic: 1.0,
             lc_speed_gain: 0.6,
-            lc_cooperate: 0.5,
             lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
@@ -191,10 +193,10 @@ impl Impatience {
     }
 
     /// A driver this impatient takes a way they would yield on, if the foe is still
-    /// farther than this many seconds away.
+    /// farther than this many seconds away (`FED_UP_AFTER`, the same for every driver).
     pub fn claims_after(&self) -> Option<f32> {
         if self.value >= 0.999 {
-            Some(2.5)
+            Some(FED_UP_AFTER)
         } else {
             None
         }

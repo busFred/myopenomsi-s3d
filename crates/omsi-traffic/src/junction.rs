@@ -532,23 +532,6 @@ impl Junctions {
     pub fn is_inside(&self, lane: usize) -> bool {
         self.of_lane.contains_key(&lane)
     }
-
-    /// The whole way through the junction starting at movement `(j, m)`: its lane and the
-    /// inner pieces it continues into (first continuation each time), with the distance
-    /// from the start of the first to the end of the last.
-    pub fn way_through(&self, net: &Network, j: usize, m: usize) -> (Vec<usize>, f32) {
-        let node = &self.nodes[j];
-        let mut out = vec![node.movements[m].lane];
-        let mut len = net.lanes[node.movements[m].lane].length();
-        let mut cur = m;
-        for _ in 0..6 {
-            let Some(&n) = node.movements[cur].continues.first() else { break };
-            out.push(node.movements[n].lane);
-            len += net.lanes[node.movements[n].lane].length();
-            cur = n;
-        }
-        (out, len)
-    }
 }
 
 #[cfg(test)]

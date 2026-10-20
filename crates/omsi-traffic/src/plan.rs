@@ -272,14 +272,11 @@ pub const PERSON_RADIUS: f32 = 0.28;
 
 /// The thing passed must have settled sideways: not itself out on a pass (stepping back from
 /// an aborted squeeze, its lateral still moving), and its lateral where it means to be.
-fn lateral_settled(sim: &Simulation, vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool {
+fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool {
     match l.what {
         // (standing, its offset cannot change: the ramps run by the odometer)
         Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < 0.3 || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
-        Seen::Player(_) | Seen::Parked => {
-            let _ = sim;
-            true
-        }
+        Seen::Player(_) | Seen::Parked => true,
     }
 }
 
@@ -393,7 +390,7 @@ fn pausing_player(l: &crate::perception::Headway) -> bool {
 /// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
 /// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
 /// the thing standing and nobody passing on it the wrong way. (What the keep-back asks.)
-fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+fn could_bypass(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
     let lane = &net.lanes[me.state.lane];
     if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < 40.0 {
         return false;
@@ -402,7 +399,6 @@ fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView,
     if (my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0) {
         return false;
     }
-    let _ = p;
     // (the gap there is the start's to accept, `change_desire`, and a car driving on ahead
     // there leaves the room: one going by in that lane now does not make the car roll up to 2 m behind the obstacle, from where it can never
     // steer out - fix pass 2, the queue behind a bus at its stop)
@@ -486,7 +482,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
             hi = t;
         }
     }
-    Some(hi * bypass_min_len(me.length(), side).max(BYPASS_LENGTH.min(bypass_min_len(me.length(), side))))
+    Some(hi * bypass_min_len(me.length(), side))
 }
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
@@ -1193,7 +1189,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let squeeze_end = real + squeeze_obstacle_len + st.front + st.rear + 2.0;
         let squeeze = (reach <= extent || over_line.is_some())
             && !player_out
-            && lateral_settled(sim, vehicles, &l)
+            && lateral_settled(vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
             && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
@@ -1238,7 +1234,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         });
         let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
-        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, p, nb, &l));
+        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {

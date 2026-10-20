@@ -467,12 +467,11 @@ fn look_ahead(v: f32) -> f32 {
 }
 
 /// The vehicle ahead on the way, through the lanes ahead (by lane registration: an aircraft's,
-/// whose way has no body test).
+/// whose way has no body test; an aircraft never passes, `plan`'s `can_pass`).
 fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)], look: f32) -> Option<Headway> {
     let me = &vehicles[i];
     let st = &me.state;
     let signalling = st.change.map(|c| c.wait > 0.0 && c.t <= 0.0 && !c.bypass).unwrap_or(false);
-    let passing = me.passing.filter(|p| !p.aborted);
     let mut best: Option<Headway> = None;
     let consider = |best: &mut Option<Headway>, lane_d0: f32, occ: &crate::sim::Occupant, limit: f32| {
         if occ.vehicle == i {
@@ -494,18 +493,6 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
             let rel = (o.pos - me.pos).truncate();
             let h = (me.heading as f64).to_radians();
             if rel.dot(DVec2::new(h.sin(), h.cos())) < 0.0 {
-                return;
-            }
-        }
-        if let Some((id, until)) = me.ignore_lead {
-            if id == o.id && sim.time < until {
-                return;
-            }
-        }
-        // the standing thing I am passing
-        if let Some(p) = passing {
-            let standing = o.state.speed < 0.3;
-            if standing && st.odometer + gap + st.front < p.until + 1.0 {
                 return;
             }
         }
@@ -588,9 +575,9 @@ fn body_candidates(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(u
 /// near me (within `body_look`) `Seen::Body` (across the way: crossing a junction, pulling
 /// out, passing). A car changing lanes is where its body is, not on its target lane at its
 /// middle from the first frame (viz3 case01 #4519 stood behind #4436 3.5 m to its side, a
-/// frozen change). Not my lead: my follower that has me as its lead, a lead I ignore for a
-/// while (`ignore_lead`), the standing thing I am passing, and, of two bodies blocking each
-/// other, the one with the lower id's for the higher. (nearest of the lane kind, nearest body)
+/// frozen change). Not my lead: my follower that has me as its lead, the standing thing I am
+/// passing, and, of two bodies blocking each other, the one with the lower id's for the
+/// higher. (nearest of the lane kind, nearest body)
 fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], way: &WayPts, look: f32, body_look: f32, cand: Vec<(usize, bool, f32)>, ahead: &mut Vec<(f32, f32, f32)>) -> (Option<Headway>, Option<Headway>) {
     let me = &vehicles[i];
     let st = &me.state;
@@ -695,11 +682,6 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             let oh = (o.heading as f64).to_radians();
             ahead.push((gap, far - st.front, o.state.speed * DVec2::new(oh.sin(), oh.cos()).dot(f) as f32));
         }
-        if let Some((id, until)) = me.ignore_lead {
-            if id == o.id && sim.time < until {
-                continue;
-            }
-        }
         let (q, right) = (way.pts[k].1, DVec2::new(f.y, -f.x));
         let lateral = (o.pos.truncate() - q).dot(right) as f32 + st.lateral_ahead(way.pts[k].0);
         // the standing thing I am passing (in my lane, nearer its middle than the line of the
@@ -735,7 +717,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             if gap < -0.5 || gap > look || occ.lateral.abs() > me.half_width + o.half_width + LEAD_MARGIN as f32 {
                 continue;
             }
-            if o.lead_id == Some(me.id) || me.ignore_lead.is_some_and(|(id, until)| id == o.id && sim.time < until) {
+            if o.lead_id == Some(me.id) {
                 continue;
             }
             let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
@@ -1732,9 +1714,6 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     p.route_change = st.route_change_due(net);
     p
 }
-
-#[allow(dead_code)]
-fn _unused(_: DVec3) {}
 
 #[cfg(test)]
 mod cut_in_tests {

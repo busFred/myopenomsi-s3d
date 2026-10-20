@@ -242,8 +242,6 @@ pub struct Vehicle {
     pub last: Decision,
     /// Id of the vehicle followed last frame.
     pub lead_id: Option<u64>,
-    /// (vehicle id, time until) a lead is ignored to break a mutual wait.
-    pub ignore_lead: Option<(u64, f64)>,
     /// Indicator shown, and since when (debounced).
     pub blinker_shown: (i32, f64),
     /// World position of the origin and heading (degrees), from the way.
@@ -426,7 +424,6 @@ impl Vehicle {
             external: External::default(),
             last: Decision::default(),
             lead_id: None,
-            ignore_lead: None,
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
@@ -982,22 +979,20 @@ impl Simulation {
                 exit_room: j.exit_room,
                 impatience: v.impatience,
                 absolute: v.is_rail() || v.external.priority,
-                held: st.speed < 0.3 && v.last.held,
+                held: v.is_held(),
                 // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                 // answer or a full exit)
-                blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
                 // (people or a zebra in front of it, or a lead that stands too: nothing that
                 // lets it go on a schedule, as a light or a lead moving off does)
                 // in the box when its light turned: it clears it (rule F)
                 clearing: j.clearing && !light_red,
-                stuck: st.speed < 0.3
-                    && v.last.held
+                stuck: v.is_held()
                     && match v.last.why {
                         Why::People | Why::Zebra => true,
                         Why::Lead => p.leader.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0),
                         _ => false,
                     },
-                red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
@@ -1185,7 +1180,6 @@ impl Simulation {
                 blocked,
                 stuck: false,
                 clearing: false,
-                red_hysteresis: false,
                 lanes: way,
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
@@ -1232,7 +1226,7 @@ impl Simulation {
         }
         self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
-        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, &claims, &self.signal_groups);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
         // and the next tie there is the other side's ([round6 J3] written at the first
