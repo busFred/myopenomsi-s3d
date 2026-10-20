@@ -73,6 +73,12 @@ const KERB_CLEAR: f64 = 0.3;
 const LANE_MIN_WIDTH: f64 = 2.5;
 /// A person's body radius (m), for the viewer's mask.
 const PERSON_RADIUS: f64 = 0.28;
+/// How far ahead (m) `heads` looks for the junction pieces of a head's way: past the claim's
+/// furthest reach (`Simulation::tick`'s horizon, at most 220 m) and a way through of its own.
+const HEADS_WAY: f32 = 400.0;
+/// An eased-off car standing longer than this (s) counts in `ab`'s `ease_stand` (and, with the
+/// follow its grant offers, `ease_pinned`): round 6's count of the ease pin (review-r6 case03/06).
+const EASE_PIN_AFTER: f64 = 3.0;
 
 fn main() {
     // (warnings on stderr, as a recording made under other rules than the current ones;
@@ -181,6 +187,15 @@ fn fmt_id(id: u64) -> String {
         format!("PLAYER{}", id - PLAYER_ID_BASE)
     } else {
         format!("#{id}")
+    }
+}
+
+/// A claimant named by its claim index (`Claim::vehicle`; a player's is `usize::MAX - k`).
+fn fmt_claimant(r: &Replay, w: usize) -> String {
+    if w >= usize::MAX - 64 {
+        r.sim.players.get(usize::MAX - w).map(|p| format!("PLAYER{}", p.id)).unwrap_or("PLAYER?".into())
+    } else {
+        r.vehicles.get(w).map(|o| format!("#{}", o.id)).unwrap_or("?".into())
     }
 }
 
@@ -1568,17 +1583,23 @@ fn build_chain(
         let next = h.next;
         // how the two ways through meet, by the junction table
         if let Some((n, "yields to")) = next {
-            if let (Some((j1, m1, _, _)), Some((j2, m2, _, c2))) =
+            if let (Some((j1, m1, _, c1)), Some((j2, m2, _, c2))) =
                 (snaps[k].jv.get(&cur), snaps[k].jv.get(&n))
             {
                 if j1 == j2 {
-                    let foes = &jn.nodes[*j1].movements[*m1].foes;
+                    // (along the whole chain of the way through, as the resolver reads it:
+                    // the first piece's own foes missed the stretches of the pieces after it)
+                    let foes: Vec<(usize, omsi_traffic::junction::Foe)> = if c1.is_empty() {
+                        jn.nodes[*j1].movements[*m1].foes.iter().map(|f| (*m1, *f)).collect()
+                    } else {
+                        jn.foes_along_pieces(*j1, c1)
+                    };
                     let rel: Vec<String> = foes
                         .iter()
-                        .filter(|f| f.movement == *m2 || c2.iter().any(|c| c.0 == f.movement))
-                        .map(|f| {
+                        .filter(|(_, f)| f.movement == *m2 || c2.iter().any(|c| c.0 == f.movement))
+                        .map(|(p, f)| {
                             format!(
-                                "{:?} yields={} mine {:.1}..{:.1} theirs {:.1}..{:.1}",
+                                "m{p} {:?} yields={} mine {:.1}..{:.1} theirs {:.1}..{:.1}",
                                 f.kind, f.yields, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1
                             )
                         })
@@ -3760,10 +3781,11 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     let mut foe_coming: Vec<String> = Vec::new();
     let mut exit_txt = String::new();
     // the junction pieces on the way ahead (a way through may be several pieces), up to
-    // the first lane outside the junction after them
+    // the first lane outside the junction after them, however long the way through (a claim
+    // reaches up to 220 m: the old 80 m cut hid the stretches case11's #54242 waited for)
     let mut jms: Vec<(usize, usize, usize, f32)> = Vec::new();
     let mut exit: Option<(usize, f32)> = None;
-    for &(l, d0) in &wl {
+    for &(l, d0) in &way_lanes(net, st, HEADS_WAY) {
         match r.sim.junctions.of_lane.get(&l) {
             Some(&(j, m)) => jms.push((j, m, l, d0)),
             None if !jms.is_empty() => {
@@ -3771,9 +3793,6 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 break;
             }
             None => {}
-        }
-        if d0 > st.front + 80.0 {
-            break;
         }
     }
     if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull)) {
@@ -4152,6 +4171,15 @@ struct Extra {
     unjust_stream_s: u64,
     /// Mutual holds negotiated: a car eased off for the other (`Vehicle::ease_for`), whole map.
     eases: u64,
+    /// Seconds an eased-off car stands past `EASE_PIN_AFTER` (whole map), and of them those
+    /// with a follow its grant offers (`Grant::follow`: the partner rolls on ahead into the
+    /// merge, the car could roll in behind it).
+    ease_stand_s: f64,
+    ease_pinned_s: f64,
+    /// Seconds a vehicle within the radius stands refused for a foe at a stretch more than
+    /// 40 m / 60 m ahead of its front (`Grant::at`; review-r6 case11's count).
+    far_refused_40_s: f64,
+    far_refused_60_s: f64,
     events: Vec<String>,
 }
 
@@ -4311,6 +4339,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
+    // (an eased-off car standing: since when; the last frame's time)
+    let mut ease_still: HashMap<u64, f64> = HashMap::new();
+    let mut last_frame = r.sim.time;
     let close = |sc: &mut Score, run: Vec<HeadTally>| {
         if run.len() < min_head {
             return;
@@ -4337,6 +4368,34 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
         // ---- every frame: lane changes standing, passes signalled
         {
             let now = r.sim.time;
+            let fdt = (now - last_frame).clamp(0.0, 1.0);
+            last_frame = now;
+            for (i, v) in r.vehicles.iter().enumerate() {
+                if v.ease_for.is_none() || v.state.speed >= 0.3 {
+                    ease_still.remove(&v.id);
+                    continue;
+                }
+                let since = *ease_still.entry(v.id).or_insert(now);
+                if now - since > EASE_PIN_AFTER {
+                    ex.ease_stand_s += fdt;
+                    if r.sim.claims.iter().any(|(c, g)| c.vehicle == i && g.follow.is_some()) {
+                        ex.ease_pinned_s += fdt;
+                    }
+                }
+            }
+            for (c, g) in &r.sim.claims {
+                let Some(v) = r.vehicles.get(c.vehicle) else { continue };
+                if g.go || g.hold != Some(Hold::Foe) || v.state.speed >= 0.3 || !near(v.pos) {
+                    continue;
+                }
+                let to_at = g.at.map(|a| a - (c.s + c.front)).unwrap_or(0.0);
+                if to_at > 40.0 {
+                    ex.far_refused_40_s += fdt;
+                }
+                if to_at > 60.0 {
+                    ex.far_refused_60_s += fdt;
+                }
+            }
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
             for &id in &ids {
                 first_seen.entry(id).or_insert(now);
@@ -4683,6 +4742,8 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("pass_wrong_s", e.pass_wrong_side_s.to_string()),
         ("stranded_s", e.pass_stranded_s.to_string()),
         ("eases", e.eases.to_string()),
+        ("ease_stand/pinned", format!("{:.0}/{:.0}", e.ease_stand_s, e.ease_pinned_s)),
+        ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
     ]
 }
 
@@ -4707,6 +4768,10 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.pass_wrong_side_s += e.pass_wrong_side_s;
     t.pass_stranded_s += e.pass_stranded_s;
     t.eases += e.eases;
+    t.ease_stand_s += e.ease_stand_s;
+    t.ease_pinned_s += e.ease_pinned_s;
+    t.far_refused_40_s += e.far_refused_40_s;
+    t.far_refused_60_s += e.far_refused_60_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -5254,6 +5319,9 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 let gaps: Vec<String> = found.iter().map(|&i| format!("#{} {:.2} m", r.vehicles[i].id, r.vehicles[i].obb().separation(&pb))).collect();
                 println!("t={t:.1} player {} ({:.1},{:.1}) hd {:.0} v {:.2} still {:.1} blinker {}; boxes to it: {}", p.id, p.pos.x, p.pos.y, p.heading, p.speed, p.still, p.blinker, gaps.join(", "));
             }
+            for (c, g) in r.sim.claims.iter().filter(|(c, _)| c.vehicle >= usize::MAX - 64) {
+                println!("t={t:.1}   player claim j{} m{} s {:.1} light_red {} blocked {} lead {:?} -> go {} wait_for {:?}", c.junction, c.movement, c.s, c.light_red, c.blocked, c.lead.map(|w| fmt_claimant(&r, w)), g.go, g.wait_for.map(|w| fmt_claimant(&r, w)));
+            }
         }
         for &i in &found {
             let v = &r.vehicles[i];
@@ -5285,8 +5353,13 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         for &i in &found {
             if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {
                 println!(
-                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} -> go {} wait_for {:?} hold {:?} at {:?}",
-                    r.vehicles[i].id, c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked, c.stuck, c.held, c.clearing, c.exit_room, g.go, g.wait_for.and_then(|w| r.vehicles.get(w)).map(|o| o.id), g.hold, g.at
+                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} lead {:?} eased {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?} follow {:?} zip {:?}",
+                    r.vehicles[i].id, c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked, c.stuck, c.held, c.clearing, c.exit_room,
+                    c.lead.map(|w| fmt_claimant(&r, w)), c.yields_now.map(|w| fmt_claimant(&r, w)),
+                    g.go, g.wait_for.map(|w| fmt_claimant(&r, w)), g.hold, g.at,
+                    // (the distance from the front to the stretch waited for)
+                    g.at.map(|a| ((a - (c.s + c.front)) * 10.0).round() / 10.0),
+                    g.follow.map(|(gap, v)| ((gap * 10.0).round() / 10.0, (v * 10.0).round() / 10.0)), g.zip.map(|z| z.1)
                 );
             }
         }

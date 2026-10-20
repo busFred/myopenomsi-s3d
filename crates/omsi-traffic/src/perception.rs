@@ -7,7 +7,7 @@
 //! body, a player or a person reuses the samples; the vehicles and the people near the
 //! car come from the simulation's grids, not from a scan of everything.
 
-use crate::junction::Junctions;
+use crate::junction::{FoeKind, Junctions};
 use crate::sim::{Simulation, Vehicle};
 use glam::{DVec2, DVec3};
 use omsi_sim::collision::Obb;
@@ -1333,6 +1333,11 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };
         let clear_from = d0 + if last > 0.0 { last } else { way_len };
         let need = me.length() + me.state.min_gap;
+        // [round6 J6] a box to keep clear: a crossing on the way through, or a zebra cut; a
+        // merge-only lane join has no box, and the queue-place term below (`EXIT_NEAR`) does not
+        // apply there, only the ordinary room (case10: taxis stood 22 s each at the j31 join,
+        // exit-full for a queue forming 15 m on)
+        let crosses = foes.iter().any(|f| f.kind == FoeKind::Cross) || chain.iter().any(|&(mm, _)| net.walks.get(js.nodes[j].movements[mm].lane).is_some_and(|w| !w.is_empty()));
         let mut room = f32::INFINITY;
         for &(wl, wd) in &way[k..] {
             if wd > clear_from + 40.0 {
@@ -1360,7 +1365,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 let standing_lead = o.last.lead.filter(|l| l.speed < 0.3);
                 let queueing = o.state.speed < 0.3 || standing_lead.is_some();
                 let predicted_tail = tail + standing_lead.map(|l| (l.gap - o.state.min_gap).max(0.0)).unwrap_or(0.0);
-                if !o.external.at_stop && tail > clear_from - 0.5 && ((crawling && tail - clear_from < EXIT_NEAR) || (queueing && predicted_tail - clear_from < EXIT_NEAR + need)) {
+                if crosses && !o.external.at_stop && tail > clear_from - 0.5 && ((crawling && tail - clear_from < EXIT_NEAR) || (queueing && predicted_tail - clear_from < EXIT_NEAR + need)) {
                     room = 0.0;
                 }
             }

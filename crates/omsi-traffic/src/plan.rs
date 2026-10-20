@@ -415,7 +415,10 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
         // (a car standing with its bumper over the line waits like one behind it: at a
         // standstill nothing is "too late to stop")
         Aspect::Red | Aspect::RedYellow => {
-            let go = (marked && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
+            // ([round6 J3] the mark lets it on only while it rolls, as on yellow: an eased car
+            // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
+            // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
+            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
             LightCall { go, mark: false, marked_through: marked && gap < comfortable }
         }
     }
@@ -444,11 +447,22 @@ const QUEUE_BRAKE: f32 = 2.0;
 /// place ahead or pedestrian crossing its body would stand in ("keep the junction clear"; a
 /// meeting place it is in already it cannot leave but forward). A distance from the origin.
 fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, waited: f32) -> f32 {
+    pulled_back(&hold_bands(net, sim, j), me, j.entry + waited - 1.0)
+}
+
+/// The bands of the way through a held car keeps its body out of (`hold_point`): the meeting
+/// places (from a metre before), the pedestrian crossings and the convergences.
+fn hold_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
     let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
     bands.extend(walk_bands(net, sim, j));
     bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
-    pulled_back(&bands, me, j.entry + waited - 1.0)
+    bands
 }
+
+/// [round6 J2] A car comes to rest up to this far (m) short of its stop (the controller's 0.6 m
+/// `STOP_LINE_GAP` and a creep): `pulled_back` keeps that much more of the body out of a band
+/// (review-r6j: the rear stood 0.6 m inside a convergence it was stopped behind).
+const REST_SHORT: f32 = 1.0;
 
 /// `stop` (a distance from the origin, the front's) pulled back before every band of
 /// `bands` (from, to) the body would stand in, a band at a time.
@@ -456,7 +470,7 @@ fn pulled_back(bands: &[(f32, f32)], me: &Vehicle, mut stop: f32) -> f32 {
     let front = me.state.front;
     let len = me.length();
     for _ in 0..32 {
-        let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len).map(|b| b.0).fold(f32::INFINITY, f32::min);
+        let hit = bands.iter().filter(|b| b.0 > front - 0.3 && b.0 < stop && b.1 > stop - len - REST_SHORT).map(|b| b.0).fold(f32::INFINITY, f32::min);
         if !hit.is_finite() {
             break;
         }
@@ -519,9 +533,38 @@ fn entry_roots(sim: &Simulation, j: usize, m: usize) -> Vec<usize> {
     roots
 }
 
+/// [round6 J3] Under this speed (m/s) an eased-off car stands, and is pinned where it is
+/// (`Claim::standing`'s 0.3 m/s).
+const EASE_STANDING: f32 = 0.3;
+
 /// A standing vehicle this far (m) off a piece of my way (its origin to the piece's centre
 /// line) is on a lane running side by side with it, and its rear is projected on my way.
 const BESIDE_MAX: f64 = 4.0;
+
+/// [round6 J2] A convergence of the way through (`converge_bands`) beginning within this many
+/// metres past the front (the line while short of it) and the gentle stopping distance stops a
+/// refused car at once; one farther on it rolls up to (review-r6 fix 4: the coach of case01 froze
+/// across the player's lane for a stretch 90 m on).
+const CONVERGE_LOOK: f32 = 20.0;
+
+/// [round6 J2] The body of the vehicle waited for (`Grant::wait_for`, the claims' index; a
+/// player's is `usize::MAX - k`) projected on the way through: (rear, front), distances from my
+/// origin, when its origin lies within `BESIDE_MAX` of a piece of the way.
+fn waited_body_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], j: &JunctionView, w: usize) -> Option<(f32, f32)> {
+    let (pos, rear, front) = if w >= usize::MAX - 64 {
+        let p = sim.players.get(usize::MAX - w)?;
+        (p.pos, p.half_len, p.half_len)
+    } else {
+        let o = vehicles.get(w)?;
+        (o.pos, o.state.rear, o.state.front)
+    };
+    let node = &sim.junctions.nodes[j.junction];
+    j.chain
+        .iter()
+        .filter_map(|&(m, off)| net.lanes.get(node.movements[m].lane)?.nearest_point(pos).filter(|&(_, d)| d < BESIDE_MAX).map(|(s, d)| (d, j.entry + off + s)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, s)| (s - rear, s + front))
+}
 
 /// A car refused for a side-merge stretch (`Foe::side`) that a vehicle stands held in rolls up
 /// to it instead of standing at the line, when every band between the line and that stretch
@@ -693,12 +736,39 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (a side-merge stretch of my own fork that a vehicle stands in: up to it, behind
             // that vehicle, `roll_up_point`)
             let at = match (g.hold, g.at) {
+                // [round6 J1] held only by a foe standing for good far ahead: up to its stretch
+                (Some(Hold::Foe), Some(waited)) if g.roll_up => hold_point(net, sim, me, j, waited),
                 (Some(Hold::Foe), Some(waited)) => match roll_up_point(net, sim, vehicles, me, j, waited) {
                     Some(at) => at,
                     None => {
                         let at = hold_point(net, sim, me, j, waited);
-                        let converges = converge_bands(sim, j).iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear);
-                        if (at < first || converges) && first > st.front - 0.3 {
+                        // [round6 J2] only a convergence beginning within the stopping distance
+                        // (`CONVERGE_LOOK` at least) stops the car at once; a farther one it rolls
+                        // up to (`at` is pulled back before it), unless the vehicle waited for
+                        // stands in it (review9: refused cars rolled into the very car they
+                        // waited for). (case01 #4252 froze across the player's lane for a
+                        // convergence 90 m on, case11 #54242 mid-turn.)
+                        // (from the line while short of it: a convergence near the line stops a
+                        // car rolling up to it there, as one standing at it)
+                        let look = st.front.max(j.entry) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);
+                        let waited_body = g.wait_for.and_then(|w| waited_body_on_way(net, sim, vehicles, j, w));
+                        let bands = converge_bands(sim, j);
+                        let converges = bands.iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear && (b.0 < look || waited_body.is_some_and(|(lo, hi)| lo < b.1 && hi > b.0)));
+                        // (one farther on only: the car rolls up to the stretch, `at`, pulled back
+                        // before the convergence, and keeps that stop once it is past its line,
+                        // where `first` would be short of the first meeting place, inside the
+                        // convergence or on a zebra cut, review-r6j)
+                        let ahead: Vec<&(f32, f32, usize)> = bands.iter().filter(|b| b.0 < j.entry + waited && b.1 > -st.rear).collect();
+                        let far_only = !converges && !ahead.is_empty();
+                        // (and one come near that lies farther than `CONVERGE_LOOK` past the line -
+                        // one a car standing at the line rolls up to - once the car is past its line
+                        // or can no longer stop there gently: before the convergence, `at`, not short
+                        // of the first meeting place, past it. Nearer ones as before.)
+                        let line_stop = !j.inside && (gently || v < 0.5);
+                        let past_line_look = !ahead.is_empty() && ahead.iter().all(|b| b.0 >= j.entry + CONVERGE_LOOK);
+                        if (far_only || (converges && !line_stop && past_line_look)) && at > st.front - 0.3 {
+                            at
+                        } else if (at < first || converges) && first > st.front - 0.3 {
                             first
                         } else if converges {
                             // (past the line already: as soon as it can stop gently)
@@ -729,11 +799,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // (eased off in a mutual hold: it stays where it stands until the other is through)
+    // [round6 J3] pinned there only while it stands and its grant offers no follow; with one
+    // (the other rolls on into a merge of the two ahead) it rolls in behind it, the follow
+    // branch above; rolling with none, it stops gently (case03: #5424 stood pinned 13 s with
+    // the follow behind #8417 ready 9 of them; case06 #13911 10 s on the zebra)
     if let (Some(_), Some(g)) = (me.ease_for, grant) {
         if !g.go {
             out.hold = g.hold;
             out.wait_for = g.wait_for;
-            min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::Junction);
+            if g.follow.is_none() {
+                let at = if v < EASE_STANDING { st.front + 0.1 } else { st.front + v * v / (2.0 * dp.comfort_brake) + 0.3 };
+                min_stop(&mut out.stop, &mut out.why, Some(at), Why::Junction);
+            }
         }
     }
 

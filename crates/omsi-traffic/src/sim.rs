@@ -320,6 +320,21 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     }
 }
 
+/// [round6 J5] A standing player's claim names as its lead the AI vehicle in its corridor
+/// within this many metres of its front (review-r6 fix 7: a queue's gap, 2-3 m).
+pub const PLAYER_LEAD_REACH: f32 = 3.0;
+/// [round6 J5] ... its centre within this many metres of the player's axis (`traffic_cases
+/// heads`' 2.5 m corridor for the queue in front of the player).
+pub const PLAYER_LEAD_ACROSS: f32 = 2.5;
+/// [round6 J5] ... or within this many metres when it moves off ahead of the player (`heads`'
+/// 12 m from one car of a queue to the next).
+pub const PLAYER_LEAD_AWAY: f32 = 12.0;
+/// [round6 J5] ... and its box reaching no more than this far (m) back past the player's front
+/// (review-r6j: a car alongside counted as the lead).
+pub const PLAYER_LEAD_OVERLAP: f32 = 0.5;
+/// [round6 J4] A player keeps the light of its lit lane until its rear is this far (m) past the
+/// lane's start (`perception::signal_ahead`'s half metre for an AI car).
+pub const PLAYER_LINE_PAST: f32 = 0.5;
 /// Seconds a player stands before it counts as held where it is: blocked to the junction
 /// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
 pub const PLAYER_STILL: f32 = 2.0;
@@ -913,6 +928,11 @@ impl Simulation {
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
                 clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                // (held by its service, or standing `FAR_FOE_STOOD` s or more)
+                // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
+                // from its first frame, review-r6j)
+                standing_long: st.speed < 0.3 && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
+                brake,
             });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -1004,7 +1024,10 @@ impl Simulation {
             // nor a detector, `perception::detector_light`)
             let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
-            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d - p.half_len > -0.5).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
+            // ([round6 J4] until its REAR is half a metre past the lit lane's start, as an AI
+            // car's `signal_ahead`: the front 0.8 m past its stub, the player's bus lost its red,
+            // stood blocked and held a green stream, case07 #37076 21 s)
+            let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d + p.half_len > -PLAYER_LINE_PAST).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
             let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
@@ -1022,12 +1045,52 @@ impl Simulation {
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
             let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
+            // [round6 J5] standing, its lead: the AI vehicle in its corridor, its box
+            // within `PLAYER_LEAD_REACH` ahead of the front and its centre within
+            // `PLAYER_LEAD_ACROSS` of the axis (`traffic_cases heads`' queue in front of the
+            // player), so that a foe the player stands behind does not wait for it (`reservation`:
+            // a standing foe whose lead is me; case01: coach #4252 waited for PLAYER0 standing
+            // 1 m behind its tail)
+            let player_foes: Vec<usize> = foes.iter().map(|f| f.movement).collect();
+            let meets = |k: usize| claim_of[k].is_some_and(|ck| claims[ck].junction == j && !claims[ck].chain.iter().any(|&(cm, _)| cm == m) && claims[ck].chain.iter().any(|&(cm, _)| player_foes.contains(&cm)));
+            let lead = (p.still > PLAYER_STILL && p.speed.abs() < 0.3)
+                .then(|| {
+                    let fwd = p.fwd();
+                    let right = DVec2::new(fwd.y, -fwd.x);
+                    let o = p.pos.truncate();
+                    // (at any speed of its own: the coach creeping off in front of the standing
+                    // player was refused for it again at 0.6-1.8 m/s, stop and go)
+                    self.vehicles_near(p.pos, (p.half_len + PLAYER_LEAD_REACH) as f64 + 20.0)
+                        .into_iter()
+                        .filter_map(|k| {
+                            let b = vehicles[k].obb();
+                            let along = b.corners().map(|c| (c - o).dot(fwd) - p.half_len as f64);
+                            let lo = along.iter().copied().fold(f64::INFINITY, f64::min);
+                            // (one moving off from in front of it keeps it as its lead for
+                            // `PLAYER_LEAD_AWAY`: refused again 3 m on, it stood and went)
+                            let hk = (vehicles[k].heading as f64).to_radians();
+                            let away = vehicles[k].state.speed >= 0.3 && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
+                            let reach = if away { PLAYER_LEAD_AWAY } else { PLAYER_LEAD_REACH };
+                            // (wholly ahead of its front, but for half a metre: not a car alongside
+                            // in a narrow piece beside it with its front just past the player's)
+                            (lo > -PLAYER_LEAD_OVERLAP as f64 && lo < reach as f64 && (b.center - o).dot(right).abs() < PLAYER_LEAD_ACROSS as f64).then_some((k, lo.max(0.0)))
+                        })
+                        // (of two side by side in its corridor, one whose way meets the player's
+                        // at this junction and is not on the player's own piece (one ahead on its
+                        // way comes first anyway, `reservation::behind_on_my_way`), else the
+                        // nearest: case01, the player stood 2 m behind #5348 on its own piece and
+                        // 1-2 m behind the tail of coach #4252 beside it, which waited for the
+                        // player at their zipper)
+                        .min_by(|a, b| (!meets(a.0), a.1).partial_cmp(&(!meets(b.0), b.1)).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(k, _)| k)
+                })
+                .flatten();
             claims.push(Claim {
                 chain,
                 was_standing: false,
                 light_red,
                 until_go,
-                lead: None,
+                lead,
                 vehicle: usize::MAX - k,
                 junction: j,
                 movement: m,
@@ -1052,6 +1115,8 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
+                standing_long: false,
+                brake: omsi_sim::traffic::MAX_BRAKE * 0.7,
             });
         }
         for (i, standing) in standing_now {
@@ -1094,9 +1159,11 @@ impl Simulation {
         let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
-        // and the next tie there is the other side's
+        // and the next tie there is the other side's ([round6 J3] written at the first
+        // decision, not only on go: refused for a third, the winner stays first, and the pair's
+        // order does not flip as their distances change)
         for (g, c) in grants.iter().zip(&claims) {
-            if let (true, Some((key, piece))) = (g.go, g.zip) {
+            if let Some((key, piece)) = g.zip {
                 // (a player's win is not remembered: no keyframe would carry it)
                 if let Some(v) = vehicles.get_mut(c.vehicle) {
                     v.zip_won = Some((key, piece, self.time));
@@ -1130,9 +1197,15 @@ impl Simulation {
                 if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
                     return None;
                 }
-                // (the other still short of, or in, a meeting place of the two)
+                // (the other still short of, or in, the first meeting place of the two beyond
+                // where I stand, its rear not yet `CLEAR_MARGIN` s of its speed past that
+                // stretch's end. [round6 J3] Not every meeting place of the chain: two merging
+                // run on along one way, and the ease held the one behind until the other had
+                // left the whole object, review-r6 case03/06)
                 let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
-                let inside = pieces.iter().any(|(_, f)| theirs.chain.iter().any(|&(m, off)| m == f.movement && theirs.s - off - theirs.rear <= f.theirs.1));
+                let my_front = mine.s + mine.front;
+                let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
+                let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::CLEAR_MARGIN * theirs.speed.max(0.0));
                 inside.then_some((k, o))
             })();
             match keep {
