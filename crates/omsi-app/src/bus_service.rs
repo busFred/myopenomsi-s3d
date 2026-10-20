@@ -54,6 +54,10 @@ pub enum Phase {
 
 #[derive(Debug, Clone)]
 pub struct BusService {
+    /// [round 7 A7] The offset it steers to at or into a stop (its bay, a place parked away):
+    /// the planner's `External::bay`. None between stops, where the traffic's own rules
+    /// (the kerb swerve, the settle creep) place it in its lane.
+    pub bay_wish: Option<f32>,
     pub stops: VecDeque<Stop>,
     pub phase: Phase,
     /// Seconds in the current phase.
@@ -671,8 +675,6 @@ pub struct Ctx<'a> {
     pub stopped: f32,
     /// Passing something (the passing manoeuvre owns the lateral position).
     pub passing: bool,
-    /// Where it would swerve to round a car parked at the kerb.
-    pub kerb_swerve: Option<f32>,
     /// [ROLLBACK bus-106] Another bus stands at the same stop close ahead of it (its tail within
     /// 9 m): this one, once in its bay and still, serves the stop where it stands.
     pub lead_close: bool,
@@ -729,6 +731,7 @@ impl BusService {
             this_layover: false,
             rerouted: false,
             ahead_by: 0.0,
+            bay_wish: None,
             pace: 1.0,
             pace_target: None,
             left_early: false,
@@ -971,6 +974,7 @@ impl BusService {
             st.lateral_target = 0.0;
             st.lateral_ramp = (lat, 0.0, st.odometer, len);
         }
+        self.bay_wish = None;
         if ctx.debug {
             log::info!(
                 "t={:.1}: timetable bus {} pulls away, IBIS stop {:?}",
@@ -1082,7 +1086,10 @@ impl BusService {
         if !p.arrived {
             let d = st.route_distance(ctx.net, p.ri, p.s);
             if !ctx.passing {
-                st.lateral_target = if d < BAY_REACH { p.lat } else { 0.0 };
+                if d < BAY_REACH {
+                    st.lateral_target = p.lat;
+                }
+                self.bay_wish = (d < BAY_REACH).then_some(p.lat);
             }
             if st.speed < 0.3 && (d < 1.5 || (ctx.stopped > 5.0 && d < 15.0 && (st.lateral - p.lat).abs() < 0.5)) {
                 p.arrived = true;
@@ -1106,6 +1113,7 @@ impl BusService {
         st.signal = out_signal(p.lat);
         st.signal_time = 2.5;
         st.lateral_target = 0.0;
+        self.bay_wish = None;
         if ctx.debug {
             log::info!("t={:.1}: timetable bus {} sets off back for its stop", ctx.day_time, ctx.id);
         }
@@ -1210,9 +1218,9 @@ impl BusService {
         }
         loop {
             let Some(stop) = self.stops.front().copied() else {
-                if !ctx.passing {
-                    st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
-                }
+                // ([round 7 A7] out of any bay: where it sits in its lane is the traffic's -
+                // the target is not written here every frame)
+                self.bay_wish = None;
                 // [round 6 B2] the end of its track with no stop left: its trip is over here
                 // (the timetable hands it the tour's next trip where it is, or lets it go),
                 // as at its last stop - not on at a tile edge (`route_open`: it waits for the
@@ -1280,9 +1288,9 @@ impl BusService {
                 self.pace_target = None;
                 self.pull = 0.0;
                 crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
-                if !ctx.passing {
-                    st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
-                }
+                // ([round 7 A7] out of any bay: where it sits in its lane is the traffic's -
+                // the target is not written here every frame)
+                self.bay_wish = None;
                 continue;
             }
             // into the bay over the last metres, but only once no junction lies between
@@ -1300,11 +1308,11 @@ impl BusService {
                     .reduce(f32::max);
                 let ramp = ((stop.bay - st.lateral).abs() * 8.0).clamp(8.0, 30.0);
                 let junction_first = junction_end.is_some_and(|e| d - e >= ramp);
-                st.lateral_target = if d < BAY_REACH && d > -25.0 && !junction_first {
-                    stop.bay
-                } else {
-                    ctx.kerb_swerve.unwrap_or(0.0)
-                };
+                let entering = d < BAY_REACH && d > -25.0 && !junction_first;
+                if entering {
+                    st.lateral_target = stop.bay;
+                }
+                self.bay_wish = entering.then_some(stop.bay);
             }
             // queued behind something standing at its stop (another bus, the player's):
             // after a while it serves the stop where it stands, as drivers do
@@ -1474,7 +1482,6 @@ mod tests {
             id: 1,
             stopped: 0.0,
             passing: false,
-            kerb_swerve: None,
             lead_close: false,
             follower_close: false,
             wanted: None,
@@ -1609,7 +1616,7 @@ mod tests {
     }
 
     fn ctx_on<'a>(net: &'a Network, way: &'a [(usize, f32)], day_time: f64, stopped: f32) -> Ctx<'a> {
-        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, kerb_swerve: None, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0, v_nom: 13.9, people_hold: false, close_behind: false, covers_through: true }
+        Ctx { net, way, day_time, dt: 0.1, id: 1, stopped, passing: false, lead_close: false, follower_close: false, wanted: None, debug: false, roadside: true, queue_behind_secs: 0.0, v_nom: 13.9, people_hold: false, close_behind: false, covers_through: true }
     }
 
     /// The bus driven along its way by `AiState::drive` for `secs` from `t`, its service
@@ -1843,6 +1850,18 @@ mod tests {
         let target = s.step(&mut st, &mut v, &ctx).expect("its stop");
         assert_eq!(s.phase, Phase::Running);
         assert!((target - (8.0 + 6.0 - 0.3)).abs() < 0.01, "{target}");
+        // [round 7 A7] into its stop it asks for its bay
+        assert_eq!(s.bay_wish, Some(1.2));
+        assert_eq!(st.lateral_target, 1.2);
+        // [round 7 A7] far from it (beyond BAY_REACH) no bay, and its lateral target is the
+        // traffic's: not written by the service
+        let mut far = BusService::new(vec![stop()]);
+        let mut st_far = at(20.0);
+        st_far.lateral_target = -0.4;
+        let way_far = [(0usize, -20.0f32)];
+        far.step(&mut st_far, &mut v, &ctx_on(&net, &way_far, 100.0, 0.0));
+        assert_eq!(far.bay_wish, None);
+        assert_eq!(st_far.lateral_target, -0.4);
         // clear now, still standing (a creep does not reset the time): it goes on to the pole
         ctx.people_hold = false;
         ctx.stopped = 9.0;
@@ -1884,6 +1903,7 @@ mod tests {
             st.s > 160.0
         });
         assert_eq!(st.lateral_target, 0.0);
+        assert_eq!(s.bay_wish, None, "between stops it asks for no bay");
         assert!(lateral_at.iter().any(|&(s, l)| s < 101.0 && l > 1.1), "starts in the bay");
         assert!(st.lateral.abs() < 0.05, "back in the lane: {}", st.lateral);
     }

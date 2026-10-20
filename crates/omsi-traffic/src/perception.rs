@@ -279,6 +279,9 @@ pub struct Perception {
     /// [round 5 L3] `kerb_swerve` is (also) the shift past people beside the lane: the car
     /// eases past them.
     pub people_swerve: bool,
+    /// [round 7 A7] The swerve round a parked car alone (`kerb_swerve` without the shift
+    /// past people): what a timetable bus between its stops takes.
+    pub parked_swerve: Option<f32>,
     pub oncoming: Option<OncomingView>,
     /// A player's vehicle ahead indicating to pull out towards the traffic: the distance
     /// from my origin to its rear.
@@ -1730,6 +1733,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             (a, b) => a.or(b.map(|s| s.0)),
         };
         p.people_swerve = shifted.is_some();
+        p.parked_swerve = swerve;
         p.people_stop = match shifted {
             Some((_, stop)) => stop,
             None => people_stop,

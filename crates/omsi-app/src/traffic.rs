@@ -3346,7 +3346,6 @@ impl Traffic {
                     id: car.id,
                     stopped: car.ai.stopped,
                     passing: car.ai.passing.is_some(),
-                    kerb_swerve: None,
                     lead_close,
                     follower_close,
                     debug: debug || omsi_cfg::env::var_os("OMSI_DEBUG_PAX").is_some(),
@@ -3364,8 +3363,11 @@ impl Traffic {
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);
                 }
                 // [ROLLBACK r4d-B3] ahead of its timetable: slower
-                car.ai.state.desire = car.ai.params.speed_factor * service.pace;
-                ext.bay = Some(car.ai.state.lateral_target);
+                ext.pace = Some(service.pace);
+                // [round 7 A7] at or into a stop (or a place parked away) its bay; between
+                // stops the traffic's rules place it (the kerb swerve, the settle creep: a bay
+                // of its lateral target every frame kept both from it)
+                ext.bay = service.bay_wish.or(service.at_stop().then_some(car.ai.state.lateral_target));
                 ext.blinker_off = matches!(service.phase, Phase::Boarding | Phase::Waiting);
                 // [ROLLBACK aiparked-73] a long layover at the terminus: engine off
                 car.vehicle.ai_parked = service.parked(day_time);
@@ -3379,8 +3381,7 @@ impl Traffic {
                         let d = found.map(|w| w.1).unwrap_or(-st.s) + plan.s;
                         if d < 80.0 {
                             ext.stop_at = Some(ext.stop_at.map_or(d + st.front + 0.3, |x| x.min(d + st.front + 0.3)));
-                            st.signal = 2;
-                            st.signal_time = 1.0;
+                            ext.signal = Some(2);
                             let len = (plan.lat.abs() * 6.0).clamp(10.0, 22.0);
                             if d < len + 1.0 {
                                 ext.bay = Some(plan.lat);
@@ -3420,6 +3421,9 @@ impl Traffic {
             c.ai = v;
         }
         self.day_time = self.sim.day_time;
+        if debug {
+            self.log_bus_lateral();
+        }
         let mut remove: Vec<usize> = self.sim.removed.clone();
         remove.extend(respawn.iter().copied());
         remove.sort_unstable_by(|a, b| b.cmp(a));
@@ -3767,6 +3771,34 @@ impl Traffic {
             found += 1;
         }
         found
+    }
+
+    /// `OMSI_DEBUG_TRAFFIC`: [round 7 A7] a timetable bus between stops (no bay asked for)
+    /// that the traffic's own rules move sideways - the kerb swerve round a parked car or
+    /// people, the settle creep of a lane change settled in place - logged as it starts.
+    fn log_bus_lateral(&self) {
+        static ON: std::sync::OnceLock<parking_lot::Mutex<hashbrown::HashSet<u64>>> = std::sync::OnceLock::new();
+        let mut on = ON.get_or_init(Default::default).lock();
+        for c in self.cars.iter().filter(|c| c.bus.is_some()) {
+            let st = &c.ai.state;
+            let free = c.ai.external.bay.is_none() && c.ai.passing.is_none() && st.change.is_none();
+            let what = if !free {
+                None
+            } else if st.lateral_target.abs() > 0.05 {
+                Some("swerves")
+            } else if st.settled_offset && st.lateral.abs() > 0.05 {
+                Some("settles")
+            } else {
+                None
+            };
+            match what {
+                Some(w) if on.insert(c.id) => log::info!("t={:.1}: timetable bus {} between stops {w}: lateral {:+.2} -> {:+.2} m on lane {} at {:.1} m/s ({:?})", self.time, c.id, st.lateral, st.lateral_target, st.lane, st.speed, c.ai.last.why),
+                None => {
+                    on.remove(&c.id);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `OMSI_DEBUG_LIGHTS`: every change of the lights of the chosen programs, with the

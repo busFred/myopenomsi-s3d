@@ -1287,16 +1287,20 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 9. where the car sits in its lane: a bay, a swerve round a parked car, or the middle
     if me.passing.is_none() && st.change.is_none() {
+        // ([round 7 A7] a timetable bus has a bay only at or into its stop: between stops it
+        // swerves round a parked car as everybody does - not towards the middle past the
+        // people at the kerb, whom it serves: the round-5 L3 shift took bus 267 0.5 m out
+        // beside the waiters of its next stop, Anwai 300 s run)
         if let Some(bay) = me.external.bay {
             out.lateral = Some(bay);
-        } else if !me.serves_stops() {
+        } else if me.serves_stops() {
+            out.lateral = Some(p.parked_swerve.unwrap_or(0.0));
+        } else {
             out.lateral = Some(p.kerb_swerve.unwrap_or(0.0));
             // [round 5 L3] easing past people beside the lane: gently, as a car edging out
             if p.people_swerve && v < 3.0 && out.accel_cap.is_none() {
                 out.accel_cap = Some(omsi_sim::ai_motion::PULL_OUT_ACCEL);
             }
-        } else {
-            out.lateral = Some(0.0);
         }
     }
 
