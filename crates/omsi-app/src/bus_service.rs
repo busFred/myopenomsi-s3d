@@ -138,8 +138,6 @@ pub struct BusService {
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
 #[derive(Debug, Clone)]
 pub struct Away {
-    /// It comes back for its layover (it waits for the departure when it is back).
-    layover: bool,
     /// Parked somewhere with room: where, and what it comes back by.
     park: Option<ParkAway>,
 }
@@ -1047,7 +1045,7 @@ impl BusService {
                 let mut r = route;
                 r.extend(rest);
                 set_route(st, net, r);
-                self.away = Some(Away { layover, park: None });
+                self.away = Some(Away { park: None });
             }
             Detour::Park { route, s, lat, len, back, back_len } => {
                 let leave_at = depart - detour_time(back_len) - DETOUR_MARGIN * 0.5;
@@ -1062,7 +1060,7 @@ impl BusService {
                     .collect();
                 let ri = route.len() - 1;
                 set_route(st, net, route);
-                self.away = Some(Away { layover, park: Some(ParkAway { ri, s, lat, back, rest, stops, leave_at, arrived: false }) });
+                self.away = Some(Away { park: Some(ParkAway { ri, s, lat, back, rest, stops, leave_at, arrived: false }) });
             }
         }
         // (back at the stop it waits for its departure as on its layover)
