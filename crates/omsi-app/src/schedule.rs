@@ -478,6 +478,12 @@ pub struct Schedule {
 /// A tour's bus waits at the end of a trip for the next one of its tour when that leaves
 /// within this many seconds; for a longer break it goes (and a bus comes back for it).
 const TOUR_LAYOVER_MAX: f64 = 30.0 * 60.0;
+/// [round 6 B2] A bus handed its tour's next trip faster than this (m/s: a creep) is on the
+/// move (at the end of its track) ...
+const PIN_MOVING: f32 = 1.0;
+/// [round 6 B2] ... and stops for a first stop just behind it braking at this (m/s²: a
+/// bus's comfortable braking, `DriverParams::preset` Bus `comfort_brake`).
+const PIN_DECEL: f32 = 1.5;
 
 /// A tour's bus takes its next trip on only from one of the trip's first lanes (or a short
 /// way onto one of them): Omsi.exe starts every trip at its beginning.
@@ -974,7 +980,11 @@ impl Schedule {
                     self.pending.push_back(j);
                 }
             }
-            if !taken && next.is_none() {
+            // [round 6 B2] (one whose trip ended on the move at the end of its track drives
+            // off as a bus off a dead end - gone, taken off once out of sight - rather than
+            // vanishing mid-road, possibly in view)
+            let on_the_move = traffic.cars[ci].bus.as_ref().is_some_and(|b| b.drives_off());
+            if !taken && next.is_none() && !on_the_move {
                 // the tour's last trip is over: Omsi takes the bus (and what is coupled to
                 // it) off the road at once rather than letting it drive on
                 traffic.remove_car(world, renderer, scene, id);
@@ -2516,7 +2526,7 @@ impl Schedule {
             // the tour's bus that has just finished its trip takes this one on from where
             // it stands: the section itself when it stands on it, else the shortest way
             // from its lane onto one of the section's first lanes (round a terminal loop)
-            let (lane0, s0) = (traffic.cars[ci].ai.state.lane, traffic.cars[ci].ai.state.s);
+            let (lane0, s0, v0) = (traffic.cars[ci].ai.state.lane, traffic.cars[ci].ai.state.s, traffic.cars[ci].ai.state.speed);
             let net = &traffic.net;
             let (prefix, from) = match tour_entry(&section, lane0) {
                 Some(r) => (Vec::new(), r),
@@ -2549,14 +2559,18 @@ impl Schedule {
             };
             let route: Vec<usize> = prefix.iter().copied().chain(section[from..].iter().copied()).collect();
             let shift = prefix.len() as isize - from as isize;
-            // the stops from the bus on; one just behind it on its lane is where it stands
+            // the stops from the bus on; one just behind it on its lane is where it stands -
+            // [round 6 B2] or, handed over on the move at the end of its track, where it comes
+            // to rest braking gently (pinned at its front it stopped dead from speed)
+            let pin = if v0 > PIN_MOVING { s0 + v0 * v0 / (2.0 * PIN_DECEL) + 0.3 } else { s0 + 0.3 };
+            let pin = pin.min(traffic.net.lanes[lane0].length());
             let stops: Vec<(usize, f32, f32, f64, i64, f32)> = stops
                 .into_iter()
                 .filter(|st| st.0 >= from)
                 .filter_map(|(ri, ss, lat, t, id, side)| {
                     let nri = (ri as isize + shift) as usize;
                     if nri == 0 && ss <= s0 + 0.3 {
-                        (s0 - ss < 25.0).then_some((0, s0 + 0.3, 0.0, t, id, side))
+                        (s0 - ss < 25.0).then_some((0, pin, 0.0, t, id, side))
                     } else {
                         Some((nri, ss, lat, t, id, side))
                     }

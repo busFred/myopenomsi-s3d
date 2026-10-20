@@ -129,6 +129,10 @@ pub struct BusService {
     pull: f32,
     pull_to: Option<f32>,
     pulled_here: bool,
+    /// [round 6 B2] Its trip ended at the end of its route with no stop there (a track that
+    /// ends on a lane with a way on): it drives on until the timetable hands it the tour's
+    /// next trip or lets it go, rather than standing at the lane's end.
+    track_end: bool,
 }
 
 /// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
@@ -296,6 +300,136 @@ pub fn covers_through_lane(net: &Network, lane: usize, lateral: f32, half_width:
 /// holds up a car).
 pub fn covers_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
     net.lanes.get(lane).is_some_and(|l| lateral.abs() < half_width + l.width * 0.5 - 0.5)
+}
+
+/// [round 6 B1] A bus standing across the fan of lanes of a junction object holds up the
+/// traffic of the lanes beside its own (review-r6-cases case11: the layover bus on junction
+/// piece 12074 stood over the stretches of j30 while B2 looked at its own lane only). A lane
+/// of its object is covered when a car driving on its axis would come within this much (m)
+/// of the bus's body: `covers_lane`'s 0.5 m margin ...
+pub const FAN_COVER: f32 = 0.5;
+/// [round 6 B1] ... with the car this wide either side of the axis (m: the parked cars'
+/// half width the traffic plans with, `Traffic::tick`'s `Parked { half_width: 0.9 }`, and
+/// round a typical town car's 1.8 m). A lane 2.7 m or more off the axis of a 2.5 m bus is
+/// then not covered (a bus in a bay beside the through lane stays).
+pub const FAN_CAR_HALF: f32 = 0.9;
+/// [round 6 B1] A vehicle standing on a covered lane, or whose way runs into one within
+/// this far of its front (m), and held by the bus (it waits for it, follows it or is held
+/// by its body), queues behind the bus (the gap list's 40 m horizon of a junction approach,
+/// review-r6-cases section 1 case11).
+pub const FAN_QUEUE_REACH: f32 = 40.0;
+/// [round 6 B1] Lane samples are tested against the body this far apart (m).
+const FAN_STEP: f64 = 0.5;
+
+/// [round 6 B1] The other street lanes of the junction object whose piece `own` the bus
+/// stands on that its body covers: a car of `FAN_CAR_HALF` on the lane's axis would come
+/// within `FAN_COVER` of the body (origin `pos`, `heading` degrees clockwise from north,
+/// `front`/`rear` from the origin, `half_width`), and `through` says other vehicles drive
+/// the lane. None on a lane of a spline: the lanes beside it there are its own road's
+/// (`ThroughLanes::through` and `covers_lane` already judge it).
+#[allow(clippy::too_many_arguments)]
+pub fn fan_lanes_covered(net: &Network, own: usize, pos: glam::DVec2, heading: f32, front: f32, rear: f32, half_width: f32, through: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    let Some(here) = net.lanes.get(own) else { return Vec::new() };
+    let Some(key) = here.key.filter(|_| here.source == 2) else { return Vec::new() };
+    let h = (heading as f64).to_radians();
+    let (fwd, right) = (glam::DVec2::new(h.sin(), h.cos()), glam::DVec2::new(h.cos(), -h.sin()));
+    let (mid, half_len) = (((front - rear) * 0.5) as f64, ((front + rear) * 0.5) as f64);
+    // (a car's flank on the axis within FAN_COVER of the body: the axis within this of it)
+    let reach = (FAN_CAR_HALF + FAN_COVER) as f64;
+    // (the distance of a point from the body's rectangle)
+    let near_body = |q: glam::DVec2| {
+        let r = q - pos;
+        let along = (r.dot(fwd) - mid).abs() - half_len;
+        let across = r.dot(right).abs() - half_width as f64;
+        glam::DVec2::new(along.max(0.0), across.max(0.0)).length() < reach
+    };
+    let span = half_len + mid.abs() + reach + 1.0;
+    let cell = |v: f64| (v / 50.0).floor() as i32;
+    let mut out: Vec<usize> = Vec::new();
+    for cx in cell(pos.x - span)..=cell(pos.x + span) {
+        for cy in cell(pos.y - span)..=cell(pos.y + span) {
+            for &i in net.grid.get(&(cx, cy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let l = &net.lanes[i];
+                if i == own || out.contains(&i) || l.kind != LaneKind::Street || l.source != 2 || l.key.is_none_or(|k| (k.tile, k.id) != (key.tile, key.id)) {
+                    continue;
+                }
+                let covered = l.points.windows(2).any(|w| {
+                    let (a, b) = (w[0].truncate(), w[1].truncate());
+                    let n = ((b - a).length() / FAN_STEP).ceil().max(1.0) as usize;
+                    (0..=n).any(|k| near_body(a + (b - a) * (k as f64 / n as f64)))
+                });
+                if covered && through(i) {
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// [round 6 B1] One of the others for `fan_queue`.
+#[derive(Debug, Clone, Default)]
+pub struct FanOther {
+    pub id: u64,
+    /// The lane it is on, and its way's lanes with the distance of each one's start from
+    /// its front.
+    pub lane: usize,
+    pub way: Vec<(usize, f32)>,
+    pub speed: f32,
+    /// Seconds it has stood.
+    pub stood: f32,
+    /// The vehicle it follows.
+    pub lead: Option<u64>,
+    /// It stands at a stop of its own (a timetable bus serving its berth, or done with its
+    /// trip there): it waits for nobody.
+    pub serving: bool,
+    /// The bus is what holds it: it waits for the bus at a junction, follows it, or the
+    /// bus's body holds it (`Decision::wait_for` / `lead_id` / `body_block`).
+    pub held_by_bus: bool,
+}
+
+/// [round 6 B1] The queue at the lanes a bus covers (`fan_lanes_covered`): of the vehicles
+/// `others` the ones standing on a covered lane or whose way runs into one within
+/// `FAN_QUEUE_REACH` and that the bus holds, and the ones standing queued behind those (as
+/// far back as 30): the longest any of the first has stood, and how many stand in all.
+/// One standing there for anything else - a red light, a give-way, people - is no queue of
+/// the bus's (a bus off its stop over two fan lanes had five standing 60 s behind a light
+/// there, none for it: review-r6b-regression b1c-after bus 252), nor a bus at a stop of its
+/// own (two layovers at the berths of one fan would send each other round the block).
+pub fn fan_queue(fan: &[usize], others: &[FanOther]) -> (f32, usize) {
+    if fan.is_empty() {
+        return (0.0, 0);
+    }
+    let standing = |o: &FanOther| o.speed < 0.3 && !o.serving;
+    let mut chain: Vec<u64> = Vec::new();
+    let mut secs = 0.0f32;
+    for o in others.iter().filter(|o| standing(o) && o.held_by_bus) {
+        if fan.contains(&o.lane) || o.way.iter().any(|&(l, d)| d <= FAN_QUEUE_REACH && fan.contains(&l)) {
+            chain.push(o.id);
+            secs = secs.max(o.stood);
+        }
+    }
+    let mut k = 0;
+    while k < chain.len() && chain.len() <= 30 {
+        let id = chain[k];
+        for o in others.iter().filter(|o| standing(o)) {
+            if o.lead == Some(id) && !chain.contains(&o.id) {
+                chain.push(o.id);
+            }
+        }
+        k += 1;
+    }
+    (secs, chain.len())
+}
+
+/// [round 6 B1] A layover bus blocks the traffic and the queue asks it to go
+/// (`Traffic::bus_detour`): it covers its own through lane (`covers_through_lane`) and the
+/// queue behind it asks (`queue_asks_to_go`: `behind_secs` stood behind it, `behind` in the
+/// queue), or it covers lanes of its fan and the queue held there asks (`fan_queue`'s
+/// `fan_secs`, `fan_queued`).
+pub fn layover_asked_to_go(covers_own: bool, behind_secs: f32, behind: usize, fan: &[usize], fan_secs: f32, fan_queued: usize) -> bool {
+    (covers_own && queue_asks_to_go(behind_secs, behind)) || (!fan.is_empty() && queue_asks_to_go(fan_secs, fan_queued))
 }
 
 /// [ROLLBACK r4d-B2] The through lanes, as the traffic has driven them: a street lane is one
@@ -604,6 +738,7 @@ impl BusService {
             pull: 0.0,
             pull_to: None,
             pulled_here: false,
+            track_end: false,
         }
     }
 
@@ -626,6 +761,27 @@ impl BusService {
         self.phase == Phase::TripDone
     }
 
+    /// [round 6 B2] Its trip is over at the end of its track, and it drives on off the end
+    /// of its route (the planner does not hold it there: `External::trip_over`).
+    pub fn drives_off(&self) -> bool {
+        self.phase == Phase::TripDone && self.track_end
+    }
+
+    /// [round 6 B2] Driving with no stop left, it has reached the last lane of its route,
+    /// a street lane with a way on, and the route is complete (not `route_open`) and its own
+    /// (not round the block or to a place with room).
+    fn track_ends(&self, st: &AiState, net: &Network) -> bool {
+        self.phase == Phase::Running
+            && self.stops.is_empty()
+            && !self.route_open
+            && self.away.is_none()
+            && self.pending.is_none()
+            && !st.route.is_empty()
+            && st.route_index + 1 >= st.route.len()
+            && st.route.last() == Some(&st.lane)
+            && net.lanes.get(st.lane).is_some_and(|l| l.kind == LaneKind::Street && !l.next.is_empty())
+    }
+
     /// [ROLLBACK aiparked-73] Standing out a long layover with the engine off: it starts again
     /// `PARKED_START` before the doors open for the departure.
     pub fn parked(&self, day_time: f64) -> bool {
@@ -633,7 +789,7 @@ impl BusService {
         // the line waits for its next trip with the engine off, as one placed there does
         // (it stood with the engine running until the next trip was handed to it)
         if self.phase == Phase::TripDone {
-            return self.phase_t > TRIP_DONE_PARK;
+            return !self.track_end && self.phase_t > TRIP_DONE_PARK;
         }
         matches!(self.phase, Phase::Waiting | Phase::Boarding) && self.long_wait && self.leave_at - day_time > PARKED_START
     }
@@ -652,6 +808,7 @@ impl BusService {
             Phase::Boarding => self.boarding.max(0.0) + 2.0 + wait,
             Phase::Waiting => wait + 2.0,
             Phase::Closing => 1.0,
+            Phase::TripDone if self.track_end => 0.0,
             Phase::TripDone => 600.0,
         }
     }
@@ -687,6 +844,7 @@ impl BusService {
         self.pace = 1.0;
         self.pace_target = None;
         self.left_early = false;
+        self.track_end = false;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -995,6 +1153,8 @@ impl BusService {
         self.phase_t += ctx.dt;
         let here = Some(st.front);
         match self.phase {
+            // [round 6 B2] (at the end of its track it drives on: no stop)
+            Phase::TripDone if self.track_end => None,
             Phase::TripDone => here,
             Phase::Waiting => {
                 self.wait(ctx);
@@ -1054,6 +1214,18 @@ impl BusService {
             let Some(stop) = self.stops.front().copied() else {
                 if !ctx.passing {
                     st.lateral_target = ctx.kerb_swerve.unwrap_or(0.0);
+                }
+                // [round 6 B2] the end of its track with no stop left: its trip is over here
+                // (the timetable hands it the tour's next trip where it is, or lets it go),
+                // as at its last stop - not on at a tile edge (`route_open`: it waits for the
+                // tiles), nor round the block, nor at a dead end (the road ends: it drives
+                // off it and its trip comes back past it, r4d-B1)
+                if self.track_ends(st, ctx.net) {
+                    self.track_end = true;
+                    self.set_phase(Phase::TripDone);
+                    st.signal = 0;
+                    st.signal_time = 0.0;
+                    log::info!("t={:.1}: timetable bus {} at the end of its track on lane {} with no stop left: its trip is over", ctx.day_time, ctx.id, st.lane);
                 }
                 return None;
             };
@@ -2087,5 +2259,193 @@ mod tests {
         s.phase = Phase::Boarding;
         s.stops.clear();
         assert_eq!(s.at_station_side(), 0.0);
+    }
+
+    /// [round 6 B1] A fan of a junction object: lane 0 runs north from the origin, lane 1
+    /// leaves the same point to the north-west, lane 2 lies 10 m to the east (all pieces of
+    /// object 12074), lane 3 is another object's on top of lane 1, lane 4 a spline's.
+    fn fan() -> Network {
+        use omsi_sim::traffic::{LaneBuilder, LaneKey};
+        let p = |x: f64, y: f64| glam::DVec3::new(x, y, 0.0);
+        let piece = |pts: Vec<glam::DVec3>, id: i64, path: u16, source: u32| {
+            let mut l = LaneBuilder::polyline(pts, LaneKind::Street, 3.0);
+            l.key = Some(LaneKey { tile: (0, 0), id, path });
+            l.source = source;
+            l
+        };
+        let mut net = Network {
+            lanes: vec![
+                piece(vec![p(0.0, 0.0), p(0.0, 30.0)], 12074, 0, 2),
+                piece(vec![p(0.0, 0.0), p(-8.0, 30.0)], 12074, 1, 2),
+                piece(vec![p(10.0, 0.0), p(10.0, 30.0)], 12074, 2, 2),
+                piece(vec![p(0.0, 0.0), p(-8.0, 30.0)], 999, 0, 2),
+                piece(vec![p(0.0, -40.0), p(0.0, 0.0)], 5, 0, 1),
+            ],
+            ..Default::default()
+        };
+        net.link(1.5);
+        net
+    }
+
+    #[test]
+    fn b1_a_layover_bus_across_a_junction_fan_covers_the_lanes_beside_its_own() {
+        let net = fan();
+        let all = |_: usize| true;
+        // a 12 m bus 8 m into lane 0: its body lies over lane 1 where that leaves lane 0
+        let at = |x: f64, y: f64| glam::DVec2::new(x, y);
+        assert_eq!(fan_lanes_covered(&net, 0, at(0.0, 8.0), 0.0, 6.0, 6.0, 1.25, &all), vec![1], "lane 1 of its object; not lane 2 10 m off, nor another object's");
+        // the lane only counts when the traffic drives it
+        assert!(fan_lanes_covered(&net, 0, at(0.0, 8.0), 0.0, 6.0, 6.0, 1.25, &|l| l != 1).is_empty());
+        // pulled 3.2 m into a bay to the right: clear of lane 1 (counter-case: it stays)
+        assert!(fan_lanes_covered(&net, 0, at(3.2, 8.0), 0.0, 6.0, 6.0, 1.25, &all).is_empty());
+        // further up, where lane 1 is more than half a metre off its flank: nothing
+        assert!(fan_lanes_covered(&net, 0, at(0.0, 26.0), 0.0, 4.0, 4.0, 1.25, &all).is_empty());
+        // on a spline's lane: the lanes beside are its road's, `covers_lane` judges them
+        assert!(fan_lanes_covered(&net, 4, at(0.0, -20.0), 0.0, 6.0, 6.0, 1.25, &all).is_empty());
+        // a lane of its object alongside: covered while a car (0.9 m) on its axis would come
+        // within 0.5 m of the body, not when it is 2.7 m or more off the bus's axis
+        let beside = |x: f64| {
+            use omsi_sim::traffic::{LaneBuilder, LaneKey};
+            let piece = |x0: f64, path: u16| {
+                let mut l = LaneBuilder::polyline(vec![glam::DVec3::new(x0, 0.0, 0.0), glam::DVec3::new(x0, 30.0, 0.0)], LaneKind::Street, 3.0);
+                l.key = Some(LaneKey { tile: (0, 0), id: 12074, path });
+                l.source = 2;
+                l
+            };
+            let mut n = Network { lanes: vec![piece(0.0, 0), piece(x, 1)], ..Default::default() };
+            n.link(1.5);
+            fan_lanes_covered(&n, 0, at(0.0, 15.0), 0.0, 6.0, 6.0, 1.25, &all)
+        };
+        assert_eq!(beside(2.5), vec![1], "0.35 m from a car on it");
+        assert!(beside(2.7).is_empty() && beside(2.9).is_empty(), "a car there is 0.55 m or more clear");
+    }
+
+    #[test]
+    fn b1_the_queue_at_a_covered_fan_lane_counts_who_the_bus_holds_there_and_behind() {
+        let fan = [1usize];
+        let o = |id: u64, lane: usize, way: Vec<(usize, f32)>, speed: f32, stood: f32, lead: Option<u64>, held_by_bus: bool| FanOther { id, lane, way, speed, stood, lead, serving: false, held_by_bus };
+        let others: Vec<FanOther> = vec![
+            // waiting for the bus on the covered lane 25 s, and one behind it
+            o(10, 1, vec![(1, -3.0)], 0.0, 25.0, None, true),
+            o(11, 7, vec![(7, -2.0), (1, 6.0)], 0.0, 12.0, Some(10), false),
+            // held by it 30 m before the lane on its way, and 50 m before it (too far)
+            o(12, 8, vec![(8, -5.0), (1, 30.0)], 0.1, 8.0, None, true),
+            o(13, 9, vec![(9, -5.0), (1, 50.0)], 0.0, 90.0, None, true),
+            // driving onto it: no queue
+            o(14, 9, vec![(9, -5.0), (1, 10.0)], 4.0, 0.0, None, true),
+            // another bus at its own berth on the covered lane: waits for nobody
+            FanOther { serving: true, ..o(15, 1, vec![(1, -12.0)], 0.0, 300.0, None, true) },
+            // standing on the covered lane 60 s for a light, not for the bus (b1c-after bus 252)
+            o(16, 1, vec![(1, -20.0)], 0.0, 60.0, None, false),
+            o(17, 6, vec![(6, -2.0), (1, 4.0)], 0.0, 60.0, Some(16), false),
+        ];
+        let (secs, n) = fan_queue(&fan, &others);
+        assert_eq!(n, 3, "10, 11 and 12");
+        assert!((secs - 25.0).abs() < 1e-6, "{secs}");
+        assert!(queue_asks_to_go(secs, n), "past LAYOVER_QUEUE");
+        // nobody it holds at a covered lane: no queue (a roadside layover with nobody behind
+        // stays), however many stand there for something else
+        assert_eq!(fan_queue(&fan, &others[3..]), (0.0, 0), "nor a bus at its own berth there");
+        assert_eq!(fan_queue(&[], &others), (0.0, 0));
+        assert!(!queue_asks_to_go(0.0, 0));
+    }
+
+    /// [round 6 B1] `Traffic::bus_detour`'s ask: the own lane's queue only while the bus
+    /// covers its own through lane, the fan's only with a fan; neither mixed into the other.
+    #[test]
+    fn b1_a_layover_is_asked_to_go_by_the_queue_of_what_it_covers() {
+        // its own through lane, 25 s stood behind it
+        assert!(layover_asked_to_go(true, 25.0, 1, &[], 0.0, 0));
+        // in a bay (its own lane not covered): the queue behind is not its
+        assert!(!layover_asked_to_go(false, 25.0, 4, &[], 0.0, 0));
+        // its fan, the queue it holds there
+        assert!(layover_asked_to_go(false, 0.0, 0, &[3], 21.0, 1));
+        assert!(layover_asked_to_go(false, 0.0, 0, &[3], 5.0, 4));
+        assert!(!layover_asked_to_go(false, 0.0, 0, &[3], 5.0, 3));
+        // a fan queue without a fan, or the own lane's queue with only the fan covered: no
+        assert!(!layover_asked_to_go(false, 0.0, 0, &[], 30.0, 5));
+        assert!(!layover_asked_to_go(false, 30.0, 5, &[3], 0.0, 0));
+    }
+
+    /// [round 6 B2] Lane 0 north 200 m into lane 1 (100 m) and on into lane 3, and lane 2 that
+    /// runs into nothing.
+    fn track() -> Network {
+        use omsi_sim::traffic::LaneBuilder;
+        let p = |x: f64, y: f64| glam::DVec3::new(x, y, 0.0);
+        let mut net = Network {
+            lanes: vec![
+                LaneBuilder::polyline(vec![p(0.0, 0.0), p(0.0, 200.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(0.0, 200.0), p(0.0, 300.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(50.0, 0.0), p(50.0, 200.0)], LaneKind::Street, 3.5),
+                LaneBuilder::polyline(vec![p(0.0, 300.0), p(0.0, 400.0)], LaneKind::Street, 3.5),
+            ],
+            ..Default::default()
+        };
+        net.link(1.5);
+        net
+    }
+
+    fn bus_on(route: Vec<usize>, s: f32) -> AiState {
+        let mut st = AiState::new(route[0], s, 1);
+        st.front = 6.0;
+        st.rear = 6.0;
+        st.speed = 8.0;
+        st.max_speed_kmh = 50.0;
+        st.route = route;
+        st.plan_next(&track());
+        st
+    }
+
+    #[test]
+    fn b2_a_bus_at_the_end_of_its_track_with_no_stop_left_has_done_its_trip_and_drives_on() {
+        let net = track();
+        assert_eq!((net.lanes[0].next.as_slice(), net.lanes[1].next.as_slice()), (&[1][..], &[3][..]));
+        let mut v = test_vehicle();
+        // T11's case: no stop left, the route complete, the last lane goes on
+        let mut s = BusService::new(Vec::new());
+        let mut st = bus_on(vec![0, 1], 150.0);
+        let t = drive(&mut s, &mut st, &mut v, &net, 100.0, 60.0, |_, s, _| s.trip_done());
+        assert!(s.trip_done() && s.drives_off(), "trip over on its last lane: {:?} lane {}", s.phase, st.lane);
+        assert_eq!(st.lane, 1);
+        assert!(st.speed > 5.0, "no stop on the way: {}", st.speed);
+        // it drives on (no stop asked for), engine running, nobody waits for it to go
+        let way = omsi_traffic::perception::way_lanes(&net, &st, 200.0);
+        let mut ctx = ctx_on(&net, &way, t + 30.0, 0.0);
+        ctx.dt = 30.0;
+        assert_eq!(s.step(&mut st, &mut v, &ctx), None);
+        assert!(!s.parked(t + 30.0) && s.standing_for(t + 30.0) == 0.0);
+        // the tour's next trip handed over: an ordinary trip again
+        s.restart(vec![Stop { ri: 0, s: 50.0, bay: 0.0, depart: 400.0, id: 9, side: 0.0 }], true);
+        assert!(!s.trip_done() && !s.drives_off());
+
+        // counter-case: at the edge of the loaded map (`route_open`) it waits for the tiles
+        let mut s = BusService::new(Vec::new());
+        s.route_open = true;
+        let mut st = bus_on(vec![0, 1], 150.0);
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 15.0, |_, _, st| st.lane == 1 && st.s > 30.0);
+        assert_eq!((st.lane, s.phase), (1, Phase::Running));
+
+        // counter-case: a dead end (lane 2 runs into nothing) - it drives off it, its trip
+        // comes back past it (r4d-B1): not over
+        let mut s = BusService::new(Vec::new());
+        let mut st = bus_on(vec![2], 100.0);
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 10.0, |_, _, st| st.s > 160.0);
+        assert_eq!(s.phase, Phase::Running);
+    }
+
+    #[test]
+    fn b2_a_terminus_stop_on_the_last_lane_is_served_before_the_trip_is_over() {
+        let net = track();
+        let mut v = test_vehicle();
+        let mut s = BusService::new(vec![Stop { ri: 1, s: 50.0, bay: 0.0, depart: 130.0, id: 9, side: 0.0 }]);
+        let mut st = bus_on(vec![0, 1], 150.0);
+        let mut served = false;
+        drive(&mut s, &mut st, &mut v, &net, 100.0, 120.0, |_, s, _| {
+            served |= s.at_stop();
+            s.trip_done()
+        });
+        assert!(served, "it stopped at its terminus first");
+        assert!(s.trip_done() && !s.drives_off(), "then its trip is over there, standing (as before round 6)");
+        assert!(st.lane == 1 && (st.s - 50.0).abs() < 2.5 && st.speed < 0.3, "at its stop: s {} speed {}", st.s, st.speed);
     }
 }

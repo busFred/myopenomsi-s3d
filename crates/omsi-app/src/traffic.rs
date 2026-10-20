@@ -3136,10 +3136,54 @@ impl Traffic {
         chain.len() - 1
     }
 
+    /// [round 6 B1] The lanes beside its own of the junction object timetable bus `i` stands
+    /// on that its body covers (`bus_service::fan_lanes_covered`); none while it drives.
+    fn fan_cover(&self, i: usize) -> Vec<usize> {
+        let c = &self.cars[i];
+        let st = &c.ai.state;
+        if c.bus.is_none() || c.is_rail() || st.speed >= 0.3 {
+            return Vec::new();
+        }
+        let through = |l: usize| self.through.through(&self.net, l, c.id);
+        crate::bus_service::fan_lanes_covered(&self.net, st.lane, c.ai.pos.truncate(), c.ai.heading, st.front, st.rear, c.half_width, &through)
+    }
+
+    /// [round 6 B1] The queue at the lanes `fan` timetable bus `i` covers
+    /// (`bus_service::fan_queue`): the longest anybody it holds has stood there, and how
+    /// many stand.
+    fn fan_queue(&self, i: usize, fan: &[usize]) -> (f32, usize) {
+        if fan.is_empty() {
+            return (0.0, 0);
+        }
+        let me = self.cars[i].id;
+        let reach = crate::bus_service::FAN_QUEUE_REACH;
+        let others: Vec<crate::bus_service::FanOther> = self
+            .cars
+            .iter()
+            .filter(|o| o.id != me && o.ai.state.speed < 0.3)
+            .map(|o| {
+                let st = &o.ai.state;
+                let way: Vec<(usize, f32)> = omsi_traffic::perception::way_lanes(&self.net, st, reach + st.front).into_iter().map(|(l, d)| (l, d - st.front)).collect();
+                let last = &o.ai.last;
+                crate::bus_service::FanOther {
+                    id: o.id,
+                    lane: st.lane,
+                    way,
+                    speed: st.speed,
+                    stood: o.ai.stopped,
+                    lead: last.lead_id,
+                    serving: o.at_stop() || o.trip_done(),
+                    held_by_bus: last.wait_for == Some(me) || last.lead_id == Some(me) || last.body_block == Some(me),
+                }
+            })
+            .collect();
+        crate::bus_service::fan_queue(fan, &others)
+    }
+
     /// [ROLLBACK r4d-B2] Timetable bus `i` stands out its layover (or queues for an occupied
     /// berth) across a through lane and the queue behind it asks it to go: a way off
     /// (`bus_service::plan_detour`). None when it need not go; Some(None) when nothing fits.
-    fn bus_detour(&self, i: usize, queue_behind_secs: f32) -> Option<Option<crate::bus_service::Detour>> {
+    fn bus_detour(&self, i: usize, queue_behind_secs: f32, fan: &[usize], fan_secs: f32, fan_queued: usize) -> Option<Option<crate::bus_service::Detour>> {
         let c = &self.cars[i];
         let b = c.bus.as_ref()?;
         let st = &c.ai.state;
@@ -3153,10 +3197,10 @@ impl Traffic {
         let near = st.route_distance(&self.net, stop.ri, stop.s);
         let left = b.detour_wanted(st.speed, self.day_time, queued && near < 60.0)?;
         let through = self.through.through(&self.net, st.lane, c.id);
-        if !crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, c.half_width, through) {
-            return None;
-        }
-        if !crate::bus_service::queue_asks_to_go(queue_behind_secs, self.queued_behind(i)) {
+        // [round 6 B1] (or the lanes beside its own of the junction object it stands on, and
+        // the queue it holds there)
+        let covers_own = crate::bus_service::covers_through_lane(&self.net, st.lane, st.lateral, c.half_width, through);
+        if !crate::bus_service::layover_asked_to_go(covers_own, queue_behind_secs, self.queued_behind(i), fan, fan_secs, fan_queued) {
             return None;
         }
         // back to where it stands, or to its stop point when that lies on this lane ahead
@@ -3323,6 +3367,11 @@ impl Traffic {
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
             // how long somebody has stood right behind this bus (a roadside layover gives
             // way to the traffic it holds up)
+            // [round 6 B1] the lanes beside its own it covers at a junction, and the queue it
+            // holds there: for its layover's way off only (`bus_detour`), not the roadside
+            // layover's early start nor the early-start lead's wait
+            let fan = self.fan_cover(i);
+            let (fan_secs, fan_queued) = self.fan_queue(i, &fan);
             let queue_behind_secs = if self.cars[i].bus.is_some() {
                 let me = &self.cars[i];
                 let cars = self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me.id) && o.ai.state.speed < 0.3).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
@@ -3340,7 +3389,7 @@ impl Traffic {
             } else {
                 0.0
             };
-            let mut detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs) } else { None };
+            let mut detour = if self.cars[i].bus.is_some() { self.bus_detour(i, queue_behind_secs, &fan, fan_secs, fan_queued) } else { None };
             // [ROLLBACK r4d-B3] a vehicle close behind it (the player's too), and its body over
             // a through lane
             let (close_behind, covers_through) = if self.cars[i].bus.is_some() {
@@ -3408,6 +3457,8 @@ impl Traffic {
                     None => {}
                 }
                 ext.stop_at = service.step(&mut car.ai.state, &mut car.vehicle, &ctx);
+                // [round 6 B2] its trip over at the end of its track: on off the route's end
+                ext.trip_over = service.drives_off();
                 if std::mem::take(&mut service.rerouted) {
                     // (the route it drives now, for the recording)
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);

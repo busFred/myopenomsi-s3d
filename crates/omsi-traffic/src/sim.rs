@@ -154,6 +154,11 @@ pub struct External {
     pub standing_for: f32,
     /// `TrafficPriority`: goes first at junctions.
     pub priority: bool,
+    /// [round 6 B2] A timetable bus whose trip is over at the end of its track (no stop left,
+    /// the route complete, its last lane with a way on): it drives on off its route's end
+    /// rather than standing there (`plan` rule 10).
+    #[serde(default)]
+    pub trip_over: bool,
 }
 
 /// The last decision, kept for consumers and the debug overlay. Other vehicles are named

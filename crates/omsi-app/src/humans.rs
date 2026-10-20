@@ -2660,6 +2660,102 @@ fn on_carriageway(net: &Network, q: DVec3) -> bool {
     false
 }
 
+/// [round 6 B3] Somebody waiting for a bus keeps clear of a street lane's axis by half the
+/// lane's width, or half the widest random vehicle's when that is wider (m: BeijingCity's
+/// Daba coaches are 2.52 m, a few trucks 2.55), ...
+const WAITER_VEHICLE_WIDTH: f64 = 2.6;
+/// ... plus a body's radius (`perception::BODY_RADIUS`) and `KERB_CLEAR`: a car-class coach
+/// passing in the middle of the lane is then clear of them by 0.3 m and holds for nobody
+/// there (review-r6-cases case02: nine waiters 1.46-1.55 m off the axis of bus lane 622,
+/// width 1 m, held two 11.6 m coaches 148 s, in the 2 cm band between the hold at hw+0.3 and
+/// the release at hw+0.28).
+const WAITER_BODY: f64 = 0.28;
+/// [round 6 B3] A waiting place is moved at most this far (m) to clear the lanes; one that
+/// needs more (a platform between two lanes) stays where the map has it.
+const WAITER_PUSH_MAX: f64 = 1.0;
+
+/// [round 6 B3] How far from the axis of street lane `l` somebody waiting for a bus keeps.
+fn waiter_reach(l: &omsi_sim::traffic::Lane) -> f64 {
+    (l.width as f64).max(WAITER_VEHICLE_WIDTH) * 0.5 + WAITER_BODY + KERB_CLEAR
+}
+
+/// [round 6 B3] `q`, moved straight away from the axes of the street lanes it is closer to
+/// than `waiter_reach` (at its height); `q` itself when nothing is that close, or when
+/// clearing them would take it more than `WAITER_PUSH_MAX` or into another lane.
+pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
+    // (the lane's polyline point nearest to `p`, and how far: as `Lane::nearest_point`)
+    let nearest = |l: &omsi_sim::traffic::Lane, p: DVec3| -> Option<(DVec3, f64)> {
+        let mut best: Option<(DVec3, f64)> = None;
+        for w in l.points.windows(2) {
+            let ab = w[1] - w[0];
+            let t = ((p - w[0]).truncate().dot(ab.truncate()) / ab.truncate().length_squared().max(1e-9)).clamp(0.0, 1.0);
+            let c = w[0] + ab * t;
+            let d = (c - p).truncate().length();
+            if (c.z - p.z).abs() < 2.5 && best.is_none_or(|b| d < b.1) {
+                best = Some((c, d));
+            }
+        }
+        best
+    };
+    // (the street lane it is deepest in, by how much)
+    let worst = |p: DVec3| -> Option<(DVec3, f64, f64)> {
+        let (cx, cy) = ((p.x / 50.0).floor() as i32, (p.y / 50.0).floor() as i32);
+        let mut out: Option<(DVec3, f64, f64)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &i in net.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    let l = &net.lanes[i];
+                    if l.kind != LaneKind::Street {
+                        continue;
+                    }
+                    let reach = waiter_reach(l);
+                    if let Some((c, d)) = nearest(l, p) {
+                        if d < reach - 1e-3 && out.is_none_or(|o| reach - d > o.2 - o.1) {
+                            out = Some((c, d, reach));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    };
+    let mut p = q;
+    for _ in 0..4 {
+        let Some((c, _, reach)) = worst(p) else {
+            return if (p - q).truncate().length() <= WAITER_PUSH_MAX { p } else { q };
+        };
+        let away = (p - c).truncate();
+        if away.length() < 1e-3 {
+            return q;
+        }
+        let to = c.truncate() + away.normalize() * (reach + 0.01);
+        p = DVec3::new(to.x, to.y, p.z);
+        if (p - q).truncate().length() > WAITER_PUSH_MAX {
+            return q;
+        }
+    }
+    if worst(p).is_none() { p } else { q }
+}
+
+/// [round 6 B3] The waiting places of `stop` (not the seats: a bench stays where it is)
+/// and its point, cleared of the street lanes (`clear_of_lanes`): the places that moved.
+fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> Vec<usize> {
+    let mut moved = Vec::new();
+    for (k, sp) in stop.spots.iter_mut().enumerate() {
+        if sp.height != 0.0 {
+            continue;
+        }
+        let to = clear_of_lanes(net, sp.pos);
+        if (to - sp.pos).length() > 1e-3 {
+            sp.pos = to;
+            moved.push(k);
+        }
+    }
+    stop.kerb_shift = clear_of_lanes(net, stop.pos) - stop.pos;
+    stop.cleared = true;
+    moved
+}
+
 /// [ROLLBACK r4c-P3] Where somebody waits before stepping onto `next` at the end of `way` (the
 /// legs walked up to the kerb, the last first): a step back from the kerb and spread along
 /// it, outside every carriageway lane's footprint. A kerb inside one (a short piece at the
@@ -4364,6 +4460,31 @@ impl Humans {
             let st = self.build_pax_stop(world, net, id, pos, rot, &name);
             self.stops.insert(id, st);
         }
+        // [round 6 B3] the stops set up before the network was there: their places cleared
+        // of the street lanes now, and whoever is at a place that moved walks to it
+        if let Some(net) = net {
+            let mut ids: Vec<i64> = self.stops.iter().filter(|(_, s)| !s.cleared).map(|(&id, _)| id).collect();
+            ids.sort_unstable();
+            for id in ids {
+                let moved = clear_stop_of_lanes(self.stops.get_mut(&id).unwrap(), net);
+                if moved.is_empty() {
+                    continue;
+                }
+                let spots: Vec<DVec3> = self.stops[&id].spots.iter().map(|sp| sp.pos).collect();
+                for p in self.people.iter_mut() {
+                    if let State::Pax(x) = &mut p.state {
+                        let Some(k) = x.spot.filter(|k| moved.contains(k)) else { continue };
+                        if x.stop == Some(id) && x.inside.is_none() && matches!(x.task, Task::WaitingForBus | Task::WalkingToBusstop) && x.st <= 1 {
+                            // (the few steps there, as to any waiting place)
+                            x.task = Task::WalkingToBusstop;
+                            x.target = spots[k];
+                            x.target_bus = false;
+                            x.st = 1;
+                        }
+                    }
+                }
+            }
+        }
         self.started = true;
     }
 
@@ -4453,7 +4574,7 @@ impl Humans {
             Some(n) => n.get(&id).cloned().unwrap_or_else(|| id.to_string()),
             None => String::new(),
         };
-        PaxStop {
+        let mut stop = PaxStop {
             name: name.to_string(),
             alias,
             pos,
@@ -4473,7 +4594,13 @@ impl Humans {
             buses: Vec::new(),
             dests,
             lines,
+            cleared: false,
+            kerb_shift: DVec3::ZERO,
+        };
+        if let Some(net) = net {
+            clear_stop_of_lanes(&mut stop, net);
         }
+        stop
     }
 
     /// The stops near the player fill with people (sub_61bf94, every frame): a stop coming
@@ -10393,6 +10520,64 @@ mod ped_tests {
         // caught before the middle: back on the near pavement, never standing in the road
         assert!(end.y < -5.0, "{end:?}");
         assert!(stood < 0.2, "{stood}");
+    }
+
+    /// [round 6 B3] A bus waiter's place keeps `max(w, 2.6)/2 + 0.58` from a street lane's
+    /// axis (case02: waiters 1.46-1.55 m off bus lane 622, 1 m wide, held 11.6 m coaches
+    /// 148 s): a place in that band moves out of it; one clear of it, one on another level,
+    /// and one between two lanes (a platform) stay where they are; seats stay.
+    #[test]
+    fn b3_bus_waiters_stand_clear_of_the_widest_vehicle_in_the_lane() {
+        use omsi_sim::traffic::LaneBuilder;
+        let p = |x: f64, y: f64| DVec3::new(x, y, 0.0);
+        let road = |width: f32, other: bool| {
+            let mut lanes = vec![LaneBuilder::polyline(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, width)];
+            if other {
+                lanes.push(LaneBuilder::polyline(vec![p(50.0, 3.5), p(-50.0, 3.5)], LaneKind::Street, width));
+            }
+            let mut net = Network { lanes, ..Default::default() };
+            net.link(1.5);
+            net
+        };
+        let net = road(1.0, false);
+        let reach = 1.3 + 0.28 + 0.3;
+        for y in [1.46, 1.5, 1.55, -1.5] {
+            let q = clear_of_lanes(&net, p(3.0, y));
+            assert!((q.y.abs() - reach).abs() < 0.02 && q.y.signum() == f64::signum(y) && (q.x - 3.0).abs() < 1e-6, "{y} -> {q:?}");
+        }
+        assert_eq!(clear_of_lanes(&net, p(3.0, 2.2)), p(3.0, 2.2), "clear already");
+        assert_eq!(clear_of_lanes(&net, DVec3::new(3.0, 1.5, 6.0)), DVec3::new(3.0, 1.5, 6.0), "on a bridge above");
+        // a wide lane: its own half width counts
+        assert!((clear_of_lanes(&road(3.5, false), p(0.0, 2.0)).y - (1.75 + 0.58)).abs() < 0.02);
+        // between two lanes 3.5 m apart there is no clear place within a metre: it stays
+        assert_eq!(clear_of_lanes(&road(1.0, true), p(0.0, 1.75)), p(0.0, 1.75));
+        // a stop's places: the standing one moves, the bench does not
+        let mut stop = PaxStop {
+            name: String::new(),
+            alias: String::new(),
+            pos: p(0.0, 1.5),
+            heading: 90.0,
+            gather: p(0.0, 1.5),
+            spots: vec![WaitSpot { pos: p(1.0, 1.5), face: 0.0, height: 0.0 }, WaitSpot { pos: p(2.0, 1.5), face: 0.0, height: 0.45 }, WaitSpot { pos: p(3.0, 3.0), face: 0.0, height: 0.0 }],
+            taken: vec![false; 3],
+            enter_max: 1.0,
+            enter_min: 0.0,
+            length: 30.0,
+            lane: None,
+            was_near: false,
+            near: false,
+            clock_ms: 0.0,
+            want: 0,
+            factor: 1.0,
+            buses: Vec::new(),
+            dests: Vec::new(),
+            lines: Vec::new(),
+            cleared: false,
+            kerb_shift: DVec3::ZERO,
+        };
+        assert_eq!(clear_stop_of_lanes(&mut stop, &net), vec![0]);
+        assert!(stop.cleared && (stop.spots[0].pos.y - reach).abs() < 0.02 && stop.spots[1].pos.y == 1.5 && stop.spots[2].pos.y == 3.0);
+        assert!((stop.kerb_shift.y - (reach - 1.5)).abs() < 0.02);
     }
 }
 

@@ -88,6 +88,40 @@ fn a_timetable_bus_drives_off_a_dead_end_and_stops_at_a_route_end_that_goes_on()
     assert!((vs[0].state.s + vs[0].state.front - 150.0).abs() < 1.0, "at its stop: s {}", vs[0].state.s);
 }
 
+/// [round 6 B2] A timetable bus whose trip is over at the end of its track
+/// (`External::trip_over`: no stop left, the route complete) is not held at the end of its
+/// route where the road goes on (case08: T11's bus stood 11.7 min at Why::End on lane
+/// 10871, next [10468]): it drives on as off a dead end; without the flag (a route still
+/// open at a tile edge, a stop pending) it stops there as before.
+#[test]
+fn b2_a_bus_whose_trip_is_over_at_its_track_end_is_not_held_there() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (200.0, 0.0)]), lane(&[(200.0, 0.0), (300.0, 0.0)])]);
+    assert_eq!(net.lanes[0].next, vec![1]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 10.0)];
+    let mut whys = Vec::new();
+    let gone = run(&net, &mut sim, &mut vs, 40.0, |_, _, vs| {
+        for v in vs.iter_mut() {
+            v.external.trip_over = true;
+        }
+        whys.extend(vs.iter().map(|v| v.last.why));
+    });
+    assert!(!whys.contains(&Why::End), "never held at the end");
+    assert_eq!(gone.len(), 1, "off the end of its route");
+    assert!(gone[0].2 > 6.0, "at its speed: {:?}", gone[0]);
+    // (the flag is the planner's only exemption: a stop of the service still holds it)
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 40.0, 10.0)];
+    let gone = run(&net, &mut sim, &mut vs, 60.0, |_, _, vs| {
+        if let Some(v) = vs.first_mut() {
+            v.external.trip_over = true;
+            v.external.stop_at = Some(150.0 - v.state.s);
+        }
+    });
+    assert!(gone.is_empty());
+    assert!((vs[0].state.s + vs[0].state.front - 150.0).abs() < 1.0, "at its stop: s {}", vs[0].state.s);
+}
+
 /// A bus on lane 0 (east along y = 0) coming up to its stop: its front comes to rest at
 /// x = 150, in the bay 1.23 m right of the lane (as the service asks).
 fn to_the_stop(v: &mut Vehicle) {
@@ -156,4 +190,36 @@ fn a_bus_pulls_up_to_its_pole_beside_the_people_and_only_one_in_its_way_holds_it
     let b = &vs[0];
     assert!((b.state.s + b.state.front - 150.0).abs() < 0.6, "crept up to its pole: front at {}", b.state.s + b.state.front);
     assert!(!reset_by_creep);
+}
+
+/// [round 6 B3] Why bus waiters' places keep `max(w, 2.6)/2 + 0.58` m off a lane's axis
+/// (humans.rs `clear_of_lanes`): an 11.6 m coach of the random traffic (car class, 1.26 m
+/// half width: BeijingCity's Daba HHF.ovh) in the middle of a 1 m bus lane is held by one
+/// standing 1.46-1.55 m off its way (case02's waiters, 148 s), as by any car - their body
+/// within 0.3 m of its flank - and passes one standing where the places are moved to, 1.88 m.
+#[test]
+fn b3_a_coach_passes_bus_waiters_standing_clear_of_the_lane() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
+    let pass = |off: f64| {
+        let mut st = AiState::new(0, 40.0, 1);
+        st.speed = 8.0;
+        st.front = 5.8;
+        st.rear = 5.8;
+        st.length = 11.6;
+        st.max_speed_kmh = 50.0;
+        let mut v = Vehicle::new(1, VehicleClass::Car, st, 1.26, 7919);
+        v.fresh = 0.0;
+        let mut sim = Simulation::new(&net, vec![]);
+        sim.people = (0..9).map(|k| person(80.0 + k as f64 * 0.8, -off, true)).collect();
+        let mut vs = vec![v];
+        let mut held = false;
+        run(&net, &mut sim, &mut vs, 12.0, |_, _, vs| held |= vs[0].last.why == Why::People);
+        (held, vs[0].state.s)
+    };
+    for off in [1.0, 1.46, 1.55] {
+        let (held, s) = pass(off);
+        assert!(held && s + 5.8 < 80.0, "held by them {off} m off: s {s}");
+    }
+    let (held, s) = pass(1.3 + 0.28 + 0.3);
+    assert!(!held && s > 90.0, "past them at 1.88 m: s {s}");
 }
