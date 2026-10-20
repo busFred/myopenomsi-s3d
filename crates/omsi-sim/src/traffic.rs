@@ -2818,6 +2818,11 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     if lane.kind != kind || kind == LaneKind::Sidewalk {
         return Err(Closed::Kind);
     }
+    // (a rail or a flight path is its vehicle's whatever the road rules and the traffic
+    // densities say: those are the street traffic's)
+    if kind != LaneKind::Street {
+        return Ok(());
+    }
     if !lane.allows(st.veh_type) {
         return Err(Closed::Rules);
     }
