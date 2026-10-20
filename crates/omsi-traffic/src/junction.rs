@@ -199,13 +199,17 @@ impl Junctions {
         for a in 0..net.lanes.len().min(net.crossings.len()) {
             for c in &net.crossings[a] {
                 let b = c.other;
-                if !c.merge || b <= a || !net.lanes[a].next.iter().any(|n| net.lanes.get(b).is_some_and(|lb| lb.next.contains(n))) {
+                // (a merge between lanes of no one object: a lane join, or lanes converging side
+                // by side before one, `Network::compile_joins`)
+                if !c.merge || b <= a || b >= net.lanes.len() {
                     continue;
                 }
                 if object(a).is_some() && object(a) == object(b) {
                     continue;
                 }
-                for &n in net.lanes[a].next.iter().filter(|n| net.lanes[b].next.contains(n)) {
+                let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
+                let ways_on: Vec<usize> = if shared.is_empty() { net.lanes[a].next.iter().chain(&net.lanes[b].next).copied().collect() } else { shared };
+                for n in ways_on {
                     into.push((a, n));
                 }
                 parent.entry(a).or_insert(a);

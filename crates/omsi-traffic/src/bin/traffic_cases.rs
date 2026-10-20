@@ -5294,7 +5294,24 @@ fn joins(args: &[String]) -> Res<()> {
                 }
             }
         }
-        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, pieces of one way {pieces}; uncovered {}: touching a junction {none_in}, outside junctions {none_out} (lanes in junctions: {cats:?})", none_in + none_out);
+        // [round 7 A2-full fix] lanes converging side by side before a join without a shared
+        // next lane: those that converge (a side merge compiled, `Network::join_approaches`)
+        // must be one junction's foes too
+        let (mut side_ok, mut side_none) = (0usize, 0usize);
+        for (a, b) in net.join_approaches() {
+            if !net.crossings.get(a).is_some_and(|v| v.iter().any(|c| c.other == b && c.side)) {
+                continue;
+            }
+            if foe(a, b).is_some() {
+                side_ok += 1;
+            } else {
+                side_none += 1;
+                if list {
+                    println!("  side-by-side {a}/{b}: no meeting place in a junction table");
+                }
+            }
+        }
+        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, pieces of one way {pieces}; uncovered {}: touching a junction {none_in}, outside junctions {none_out} (lanes in junctions: {cats:?}); converging before a join: {side_ok} compiled, uncovered {side_none}", none_in + none_out);
     }
     Ok(())
 }

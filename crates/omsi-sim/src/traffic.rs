@@ -1332,7 +1332,55 @@ impl Network {
                 }
             }
         }
+        // [round 7 A2-full fix] lanes converging side by side before the join, without a
+        // shared next lane (viz case06: 4115 runs beside 3745 and reaches 3747 through 4126):
+        // the lanes up to two links back from each side of a join, converging closer than a
+        // car is wide, get the side-merge meeting place of `add_converging`
+        for (i, j) in self.join_approaches() {
+            if self.add_converging(i, j) {
+                n += 1;
+            }
+        }
         n
+    }
+
+    /// [round 7 A2-full fix] The pairs of street lanes that may converge before a lane join
+    /// without sharing a next lane: for every two lanes running into one lane, the lanes up to
+    /// two links back from each (themselves included), one from each side, of different paths.
+    pub fn join_approaches(&self) -> Vec<(usize, usize)> {
+        let len = self.lanes.len().min(self.prev.len());
+        let street = |l: usize| self.lanes.get(l).is_some_and(|l| l.kind == LaneKind::Street && l.points.len() >= 2);
+        let back = |from: usize| -> Vec<usize> {
+            let mut out = vec![from];
+            let mut at = vec![from];
+            for _ in 0..2 {
+                at = at.iter().flat_map(|&l| self.prev.get(l).cloned().unwrap_or_default()).filter(|&l| street(l) && !out.contains(&l)).collect();
+                out.extend(at.iter().copied());
+            }
+            out
+        };
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for to in 0..len {
+            if !street(to) {
+                continue;
+            }
+            let prev: Vec<usize> = self.prev[to].iter().copied().filter(|&p| p != to && street(p)).collect();
+            for (x, &a) in prev.iter().enumerate() {
+                for &b in &prev[x + 1..] {
+                    let (ba, bb) = (back(a), back(b));
+                    for &i in &ba {
+                        for &j in &bb {
+                            if i != j && !ba.contains(&j) && !bb.contains(&i) {
+                                pairs.push((i.min(j), i.max(j)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
     }
 
     /// The converging lanes of every crossing object (`add_converging`) on a network whose
