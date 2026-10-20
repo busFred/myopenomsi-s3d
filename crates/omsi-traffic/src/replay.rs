@@ -241,7 +241,14 @@ impl Replay {
             }
             Record::Remove { id, .. } => {
                 let id = *id;
-                self.vehicles.retain(|v| v.id != id);
+                // (a free run drives its own vehicles: the game's removal of one, made
+                // under the game's rules at the game's time, is not applied to a vehicle
+                // this run still has - a car the game deleted the second its light turned
+                // green vanished here while rolling into its turn under the new rules; the
+                // run's own network end takes a vehicle off, as `drive` does)
+                if !self.free_run {
+                    self.vehicles.retain(|v| v.id != id);
+                }
                 self.pending_spawns.retain(|p| p.1.id != id);
             }
             Record::VehicleChanged { time, vehicle } => {
