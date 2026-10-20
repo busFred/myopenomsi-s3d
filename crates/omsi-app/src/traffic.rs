@@ -60,8 +60,10 @@ const PULL_OUT_CHANCE: f64 = 0.035;
 /// How far ahead an emergency vehicle warns what holds it up (`TrafficPriorityWarningNeeded`,
 /// m).
 const PRIORITY_WARN_GAP: f32 = 60.0;
-/// A car that gave up and has stood this long (s) held by nothing anybody can see goes even
-/// in view (see `Traffic::populate_seen`).
+/// A random car that has stood this long (s) held by nothing anybody can see goes even in
+/// view (see `Traffic::populate_seen`): the crate's own clock of standing held by nothing,
+/// `omsi_traffic::Vehicle::waiting` ([round 7 B1]: it was the seconds without 5 m
+/// of progress, which a long red or a queue ran up too).
 const PHANTOM_WAIT: f32 = 90.0;
 
 /// [round5 C4] A lead standing within this (m) makes a car that gave up a queued car, not a
@@ -1893,23 +1895,27 @@ impl Traffic {
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
             let sleeps_instead = random && !c.ai.gone && !c.serves_stops() && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
-            let remove = if unloaded {
-                true
+            // (the first rule that takes it, for the log)
+            // (the rules are asked in order, lazily: `hidden` casts rays)
+            let first = |rules: &[(&dyn Fn() -> bool, &'static str)]| rules.iter().find(|r| r.0()).map(|r| r.1);
+            let hidden = || self.hidden(world, p, r);
+            let reason: Option<&'static str> = if unloaded {
+                Some("its ground unloaded")
             } else if at_edge {
                 // (its trip comes back with the tiles; kept until nobody saw it, a bus stood
                 // with its passengers at the far end of a straight road for good)
-                self.hidden(world, p, r) || (c.ai.stopped > 8.0 && from_eye > 180.0) || c.ai.stopped > 150.0
+                first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > 8.0 && from_eye > 180.0, "at the loaded route's end, far off"), (&|| c.ai.stopped > 150.0, "at the loaded route's end, long")])
             } else if !random {
-                false
-            } else if at_end && (self.hidden(world, p, r) || (c.ai.stopped > 8.0 && from_eye > 180.0) || c.ai.stopped > 150.0 || (c.ai.stopped > 25.0 && queued.contains(&c.id) && from_eye > 25.0)) {
+                None
+            } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > 8.0 && from_eye > 180.0, "at a dead end, far off"), (&|| c.ai.stopped > 150.0, "at a dead end, long"), (&|| c.ai.stopped > 25.0 && queued.contains(&c.id) && from_eye > 25.0, "at a dead end, a queue behind it")])).flatten() {
                 // (and in view too once others wait behind it: a fire engine at the end of a
                 // dead-end street held a queue of fourteen cars for two and a half minutes)
                 // (taken at once it vanished in plain view 300 m ahead; but a car kept
                 // until nobody could see it stood for good at the end of a long straight
                 // road in view, and the queue behind it - timetable buses with their
                 // passengers among them - never moved again)
-                true
-            } else if c.ai.gone || dist > far {
+                Some(why)
+            } else if c.ai.gone || dist > far || c.ai.waiting > PHANTOM_WAIT {
                 // in plain view a car stays until the renderer leaves it out anyway, and
                 // close by (the mirrors, a turn of the head) it stays in any case
                 // (one that gave up in a gridlock goes after four minutes even in view,
@@ -1922,13 +1928,20 @@ impl Traffic {
                 // [round5 C4] (not one behind a standing vehicle within QUEUE_LEAD: a queue,
                 // whatever its own hold reads - x10 case15: two cars 6 m in front of the
                 // player, why=people behind leads 2.2 m ahead, vanished at 90 s)
-                (dist > VISIBLE_RANGE * 1.3 && from_eye > NEAR_HIDE)
-                    || self.hidden(world, p, r)
-                    || (c.ai.gone && c.ai.stopped > 240.0 && from_eye > 40.0)
-                    || (c.ai.gone && c.ai.progress.1 > PHANTOM_WAIT && matches!(c.ai.last.why, Why::None | Why::People) && from_eye > 25.0 && !in_a_queue(c.ai.last.lead_id, c.ai.last.lead, &standing))
+                // [round 7 B1] (the phantom clock is the crate's: any hold - a light, a
+                // junction, a lead, people - or moving restarts it, so no car goes at the
+                // first frame after its red; one that gave up (`gone`, five minutes of it) goes
+                // once out of sight, or past 40 m after four minutes standing)
+                first(&[
+                    (&|| dist > VISIBLE_RANGE * 1.3 && from_eye > NEAR_HIDE, "out of range"),
+                    (&|| hidden(), if c.ai.gone { "gave up, out of sight" } else { "out of sight" }),
+                    (&|| c.ai.gone && c.ai.stopped > 240.0 && from_eye > 40.0, "gave up, stood four minutes"),
+                    (&|| c.ai.waiting > PHANTOM_WAIT && from_eye > 25.0 && !in_a_queue(c.ai.last.lead_id, c.ai.last.lead, &standing), "held by nothing (phantom)"),
+                ])
             } else {
-                false
+                None
             };
+            let remove = reason.is_some();
             if remove && sleeps_instead && !at_end {
                 let c = self.cars.swap_remove(i);
                 asleep += 1;
@@ -1957,7 +1970,9 @@ impl Traffic {
                 }
                 if self.debug_population {
                     let v = self.viewer;
-                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), if c.ai.gone { "finished" } else { "far away" });
+                    // ([round 7 B1] with the rule that took it, its distance from the eye, its
+                    // last hold and its waiting time, the give-up clock)
+                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting);
                 }
                 self.orphan_sounds.extend(c.sounds);
                 for r in std::iter::once(c.render).chain(c.trailer_renders) {
