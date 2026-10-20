@@ -379,7 +379,7 @@ impl Replay {
     /// (keyframe, spawn, changed way) and when the network grows, not every frame: a
     /// vehicle plans on on the replay's own network.
     fn through_stubs_all(&mut self) {
-        for v in &mut self.vehicles {
+        for v in self.vehicles.iter_mut().chain(self.pending_spawns.iter_mut().map(|p| &mut p.1)) {
             v.state.route_through_stubs(&self.net);
         }
     }
