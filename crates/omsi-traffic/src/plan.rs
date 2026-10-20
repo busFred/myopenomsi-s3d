@@ -590,10 +590,10 @@ pub fn cannot_stop(v: f32, room: f32, brake: f32) -> bool {
     v > 1.0 && room < v * v / (2.0 * brake)
 }
 
-/// [round 7 D2] How far from its line (m) a stop at the light is still comfortable: the
-/// driver's `comfort_brake` times 1.4, and a metre (`light_call`'s dilemma zone).
-pub fn comfortable_stop(v: f32, dp: &DriverParams) -> f32 {
-    v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0
+/// [fix pass 2, 4] Can the driver stop within `gap` (m) at `v` (m/s) with its comfortable
+/// braking (SUMO's yellow: the vehicle stops when v²/2gap is within its decel)? Standing it can.
+pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
+    v <= STANDING_SPEED || (gap > 0.0 && v * v / (2.0 * gap) <= dp.comfort_brake)
 }
 
 /// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
@@ -620,8 +620,12 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     match sig.aspect {
         Aspect::Green | Aspect::GreenYellow | Aspect::Dark => LightCall { go: true, decision: None },
         Aspect::Yellow => {
-            // (and never from a standstill or a queue: at rest nothing is "too late to stop")
-            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && gap < comfortable_stop(v, dp));
+            // (and never from a standstill or a queue: at rest nothing is "too late to stop";
+            // [fix pass 2, 4] nor into a box whose exit is not free - SUMO's no-block check,
+            // sumo.md: viz5 case05 #16535 took its amber with people 2.8 m past the line and
+            // stood 85.8 s inside - unless it cannot stop at all)
+            let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
+            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap + 0.5, HARD_BRAKE)));
             LightCall { go: go && v > STANDING_SPEED, decision: Some((light, go, gap)) }
         }
         Aspect::Red | Aspect::RedYellow => {

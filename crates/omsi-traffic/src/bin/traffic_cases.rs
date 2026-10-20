@@ -4210,6 +4210,10 @@ struct Extra {
     /// give-up, so `removed_in_view` alone moves little.
     wait60: u64,
     wait120: u64,
+    /// [fix pass 2, 4] Vehicles within the radius standing with their body over a crossing cut
+    /// of their lane (`Network::walks`), distinct vehicles and seconds.
+    on_cut_vehicles: u64,
+    on_cut_s: f64,
     events: Vec<String>,
 }
 
@@ -4373,6 +4377,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
     let mut gone_seen: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
     let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
+    let mut on_cut_ids: HashSet<u64> = HashSet::new();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4445,6 +4450,16 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             }
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
+            for v in r.vehicles.iter().filter(|v| v.state.speed < 0.3 && near(v.pos)) {
+                let st = &v.state;
+                let over = r.net.walks.get(st.lane).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| sa >= st.s - st.rear && sa <= st.s + st.front));
+                if over {
+                    ex.on_cut_s += fdt;
+                    if on_cut_ids.insert(v.id) {
+                        ex.on_cut_vehicles += 1;
+                    }
+                }
+            }
             for v in r.vehicles.iter().filter(|v| !v.serves_stops() && near(v.pos)) {
                 if v.waiting > 60.0 && waited60.insert(v.id) {
                     ex.wait60 += 1;
@@ -4827,6 +4842,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("removed_in_view", e.removed_in_view.to_string()),
         ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
         ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
+        ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
     ]
 }
 
@@ -4856,6 +4872,8 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.end_moving += e.end_moving;
     t.wait60 += e.wait60;
     t.wait120 += e.wait120;
+    t.on_cut_vehicles += e.on_cut_vehicles;
+    t.on_cut_s += e.on_cut_s;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
