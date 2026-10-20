@@ -56,7 +56,7 @@ pub const RULES: &str = "competitor_filter,signal_foes,stub_links,lights_first,r
 /// [round 7 E1] The rules the traffic runs with, as a hash: FNV-1a (64 bit) over the
 /// sources of the rules - the driver, perception, plan, junctions, resolver, simulation,
 /// access rule (omsi-traffic) and the lane model (omsi-sim's traffic.rs) - with comment
-/// lines and blank lines left out, so that a changed constant or rule changes it and a
+/// lines, blank lines and the test modules left out, so that a changed constant or rule changes it and a
 /// reworded comment does not. A recording names it (`Header::rules`); one naming another
 /// does not replay bit-exactly (`replay::other_rules`).
 pub fn rules_hash() -> String {
@@ -75,7 +75,16 @@ pub fn rules_hash() -> String {
         ];
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for src in SOURCES {
-            for line in src.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")) {
+            // (the rules only: a test module, `#[cfg(test)] mod`, and what follows are left out)
+            let mut lines = src.lines().map(str::trim).peekable();
+            let mut rules: Vec<&str> = Vec::new();
+            while let Some(l) = lines.next() {
+                if l == "#[cfg(test)]" && lines.peek().is_some_and(|n| n.starts_with("mod ")) {
+                    break;
+                }
+                rules.push(l);
+            }
+            for line in rules.into_iter().filter(|l| !l.is_empty() && !l.starts_with("//")) {
                 for b in line.bytes().chain(std::iter::once(b'\n')) {
                     h ^= b as u64;
                     h = h.wrapping_mul(0x0100_0000_01b3);

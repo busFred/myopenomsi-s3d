@@ -282,3 +282,32 @@ fn a_vehicle_record_without_a_removed_driver_field_still_reads() {
     let with_more = text.replacen("{", "{\"a_field_from_elsewhere\":1,", 1);
     let _: Vehicle = omsi_traffic::finite::from_str(&with_more).expect("reads with an unknown field");
 }
+
+/// [round 7 A9] The player's pulling away is measured: 2 m/s² shown, the claim reckons 2;
+/// it fades back towards `PLAYER_ACCEL` once the player cruises.
+#[test]
+fn the_players_pulling_away_is_measured() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    use omsi_traffic::{PlayerView, Simulation};
+    let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::ZERO, DVec3::new(500.0, 0.0, 0.0)], LaneKind::Street, 3.5)], ..Default::default() };
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    let mut sim = Simulation::new(&net, vec![]);
+    let player = |speed: f32| PlayerView { id: 3, pos: DVec3::new(50.0, -1.0, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed, still: 0.0, blinker: 0, signalling: 0.0, priority: false };
+    let mut vs: Vec<Vehicle> = Vec::new();
+    assert_eq!(sim.player_accel(3), omsi_traffic::sim::PLAYER_ACCEL);
+    let mut speed = 0.0f32;
+    for _ in 0..(5.0 / DT) as usize {
+        speed += 2.0 * DT;
+        sim.players = vec![player(speed)];
+        sim.tick(&net, DT, &mut vs);
+    }
+    assert!((sim.player_accel(3) - 2.0).abs() < 0.2, "measured {:.2}", sim.player_accel(3));
+    for _ in 0..(60.0 / DT) as usize {
+        sim.players = vec![player(speed)];
+        sim.tick(&net, DT, &mut vs);
+    }
+    assert!(sim.player_accel(3) < 1.4, "faded to {:.2}", sim.player_accel(3));
+}

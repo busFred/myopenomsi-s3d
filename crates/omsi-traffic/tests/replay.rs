@@ -618,3 +618,32 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     while old.step() {}
     assert!(old.divergence.len() >= 2 && old.divergence.iter().all(|d| d.1 == 0.0), "{:?}", old.divergence);
 }
+
+/// [round 7 E2] A free run lays the game's stop from its own vehicle: a car the game stops at
+/// x = 150 (its `External::stop_at` counted from where the game had it), 10 m behind the game
+/// in the run after the first frame, still stops at x = 150, not 10 m short of it.
+#[test]
+fn a_free_run_keeps_the_games_stop_where_it_lies() {
+    let net = priority_junction();
+    let cars = vec![car(1, 0, 60.0, 10.0)];
+    let path = temp("stop");
+    let mut hook = |_: f32, _: &mut Network, _: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
+        if let Some(c) = cars.first_mut() {
+            c.external.stop_at = Some(150.0 - c.state.s);
+        }
+    };
+    record(net, vec![], cars, 25.0, &path, &mut hook);
+    let mut r = Replay::load(&path).expect("reads");
+    let _ = std::fs::remove_file(&path);
+    r.free_run = true;
+    assert!(r.at(0));
+    // (a frame in step with the game: the stop is laid then; the run then falls behind)
+    assert!(r.step());
+    let v = r.vehicles.iter_mut().find(|v| v.id == 1).expect("the car");
+    v.state.s -= 10.0;
+    v.state.odometer -= 10.0;
+    while r.step() {}
+    let v = r.vehicles.iter().find(|v| v.id == 1).expect("the car");
+    let front = v.state.s + v.state.front;
+    assert!(v.state.speed < 0.1 && (front - 150.0).abs() < 2.0, "stood with its front at {front:.1} (speed {:.1})", v.state.speed);
+}

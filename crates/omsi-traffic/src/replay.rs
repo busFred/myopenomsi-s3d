@@ -69,7 +69,9 @@ pub struct Replay {
     /// network end takes vehicles off. Of the frame's inputs the players and the people
     /// apply as recorded; the light clocks run on with the run's own demand after the first
     /// frame, and the game's stops and lateral ramps are laid from the run's own vehicles
-    /// ([round 7 E2], `free_inputs`). This is how a rule change is tried: what the recording
+    /// ([round 7 E2], `free_inputs`). (The people are the game's: they walk by the game's
+    /// light phases while the run's vehicles see the run's own clocks - a pedestrian may
+    /// cross on a phase the run's light no longer shows.) This is how a rule change is tried: what the recording
     /// does differently with it is not undone by the next keyframe.
     pub free_run: bool,
     /// Free run: spawns that did not fit on the road as the free run has it (a vehicle
@@ -104,7 +106,9 @@ pub struct Replay {
 }
 
 /// [round 7 E2] A recorded stop distance (`External::stop_at`) growing by more than this (m)
-/// from one frame to the next is a new stop (the game's bus approaching one sees it shrink).
+/// from one frame to the next is a new stop: the game's bus approaching one sees it shrink by
+/// its travel, at most 0.6 m a frame (18 m/s at 30 frames a second), and a stop it serves
+/// stays put; a jump up of a metre is the next stop (`bus_service::step` hands it on).
 const NEW_STOP: f32 = 1.0;
 
 impl Replay {
