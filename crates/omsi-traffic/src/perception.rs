@@ -1089,6 +1089,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     let (drivable_left, drivable_right) = lane.map(|l| l.drivable()).unwrap_or((0.0, 0.0));
     let lane_left = lane.map(|l| l.length() - st.s).unwrap_or(0.0);
     let zebras = zebra_cuts(net, me, lanes);
+    // ([fix pass 3, 3] my body already over a crossing my way cuts: I clear it forward - the
+    // people on it treat me as an obstacle, SUMO's pedestrian side, sumo.md §4.3)
+    let covering = lanes.iter().any(|&(l, d0)| net.walks.get(l).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front)));
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
         let rel = p.pos - me.pos;
@@ -1103,6 +1106,17 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // 0.3 m behind the kerb spot stepping on 1.5-2.5 s before the car)
         let cut = zebras.iter().find(|z| z.holds(net, p.pos));
         let on_crossing = p.on_crossing || (!p.at_kerb && cut.is_some());
+        // (somebody on the crossing my body covers - level with my body or within the
+        // crossing's width past my front - holds me only inside my body now; one farther
+        // ahead is on the next crossing and holds as any)
+        let hd = (me.heading as f64).to_radians();
+        let ahead_of_front = rel.truncate().dot(DVec2::new(hd.sin(), hd.cos())) as f32 - st.front;
+        if covering && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
+            if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
+                holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
+            }
+            continue;
+        }
         let at_kerb_of_stop = own_stop && !on_crossing && (standing || p.waiting_for_bus);
         let half = if on_crossing {
             me.half_width + 1.5
@@ -1136,7 +1150,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let body = me.obb();
             // (where they are; where their step takes them only for one stepping - a shuffle
             // is no step, round 5 C2)
-            let stepping = on_crossing || p.vel.length() >= STEP_SPEED as f64;
+            // ([fix pass 3, 3] and only somebody inside it NOW holds a car whose body already
+            // covers a crossing: it clears the crossing forward - viz3 case20 #59845 stopped at
+            // 3.7 m/s with the crossing under it and stood 78 s with a walker's projected step
+            // inside its body)
+            let stepping = (on_crossing || p.vel.length() >= STEP_SPEED as f64) && !covering;
             let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
             if at.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0) {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
