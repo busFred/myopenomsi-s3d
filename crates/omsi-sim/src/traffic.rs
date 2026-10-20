@@ -1435,24 +1435,20 @@ impl Network {
         n
     }
 
-    /// [fix pass 2, 1a] Lanes `i` and `j` leave one lane together, directly or within two
-    /// links (a lane forking into twin pieces that rejoin, viz3 case03: 1106/1110 leave 1100
-    /// and rejoin into 1477/1481): pieces of ONE way, as SUMO makes the connections of one lane
-    /// that re-merge one internal edge - no meeting place between them, the queue order
-    /// decides (a merge band there stopped a refused car at its entry line 55 m from the car
-    /// it waited for, `plan::roll_up_point` taking own-fork side merges only).
+    /// [fix pass 2, 1a; pass 3, 8] Lanes `i` and `j` are pieces of ONE crossing object that
+    /// leave one lane together (a lane forking into twin pieces of the object that rejoin, viz3
+    /// case03: 1106/1110 leave 1100 and rejoin into 1477/1481): pieces of ONE way, as SUMO
+    /// makes the connections of one lane that re-merge one internal edge - no meeting place
+    /// between them, the queue order decides. Spline lanes leaving one lane and converging
+    /// (3126/3129 off 2746, abreast over their last 14 m into 79), and lanes whose common root
+    /// is farther back, keep their meeting place.
     pub fn same_root(&self, i: usize, j: usize) -> bool {
-        let back = |from: usize| -> Vec<usize> {
-            let mut out = Vec::new();
-            let mut at = vec![from];
-            for _ in 0..2 {
-                at = at.iter().flat_map(|&l| self.prev.get(l).cloned().unwrap_or_default()).filter(|l| !out.contains(l)).collect();
-                out.extend(at.iter().copied());
-            }
-            out
-        };
-        let (bi, bj) = (back(i), back(j));
-        bi.iter().any(|r| bj.contains(r))
+        let object = |l: usize| self.lanes.get(l).filter(|l| l.source == 2).and_then(|l| l.key).map(|k| (k.tile, k.id));
+        if object(i).is_none() || object(i) != object(j) {
+            return false;
+        }
+        let (pi, pj) = (self.prev.get(i), self.prev.get(j));
+        pi.is_some_and(|a| pj.is_some_and(|b| a.iter().any(|r| b.contains(r))))
     }
 
     /// [round 7 A2-full fix] The pairs of street lanes that may converge before a lane join
