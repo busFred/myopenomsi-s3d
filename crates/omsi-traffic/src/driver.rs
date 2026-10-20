@@ -59,7 +59,8 @@ impl VehicleClass {
 
 /// Everything about how a driver drives, in one place. Units: metres, seconds, m/s².
 /// (Read from recordings: a field a recording lacks - one removed or added on another branch
-/// - reads as the car preset's, `record::VERSION`'s compatibility rule.)
+/// - reads as unknown (NaN) and is then the preset's of the vehicle's class,
+/// `DriverParams::fill_missing`; `record::VERSION`'s compatibility rule.)
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DriverParams {
@@ -95,12 +96,25 @@ pub struct DriverParams {
 }
 
 impl Default for DriverParams {
+    /// Every field unknown (NaN): what a field a recording lacks is read as, until
+    /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
-        DriverParams::preset(VehicleClass::Car)
+        let n = f32::NAN;
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, gap_accept: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, yellow_brake: n }
     }
 }
 
 impl DriverParams {
+    /// [fix pass 2, 5] The fields a recording lacked (NaN, `Default`) take the preset of
+    /// `class` (a bus's `yellow_brake` is a bus's, not a car's).
+    pub fn fill_missing(&mut self, class: VehicleClass) {
+        let p = DriverParams::preset(class);
+        macro_rules! fill {
+            ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
+        }
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, gap_accept, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, yellow_brake);
+    }
+
     /// The preset of a class, before jitter.
     pub fn preset(class: VehicleClass) -> DriverParams {
         let car = DriverParams {

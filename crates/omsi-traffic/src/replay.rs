@@ -143,7 +143,15 @@ impl Replay {
         Ok(Replay::new(header, records, skipped, truncated))
     }
 
-    pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
+    pub fn new(header: Header, mut records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
+        // ([fix pass 2, 5] a driver field a record lacked: its class's preset)
+        for rec in &mut records {
+            match rec {
+                Record::Keyframe { vehicles, .. } => vehicles.iter_mut().for_each(|v| v.params.fill_missing(v.class)),
+                Record::Spawn { vehicle, .. } | Record::VehicleChanged { vehicle, .. } => vehicle.params.fill_missing(vehicle.class),
+                _ => {}
+            }
+        }
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
         let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new() };

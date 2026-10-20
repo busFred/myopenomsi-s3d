@@ -141,6 +141,7 @@ impl Passing {
 
 /// What the app tells the planner about this vehicle this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
@@ -227,8 +228,11 @@ fn player_next(net: &Network, lane: usize, blinker: u8) -> Option<usize> {
     })
 }
 
-/// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
+/// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres. (Read from
+/// a recording, a field it lacks takes `Vehicle::default()`'s, and a driver field its class's
+/// preset - `DriverParams::fill_missing`, `record::VERSION`'s rule.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Vehicle {
     pub id: u64,
     pub class: VehicleClass,
@@ -443,6 +447,16 @@ fn offset_left(v: &Vehicle) -> bool {
 /// Seconds a lane change may stand without moving on before it is settled where the car is:
 /// done in place, or given up (`AiState::settle_change`).
 pub const FROZEN_CHANGE: f32 = 5.0;
+
+impl Default for Vehicle {
+    /// A car standing on lane 0 (`Vehicle::new`), its driver unknown (`DriverParams::default`,
+    /// filled from the class's preset on reading): what a field a recording lacks is read as.
+    fn default() -> Vehicle {
+        let mut v = Vehicle::new(0, VehicleClass::Car, AiState::default(), 0.9, 1);
+        v.params = DriverParams::default();
+        v
+    }
+}
 
 impl Vehicle {
     pub fn new(id: u64, class: VehicleClass, state: AiState, half_width: f32, seed: u64) -> Vehicle {

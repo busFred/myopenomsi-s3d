@@ -43,8 +43,11 @@ use std::sync::mpsc;
 /// [fix pass 1, 15] Compatibility rule: a recording is read by the tools of its format and
 /// later ones. On read, a field the recording has and the code no longer knows is ignored
 /// (no `deny_unknown_fields` anywhere), and a field the code has and the recording lacks
-/// takes its default (`serde(default)`; `DriverParams` reads a missing one as the car
-/// preset's). A recording of a later format than the tool's (`header.version > VERSION`,
+/// takes its container's default - `Vehicle`, `AiState`, `External` and `DriverParams` are
+/// `serde(default)` (`Vehicle::default`, `AiState::default`: a car standing at the start of
+/// lane 0; `External::default`: no input) - except a driver field, which reads as unknown
+/// and then takes the preset of the vehicle's class (`DriverParams::fill_missing`, in
+/// `Replay::new`: a bus's missing `yellow_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
 /// e.g. format 4 in a round-6 tool) is not for that tool: `Replay::load` refuses it with that
 /// message, as fields it requires may be missing; read it with the branch's own tool.
 pub const VERSION: u32 = 4;

@@ -2871,8 +2871,10 @@ const JOINT_BLEND: f32 = 6.0;
 pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
-/// going. The body that follows this way is `ai_motion::AiBody`.
+/// going. The body that follows this way is `ai_motion::AiBody`. (Read from a recording, a
+/// field it lacks takes `AiState::default()`'s: `omsi_traffic::record::VERSION`'s rule.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AiState {
     pub traffic_pool: Option<(usize, std::sync::Arc<Vec<i32>>)>,
     /// The vehicle's `[ai_veh_type]` (0 car, 1 taxi, 2 bus, 3 truck; -1 a timetable bus):
@@ -3180,6 +3182,14 @@ impl LaneSeq {
     fn heading(&self, net: &Network, s: f32, d: f32) -> f32 {
         let (i, u) = self.locate(net, s, d);
         net.lanes[self.lanes[i]].heading_at_ext(u)
+    }
+}
+
+impl Default for AiState {
+    /// A vehicle on lane 0 at its start, standing (`AiState::new`): what a field a recording
+    /// lacks is read as.
+    fn default() -> AiState {
+        AiState::new(0, 0.0, 1)
     }
 }
 

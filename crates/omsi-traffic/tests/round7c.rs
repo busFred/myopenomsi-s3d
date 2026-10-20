@@ -277,8 +277,20 @@ fn a_vehicle_record_without_a_removed_driver_field_still_reads() {
     let text = omsi_traffic::finite::to_string(&v).expect("written");
     let without = text.replace(",\"yellow_brake\":2.5", "").replace("\"yellow_brake\":2.5,", "");
     assert!(!without.contains("yellow_brake"), "the field is gone from the text");
-    let back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without yellow_brake");
+    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without yellow_brake");
+    back.params.fill_missing(back.class);
     assert_eq!(back.params.yellow_brake, omsi_traffic::DriverParams::preset(VehicleClass::Car).yellow_brake);
+    // a bus's missing field is a bus's
+    let bus = standing(VehicleClass::Bus);
+    let text = omsi_traffic::finite::to_string(&bus).expect("written");
+    let without = text.replace(",\"yellow_brake\":1.8", "").replace("\"yellow_brake\":1.8,", "");
+    assert!(!without.contains("yellow_brake"));
+    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads");
+    back.params.fill_missing(back.class);
+    assert_eq!(back.params.yellow_brake, 1.8);
+    // and a vehicle missing whole fields of its own and of its way reads too
+    let bare: Vehicle = omsi_traffic::finite::from_str("{\"id\":7,\"class\":\"Bus\",\"state\":{\"lane\":3,\"s\":12.5}}").expect("reads a bare vehicle");
+    assert_eq!((bare.id, bare.state.lane), (7, 3));
     let with_more = text.replacen("{", "{\"a_field_from_elsewhere\":1,", 1);
     let _: Vehicle = omsi_traffic::finite::from_str(&with_more).expect("reads with an unknown field");
 }
