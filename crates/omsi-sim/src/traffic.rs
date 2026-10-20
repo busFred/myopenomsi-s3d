@@ -2735,13 +2735,22 @@ pub enum Aspect {
     Dark,
 }
 
-/// How far ahead (m) a car decides which way it goes: far enough to signal a turn in good
-/// time and for the steering to look beyond the junction.
+/// How far ahead (m) a car decides which way it goes at least: far enough to signal a turn in
+/// good time and for the steering to look beyond the junction; [round 7 A8] and as far as its
+/// junction claim reaches (`claim_horizon`), so that the junction is seen there.
 const PLAN_AHEAD: f32 = 90.0;
 /// At most this many lanes are planned ahead (junction pieces can be a few metres long).
 // [ROLLBACK lights-130] 20 lanes (was 10): on a road of short pieces ten lanes were not
-// ninety metres, and a light further ahead was not seen in time to stop
-const PLAN_LANES: usize = 20;
+// ninety metres, and a light further ahead was not seen in time to stop; [round 7 A8] 40 for
+// the claim horizon's 220 m
+const PLAN_LANES: usize = 40;
+
+/// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
+/// `speed` m/s files its junction claim - eight seconds, at least 60 m, at most 220 m - and
+/// so how far ahead it plans its way and looks for the junction.
+pub fn claim_horizon(speed: f32) -> f32 {
+    (8.0 * speed + 30.0).clamp(60.0, 220.0)
+}
 /// Linked lanes may end up to 1.5 m apart; over this many metres on either side of a joint
 /// the way is bent so that it has no step (half the gap on each side).
 const JOINT_BLEND: f32 = 6.0;
@@ -3135,6 +3144,11 @@ impl AiState {
         }
     }
 
+    /// How far ahead (m) the way is planned: `PLAN_AHEAD`, or the claim horizon at this speed.
+    fn plan_ahead(&self) -> f32 {
+        PLAN_AHEAD.max(claim_horizon(self.speed) + self.front)
+    }
+
     /// Decide the way on: the lane after the current one and enough lanes after it to
     /// cover `PLAN_AHEAD` metres (a timetable route simply is that plan).
     pub fn plan_next(&mut self, net: &Network) {
@@ -3153,7 +3167,7 @@ impl AiState {
         }
         let planned: f32 = self.upcoming().map(|l| net.lanes[l].length()).sum();
         let rest = net.lanes[self.lane].length() - self.s;
-        if self.planned_next.is_some() && (rest + planned >= PLAN_AHEAD || self.ahead.len() >= PLAN_LANES) {
+        if self.planned_next.is_some() && (rest + planned >= self.plan_ahead() || self.ahead.len() >= PLAN_LANES) {
             return;
         }
         let mut plan: Vec<usize> = self.upcoming().collect();
@@ -3166,7 +3180,8 @@ impl AiState {
     /// `PLAN_AHEAD` metres.
     fn extend_plan(&mut self, net: &Network, from: usize, rest: f32, plan: &mut Vec<usize>) {
         let mut dist = rest + plan.iter().map(|&l| net.lanes[l].length()).sum::<f32>();
-        while dist < PLAN_AHEAD && plan.len() <= PLAN_LANES {
+        let ahead = self.plan_ahead();
+        while dist < ahead && plan.len() <= PLAN_LANES {
             let last = plan.last().copied().unwrap_or(from);
             // [ROLLBACK cycle-135] not round a loop of short lanes to fill the plan (two
             // lanes of no length leading into each other made a plan of twenty), nor back

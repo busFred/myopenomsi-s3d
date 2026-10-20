@@ -321,7 +321,7 @@ pub const PLAYER_GAP: f32 = 4.0;
 /// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
 /// and how far ahead it looks for one (`perception::junction_ahead`).
 pub fn claim_horizon(speed: f32) -> f32 {
-    (8.0 * speed + 30.0).clamp(60.0, 220.0)
+    omsi_sim::traffic::claim_horizon(speed)
 }
 
 /// [ROLLBACK r4d-B4] A timetable bus creeping up to its stop slower than this (m/s) has not

@@ -248,3 +248,24 @@ fn the_swerve_round_a_parked_car_does_not_flicker() {
     assert!(targets.iter().any(|&t| t < -0.05), "no swerve: {targets:?}");
     assert!(flips <= 2, "the swerve target changed {flips} times: {targets:?}");
 }
+
+/// [round 7 A8] The way is planned as far as the claim horizon: at 22 m/s a car plans 206 m
+/// and more ahead (the junction claim is filed eight seconds out), not 90 m.
+#[test]
+fn the_way_is_planned_to_the_claim_horizon() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    let lanes: Vec<_> = (0..16).map(|k| LaneBuilder::polyline(vec![DVec3::new(30.0 * k as f64, 0.0, 0.0), DVec3::new(30.0 * (k + 1) as f64, 0.0, 0.0)], LaneKind::Street, 3.5)).collect();
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    let mut st = AiState::new(0, 5.0, 1);
+    st.speed = 22.0;
+    st.plan_next(&net);
+    let planned: f32 = 25.0 + st.upcoming().map(|l| net.lanes[l].length()).sum::<f32>();
+    assert!(planned >= omsi_traffic::sim::claim_horizon(22.0), "planned {planned:.0} m");
+    let mut slow = AiState::new(0, 5.0, 1);
+    slow.speed = 5.0;
+    slow.plan_next(&net);
+    let planned: f32 = 25.0 + slow.upcoming().map(|l| net.lanes[l].length()).sum::<f32>();
+    assert!(planned < 150.0, "slow: planned {planned:.0} m");
+}
