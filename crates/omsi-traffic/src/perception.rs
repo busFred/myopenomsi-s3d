@@ -746,8 +746,8 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
 /// rule of a lane join the junctions know no meeting place of (`Junctions::foe_between`:
 /// [round 7 A2] where they do - a compiled merge - its grant and the zipper decide, and this
 /// first-come rule, which contradicted them, is not asked). Of the joins of the recorded
-/// networks, X10's had 28 such pairs outside junctions and 231 with one lane in one
-/// (`traffic_cases joins`).
+/// networks with no compiled meeting place, X10's had 28 pairs outside junctions and 231
+/// with one lane in one, BeijingCity's 60 and 532 (`traffic_cases joins`).
 fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
     let me = &vehicles[i];
     let st = &me.state;

@@ -398,8 +398,8 @@ pub const PLAYER_LINE_PAST: f32 = 0.5;
 /// Seconds a player stands before it counts as held where it is: blocked to the junction
 /// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
 pub const PLAYER_STILL: f32 = 2.0;
-/// A standing player whose body is this far (m) clear of the lane's edge makes no junction
-/// claim: what a car keeps off a kerb (`perception::KERB_CLEAR`).
+/// A standing player whose body is this far (m) clear of the lane's edge is parked beside
+/// the lanes and makes no junction claim (`beside_lane`; x10 case10).
 pub const PARKED_CLEAR: f32 = 0.3;
 
 /// The lateral offset (m, right positive) of player `p` from lane `lane` at `s` along it.

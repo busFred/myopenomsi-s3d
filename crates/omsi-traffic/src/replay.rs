@@ -63,11 +63,14 @@ pub struct Replay {
     /// vehicles at later keyframes. They are still compared (`divergence`, `missing`), and
     /// the replay goes on with its own. `Spawn` adds a vehicle whose id is not on the road
     /// (when its place is free: else it waits for up to `SPAWN_PATIENCE` s, then is
-    /// dropped), `VehicleChanged` gives a vehicle its new way without moving it (unless it is where the
-    /// game has it), `Remove`
-    /// takes one off, the frame's inputs apply as always. This is how a rule
-    /// change is tried: what the recording does differently with it is not undone by the
-    /// next keyframe.
+    /// dropped), `VehicleChanged` gives a vehicle its new way without moving it (unless it is
+    /// where the game has it), `Remove` is not applied (the game's removals were made under
+    /// the game's rules, 25ce52f; it only drops a spawn still waiting), and the run's own
+    /// network end takes vehicles off. Of the frame's inputs the players and the people
+    /// apply as recorded; the light clocks run on with the run's own demand after the first
+    /// frame, and the game's stops and lateral ramps are laid from the run's own vehicles
+    /// ([round 7 E2], `free_inputs`). This is how a rule change is tried: what the recording
+    /// does differently with it is not undone by the next keyframe.
     pub free_run: bool,
     /// Free run: spawns that did not fit on the road as the free run has it (a vehicle
     /// there already, or one just ahead): (give up at, the vehicle). They are tried again
