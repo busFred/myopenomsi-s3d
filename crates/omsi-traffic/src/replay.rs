@@ -174,6 +174,7 @@ impl Replay {
         if let Record::Keyframe { time, vehicles } = &self.records[at] {
             self.vehicles = vehicles.clone();
             self.sim.time = *time;
+            self.through_stubs_all();
         }
         self.cursor = at + 1;
         true
@@ -219,11 +220,13 @@ impl Replay {
                     let mut vs = vehicles.clone();
                     self.keep_standing(&mut vs);
                     self.vehicles = vs;
+                    self.through_stubs_all();
                 }
             }
             Record::Spawn { time, vehicle, type_name } => {
                 self.types.insert(vehicle.id, type_name.clone());
-                let v = vehicle.clone();
+                let mut v = vehicle.clone();
+                v.state.route_through_stubs(&self.net);
                 if self.free_run {
                     // (a free run keeps the one it has, and does not put one onto another)
                     if !self.vehicles.iter().any(|o| o.id == v.id) {
@@ -255,7 +258,8 @@ impl Replay {
                 self.pending_spawns.retain(|p| p.1.id != id);
             }
             Record::VehicleChanged { time, vehicle } => {
-                let v = vehicle.clone();
+                let mut v = vehicle.clone();
+                v.state.route_through_stubs(&self.net);
                 if self.free_run {
                     match self.vehicles.iter().position(|o| o.id == v.id) {
                         // (the way changes, not where the vehicle is; one where the game
@@ -283,6 +287,7 @@ impl Replay {
                 }
                 let added = self.net.extend(lanes.clone(), LINK_TOL);
                 self.sim.network_grew(&self.net, added.start);
+                self.through_stubs_all();
             }
             Record::LightsAdded { first, lights, .. } => {
                 let from = (*first).min(self.sim.lights.len());
@@ -306,6 +311,17 @@ impl Replay {
             if let Some(&s) = here.get(&v.id) {
                 v.claim_standing = s;
             }
+        }
+    }
+
+    /// [round 7 E3] A recording from before the lit stubs: its vehicles planned their ways on
+    /// the network as the game linked it, and the ways round the lit stubs take the stubs
+    /// (`AiState::route_through_stubs`) - once, as a vehicle comes from the recording
+    /// (keyframe, spawn, changed way) and when the network grows, not every frame: a
+    /// vehicle plans on on the replay's own network.
+    fn through_stubs_all(&mut self) {
+        for v in &mut self.vehicles {
+            v.state.route_through_stubs(&self.net);
         }
     }
 
@@ -370,7 +386,7 @@ impl Replay {
         // list is the game's at recording time, so a change of that rule showed in no replay
         // (a recording without the legs keeps its own list)
         if f.people.iter().any(|p| p.leg.is_some()) {
-            sim.walkers = f.people.iter().filter(|p| !(p.at_kerb && p.decision.as_deref() == Some("red light"))).filter_map(|p| p.leg.map(|(l, s, _)| (l, s))).collect();
+            sim.walkers = f.people.iter().filter(|p| !(p.at_kerb && p.decision.as_deref() == Some(crate::record::RED_LIGHT))).filter_map(|p| p.leg.map(|(l, s, _)| (l, s))).collect();
         } else {
             sim.walkers.clone_from(&f.walkers);
         }
@@ -399,11 +415,6 @@ impl Replay {
             if let Some(s) = steer.get(&v.id) {
                 s.apply(&mut v.state);
             }
-        }
-        // (a recording from before the lit stubs: its vehicles planned their ways on the
-        // network as the game linked it, and the ways round the lit stubs take the stubs)
-        for v in &mut self.vehicles {
-            v.state.route_through_stubs(&self.net);
         }
         for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {
             c.time = *time;
@@ -566,7 +577,8 @@ fn build(h: &Header) -> (Network, Simulation) {
         Some(d) => d.junctions.clone(),
         None => Junctions::compile(&net),
     };
-    // (the junctions are the recorded ones: nothing to compile)
+    // (the recorded junctions: `Replay::new` compiles its own after the lit stubs; these are
+    // the game's, for `recorded`)
     let mut sim = Simulation::new(&Network::default(), h.lights.clone());
     sim.junctions = junctions;
     sim.left_hand = net.left_hand;

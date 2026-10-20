@@ -79,6 +79,11 @@ pub fn rules_hash() -> String {
     .clone()
 }
 
+/// [round 7 E3] The decision a person waiting at the kerb for a red light records
+/// (`PersonRecord::decision`): the replay leaves them out of the walkers (the game's
+/// `Humans::strollers`).
+pub const RED_LIGHT: &str = "red light";
+
 /// The memory keeps this many seconds (and the keyframe before them).
 pub const RING_SECS: f64 = 60.0;
 /// A keyframe of every vehicle this often (s): a replay starts at one, and a replay that
@@ -104,7 +109,10 @@ pub struct Header {
     /// What the network and the junction table derived from the lanes. The game grows its
     /// network tile by tile and some of it (a timetable's reverse twins of a junction's
     /// paths) comes out differently from linking all the lanes at once, so the replay
-    /// takes the game's own. Without it (a fixture written by hand) it is worked out.
+    /// takes the game's own links, conflicts and walks; the junction table it compiles
+    /// itself after the lit stubs (`Replay::new`), the recorded one is the game's for
+    /// comparison (`replay::recorded`, `traffic_cases stubs`). Without it (a fixture written
+    /// by hand) it is worked out.
     #[serde(default)]
     pub derived: Option<Derived>,
     /// (format 2) The rules the game ran with, for information: [`RULES`] since the rule
@@ -493,7 +501,8 @@ impl Recorder {
             time_scale: sim.time_scale,
             players: &sim.players,
             people,
-            walkers: &sim.walkers,
+            // ([round 7 E3] not with the people's legs: the replay rebuilds the list from them)
+            walkers: if people.iter().any(|p| p.leg.is_some()) { &[] } else { &sim.walkers },
             externals: &self.externals,
             steer,
             light_clocks: LightClocks(&sim.lights),
@@ -506,21 +515,6 @@ impl Recorder {
     pub fn keyframe(&mut self, time: f64, vehicles: &[Vehicle]) {
         self.last_keyframe = time;
         self.line(time, Kind::Keyframe, &RecordRef::Keyframe { time, vehicles });
-    }
-
-    /// A record the game writes itself (a vehicle changed, a note).
-    pub fn event(&mut self, rec: Record) {
-        let kind = match rec {
-            Record::LanesAdded { .. } | Record::LightsAdded { .. } => Kind::FileOnly,
-            Record::Keyframe { .. } => Kind::Keyframe,
-            Record::Parked { .. } => Kind::Parked,
-            _ => Kind::Other,
-        };
-        let time = rec.time();
-        match finite::to_string(&rec) {
-            Ok(text) => self.send(Msg::Line { time, kind, text }),
-            Err(e) => log::warn!("traffic recording: a record could not be written: {e}"),
-        }
     }
 
     /// The game changed vehicle `v`'s way between frames.
