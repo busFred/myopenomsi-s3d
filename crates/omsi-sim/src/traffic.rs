@@ -2846,6 +2846,12 @@ pub struct AiState {
     /// At most this much acceleration for now (m/s²): edging out round something standing
     /// close ahead.
     pub accel_cap: Option<f32>,
+    /// A frozen lane change was settled where the body stood (`settle_change`) and the
+    /// offset it left has not eased off yet: standing, the traffic eases it in place. Only
+    /// `settle_change` sets it (a fresh car, a pull-out from a bay or a parking strip, a
+    /// swerve have offsets too, and must not slide).
+    #[serde(default)]
+    pub settled_offset: bool,
 }
 
 /// What a car keeps its distance to: the gap from its front bumper to the thing (m), how
@@ -2935,6 +2941,10 @@ pub struct LaneChange {
     pub bypass: bool,
 }
 
+/// A vehicle's heading is that of the chord of its way this far behind and ahead of it (m,
+/// `Simulation::update_positions`).
+pub const HEADING_CHORD: f32 = 1.5;
+
 /// Smoothstep 0..1.
 fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -3018,7 +3028,7 @@ impl LaneSeq {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3346,13 +3356,15 @@ impl AiState {
         self.lateral = off;
         self.lateral_target = 0.0;
         self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
+        self.settled_offset = true;
     }
 
-    /// Pull out into `to` from behind a standing obstacle: a short, steep move.
-    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32) {
+    /// Pull out into `to` from behind a standing obstacle: a short, steep move over
+    /// `length` metres (8, less from close behind it).
+    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32) {
         self.start_change(net, to, dir);
         if let Some(c) = self.change.as_mut() {
-            c.length = 8.0;
+            c.length = length;
             c.bypass = true;
             // (pulling out round something: the old signal time)
             c.wait = c.wait.min(1.2);
@@ -3708,7 +3720,10 @@ impl AiState {
                 to_len = net.lanes.get(c.to).map(|l| l.length()).unwrap_or(0.0);
             }
             let from_ends = self.s >= from_len && (self.planned_next.is_none() || !carry_on);
-            if c.t >= 1.0 || from_ends || c.s_to >= to_len {
+            // (a bypass's short S-curve ends once the heading's chord behind the car is off it
+            // too: ended at its end, the heading jumped back 40 degrees in a frame, review r6l)
+            let tail = if c.bypass { HEADING_CHORD / c.length.max(0.1) } else { 0.0 };
+            if c.t >= 1.0 + tail || from_ends || c.s_to >= to_len {
                 // arrived on the new lane: it has no joint behind the car, and the way on
                 // is planned afresh from there
                 if self.route.get(self.route_index + 1) == Some(&c.to) {
@@ -3859,7 +3874,7 @@ mod tests {
         car.speed = 3.0;
         car.plan_next(&net);
         assert_eq!(car.planned_next, Some(2));
-        car.start_bypass(&net, 1, 1);
+        car.start_bypass(&net, 1, 1, 8.0);
         let dt = 1.0 / 30.0;
         let mut at = car.way_point(&net, 0.0);
         for _ in 0..300 {

@@ -355,6 +355,29 @@ pub const SIDESTEP_SPEED: f32 = 0.5;
 /// ... until it is this near its lane's middle (m).
 pub const SIDESTEP_DONE: f32 = 0.05;
 
+/// A settled lane change's offset eases in place at this pace (m/s) while the car stands
+/// (round 6 L3: it eased by distance only, and viz5 case05 #18836, settled 1.38 m out over
+/// the lane it came from, stood 46 s behind #20220 with 66 m free ahead; a car edging over,
+/// slower than `SIDESTEP_SPEED`'s step back of a pass given up).
+pub const SETTLE_CREEP: f32 = 0.3;
+
+/// Whether `v`'s offset is one a settled change left (`AiState::settled_offset`, set by
+/// `settle_change` alone, kept in keyframes) and still easing off: no change, pass, bay,
+/// pull-out or swerve since, and not a car just put on the road. (Round 6 L3 fix pass 1: the
+/// lane-change cooldown a new car starts with let every fresh car standing with an offset -
+/// 139 of 416, the pull-outs from the parking strips - slide sideways; x10 case08 #11387 slid,
+/// started its pull-out pass 6 s late, and #11125 ran into it.)
+fn settling(v: &Vehicle) -> bool {
+    let st = &v.state;
+    st.settled_offset && offset_left(v) && v.fresh <= 0.0 && v.pull_out <= 0.0 && v.external.bay.is_none()
+}
+
+/// A settled offset still there to ease off (`settling` without the vehicle's own state).
+fn offset_left(v: &Vehicle) -> bool {
+    let st = &v.state;
+    st.change.is_none() && v.passing.is_none() && st.lateral.abs() > SIDESTEP_DONE && st.lateral_target == 0.0 && st.lateral_ramp.1 == 0.0
+}
+
 /// Seconds a lane change may stand without moving on before it is settled where the car is:
 /// done in place, or given up (`AiState::settle_change`).
 pub const FROZEN_CHANGE: f32 = 5.0;
@@ -570,8 +593,8 @@ impl Simulation {
                 continue;
             }
             let p = v.state.way_point(net, 0.0);
-            let a = v.state.way_point(net, -1.5);
-            let b = v.state.way_point(net, 1.5);
+            let a = v.state.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
+            let b = v.state.way_point(net, omsi_sim::traffic::HEADING_CHORD);
             let d = (b - a).truncate();
             v.pos = p;
             if d.length_squared() > 1e-6 {
@@ -1307,6 +1330,7 @@ impl Simulation {
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
         let now = self.time;
         let sidestep = self.sidestep(vehicles, i, dt);
+        let creep = self.settle_creep(vehicles, i, dt);
         // (a pass given up whose obstacle has left: over, the car drives on where it is and the
         // offset eases off as it goes, re-entering its lane ahead; review12, case15 #47238 stood
         // 88 s out on the oncoming side, its stop behind it, after the obstacle had gone)
@@ -1352,9 +1376,9 @@ impl Simulation {
                     v.state.start_change(net, to, dir);
                 }
             }
-            Some(Start::Bypass { to, dir }) => {
+            Some(Start::Bypass { to, dir, out_len }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
-                    v.state.start_bypass(net, to, dir);
+                    v.state.start_bypass(net, to, dir, out_len);
                     v.stopped = 0.0;
                 }
             }
@@ -1428,6 +1452,14 @@ impl Simulation {
             }
         }
         let alive = v.state.drive(net, dt, plan.lead, plan.stop);
+        // a change of the driver's own whose target lane (moving on along its plan) is closed
+        // to it: given up while the body is less than half over (viz5 case04 #5644 went on from
+        // 3470's rule-less bus lane piece into 3474's)
+        let closed = v.state.change.is_some_and(|c| v.state.route.is_empty() && net.lanes.get(c.to).is_some_and(|l| l.source != 2 && !crate::access::is_open(l, v)));
+        if closed && v.state.change_offsets(net).is_some_and(|(k, _, _)| k < 0.5) {
+            v.state.settle_change(net, false);
+            v.change_still = (0.0, 0.0);
+        }
         // a lane change that stands frozen part-way is settled where the body is
         match v.state.change {
             Some(c) => {
@@ -1487,6 +1519,18 @@ impl Simulation {
             let straight = return_look(&v.state);
             v.state.lateral_curve = vec![(odo, lat), (odo + straight, lat), (odo + straight + back, 0.0)];
             v.state.lateral_target = 0.0;
+        }
+        // a settled change standing with its offset: eased in place towards the lane's middle
+        // while its body there touches nobody (it eased only as the car drove on)
+        if !offset_left(v) {
+            v.state.settled_offset = false;
+        }
+        if settling(v) {
+            if let Some(lat) = creep.filter(|_| v.state.speed < 0.1) {
+                v.state.lateral_curve.clear();
+                v.state.lateral = lat;
+                v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+            }
         }
         if let Some(p) = v.passing {
             if p.aborted {
@@ -1628,6 +1672,33 @@ impl Simulation {
         let clear_of_cars = self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).all(|j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || vehicles[j].obb().separation(&b) > 0.2);
         let clear_of_players = self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || p.obb(0.0, 0.0).separation(&b) > 0.2);
         (clear_of_cars && clear_of_players).then_some(new)
+    }
+
+    /// A settled change standing with its offset (`settling`): the offset one step
+    /// (`SETTLE_CREEP` for `dt`) towards its lane's middle, if its body there comes within
+    /// 0.2 m of nobody - vehicle, player or person on foot (`PERSON_RADIUS`) - it does not
+    /// move away from (the one it settled beside, viz case06, must not be touched; one it
+    /// leaves behind on the other side does not hold it; review r6l: a person standing
+    /// 0.4 m off its inner side was eased 0.88 m into).
+    fn settle_creep(&self, vehicles: &[Vehicle], i: usize, dt: f32) -> Option<f32> {
+        let v = &vehicles[i];
+        if !settling(v) || v.state.speed >= 0.1 {
+            return None;
+        }
+        let lat = v.state.lateral;
+        let new = lat - (SETTLE_CREEP * dt).min(lat.abs()) * lat.signum();
+        let h = (v.heading as f64).to_radians();
+        let right = DVec2::new(h.cos(), -h.sin());
+        let now = v.obb();
+        let b = Obb::vehicle(v.pos.truncate() - right * (lat - new) as f64, v.heading as f64, v.state.front as f64, v.state.rear as f64, v.half_width as f64);
+        let ok = |o: &Obb| o.separation(&b) > 0.2 || o.separation(&b) > o.separation(&now);
+        let clear_of_cars = self.vehicles_near(v.pos, 25.0).into_iter().filter(|&j| j != i).all(|j| (vehicles[j].pos.z - v.pos.z).abs() > 3.0 || ok(&vehicles[j].obb()));
+        let clear_of_players = self.players.iter().all(|p| (p.pos.z - v.pos.z).abs() > 3.0 || ok(&p.obb(0.0, 0.0)));
+        let clear_of_people = self.people_near(v.pos, 15.0).into_iter().all(|k| {
+            let q = &self.people[k];
+            (q.pos.z - v.pos.z).abs() > 2.5 || ok(&Obb::point(q.pos, crate::plan::PERSON_RADIUS as f64))
+        });
+        (clear_of_cars && clear_of_players && clear_of_people).then_some(new)
     }
 
     /// The indicator a vehicle shows now (0 off, 1 left, 2 right).

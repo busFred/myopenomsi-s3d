@@ -410,31 +410,32 @@ fn x3_a_change_frozen_more_than_half_across_is_done_in_place_and_one_less_given_
         let start = cars[0].pos;
         let mut jump = 0.0f64;
         let mut prev = start;
-        let mut settled_at: Option<f32> = None;
+        let mut settled_at: Option<(f32, f64, f32)> = None;
         run(&net, &mut sim, &mut cars, 8.0, |time, _, cars| {
             let me = cars.iter().find(|c| c.id == 1).unwrap();
             jump = jump.max((me.pos - prev).truncate().length());
             prev = me.pos;
             if me.state.change.is_none() && settled_at.is_none() {
-                settled_at = Some(time);
+                settled_at = Some((time, me.pos.y, me.state.lateral));
             }
         });
         let me = cars.iter().find(|c| c.id == 1).unwrap();
-        let at = settled_at.expect("the change was never settled");
+        let (at, y, lat) = settled_at.expect("the change was never settled");
         assert!(at > 4.9 && at < 5.5, "settled at {at:.2} s");
         assert_eq!(me.state.lane, if done { 1 } else { 0 }, "t {t}");
-        // where the body was: on lane 1 offset to the left, or on lane 0 offset to the right
-        let y = me.pos.y;
+        // where the body was when settled: on lane 1 offset to the left, or on lane 0 offset
+        // to the right (since round 6 L3 the offset then eases in place at SETTLE_CREEP while
+        // the car stands, so it is no longer where it was at the end of the run)
         assert!((y - start.y).abs() < 0.05, "the body moved from y {:.2} to {:.2}", start.y, y);
         assert!(jump < 0.05, "a jump of {jump:.2} m");
-        let lat = me.state.lateral;
         let expect = if done { -(y + 3.5) as f32 } else { -y as f32 };
         assert!((lat - expect).abs() < 0.05, "lateral {lat:.2}, expected {expect:.2}");
+        assert!(me.state.lateral.abs() < lat.abs() - 0.3, "the offset {lat:.2} did not ease in place: {:.2}", me.state.lateral);
         // the occupancy follows the body
         sim.build_occupancy(&net, &cars);
         let i = cars.iter().position(|c| c.id == 1).unwrap();
         let occ = sim.occupancy.get(&me.state.lane).unwrap().iter().find(|o| o.vehicle == i).unwrap();
-        assert!((occ.lateral - expect).abs() < 0.05, "registered at lateral {:.2}", occ.lateral);
+        assert!((occ.lateral - me.state.lateral).abs() < 0.05, "registered at lateral {:.2}", occ.lateral);
         let other = if done { 0 } else { 1 };
         assert!(sim.occupancy.get(&other).map(|v| v.iter().all(|o| o.vehicle != i)).unwrap_or(true));
     }
