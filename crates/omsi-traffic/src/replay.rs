@@ -493,7 +493,6 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle) {
     st.desire = r.desire;
     st.headway = r.headway;
     st.min_gap = r.min_gap;
-    st.accept_gap = r.accept_gap;
     st.reaction = r.reaction;
     st.lat_accel = r.lat_accel;
     st.route = r.route.clone();

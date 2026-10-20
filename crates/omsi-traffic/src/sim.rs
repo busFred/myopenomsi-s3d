@@ -978,7 +978,7 @@ impl Simulation {
                 v_max: limit.min(st.max_speed_kmh / 3.6),
                 front: st.front,
                 rear: st.rear,
-                gap: v.impatience.gap(st.accept_gap),
+                gap: v.impatience.gap(v.params.gap_accept),
                 committed,
                 exit_room: j.exit_room,
                 impatience: v.impatience,
@@ -1460,7 +1460,7 @@ impl Simulation {
                 let lat = v.state.lateral;
                 if v.state.speed < 0.5 {
                     v.state.lateral_curve.clear();
-                    v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                    v.state.lateral_ramp = (lat, 0.0, odo, omsi_sim::traffic::s_curve_len(lat));
                 } else {
                     let back = (hold - odo - 0.5).clamp(2.0, 8.0);
                     v.state.lateral_curve = vec![(odo, lat), (odo + back, 0.0)];
@@ -1562,7 +1562,7 @@ impl Simulation {
             // (a pass on its way back in from where it is: the bent way eases the offset off
             // as it drives, held out while a body beside it is in the way, `return_blocked`)
             let (odo, lat) = (v.state.odometer, v.state.lateral);
-            let back = (lat.abs() * 8.0).clamp(8.0, 30.0);
+            let back = omsi_sim::traffic::s_curve_len(lat);
             if let Some(p) = v.passing.as_mut() {
                 *p = Passing { side: lat, until: odo, block: odo, aborted: false, hold: odo, back_len: back, wait: 0.0, obstacle: None, ..*p };
             }
@@ -1581,7 +1581,7 @@ impl Simulation {
             if let Some(lat) = creep.filter(|_| v.state.speed < 0.1) {
                 v.state.lateral_curve.clear();
                 v.state.lateral = lat;
-                v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                v.state.lateral_ramp = (lat, 0.0, v.state.odometer, omsi_sim::traffic::s_curve_len(lat));
             }
         }
         if let Some(p) = v.passing {
@@ -1594,7 +1594,7 @@ impl Simulation {
                         v.state.lateral_curve.clear();
                         v.state.lateral = lat;
                         v.state.lateral_target = 0.0;
-                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, omsi_sim::traffic::s_curve_len(lat));
                     }
                 }
                 if v.state.speed < 0.1 && v.state.lateral.abs() <= SIDESTEP_DONE && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
@@ -1607,13 +1607,13 @@ impl Simulation {
                 }
             } else if v.state.odometer >= p.until + p.back_len {
                 v.passing = None;
-            } else if v.stopped > 8.0 && v.state.lateral.abs() < p.side.abs() * 0.5 {
+            } else if v.stopped > plan::PASS_STRANDED && v.state.lateral.abs() < p.side.abs() * 0.5 {
                 // never got out: give it up where it stands (the offset easing off as it drives)
                 v.passing = None;
                 let (odo, lat) = (v.state.odometer, v.state.lateral);
                 v.state.lateral_curve.clear();
                 v.state.lateral_target = 0.0;
-                v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                v.state.lateral_ramp = (lat, 0.0, odo, omsi_sim::traffic::s_curve_len(lat));
             }
         }
         // a random car that stands held by nothing for minutes asks to be taken away when

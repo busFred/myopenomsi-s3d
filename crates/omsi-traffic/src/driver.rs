@@ -166,7 +166,6 @@ impl DriverParams {
         st.desire = self.speed_factor;
         st.lat_accel = self.lat_accel;
         st.reaction = self.reaction;
-        st.accept_gap = self.gap_accept;
     }
 }
 

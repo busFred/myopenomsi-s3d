@@ -109,24 +109,11 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
-    if !nb.allowed {
-        return (0.0, false);
-    }
-    // the solid line (`[rule] overtaking_prohib`) on either lane, and the pieces of a
-    // junction object: no change of the driver's own
-    if lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 {
+    if !may_change_to(net, me, nb) {
         return (0.0, false);
     }
     let mut desire = 0.0f32;
-    // a turn lane is never left within 150 m of its junction, and a turn ahead is taken
-    // from the lane that leads into it
-    let my_turn = st.turn_ahead(net, 150.0).map(|t| t.0).unwrap_or(0);
-    if my_turn != 0 && nb.turn != my_turn {
-        return (0.0, false);
-    }
-    if nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0 {
-        return (0.0, false);
-    }
+    let my_turn = st.turn_ahead(net, TURN_LANE_KEEP).map(|t| t.0).unwrap_or(0);
     if lane.turn == 0 && my_turn != 0 && nb.turn == my_turn && lane.turn != my_turn {
         desire = desire.max(1.0 * dp.lc_strategic);
     }
@@ -150,10 +137,29 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > KEEP_SIDE_REACH && open_on(net, me, nb.lane, st.s) {
         desire = desire.max(dp.lc_keep_right);
     }
-    if nb.runs_on < 40.0 {
-        return (0.0, false);
-    }
     (desire, gap_accepted(me, nb))
+}
+
+/// A turn lane is never left within this many metres (m) of its junction, nor one taken
+/// that leads into a turn the driver does not take before it runs on this far.
+const TURN_LANE_KEEP: f32 = 150.0;
+/// A lane beside that runs on less than this (m, `NeighbourView::runs_on`) is not changed
+/// onto.
+const CHANGE_RUNS_ON: f32 = 40.0;
+
+/// [round 7 D5] May the driver change onto `nb` of its own accord (a change for a reason of
+/// its own, a bypass; `change_desire` and `could_bypass` ask the same): the path's rules
+/// allow it there; no solid line (`[rule] overtaking_prohib`) on either lane, not on a
+/// junction object's piece; a turn lane is never left within `TURN_LANE_KEEP` of its
+/// junction, a turn ahead is taken from the lane that leads into it, and a turn lane is not
+/// taken for a turn the driver does not take; and `nb` runs on `CHANGE_RUNS_ON` at least.
+fn may_change_to(net: &Network, me: &Vehicle, nb: &NeighbourView) -> bool {
+    let lane = &net.lanes[me.state.lane];
+    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < CHANGE_RUNS_ON {
+        return false;
+    }
+    let my_turn = me.state.turn_ahead(net, TURN_LANE_KEEP).map(|t| t.0).unwrap_or(0);
+    !((my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < TURN_LANE_KEEP))
 }
 
 /// A keep-to-the-side change needs the target lane to reach this far on (m,
@@ -171,9 +177,8 @@ pub const KEEP_SIDE_OPEN_AHEAD: f32 = 60.0;
 /// asked, the way through is the junction's.
 fn open_on(net: &Network, me: &Vehicle, lane: usize, s: f32) -> bool {
     let st = &me.state;
-    // (`AiState::start_change`'s move: 2.8 to 4 s at the speed now, at least 12 m)
-    let change_len = (st.speed * (4.0 - st.speed * 0.04).clamp(2.8, 4.0)).max(12.0);
-    let need = change_len + KEEP_SIDE_OPEN_AHEAD;
+    // (`AiState::start_change`'s move)
+    let need = omsi_sim::traffic::change_length(st.speed) + KEEP_SIDE_OPEN_AHEAD;
     let mut cur = lane;
     let mut d = -net.beside_s(st.lane, lane, s);
     for _ in 0..16 {
@@ -243,6 +248,9 @@ pub const SQUEEZE_NEAR: f32 = 25.0;
 /// No light or junction within this many metres past the thing an in-lane squeeze goes
 /// round (Sobol's 25 m; the pass on the oncoming lane keeps 60 m behind the player).
 pub const SQUEEZE_ZONE: f32 = 25.0;
+/// A pass on the oncoming lane round the player keeps this far (m) from a light or a
+/// junction past it; round anything else `SQUEEZE_ZONE`, as a squeeze.
+pub const PASS_ZONE_PLAYER: f32 = 60.0;
 /// Seconds the player's bus has stood before a car squeezes past it inside the lane
 /// (Sobol's `player_squeeze` fired at 1.5 s; the oncoming-lane pass waits for 4 s and 3 s
 /// stopped itself).
@@ -391,12 +399,7 @@ fn pausing_player(l: &crate::perception::Headway) -> bool {
 /// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
 /// the thing standing and nobody passing on it the wrong way. (What the keep-back asks.)
 fn could_bypass(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
-    let lane = &net.lanes[me.state.lane];
-    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < 40.0 {
-        return false;
-    }
-    let my_turn = me.state.turn_ahead(net, 150.0).map(|t| t.0).unwrap_or(0);
-    if (my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0) {
+    if !may_change_to(net, me, nb) {
         return false;
     }
     // (the gap there is the start's to accept, `change_desire`, and a car driving on ahead
@@ -1060,7 +1063,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
-        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.entry < 40.0).unwrap_or(false);
+        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.entry < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok) = change_desire(net, sim, me, p, &nb, near_junction);
@@ -1225,7 +1228,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // round two standing cars with three more beyond and stood out there 110 s)
         let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
-        let zone = if squeeze { SQUEEZE_ZONE } else if player { 60.0 } else { 25.0 };
+        let zone = if squeeze || !player { SQUEEZE_ZONE } else { PASS_ZONE_PLAYER };
         let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
         // (an in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when the obstacle
         // stands within `SQUEEZE_NEAR`, and inside the junction already it may go where its

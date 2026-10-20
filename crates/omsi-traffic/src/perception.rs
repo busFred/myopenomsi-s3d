@@ -100,6 +100,12 @@ pub const AT_STOP_OBSTACLE_STAND: f32 = 0.5;
 /// going to lift soon).
 pub const HELD_OBSTACLE_STAND: f32 = 25.0;
 
+/// How far ahead of its front (m) a driver at `v` m/s looks for people on its way: a stop
+/// and some, 8 m at least, 45 m at most (`people_ahead`, `crossing_ahead`, `perceive`).
+pub fn people_reach(v: f32) -> f32 {
+    (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalView {
     /// Distance from the origin to the stop line.
@@ -984,7 +990,6 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 const KERB_CLEAR: f32 = 0.3;
 
 /// A person's body radius (m, `humans::BODY_OUTSIDE`).
-const BODY_RADIUS: f32 = 0.28;
 
 /// How far ahead (s) the step of a person about to enter my lane is followed, at most: the
 /// time I need to reach them, at least 2 s (review-r5c-safety: at `dist / v` alone, 0.15 s at
@@ -1046,7 +1051,7 @@ fn shift_at(swerve: f32, along: f32, v: f32) -> f32 {
 fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, parked_swerve: Option<f32>) -> (Option<f32>, Option<(f32, Option<f32>)>) {
     let st = &me.state;
     let v = st.speed;
-    let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
+    let reach = people_reach(v);
     let radius = (st.front + reach + 6.0) as f64;
     // who holds the car on its way, and who would on the lane's axis (the shift's candidates)
     let mut holders: Vec<Holder> = Vec::new();
@@ -1103,7 +1108,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
             let later_axis = (later - q).dot(right) as f32 + lat;
             // (where their body is now, off my way: the exemptions below are for somebody
             // outside my footprint, which a projected shuffle must not decide)
-            let outside = now_way.abs() >= me.half_width + BODY_RADIUS;
+            let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
             // [round 5 L3] one beside the lane - outside its footprint now and after their
             // step, their body outside mine (C2 holds one inside it), inside the drawn road -
             // on the car's own lane: a shift inside the drawn road may clear them (a bus pulls
@@ -1131,7 +1136,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
                 // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
                 // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
                 // with a stream on the crossing they let the vehicle go first (P4)
-                if p.at_kerb && !p.on_crossing && across >= me.half_width + BODY_RADIUS {
+                if p.at_kerb && !p.on_crossing && across >= me.half_width + crate::plan::PERSON_RADIUS {
                     continue;
                 }
                 // [round5 C2] somebody level with my body (their body behind my front
@@ -1144,7 +1149,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
                 // held of 6). One level with my body INSIDE my footprint is being hit:
                 // held as before (review-r5c-safety: 25 new contacts at across 0.7-1.5 m,
                 // 1-7 m/s). Not a bus pulling in at its stop (B4).
-                if !at_kerb_of_stop && outside && d + (along as f32) < st.front - BODY_RADIUS {
+                if !at_kerb_of_stop && outside && d + (along as f32) < st.front - crate::plan::PERSON_RADIUS {
                     continue;
                 }
                 // someone who has stood at the edge for a while does not hold a standing car
@@ -1217,7 +1222,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
 fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {
     let st = &me.state;
     let v = st.speed;
-    let reach = (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0);
+    let reach = people_reach(v);
     let radius = (st.front + reach + 6.0) as f64;
     let half = (me.half_width + 0.3) as f64;
     let mut far = 0.0f32;
@@ -1646,7 +1651,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     } else {
         // the way ahead, sampled once for the bodies, the players and the people
         let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
-        let people_reach = (st.speed * st.speed / 5.0 + st.speed + 6.0).clamp(8.0, 45.0) + st.front;
+        let people_reach = people_reach(st.speed) + st.front;
         let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
         let (cand, far) = body_candidates(sim, vehicles, i, &p.way, look, body_look);
         let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });

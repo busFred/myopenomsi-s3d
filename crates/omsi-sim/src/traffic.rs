@@ -2721,13 +2721,12 @@ pub struct AiState {
     pub lat_accel: f32,
     /// The driver (`TPathInfo`'s rowdy_factor & co): how fast they like to go relative to
     /// the limit, the time gap they keep to the car ahead (s), the distance they stop
-    /// behind it (m), the gap in the cross traffic they accept at a junction (s) and how
-    /// long they take to move off when the way clears (s). `accel` is how hard they pull
+    /// behind it (m) and how long they take to move off when the way clears (s) (the gap
+    /// in the cross traffic they accept at a junction is `DriverParams::gap_accept`). `accel` is how hard they pull
     /// away and `decel` how hard they like to brake.
     pub desire: f32,
     pub headway: f32,
     pub min_gap: f32,
-    pub accept_gap: f32,
     pub reaction: f32,
     /// From the vehicle's origin (the lane position `s`) to its front and rear bumper (m).
     pub front: f32,
@@ -2785,6 +2784,18 @@ pub fn arrival_time(dist: f32, v: f32, a: f32, v_max: f32) -> f32 {
     } else {
         t_up + (dist - d_up) / v_max
     }
+}
+
+/// The road a lane change at `speed` (m/s) moves over along (m): 2.8 to 4 s at that speed,
+/// at least 12 m ([ROLLBACK lanechange-108] a longer, gentler move: three to four seconds).
+pub fn change_length(speed: f32) -> f32 {
+    (speed * (4.0 - speed * 0.04).clamp(2.8, 4.0)).max(12.0)
+}
+
+/// The road (m) an S-curve sideways by `offset` metres takes (`AiState::lateral_ramp`): 8 m
+/// per metre across, 8 m at least, 30 m at most.
+pub fn s_curve_len(offset: f32) -> f32 {
+    (offset.abs() * 8.0).clamp(8.0, 30.0)
 }
 
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
@@ -2899,7 +2910,7 @@ impl LaneSeq {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3086,10 +3097,7 @@ impl AiState {
     pub fn start_change(&mut self, net: &Network, to: usize, dir: i32) {
         let Some(l) = net.lanes.get(self.lane) else { return };
         let Some(t) = net.lanes.get(to) else { return };
-        // two to three and a half seconds at the speed the car has now, at least 12 m
-        // ([ROLLBACK lanechange-108] a longer, gentler move: three to four seconds)
-        let duration = (4.0 - self.speed * 0.04).clamp(2.8, 4.0);
-        let length = (self.speed * duration).max(12.0);
+        let length = change_length(self.speed);
         // (the same share of a lane that starts beside this one, else the point beside the car)
         let s_to = net.beside_s(self.lane, to, self.s.min(l.length()));
         let rest = t.length() - s_to;
@@ -3219,7 +3227,7 @@ impl AiState {
         self.lateral_curve.clear();
         self.lateral = off;
         self.lateral_target = 0.0;
-        self.lateral_ramp = (off, 0.0, self.odometer, (off.abs() * 8.0).clamp(8.0, 30.0));
+        self.lateral_ramp = (off, 0.0, self.odometer, s_curve_len(off));
         self.settled_offset = true;
     }
 
@@ -3614,7 +3622,7 @@ impl AiState {
         }
         if (self.lateral_target - self.lateral_ramp.1).abs() > 1e-3 {
             let from = self.lateral_at(self.odometer - ds);
-            let len = ((self.lateral_target - from).abs() * 8.0).clamp(8.0, 30.0);
+            let len = s_curve_len(self.lateral_target - from);
             self.lateral_ramp = (from, self.lateral_target, self.odometer - ds, len);
         }
         self.lateral = self.lateral_at(self.odometer);
