@@ -58,7 +58,10 @@ impl VehicleClass {
 }
 
 /// Everything about how a driver drives, in one place. Units: metres, seconds, m/s².
+/// (Read from recordings: a field a recording lacks - one removed or added on another branch
+/// - reads as the car preset's, `record::VERSION`'s compatibility rule.)
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DriverParams {
     /// Time gap kept to the car ahead (IDM `tau`).
     pub tau: f32,
@@ -89,6 +92,12 @@ pub struct DriverParams {
     /// Patience at a yellow light: go through when the stop would need more than this
     /// braking (m/s²).
     pub yellow_brake: f32,
+}
+
+impl Default for DriverParams {
+    fn default() -> DriverParams {
+        DriverParams::preset(VehicleClass::Car)
+    }
 }
 
 impl DriverParams {

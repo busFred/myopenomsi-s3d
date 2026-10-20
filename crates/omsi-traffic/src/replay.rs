@@ -130,6 +130,9 @@ impl Replay {
         if let Some(why) = other_rules(&header) {
             log::warn!("replay: {} was made under other rules ({why}): the replay runs with the current ones ({}) and will not reproduce it bit-exactly", path.display(), rules_hash());
         }
+        if header.version > crate::record::VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is of format {}, later than this tool's {}: read it with the tool of its branch (`record::VERSION`)", path.display(), header.version, crate::record::VERSION)));
+        }
         if header.version < 4 {
             log::warn!("replay: {} is of format {}: fields added since (`record::VERSION`) read as their defaults where it lacks them", path.display(), header.version);
         }

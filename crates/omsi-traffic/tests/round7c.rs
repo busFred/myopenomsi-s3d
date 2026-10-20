@@ -267,3 +267,18 @@ fn the_way_is_planned_to_the_claim_horizon() {
     let planned: f32 = 25.0 + slow.upcoming().map(|l| net.lanes[l].length()).sum::<f32>();
     assert!(planned < 150.0, "slow: planned {planned:.0} m");
 }
+
+/// [fix pass 1, 15] A vehicle record missing a driver field (removed on another branch, e.g.
+/// `yellow_brake`) still reads, the field as the car preset's; one with a field the code no
+/// longer knows reads too.
+#[test]
+fn a_vehicle_record_without_a_removed_driver_field_still_reads() {
+    let v = standing(VehicleClass::Car);
+    let text = omsi_traffic::finite::to_string(&v).expect("written");
+    let without = text.replace(",\"yellow_brake\":2.5", "").replace("\"yellow_brake\":2.5,", "");
+    assert!(!without.contains("yellow_brake"), "the field is gone from the text");
+    let back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without yellow_brake");
+    assert_eq!(back.params.yellow_brake, omsi_traffic::DriverParams::preset(VehicleClass::Car).yellow_brake);
+    let with_more = text.replacen("{", "{\"a_field_from_elsewhere\":1,", 1);
+    let _: Vehicle = omsi_traffic::finite::from_str(&with_more).expect("reads with an unknown field");
+}

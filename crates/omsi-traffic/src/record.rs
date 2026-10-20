@@ -39,6 +39,14 @@ use std::sync::mpsc;
 /// `mutual`, `mutual_gap`, `ease_for`, `waiting`, `External::trip_over`,
 /// `Frame::steer`, `Frame::order`; a format-3 recording may lack some (read as their
 /// defaults, `Replay::load` warns).
+///
+/// [fix pass 1, 15] Compatibility rule: a recording is read by the tools of its format and
+/// later ones. On read, a field the recording has and the code no longer knows is ignored
+/// (no `deny_unknown_fields` anywhere), and a field the code has and the recording lacks
+/// takes its default (`serde(default)`; `DriverParams` reads a missing one as the car
+/// preset's). A recording of a later format than the tool's (`header.version > VERSION`,
+/// e.g. format 4 in a round-6 tool) is not for that tool: `Replay::load` refuses it with that
+/// message, as fields it requires may be missing; read it with the branch's own tool.
 pub const VERSION: u32 = 4;
 /// The rule switches a recording names (`Header::switches`), for information: the rule
 /// changes once tried behind switches and accepted, now always on, and the junction rules of
