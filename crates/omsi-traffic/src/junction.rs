@@ -528,6 +528,16 @@ impl Junctions {
         Some((&self.nodes[j], &self.nodes[j].movements[m]))
     }
 
+    /// [round 7 A2] The meeting place of lanes `a` and `b`, two pieces of one junction: the
+    /// foe of `a`'s movement that is `b`'s (None outside a junction or with no meeting place).
+    pub fn foe_between(&self, a: usize, b: usize) -> Option<&Foe> {
+        let (&(ja, ma), &(jb, mb)) = (self.of_lane.get(&a)?, self.of_lane.get(&b)?);
+        if ja != jb {
+            return None;
+        }
+        self.nodes[ja].movements[ma].foes.iter().find(|f| f.movement == mb)
+    }
+
     /// Is lane `lane` inside a junction?
     pub fn is_inside(&self, lane: usize) -> bool {
         self.of_lane.contains_key(&lane)

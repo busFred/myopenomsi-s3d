@@ -96,6 +96,7 @@ fn main() {
         Some("ab") if args.len() >= 3 => ab(&args[2..]),
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
+        Some("joins") if args.len() >= 3 => joins(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -5202,6 +5203,53 @@ fn stubs(args: &[String]) -> Res<()> {
 /// they start and end, and whether they lead into a common lane; the nearest first. (Converging lanes whose
 /// starts lie under 3 m apart are no merge to `compute_conflicts`: cars on them met side by
 /// side, round 4a.)
+/// [round 7 A2] The lane joins of a fixture's network: two street lanes running into one
+/// lane, by whether the compiled junctions know a meeting place between them (a foe of one
+/// movement for the other, by kind). Prints the pairs no junction knows (`--list`), the
+/// ones `perception::merging_ahead` was the only merge rule for.
+fn joins(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let (r, _) = grown(Path::new(f), true)?;
+        let (net, js) = (&r.net, &r.sim.junctions);
+        let foe = |a: usize, b: usize| -> Option<omsi_traffic::FoeKind> {
+            let (&(ja, ma), &(jb, mb)) = (js.of_lane.get(&a)?, js.of_lane.get(&b)?);
+            (ja == jb).then_some(())?;
+            js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb).map(|x| x.kind)
+        };
+        let street = |l: usize| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2;
+        let (mut merge, mut other, mut none_in, mut none_out) = (0, 0, 0, 0);
+        for n in 0..net.lanes.len() {
+            if !street(n) {
+                continue;
+            }
+            let prev: Vec<usize> = net.prev.get(n).map(|v| v.iter().copied().filter(|&p| street(p)).collect()).unwrap_or_default();
+            for (k, &a) in prev.iter().enumerate() {
+                for &b in &prev[k + 1..] {
+                    match foe(a, b) {
+                        Some(omsi_traffic::FoeKind::Merge) => merge += 1,
+                        Some(_) => other += 1,
+                        None => {
+                            let inside = js.of_lane.contains_key(&a) || js.of_lane.contains_key(&b);
+                            if inside {
+                                none_in += 1;
+                            } else {
+                                none_out += 1;
+                            }
+                            if list {
+                                let e = net.lanes[n].start();
+                                println!("  join into {n} ({:.0}, {:.0}) from {a} and {b}: no meeting place, {}", e.x, e.y, if inside { "a lane in a junction" } else { "outside junctions" });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, none: touching a junction {none_in}, outside junctions {none_out}");
+    }
+    Ok(())
+}
+
 fn converge(args: &[String]) -> Res<()> {
     let all = args.iter().any(|a| a == "--all");
     let fixtures: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();

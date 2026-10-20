@@ -744,7 +744,12 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
     (on_lane, body)
 }
 
-/// A vehicle on another lane into the same next lane that gets to the joint first.
+/// A vehicle on another lane into the same next lane that gets to the joint first: the merge
+/// rule of a lane join the junctions know no meeting place of (`Junctions::foe_between`:
+/// [round 7 A2] where they do - a compiled merge - its grant and the zipper decide, and this
+/// first-come rule, which contradicted them, is not asked). Of the joins of the recorded
+/// networks, X10's had 28 such pairs outside junctions and 231 with one lane in one
+/// (`traffic_cases joins`).
 fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
     let me = &vehicles[i];
     let st = &me.state;
@@ -758,7 +763,7 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
     let t_me = arrival_time(d_me, st.speed, st.accel, limit);
     let mut best: Option<Headway> = None;
     for &p in net.prev.get(next)? {
-        if p == st.lane {
+        if p == st.lane || sim.junctions.foe_between(st.lane, p).is_some() {
             continue;
         }
         let pl = &net.lanes[p];
@@ -776,12 +781,12 @@ fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize
                 continue;
             }
             // someone held at a light or a junction never arrives
-            if o.state.speed < 0.5 && o.last.stop.is_some() {
+            if o.state.speed < STANDING_SPEED && o.last.stop.is_some() {
                 continue;
             }
             let d_them = pl.length() - occ.s;
             let t_them = arrival_time(d_them, o.state.speed, o.state.accel, limit);
-            // (a near tie keeps whoever was first last frame: by the lower id)
+            // (a near tie, within 0.4 s, goes to the lower id)
             let first = t_them + 0.4 < t_me || ((t_them - t_me).abs() <= 0.4 && o.id < me.id);
             if !first {
                 continue;
