@@ -205,10 +205,10 @@ fn fmt_id(id: u64) -> String {
     }
 }
 
-/// A claimant named by its claim index (`Claim::vehicle`; a player's is `usize::MAX - k`).
+/// A claimant named by its claim index (`Claim::vehicle`; a player's `sim::player_claim`).
 fn fmt_claimant(r: &Replay, w: usize) -> String {
-    if w >= usize::MAX - 64 {
-        r.sim.players.get(usize::MAX - w).map(|p| format!("PLAYER{}", p.id)).unwrap_or("PLAYER?".into())
+    if let Some(id) = omsi_traffic::sim::claim_player(w) {
+        format!("PLAYER{id}")
     } else {
         r.vehicles.get(w).map(|o| format!("#{}", o.id)).unwrap_or("?".into())
     }
@@ -5353,7 +5353,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 let gaps: Vec<String> = found.iter().map(|&i| format!("#{} {:.2} m", r.vehicles[i].id, r.vehicles[i].obb().separation(&pb))).collect();
                 println!("t={t:.1} player {} ({:.1},{:.1}) hd {:.0} v {:.2} still {:.1} blinker {}; boxes to it: {}", p.id, p.pos.x, p.pos.y, p.heading, p.speed, p.still, p.blinker, gaps.join(", "));
             }
-            for (c, g) in r.sim.claims.iter().filter(|(c, _)| c.vehicle >= usize::MAX - 64) {
+            for (c, g) in r.sim.claims.iter().filter(|(c, _)| omsi_traffic::sim::claim_player(c.vehicle).is_some()) {
                 println!("t={t:.1}   player claim j{} m{} s {:.1} light_red {} blocked {} lead {:?} -> go {} wait_for {:?}", c.junction, c.movement, c.s, c.light_red, c.blocked, c.lead.map(|w| fmt_claimant(&r, w)), g.go, g.wait_for.map(|w| fmt_claimant(&r, w)));
             }
         }

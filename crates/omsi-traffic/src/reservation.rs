@@ -256,10 +256,10 @@ enum Standing {
     Rank(usize),
 }
 
-/// The players' claims (`usize::MAX - k`, see `Simulation::tick`): their grants are not
-/// read (the player drives), so a refused player is no proof of anything.
+/// The players' claims (`sim::player_claim`): their grants are not read (the player
+/// drives), so a refused player is no proof of anything.
 fn is_player(vehicle: usize) -> bool {
-    vehicle >= usize::MAX - 64
+    crate::sim::claim_player(vehicle).is_some()
 }
 
 /// The standing refused claims of the first pass, and the order of the contenders among

@@ -182,6 +182,24 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
+/// [round 7 D6] A player's claim names it as `Decision::wait_for` does, `PLAYER_ID_BASE` +
+/// its id (`Claim::vehicle`, `Grant::wait_for`; an AI vehicle's is its index).
+pub fn player_claim(id: u32) -> usize {
+    (PLAYER_ID_BASE + id as u64) as usize
+}
+
+/// The player id a claim's vehicle names (`player_claim`), None for an AI vehicle's index.
+pub fn claim_player(vehicle: usize) -> Option<u32> {
+    (vehicle as u64).checked_sub(PLAYER_ID_BASE).map(|k| k as u32)
+}
+
+/// [round 7 D6] A body `lateral` metres off the axis of `lane`, `half_width` to either side,
+/// is wholly beside the lane by more than `PARKED_CLEAR` (`player_parked_beside`; perception's
+/// exit room, which counts a player there as off the lane).
+pub fn beside_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
+    lateral.abs() - half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
+}
+
 /// The lane a player's vehicle goes on into from `lane`: the only one, or at a fork the one
 /// its indicator points to (the furthest turn that way, a lane flagged with that turn first),
 /// else the straightest (a lane without a turn flag first).
@@ -779,7 +797,7 @@ impl Simulation {
     /// 9 cars 106 s.)
     fn player_parked_beside(net: &Network, lane: usize, s: f32, p: &PlayerView) -> bool {
         let lateral = player_lateral(net, lane, s, p);
-        p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
+        p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && beside_lane(net, lane, lateral, p.half_width)
     }
 
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
@@ -1017,7 +1035,7 @@ impl Simulation {
         // AI vehicle: a claim of the first piece alone never met the oncoming left turner
         // on the piece after it, viz3 case11); off the lanes, the junction on the lanes
         // starting ahead of it, on its first piece
-        for (k, p) in self.players.iter().enumerate() {
+        for p in self.players.iter() {
             let v = p.speed.max(0.0);
             let horizon = (8.0 * v + 30.0).clamp(60.0, 220.0);
             // the way: (lane, distance from the vehicle's origin to the lane's start)
@@ -1167,7 +1185,7 @@ impl Simulation {
                 light_red,
                 until_go,
                 lead,
-                vehicle: usize::MAX - k,
+                vehicle: player_claim(p.id),
                 junction: j,
                 movement: m,
                 s: s_on,
@@ -1395,7 +1413,7 @@ impl Simulation {
         });
         let return_blocked = self.return_blocked(vehicles, i);
         let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
-        let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
+        let wait_for = plan.wait_for.map(|k| if claim_player(k).is_some() { k as u64 } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,

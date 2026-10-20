@@ -1371,7 +1371,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 // (a player snapped to this lane from beside it, its body clear of the lane by
                 // the kerb margin, as `Simulation::player_parked_beside`: in a queue 3.5 m to the
                 // left of the exit lane, the player's bus closed the box for 25 s, viz3 case03)
-                if lateral.abs() - p.half_width > net.lanes[wl].width * 0.5 + crate::sim::PARKED_CLEAR {
+                if crate::sim::beside_lane(net, wl, lateral, p.half_width) {
                     continue;
                 }
                 let tail = wd + s - p.half_len;

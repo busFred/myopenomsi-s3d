@@ -287,7 +287,7 @@ fn player_over_its_line(past: f64, still: f32) -> (bool, Option<f32>, bool) {
         if through.is_none() && front_x(&cars[0]) > 20.0 {
             through = Some(t);
         }
-        red |= sim.claims.iter().any(|(c, _)| c.vehicle >= usize::MAX - 64 && c.light_red);
+        red |= sim.claims.iter().any(|(c, _)| omsi_traffic::sim::claim_player(c.vehicle).is_some() && c.light_red);
         sim.players = vec![player];
     });
     (waited, through, red)
@@ -342,7 +342,7 @@ fn behind_the_tail(gap: f64, still: f32, speed: f32, secs: f32) -> (bool, Option
     run(&net, &mut sim, &mut cars, secs, |_, sim, cars| {
         waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
         if first {
-            lead = sim.claims.iter().find(|(c, _)| c.vehicle >= usize::MAX - 64).and_then(|(c, _)| c.lead);
+            lead = sim.claims.iter().find(|(c, _)| omsi_traffic::sim::claim_player(c.vehicle).is_some()).and_then(|(c, _)| c.lead);
             first = false;
         }
         sim.players = vec![player];

@@ -72,7 +72,7 @@ pub struct Plan {
     /// Held by something (the start reaction applies when it clears).
     pub held: bool,
     pub hold: Option<Hold>,
-    /// The claim index of the vehicle waited for at a junction (a player: `usize::MAX - k`).
+    /// The claim index of the vehicle waited for at a junction (a player: `sim::player_claim`).
     pub wait_for: Option<usize>,
     /// Id of the vehicle whose body across the way holds this one.
     pub body_block: Option<u64>,
@@ -764,11 +764,11 @@ const BESIDE_MAX: f64 = 4.0;
 const CONVERGE_LOOK: f32 = 20.0;
 
 /// [round6 J2] The body of the vehicle waited for (`Grant::wait_for`, the claims' index; a
-/// player's is `usize::MAX - k`) projected on the way through: (rear, front), distances from my
+/// player's `sim::player_claim`) projected on the way through: (rear, front), distances from my
 /// origin, when its origin lies within `BESIDE_MAX` of a piece of the way.
 fn waited_body_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], j: &JunctionView, w: usize) -> Option<(f32, f32)> {
-    let (pos, rear, front) = if w >= usize::MAX - 64 {
-        let p = sim.players.get(usize::MAX - w)?;
+    let (pos, rear, front) = if let Some(id) = crate::sim::claim_player(w) {
+        let p = sim.players.iter().find(|p| p.id == id)?;
         (p.pos, p.half_len, p.half_len)
     } else {
         let o = vehicles.get(w)?;
