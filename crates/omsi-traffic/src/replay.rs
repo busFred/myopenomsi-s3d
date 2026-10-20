@@ -86,7 +86,20 @@ pub struct Replay {
     pub dropped_spawns: u64,
     /// Indices of the keyframes in `records`.
     keyframes: Vec<usize>,
+    /// [round 7 E2] Free run: the light clocks were taken from the recording (the first
+    /// frame after the starting keyframe); from then on they run on with the run's own
+    /// demand (`Simulation::update_lights`).
+    clocks_taken: bool,
+    /// [round 7 E2] Free run, per vehicle: the stop the game's bus service last asked for,
+    /// (its distance as recorded, the run's odometer reading at it) - see `free_inputs`.
+    free_stops: HashMap<u64, (f32, f32)>,
+    /// [round 7 E2] Free run, per vehicle: the lateral ramp the game had last (`Steer`).
+    free_ramps: HashMap<u64, (f32, f32, f32, f32)>,
 }
+
+/// [round 7 E2] A recorded stop distance (`External::stop_at`) growing by more than this (m)
+/// from one frame to the next is a new stop (the game's bus approaching one sees it shrink).
+const NEW_STOP: f32 = 1.0;
 
 impl Replay {
     /// Read a recording. The state is the header's network with no vehicles; `at` puts
@@ -120,7 +133,7 @@ impl Replay {
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes };
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new() };
         r.stub_links();
         r
     }
@@ -160,6 +173,9 @@ impl Replay {
         self.missing.clear();
         self.pending_spawns.clear();
         self.in_sync = true;
+        self.clocks_taken = false;
+        self.free_stops.clear();
+        self.free_ramps.clear();
         self.deferred_spawns = 0;
         self.dropped_spawns = 0;
         for i in 0..at {
@@ -264,7 +280,7 @@ impl Replay {
                     match self.vehicles.iter().position(|o| o.id == v.id) {
                         // (the way changes, not where the vehicle is; one where the game
                         // has it is the game's)
-                        Some(i) if !in_step(&self.vehicles[i], &v) => take_way(&mut self.vehicles[i], &v),
+                        Some(i) if !in_step(&self.vehicles[i], &v) => take_way(&mut self.vehicles[i], &v, &self.net),
                         Some(i) => self.vehicles[i] = v,
                         None => self.spawn_free(*time, v),
                     }
@@ -312,6 +328,46 @@ impl Replay {
                 v.claim_standing = s;
             }
         }
+    }
+
+    /// [round 7 E2] Free run: the game's inputs of a frame on the run's own vehicles, which
+    /// are not where the game's were. The flags and the bay (`External` but `stop_at`) and
+    /// the indicator and lateral target (`Steer`) as recorded (`free_ramps`: the game's last
+    /// ramp); a stop distance is the game
+    /// bus's, from where the game had it: the run keeps the stop where it lay from its own
+    /// bus when the game asked for it (`free_stops`: a new one when the recorded distance
+    /// appears or grows by `NEW_STOP`), and so counts the distance from its own place; a
+    /// lateral ramp the game laid (`Steer::lateral_ramp`, other than the vehicle's) is laid
+    /// from the run's own place and offset, not the game's odometer.
+    fn free_inputs(vehicles: &mut [Vehicle], free_stops: &mut HashMap<u64, (f32, f32)>, free_ramps: &mut HashMap<u64, (f32, f32, f32, f32)>, ext: &HashMap<u64, External>, steer: &HashMap<u64, crate::record::Steer>) {
+        let mut stops: HashMap<u64, (f32, f32)> = HashMap::new();
+        for v in vehicles.iter_mut() {
+            let mut e = ext.get(&v.id).copied().unwrap_or_default();
+            if let Some(d) = e.stop_at {
+                let odo = v.state.odometer;
+                let at = match free_stops.get(&v.id) {
+                    Some(&(last, at)) if d <= last + NEW_STOP => at,
+                    _ => odo + d,
+                };
+                stops.insert(v.id, (d, at));
+                e.stop_at = Some(at - odo);
+            }
+            v.external = e;
+            if let Some(s) = steer.get(&v.id) {
+                let st = &mut v.state;
+                st.signal = s.signal;
+                st.signal_time = s.signal_time;
+                st.lateral_target = s.lateral_target;
+                // (a ramp the game laid since it last had one: the first seen is the vehicle's
+                // own when it came from the recording)
+                let last = free_ramps.insert(v.id, s.lateral_ramp).unwrap_or(st.lateral_ramp);
+                if s.lateral_ramp != last {
+                    let (_, to, _, len) = s.lateral_ramp;
+                    st.lateral_ramp = (st.lateral, to, st.odometer, len);
+                }
+            }
+        }
+        *free_stops = stops;
     }
 
     /// [round 7 E3] A recording from before the lit stubs: its vehicles planned their ways on
@@ -410,15 +466,24 @@ impl Replay {
         }
         let ext: HashMap<u64, External> = f.externals.iter().copied().collect();
         let steer: HashMap<u64, crate::record::Steer> = f.steer.iter().copied().collect();
-        for v in &mut self.vehicles {
-            v.external = ext.get(&v.id).copied().unwrap_or_default();
-            if let Some(s) = steer.get(&v.id) {
-                s.apply(&mut v.state);
+        if self.free_run {
+            Self::free_inputs(&mut self.vehicles, &mut self.free_stops, &mut self.free_ramps, &ext, &steer);
+        } else {
+            for v in &mut self.vehicles {
+                v.external = ext.get(&v.id).copied().unwrap_or_default();
+                if let Some(s) = steer.get(&v.id) {
+                    s.apply(&mut v.state);
+                }
             }
         }
-        for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {
-            c.time = *time;
-            c.held = *held;
+        // ([round 7 E2] a free run takes the clocks once and runs them on itself: the demand
+        // phases follow its own vehicles, not the game's)
+        if !self.free_run || !self.clocks_taken {
+            for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {
+                c.time = *time;
+                c.held = *held;
+            }
+            self.clocks_taken = true;
         }
         sim.tick(&self.net, f.dt, &mut self.vehicles);
         // (as the game takes them off: from the back, each swapped with the last)
@@ -489,8 +554,10 @@ fn in_step(o: &Vehicle, rec: &Vehicle) -> bool {
 
 /// A free run's vehicle `o` gets the way the game changed (`rec`): the route and where in it
 /// the vehicle is, its class, driver, size and external inputs. It stays where it is: its
-/// place, speed, odometer, lane changes in progress and the lanes it has planned.
-fn take_way(o: &mut Vehicle, rec: &Vehicle) {
+/// place, speed, odometer and lane changes in progress; [round 7 E2] a new route is planned
+/// afresh from where it is, as the game's `set_route` does (bus_service.rs), not along the
+/// lanes the old one had planned.
+fn take_way(o: &mut Vehicle, rec: &Vehicle, net: &Network) {
     o.class = rec.class;
     o.params = rec.params.clone();
     o.half_width = rec.half_width;
@@ -509,9 +576,15 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle) {
     st.min_gap = r.min_gap;
     st.reaction = r.reaction;
     st.lat_accel = r.lat_accel;
+    let new_route = st.route != r.route;
     st.route = r.route.clone();
     // (where it is in the new route: its lane's place in it when it is there)
     st.route_index = st.route.iter().position(|&l| l == st.lane).unwrap_or(r.route_index);
+    if new_route && !st.route.is_empty() {
+        st.planned_next = None;
+        st.ahead.clear();
+        st.plan_next(net);
+    }
 }
 
 /// Why the recording was made under other rules than the current ones ([`rules_hash`]), if
