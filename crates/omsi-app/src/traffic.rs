@@ -4045,7 +4045,8 @@ impl Traffic {
 
     /// [round 7 fix pass 1, 12] How far behind its origin (m) the consist of `ty` (its rear
     /// sections, trailers, the cars of a unit) reaches standing straight: each car placed as
-    /// `blocked_except` places it, the farthest corner back.
+    /// `blocked_except` places it, the farthest corner back. (One straight box: the rear
+    /// section of an articulated bus swinging inwards in a bend is not modelled.)
     fn consist_rear(&mut self, ty: &Arc<VehicleType>) -> f32 {
         let (pos, heading) = (DVec3::ZERO, 0.0f64);
         let mut back_most = 0.0f64;

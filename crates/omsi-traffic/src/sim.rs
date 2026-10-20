@@ -514,7 +514,10 @@ impl Vehicle {
     /// (SUMO's "blocked") - but a red light and its own stop, which pause it; moving, it
     /// restarts. A random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up (`gone`) - a
     /// gridlock or a mutual refusal too, a 200 s red not - and is back in the traffic once it
-    /// moves. The app reads this clock (`Vehicle::waiting`) for its removals, no other.
+    /// moves. The app reads this clock (`Vehicle::waiting`) for its removals, no other. (Two
+    /// differences from SUMO: it counts only the vehicle first in line before a junction and
+    /// names no red-light pause; this runs for every standing car of a queue and pauses at
+    /// red.)
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
         let moving = self.state.speed > UNHELD_SPEED;
