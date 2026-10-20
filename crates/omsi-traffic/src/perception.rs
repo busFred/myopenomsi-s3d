@@ -1418,7 +1418,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // over its line on yellow 16 m short of it, that could still stop, was committed and
         // went in front of a car it had been refused for; review9)
         let to_line = light_line - me.state.front - 0.6;
-        let cannot_stop = me.state.speed > 1.0 && to_line < me.state.speed * me.state.speed / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+        let cannot_stop = crate::plan::cannot_stop(me.state.speed, to_line, crate::plan::HARD_BRAKE);
         let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
         return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }

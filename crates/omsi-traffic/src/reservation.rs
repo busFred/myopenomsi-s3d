@@ -87,7 +87,7 @@ pub struct Claim {
     /// near it (`FAR_FOE_REACH`).
     pub standing_long: bool,
     /// The brake (m/s²) its committed test reckons with (`Simulation::tick`: the vehicle's
-    /// own `decel * 1.5` inside the object, `MAX_BRAKE * 0.7` before it).
+    /// own `decel * 1.5` inside the object, `plan::HARD_BRAKE` before it).
     pub brake: f32,
 }
 

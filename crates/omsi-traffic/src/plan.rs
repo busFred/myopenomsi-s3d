@@ -3,7 +3,7 @@
 //! No plan reads another vehicle's plan; the only cross-vehicle input is the junction
 //! grant.
 
-use crate::driver::{VehicleClass, STANDING_SPEED};
+use crate::driver::{DriverParams, VehicleClass, STANDING_SPEED};
 use crate::perception::{JunctionView, NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
@@ -575,6 +575,28 @@ pub struct LightCall {
     pub marked_through: bool,
 }
 
+/// [round 7 D2] The braking (m/s²) a driver reckons with when asking whether it can still
+/// stop before a line or a meeting place: hard, short of an emergency stop (`MAX_BRAKE`).
+/// One figure for the light (`light_call`), the claim's committed and clearing tests and the
+/// player's red (before: 0.8 of `MAX_BRAKE` at the light, 0.7 at the junction).
+pub const HARD_BRAKE: f32 = omsi_sim::traffic::MAX_BRAKE * 0.8;
+
+/// [round 7 D2] Too late to stop within `room` metres at `v` m/s braking `brake` (m/s²;
+/// `HARD_BRAKE` but inside a junction); under 1 m/s a car can always stop.
+pub fn cannot_stop(v: f32, room: f32, brake: f32) -> bool {
+    v > 1.0 && room < v * v / (2.0 * brake)
+}
+
+/// [round 7 D2] How far from its line (m) a stop at the light is still comfortable: the
+/// driver's `comfort_brake` times 1.4, and a metre (`light_call`'s dilemma zone).
+pub fn comfortable_stop(v: f32, dp: &DriverParams) -> f32 {
+    v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0
+}
+
+/// A driver who took the mark (`Vehicle::amber`) keeps it this far (m) beyond
+/// `comfortable_stop` on yellow (`light_call`; `Simulation`'s stale mark).
+pub const MARK_REACH: f32 = 6.0;
+
 /// The driver's call at the light: through on green, the dilemma zone on yellow, on red
 /// only with the mark close to the line or too late to stop.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
@@ -582,8 +604,7 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     let dp = &me.params;
     let v = st.speed;
     let gap = sig.dist - st.front;
-    let comfortable = v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0;
-    let possible = v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8);
+    let comfortable = comfortable_stop(v, dp);
     let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
     let marked = me.amber == Some((sig.ctl, sig.light));
     match sig.aspect {
@@ -601,8 +622,8 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // below; a car released from a junction hold standing 0.5 m before an amber line
             // took the mark and crept over on red, viz case07 #18558)
             let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
-            LightCall { go, mark: go, marked_through: marked && gap < comfortable + 6.0 }
+            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + MARK_REACH));
+            LightCall { go, mark: go, marked_through: marked && gap < comfortable + MARK_REACH }
         }
         // (a car standing with its bumper over the line waits like one behind it: at a
         // standstill nothing is "too late to stop")
@@ -610,7 +631,7 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // ([round6 J3] the mark lets it on only while it rolls, as on yellow: an eased car
             // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
             // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
-            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
+            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || cannot_stop(v, gap + 0.5, HARD_BRAKE);
             LightCall { go, mark: false, marked_through: marked && gap < comfortable }
         }
     }

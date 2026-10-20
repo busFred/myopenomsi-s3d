@@ -890,9 +890,8 @@ impl Simulation {
                 let left = ahead.is_none() && here != Some(a);
                 let another = ahead.is_some_and(|s| s.dist > v.state.front + 0.5) && v.amber_line.is_some_and(|at| v.state.odometer > at + v.length() + 1.0);
                 // (or the line ahead lies further than a mark is ever taken at this speed:
-                // `plan::light_call`, a yellow within "comfortable", kept 6 m beyond it)
-                let comfortable = v.state.speed * v.state.speed / (2.0 * v.params.comfort_brake * 1.4) + 1.0;
-                let far = ahead.is_some_and(|s| s.dist - v.state.front > comfortable + 6.0);
+                // `plan::light_call`, a yellow within "comfortable", kept `MARK_REACH` beyond it)
+                let far = ahead.is_some_and(|s| s.dist - v.state.front > plan::comfortable_stop(v.state.speed, &v.params) + plan::MARK_REACH);
                 if left || another || far {
                     stale_amber.push(i);
                 }
@@ -919,8 +918,8 @@ impl Simulation {
             let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
             let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
             let room = next - st.front - 0.6;
-            let brake = if j.inside { st.decel * 1.5 } else { omsi_sim::traffic::MAX_BRAKE * 0.7 };
-            let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
+            let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
+            let cannot_stop = plan::cannot_stop(st.speed, room, brake);
             let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
@@ -1092,7 +1091,7 @@ impl Simulation {
             }
             let next_ahead = foes.iter().map(|f| f.mine.0).filter(|&m0| m0 - front_at > 0.5).fold(f32::INFINITY, f32::min);
             let room = if next_ahead.is_finite() { next_ahead } else { cs } - front_at - 0.6;
-            let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            let cannot_stop = plan::cannot_stop(v, room, plan::HARD_BRAKE);
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
@@ -1108,7 +1107,8 @@ impl Simulation {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
                     let gap = d - p.half_len;
-                    let can_stop = v < 1.0 || gap > v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8) + 0.5;
+                    // (as an AI car's `light_call`)
+                    let can_stop = !plan::cannot_stop(v, gap + 0.5, plan::HARD_BRAKE);
                     if red && can_stop {
                         (Some(lt), true, c.time_until_go(lt.1))
                     } else {
@@ -1191,7 +1191,7 @@ impl Simulation {
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
                 standing_long: false,
-                brake: omsi_sim::traffic::MAX_BRAKE * 0.7,
+                brake: plan::HARD_BRAKE,
             });
         }
         for (i, standing) in standing_now {
