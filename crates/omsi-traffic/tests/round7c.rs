@@ -124,3 +124,56 @@ fn a_marked_car_standing_at_its_red_is_not_marked_through() {
     let call = light_call(&v, &p, &sig(Aspect::Red));
     assert!(call.go && call.marked_through, "rolling: {call:?}");
 }
+
+/// [round 7 A2-full] Two spline lanes (no crossing object) converging into one lane have a
+/// compiled meeting place - a merge, the side road giving way by the right-of-way order - so
+/// the junction table decides there; two cars arriving together do not meet in the joint.
+#[test]
+fn two_spline_lanes_converging_into_one_have_a_compiled_merge_and_do_not_meet() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    use omsi_traffic::{FoeKind, Junctions, Simulation};
+    let lane = |pts: &[(f64, f64)], prio: f32| {
+        let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.5);
+        l.priority = prio;
+        l
+    };
+    // 0: the main road, 1: a side road joining it from the right at 30 degrees, 2: on
+    let lanes = vec![lane(&[(0.0, 0.0), (200.0, 0.0)], 128.0), lane(&[(30.0, -90.0), (120.0, -52.0), (200.0, 0.0)], 64.0), lane(&[(200.0, 0.0), (400.0, 0.0)], 128.0)];
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    assert_eq!(net.prev[2].len(), 2, "both run into lane 2");
+    let js = Junctions::compile(&net);
+    let side = js.foe_between(1, 0).expect("the join has a meeting place");
+    assert_eq!(side.kind, FoeKind::Merge);
+    assert!(side.yields, "the side road gives way to the main road");
+    assert!(!js.foe_between(0, 1).expect("both ways").yields);
+    // two cars timed to reach the joint together: the side road's waits, nobody touches
+    let car = |id: u64, l: usize, s: f32| {
+        let mut st = AiState::new(l, s, id);
+        st.speed = 12.0;
+        st.front = 2.0;
+        st.rear = 2.0;
+        st.length = 4.0;
+        st.max_speed_kmh = 60.0;
+        let mut v = Vehicle::new(id, VehicleClass::Car, st, 0.9, id * 7919);
+        v.fresh = 0.0;
+        v.state.plan_next(&net);
+        v
+    };
+    let side_len = net.lanes[1].length();
+    let mut vs = vec![car(1, 0, 100.0), car(2, 1, side_len - 100.0)];
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut closest = f64::INFINITY;
+    let mut side_held = false;
+    for _ in 0..(20.0 / DT) as usize {
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        closest = closest.min(vs[0].obb().separation(&vs[1].obb()));
+        side_held |= vs[1].last.why == Why::Junction;
+    }
+    assert!(side_held, "the side road's car never gave way");
+    assert!(closest > 0.3, "the two came within {closest:.2} m");
+}

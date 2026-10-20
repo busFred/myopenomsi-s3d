@@ -815,7 +815,8 @@ impl Network {
         self.crossings = vec![Vec::new(); self.lanes.len()];
         self.walks = vec![Vec::new(); self.lanes.len()];
         let (n, walks) = self.conflicts_from(0);
-        log::info!("path network: {n} conflicting lane pairs at crossings, {walks} footpath crossings");
+        let joins = self.compile_joins();
+        log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {walks} footpath crossings");
     }
 
     /// `conflicts`, `crossings` and `walks` of the junction objects whose lanes start at
@@ -1296,9 +1297,47 @@ impl Network {
         false
     }
 
+    /// [round 7 A2-full] The meeting place of every lane join: two street lanes that run into
+    /// one lane (both in its `prev`) and have none yet - spline lanes outside any crossing
+    /// object, a spline lane joining an object's way out, two pieces of one object that start
+    /// within 3 m of each other (which `conflicts_from` leaves out) - a merge at their ends, as
+    /// `conflicts_from` compiles one (`meeting_extent` back from the end, half a metre on).
+    /// Not between pieces of one way (`one_way_pieces`: one leads into the other; the queue
+    /// order decides there). Returns how many were added.
+    pub fn compile_joins(&mut self) -> usize {
+        let len = self.lanes.len();
+        self.conflicts.resize(len, Vec::new());
+        self.crossings.resize(len, Vec::new());
+        let street = |l: &Lane| l.kind == LaneKind::Street && l.points.len() >= 2;
+        let mut n = 0;
+        for to in 0..len.min(self.prev.len()) {
+            if !street(&self.lanes[to]) {
+                continue;
+            }
+            let prev: Vec<usize> = self.prev[to].iter().copied().filter(|&p| p < len && p != to && street(&self.lanes[p])).collect();
+            for (x, &i) in prev.iter().enumerate() {
+                for &j in &prev[x + 1..] {
+                    if self.crossings[i].iter().any(|c| c.other == j) || self.one_way_pieces(i, j) {
+                        continue;
+                    }
+                    let (a, b) = (&self.lanes[i], &self.lanes[j]);
+                    let (sa, sb) = (a.length(), b.length());
+                    let ab = meeting_extent(a, sa, b).0;
+                    let bb = meeting_extent(b, sb, a).0;
+                    self.conflicts[i].push(j);
+                    self.conflicts[j].push(i);
+                    self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: true, before: ab, after: 0.5, other_before: bb, other_after: 0.5, side: false });
+                    self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: true, before: bb, after: 0.5, other_before: ab, other_after: 0.5, side: false });
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// The converging lanes of every crossing object (`add_converging`) on a network whose
     /// meeting places were derived before them (a recording's header): the pairs with no
-    /// meeting place yet. Returns how many were added.
+    /// meeting place yet, and the lane joins (`compile_joins`). Returns how many were added.
     pub fn compile_converging(&mut self) -> usize {
         self.conflicts.resize(self.lanes.len(), Vec::new());
         self.crossings.resize(self.lanes.len(), Vec::new());
@@ -1321,7 +1360,7 @@ impl Network {
                 }
             }
         }
-        n
+        n + self.compile_joins()
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -1939,6 +1978,7 @@ impl Network {
         // meeting places and footpath crossings inside the new junction objects, and how far
         // every lane now leads (a dead end may go on into the new tiles)
         self.conflicts_from(first);
+        self.compile_joins();
         self.update_reach_from(first);
         self.clip_drivable(first);
         first..end

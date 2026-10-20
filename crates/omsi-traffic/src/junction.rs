@@ -124,6 +124,10 @@ impl Junction {
     }
 }
 
+/// The tile of a junction made of a lane join of spline lanes alone (`Junctions::extend`):
+/// its key is (this tile, the join's first lane).
+pub const JOIN_TILE: i32 = i32::MIN;
+
 /// All junctions of a network, with lookups by lane.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Junctions {
@@ -147,51 +151,115 @@ impl Junctions {
         j
     }
 
-    /// Compile the crossing objects whose lanes start at index `first` (lanes come in
-    /// whole objects when a tile loads). Lanes before `first` are already compiled;
-    /// their entries and exits into the new lanes are patched up.
+    /// Compile the junctions again with the lanes added from index `first` (lanes come in
+    /// whole objects when a tile loads): every crossing object with all its lanes (an object
+    /// extended with reverse twins is compiled whole), and [round 7 A2-full] every lane join
+    /// (`Network::compile_joins`) whose two lanes are not of one object: a spline lane joining
+    /// an object's way goes into that object as one of its movements, and joins of spline
+    /// lanes alone make a junction of their own (`JOIN_TILE`), so that every join has a
+    /// meeting place in one junction table (`foe_between`). Junctions keep their index (a new
+    /// one comes at the end), so what a vehicle remembers of one (`ease_for`, `zip_won`)
+    /// stays right.
     pub fn extend(&mut self, net: &Network, first: usize) {
-        let first = first.min(self.compiled);
-        // group the new junction lanes by object
-        let mut by_object: HashMap<((i32, i32), i64), Vec<usize>> = HashMap::new();
-        for (i, l) in net.lanes.iter().enumerate().skip(first) {
-            if l.source != 2 || !matches!(l.kind, LaneKind::Street | LaneKind::Rail) {
+        let _ = first;
+        let object = |l: usize| -> Option<((i32, i32), i64)> {
+            let lane = net.lanes.get(l)?;
+            if lane.source != 2 || !matches!(lane.kind, LaneKind::Street | LaneKind::Rail) {
+                return None;
+            }
+            lane.key.map(|k| (k.tile, k.id))
+        };
+        let mut lanes_of: HashMap<((i32, i32), i64), Vec<usize>> = HashMap::new();
+        let mut keys: Vec<((i32, i32), i64)> = Vec::new();
+        for i in 0..net.lanes.len() {
+            if let Some(k) = object(i) {
+                let v = lanes_of.entry(k).or_insert_with(|| {
+                    keys.push(k);
+                    Vec::new()
+                });
+                v.push(i);
+            }
+        }
+        // the lane joins not inside one object, grouped (a lane joining two others is one
+        // place); a group with an object's lane goes into that object
+        let mut parent: HashMap<usize, usize> = HashMap::new();
+        fn find(parent: &mut HashMap<usize, usize>, x: usize) -> usize {
+            let mut r = x;
+            while let Some(&p) = parent.get(&r) {
+                if p == r {
+                    break;
+                }
+                r = p;
+            }
+            parent.insert(x, r);
+            r
+        }
+        for a in 0..net.lanes.len().min(net.crossings.len()) {
+            for c in &net.crossings[a] {
+                let b = c.other;
+                if !c.merge || b <= a || !net.lanes[a].next.iter().any(|n| net.lanes.get(b).is_some_and(|lb| lb.next.contains(n))) {
+                    continue;
+                }
+                if object(a).is_some() && object(a) == object(b) {
+                    continue;
+                }
+                parent.entry(a).or_insert(a);
+                parent.entry(b).or_insert(b);
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb));
+                }
+            }
+        }
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut join_keys: Vec<((i32, i32), i64)> = Vec::new();
+        let members: Vec<usize> = parent.keys().copied().collect();
+        for l in members {
+            let r = find(&mut parent, l);
+            groups.entry(r).or_default().push(l);
+        }
+        for (root, mut lanes) in groups {
+            lanes.sort_unstable();
+            let objects: Vec<((i32, i32), i64)> = {
+                let mut o: Vec<_> = lanes.iter().filter_map(|&l| object(l)).collect();
+                o.sort_unstable();
+                o.dedup();
+                o
+            };
+            let outside: Vec<usize> = lanes.iter().copied().filter(|&l| object(l).is_none()).collect();
+            match objects.first() {
+                Some(&k) => lanes_of.entry(k).or_default().extend(outside),
+                None => {
+                    let k = ((JOIN_TILE, JOIN_TILE), root as i64);
+                    join_keys.push(k);
+                    lanes_of.insert(k, outside);
+                }
+            }
+        }
+        // in place, by key; new ones at the end
+        let mut placed: Vec<((i32, i32), i64)> = Vec::new();
+        for idx in 0..self.nodes.len() {
+            let key = self.nodes[idx].key;
+            if let Some(lanes) = lanes_of.get_mut(&key) {
+                lanes.sort_unstable();
+                lanes.dedup();
+                self.nodes[idx] = Self::build(net, key, lanes);
+                placed.push(key);
+            }
+        }
+        keys.sort_unstable();
+        // (the objects first, as compiled before, then the joins of spline lanes)
+        keys.extend(join_keys);
+        for key in keys {
+            if placed.contains(&key) {
                 continue;
             }
-            let Some(k) = l.key else { continue };
-            by_object.entry((k.tile, k.id)).or_default().push(i);
-        }
-        // (an object whose lanes were extended with reverse twins: compiled again whole)
-        let mut keys: Vec<_> = by_object.keys().copied().collect();
-        keys.sort_unstable();
-        for &key in &keys {
-            let mut lanes = by_object.remove(&key).unwrap_or_default();
-            if let Some(old) = self.nodes.iter().position(|n| n.key == key) {
-                for m in &self.nodes[old].movements {
-                    if !lanes.contains(&m.lane) {
-                        lanes.push(m.lane);
-                    }
-                }
+            if let Some(lanes) = lanes_of.get_mut(&key) {
                 lanes.sort_unstable();
-                let node = Self::build(net, key, &lanes);
-                self.nodes[old] = node;
-            } else {
-                lanes.sort_unstable();
-                self.nodes.push(Self::build(net, key, &lanes));
+                lanes.dedup();
+                self.nodes.push(Self::build(net, key, lanes));
+                placed.push(key);
             }
-        }
-        // the old junctions' ways in and out may lie on the new lanes
-        let old_keys: Vec<((i32, i32), i64)> = self.nodes.iter().filter(|n| !keys.contains(&n.key)).map(|n| n.key).collect();
-        for key in old_keys {
-            let Some(idx) = self.nodes.iter().position(|n| n.key == key) else { continue };
-            let lanes: Vec<usize> = self.nodes[idx].movements.iter().map(|m| m.lane).collect();
-            let fresh = Self::build(net, key, &lanes);
-            for (m, f) in self.nodes[idx].movements.iter_mut().zip(fresh.movements) {
-                m.entries = f.entries;
-                m.exits = f.exits;
-                m.continues = f.continues;
-            }
-            self.nodes[idx].crossings = fresh.crossings;
         }
         self.compiled = net.lanes.len();
         self.rebuild_lookups();

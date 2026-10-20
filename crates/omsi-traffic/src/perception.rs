@@ -271,8 +271,6 @@ pub struct Perception {
     /// A player's vehicle ahead indicating to pull out towards the traffic: the distance
     /// from my origin to its rear.
     pub letting_out: Option<f32>,
-    /// A vehicle on another lane that reaches the joint ahead first.
-    pub merging: Option<Headway>,
     /// Every body in my corridor ahead (vehicles, players, parked cars): (gap from my front to
     /// its near edge, to its far edge, its speed along my way), nearest first. What lies
     /// beyond the lead (a pass needs room to come back in, `plan`).
@@ -740,61 +738,6 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         }
     }
     (on_lane, body)
-}
-
-/// A vehicle on another lane into the same next lane that gets to the joint first: the merge
-/// rule of a lane join the junctions know no meeting place of (`Junctions::foe_between`:
-/// [round 7 A2] where they do - a compiled merge - its grant and the zipper decide, and this
-/// first-come rule, which contradicted them, is not asked). Of the joins of the recorded
-/// networks with no compiled meeting place, X10's had 28 pairs outside junctions and 231
-/// with one lane in one, BeijingCity's 60 and 532 (`traffic_cases joins`).
-fn merging_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
-    let me = &vehicles[i];
-    let st = &me.state;
-    let next = st.planned_next?;
-    let my_lane = net.lanes.get(st.lane)?;
-    let d_me = my_lane.length() - st.s;
-    if d_me > look_ahead(st.speed) {
-        return None;
-    }
-    let limit = my_lane.speed_limit_kmh / 3.6;
-    let t_me = arrival_time(d_me, st.speed, st.accel, limit);
-    let mut best: Option<Headway> = None;
-    for &p in net.prev.get(next)? {
-        if p == st.lane || sim.junctions.foe_between(st.lane, p).is_some() {
-            continue;
-        }
-        let pl = &net.lanes[p];
-        for occ in sim.occupancy.get(&p).map(|v| v.as_slice()).unwrap_or(&[]) {
-            if occ.vehicle == i || occ.foreign {
-                continue;
-            }
-            let o = &vehicles[occ.vehicle];
-            // into the same next lane; or out of a lane ending where mine does, whichever
-            // lane it goes on into (two lanes converging on one joint whose starts lie too
-            // close for the network to call them a merge, and for the junction to know them
-            // as foes, met side by side at the joint)
-            let same_joint = (pl.end() - my_lane.end()).truncate().length() < 1.5;
-            if o.state.planned_next != Some(next) && !same_joint {
-                continue;
-            }
-            // someone held at a light or a junction never arrives
-            if o.state.speed < STANDING_SPEED && o.last.stop.is_some() {
-                continue;
-            }
-            let d_them = pl.length() - occ.s;
-            let t_them = arrival_time(d_them, o.state.speed, o.state.accel, limit);
-            // (a near tie, within 0.4 s, goes to the lower id)
-            let first = t_them + 0.4 < t_me || ((t_them - t_me).abs() <= 0.4 && o.id < me.id);
-            if !first {
-                continue;
-            }
-            let gap = (d_me - d_them - o.state.rear - st.front).max(0.3);
-            let h = Headway { gap, speed: o.state.speed, acc: o.state.acc, what: Seen::Vehicle(occ.vehicle), standing_for: o.stopped, half_width: o.half_width, length: o.length(), held: true, at_stop: false, lateral: 0.0, rest: Headway::rest_of(o, gap, st.front) };
-            best = Headway::nearer(best, Some(h));
-        }
-    }
-    best
 }
 
 /// A body beside me (`rel`: from the way's sample to its middle, `f`: the way's direction
@@ -1674,9 +1617,8 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     p.road_left = net.reach.get(st.lane).copied().unwrap_or(lane.length()) - st.s;
     let air = me.class == crate::driver::VehicleClass::Air;
 
-    p.merging = merging_ahead(net, sim, vehicles, i);
     if air {
-        p.leader = Headway::nearer(leader_on_way(sim, vehicles, i, &p.way, look), p.merging);
+        p.leader = leader_on_way(sim, vehicles, i, &p.way, look);
     } else {
         // the way ahead, sampled once for the bodies, the players and the people
         let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
@@ -1686,7 +1628,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });
         let way = WayPts::sample(net, st, upto);
         let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &p.way, &way, look, body_look, cand, &mut p.ahead);
-        p.leader = Headway::nearer(on_lane, p.merging);
+        p.leader = on_lane;
         if player_near {
             let pl = player_on_way(sim, me, &way, look);
             if let Some(h) = pl {

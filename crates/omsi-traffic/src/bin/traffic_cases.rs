@@ -5221,8 +5221,10 @@ fn stubs(args: &[String]) -> Res<()> {
 /// side, round 4a.)
 /// [round 7 A2] The lane joins of a fixture's network: two street lanes running into one
 /// lane, by whether the compiled junctions know a meeting place between them (a foe of one
-/// movement for the other, by kind). Prints the pairs no junction knows (`--list`), the
-/// ones `perception::merging_ahead` was the only merge rule for.
+/// movement for the other, by kind; `Junctions::foe_between`). Pieces of one way (one lane
+/// leads into the other, `Network::one_way_pieces`) have none by design and are counted
+/// apart; `uncovered` must be 0 (A2-full: every join of two ways is compiled). `--list`
+/// prints the pairs with none, `--why` with why.
 fn joins(args: &[String]) -> Res<()> {
     let list = args.iter().any(|a| a == "--list");
     for f in args.iter().filter(|a| !a.starts_with("--")) {
@@ -5235,6 +5237,8 @@ fn joins(args: &[String]) -> Res<()> {
         };
         let street = |l: usize| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2;
         let (mut merge, mut other, mut none_in, mut none_out) = (0, 0, 0, 0);
+        let mut cats: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut pieces = 0usize;
         for n in 0..net.lanes.len() {
             if !street(n) {
                 continue;
@@ -5245,8 +5249,21 @@ fn joins(args: &[String]) -> Res<()> {
                     match foe(a, b) {
                         Some(omsi_traffic::FoeKind::Merge) => merge += 1,
                         Some(_) => other += 1,
+                        None if net.one_way_pieces(a, b) => pieces += 1,
                         None => {
                             let inside = js.of_lane.contains_key(&a) || js.of_lane.contains_key(&b);
+                            let cat = match (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                                (None, None) => "none",
+                                (Some(x), Some(y)) if x.0 == y.0 => "same",
+                                (Some(_), Some(_)) => "two",
+                                _ => "one",
+                            };
+                            *cats.entry(cat).or_insert(0usize) += 1;
+                            if args.iter().any(|a| a == "--why") {
+                                let (la, lb) = (&net.lanes[a], &net.lanes[b]);
+                                let why = if la.key.map(|k| k.path) == lb.key.map(|k| k.path) && la.key.is_some() { "same path" } else if la.kind == LaneKind::Rail && lb.kind == LaneKind::Rail { "rail" } else if (la.start() - lb.start()).truncate().length() <= 3.0 { "starts within 3 m" } else { "other" };
+                                println!("  {cat} {a}/{b} into {n}: {why}; ends {:.1} m apart, lengths {:.1}/{:.1}, src {}/{}", (la.end() - lb.end()).truncate().length(), la.length(), lb.length(), la.source, lb.source);
+                            }
                             if inside {
                                 none_in += 1;
                             } else {
@@ -5261,7 +5278,7 @@ fn joins(args: &[String]) -> Res<()> {
                 }
             }
         }
-        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, none: touching a junction {none_in}, outside junctions {none_out}");
+        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, pieces of one way {pieces}; uncovered {}: touching a junction {none_in}, outside junctions {none_out} (lanes in junctions: {cats:?})", none_in + none_out);
     }
     Ok(())
 }
