@@ -7,7 +7,9 @@
 //! body, a player or a person reuses the samples; the vehicles and the people near the
 //! car come from the simulation's grids, not from a scan of everything.
 
+use crate::driver::STANDING_SPEED;
 use crate::junction::{FoeKind, Junctions};
+use crate::plan::QUEUE_OBSTACLE_STAND;
 use crate::sim::{Simulation, Vehicle};
 use glam::{DVec2, DVec3};
 use omsi_sim::collision::Obb;
@@ -57,7 +59,7 @@ impl Headway {
     /// behind a bus at its stop); `None` with neither.
     fn rest_of(o: &Vehicle, gap: f32, front: f32) -> Option<f32> {
         let by_stop = o.last.stop.map(|s| (s - o.state.front).max(0.0));
-        let by_lead = o.last.lead.filter(|l| l.speed < 0.3).map(|l| (l.gap - o.state.min_gap).max(0.0));
+        let by_lead = o.last.lead.filter(|l| l.speed < STANDING_SPEED).map(|l| (l.gap - o.state.min_gap).max(0.0));
         let on = match (by_stop, by_lead) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -77,18 +79,26 @@ impl Headway {
         omsi_sim::traffic::Lead { gap: self.gap, speed: self.speed, acc: self.acc }
     }
 
-    /// Something that stands and will go on standing: worth going round.
+    /// Something that stands and will go on standing: worth going round. (Parked; a bus at
+    /// its stop after `AT_STOP_OBSTACLE_STAND`; one held by nothing, or the player, after
+    /// `QUEUE_OBSTACLE_STAND`; anything after `HELD_OBSTACLE_STAND`.)
     pub fn standing_obstacle(&self) -> bool {
-        if self.speed >= 0.3 {
+        if self.speed >= STANDING_SPEED {
             return false;
         }
         match self.what {
             Seen::Parked => true,
-            Seen::Player(_) => self.standing_for > 4.0,
-            Seen::Vehicle(_) | Seen::Body(_) => (self.at_stop && self.standing_for > 0.5) || (!self.held && self.standing_for > 4.0) || self.standing_for > 25.0,
+            Seen::Player(_) => self.standing_for > QUEUE_OBSTACLE_STAND,
+            Seen::Vehicle(_) | Seen::Body(_) => (self.at_stop && self.standing_for > AT_STOP_OBSTACLE_STAND) || (!self.held && self.standing_for > QUEUE_OBSTACLE_STAND) || self.standing_for > HELD_OBSTACLE_STAND,
         }
     }
 }
+
+/// A bus at its stop is an obstacle worth going round once it has stood this long there (s).
+pub const AT_STOP_OBSTACLE_STAND: f32 = 0.5;
+/// Anything standing this long (s) is an obstacle, whatever holds it (its hold is not
+/// going to lift soon).
+pub const HELD_OBSTACLE_STAND: f32 = 25.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalView {
@@ -687,7 +697,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // the standing thing I am passing (in my lane, nearer its middle than the line of the
         // pass: one standing on the line the pass takes, an oncoming car, is in my way)
         if let Some(p) = passing {
-            if o.state.speed < 0.3 && st.odometer + gap + st.front < p.until + 1.0 && lateral.abs() < (lateral - p.side).abs() {
+            if o.state.speed < STANDING_SPEED && st.odometer + gap + st.front < p.until + 1.0 && lateral.abs() < (lateral - p.side).abs() {
                 continue;
             }
         }
@@ -1143,7 +1153,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
                 // (review-r5c-safety: at `half - 0.9` a red-light waiter standing 0.5-1.1 m
                 // off my axis was crawled through at 0.25 m/s once the zebra check no longer
                 // listed them)
-                if !p.on_crossing && !at_kerb_of_stop && v < 0.3 && p.still > 3.0 && outside {
+                if !p.on_crossing && !at_kerb_of_stop && v < STANDING_SPEED && p.still > 3.0 && outside {
                     continue;
                 }
                 // (where the person really is relative to the sample, so that the stop
@@ -1343,9 +1353,9 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 // behind #11131 rolling at 4.6 m/s towards a queue 18 m ahead, and stood with
                 // its tail across the through lane; a queue tail 40 m past a crossing, viz3
                 // case03/16, leaves the box open)
-                let crawling = o.state.speed >= 0.3 && o.state.speed < EXIT_SLOW;
-                let standing_lead = o.last.lead.filter(|l| l.speed < 0.3);
-                let queueing = o.state.speed < 0.3 || standing_lead.is_some();
+                let crawling = o.state.speed >= STANDING_SPEED && o.state.speed < EXIT_SLOW;
+                let standing_lead = o.last.lead.filter(|l| l.speed < STANDING_SPEED);
+                let queueing = o.state.speed < STANDING_SPEED || standing_lead.is_some();
                 let predicted_tail = tail + standing_lead.map(|l| (l.gap - o.state.min_gap).max(0.0)).unwrap_or(0.0);
                 if crosses && !o.external.at_stop && tail > clear_from - 0.5 && ((crawling && tail - clear_from < EXIT_NEAR) || (queueing && predicted_tail - clear_from < EXIT_NEAR + need)) {
                     room = 0.0;
@@ -1549,7 +1559,7 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
             return;
         }
         // standing in or just beyond the stretch the pass uses: in the way, not coming
-        if speed < 0.5 && pos > os - pass_len - 15.0 {
+        if speed < STANDING_SPEED && pos > os - pass_len - 15.0 {
             blocked = true;
             clear_for = 0.0;
             return;
@@ -1558,7 +1568,7 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
         let dist = (os - pos).max(0.0);
         let mut t = arrival_time(dist, speed, accel, limit);
         // a car standing at a red light with time to go: counts from when it goes
-        if at_red && speed < 0.5 {
+        if at_red && speed < STANDING_SPEED {
             t += 5.0;
         }
         // inside the stretch I will use: no time at all

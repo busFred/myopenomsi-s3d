@@ -6,7 +6,7 @@
 //! vehicle. The answer is a pure function of the claims, so the stage can be checked in a
 //! test with no vehicles at all.
 
-use crate::driver::Impatience;
+use crate::driver::{Impatience, STANDING_SPEED};
 use crate::junction::{FoeKind, Junctions};
 use omsi_sim::traffic::arrival_time;
 
@@ -117,7 +117,7 @@ impl Claim {
     /// last claim (a car let go that creeps off is not refused again by the ordinary rules
     /// the moment it passes 0.3 m/s, to be let go again once it has stopped).
     pub fn standing(&self) -> bool {
-        self.speed < 0.3 || (self.was_standing && self.speed <= 1.0)
+        self.speed < STANDING_SPEED || (self.was_standing && self.speed <= 1.0)
     }
 }
 
@@ -362,7 +362,7 @@ fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize
             return step >= 1;
         }
         let Some(&next) = claim_of.get(&lead) else { return false };
-        if next == k || claims[next].speed >= 0.3 {
+        if next == k || claims[next].speed >= STANDING_SPEED {
             return false;
         }
         at = next;
@@ -422,7 +422,7 @@ fn held_off(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain
 fn behind_on_my_way(c: &Claim, o: &Claim) -> bool {
     c.chain.iter().any(|&(piece, my_off)| {
         let mine = c.s - my_off;
-        (mine + c.front >= 0.0 || o.speed < 0.3) && o.chain.iter().any(|&(their_piece, their_off)| their_piece == piece && o.s - their_off + o.front <= mine - c.rear - 1.0)
+        (mine + c.front >= 0.0 || o.speed < STANDING_SPEED) && o.chain.iter().any(|&(their_piece, their_off)| their_piece == piece && o.s - their_off + o.front <= mine - c.rear - 1.0)
     })
 }
 
@@ -470,7 +470,7 @@ fn merging_behind(c: &Claim, o: &Claim, foe: &crate::junction::Foe) -> bool {
 /// then it waits where it is (`must_stop`). (Round 5: "when a complete stop is expected, roll
 /// earlier and let one slow down".)
 fn eased_follow(my_foes: &[(usize, crate::junction::Foe)], c: &Claim, o: &Claim) -> Option<(f32, f32)> {
-    if o.speed < 0.3 {
+    if o.speed < STANDING_SPEED {
         return None;
     }
     let mut best: Option<(f32, f32)> = None;
@@ -601,7 +601,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // comes as its window from standing says (a car standing in a queue on a
                 // lead-in whose first meeting place, with its own stub or another way, lay
                 // behind its bumper held the claimant ahead of it until it "left")
-                if shifted.speed < 0.3 && !their_inside {
+                if shifted.speed < STANDING_SPEED && !their_inside {
                     shifted.committed = false;
                 }
                 // (clearing the box, it is committed to the others; not one standing outside this
@@ -614,7 +614,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // past its line on amber, standing 8 m short of the merge with the bus as its
                 // lead, was committed to the bus, which let it out first; each waited for the
                 // other 46 s)
-                if shifted.clearing && !(shifted.stuck && !their_inside) && !(shifted.speed < 0.3 && !their_inside && held_by(claims, &claim_of, plain, ok, c.vehicle)) {
+                if shifted.clearing && !(shifted.stuck && !their_inside) && !(shifted.speed < STANDING_SPEED && !their_inside && held_by(claims, &claim_of, plain, ok, c.vehicle)) {
                     shifted.committed = true;
                 }
                 let o = &shifted;
@@ -626,7 +626,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // foe for others while it stood in its queue, viz2 case12 #40303 waited 22 s for
                 // #40927 74 m away, review-r6j)
                 let far_reach = FAR_FOE_REACH.max(c.speed * c.speed / (2.0 * FAR_FOE_BRAKE.min(c.brake)) + FAR_FOE_SLACK);
-                if their_inside && o.speed < 0.3 && o.standing_long && foe.mine.0 - (c.s + c.front) > far_reach {
+                if their_inside && o.speed < STANDING_SPEED && o.standing_long && foe.mine.0 - (c.s + c.front) > far_reach {
                     if far.map(|f| foe.mine.0 < f.1).unwrap_or(true) {
                         far = Some((o.vehicle, foe.mine.0));
                     }
@@ -663,7 +663,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // case05: a bus at the head of the queue it had just left waited 8.6 s for
                 // three cars rolling up behind it, each a competitor from its own speed until
                 // it had come to a full stop)
-                if !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < 0.3 && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
+                if !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
                     continue;
                 }
                 // a foe standing at its red light is not coming before its light goes:
@@ -672,7 +672,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // standing there, `Claim::was_standing`)
                 if at_red {
                     let t = o.until_go.unwrap_or(f32::INFINITY);
-                    let standing = o.speed < 0.5 || (o.was_standing && o.speed <= 1.0);
+                    let standing = o.standing();
                     // (standing: from rest at its green; rolling: not before its green, nor
                     // before its own window says)
                     let shift = if standing { t } else { (t - their_in).max(0.0) };
@@ -682,7 +682,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                     if my_out + margin <= their_in {
                         continue;
                     }
-                } else if o.light_red && (o.speed < 0.5 || (o.was_standing && o.speed <= 1.0)) && !their_inside {
+                } else if o.light_red && o.standing() && !their_inside {
                     match o.until_go {
                         Some(t) => {
                             their_in += t;
@@ -717,12 +717,12 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // the meeting place", viz case14 #46608/#50444). Level with me or ahead, it
                 // holds me as before (`competitor_filter_my_follower_in_the_same_lane_is_no_foe`)
                 let behind_me = foe.kind == FoeKind::Merge && foe.theirs.1 - (o.s + o.front) > foe.mine.1 - (c.s - c.rear);
-                if their_inside && o.speed < 0.3 && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
+                if their_inside && o.speed < STANDING_SPEED && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
                     continue;
                 }
                 // standing in the meeting place, held by its own lead: it is not leaving
                 // on the schedule its acceleration would give it
-                if their_inside && o.held && o.speed < 0.3 {
+                if their_inside && o.held && o.speed < STANDING_SPEED {
                     their_out = f32::INFINITY;
                 }
                 // (one who has to give way is "first" only by the gap it accepts, not by
@@ -847,7 +847,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // (four cars arriving together at an unmarked junction all give way to
                 // the right: when the foe stands and waits as well, half the patience is
                 // enough to go first, as a nod across the junction settles it in life)
-                let mutual_wait = plain.is_some() && c.impatience.value >= HALF_FED_UP && o.speed < 0.3 && !their_inside && !o.committed;
+                let mutual_wait = plain.is_some() && c.impatience.value >= HALF_FED_UP && o.speed < STANDING_SPEED && !their_inside && !o.committed;
                 let fed_up = (squeeze.is_some() && far_enough) || mutual_wait;
                 let take_anyway = fed_up && !their_inside && !o.committed && !goes_now && !(o.impatience.value >= HALF_FED_UP && o.vehicle < c.vehicle);
                 // (second pass) I stand refused at my line; a foe that

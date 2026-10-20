@@ -4,7 +4,7 @@
 //! caller's, so the app keeps its own vehicle instances beside them and a test needs
 //! neither.
 
-use crate::driver::{DriverParams, Impatience, VehicleClass};
+use crate::driver::{DriverParams, Impatience, VehicleClass, STANDING_SPEED};
 use crate::junction::Junctions;
 use crate::perception::{self, Perception, Seen};
 use crate::plan::{self, Plan, Start, Why};
@@ -286,6 +286,11 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
+/// [ROLLBACK r4d-B4] A timetable bus creeping up to its stop slower than this (m/s) has not
+/// moved off: its standing time (`Vehicle::stopped`) runs on (`STANDING_SPEED` would reset
+/// it in a 0.3-0.4 m/s creep).
+pub const CREPT_OFF_SPEED: f32 = 0.5;
+
 /// [round 7 B1] A random vehicle that has stood held by nothing (`Vehicle::held_by_nothing`)
 /// this long at a stretch (s) gives up (`Vehicle::gone`): five minutes, SUMO's default
 /// `--time-to-teleport` of 300 s for a vehicle that waited too long (sumo.md 5.3,
@@ -478,7 +483,7 @@ impl Vehicle {
 
     /// Standing still, held by something.
     pub fn is_held(&self) -> bool {
-        self.state.speed < 0.3 && self.last.held
+        self.state.speed < STANDING_SPEED && self.last.held
     }
 
     /// [round 7 A4] A timetable bus (`VehicleClass::serves_stops`).
@@ -774,7 +779,7 @@ impl Simulation {
     /// 9 cars 106 s.)
     fn player_parked_beside(net: &Network, lane: usize, s: f32, p: &PlayerView) -> bool {
         let lateral = player_lateral(net, lane, s, p);
-        p.still > PLAYER_STILL && p.speed.abs() < 0.3 && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
+        p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
     }
 
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
@@ -954,7 +959,7 @@ impl Simulation {
             // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
             let was_standing = v.claim_standing;
-            standing_now.push((i, st.speed < 0.3 || (was_standing && st.speed <= 1.0)));
+            standing_now.push((i, st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0)));
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
                 chain: j.chain.clone(),
@@ -990,7 +995,7 @@ impl Simulation {
                 stuck: v.is_held()
                     && match v.last.why {
                         Why::People | Why::Zebra => true,
-                        Why::Lead => p.leader.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0),
+                        Why::Lead => p.leader.is_some_and(|l| l.speed < STANDING_SPEED && l.gap < 12.0),
                         _ => false,
                     },
                 lanes: perception::way_lanes(net, st, 150.0),
@@ -998,11 +1003,11 @@ impl Simulation {
                 id: v.id,
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
-                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                 // (held by its service, or standing `FAR_FOE_STOOD` s or more)
                 // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
                 // from its first frame, review-r6j)
-                standing_long: st.speed < 0.3 && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
+                standing_long: st.speed < STANDING_SPEED && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
                 brake,
             });
         }
@@ -1115,7 +1120,7 @@ impl Simulation {
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
-            let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
+            let blocked = p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && !light_red;
             // [round6 J5] standing, its lead: the AI vehicle in its corridor, its box
             // within `PLAYER_LEAD_REACH` ahead of the front and its centre within
             // `PLAYER_LEAD_ACROSS` of the axis (`traffic_cases heads`' queue in front of the
@@ -1124,7 +1129,7 @@ impl Simulation {
             // 1 m behind its tail)
             let player_foes: Vec<usize> = foes.iter().map(|f| f.movement).collect();
             let meets = |k: usize| claim_of[k].is_some_and(|ck| claims[ck].junction == j && !claims[ck].chain.iter().any(|&(cm, _)| cm == m) && claims[ck].chain.iter().any(|&(cm, _)| player_foes.contains(&cm)));
-            let lead = (p.still > PLAYER_STILL && p.speed.abs() < 0.3)
+            let lead = (p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED)
                 .then(|| {
                     let fwd = p.fwd();
                     let right = DVec2::new(fwd.y, -fwd.x);
@@ -1140,7 +1145,7 @@ impl Simulation {
                             // (one moving off from in front of it keeps it as its lead for
                             // `PLAYER_LEAD_AWAY`: refused again 3 m on, it stood and went)
                             let hk = (vehicles[k].heading as f64).to_radians();
-                            let away = vehicles[k].state.speed >= 0.3 && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
+                            let away = vehicles[k].state.speed >= STANDING_SPEED && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
                             let reach = if away { PLAYER_LEAD_AWAY } else { PLAYER_LEAD_REACH };
                             // (wholly ahead of its front, but for half a metre: not a car alongside
                             // in a narrow piece beside it with its front just past the player's)
@@ -1307,12 +1312,12 @@ impl Simulation {
         let mut timers: Vec<(Option<(u64, f32)>, f32)> = Vec::with_capacity(vehicles.len());
         for v in vehicles.iter() {
             // (both standing: one rolling up to its stop is not held yet)
-            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
+            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < STANDING_SPEED)).filter(|_| v.state.speed < STANDING_SPEED);
             timers.push(match (other, v.mutual) {
                 (Some(o), Some((p, t))) if p == o => (Some((o, t + dt)), 0.0),
                 (Some(o), _) => (Some((o, dt)), 0.0),
                 // (not seen this frame: kept over a short gap while it stands)
-                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < 0.3 => (Some((p, t + dt)), v.mutual_gap + dt),
+                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < STANDING_SPEED => (Some((p, t + dt)), v.mutual_gap + dt),
                 (None, _) => (None, 0.0),
             });
         }
@@ -1326,7 +1331,7 @@ impl Simulation {
             if vehicles[a].id > oid || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
                 continue;
             }
-            if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+            if vehicles[a].state.speed >= STANDING_SPEED || vehicles[b].state.speed >= STANDING_SPEED {
                 continue;
             }
             // (only at a frame the hold is seen: who is body-blocked is read from this frame)
@@ -1398,7 +1403,7 @@ impl Simulation {
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
         v.lead_id = lead_id;
-        if plan.why == Why::Light && v.state.speed < 0.5 {
+        if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
             self.held_at_red += 1;
         }
         if let Some(light) = plan.amber {
@@ -1510,7 +1515,7 @@ impl Simulation {
         // a lane change that stands frozen part-way is settled where the body is
         match v.state.change {
             Some(c) => {
-                if v.state.speed >= 0.3 || (c.t - v.change_still.0).abs() > 0.01 {
+                if v.state.speed >= STANDING_SPEED || (c.t - v.change_still.0).abs() > 0.01 {
                     v.change_still = (c.t, 0.0);
                 } else {
                     v.change_still.1 += dt;
@@ -1525,11 +1530,11 @@ impl Simulation {
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
         v.pull_out = (v.pull_out - dt).max(0.0);
-        let standing = v.state.speed < 0.3;
-        // [ROLLBACK r4d-B4] a bus creeping up under 0.5 m/s has not moved off: its standing
-        // time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of its
-        // stop by people served the stop where it stood only after 12.7 s instead of 6)
-        let moving = if v.serves_stops() { v.state.speed >= 0.5 } else { !standing };
+        let standing = v.state.speed < STANDING_SPEED;
+        // [ROLLBACK r4d-B4] a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
+        // standing time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of
+        // its stop by people served the stop where it stood only after 12.7 s instead of 6)
+        let moving = if v.serves_stops() { v.state.speed >= CREPT_OFF_SPEED } else { !standing };
         if standing && !v.external.at_stop {
             v.stopped += dt;
         } else if moving {

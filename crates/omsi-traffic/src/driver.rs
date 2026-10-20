@@ -5,6 +5,11 @@
 
 use omsi_sim::traffic::AiState;
 
+/// [round 7 D1] Under this speed (m/s) a vehicle stands: one threshold for every rule that
+/// asks whether a vehicle (a lead, a foe, a claimant, the player) stands (`Claim::standing`
+/// adds its 1 m/s hysteresis for a claimant that stood).
+pub const STANDING_SPEED: f32 = 0.3;
+
 /// A fed-up driver (`Impatience::claims_after`) takes a way they would yield on when the foe
 /// is still this many seconds away (s; the figure since b9568aa, not jittered per driver).
 pub const FED_UP_AFTER: f32 = 2.5;

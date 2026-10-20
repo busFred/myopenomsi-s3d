@@ -3,7 +3,7 @@
 //! No plan reads another vehicle's plan; the only cross-vehicle input is the junction
 //! grant.
 
-use crate::driver::VehicleClass;
+use crate::driver::{VehicleClass, STANDING_SPEED};
 use crate::perception::{JunctionView, NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
@@ -275,7 +275,7 @@ pub const PERSON_RADIUS: f32 = 0.28;
 fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool {
     match l.what {
         // (standing, its offset cannot change: the ramps run by the odometer)
-        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < 0.3 || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
+        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < STANDING_SPEED || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
         Seen::Player(_) | Seen::Parked => true,
     }
 }
@@ -490,7 +490,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
 pub const BYPASS_HOLD_SLACK: f32 = 0.5;
 
 /// Seconds a vehicle at the head of a queue stands, held by nothing, before the queue counts
-/// as one behind an obstacle (`Headway::standing_obstacle`'s 4 s for one standing unheld).
+/// as one behind an obstacle; `Headway::standing_obstacle` takes one standing unheld, or the player, as one after it.
 pub const QUEUE_OBSTACLE_STAND: f32 = 4.0;
 /// Vehicles of a queue looked along for its head (`behind_an_obstacle`).
 pub const QUEUE_LOOK: usize = 6;
@@ -503,13 +503,13 @@ pub const QUEUE_LOOK: usize = 6;
 /// pass 2: behind bus #22368 at its stop, viz5 case07, four cars closed up to 1.8-2.2 m and
 /// stood 60 s and more, none able to steer out).
 fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
-    if lead.speed >= 0.3 {
+    if lead.speed >= STANDING_SPEED {
         return false;
     }
     let (Seen::Vehicle(mut j) | Seen::Body(mut j)) = lead.what else { return false };
     for _ in 0..QUEUE_LOOK {
         let Some(o) = vehicles.get(j) else { return false };
-        if o.state.speed >= 0.3 || o.passing.is_some() || o.state.change.is_some() {
+        if o.state.speed >= STANDING_SPEED || o.passing.is_some() || o.state.change.is_some() {
             return false;
         }
         let why = o.last.why;
@@ -574,9 +574,6 @@ pub struct LightCall {
     /// it (a queue it stands in), whatever the light shows by then.
     pub marked_through: bool,
 }
-
-/// Under this speed (m/s) a car is standing: it does not take a yellow (`light_call`).
-const STANDING_SPEED: f32 = 0.3;
 
 /// The driver's call at the light: through on green, the dilemma zone on yellow, on red
 /// only with the mark close to the line or too late to stop.
@@ -789,7 +786,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     }
     let me_k = me_index(vehicles, me);
     let standing_in = |m: usize, from: f32, to: f32| -> bool {
-        sim.claims.iter().any(|(c, _)| c.vehicle != me_k && c.speed < 0.3 && c.junction == j.junction && c.chain.iter().any(|&(cm, off)| cm == m && c.s - off + c.front >= from && c.s - off - c.rear <= to))
+        sim.claims.iter().any(|(c, _)| c.vehicle != me_k && c.speed < STANDING_SPEED && c.junction == j.junction && c.chain.iter().any(|&(cm, off)| cm == m && c.s - off + c.front >= from && c.s - off - c.rear <= to))
     };
     if !foes.iter().any(|(_, f)| (f.mine.0 - waited).abs() < 0.05 && f.side && standing_in(f.movement, f.theirs.0, f.theirs.1)) {
         return None;
@@ -824,7 +821,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         let lane = node.movements[m].lane;
         for occ in sim.occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
             let o = &vehicles[occ.vehicle];
-            if o.id == me.id || o.state.speed >= 0.3 {
+            if o.id == me.id || o.state.speed >= STANDING_SPEED {
                 continue;
             }
             if let Some(r) = rear_on_my_way(o.pos, o.state.rear) {
@@ -833,7 +830,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         }
         for &(k, _, _) in sim.player_occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
             let p = &sim.players[k];
-            if p.speed.abs() < 0.3 {
+            if p.speed.abs() < STANDING_SPEED {
                 if let Some(r) = rear_on_my_way(p.pos, p.half_len) {
                     stop = stop.min(r - me.state.min_gap);
                 }
