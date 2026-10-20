@@ -4323,7 +4323,7 @@ fn stop_lines(net: &Network) -> Vec<StopLine> {
 }
 
 /// Replay one fixture free-running from its first keyframe to the end and score it.
-fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
+fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch: bool) -> Res<Score> {
     let mut r = Replay::load(fixture)?;
     r.free_run = free_run;
     if !r.at(0) {
@@ -4494,6 +4494,21 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             prev_odo.insert(v.id, st.odometer);
             if !near(v.pos) {
                 continue;
+            }
+            // (`--pedtouch`, the round-6 reviewers' probe: a moving vehicle's body over a
+            // person's disc, 0.28 m, every frame, on stderr)
+            if pedtouch && st.speed >= 0.3 {
+                let b = v.obb();
+                for p in &r.sim.people {
+                    if (p.pos - v.pos).truncate().length() > 15.0 || (p.pos.z - v.pos.z).abs() > 2.5 {
+                        continue;
+                    }
+                    let sep = omsi_sim::collision::Obb::point(p.pos, 0.28).separation(&b);
+                    if sep < -0.01 {
+                        let coach = v.class == omsi_traffic::VehicleClass::Car && v.state.length >= 10.0;
+                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y);
+                    }
+                }
             }
             // the front point crossing a stop line (the lit lane's start) between two frames
             let h = (v.heading as f64).to_radians();
@@ -4836,6 +4851,7 @@ fn ab(args: &[String]) -> Res<()> {
     let min_head: usize = opt(args, "--min-head").map(|s| s.parse()).transpose()?.unwrap_or(10);
     let jobs: usize = opt(args, "--jobs").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     let free_run = !args.iter().any(|a| a == "--reset");
+    let pedtouch = args.iter().any(|a| a == "--pedtouch");
 
     // (each fixture on its own: the order of the rows is the order given)
     let results: std::sync::Mutex<Vec<Option<Result<Score, String>>>> = std::sync::Mutex::new((0..fixtures.len()).map(|_| None).collect());
@@ -4846,7 +4862,7 @@ fn ab(args: &[String]) -> Res<()> {
                 let k = nextjob.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Some(path) = fixtures.get(k) else { break };
                 let t0 = std::time::Instant::now();
-                let res = ab_run(path, radius, min_head, free_run).map_err(|e| format!("{}: {e}", path.display()));
+                let res = ab_run(path, radius, min_head, free_run, pedtouch).map_err(|e| format!("{}: {e}", path.display()));
                 eprintln!("ab: {} done in {:.1} s", path.display(), t0.elapsed().as_secs_f64());
                 if let Ok(mut g) = results.lock() {
                     g[k] = Some(res);

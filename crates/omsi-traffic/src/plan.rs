@@ -21,6 +21,8 @@ pub enum Why {
     Junction,
     ExitFull,
     People,
+    /// A pedestrian at a crossing (round 4's zebra check; [round 7 A3] not produced any more:
+    /// `People` holds for them. Kept for the recordings that name it.)
     Zebra,
     Service,
     Merge,
@@ -641,8 +643,9 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
 }
 
 /// The zebra band a car keeps its body out of: its front ZEBRA_STOP m before a pedestrian
-/// crossing's cut of its way (the zebra stop, as `perception::zebra_ahead`) to ZEBRA_PAST m
-/// past it (the crossing's width and a step; `hold_point`'s band since round 4).
+/// crossing's cut of its way (the zebra stop) to ZEBRA_PAST m past it (the crossing's width
+/// and a step; `hold_point`'s band since round 4). (Somebody on the crossing is held for by
+/// `perception::people_ahead`, the one people test since round 7 A3.)
 const ZEBRA_STOP: f32 = 2.5;
 const ZEBRA_PAST: f32 = 2.0;
 
@@ -1035,7 +1038,6 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 4. people
     min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
-    min_stop(&mut out.stop, &mut out.why, p.zebra_stop, Why::Zebra);
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);

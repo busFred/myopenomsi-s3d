@@ -1020,7 +1020,7 @@ impl Simulation {
                 id: v.id,
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
-                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                 // (held by its service, or standing `FAR_FOE_STOOD` s or more)
                 // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
                 // from its first frame, review-r6j)
