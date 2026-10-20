@@ -443,8 +443,15 @@ impl Vehicle {
         self.state.speed < 0.3 && self.last.held
     }
 
-    pub fn is_bus(&self) -> bool {
-        self.class.is_bus()
+    /// [round 7 A4] A timetable bus (`VehicleClass::serves_stops`).
+    pub fn serves_stops(&self) -> bool {
+        self.class.serves_stops()
+    }
+
+    /// A heavy vehicle: any bus or a truck (`VehicleClass::heavy`); a random heavy vehicle
+    /// is `heavy() && !serves_stops()`.
+    pub fn heavy(&self) -> bool {
+        self.class.heavy()
     }
 
     pub fn is_rail(&self) -> bool {
@@ -1487,7 +1494,7 @@ impl Simulation {
         // [ROLLBACK r4d-B4] a bus creeping up under 0.5 m/s has not moved off: its standing
         // time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of its
         // stop by people served the stop where it stood only after 12.7 s instead of 6)
-        let moving = if v.is_bus() { v.state.speed >= 0.5 } else { !standing };
+        let moving = if v.serves_stops() { v.state.speed >= 0.5 } else { !standing };
         if standing && !v.external.at_stop {
             v.stopped += dt;
         } else if moving {
@@ -1570,7 +1577,7 @@ impl Simulation {
             }
         }
         // a random car that stands for ever asks to be taken away when nobody looks
-        if !v.is_bus() && !v.is_rail() && plan.why != Why::Light {
+        if !v.serves_stops() && !v.is_rail() && plan.why != Why::Light {
             let stood = v.stopped.max(v.progress.1);
             if (stood > 60.0 && !matches!(plan.why, Why::Junction | Why::ExitFull)) || stood > 150.0 {
                 v.gone = true;

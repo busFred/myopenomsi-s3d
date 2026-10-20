@@ -231,7 +231,7 @@ fn obstacle_bus(sim: &Simulation, vehicles: &[Vehicle], id: u64) -> Option<(bool
         return Some((true, p.blinker as i32 == out, p.speed.abs() > 0.5));
     }
     let o = vehicles.iter().find(|o| o.id == id)?;
-    Some((o.is_bus(), o.blinker_shown.0 == out, o.state.speed > 0.5))
+    Some((o.serves_stops(), o.blinker_shown.0 == out, o.state.speed > 0.5))
 }
 
 /// Within this many metres of a junction (from the front to where its object begins) a car
@@ -1254,7 +1254,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // on to 2 m behind a bus at its stop and could never steer out, viz5 case07 #37625)
         let bypass_room_held = bypass_possible && !pass_possible;
         let slack = if bypass_room_held { -BYPASS_HOLD_SLACK } else { 0.5 };
-        if (pass_possible || bypass_possible) && !(me.is_bus() && l.at_stop) && l.gap > room + slack {
+        if (pass_possible || bypass_possible) && !(me.serves_stops() && l.at_stop) && l.gap > room + slack {
             let dist = (l.gap - room).max(0.0);
             let need_brake = v * v / (2.0 * dist.max(0.1));
             if need_brake <= dp.comfort_brake * 1.5 {
@@ -1281,7 +1281,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if me.passing.is_none() && st.change.is_none() {
         if let Some(bay) = me.external.bay {
             out.lateral = Some(bay);
-        } else if !me.is_bus() {
+        } else if !me.serves_stops() {
             out.lateral = Some(p.kerb_swerve.unwrap_or(0.0));
             // [round 5 L3] easing past people beside the lane: gently, as a car edging out
             if p.people_swerve && v < 3.0 && out.accel_cap.is_none() {

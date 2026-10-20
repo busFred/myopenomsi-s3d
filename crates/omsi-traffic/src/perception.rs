@@ -1063,7 +1063,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
     // at the kerb: only one inside its footprint and `KERB_CLEAR` round it holds it, where
     // they stand (where their shuffle would take them stopped a bus 7.4 m short of its pole),
     // and with no "stood at the edge a while" exemption (it crept on and stopped by turns)
-    let own_stop = me.is_bus() && me.external.stop_at.is_some_and(|s| s - st.front < 40.0);
+    let own_stop = me.serves_stops() && me.external.stop_at.is_some_and(|s| s - st.front < 40.0);
     // the current lane's footprint and drawn road (the shift is planned on it alone)
     let lane = net.lanes.get(st.lane);
     let lane_half = lane.map(|l| l.width * 0.5).unwrap_or(f32::INFINITY);
@@ -1079,7 +1079,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
         let at_kerb_of_stop = own_stop && !p.on_crossing && (standing || p.waiting_for_bus);
         let half = if p.on_crossing {
             me.half_width + 1.5
-        } else if p.waiting_for_bus && me.is_bus() {
+        } else if p.waiting_for_bus && me.serves_stops() {
             me.half_width - 0.3
         } else if at_kerb_of_stop {
             // (its footprint and 0.3 m clear of it)
@@ -1098,7 +1098,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
         let t = if stepping_in { (dist / v.max(1.0)).clamp(2.0, STEP_LOOK) } else { (dist / v.max(1.0)).min(2.0) };
         let later = p.pos.truncate() + p.vel * t as f64;
         // (where somebody waiting for a bus is, not where their shuffle would take them)
-        let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.is_bus()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
+        let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.serves_stops()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
         for &(d, q, fwd) in &way.pts {
             if d > reach + st.front {
                 break;
@@ -1118,7 +1118,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, way: &WayPts, par
             // in beside its people; one on a crossing, or stepping into the lane, holds the car)
             let strip = if now_axis < 0.0 { drivable_left } else { drivable_right };
             let swervable = |along: f32| {
-                !me.is_bus()
+                !me.serves_stops()
                     && !p.on_crossing
                     && outside
                     && along <= lane_left

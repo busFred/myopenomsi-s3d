@@ -479,14 +479,14 @@ fn l3_a_person_inside_the_lane_or_stepping_in_still_holds_the_car() {
     on.stopped = 30.0;
     let (lat, _, got_past, stood, _) = past_people(&net, sedan(1, 0, 190.0, 4.0), walkers_beside(205.0), vec![on], 10.0, 212.0);
     assert!(stood && !got_past && lat > -0.1, "shifted into a taken oncoming lane (past {got_past}, stood {stood}, lat {lat:.2})");
-    // a bus: no shift of its own (its bay and stop rules are its own), it holds as before
+    // a timetable bus: no shift of its own (its bay and stop rules are its own), it holds as before
     let mut st = AiState::new(0, 190.0, 9);
     st.speed = 4.0;
     st.front = 6.0;
     st.rear = 6.0;
     st.length = 12.0;
     st.veh_type = 2;
-    let mut bus = Vehicle::new(9, VehicleClass::Bus, st, 1.25, 9 * 7919);
+    let mut bus = Vehicle::new(9, VehicleClass::ScheduledBus, st, 1.25, 9 * 7919);
     bus.fresh = 0.0;
     let (lat, _, got_past, stood, _) = past_people(&net, bus, walkers_beside(205.0), vec![], 10.0, 212.0);
     assert!(stood && !got_past && lat > -0.1, "the bus shifted (past {got_past}, stood {stood}, lat {lat:.2})");

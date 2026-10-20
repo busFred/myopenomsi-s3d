@@ -615,7 +615,7 @@ fn bus_at_stop() -> (Network, Vec<Vehicle>) {
     st.rear = 6.0;
     st.length = 12.0;
     st.veh_type = 2;
-    let mut bus = Vehicle::new(2, VehicleClass::Bus, st, 1.25, 2 * 7919);
+    let mut bus = Vehicle::new(2, VehicleClass::ScheduledBus, st, 1.25, 2 * 7919);
     bus.fresh = 0.0;
     bus.external.at_stop = true;
     bus.external.standing_for = 30.0;

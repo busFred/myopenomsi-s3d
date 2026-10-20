@@ -36,10 +36,13 @@ impl VehicleClass {
         }
     }
 
-    pub fn is_bus(self) -> bool {
-        matches!(self, VehicleClass::Bus | VehicleClass::ScheduledBus)
+    /// [round 7 A4] A timetable bus: it serves stops (pulls in beside its people, keeps to
+    /// its bay, is never given up). A random bus (`Bus`) is heavy traffic like a truck.
+    pub fn serves_stops(self) -> bool {
+        self == VehicleClass::ScheduledBus
     }
 
+    /// A heavy vehicle (a bus, timetable or random, or a truck): its body and driver.
     pub fn heavy(self) -> bool {
         matches!(self, VehicleClass::Bus | VehicleClass::ScheduledBus | VehicleClass::Truck)
     }
