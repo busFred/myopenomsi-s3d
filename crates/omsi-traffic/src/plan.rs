@@ -909,7 +909,7 @@ fn refused_stop(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     let st = &me.state;
     let dp = &me.params;
     let v = st.speed;
-    let at_line = j.entry - 0.3;
+    let at_line = j.line - 0.3;
     let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
     let line_stop = !j.inside && (gently || v < 0.5);
     let first = if line_stop { at_line } else { j.conflict_start - 1.0 };
@@ -921,13 +921,13 @@ fn refused_stop(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         return at;
     }
     let at = hold_point(net, sim, me, j, waited);
-    let look = st.front.max(j.entry) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);
+    let look = st.front.max(j.line) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);
     let waited_body = g.wait_for.and_then(|w| waited_body_on_way(net, sim, vehicles, j, w));
     let bands = converge_bands(sim, j);
     let ahead: Vec<&(f32, f32, usize)> = bands.iter().filter(|b| b.0 < j.entry + waited && b.1 > -st.rear).collect();
     let converges = ahead.iter().any(|b| b.0 < look || waited_body.is_some_and(|(lo, hi)| lo < b.1 && hi > b.0));
     let far_only = !converges && !ahead.is_empty();
-    let past_line_look = !ahead.is_empty() && ahead.iter().all(|b| b.0 >= j.entry + CONVERGE_LOOK);
+    let past_line_look = !ahead.is_empty() && ahead.iter().all(|b| b.0 >= j.line + CONVERGE_LOOK);
     if (far_only || (converges && !line_stop && past_line_look)) && at > st.front - 0.3 {
         at
     } else if (at < first || converges) && first > st.front - 0.3 {
@@ -1066,7 +1066,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
-        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.entry < JUNCTION_KEEP).unwrap_or(false);
+        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.line < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok) = change_desire(net, sim, me, p, &nb, near_junction);
@@ -1247,8 +1247,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if squeeze && j.inside {
                 return squeeze_run > j.conflict_start && j.conflict_end > -st.rear;
             }
-            let keep = j.entry - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
-            j.entry < real + st.front + obstacle_len + zone || keep
+            let keep = j.line - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
+            j.line < real + st.front + obstacle_len + zone || keep
         }).unwrap_or(false);
         let road_ok = p.road_left > pass_len + real + 30.0;
         let oncoming = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked);

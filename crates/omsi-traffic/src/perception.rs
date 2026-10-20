@@ -122,6 +122,13 @@ pub struct JunctionView {
     pub movement: usize,
     /// Distance from the origin to the start of the movement's lane (negative inside).
     pub entry: f32,
+    /// [round 7 A2-full] Distance from the origin to where the junction begins on this way:
+    /// the movement's lane's start (`entry`), but for a lane that is a movement only by
+    /// joining another way (a spline lane, `Junctions::extend`) a metre before its first
+    /// meeting place - up to there it is an approach lane like any lane leading in (the
+    /// claim horizon applies, the line is there), from there on it is inside.
+    pub line: f32,
+    /// The origin is past `line`.
     pub inside: bool,
     /// The pieces of the junction the way runs through, each with how far along the way
     /// through its start lies (`Junctions::chain_along`).
@@ -618,12 +625,13 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         if on_way && (along + o.state.front < -(st.rear + 2.0) || along - o.state.rear - st.front > look + 3.0) {
             continue;
         }
-        // (two bodies blocking each other: the higher id goes)
-        // TODO(review11, pre-existing): of two bodies blocking each other head-on, the higher id
-        // ignores the lower one's body and drives into it (-1.82 m on both the baseline and
-        // round 4b); it should keep the body as an obstacle and leave the pair to the
-        // negotiation of a mutual hold instead.
-        if !on_way && o.last.body_block == Some(me.id) && me.id > o.id {
+        // (two bodies blocking each other, both moving: the higher id goes. [round 7 A2-full]
+        // Not past one that stands: a standing body is the lead of whoever rolls into it,
+        // whatever it waits for - viz2 case11's cars rolled at 4-5 m/s into a car standing at
+        // the join of 9844/9845 and 10340, 1.28 m deep, as it named them its body block; two
+        // that both stand are left to the negotiation of a mutual hold, `Simulation`'s
+        // `mutual`, review11's TODO.)
+        if !on_way && o.last.body_block == Some(me.id) && me.id > o.id && o.state.speed >= STANDING_SPEED {
             continue;
         }
         // (one changing into a lane of my way: also where its body is going, at that lane's
@@ -1323,7 +1331,15 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             break;
         }
         let Some(&(j, m)) = js.of_lane.get(&l) else { continue };
-        let inside = d0 <= 0.0;
+        let approach = match net.lanes.get(l) {
+            Some(lane) if lane.source != 2 => {
+                let first = js.nodes[j].movements[m].conflict_start;
+                if first.is_finite() { (first - 1.0).max(0.0) } else { 0.0 }
+            }
+            _ => 0.0,
+        };
+        let line = d0 + approach;
+        let inside = line <= 0.0;
         // the pieces my way takes through the object, and where their meeting places
         // begin and end in my way's distances (they may lie on the pieces after this one)
         let chain = js.chain_along(j, &way[k..]);
@@ -1435,7 +1451,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let to_line = light_line - me.state.front - 0.6;
         let cannot_stop = crate::plan::cannot_stop(me.state.speed, to_line, crate::plan::HARD_BRAKE);
         let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
-        return Some(JunctionView { junction: j, movement: m, entry: d0, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
+        return Some(JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
     }
     None
 }

@@ -183,6 +183,8 @@ impl Junctions {
         // the lane joins not inside one object, grouped (a lane joining two others is one
         // place); a group with an object's lane goes into that object
         let mut parent: HashMap<usize, usize> = HashMap::new();
+        // (the lanes each join runs into)
+        let mut into: Vec<(usize, usize)> = Vec::new();
         fn find(parent: &mut HashMap<usize, usize>, x: usize) -> usize {
             let mut r = x;
             while let Some(&p) = parent.get(&r) {
@@ -203,6 +205,9 @@ impl Junctions {
                 if object(a).is_some() && object(a) == object(b) {
                     continue;
                 }
+                for &n in net.lanes[a].next.iter().filter(|n| net.lanes[b].next.contains(n)) {
+                    into.push((a, n));
+                }
                 parent.entry(a).or_insert(a);
                 parent.entry(b).or_insert(b);
                 let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
@@ -218,10 +223,22 @@ impl Junctions {
             let r = find(&mut parent, l);
             groups.entry(r).or_default().push(l);
         }
+        let mut into_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (a, n) in into {
+            let r = find(&mut parent, a);
+            into_of.entry(r).or_default().push(n);
+        }
         for (root, mut lanes) in groups {
             lanes.sort_unstable();
+            // (an object among the lanes, else among the lanes they run into: a spline lane
+            // joining an object's way in, as part of that object, so the way through it is one
+            // junction - a junction of its own just before the object hid the object's foes
+            // until the car was on its first piece, viz2 case11 #40894)
             let objects: Vec<((i32, i32), i64)> = {
                 let mut o: Vec<_> = lanes.iter().filter_map(|&l| object(l)).collect();
+                if o.is_empty() {
+                    o = into_of.get(&root).map(|v| v.iter().filter_map(|&n| object(n)).collect()).unwrap_or_default();
+                }
                 o.sort_unstable();
                 o.dedup();
                 o
