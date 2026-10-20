@@ -244,8 +244,7 @@ fn j3_a_marked_car_standing_at_a_red_line_waits_for_its_green() {
     let mut cars = vec![car(1, 0, 290.0 - 0.5 - 2.0, 0.1)];
     run(&net, &mut sim, &mut cars, 10.0, |t, _, cars| {
         if t < DT * 0.5 {
-            cars[0].amber = Some((0, 0));
-            cars[0].amber_line = Some(cars[0].state.odometer + 0.5);
+            cars[0].light_decision = Some(((0, 0), true, cars[0].state.odometer + 0.5));
         }
     });
     let front = front_x(&cars[0]);

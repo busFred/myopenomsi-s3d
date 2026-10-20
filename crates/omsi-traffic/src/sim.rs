@@ -254,8 +254,12 @@ pub struct Vehicle {
     /// Seconds before a car leaving a parking space moves.
     pub pull_out: f32,
     pub passing: Option<Passing>,
-    /// Past the line on green/yellow: goes through on red too.
-    pub amber: Option<(usize, usize)>,
+    /// [round 7 fix pass 1] The decision taken at the amber onset of the light ahead:
+    /// (controller, light), through or stop, and the odometer reading at its line
+    /// (`plan::light_call`, SUMO's yellow rule). Gone when that light is no longer ahead or
+    /// turns green.
+    #[serde(default)]
+    pub light_decision: Option<((usize, usize), bool, f32)>,
     pub external: External,
     pub last: Decision,
     /// Id of the vehicle followed last frame.
@@ -276,9 +280,6 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
-    /// With `amber`: the odometer reading at the line it marks.
-    #[serde(default)]
-    pub amber_line: Option<f32>,
     /// The zipper merge it last went first at: (the merge, its piece there, the time). The
     /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
     /// from these, so a keyframe restores it.
@@ -461,7 +462,7 @@ impl Vehicle {
             fresh: 1.5,
             pull_out: 0.0,
             passing: None,
-            amber: None,
+            light_decision: None,
             external: External::default(),
             last: Decision::default(),
             lead_id: None,
@@ -470,7 +471,6 @@ impl Vehicle {
             heading: 0.0,
             claim_standing: false,
             passed_on_go: None,
-            amber_line: None,
             zip_won: None,
             change_still: (0.0, 0.0),
             mutual: None,
@@ -933,7 +933,6 @@ impl Simulation {
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
         // the line each vehicle has passed on green or yellow, written back with them
         let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
-        let mut stale_amber: Vec<usize> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
             let passed = p.junction.as_ref().and_then(|j| {
                 let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
@@ -946,23 +945,6 @@ impl Simulation {
             });
             if passed != v.passed_on_go {
                 passed_now.push((i, passed));
-            }
-            // the mark of a line taken on green or yellow (`Vehicle::amber`) is for that line:
-            // gone once neither the light ahead nor the junction's light is that light, or once
-            // the car is past that line and a line of the same light lies ahead (it stayed on
-            // after the junction, and the next approach under the same signal group went over
-            // its red on it: viz3 case01, light 1.0 lights three approaches)
-            if let Some(a) = v.amber {
-                let ahead = p.signal.filter(|s| (s.ctl, s.light) == a);
-                let here = p.junction.as_ref().and_then(|j| j.light).map(|(c, l, _)| (c, l));
-                let left = ahead.is_none() && here != Some(a);
-                let another = ahead.is_some_and(|s| s.dist > v.state.front + 0.5) && v.amber_line.is_some_and(|at| v.state.odometer > at + v.length() + 1.0);
-                // (or the line ahead lies further than a mark is ever taken at this speed:
-                // `plan::light_call`, a yellow within "comfortable", kept `MARK_REACH` beyond it)
-                let far = ahead.is_some_and(|s| s.dist - v.state.front > plan::comfortable_stop(v.state.speed, &v.params) + plan::MARK_REACH);
-                if left || another || far {
-                    stale_amber.push(i);
-                }
             }
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
@@ -1005,12 +987,11 @@ impl Simulation {
                 // committed to the cars waiting for it)
                 Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
-                    // call (too late to stop, the yellow it takes), or the mark of one
-                    // that took the line on green or yellow and is still rolling close to it
-                    // ([round 7 A6] one standing at its red with the mark waits for its green,
-                    // round 6 J3, and files `light_red` like any car standing there)
+                    // call (too late to stop, the yellow it takes), or one
+                    // committed at amber onset and still rolling (`plan::light_call`; one
+                    // standing at its red waits for its green and files `light_red`)
                     let call = plan::light_call(v, p, &sig);
-                    let through = call.go || call.marked_through;
+                    let through = call.go;
                     if through {
                         (false, None)
                     } else {
@@ -1273,10 +1254,6 @@ impl Simulation {
         for (i, passed) in passed_now {
             vehicles[i].passed_on_go = passed;
         }
-        for i in stale_amber {
-            vehicles[i].amber = None;
-            vehicles[i].amber_line = None;
-        }
         // the signal groups the claimants' lights belong to: which pairs never let vehicles
         // in together (worked out once per pair of lights, from the programs)
         for a in 0..claims.len() {
@@ -1479,10 +1456,7 @@ impl Simulation {
         if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
             self.held_at_red += 1;
         }
-        if let Some(light) = plan.amber {
-            v.amber = Some(light);
-            v.amber_line = plan.amber_line.map(|gap| v.state.odometer + gap);
-        }
+        v.light_decision = plan.light_decision.map(|(l, go, gap)| (l, go, v.state.odometer + gap));
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
@@ -1626,9 +1600,6 @@ impl Simulation {
         // ever, each in turn fed up for one frame (and then creeping and stopping again).
         if !(v.state.speed < 2.0 && !plan.held) {
             v.impatience.update(&v.params, dt, held);
-        }
-        if v.stopped > 2.0 {
-            v.amber = None;
         }
         // a pass runs its course: the bent way brings the car back by itself
         if obstacle_gone {

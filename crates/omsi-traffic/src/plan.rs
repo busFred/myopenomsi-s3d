@@ -78,10 +78,9 @@ pub struct Plan {
     pub wait_for: Option<usize>,
     /// Id of the vehicle whose body across the way holds this one.
     pub body_block: Option<u64>,
-    /// At the line on green or yellow: the driver goes through whatever it turns to.
-    pub amber: Option<(usize, usize)>,
-    /// With `amber`: the gap from the front to that line (m).
-    pub amber_line: Option<f32>,
+    /// The decision at the light ahead taken at its amber onset (`light_call`): (light,
+    /// through, the gap from the front to its line).
+    pub light_decision: Option<((usize, usize), bool, f32)>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -573,12 +572,10 @@ fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
 pub struct LightCall {
     /// Over the line now (no stop for the light).
     pub go: bool,
-    /// The light's mark is set (`Vehicle::amber`): the driver took the line on green or yellow.
-    pub mark: bool,
-    /// Holding the mark close to the line while rolling: it goes through, whatever the light
-    /// shows by then. ([round 7 A6] Not standing: one that came to a stand with the mark
-    /// waits for its green, as `go` has since round 6 J3, and its claim files its red.)
-    pub marked_through: bool,
+    /// The decision taken at this light's amber onset - (light, through, the gap from the
+    /// front to its line) - kept until the light is no longer the one ahead or turns green
+    /// (`Vehicle::light_decision`).
+    pub decision: Option<((usize, usize), bool, f32)>,
 }
 
 /// [round 7 D2] The braking (m/s²) a driver reckons with when asking whether it can still
@@ -599,46 +596,37 @@ pub fn comfortable_stop(v: f32, dp: &DriverParams) -> f32 {
     v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0
 }
 
-/// A driver who took the mark (`Vehicle::amber`) keeps it this far (m) beyond
-/// `comfortable_stop` on yellow (`light_call`; `Simulation`'s stale mark).
-pub const MARK_REACH: f32 = 6.0;
-
-/// The driver's call at the light: through on green, the dilemma zone on yellow, on red
-/// only with the mark close to the line or too late to stop.
+/// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
+/// on green; at amber onset the driver decides once whether it can stop with comfortable
+/// braking (`comfortable_stop`) - if not it is committed and goes, if so it stops - and keeps
+/// that decision while this light is the one ahead (`Vehicle::light_decision`); on red only a
+/// car that cannot stop at all (`cannot_stop`, `HARD_BRAKE`) or one committed at amber onset
+/// and still rolling crosses. Nothing is decided on green, no decision is extended past
+/// what the onset allowed, and a committed car that came to a stand waits for its green
+/// (round 6 J3: one standing short of its line set off over it on red, viz case07 #18558).
+/// (This replaces round 4's amber mark: taken on green 3 m out, extended 6 m on yellow,
+/// carried over frames and retired by `stale_amber` and a 2 s stand; x10 case03 #3145
+/// crossed its line on red on it.)
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     let st = &me.state;
     let dp = &me.params;
     let v = st.speed;
     let gap = sig.dist - st.front;
-    let comfortable = comfortable_stop(v, dp);
     let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
-    let marked = me.amber == Some((sig.ctl, sig.light));
+    let light = (sig.ctl, sig.light);
+    // (that light's line: the same light lights several approaches, viz3 case01's 1.0 three)
+    let line = st.odometer + gap;
+    let held = me.light_decision.filter(|d| d.0 == light && (d.2 - line).abs() < 2.0).map(|d| d.1);
     match sig.aspect {
-        Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
-            // at the line on green: through, whatever it turns to in a moment
-            LightCall { go: true, mark: gap < 3.0 && !queued && v > 1.0, marked_through: marked && gap < comfortable }
-        }
+        Aspect::Green | Aspect::GreenYellow | Aspect::Dark => LightCall { go: true, decision: None },
         Aspect::Yellow => {
-            // the dilemma zone: through when stopping is no longer comfortable; a
-            // driver who took the line on green just before goes a little further
-            // out ("had the mark" alone let a car two places back in a queue go).
-            // One already braking for the light stays on the brake: slowing, it
-            // came within "comfortable" of the line again and set off across on red.
-            // (and never from a standstill: at rest nothing is "too late to stop", as on red
-            // below; a car released from a junction hold standing 0.5 m before an amber line
-            // took the mark and crept over on red, viz case07 #18558)
-            let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + MARK_REACH));
-            LightCall { go, mark: go, marked_through: marked && v > STANDING_SPEED && gap < comfortable + MARK_REACH }
+            // (and never from a standstill or a queue: at rest nothing is "too late to stop")
+            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && gap < comfortable_stop(v, dp));
+            LightCall { go: go && v > STANDING_SPEED, decision: Some((light, go, gap)) }
         }
-        // (a car standing with its bumper over the line waits like one behind it: at a
-        // standstill nothing is "too late to stop")
         Aspect::Red | Aspect::RedYellow => {
-            // ([round6 J3] the mark lets it on only while it rolls, as on yellow: an eased car
-            // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
-            // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
-            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || cannot_stop(v, gap + 0.5, HARD_BRAKE);
-            LightCall { go, mark: false, marked_through: marked && v > STANDING_SPEED && gap < comfortable }
+            let committed = held == Some(true) && v > STANDING_SPEED;
+            LightCall { go: committed || cannot_stop(v, gap + 0.5, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
         }
     }
 }
@@ -990,10 +978,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // light turned, it drives on; a later line, of that controller or not, holds it as any)
     if let Some(sig) = p.signal.filter(|s| !p.junction.as_ref().is_some_and(|j| j.clears_past(s, st.front))) {
         let call = light_call(me, p, &sig);
-        if call.mark {
-            out.amber = Some((sig.ctl, sig.light));
-            out.amber_line = Some(sig.dist - st.front);
-        }
+        out.light_decision = call.decision;
         if !call.go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);
         }

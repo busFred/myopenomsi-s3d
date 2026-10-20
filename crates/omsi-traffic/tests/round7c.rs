@@ -123,26 +123,41 @@ fn an_open_lane_leading_only_into_a_closed_one_is_not_taken() {
     }
 }
 
-/// [round 7 A6] The mark of a line taken on green or yellow carries a car over its red only
-/// while it rolls (round 6 J3): standing with the mark half a metre short of the line it is not "marked
-/// through", so its claim files the red like any car standing there.
+/// [round 7 fix pass 1] SUMO's yellow rule: at amber onset a car that cannot stop
+/// comfortably is committed and goes, on red too while it rolls; one that can stops; a
+/// committed car standing at its red waits; on red without a decision only a car that cannot
+/// stop at all goes.
 #[test]
-fn a_marked_car_standing_at_its_red_is_not_marked_through() {
+fn the_decision_at_amber_onset_is_kept_and_a_standing_car_waits() {
     use omsi_sim::traffic::Aspect;
     use omsi_traffic::{plan::light_call, Perception, SignalView};
-    let mut v = standing(VehicleClass::Car);
-    v.amber = Some((0, 0));
-    v.state.front = 2.0;
-    let sig = |aspect| SignalView { dist: v.state.front + 0.5, ctl: 0, light: 0, aspect, until_go: Some(20.0) };
     let p = Perception::default();
-    for aspect in [Aspect::Red, Aspect::Yellow] {
-        let call = light_call(&v, &p, &sig(aspect));
-        assert!(!call.go && !call.marked_through, "standing at {aspect:?}: {call:?}");
-    }
-    // rolling at 2 m/s there: through
-    v.state.speed = 2.0;
-    let call = light_call(&v, &p, &sig(Aspect::Red));
-    assert!(call.go && call.marked_through, "rolling: {call:?}");
+    let mut v = standing(VehicleClass::Car);
+    v.state.front = 2.0;
+    v.state.speed = 12.0;
+    let sig = |v: &Vehicle, gap: f32, aspect| SignalView { dist: v.state.front + gap, ctl: 0, light: 0, aspect, until_go: Some(20.0) };
+    // yellow 15 m out at 12 m/s: no comfortable stop (27 m) - committed
+    let call = light_call(&v, &p, &sig(&v, 15.0, Aspect::Yellow));
+    assert!(call.go && call.decision.is_some_and(|d| d.1), "{call:?}");
+    v.light_decision = call.decision.map(|(l, go, gap)| (l, go, v.state.odometer + gap));
+    // red 10 m out, could stop hard (11.25 m at 6.4 m/s2 is more: cannot) - and committed anyway
+    assert!(light_call(&v, &p, &sig(&v, 10.0, Aspect::Red)).go);
+    // standing with the decision 0.5 m short: waits
+    v.state.speed = 0.0;
+    assert!(!light_call(&v, &p, &sig(&v, 10.0, Aspect::Red)).go);
+    // yellow 40 m out at 12 m/s: stops, and keeps stopping as it comes nearer
+    let mut w = standing(VehicleClass::Car);
+    w.state.front = 2.0;
+    w.state.speed = 12.0;
+    let call = light_call(&w, &p, &sig(&w, 40.0, Aspect::Yellow));
+    assert!(!call.go && call.decision.is_some_and(|d| !d.1));
+    w.light_decision = call.decision.map(|(l, go, gap)| (l, go, w.state.odometer + gap));
+    w.state.speed = 8.0;
+    w.state.odometer += 25.0;
+    assert!(!light_call(&w, &p, &sig(&w, 15.0, Aspect::Yellow)).go, "changed its mind");
+    // red, no decision, 30 m out at 12 m/s: stops
+    let x = Vehicle { light_decision: None, ..w.clone() };
+    assert!(!light_call(&x, &p, &sig(&x, 30.0, Aspect::Red)).go);
 }
 
 /// [round 7 A2-full] Two spline lanes (no crossing object) converging into one lane have a

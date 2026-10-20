@@ -334,10 +334,10 @@ fn v6a_amber_at_the_line() {
                 if !red && t >= y + after {
                     red = true;
                     set(sim, 0, 0);
-                    eprintln!("  red at t={t:.2} lane {} gap {:.1} v {:.1} amber {:?}", c.state.lane, 200.0 - (c.state.s + c.state.front), c.state.speed, c.amber);
+                    eprintln!("  red at t={t:.2} lane {} gap {:.1} v {:.1}", c.state.lane, 200.0 - (c.state.s + c.state.front), c.state.speed);
                 }
             }
-            amber_seen |= c.amber.is_some();
+            amber_seen |= c.light_decision.is_some();
             if c.state.lane != 0 && crossed.is_none() {
                 crossed = Some((t, red));
             }
@@ -364,21 +364,21 @@ fn v6b_stale_amber_runs_the_next_light() {
     let mut amber_after_first = false;
     run(&net, &mut sim, &mut cars, 40.0, |t, sim, cars| {
         if cars[0].state.lane == 2 {
-            amber_after_first |= cars[0].amber.is_some();
-            if clear && yellow_at.is_none() { cars[0].amber = None; }
+            amber_after_first |= cars[0].light_decision.is_some();
+            if clear && yellow_at.is_none() { cars[0].light_decision = None; }
         }
         let c = &cars[0];
         let gap = 500.0 - (c.state.s + 230.0 + c.state.front);
         if c.state.lane == 2 && yellow_at.is_none() && gap <= 60.0 {
             yellow_at = Some(t);
             set(sim, 1, 9);
-            eprintln!("  2nd light yellow at t={t:.2} gap {gap:.1} v {:.1} amber {:?}", c.state.speed, c.amber);
+            eprintln!("  2nd light yellow at t={t:.2} gap {gap:.1} v {:.1}", c.state.speed);
         }
         if let Some(y) = yellow_at {
             if !red && t >= y + 3.0 {
                 red = true;
                 set(sim, 1, 0);
-                eprintln!("  2nd light red at t={t:.2} lane {} v {:.1} amber {:?}", c.state.lane, c.state.speed, c.amber);
+                eprintln!("  2nd light red at t={t:.2} lane {} v {:.1}", c.state.lane, c.state.speed);
             }
         }
         if c.state.lane == 3 && crossed.is_none() {

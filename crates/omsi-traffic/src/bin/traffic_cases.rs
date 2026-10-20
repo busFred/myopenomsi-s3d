@@ -3546,11 +3546,11 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     );
     let _ = writeln!(
         b,
-        "  FIELDS: {} | impatience {:.2} (waited {:.0} s) amber {:?} passing {} at_stop {} stop_at {:?}",
+        "  FIELDS: {} | impatience {:.2} (waited {:.0} s) light decision {:?} passing {} at_stop {} stop_at {:?}",
         fields,
         v.impatience.value,
         v.impatience.waited,
-        v.amber,
+        v.light_decision,
         v.passing.map(|p| format!("lane {:?} side {:.1} aborted {}", p.lane, p.side, p.aborted)).unwrap_or("-".into()),
         v.external.at_stop,
         v.external.stop_at
