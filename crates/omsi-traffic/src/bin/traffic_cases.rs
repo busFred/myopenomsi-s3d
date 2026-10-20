@@ -4928,6 +4928,11 @@ fn ab(args: &[String]) -> Res<()> {
     print!("{out}");
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     {
+        // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
+        let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
+        println!("(fork fallbacks, whole map: took a lane closed by density {}, by the rules {}, none {})", n(0), n(1), n(2));
+    }
+    {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting
         // place), frozen lane changes (runs/vehicles/s), phantom leads (vehicles/s), keep-back
         // (s with a red or junction ahead / all s), passes (unsignalled/all), out showing the

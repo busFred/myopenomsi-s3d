@@ -2798,6 +2798,56 @@ pub fn s_curve_len(offset: f32) -> f32 {
     (offset.abs() * 8.0).clamp(8.0, 30.0)
 }
 
+/// Why a lane is closed to a vehicle (`open_to`; the debug overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closed {
+    /// Not a lane of the vehicle's kind (a footpath, a rail, a flight path for a car).
+    Kind,
+    /// `[rule] no_cars`, `bus`, `trucks` by the vehicle's `[ai_veh_type]`.
+    Rules,
+    /// No random traffic of this vehicle's group drives here (`trafficdensity 0`).
+    Density,
+}
+
+/// [round 7 A1] Is `lane` open to a vehicle with the way `st`, driving on lanes of `kind`
+/// (street, rail, air), for driving along? One rule for the population, the way on at a
+/// fork, a lane change, a pass on the oncoming lane and the lane beside
+/// (`omsi_traffic::access`). A timetable vehicle on its route is open anywhere its route
+/// goes; this answers for the driver's own choices.
+pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> {
+    if lane.kind != kind || kind == LaneKind::Sidewalk {
+        return Err(Closed::Kind);
+    }
+    if !lane.allows(st.veh_type) {
+        return Err(Closed::Rules);
+    }
+    // a scheduled bus goes where its route goes; everybody else needs the lane to carry
+    // traffic of their group
+    if st.route.is_empty() {
+        // (a vehicle of no group is a normal car: where the path names its groups, the
+        // first group's share counts, not the most any group gets - `density` is the
+        // greatest over all groups, so that a lane stays open to whoever is asked for)
+        let density = match st.traffic_pool.as_ref() {
+            Some((pool, defaults)) => lane.pool_density(defaults, *pool),
+            None if lane.group_density.is_empty() => lane.density,
+            None => lane.pool_density(&[1], 0),
+        };
+        if density <= 0.0 {
+            return Err(Closed::Density);
+        }
+    }
+    // (no test on the path's width: a tenth of the stock maps' street paths are drawn a
+    // metre wide where the lane is a full one - Spandau's ten-lane Altstädter Ring is
+    // all 1 m paths - and BeijingCity's bus lane is as wide as its cycle lane. What keeps
+    // a car off a cycle lane beyond a strip is the strip: `Lane::beside_each_other`.)
+    Ok(())
+}
+
+/// [round 7 A1] Forks where no way on was open to the vehicle (`AiState::choose_after`), by
+/// what it took then: [a lane closed by density, by the rules, none]. A diagnostic for
+/// `traffic_cases ab` (whole process).
+pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
@@ -2927,12 +2977,15 @@ impl AiState {
         self.planned_next.into_iter().chain(self.ahead.iter().copied())
     }
 
-    /// A random way on from the end of `lane`. Lanes the map closes to this vehicle ([rule]
-    /// no_cars, bus, trucks: `Lane::allows`) and lanes whose traffic density is zero are not driven
-    /// into - filtering them only at spawn still let cars turn into a pedestrian street or a
-    /// depot yard from next door. A car that has taken a turn lane takes the turn. A way that
-    /// ends the network just ahead (`Network::reach`) is taken like any other, as in OMSI: the
-    /// car is taken away where it runs off the end.
+    /// A random way on from the end of `lane`: one open to this vehicle by the access rule
+    /// (`open_to`: the path's rules, `[rule] no_cars`/`bus`/`trucks` by its type, and the
+    /// traffic density of its group - filtering them only at spawn still let cars turn into a
+    /// pedestrian street or a depot yard from next door); a car of a traffic pool takes them
+    /// by its pool's density. [round 7 A1] With none open (counted, `FORK_FALLBACKS`): a lane
+    /// closed only by density (no traffic of its group asked for there), then one closed by
+    /// the rules that is not `no_cars`; never a `no_cars` lane nor another kind - none, and
+    /// the car runs off the end of its lane, taken away there as in OMSI. A way that ends the
+    /// network just ahead (`Network::reach`) is taken like any other.
     fn choose_after(
         &mut self,
         net: &Network,
@@ -2943,26 +2996,24 @@ impl AiState {
         // [ROLLBACK cycle-135] the ways that lead back round a loop of short lanes are not
         // among the choices (the others are: a street goes on where it has a way on)
         let next: Vec<usize> = l.next.iter().copied().filter(|&n| !avoid(n)).collect();
-        // (a car of a traffic pool - the trucks of a map that keeps them to its port roads -
-        // takes the ways its pool may go, as it was put on one; where none of them does, the
-        // ways open to cars, then any: it does not stand at the junction for ever)
-        let open_to = |pooled: bool| -> Vec<usize> {
-            next.iter()
-                .copied()
-                .filter(|&n| {
-                    let nl = &net.lanes[n];
-                    let d = match self.traffic_pool.as_ref().filter(|_| pooled) {
-                        Some((p, defaults)) => nl.pool_density(defaults, *p),
-                        None => nl.density,
-                    };
-                    nl.allows(self.veh_type) && d > 0.0
-                })
-                .collect()
+        let kind = l.kind;
+        let closed = |n: usize| open_to(&net.lanes[n], self, kind).err();
+        let open: Vec<usize> = next.iter().copied().filter(|&n| closed(n).is_none()).collect();
+        let (choices, weighted) = if !open.is_empty() || next.is_empty() {
+            (open, self.traffic_pool.is_some())
+        } else {
+            let density: Vec<usize> = next.iter().copied().filter(|&n| closed(n) == Some(Closed::Density)).collect();
+            let rules: Vec<usize> = next.iter().copied().filter(|&n| closed(n) == Some(Closed::Rules) && !net.lanes[n].no_cars).collect();
+            let (k, choices) = if !density.is_empty() {
+                (0, density)
+            } else if !rules.is_empty() {
+                (1, rules)
+            } else {
+                (2, Vec::new())
+            };
+            FORK_FALLBACKS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (choices, false)
         };
-        let pooled = self.traffic_pool.is_some().then(|| open_to(true)).filter(|o| !o.is_empty());
-        let weighted = pooled.is_some();
-        let open = pooled.unwrap_or_else(|| open_to(false));
-        let choices = if open.is_empty() { next.clone() } else { open };
         if choices.is_empty() {
             None
         } else {

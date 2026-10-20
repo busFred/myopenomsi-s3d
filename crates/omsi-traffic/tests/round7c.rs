@@ -61,3 +61,44 @@ fn a_random_bus_gives_up_a_timetable_bus_never() {
     tt.state.speed = 5.0;
     assert!(stand(&mut tt, Why::None, 1.0));
 }
+
+/// [round 7 A1] The way on at a fork follows the access rule (`open_to`): an open lane
+/// whenever there is one; with none open, one closed only by density before one closed by
+/// the rules; never a `no_cars` lane.
+#[test]
+fn the_way_on_at_a_fork_takes_open_lanes_then_density_closed_never_no_cars() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    let lane = |a: (f64, f64), b: (f64, f64)| LaneBuilder::polyline(vec![DVec3::new(a.0, a.1, 0.0), DVec3::new(b.0, b.1, 0.0)], LaneKind::Street, 3.5);
+    // lane 0 into a fork of three: 1 (the case's "open"), 2 (density 0), 3 (no_cars)
+    let fork = |open: bool| {
+        let mut lanes = vec![lane((0.0, 0.0), (100.0, 0.0)), lane((100.0, 0.0), (200.0, 10.0)), lane((100.0, 0.0), (200.0, 0.0)), lane((100.0, 0.0), (200.0, -10.0))];
+        if !open {
+            lanes[1].no_cars = true;
+        }
+        lanes[2].density = 0.0;
+        lanes[3].no_cars = true;
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        net
+    };
+    let ways = |net: &Network| -> Vec<Option<usize>> {
+        (0..40u64)
+            .map(|seed| {
+                let mut st = AiState::new(0, 95.0, seed + 1);
+                st.plan_next(net);
+                st.planned_next
+            })
+            .collect()
+    };
+    let net = fork(true);
+    assert_eq!(net.lanes[0].next.len(), 3);
+    assert!(ways(&net).iter().all(|w| *w == Some(1)), "only the open way: {:?}", ways(&net));
+    // none open: the density-closed lane, never the no_cars one
+    let net = fork(false);
+    assert!(ways(&net).iter().all(|w| *w == Some(2)), "the density-closed way: {:?}", ways(&net));
+    // only no_cars lanes: no way on
+    let mut net = fork(false);
+    net.lanes[2].no_cars = true;
+    assert!(ways(&net).iter().all(|w| w.is_none()), "{:?}", ways(&net));
+}
