@@ -647,7 +647,7 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
 /// crossing's cut of its way (the zebra stop) to ZEBRA_PAST m past it (the crossing's width
 /// and a step; `hold_point`'s band since round 4). (Somebody on the crossing is held for by
 /// `perception::people_ahead`, the one people test since round 7 A3.)
-const ZEBRA_STOP: f32 = 2.5;
+pub const ZEBRA_STOP: f32 = 2.5;
 const ZEBRA_PAST: f32 = 2.0;
 
 /// A lead slower than this (m/s) is a queue I come to rest behind, not one I follow through

@@ -87,8 +87,8 @@ fn person(x: f64, y: f64) -> Person {
 
 /// [round5 C1] A walker on the crossing 2.8 m or a lane width from my axis (the far half of
 /// the zebra; the old rule held for anyone within 3 m along it) holds nobody at the zebra;
-/// one within my footprint and 1.5 m (2.4 m) stops me short of them. ([round 7 A3] the one
-/// people test, `people_ahead`, decides: its stop is 1.5 m short of the person.)
+/// one within my footprint and 1.5 m (2.4 m) stops me 2.5 m short of the zebra. ([round 7 A3] the one
+/// people test, `people_ahead`, decides: `ZEBRA_STOP` before the cut.)
 #[test]
 fn c1_a_walker_on_the_far_half_of_the_zebra_holds_nobody_one_in_my_lane_does() {
     let net = road_with_a_zebra(true);
@@ -112,7 +112,7 @@ fn c1_a_walker_on_the_far_half_of_the_zebra_holds_nobody_one_in_my_lane_does() {
         });
         if holds {
             let at = stood_at.unwrap_or_else(|| panic!("walker at y {y}: never stood for them ({held_s:.1} s why=people)"));
-            assert!(at > 18.0 && at <= 23.0 - 1.5 + 0.2, "walker at y {y}: stood with its front at x = {at:.1}");
+            assert!(at > 18.0 && at <= 23.0 - 2.5 + 0.2, "walker at y {y}: stood with its front at x = {at:.1}");
         } else {
             assert!(held_s < 0.5, "walker at y {y}: held {held_s:.1} s for them");
             assert!(front_x(&cars[0]) > 100.0, "walker at y {y}: did not pass: front at {:.1}", front_x(&cars[0]));

@@ -94,6 +94,11 @@ impl Headway {
     }
 }
 
+/// [round 7 A3 fix] Somebody moving at this pace (m/s) or more is stepping, and is judged
+/// where their step takes them as well as where they are (`people_ahead`); slower is a shuffle
+/// (round 5 C2: 0.1 m/s beside a standing car's body).
+const STEP_SPEED: f32 = 0.5;
+
 /// A bus at its stop is an obstacle worth going round once it has stood this long there (s).
 pub const AT_STOP_OBSTACLE_STAND: f32 = 0.5;
 /// Anything standing this long (s) is an obstacle, whatever holds it (its hold is not
@@ -1010,6 +1015,8 @@ const ZEBRA_AHEAD: f32 = 30.0;
 /// the lane's axis, the lane's right there and how far from that axis it holds.
 struct ZebraCut {
     walk: usize,
+    /// Distance from my origin along my way to the cut.
+    along: f32,
     at: DVec2,
     right: DVec2,
     half: f32,
@@ -1043,7 +1050,7 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
             }
             let (q, h) = lane.at(sa);
             let hr = (h as f64).to_radians();
-            out.push(ZebraCut { walk: w, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half });
+            out.push(ZebraCut { walk: w, along: point, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half });
         }
     }
     out
@@ -1088,7 +1095,8 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // is held for as one on the crossing: the one people test (round 4's zebra check,
         // which held for them from the walkers' list, is gone; review-r5c-safety C2: a stander
         // 0.3 m behind the kerb spot stepping on 1.5-2.5 s before the car)
-        let on_crossing = p.on_crossing || (!p.at_kerb && zebras.iter().any(|z| z.holds(net, p.pos)));
+        let cut = zebras.iter().find(|z| z.holds(net, p.pos));
+        let on_crossing = p.on_crossing || (!p.at_kerb && cut.is_some());
         let at_kerb_of_stop = own_stop && !on_crossing && (standing || p.waiting_for_bus);
         let half = if on_crossing {
             me.half_width + 1.5
@@ -1122,8 +1130,8 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let now_way = (p.pos.truncate() - q).dot(right) as f32;
             let now_axis = now_way + lat;
             let later_axis = (later - q).dot(right) as f32 + lat;
-            // (where their body is now, off my way: the exemptions below are for somebody
-            // outside my footprint, which a projected shuffle must not decide)
+            // (where their body is now, off my way: the shift below is for somebody outside my
+            // footprint, which a projected shuffle must not decide)
             let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
             // [round 5 L3] one beside the lane - outside its footprint now and after their
             // step, their body outside mine (C2 holds one inside it), inside the drawn road -
@@ -1145,6 +1153,15 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 let along = r.dot(fwd);
                 let across_way = r.dot(right) as f32;
                 let across = across_way.abs();
+                // ([round 7 A3 fix] outside my footprint at this position - now or where their
+                // step takes them - for the exemptions below: one stepping into my body from
+                // beside it holds the car; review-cleanup-crate-safety: x10 case15 bus #33316
+                // swept a walker on a crossing 1.20 m deep at 4.4 m/s)
+                // (a shuffle is no step: round 5 C2's people shuffling at 0.1 m/s beside a
+                // standing car's body do not hold it; anybody on a crossing is taken where
+                // their step takes them, whatever their pace)
+                let stepping = on_crossing || p.vel.length() >= STEP_SPEED as f64;
+                let outside_here = outside && (!stepping || across >= me.half_width + crate::plan::PERSON_RADIUS);
                 if along.abs() > WAY_STEP as f64 * 0.5 + 0.05 {
                     continue;
                 }
@@ -1165,7 +1182,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // held of 6). One level with my body INSIDE my footprint is being hit:
                 // held as before (review-r5c-safety: 25 new contacts at across 0.7-1.5 m,
                 // 1-7 m/s). Not a bus pulling in at its stop (B4).
-                if !at_kerb_of_stop && outside && d + (along as f32) < st.front - crate::plan::PERSON_RADIUS {
+                if !at_kerb_of_stop && outside_here && d + (along as f32) < st.front - crate::plan::PERSON_RADIUS {
                     continue;
                 }
                 // someone who has stood at the edge for a while does not hold a standing car
@@ -1174,12 +1191,18 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // (review-r5c-safety: at `half - 0.9` a red-light waiter standing 0.5-1.1 m
                 // off my axis was crawled through at 0.25 m/s once the zebra check no longer
                 // listed them)
-                if !on_crossing && !at_kerb_of_stop && v < STANDING_SPEED && p.still > 3.0 && outside {
+                if !on_crossing && !at_kerb_of_stop && v < STANDING_SPEED && p.still > 3.0 && outside_here {
                     continue;
                 }
                 // (where the person really is relative to the sample, so that the stop
                 // point does not jump with the sampling)
-                let stop = d + along as f32 - 1.5;
+                // (somebody on a crossing my way cuts: short of the crossing, `plan::ZEBRA_STOP`
+                // before the cut, as SUMO's vehicle does not take a crossing link a person
+                // occupies; elsewhere 1.5 m short of them)
+                let stop = match cut {
+                    Some(z) if on_crossing => z.along - crate::plan::ZEBRA_STOP,
+                    _ => d + along as f32 - 1.5,
+                };
                 let axis = across_way + lat;
                 let h = Holder { stop, along: d + along as f32, axis, swervable: swervable(d + along as f32) };
                 if across < half {
