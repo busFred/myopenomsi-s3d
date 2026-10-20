@@ -304,6 +304,17 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
+/// [round 7 A9] A player's pulling away (m/s²) before it is measured
+/// (`Simulation::measure_players`: the figure its claims used as a constant, between a bus
+/// preset's 1.0 and a car's 1.8), the floor of the estimate, and how long (s) a measured
+/// acceleration takes to fade back to it.
+pub const PLAYER_ACCEL: f32 = 1.2;
+pub const PLAYER_ACCEL_MIN: f32 = 0.6;
+pub const PLAYER_ACCEL_MEMORY: f32 = 20.0;
+/// The gap (s) a player's claim names: the player's grant is never read (its driver decides),
+/// so it stands for the car driver's preset `gap_accept` (`DriverParams::preset`).
+pub const PLAYER_GAP: f32 = 4.0;
+
 /// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
 /// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
 /// and how far ahead it looks for one (`perception::junction_ahead`).
@@ -553,8 +564,11 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
+    /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
+    /// speed last frame, the estimate).
+    pub player_pull: Vec<(u32, f32, f32)>,
     pub people: Vec<Person>,
-    /// Pedestrians on footpath lanes: (lane, distance), for push buttons and zebras.
+    /// Pedestrians on footpath lanes: (lane, distance), for push buttons.
     pub walkers: Vec<(usize, f32)>,
     pub parked: HashMap<usize, Vec<Parked>>,
     pub occupancy: HashMap<usize, Vec<Occupant>>,
@@ -596,6 +610,7 @@ impl Simulation {
             day_time: 0.0,
             time_scale: 1.0,
             players: Vec::new(),
+            player_pull: Vec::new(),
             people: Vec::new(),
             walkers: Vec::new(),
             parked: HashMap::new(),
@@ -746,6 +761,33 @@ impl Simulation {
         }
     }
 
+    /// [round 7 A9] Measure each player's pulling away: the hardest acceleration it showed,
+    /// easing back towards `PLAYER_ACCEL` over `PLAYER_ACCEL_MEMORY` s, never under
+    /// `PLAYER_ACCEL_MIN`. A player not seen before starts at `PLAYER_ACCEL`.
+    fn measure_players(&mut self, dt: f32) {
+        let ease = (dt / PLAYER_ACCEL_MEMORY).clamp(0.0, 1.0);
+        let mut next: Vec<(u32, f32, f32)> = Vec::with_capacity(self.players.len());
+        for p in &self.players {
+            let est = match self.player_pull.iter().find(|q| q.0 == p.id) {
+                Some(&(_, last, est)) if dt > 0.0 => {
+                    let a = (p.speed.abs() - last.abs()) / dt;
+                    let eased = est + (PLAYER_ACCEL - est) * ease;
+                    // (a jump of the speed - a teleport, a reset - is no acceleration)
+                    if a <= omsi_sim::traffic::MAX_BRAKE { eased.max(a) } else { eased }
+                }
+                Some(&(_, _, est)) => est,
+                None => PLAYER_ACCEL,
+            };
+            next.push((p.id, p.speed, est.max(PLAYER_ACCEL_MIN)));
+        }
+        self.player_pull = next;
+    }
+
+    /// The pulling away (m/s²) of the player with id `id` as measured (`measure_players`).
+    pub fn player_accel(&self, id: u32) -> f32 {
+        self.player_pull.iter().find(|q| q.0 == id).map(|q| q.2).unwrap_or(PLAYER_ACCEL)
+    }
+
     /// The light that governs footpath lane `lane`: its own, else that of the pedestrian
     /// crossing it is a piece of.
     pub fn crossing_light(&self, net: &Network, lane: usize) -> Option<(usize, usize)> {
@@ -875,6 +917,7 @@ impl Simulation {
         self.removed.clear();
         self.changes_started.clear();
         self.held_at_red = 0;
+        self.measure_players(dt);
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
@@ -1105,6 +1148,10 @@ impl Simulation {
             });
             let Some((j, chain, s_on)) = hit else { continue };
             let Some(&(m, _)) = chain.first() else { continue };
+            // (the road's limit where it drives, as an AI claim's: the lane it is on, else the
+            // junction's piece it heads for)
+            let road_limit = way.first().map(|w| w.0).unwrap_or(self.junctions.nodes[j].movements[m].lane);
+            let road_limit = net.lanes.get(road_limit).map(|l| l.speed_limit_kmh / 3.6).unwrap_or(13.0);
             // where its meeting places begin along the way through (the end of the way when
             // it meets nobody), and the next one its front has not entered
             let foes = self.junctions.foes_along(j, &chain);
@@ -1198,11 +1245,11 @@ impl Simulation {
                 movement: m,
                 s: s_on,
                 speed: v,
-                accel: 1.2,
-                v_max: 14.0,
+                accel: self.player_accel(p.id),
+                v_max: road_limit,
                 front: p.half_len,
                 rear: p.half_len,
-                gap: 4.0,
+                gap: PLAYER_GAP,
                 committed,
                 exit_room: true,
                 impatience: Impatience::default(),

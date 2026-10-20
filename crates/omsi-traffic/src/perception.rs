@@ -1584,8 +1584,8 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
     let mut clear_for = f32::INFINITY;
     let mut blocked = false;
     let behind_me = os + st.rear + 1.0;
-    // (pos, speed, accel, held at a red light)
-    let mut note = |pos: f32, speed: f32, accel: f32, at_red: bool| {
+    // (pos, speed, accel, seconds until the red light it stands at lets it go)
+    let mut note = |pos: f32, speed: f32, accel: f32, red_for: Option<f32>| {
         // past me already
         if pos > behind_me {
             return;
@@ -1599,9 +1599,10 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
         // not yet level: the distance it still has to me
         let dist = (os - pos).max(0.0);
         let mut t = arrival_time(dist, speed, accel, limit);
-        // a car standing at a red light with time to go: counts from when it goes
-        if at_red && speed < STANDING_SPEED {
-            t += 5.0;
+        // a car standing at a red light: counts from when it goes ([round 7 A9] the light's
+        // own `until_go`, not a flat 5 s; never within a cycle: not coming)
+        if let (Some(wait), true) = (red_for, speed < STANDING_SPEED) {
+            t += wait;
         }
         // inside the stretch I will use: no time at all
         if pos > os - pass_len {
@@ -1615,11 +1616,12 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            note(occ.s + off, o.state.speed, o.state.accel, o.last.why == crate::plan::Why::Light);
+            let red_for = (o.last.why == crate::plan::Why::Light).then(|| signal_ahead(net, sim, &way_lanes(net, &o.state, 160.0), o.state.rear).and_then(|s| s.until_go).unwrap_or(f32::INFINITY));
+            note(occ.s + off, o.state.speed, o.state.accel, red_for);
         }
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let p = &sim.players[k];
-            note(s + off, p.speed.max(0.0), 1.2, false);
+            note(s + off, p.speed.max(0.0), sim.player_accel(p.id), None);
         }
     }
     if sim.parked.get(&opp).map(|v| v.iter().any(|p| p.lateral.abs() <= 1.6 && p.s > os - pass_len - 10.0 && p.s < os + 10.0)).unwrap_or(false) {
