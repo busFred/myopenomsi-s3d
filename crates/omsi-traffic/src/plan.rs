@@ -905,6 +905,40 @@ fn me_index(vehicles: &[Vehicle], me: &Vehicle) -> usize {
 ///    c. a convergence near, past the line already: as soon as it can stop gently;
 ///    d. the stretch's stop.
 fn refused_stop(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, g: &Grant) -> f32 {
+    let stop = refused_stop_cases(net, sim, vehicles, me, j, g);
+    // [fix pass 3, 4] off a crossing: a body that would stand over a crossing band at the
+    // stop (`pulled_back` only pulls back before bands ahead of the front, so a body already
+    // partly in one stopped there: x10 case04 #3222 at s 4.0 with its rear over the crossing
+    // at 2.2) goes forward until its rear is past the crossing and `ZEBRA_PAST` where the
+    // meeting place it waits for allows, else back to `ZEBRA_STOP` before the crossing while
+    // it can still stop there
+    let limit = match (g.hold, g.at) {
+        (Some(Hold::Foe), Some(waited)) => j.entry + waited - 1.0,
+        _ => j.conflict_start - 1.0,
+    };
+    off_crossing(net, sim, me, j, stop, limit.max(stop))
+}
+
+/// [fix pass 3, 4] `stop` moved off the crossing bands of `j`'s way (`walk_bands`) the body
+/// would stand over there: forward, the rear past the band, no farther than `limit`; else
+/// back before it while the front has not passed its start.
+fn off_crossing(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, mut stop: f32, limit: f32) -> f32 {
+    let len = me.length();
+    for w in walk_bands(net, sim, j) {
+        if w.0 < stop && w.1 > stop - len - REST_SHORT {
+            let forward = w.1 + len + REST_SHORT;
+            if forward <= limit {
+                stop = forward;
+            } else if w.0 > me.state.front - 0.3 {
+                stop = stop.min(w.0);
+            }
+        }
+    }
+    stop
+}
+
+/// The stop of `refused_stop` before it is moved off a crossing.
+fn refused_stop_cases(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, g: &Grant) -> f32 {
     let st = &me.state;
     let dp = &me.params;
     let v = st.speed;
