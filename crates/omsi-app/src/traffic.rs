@@ -377,9 +377,6 @@ impl Viewer {
 /// How far from the player cars are kept (m) and how far out of sight one may be before it
 /// is taken off (m); in plain view a car stays until it is too small to see.
 const DESPAWN_FACTOR: f64 = 1.6;
-/// [ROLLBACK jamguard-1] See `Traffic::jammed`.
-const JAM_MIN_CARS: usize = 15;
-const JAM_SHARE: f32 = 0.35;
 /// [ROLLBACK appearfar-1] Further off than this (m) a random car may appear in plain view.
 const APPEAR_IN_VIEW_BEYOND: f64 = 300.0;
 
@@ -2158,8 +2155,8 @@ impl Traffic {
             .cars
             .iter()
             .filter(|c| {
+                // ([round 7 B2] a car that gave up counts too: it stands on the road)
                 !c.is_bus()
-                    && !c.ai.gone
                     && counted_near
                         .map(|(p, r)| (c.vehicle.position - p).length() < r)
                         .unwrap_or(true)
@@ -2172,13 +2169,10 @@ impl Traffic {
             })
             .count();
         let mut count = unscheduled;
-        // [ROLLBACK jamguard-1] nothing into a jam (see `jammed`)
-        if kind == LaneKind::Street && !self.initial && self.jammed(center) {
-            if self.debug_population {
-                log::info!("population t={:.1}: the road is jammed, no car put down ({} in range)", self.time, unscheduled);
-            }
-            return;
-        }
+        // ([round 7 B2] no global jam guard: SUMO has none, a car is put in only where its
+        // lane has room - the per-spot tests below, `behind_a_queue` above all; the guard
+        // counted every queue at a red, and with no car giving up there any more it held
+        // every spawn at Jiangzhaikou from 60 s on)
         while count < target && attempts < target * 12 {
             attempts += 1;
             let x = self.rand_f() as f32 * total_w;
@@ -2346,31 +2340,11 @@ impl Traffic {
 
     /// The cars out of range that have come near again take their bodies back - where
     /// nobody sees it happen, up to a little over the number asked for around the player.
-    /// [ROLLBACK jamguard-1] The traffic about `center` is jammed: of the random cars within
-    /// the spawn radius (at least `JAM_MIN_CARS` of them), more than `JAM_SHARE` have stood
-    /// for five seconds. No new car is put down then, and none woken - every one put into a
-    /// jam only lengthens it, and the spawner filled a boulevard bumper to bumper in every
-    /// lane until the junctions locked (BeijingCity, a target of 490 cars).
-    fn jammed(&self, center: DVec3) -> bool {
-        let r = self.spawn_radius;
-        let (mut standing, mut all) = (0usize, 0usize);
-        for c in &self.cars {
-            if c.is_bus() || c.ai.gone || c.at_stop() || (c.vehicle.position - center).length() > r {
-                continue;
-            }
-            all += 1;
-            if c.ai.stopped > 5.0 {
-                standing += 1;
-            }
-        }
-        all >= JAM_MIN_CARS && standing as f32 > JAM_SHARE * all as f32
-    }
-
     fn wake_dormant(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, target: usize) {
-        if self.dormant.is_empty() || self.jammed(center) {
+        if self.dormant.is_empty() {
             return;
         }
-        let active = self.cars.iter().filter(|c| !c.is_bus() && !c.ai.gone).count();
+        let active = self.cars.iter().filter(|c| !c.is_bus()).count();
         let mut budget = (target as f32 * 1.25).ceil() as usize;
         budget = budget.saturating_sub(active);
         let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
@@ -2427,7 +2401,7 @@ impl Traffic {
             return;
         }
         let map_target = ((street_target as f64 * self.street_weight / near).min(street_target as f64 * MAP_POPULATION_FACTOR as f64)) as usize;
-        let present = self.cars.iter().filter(|c| !c.is_bus() && !c.ai.gone).count() + self.dormant.len();
+        let present = self.cars.iter().filter(|c| !c.is_bus()).count() + self.dormant.len();
         if present >= map_target {
             return;
         }
