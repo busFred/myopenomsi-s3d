@@ -988,7 +988,11 @@ impl Simulation {
                 // `JunctionView::clears_past`, and the car standing there is held by it, not
                 // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
                 // committed to the cars waiting for it)
-                Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // ([fix pass 2, 1b] and any light that holds the claimant before its first
+                // meeting place, whatever the object's line: the light belongs to the claim -
+                // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
+                // `light_red false` for j783 and two cars stood refused for it 28 m apart)
+                Some(sig) if (sig.dist <= light_line.max(j.conflict_start) + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or one
                     // committed at amber onset and still rolling (`plan::light_call`; one
