@@ -2115,9 +2115,9 @@ pub struct World {
     /// Counts the changes of the loaded tiles (see [`World::refresh_tile_lists`]): whoever
     /// keeps what it derived from the stops, the waiting places or the ground looks again.
     pub tiles_generation: std::sync::atomic::AtomicU64,
-    /// Parked cars placed on `[carpark_p]` spaces: world position and heading (deg), for
-    /// the traffic to steer round (see `lane_tiles`).
-    pub parked_cars: Mutex<Vec<(DVec3, f64)>>,
+    /// Parked cars placed on `[carpark_p]` spaces: world position, heading (deg) and
+    /// `[boundingbox]`, for the traffic to steer round (see `lane_tiles`).
+    pub parked_cars: Mutex<Vec<crate::traffic::ParkedCar>>,
     /// The boxes of the parked cars of the loaded tiles, which people walk round.
     pub parked_boxes: Mutex<Arc<Vec<omsi_sim::collision::Obb>>>,
     /// Placed objects with particle systems (chimney smoke, the fireworks, a memorial's
@@ -5007,7 +5007,7 @@ impl World {
         } else {
             Vec::new()
         };
-        let mut parked_cars: Vec<(DVec3, f64)> = Vec::new();
+        let mut parked_cars: Vec<crate::traffic::ParkedCar> = Vec::new();
         let mut objects: Vec<PlacedObject> = Vec::new();
         let mut trees = Vec::new();
         let debug_objects = omsi_cfg::env::var_os("OMSI_DEBUG_OBJECTS").is_some();
@@ -5054,7 +5054,7 @@ impl World {
             }
             if o.parked && first_load {
                 // on the ground: the lane match of the traffic is by distance in 3D
-                parked_cars.push((pos, heading));
+                parked_cars.push((pos, heading, ot.sco.bounding_box));
             }
             if ot.sco.is_bus_stop {
                 state.bus_stops.push((

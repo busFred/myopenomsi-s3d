@@ -420,14 +420,15 @@ pub struct Traffic {
     pub net: Network,
     /// Sum of the spawn weights of every street lane, updated only as tiles add lanes.
     street_weight: f64,
-    /// Parked cars standing in or beside a lane: per lane, (distance along it, signed
-    /// lateral offset of the car's centre, + = right). A car in the lane's middle is an
-    /// obstacle to stop behind; one over the kerb side is passed with a swerve to the left.
-    parked: HashMap<usize, Vec<(f32, f32)>>,
+    /// Parked cars standing in or beside a lane: per lane, their boxes in the lane's frame
+    /// (distance along it and signed lateral offset of the box's middle, + = right, and its
+    /// half extents along and across the lane). A car in the lane's middle is an obstacle to
+    /// stop behind; one over the kerb side is passed with a swerve to the left.
+    parked: HashMap<usize, Vec<Parked>>,
     /// Parked cars no lane has been found beside yet: the lane may come with a tile that is
     /// not loaded yet (a road spline often starts in the next tile). Most stand in car parks
     /// and stay here.
-    parked_waiting: Vec<DVec3>,
+    parked_waiting: Vec<ParkedCar>,
     /// Tiles whose lanes the network has (lanes stay once they are in).
     pub lane_tiles: hashbrown::HashSet<(i32, i32)>,
     /// Counts the times tiles brought their lanes: whoever resolved something against the
@@ -645,6 +646,13 @@ const OVERLAP_DEPTH: f64 = 0.2;
 /// (`Traffic::spawn_clear`): the stricter of the two tests it replaces (footprints with 1 m
 /// on each side, 2 m between; the timetable's bodies with 0.5 m).
 const SPAWN_BODY_CLEAR: f64 = 2.0;
+
+/// A parked car a tile placed: its origin, heading (degrees) and `[boundingbox]`.
+pub(crate) type ParkedCar = (DVec3, f64, Option<[f32; 6]>);
+
+/// The box of a parked car whose object gives no `[boundingbox]`: 1.8 x 4.6 m, the fixed
+/// box every parked car had until round 7 (half 0.9 x 2.3).
+const PARKED_BOX: [f32; 6] = [1.8, 4.6, 1.5, 0.0, 0.0, 0.75];
 
 /// `[boundingbox]` of a vehicle that gives none (bus-sized: the traffic's bodies and the
 /// people's view of the AI cars, `Humans`, use this one value).
@@ -1060,7 +1068,7 @@ impl Traffic {
         }
         let lights = world.traffic_lights.lock().clone();
         let controller_of_object = world.controller_of_object.lock().clone();
-        let parked: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
+        let parked: HashMap<usize, Vec<Parked>> = HashMap::new();
         let turning = net.lanes.iter().filter(|l| l.turn != 0).count();
         let with_side = net
             .lanes
@@ -1539,8 +1547,8 @@ impl Traffic {
     /// signed lateral offset, + = right). `cars` are the ones the tiles placed since the last
     /// call; the cars no lane was found for before are tried again where the lanes `added`
     /// just came in.
-    fn sort_parked(&mut self, cars: Vec<(DVec3, f64)>, added: std::ops::Range<usize>) {
-        let mut todo: Vec<DVec3> = Vec::new();
+    fn sort_parked(&mut self, cars: Vec<ParkedCar>, added: std::ops::Range<usize>) {
+        let mut todo: Vec<ParkedCar> = Vec::new();
         if !added.is_empty() && !self.parked_waiting.is_empty() {
             let cells: hashbrown::HashSet<(i32, i32)> = added
                 .clone()
@@ -1550,19 +1558,24 @@ impl Traffic {
                 let (cx, cy) = Network::grid_cell(*p);
                 (-1..=1).any(|dx| (-1..=1).any(|dy| cells.contains(&(cx + dx, cy + dy))))
             };
-            let (retry, keep): (Vec<DVec3>, Vec<DVec3>) = std::mem::take(&mut self.parked_waiting)
+            let (retry, keep): (Vec<ParkedCar>, Vec<ParkedCar>) = std::mem::take(&mut self.parked_waiting)
                 .into_iter()
-                .partition(|p| near(p));
+                .partition(|p| near(&p.0));
             self.parked_waiting = keep;
             todo = retry;
         }
         let new_cars = cars.len();
-        todo.extend(cars.into_iter().map(|(p, _heading)| p));
+        todo.extend(cars);
         if todo.is_empty() {
             return;
         }
         let mut on_lanes = 0usize;
-        for p in todo {
+        for car in todo {
+            // [round 7 A10] its real box (`[boundingbox]`, as `World::parked_boxes` has it),
+            // matched and placed by the box's middle
+            let (origin, heading, bb) = car;
+            let obb = omsi_sim::collision::Obb::from_box(bb.unwrap_or(PARKED_BOX), origin, heading);
+            let p = obb.center.extend(origin.z);
             // a car beside a lane is within a few metres of it: the lanes of the cells
             // around it are enough, and a car in a car park finds none
             let beside = self
@@ -1570,7 +1583,7 @@ impl Traffic {
                 .nearest_lane_near(p, LaneKind::Street)
                 .filter(|(l, _, d)| *d <= (self.net.lanes[*l].width * 0.5).max(1.5) as f64 + 1.6);
             let Some((l, s, _)) = beside else {
-                self.parked_waiting.push(p);
+                self.parked_waiting.push(car);
                 continue;
             };
             let (q, h) = self.net.lanes[l].at(s);
@@ -1581,7 +1594,16 @@ impl Traffic {
                 let lane = &self.net.lanes[l];
                 log::info!("parked car at ({:.1}, {:.1}) stands in lane {l} ({} {:?}, width {:.1}, heading {:.0} there, s {s:.1} of {:.1}, {lat:+.2} m to the side)", p.x, p.y, lane.name, lane.key, lane.width, h, lane.length());
             }
-            self.parked.entry(l).or_default().push((s, lat));
+            // (its half extents along and across the lane: a car parked askew reaches further
+            // into it)
+            let rel = (obb.heading - hr).sin_cos();
+            let (hw, hl) = (obb.half.x, obb.half.y);
+            let half_len = (rel.1.abs() * hl + rel.0.abs() * hw) as f32;
+            let half_width = (rel.0.abs() * hl + rel.1.abs() * hw) as f32;
+            if bb.is_some_and(|b| b[1] > PARKED_BOX[1] + 0.5 || b[0] > PARKED_BOX[0] + 0.3) && omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
+                log::info!("parked car at ({:.1}, {:.1}) beside lane {l} at s {s:.1}, {lat:+.2} m: box {:.2} x {:.2} m (half {half_width:.2} across, {half_len:.2} along)", p.x, p.y, 2.0 * hw, 2.0 * hl);
+            }
+            self.parked.entry(l).or_default().push(Parked { s, lateral: lat, half_width, half_len });
             on_lanes += 1;
         }
         if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
@@ -2047,8 +2069,8 @@ impl Traffic {
                 continue;
             }
             if let Some(list) = self.parked.get_mut(&l) {
-                if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].0 - s).abs().total_cmp(&(list[b].0 - s).abs())) {
-                    if (list[j].0 - s).abs() < 3.0 {
+                if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - s).abs().total_cmp(&(list[b].s - s).abs())) {
+                    if (list[j].s - s).abs() < 3.0 {
                         list.swap_remove(j);
                     }
                 }
@@ -2235,7 +2257,7 @@ impl Traffic {
                 .get(&lane)
                 .map(|l| {
                     l.iter()
-                        .any(|&(ps, lat)| (ps - s).abs() < 8.0 && lat.abs() < 1.5)
+                        .any(|p| (p.s - s).abs() < 8.0 && p.lateral.abs() < 1.5)
                 })
                 .unwrap_or(false)
             {
@@ -3192,7 +3214,7 @@ impl Traffic {
             .filter_map(|o| Some((o.bus.as_ref()?, &o.ai.state.route)))
             .flat_map(|(b, route)| b.stops.iter().filter(move |x| route.get(x.ri) == Some(&l)).map(|x| (x.s, x.bay)))
             .collect();
-        let parked = self.parked.get(&l).cloned().unwrap_or_default();
+        let parked: Vec<Parked> = self.parked.get(&l).cloned().unwrap_or_default();
         let keep_off: Vec<f32> = self.net.crossings.get(l).into_iter().flatten().map(|c| c.at).chain(self.net.walks.get(l).into_iter().flatten().map(|w| w.1)).collect();
         let free = |a: f32, b: f32, lat: f32| {
             !self.cars.iter().any(|o| {
@@ -3255,7 +3277,7 @@ impl Traffic {
         self.sim.players = views;
         self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb }).collect();
         self.sim.walkers = self.walkers.clone();
-        self.sim.parked = self.parked.iter().map(|(l, v)| (*l, v.iter().map(|&(s, lateral)| Parked { s, lateral, half_width: 0.9, half_len: 2.3 }).collect())).collect();
+        self.sim.parked = self.parked.clone();
         self.sim.day_time = self.day_time;
         self.sim.time_scale = self.time_scale;
         // the bus services and the parking plans: what they ask of the driver this frame
@@ -4363,11 +4385,9 @@ impl Traffic {
                 Some(p) if p.done => {
                     let c = self.cars.swap_remove(i);
                     if world.return_parked(renderer, scene, p.key) {
-                        if let Some(list) = self.parked.get_mut(&p.lane) {
-                            list.push((p.s, p.lat));
-                        } else {
-                            self.parked.insert(p.lane, vec![(p.s, p.lat)]);
-                        }
+                        let st = &c.ai.state;
+                        let spot = Parked { s: p.s, lateral: p.lat, half_width: c.ai.half_width, half_len: (st.front + st.rear) * 0.5 };
+                        self.parked.entry(p.lane).or_default().push(spot);
                     }
                     if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
                         log::info!("car {} has parked (space {})", c.id, p.key);
@@ -4727,7 +4747,7 @@ fn take_from_tiles(
     world: &World,
 ) -> (
     Vec<omsi_sim::traffic::Lane>,
-    Vec<(DVec3, f64)>,
+    Vec<ParkedCar>,
     Vec<(i32, i32)>,
 ) {
     let mut lanes = world.lanes.lock();

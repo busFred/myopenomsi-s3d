@@ -310,9 +310,8 @@ pub fn covers_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) ->
 /// of its object is covered when a car driving on its axis would come within this much (m)
 /// of the bus's body: `covers_lane`'s 0.5 m margin ...
 pub const FAN_COVER: f32 = 0.5;
-/// [round 6 B1] ... with the car this wide either side of the axis (m: the parked cars'
-/// half width the traffic plans with, `Traffic::tick`'s `Parked { half_width: 0.9 }`, and
-/// round a typical town car's 1.8 m). A lane 2.7 m or more off the axis of a 2.5 m bus is
+/// [round 6 B1] ... with the car this wide either side of the axis (m: half a typical town
+/// car's 1.8 m, the box every parked car had until round 7). A lane 2.7 m or more off the axis of a 2.5 m bus is
 /// then not covered (a bus in a bay beside the through lane stays).
 pub const FAN_CAR_HALF: f32 = 0.9;
 /// [round 6 B1] A vehicle standing on a covered lane, or whose way runs into one within
@@ -466,12 +465,13 @@ impl ThroughLanes {
 /// of the through traffic, nearest the start of the lane first: its origin's place and its
 /// offset right of the lane. `lane_len`, `width`: the lane; `free(a, b)`: nobody on the lane
 /// between `a` and `b`; `on_way`: some vehicle's way uses the lane; `bays`: other stops'
-/// places off the lane (origin, offset); `parked`: the cars parked beside it (s, offset);
+/// places off the lane (origin, offset); `parked`: the cars parked beside it (their boxes in
+/// the lane's frame, [round 7 A10]);
 /// `keep_off`: places along the lane a bus must not stand on (junction mouths, crossings).
 /// Candidates, in order: another stop's bay, the lane itself when nobody's way uses it (a
 /// lay-by, a stand), a gap in a parked row or the kerb before or after the row.
 #[allow(clippy::too_many_arguments)]
-pub fn room_on_lane(lane_len: f32, width: f32, len: f32, half_width: f32, on_way: bool, bays: &[(f32, f32)], parked: &[(f32, f32)], keep_off: &[f32], free: &dyn Fn(f32, f32, f32) -> bool) -> Option<(f32, f32)> {
+pub fn room_on_lane(lane_len: f32, width: f32, len: f32, half_width: f32, on_way: bool, bays: &[(f32, f32)], parked: &[omsi_traffic::Parked], keep_off: &[f32], free: &dyn Fn(f32, f32, f32) -> bool) -> Option<(f32, f32)> {
     let need = len + PARK_ROOM;
     // off the lane: the body clear of the lane by the margin `covers_lane` asks
     let off = |lat: f32| lat.abs() >= half_width + width * 0.5 - 0.5;
@@ -488,19 +488,21 @@ pub fn room_on_lane(lane_len: f32, width: f32, len: f32, half_width: f32, on_way
             return Some((s, 0.0));
         }
     }
-    let mut row: Vec<(f32, f32)> = parked.iter().copied().filter(|p| off(p.1 + p.1.signum() * (half_width - 0.9))).collect();
-    row.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let at = |lat: f32| lat + lat.signum() * (half_width - 0.9);
+    // (the bus in a row stands with its inner side where the cars' inner sides are, each car
+    // by its own box)
+    let at = |p: &omsi_traffic::Parked| p.lateral + p.lateral.signum() * (half_width - p.half_width);
+    let mut row: Vec<omsi_traffic::Parked> = parked.iter().copied().filter(|p| off(at(p))).collect();
+    row.sort_by(|a, b| a.s.total_cmp(&b.s));
     let mut spots: Vec<(f32, f32)> = Vec::new();
-    if let (Some(&first), Some(&last)) = (row.first(), row.last()) {
+    if let (Some(first), Some(last)) = (row.first(), row.last()) {
         // the kerb before the row and after it
-        spots.push((first.0 - 2.3 - 1.0 - need * 0.5, at(first.1)));
-        spots.push((last.0 + 2.3 + 1.0 + need * 0.5, at(last.1)));
+        spots.push((first.s - first.half_len - 1.0 - need * 0.5, at(first)));
+        spots.push((last.s + last.half_len + 1.0 + need * 0.5, at(last)));
     }
     for w in row.windows(2) {
-        let ((s1, lat1), (s2, lat2)) = (w[0], w[1]);
-        if lat1.signum() == lat2.signum() && s2 - s1 - 4.6 >= need {
-            spots.push(((s1 + s2) * 0.5, at((lat1 + lat2) * 0.5)));
+        let (a, b) = (&w[0], &w[1]);
+        if a.lateral.signum() == b.lateral.signum() && b.s - a.s - a.half_len - b.half_len >= need {
+            spots.push(((a.s + b.s) * 0.5, (at(a) + at(b)) * 0.5));
         }
     }
     spots.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2119,6 +2121,8 @@ mod tests {
     #[test]
     fn a_bus_parks_in_a_bay_on_an_unused_lane_or_at_the_kerb_of_a_parked_row() {
         let none = |_: f32, _: f32, _: f32| true;
+        // (a town car's box, the one every parked car had until round 7)
+        let car_at = |s: f32, lateral: f32| omsi_traffic::Parked { s, lateral, half_width: 0.9, half_len: 2.3 };
         // a lane in use, nothing beside it: nowhere
         assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &[], &[], &none), None);
         // nobody's way: the lane's end
@@ -2130,21 +2134,26 @@ mod tests {
         // a bay that leaves the bus over the lane is none
         assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[(80.0, 1.2)], &[], &[], &none), None);
         // a parked row 3 m over from 60 to 90 m, cars 5 m apart: the kerb before it
-        let row: Vec<(f32, f32)> = (0..7).map(|k| (60.0 + 5.0 * k as f32, 3.0)).collect();
+        let row: Vec<omsi_traffic::Parked> = (0..7).map(|k| car_at(60.0 + 5.0 * k as f32, 3.0)).collect();
         let (s, lat) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none).expect("the kerb before the row");
         assert!(s < 60.0 - 2.3 - 8.0 && (lat - 3.35).abs() < 0.01, "{s} {lat}");
+        // [round 7 A10] a row of vans (2.2 x 6 m) 3.2 m over: the bus lines up with their
+        // inner sides and keeps clear of the first van's own length
+        let vans: Vec<omsi_traffic::Parked> = (0..5).map(|k| omsi_traffic::Parked { s: 60.0 + 7.0 * k as f32, lateral: 3.2, half_width: 1.1, half_len: 3.0 }).collect();
+        let (s, lat) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &vans, &[], &none).expect("the kerb before the vans");
+        assert!(s <= 60.0 - 3.0 - 1.0 - 8.0 + 0.01 && (lat - 3.35).abs() < 0.01, "{s} {lat}");
         // the stretch before the row too short (row from 15 m): after it
-        let row: Vec<(f32, f32)> = (0..7).map(|k| (15.0 + 5.0 * k as f32, 3.0)).collect();
+        let row: Vec<omsi_traffic::Parked> = (0..7).map(|k| car_at(15.0 + 5.0 * k as f32, 3.0)).collect();
         let (s, _) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none).expect("after the row");
         assert!(s > 45.0 + 2.3 + 8.0, "{s}");
         // a gap of 30 m in the row (no room before it or after it on an 80 m lane): the gap,
         // unless somebody stands there
-        let mut row: Vec<(f32, f32)> = (0..4).map(|k| (15.0 + 5.0 * k as f32, 3.0)).collect();
-        row.extend((0..4).map(|k| (60.0 + 5.0 * k as f32, 3.0)));
+        let mut row: Vec<omsi_traffic::Parked> = (0..4).map(|k| car_at(15.0 + 5.0 * k as f32, 3.0)).collect();
+        row.extend((0..4).map(|k| car_at(60.0 + 5.0 * k as f32, 3.0)));
         assert_eq!(room_on_lane(80.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none), Some((45.0, 3.35)));
         assert_eq!(room_on_lane(80.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &|_, _, _| false), None);
         // a row so close to the lane that a bus there would still cover it: none
-        let row: Vec<(f32, f32)> = (0..7).map(|k| (60.0 + 5.0 * k as f32, 1.8)).collect();
+        let row: Vec<omsi_traffic::Parked> = (0..7).map(|k| car_at(60.0 + 5.0 * k as f32, 1.8)).collect();
         assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none), None);
     }
 
