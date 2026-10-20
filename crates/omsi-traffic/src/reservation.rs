@@ -45,6 +45,10 @@ pub struct Claim {
     /// Held at this junction's line by a red light, and the seconds until it shows green
     /// (None: not within a cycle).
     pub light_red: bool,
+    /// [fix pass 3, 5] With `light_red`: the distance (m) from the claimant's origin along its
+    /// way to that red line (`f32::INFINITY`: not known, before every meeting place). The red holds it before the meeting
+    /// places beyond the line only (`red_before`).
+    pub red_at: f32,
     pub until_go: Option<f32>,
     /// The vehicle this one follows this frame (the caller's index), if any: a claimant
     /// does not wait for its own follower.
@@ -516,6 +520,14 @@ fn decide(js: &Junctions, claims: &[Claim], plain: Option<&[Grant]>, standing: O
 /// is coming. (Before, only a foe standing or creeping at its red was shifted to its green; a
 /// stream braking towards a long red at 1-12 m/s re-held a green leader every 3-5 s, viz3
 /// case16: 50 s of a 57 s green.)
+/// [fix pass 3, 5] Does the red `o` files (`light_red`, `red_at`) hold it before the meeting
+/// place that begins `meet` metres from its origin along its way? A light past the meeting
+/// place does not keep it out of it. (A red without its line, `red_at` infinite: before every
+/// meeting place, as a claim built by hand has it.)
+fn red_before(o: &Claim, meet: f32) -> bool {
+    o.light_red && (o.red_at.is_infinite() || o.red_at <= meet + 0.5)
+}
+
 fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     match (c.light, o.light) {
         (Some(mine), Some(theirs)) => !c.light_red && o.light_red && ctx.exclusive(mine, theirs),
@@ -650,7 +662,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 }
                 // lights before the table: held at a red that is never green with mine, it
                 // comes at its green (`red_foe`)
-                let at_red = !their_inside && red_foe(ctx, c, o);
+                let at_red = !their_inside && red_foe(ctx, c, o) && red_before(o, foe.theirs.0 - o.s);
                 if at_red && o.until_go.is_none() {
                     continue;
                 }
@@ -692,7 +704,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                     if my_out + margin <= their_in {
                         continue;
                     }
-                } else if o.light_red && o.standing() && !their_inside {
+                } else if red_before(o, foe.theirs.0 - o.s) && o.standing() && !their_inside {
                     match o.until_go {
                         Some(t) => {
                             their_in += t;
@@ -999,7 +1011,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, standing_long: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, standing_long: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, gap: 4.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, red_at: f32::INFINITY, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.

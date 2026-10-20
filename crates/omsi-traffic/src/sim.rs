@@ -997,19 +997,22 @@ impl Simulation {
             // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
             // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
             let light_line = j.light_line;
-            let (light_red, until_go) = match p.signal {
+            let (light_red, until_go, red_at) = match p.signal {
                 // (clearing the box: the light it passed holds it no more,
                 // `JunctionView::clears_past`)
-                Some(sig) if j.clears_past(&sig, st.front) => (false, None),
+                Some(sig) if j.clears_past(&sig, st.front) => (false, None, f32::INFINITY),
                 // (or, clearing the box, a later line of the way through: it holds the car as any,
                 // `JunctionView::clears_past`, and the car standing there is held by it, not
                 // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
                 // committed to the cars waiting for it)
-                // ([fix pass 2, 1b] and any light that holds the claimant before its first
-                // meeting place, whatever the object's line: the light belongs to the claim -
-                // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
-                // `light_red false` for j783 and two cars stood refused for it 28 m apart)
-                Some(sig) if (sig.dist <= light_line.max(j.conflict_start) + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // ([fix pass 2, 1b; pass 3, 5] and any light that holds the claimant, whatever
+                // the object's line: the light belongs to the claim, with its line (`red_at`),
+                // and the resolver keeps it out of the meeting places beyond that line only -
+                // x10 case14 #35673 queued at the red at the end of join lane 33514 filed
+                // `light_red false` for j783; #34517, 2.95 m short of its red with its first
+                // meeting place behind its front, still had to file it for the meeting places
+                // 32-40 m on)
+                Some(sig) if (sig.dist <= light_line.max(j.conflict_start) + 1.0 || v.last.why == Why::Light || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or one
                     // committed at amber onset and still rolling (`plan::light_call`; one
@@ -1017,12 +1020,12 @@ impl Simulation {
                     let call = plan::light_call(v, p, &sig);
                     let through = call.go;
                     if through {
-                        (false, None)
+                        (false, None, f32::INFINITY)
                     } else {
-                        (true, sig.until_go)
+                        (true, sig.until_go, sig.dist)
                     }
                 }
-                _ => (false, None),
+                _ => (false, None, f32::INFINITY),
             };
             // standing at its red short of the first meeting place with
             // another way, a car is committed to nothing: the merge of the lead-in with its
@@ -1038,6 +1041,7 @@ impl Simulation {
                 chain: j.chain.clone(),
                 was_standing,
                 light_red,
+                red_at,
                 until_go,
                 lead: match p.leader.map(|l| l.what) {
                     Some(Seen::Vehicle(o)) | Some(Seen::Body(o)) => Some(o),
@@ -1181,19 +1185,19 @@ impl Simulation {
             // car's `signal_ahead`: the front 0.8 m past its stub, the player's bus lost its red,
             // stood blocked and held a green stream, case07 #37076 21 s)
             let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d + p.half_len > -PLAYER_LINE_PAST).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
-            let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
+            let (light, light_red, until_go, red_at) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
                     let gap = d - p.half_len;
                     // (as an AI car's `light_call`)
                     let can_stop = !plan::cannot_stop(v, gap + 0.5, plan::HARD_BRAKE);
                     if red && can_stop {
-                        (Some(lt), true, c.time_until_go(lt.1))
+                        (Some(lt), true, c.time_until_go(lt.1), d)
                     } else {
-                        (Some(lt), false, None)
+                        (Some(lt), false, None, f32::INFINITY)
                     }
                 }
-                None => (None, false, None),
+                None => (None, false, None, f32::INFINITY),
             };
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
@@ -1243,6 +1247,7 @@ impl Simulation {
                 chain,
                 was_standing: false,
                 light_red,
+                red_at,
                 until_go,
                 lead,
                 vehicle: player_claim(p.id),
