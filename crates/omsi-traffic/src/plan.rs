@@ -575,8 +575,9 @@ pub struct LightCall {
     pub go: bool,
     /// The light's mark is set (`Vehicle::amber`): the driver took the line on green or yellow.
     pub mark: bool,
-    /// Holding the mark close to the line: it goes through as soon as nothing else holds
-    /// it (a queue it stands in), whatever the light shows by then.
+    /// Holding the mark close to the line while rolling: it goes through, whatever the light
+    /// shows by then. ([round 7 A6] Not standing: one that came to a stand with the mark
+    /// waits for its green, as `go` has since round 6 J3, and its claim files its red.)
     pub marked_through: bool,
 }
 
@@ -628,7 +629,7 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // took the mark and crept over on red, viz case07 #18558)
             let stopping = me.last.why == Why::Light && me.last.stop.is_some();
             let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + MARK_REACH));
-            LightCall { go, mark: go, marked_through: marked && gap < comfortable + MARK_REACH }
+            LightCall { go, mark: go, marked_through: marked && v > STANDING_SPEED && gap < comfortable + MARK_REACH }
         }
         // (a car standing with its bumper over the line waits like one behind it: at a
         // standstill nothing is "too late to stop")
@@ -637,7 +638,7 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
             // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
             let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || cannot_stop(v, gap + 0.5, HARD_BRAKE);
-            LightCall { go, mark: false, marked_through: marked && gap < comfortable }
+            LightCall { go, mark: false, marked_through: marked && v > STANDING_SPEED && gap < comfortable }
         }
     }
 }

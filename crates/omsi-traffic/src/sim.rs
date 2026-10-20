@@ -956,8 +956,9 @@ impl Simulation {
                 Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or the mark of one
-                    // that took the line on green or yellow and is close to it (queued
-                    // there, it goes on as soon as its leader moves, whatever the light)
+                    // that took the line on green or yellow and is still rolling close to it
+                    // ([round 7 A6] one standing at its red with the mark waits for its green,
+                    // round 6 J3, and files `light_red` like any car standing there)
                     let call = plan::light_call(v, p, &sig);
                     let through = call.go || call.marked_through;
                     if through {

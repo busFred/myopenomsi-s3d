@@ -102,3 +102,25 @@ fn the_way_on_at_a_fork_takes_open_lanes_then_density_closed_never_no_cars() {
     net.lanes[2].no_cars = true;
     assert!(ways(&net).iter().all(|w| w.is_none()), "{:?}", ways(&net));
 }
+
+/// [round 7 A6] The mark of a line taken on green or yellow carries a car over its red only
+/// while it rolls (round 6 J3): standing with the mark half a metre short of the line it is not "marked
+/// through", so its claim files the red like any car standing there.
+#[test]
+fn a_marked_car_standing_at_its_red_is_not_marked_through() {
+    use omsi_sim::traffic::Aspect;
+    use omsi_traffic::{plan::light_call, Perception, SignalView};
+    let mut v = standing(VehicleClass::Car);
+    v.amber = Some((0, 0));
+    v.state.front = 2.0;
+    let sig = |aspect| SignalView { dist: v.state.front + 0.5, ctl: 0, light: 0, aspect, until_go: Some(20.0) };
+    let p = Perception::default();
+    for aspect in [Aspect::Red, Aspect::Yellow] {
+        let call = light_call(&v, &p, &sig(aspect));
+        assert!(!call.go && !call.marked_through, "standing at {aspect:?}: {call:?}");
+    }
+    // rolling at 2 m/s there: through
+    v.state.speed = 2.0;
+    let call = light_call(&v, &p, &sig(Aspect::Red));
+    assert!(call.go && call.marked_through, "rolling: {call:?}");
+}
