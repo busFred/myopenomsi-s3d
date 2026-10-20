@@ -89,6 +89,9 @@ pub struct Replay {
     pub dropped_spawns: u64,
     /// Indices of the keyframes in `records`.
     keyframes: Vec<usize>,
+    /// The vehicles the run's own network end took off (`Simulation::removed`): (time, id,
+    /// speed, place). Appended frame by frame; a caller may drain it.
+    pub ended: Vec<(f64, u64, f32, glam::DVec3)>,
     /// [round 7 E2] Free run: the light clocks were taken from the recording (the first
     /// frame after the starting keyframe); from then on they run on with the run's own
     /// demand (`Simulation::update_lights`).
@@ -136,7 +139,7 @@ impl Replay {
     pub fn new(header: Header, records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new() };
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new() };
         r.stub_links();
         r
     }
@@ -492,7 +495,8 @@ impl Replay {
         // (as the game takes them off: from the back, each swapped with the last)
         for &i in &sim.removed {
             if i < self.vehicles.len() {
-                self.vehicles.swap_remove(i);
+                let v = self.vehicles.swap_remove(i);
+                self.ended.push((sim.time, v.id, v.state.speed, v.pos));
             }
         }
     }

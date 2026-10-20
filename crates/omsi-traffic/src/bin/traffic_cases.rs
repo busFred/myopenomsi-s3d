@@ -4201,6 +4201,10 @@ struct Extra {
     /// run in the app, not here). Not counted: one that came on the road (keyframe, spawn)
     /// given up already, and a timetable bus (its `gone` is the app's, trip over).
     removed_in_view: u64,
+    /// [round 7 SHOULD 9] Vehicles the run's network end took off within the radius (a lane
+    /// end in view), and of them, whole map, those taken off moving over 1 m/s.
+    end_in_view: u64,
+    end_moving: u64,
     events: Vec<String>,
 }
 
@@ -4423,6 +4427,15 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
             for &id in &ids {
                 first_seen.entry(id).or_insert(now);
+            }
+            for (t, id, v, pos) in std::mem::take(&mut r.ended) {
+                if near(pos) {
+                    ex.end_in_view += 1;
+                }
+                if v > 1.0 {
+                    ex.end_moving += 1;
+                    ex.events.push(format!("END-MOVING {} t={t:.1} #{id} v {v:.1} at ({:.0}, {:.0})", sc.name, pos.x, pos.y));
+                }
             }
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
@@ -4793,6 +4806,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("ease_stand/pinned", format!("{:.0}/{:.0}", e.ease_stand_s, e.ease_pinned_s)),
         ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
         ("removed_in_view", e.removed_in_view.to_string()),
+        ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
     ]
 }
 
@@ -4818,6 +4832,8 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.pass_stranded_s += e.pass_stranded_s;
     t.eases += e.eases;
     t.removed_in_view += e.removed_in_view;
+    t.end_in_view += e.end_in_view;
+    t.end_moving += e.end_moving;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
@@ -4947,7 +4963,7 @@ fn ab(args: &[String]) -> Res<()> {
     {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
         let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
-        println!("(fork fallbacks, whole map: took a lane closed by density {}, by the rules {}, none {})", n(0), n(1), n(2));
+        println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting

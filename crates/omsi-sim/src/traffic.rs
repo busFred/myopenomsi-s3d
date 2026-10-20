@@ -2888,10 +2888,12 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     Ok(())
 }
 
-/// [round 7 A1] Forks where no way on was open to the vehicle (`AiState::choose_after`), by
-/// what it took then: [a lane closed by density, by the rules, none]. A diagnostic for
-/// `traffic_cases ab` (whole process).
-pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// [round 7 A1] Ways on chosen by a tier below "open to me and leading on"
+/// (`AiState::choose_after`), per tier: [open but every way on from it closed, closed by my
+/// group's density but driven by another group, driven by no group, closed by the rules but
+/// not `no_cars`, `no_cars`, none at all]. Per call (a plan is extended frame after frame).
+/// A diagnostic for `traffic_cases ab` (whole process).
+pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
@@ -3026,10 +3028,13 @@ impl AiState {
     /// (`open_to`: the path's rules, `[rule] no_cars`/`bus`/`trucks` by its type, and the
     /// traffic density of its group - filtering them only at spawn still let cars turn into a
     /// pedestrian street or a depot yard from next door); a car of a traffic pool takes them
-    /// by its pool's density. [round 7 A1] With none open (counted, `FORK_FALLBACKS`): a lane
-    /// closed only by density (no traffic of its group asked for there), then one closed by
-    /// the rules that is not `no_cars`; never a `no_cars` lane nor another kind - none, and
-    /// the car runs off the end of its lane, taken away there as in OMSI. A way that ends the
+    /// by its pool's density. [round 7 A1] The ways on are ranked, the best tier taken (the
+    /// lower ones counted, `FORK_FALLBACKS`): open to me and leading on (a dead end too); open
+    /// to me but every way on from it closed (SUMO's bestLanes look-ahead, one step); closed
+    /// by my group's density but driven by another group; driven by no group; closed by the
+    /// rules but not `no_cars`; `no_cars` - a car already on a lane whose only continuation is
+    /// closed drives on through it, as before round 7, and is never taken off moving; only a
+    /// lane with no way of its kind at all ends the network for it. A way that ends the
     /// network just ahead (`Network::reach`) is taken like any other.
     fn choose_after(
         &mut self,
@@ -3043,22 +3048,29 @@ impl AiState {
         let next: Vec<usize> = l.next.iter().copied().filter(|&n| !avoid(n)).collect();
         let kind = l.kind;
         let closed = |n: usize| open_to(&net.lanes[n], self, kind).err();
-        let open: Vec<usize> = next.iter().copied().filter(|&n| closed(n).is_none()).collect();
-        let (choices, weighted) = if !open.is_empty() || next.is_empty() {
-            (open, self.traffic_pool.is_some())
-        } else {
-            let density: Vec<usize> = next.iter().copied().filter(|&n| closed(n) == Some(Closed::Density)).collect();
-            let rules: Vec<usize> = next.iter().copied().filter(|&n| closed(n) == Some(Closed::Rules) && !net.lanes[n].no_cars).collect();
-            let (k, choices) = if !density.is_empty() {
-                (0, density)
-            } else if !rules.is_empty() {
-                (1, rules)
-            } else {
-                (2, Vec::new())
-            };
-            FORK_FALLBACKS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (choices, false)
+        // (SUMO's bestLanes, one step: a lane whose ways on are all closed to me is no way on
+        // for me - a car entered X10's 20754 and 20737, whose only continuation is no_cars)
+        let leads_on = |n: usize| {
+            let ln = &net.lanes[n];
+            ln.next.is_empty() || ln.next.iter().any(|&m| closed(m).is_none())
         };
+        let tier = |n: usize| -> usize {
+            match closed(n) {
+                None if leads_on(n) => 0,
+                None => 1,
+                Some(Closed::Density) if net.lanes[n].density > 0.0 => 2,
+                Some(Closed::Density) => 3,
+                Some(Closed::Rules) if !net.lanes[n].no_cars => 4,
+                Some(Closed::Rules) => 5,
+                Some(Closed::Kind) => 6,
+            }
+        };
+        let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
+        let choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        let weighted = best == 0 && self.traffic_pool.is_some();
+        if best > 0 && !next.is_empty() {
+            FORK_FALLBACKS[best.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if choices.is_empty() {
             None
         } else {

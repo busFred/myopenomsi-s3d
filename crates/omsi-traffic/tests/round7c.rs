@@ -62,9 +62,10 @@ fn a_random_bus_gives_up_a_timetable_bus_never() {
     assert!(stand(&mut tt, Why::None, 1.0));
 }
 
-/// [round 7 A1] The way on at a fork follows the access rule (`open_to`): an open lane
-/// whenever there is one; with none open, one closed only by density before one closed by
-/// the rules; never a `no_cars` lane.
+/// [round 7 A1] The way on at a fork follows the access rule (`open_to`), in tiers: an open
+/// lane leading on whenever there is one; with none open, one closed only by density before
+/// one closed by the rules; a `no_cars` lane only when nothing else goes on (a car already
+/// there drives through, it is never taken off moving).
 #[test]
 fn the_way_on_at_a_fork_takes_open_lanes_then_density_closed_never_no_cars() {
     use glam::DVec3;
@@ -97,10 +98,29 @@ fn the_way_on_at_a_fork_takes_open_lanes_then_density_closed_never_no_cars() {
     // none open: the density-closed lane, never the no_cars one
     let net = fork(false);
     assert!(ways(&net).iter().all(|w| *w == Some(2)), "the density-closed way: {:?}", ways(&net));
-    // only no_cars lanes: no way on
+    // only no_cars lanes: through one of them, as before round 7
     let mut net = fork(false);
     net.lanes[2].no_cars = true;
-    assert!(ways(&net).iter().all(|w| w.is_none()), "{:?}", ways(&net));
+    assert!(ways(&net).iter().all(|w| w.is_some()), "{:?}", ways(&net));
+}
+
+/// [round 7 A1] SUMO's bestLanes, one step: an open lane whose only way on is closed to the
+/// car is not taken while another open lane leads on.
+#[test]
+fn an_open_lane_leading_only_into_a_closed_one_is_not_taken() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    let lane = |a: (f64, f64), b: (f64, f64)| LaneBuilder::polyline(vec![DVec3::new(a.0, a.1, 0.0), DVec3::new(b.0, b.1, 0.0)], LaneKind::Street, 3.5);
+    // 0 forks into 1 (on into 3, no_cars) and 2 (on into 4, open)
+    let mut lanes = vec![lane((0.0, 0.0), (100.0, 0.0)), lane((100.0, 0.0), (130.0, 10.0)), lane((100.0, 0.0), (130.0, -10.0)), lane((130.0, 10.0), (300.0, 10.0)), lane((130.0, -10.0), (300.0, -10.0))];
+    lanes[3].no_cars = true;
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    for seed in 0..40u64 {
+        let mut st = AiState::new(0, 95.0, seed + 1);
+        st.plan_next(&net);
+        assert_eq!(st.planned_next, Some(2), "seed {seed}");
+    }
 }
 
 /// [round 7 A6] The mark of a line taken on green or yellow carries a car over its red only
