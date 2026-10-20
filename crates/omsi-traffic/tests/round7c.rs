@@ -268,17 +268,21 @@ fn the_way_is_planned_to_the_claim_horizon() {
     assert!(planned < 150.0, "slow: planned {planned:.0} m");
 }
 
-/// [fix pass 1, 15] A vehicle record missing a driver field (removed on another branch, e.g.
-/// `yellow_brake`) still reads, the field as the car preset's; one with a field the code no
-/// longer knows reads too.
+/// [fix pass 1, 15] A vehicle record with a driver field the code no longer knows still
+/// reads (`yellow_brake`, removed in round 7 A5, is in every recording before it), and one
+/// missing a driver field reads too, the field as the car preset's.
 #[test]
 fn a_vehicle_record_without_a_removed_driver_field_still_reads() {
     let v = standing(VehicleClass::Car);
     let text = omsi_traffic::finite::to_string(&v).expect("written");
-    let without = text.replace(",\"yellow_brake\":2.5", "").replace("\"yellow_brake\":2.5,", "");
-    assert!(!without.contains("yellow_brake"), "the field is gone from the text");
-    let back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without yellow_brake");
-    assert_eq!(back.params.yellow_brake, omsi_traffic::DriverParams::preset(VehicleClass::Car).yellow_brake);
+    let old = text.replacen("\"tau\":", "\"yellow_brake\":2.5,\"tau\":", 1);
+    assert!(old.contains("yellow_brake"), "an old record carries the field");
+    let back: Vehicle = omsi_traffic::finite::from_str(&old).expect("reads with yellow_brake");
+    assert_eq!(back.params, v.params);
+    let without = text.replacen("\"impatience_max\":1.0,", "", 1).replacen(",\"impatience_max\":1.0", "", 1);
+    assert!(!without.contains("impatience_max"), "the field is gone from the text");
+    let back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without impatience_max");
+    assert_eq!(back.params.impatience_max, omsi_traffic::DriverParams::preset(VehicleClass::Car).impatience_max);
     let with_more = text.replacen("{", "{\"a_field_from_elsewhere\":1,", 1);
     let _: Vehicle = omsi_traffic::finite::from_str(&with_more).expect("reads with an unknown field");
 }

@@ -2566,22 +2566,6 @@ impl Traffic {
         } else {
             100.0
         };
-        // lorries and vans take bends more gently than cars
-        state.lat_accel = if kind == LaneKind::Air {
-            50.0
-        } else if heavy {
-            1.6
-        } else {
-            2.4 + (seed % 7) as f32 * 0.1
-        };
-        if bus.is_some() {
-            // it brakes for its stops the way the town's drivers brake for a light: with
-            // 1.5 m/s² of "comfortable" braking the planner braked at half that and crept
-            // up to every stop for a hundred metres
-            state.decel = 2.1;
-            state.accel = state.accel.max(1.0);
-            state.min_gap = state.min_gap.max(2.2);
-        }
         let (front, rear, half_width) = extents(&ty, if bus.is_some() { 12.0 } else { 4.5 });
         // [round 7 fix pass 1, 12] the whole consist (SUMO's vehicle length): the last coupled
         // section's rear, not the front section's - followers stopped inside a BJ6180
@@ -2604,8 +2588,6 @@ impl Traffic {
                 .speed_limit_kmh
                 .min(state.max_speed_kmh)
                 / 3.6;
-            state.accel = 0.5;
-            state.decel = 0.5;
         }
         // a bus put out at a stop stands there (in the bay, if it has one)
         let at_stop = bus
@@ -2651,21 +2633,15 @@ impl Traffic {
         // the driver: a parameter set of its class with a seeded personality, then the
         // few things the vehicle's own data says about it (its limit, how it takes bends)
         let class = if bus.is_some() { VehicleClass::ScheduledBus } else { VehicleClass::from_code(ty.def.ai_veh_type, kind) };
-        let (max_kmh, lat_accel, speed, accel, decel) = (state.max_speed_kmh, state.lat_accel, state.speed, state.accel, state.decel);
+        // (its braking, pulling away and bends are its class's `DriverParams`, one value
+        // each that the IDM and the plan both read)
+        let (max_kmh, speed) = (state.max_speed_kmh, state.speed);
         let mut ai = AiVehicle::new(id, class, state, half_width, seed);
+        // (a van of the car class over 6 t bends like a lorry: the preset by mass)
+        ai.params = ai.params.by_mass(ty.def.mass);
+        ai.params.apply(&mut ai.state);
         ai.state.max_speed_kmh = max_kmh;
-        ai.state.lat_accel = lat_accel;
         ai.state.speed = speed;
-        if kind == LaneKind::Air {
-            ai.state.accel = accel;
-            ai.state.decel = decel;
-        }
-        if bus.is_some() {
-            // it brakes for its stops the way the town's drivers brake for a light
-            ai.state.decel = 2.1;
-            ai.state.accel = ai.state.accel.max(1.0);
-            ai.state.min_gap = ai.state.min_gap.max(2.2);
-        }
         self.cars.push(AiCar {
             id,
             ai,
