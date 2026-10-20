@@ -76,6 +76,60 @@ fn in_a_queue(lead_id: Option<u64>, lead: Option<Lead>, standing: &hashbrown::Ha
 }
 
 #[cfg(test)]
+mod spawn_queue_tests {
+    use super::{may_put_on, queue_within_reach, spawn_queue_reach};
+
+    /// A crossing object (9) with two pieces across each other, fed by plain roads, one of
+    /// them lit: the lit approach and the piece with a foe are refused, a plain road is taken.
+    #[test]
+    fn b4_no_car_is_put_on_a_lit_lane_or_a_junction_piece_with_foes() {
+        use omsi_sim::traffic::{LaneBuilder, LaneKey, LaneKind, Network};
+        let lane = |pts: &[(f64, f64)], source: u32, id: i64, path: u16| {
+            let mut l = LaneBuilder::polyline(pts.iter().map(|p| glam::DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.5);
+            l.source = source;
+            l.key = Some(LaneKey { tile: (0, 0), id, path });
+            l
+        };
+        let mut net = Network::default();
+        let mut lit = lane(&[(-200.0, 0.0), (-15.0, 0.0)], 1, 1, 0);
+        lit.traffic_light = Some((0, 0));
+        net.lanes.push(lit); // 0: the lit approach
+        net.lanes.push(lane(&[(-15.0, 0.0), (15.0, 0.0)], 2, 9, 0)); // 1: across
+        net.lanes.push(lane(&[(15.0, 0.0), (200.0, 0.0)], 1, 2, 0)); // 2: plain
+        net.lanes.push(lane(&[(0.0, -200.0), (0.0, -15.0)], 1, 3, 0)); // 3: plain
+        net.lanes.push(lane(&[(0.0, -15.0), (0.0, 15.0)], 2, 9, 1)); // 4: across the other way
+        net.lanes.push(lane(&[(0.0, 15.0), (0.0, 200.0)], 1, 4, 0)); // 5: plain
+        net.link(1.5);
+        net.compute_conflicts();
+        let js = omsi_traffic::Junctions::compile(&net);
+        assert!(js.movement(1).is_some_and(|(_, m)| !m.foes.is_empty()), "the pieces meet");
+        assert!(!may_put_on(&net, &js, 0), "the lit approach");
+        assert!(!may_put_on(&net, &js, 1) && !may_put_on(&net, &js, 4), "a piece with a foe");
+        assert!(may_put_on(&net, &js, 2) && may_put_on(&net, &js, 3), "a plain road");
+    }
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+
+    /// Two 100 m lanes end to end: a standing car's rear 20 m ahead of the spot on the next
+    /// lane keeps a car going 10 m/s from being put down (reach 40 m); a moving one does not,
+    /// and hides one standing behind it; one standing 40 m ahead does not; one behind the spot
+    /// does not count.
+    #[test]
+    fn b4_no_car_is_put_down_within_reach_of_a_standing_queue() {
+        let p = |y: f64| glam::DVec3::new(0.0, y, 0.0);
+        let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![p(0.0), p(100.0)], LaneKind::Street, 3.5), LaneBuilder::polyline(vec![p(100.0), p(200.0)], LaneKind::Street, 3.5)], ..Default::default() };
+        net.link(1.5);
+        let reach = spawn_queue_reach(10.0);
+        assert!((reach - 40.0).abs() < 0.01, "{reach}");
+        let at = |cars: Vec<(usize, f32, bool)>| move |lane: usize| cars.iter().filter(|c| c.0 == lane).map(|c| (c.1, c.1 - 2.0, c.2)).collect::<Vec<_>>();
+        assert!(queue_within_reach(&net, 0, 90.0, reach, &at(vec![(1, 12.0, true)])));
+        assert!(!queue_within_reach(&net, 0, 90.0, reach, &at(vec![(1, 12.0, false), (1, 20.0, true)])));
+        assert!(!queue_within_reach(&net, 0, 90.0, reach, &at(vec![(1, 32.0, true)])));
+        assert!(!queue_within_reach(&net, 0, 90.0, reach, &at(vec![(0, 50.0, true)])));
+        assert!(queue_within_reach(&net, 0, 50.0, reach, &at(vec![(0, 60.0, true)])));
+    }
+}
+
+#[cfg(test)]
 mod queue_tests {
     use super::{in_a_queue, QUEUE_LEAD};
     use omsi_sim::traffic::Lead;
@@ -643,6 +697,55 @@ const OVERLAP_DEPTH: f64 = 0.2;
 /// (`Traffic::spawn_clear`): the stricter of the two tests it replaces (footprints with 1 m
 /// on each side, 2 m between; the timetable's bodies with 0.5 m).
 const SPAWN_BODY_CLEAR: f64 = 2.0;
+
+/// [round 7 B4] How far ahead of a spot a standing car keeps a new one from being put down
+/// there (m): SUMO's insertion gap, its car-following safe gap to a standing leader - the
+/// reaction (time gap `tau`) at the speed it is put down at, stopping from there with a town
+/// car's comfortable braking, and its standing gap: v·tau + v²/2b + s0 (`DriverParams` car
+/// preset; 40 m at 10 m/s).
+fn spawn_queue_reach(v: f32) -> f32 {
+    let car = omsi_traffic::DriverParams::preset(VehicleClass::Car);
+    v * car.tau + v * v / (2.0 * car.comfort_brake) + car.min_gap
+}
+
+/// [round 7 B4] `Traffic::may_put_on` over the network and its compiled junctions: lane `l`
+/// carries no light and is no junction piece with foes.
+fn may_put_on(net: &Network, junctions: &omsi_traffic::Junctions, l: usize) -> bool {
+    net.lanes.get(l).is_some_and(|lane| lane.traffic_light.is_none()) && !junctions.movement(l).is_some_and(|(_, m)| !m.foes.is_empty())
+}
+
+/// [round 7 B4] Whether the nearest vehicle ahead of `s` on lane `l`, or on any way on from it,
+/// within `reach` (m) stands. `on(lane)`: the vehicles on a lane, (their origin and their
+/// rear along the lane, standing). A branch ends at its first vehicle.
+fn queue_within_reach(net: &Network, l: usize, s: f32, reach: f32, on: &dyn Fn(usize) -> Vec<(f32, f32, bool)>) -> bool {
+    // (lanes to look at, with how far their start lies from the spot)
+    let mut todo = vec![(l, -s)];
+    let mut seen: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+    while let Some((lane, start)) = todo.pop() {
+        if start > reach || !seen.insert(lane) {
+            continue;
+        }
+        // the nearest vehicle ahead of the spot on this lane: (distance to its rear, standing)
+        let ahead = on(lane).into_iter().filter(|&(at, _, _)| lane != l || at > s).map(|(_, rear, standing)| (start + rear, standing)).min_by(|a, b| a.0.total_cmp(&b.0));
+        match ahead {
+            Some((d, standing)) => {
+                if standing && d < reach {
+                    return true;
+                }
+            }
+            None => {
+                let len = net.lanes.get(lane).map_or(0.0, |x| x.length());
+                for &n in net.lanes.get(lane).map(|x| x.next.as_slice()).unwrap_or(&[]) {
+                    todo.push((n, start + len));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The share of the lane's limit a random car is put down at (`create_car`).
+const SPAWN_SPEED_SHARE: f32 = 0.7;
 
 /// A parked car a tile placed: its origin, heading (degrees) and `[boundingbox]`.
 pub(crate) type ParkedCar = (DVec3, f64, Option<[f32; 6]>);
@@ -2128,7 +2231,7 @@ impl Traffic {
             .filter(|(_, l)| !l.no_cars && l.density > 0.0)
             // nor on a lane with a stop line (a car put down past the line went through
             // the junction on red), nor on a piece of a junction that meets other ways
-            .filter(|(i, l)| l.traffic_light.is_none() && !self.sim.junctions.movement(*i).is_some_and(|(_, m)| !m.foes.is_empty()))
+            .filter(|(i, _)| self.may_put_on(*i))
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
@@ -2215,13 +2318,7 @@ impl Traffic {
             {
                 continue;
             }
-            // [ROLLBACK jamguard-1] nor behind a car standing on this lane within 60 m
-            // ahead: a car put down behind a queue only lengthens it
-            if kind == LaneKind::Street
-                && self.cars.iter().any(|c| {
-                    c.ai.state.lane == lane && c.ai.state.s > s && c.ai.state.s - s < 60.0 && c.ai.stopped > 3.0
-                })
-            {
+            if kind == LaneKind::Street && self.behind_a_queue(lane, s, self.net.lanes[lane].speed_limit_kmh / 3.6 * SPAWN_SPEED_SHARE) {
                 continue;
             }
             // only on loaded ground (a lane's tile may have gone again)
@@ -2229,23 +2326,7 @@ impl Traffic {
                 continue;
             }
             let heading = self.net.lanes[lane].at(s).1 as f64;
-            // nor just in front of one driving up to that place (it would have to stop hard)
-            let in_front_of_someone = self.cars.iter().any(|c| {
-                let rel = p - c.vehicle.position;
-                let h = c.vehicle.heading.to_radians();
-                let (along, across) = (
-                    rel.x * h.sin() + rel.y * h.cos(),
-                    (rel.x * h.cos() - rel.y * h.sin()).abs(),
-                );
-                along > 0.0
-                    && along
-                        < 20.0
-                            + (c.ai.state.speed * c.ai.state.speed / (2.0 * c.ai.state.decel.max(1.0)))
-                                as f64
-                                * 1.5
-                    && across < 3.0
-            });
-            if in_front_of_someone {
+            if self.in_front_of_someone(p) {
                 continue;
             }
             if self
@@ -2340,6 +2421,35 @@ impl Traffic {
         }
     }
 
+    /// May a random car be put on (or woken on) lane `l`: not a lane with a stop line (a car
+    /// put down past the line went through the junction on red), nor a piece of a junction
+    /// that meets other ways.
+    fn may_put_on(&self, l: usize) -> bool {
+        may_put_on(&self.net, &self.sim.junctions, l)
+    }
+
+    /// [ROLLBACK jamguard-1] [round 7 B4] A car put down at `s` on lane `l` going `v` m/s would
+    /// come up behind a standing one: on the lane and the lanes it runs into (every branch), the
+    /// nearest car ahead of the spot within `spawn_queue_reach(v)` stands. A car put down
+    /// behind a queue only lengthens it; SUMO inserts a vehicle only where the safe gap to its
+    /// leader holds (and the one to its follower, `in_front_of_someone`), it has no jam guard.
+    fn behind_a_queue(&self, l: usize, s: f32, v: f32) -> bool {
+        queue_within_reach(&self.net, l, s, spawn_queue_reach(v), &|lane| {
+            self.cars.iter().filter(|c| c.ai.state.lane == lane).map(|c| (c.ai.state.s, c.ai.state.s - c.ai.state.rear, c.standing())).collect()
+        })
+    }
+
+    /// Just in front of a car driving up to `p` (it would have to stop hard): within 20 m and
+    /// one and a half braking distances ahead of it, 3 m to either side.
+    fn in_front_of_someone(&self, p: DVec3) -> bool {
+        self.cars.iter().any(|c| {
+            let rel = p - c.vehicle.position;
+            let h = c.vehicle.heading.to_radians();
+            let (along, across) = (rel.x * h.sin() + rel.y * h.cos(), (rel.x * h.cos() - rel.y * h.sin()).abs());
+            along > 0.0 && along < 20.0 + (c.ai.state.speed * c.ai.state.speed / (2.0 * c.ai.state.decel.max(1.0))) as f64 * 1.5 && across < 3.0
+        })
+    }
+
     /// The cars out of range that have come near again take their bodies back - where
     /// nobody sees it happen, up to a little over the number asked for around the player.
     fn wake_dormant(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, target: usize) {
@@ -2352,19 +2462,26 @@ impl Traffic {
         let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
         let mut i = 0;
         while i < self.dormant.len() && budget > 0 {
-            let (p, h, ty) = {
+            let (p, h, ty, lane, s, speed) = {
                 let d = &self.dormant[i];
                 let l = &self.net.lanes[d.lane];
-                let (p, h) = l.at(d.s.clamp(0.0, (l.length() - 0.1).max(0.0)));
-                (p, h as f64, d.ty.clone())
+                let s = d.s.clamp(0.0, (l.length() - 0.1).max(0.0));
+                let (p, h) = l.at(s);
+                (p, h as f64, d.ty.clone(), d.lane, s, d.speed)
             };
             let near = centers.iter().any(|c| (p - *c).truncate().length() < self.spawn_radius);
             // (as a new car: never close by, where the mirrors and a turn of the head see
             // it - woken out of the picture 30-60 m from the bus, a car came into being in
             // the mirror or just round the corner)
+            // ([round 7 B4] and where a new car may be put down: not past a stop line nor on a
+            // junction piece with foes, not behind a queue, not just in front of somebody - a
+            // dormant car drives everywhere, and one woken there appeared inside a junction)
             let ok = near
                 && world.has_ground(p.x, p.y)
                 && self.may_appear(world, p)
+                && self.may_put_on(lane)
+                && !self.behind_a_queue(lane, s, speed)
+                && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)
                 && self.spawn_clear(&ty, p, h);
             if ok {
@@ -2579,7 +2696,7 @@ impl Traffic {
             .speed_limit_kmh
             .min(state.max_speed_kmh)
             / 3.6
-            * 0.7)
+            * SPAWN_SPEED_SHARE)
             .min(state.curve_speed(&self.net));
         if kind == LaneKind::Air {
             state.speed = self.net.lanes[lane]
