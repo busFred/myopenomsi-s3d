@@ -460,7 +460,7 @@ pub(crate) fn run_offscreen(
                     }
                     Some(crate::admin::TrafficOrder::Clear) => {
                         if let Some(t) = traffic.as_mut() {
-                            let ids: Vec<u64> = t.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
+                            let ids: Vec<u64> = t.cars.iter().filter(|c| !c.serves_stops()).map(|c| c.id).collect();
                             for id in &ids {
                                 t.remove_car(&world, &renderer, &mut scene, *id);
                             }
@@ -1363,7 +1363,7 @@ pub(crate) fn run_offscreen(
             }
         }
         log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
-        for c in t.cars.iter().filter(|c| c.is_bus()) {
+        for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
             if omsi_cfg::env::var_os("OMSI_DEBUG_PROPS").is_some() {
                 for v in [

@@ -5421,7 +5421,7 @@ impl Humans {
                 })
                 .collect();
             let mut visits = HashMap::new();
-            for c in t.cars.iter().filter(|c| c.is_bus()) {
+            for c in t.cars.iter().filter(|c| c.serves_stops()) {
                 let from_eye = self.eye.map(|e| (c.vehicle.position - e.pos).length()).unwrap_or(f64::MAX);
                 if (c.vehicle.position - near).length().min(from_eye) > 400.0 && !riding.contains(&c.id) {
                     continue;

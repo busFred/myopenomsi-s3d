@@ -206,8 +206,11 @@ pub struct ParkPlan {
 }
 
 impl AiCar {
-    /// A timetable bus (in service or on its way off after its trip).
-    pub fn is_bus(&self) -> bool {
+    /// A timetable bus (in service or on its way off after its trip): it has a `BusService`,
+    /// the class `ScheduledBus` (`omsi_traffic::Vehicle::serves_stops`). A bus of the random
+    /// traffic (`[ai_veh_type]` 2) is random traffic here as everywhere (round 7 A4: it gives
+    /// up and is removed like the other random vehicles; `Vehicle::heavy` is its class).
+    pub fn serves_stops(&self) -> bool {
         self.bus.is_some()
     }
 
@@ -1869,7 +1872,7 @@ impl Traffic {
                 .unwrap_or(false);
             let unloaded = !flying && !world.has_ground(p.x, p.y);
             off_ground += unloaded as usize;
-            let random = !c.is_bus() || c.ai.gone;
+            let random = !c.serves_stops() || c.ai.gone;
             let r = (c.ai.state.length as f64 * 0.5).max(2.0);
             // standing on the last lane of the network (the map's edge), given up: a random
             // car that reaches the end is taken off by the traffic itself as Omsi.exe does
@@ -1878,7 +1881,7 @@ impl Traffic {
             // 0x703bb0); one held short of it goes as below, out of sight or far off, after
             // a long while, or in view once others queue behind it
             let at_end = c.ai.gone
-                && c.ai.stopped > if c.is_bus() { 20.0 } else { 0.5 }
+                && c.ai.stopped > if c.serves_stops() { 20.0 } else { 0.5 }
                 && c.ai.state.route.is_empty()
                 && self.net.lanes[c.ai.state.lane].next.is_empty();
             let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(dist);
@@ -1889,7 +1892,7 @@ impl Traffic {
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
-            let sleeps_instead = random && !c.ai.gone && !c.is_bus() && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
+            let sleeps_instead = random && !c.ai.gone && !c.serves_stops() && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
             let remove = if unloaded {
                 true
             } else if at_edge {
@@ -1946,10 +1949,10 @@ impl Traffic {
                 }
             } else if remove {
                 let c = self.cars.swap_remove(i);
-                if c.is_bus() {
+                if c.serves_stops() {
                     self.riders_out.push(c.id);
                 }
-                if c.is_bus() && (unloaded || at_edge) {
+                if c.serves_stops() && (unloaded || at_edge) {
                     self.removed_scheduled.push(c.id);
                 }
                 if self.debug_population {
@@ -2065,7 +2068,7 @@ impl Traffic {
             // a car of that kind coming up the lane, far enough off to slow down gently
             let mut best: Option<(usize, f32)> = None;
             for (i, c) in self.cars.iter().enumerate() {
-                if c.is_bus() || c.ai.gone || c.park.is_some() || c.ai.passing.is_some() || c.ai.state.change.is_some() || c.ai.pull_out > 0.0 {
+                if c.serves_stops() || c.ai.gone || c.park.is_some() || c.ai.passing.is_some() || c.ai.state.change.is_some() || c.ai.pull_out > 0.0 {
                     continue;
                 }
                 if c.vehicle.ty.def.path.parent().map(|d| d.to_string_lossy().to_lowercase()) != folder {
@@ -2261,7 +2264,7 @@ impl Traffic {
             .iter()
             .filter(|c| {
                 // ([round 7 B2] a car that gave up counts too: it stands on the road)
-                !c.is_bus()
+                !c.serves_stops()
                     && counted_near
                         .map(|(p, r)| (c.vehicle.position - p).length() < r)
                         .unwrap_or(true)
@@ -2456,7 +2459,7 @@ impl Traffic {
         if self.dormant.is_empty() {
             return;
         }
-        let active = self.cars.iter().filter(|c| !c.is_bus()).count();
+        let active = self.cars.iter().filter(|c| !c.serves_stops()).count();
         let mut budget = (target as f32 * 1.25).ceil() as usize;
         budget = budget.saturating_sub(active);
         let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
@@ -2520,7 +2523,7 @@ impl Traffic {
             return;
         }
         let map_target = ((street_target as f64 * self.street_weight / near).min(street_target as f64 * MAP_POPULATION_FACTOR as f64)) as usize;
-        let present = self.cars.iter().filter(|c| !c.is_bus()).count() + self.dormant.len();
+        let present = self.cars.iter().filter(|c| !c.serves_stops()).count() + self.dormant.len();
         if present >= map_target {
             return;
         }
@@ -2859,7 +2862,7 @@ impl Traffic {
         let &lane = route.first()?;
         let kind = self.net.lanes.get(lane)?.kind;
         // the options' [AIMaxCountScheduled]: no more timetable vehicles than that at once
-        if self.max_scheduled > 0 && self.cars.iter().filter(|c| c.is_bus() || !c.ai.state.route.is_empty()).count() >= self.max_scheduled as usize {
+        if self.max_scheduled > 0 && self.cars.iter().filter(|c| c.serves_stops() || !c.ai.state.route.is_empty()).count() >= self.max_scheduled as usize {
             return None;
         }
         let seed = self.rand();
@@ -3672,12 +3675,12 @@ impl Traffic {
             let buses_only = omsi_cfg::env::var_os("OMSI_TRACE_AI_BUSES").is_some();
             for (c, fr) in self.cars.iter().zip(&frames) {
                 let Some(fr) = fr else { continue };
-                if buses_only && !c.is_bus() {
+                if buses_only && !c.serves_stops() {
                     continue;
                 }
                 let (v, st, last) = (&c.vehicle, &c.ai.state, &c.ai.last);
                 let lane_heading = self.net.lanes[st.lane].at(st.s).1.rem_euclid(360.0);
-                let _ = writeln!(f, "{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.2},{},{},{:.2},{:.2},{},{:.2},{},{},{},{:.2},{:.2},{:.2},{},{},{:.1},{:?},{:.3}", self.time, c.id, v.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), v.position.x, v.position.y, v.position.z, v.heading, v.pitch, v.bank, fr.steer_deg, st.speed, st.lane, st.s, fr.blinker, self.net.lanes[st.lane].turn, lane_heading, st.lateral, c.at_station() as i32, st.acc, (last.why == Why::Junction) as i32, (last.why == Why::Light) as i32, c.ai.passing.is_some() as i32, st.front, st.rear, c.ai.half_width, c.is_bus() as i32, last.why.name(), last.stop.map(|s| s - st.front).unwrap_or(999.0).min(999.0), c.bus.as_ref().map(|b| b.phase), self.net.lanes[st.lane].at(st.s).0.z);
+                let _ = writeln!(f, "{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.2},{},{},{:.2},{:.2},{},{:.2},{},{},{},{:.2},{:.2},{:.2},{},{},{:.1},{:?},{:.3}", self.time, c.id, v.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), v.position.x, v.position.y, v.position.z, v.heading, v.pitch, v.bank, fr.steer_deg, st.speed, st.lane, st.s, fr.blinker, self.net.lanes[st.lane].turn, lane_heading, st.lateral, c.at_station() as i32, st.acc, (last.why == Why::Junction) as i32, (last.why == Why::Light) as i32, c.ai.passing.is_some() as i32, st.front, st.rear, c.ai.half_width, c.serves_stops() as i32, last.why.name(), last.stop.map(|s| s - st.front).unwrap_or(999.0).min(999.0), c.bus.as_ref().map(|b| b.phase), self.net.lanes[st.lane].at(st.s).0.z);
             }
         }
         let mut overlaps = 0;
@@ -3687,7 +3690,7 @@ impl Traffic {
         self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
-            if c.is_bus() {
+            if c.serves_stops() {
                 self.riders_out.push(c.id);
             }
             // [ROLLBACK r4d-B1] a bus still on its trip that drove off a dead end
@@ -4283,7 +4286,7 @@ impl Traffic {
     /// vehicles were removed. The configured target is unchanged, so random traffic can
     /// populate the roads again normally.
     pub fn clear_random(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene) -> usize {
-        let ids: Vec<u64> = self.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
+        let ids: Vec<u64> = self.cars.iter().filter(|c| !c.serves_stops()).map(|c| c.id).collect();
         let removed = ids.len();
         for id in ids {
             self.remove_car(world, renderer, scene, id);
@@ -4293,7 +4296,7 @@ impl Traffic {
 
     /// The AI on the roads: (cars, buses, cars asleep far from everybody, parked cars).
     pub fn counts(&self) -> (usize, usize, usize, usize) {
-        let buses = self.cars.iter().filter(|c| c.is_bus()).count();
+        let buses = self.cars.iter().filter(|c| c.serves_stops()).count();
         (self.cars.len() - buses, buses, self.dormant.len(), self.parked.values().map(Vec::len).sum())
     }
 
@@ -4309,7 +4312,7 @@ impl Traffic {
             return false;
         };
         let c = self.cars.swap_remove(i);
-        if c.is_bus() {
+        if c.serves_stops() {
             self.riders_out.push(c.id);
         }
         self.orphan_sounds.extend(c.sounds);
@@ -4413,7 +4416,7 @@ impl Traffic {
         let dt = self.last_dt.max(1.0 / 120.0);
         let mut keep: Vec<u64> = Vec::new();
         for c in &self.cars {
-            if !c.is_bus() || c.ai.gone {
+            if !c.serves_stops() || c.ai.gone {
                 continue;
             }
             let d = (c.vehicle.position - eye).length();

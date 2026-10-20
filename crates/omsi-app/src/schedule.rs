@@ -941,7 +941,7 @@ impl Schedule {
         traffic
             .cars
             .iter()
-            .position(|c| c.is_bus() && !c.ai.gone && self.car_departure.get(&c.id) == Some(&k))
+            .position(|c| c.serves_stops() && !c.ai.gone && self.car_departure.get(&c.id) == Some(&k))
     }
 
     /// The timetable buses at the end of their trip: each takes its tour's next trip on
@@ -2753,7 +2753,7 @@ impl Schedule {
             && traffic
             .cars
             .iter()
-            .any(|c| c.is_bus() && !c.ai.gone && (c.vehicle.position - at_pos).length() < 50.0)
+            .any(|c| c.serves_stops() && !c.ai.gone && (c.vehicle.position - at_pos).length() < 50.0)
         {
             log::debug!(
                 "trip {trip_name}: its stand is taken, the bus comes at its departure time"

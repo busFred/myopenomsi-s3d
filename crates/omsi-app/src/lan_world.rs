@@ -1459,7 +1459,7 @@ fn person_pose(a: &PersonState, b: &PersonState, k: f64) -> MirrorPose {
 }
 
 fn describe_car(args: &Args, c: &crate::traffic::AiCar) -> Desc {
-    let (line, destination) = if c.is_bus() {
+    let (line, destination) = if c.serves_stops() {
         car_display(&c.vehicle)
     } else {
         (String::new(), String::new())
