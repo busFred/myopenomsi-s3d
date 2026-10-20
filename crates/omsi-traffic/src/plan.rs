@@ -590,10 +590,17 @@ pub fn cannot_stop(v: f32, room: f32, brake: f32) -> bool {
     v > 1.0 && room < v * v / (2.0 * brake)
 }
 
-/// [fix pass 2, 4] Can the driver stop within `gap` (m) at `v` (m/s) with its comfortable
-/// braking (SUMO's yellow: the vehicle stops when v²/2gap is within its decel)? Standing it can.
+/// [fix pass 3, 1] The braking (m/s²) a driver always accepts to stop at an amber line,
+/// SUMO's `--tls.yellow.min-decel` (3 m/s², sumo.md §7: "the deceleration needed is compared
+/// against" it).
+pub const YELLOW_MIN_DECEL: f32 = 3.0;
+
+/// [fix pass 2, 4; pass 3, 1] Can the driver stop within `gap` (m) at `v` (m/s) on amber -
+/// SUMO's yellow: the vehicle stops when v²/2gap is within its decel or `YELLOW_MIN_DECEL`,
+/// whichever is more? Standing it can. (Its comfortable brake alone, 2 m/s², committed a car
+/// 56 m out at 14.86 m/s, needing 1.95, that crossed 1.8 s into red: viz case17 #60501.)
 pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
-    v <= STANDING_SPEED || (gap > 0.0 && v * v / (2.0 * gap) <= dp.comfort_brake)
+    v <= STANDING_SPEED || (gap > 0.0 && v * v / (2.0 * gap) <= dp.comfort_brake.max(YELLOW_MIN_DECEL))
 }
 
 /// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
