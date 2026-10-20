@@ -244,11 +244,12 @@ pub struct Vehicle {
     /// the road once out of sight. The crate sets it and clears it when the vehicle moves
     /// again (`Vehicle::give_up_clock`); a timetable bus's is the app's.
     pub gone: bool,
-    /// [round 7 B1] Seconds at a stretch it has stood held by nothing: no reason in its plan
-    /// (lead, light, yield, exit full, people, merge, ...), no lead close, no junction hold,
-    /// no foe or body it waits for, and not moving faster than `UNHELD_SPEED`.
-    #[serde(default)]
-    pub held_by_nothing: f32,
+    /// [round 7 B1] Its waiting time, as SUMO counts it for `--time-to-teleport` (s): it runs
+    /// while the vehicle stands (`UNHELD_SPEED`) held by a yield or a merge, a jam (a lead, an
+    /// exit full), a body, a mutual refusal or nothing; it pauses at a red light, for people
+    /// and at its own stop; it restarts only when the vehicle moves (`give_up_clock`).
+    #[serde(default, alias = "held_by_nothing")]
+    pub waiting: f32,
     /// Just put on the road: its speed is trimmed to what is ahead.
     pub fresh: f32,
     /// Seconds before a car leaving a parking space moves.
@@ -328,12 +329,12 @@ pub fn claim_horizon(speed: f32) -> f32 {
 /// it in a 0.3-0.4 m/s creep).
 pub const CREPT_OFF_SPEED: f32 = 0.5;
 
-/// [round 7 B1] A random vehicle that has stood held by nothing (`Vehicle::held_by_nothing`)
-/// this long at a stretch (s) gives up (`Vehicle::gone`): five minutes, SUMO's default
-/// `--time-to-teleport` of 300 s for a vehicle that waited too long (sumo.md 5.3,
+/// [round 7 B1] A random vehicle whose waiting time (`Vehicle::waiting`) reaches this (s)
+/// gives up (`Vehicle::gone`): five minutes, SUMO's default `--time-to-teleport` of 300 s for
+/// a vehicle that waited too long - in a jam, at a yield, blocked (sumo.md 5.3,
 /// https://sumo.dlr.de/docs/Simulation/Why_Vehicles_are_teleporting.html).
 pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
-/// Faster than this (m/s) a vehicle is moving: its give-up clock restarts and a vehicle that
+/// Faster than this (m/s) a vehicle is moving: its waiting time restarts and a vehicle that
 /// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
 pub const UNHELD_SPEED: f32 = 0.1;
 
@@ -458,7 +459,7 @@ impl Vehicle {
             stopped: 0.0,
             progress: (0.0, 0.0),
             gone: false,
-            held_by_nothing: 0.0,
+            waiting: 0.0,
             fresh: 1.5,
             pull_out: 0.0,
             passing: None,
@@ -493,26 +494,31 @@ impl Vehicle {
         Obb::vehicle(self.pos.truncate(), self.heading as f64, self.state.front as f64, self.state.rear as f64, self.half_width as f64)
     }
 
-    /// [round 7 B1] The give-up clock, after this frame's decision (`last`): it runs while
-    /// the vehicle stands held by nothing and restarts on any hold or on moving faster than
-    /// `UNHELD_SPEED`; a random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up
-    /// (`gone`), and is back in the traffic once it moves. (Its gridlock is not a reason: a
-    /// queue or a junction hold restarts the clock.)
+    /// [round 7 B1] The give-up clock, after this frame's decision (`last`), SUMO's waiting
+    /// time: standing (not faster than `UNHELD_SPEED`), it runs held by a yield or a merge
+    /// (`Why::Junction`, `Merge`), a jam (`Lead`, `ExitFull`), a body or a refusal
+    /// (`body_block`, `wait_for`: a mutual refusal too) or nothing; it pauses at a red light,
+    /// for people, a pull-out, the route's end and at its own stop; moving, it restarts. A
+    /// random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up (`gone`) - a gridlock or a
+    /// mutual refusal too, a 200 s red not - and is back in the traffic once it moves.
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
-        let held = d.why != Why::None || d.held || d.hold.is_some() || d.wait_for.is_some() || d.body_block.is_some() || self.external.at_stop;
         let moving = self.state.speed > UNHELD_SPEED;
-        if moving || held {
-            self.held_by_nothing = 0.0;
-        } else {
-            self.held_by_nothing += dt;
+        let counts = match d.why {
+            Why::None | Why::Lead | Why::Junction | Why::ExitFull | Why::Merge => true,
+            _ => d.body_block.is_some() || d.wait_for.is_some(),
+        } && !self.external.at_stop;
+        if moving {
+            self.waiting = 0.0;
+        } else if counts {
+            self.waiting += dt;
         }
         if self.serves_stops() || self.is_rail() {
             return;
         }
         if moving {
             self.gone = false;
-        } else if self.held_by_nothing > GIVE_UP_UNSEEN {
+        } else if self.waiting > GIVE_UP_UNSEEN {
             self.gone = true;
         }
     }

@@ -36,7 +36,7 @@ use std::sync::mpsc;
 /// reads back the lanes' half widths. 4 ([round 7 E1]): the header names the rules by their
 /// hash (`Header::rules`, [`rules_hash`]), and every field added with a `serde(default)`
 /// since 3 is written - `Vehicle::passed_on_go`, `amber_line`, `zip_won`, `change_still`,
-/// `mutual`, `mutual_gap`, `ease_for`, `held_by_nothing`, `External::trip_over`,
+/// `mutual`, `mutual_gap`, `ease_for`, `waiting`, `External::trip_over`,
 /// `Frame::steer`, `Frame::order`; a format-3 recording may lack some (read as their
 /// defaults, `Replay::load` warns).
 pub const VERSION: u32 = 4;

@@ -4205,6 +4205,11 @@ struct Extra {
     /// end in view), and of them, whole map, those taken off moving over 1 m/s.
     end_in_view: u64,
     end_moving: u64,
+    /// [round 7 B1] Distinct vehicles within the radius whose waiting time (`Vehicle::waiting`,
+    /// the give-up clock) passed 60 s and 120 s: the windows are shorter than the 300 s
+    /// give-up, so `removed_in_view` alone moves little.
+    wait60: u64,
+    wait120: u64,
     events: Vec<String>,
 }
 
@@ -4367,6 +4372,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // (those given up, and those seen: one that comes on the road given up is not counted)
     let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
     let mut gone_seen: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
+    let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4439,6 +4445,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             }
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
+            for v in r.vehicles.iter().filter(|v| !v.serves_stops() && near(v.pos)) {
+                if v.waiting > 60.0 && waited60.insert(v.id) {
+                    ex.wait60 += 1;
+                }
+                if v.waiting > 120.0 && waited120.insert(v.id) {
+                    ex.wait120 += 1;
+                }
+            }
             for v in &r.vehicles {
                 let first = gone_seen.insert(v.id);
                 if !v.gone {
@@ -4807,6 +4821,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
         ("removed_in_view", e.removed_in_view.to_string()),
         ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
+        ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
     ]
 }
 
@@ -4834,6 +4849,8 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.removed_in_view += e.removed_in_view;
     t.end_in_view += e.end_in_view;
     t.end_moving += e.end_moving;
+    t.wait60 += e.wait60;
+    t.wait120 += e.wait120;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
