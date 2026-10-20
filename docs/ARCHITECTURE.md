@@ -594,7 +594,8 @@ rewritten as traffic** (`bus_service.rs`): an `AiCar` from the same `create_car`
 carrying a `BusService` (stops, bay, doors while boarding, layover boarding in the last 45 s,
 early wait, blinker while the doors close, pull-out, trip end); riders aboard from the start by
 the hour (`riders_at`, `OMSI_AI_RIDERS`). People keep out of the scenery's collision boxes and
-mesh faces (`keep_out_of_walls`, `OMSI_DEBUG_WALLS`), going round posts one way.
+mesh faces (`keep_out_of_walls`, `OMSI_DEBUG_WALLS`; removed in AI traffic round 7: with
+people's collisions off it skipped everybody), going round posts one way.
 `OMSI_ROAD_PHOTO_SLANT=<m>` photographs the carriageway from a driver's eye. **(done)**
 
 Round 13 (Sept 25 2026, user bug list after 3cedaf3): a plain `[texttexture]` is centred over
