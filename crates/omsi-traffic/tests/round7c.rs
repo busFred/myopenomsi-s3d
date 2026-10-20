@@ -20,23 +20,21 @@ fn stand(v: &mut Vehicle, why: Why, secs: f32) -> bool {
     v.gone
 }
 
-/// [round 7 B1] SUMO's waiting time: a random car standing in a jam, at a yield or held by
-/// nothing gives up after `GIVE_UP_UNSEEN`; at a red light or for people the clock pauses
-/// (it does not restart); moving restarts it and takes the request back.
+/// [round 7 B1] SUMO's waiting time: a random car standing in a jam, at a yield, for people or
+/// held by nothing gives up after `GIVE_UP_UNSEEN`; at a red light the clock pauses (it does
+/// not restart); moving restarts it and takes the request back.
 #[test]
 fn a_random_car_gives_up_only_held_by_nothing_for_minutes_and_comes_back_when_it_moves() {
     let give_up = omsi_traffic::sim::GIVE_UP_UNSEEN;
     assert!(give_up >= 300.0);
     // at a red light or for people: never, however long
     let mut v = standing(VehicleClass::Car);
-    for why in [Why::Light, Why::People] {
-        assert!(!stand(&mut v, why, give_up + 60.0), "gave up held by {why:?}");
-    }
+    assert!(!stand(&mut v, Why::Light, give_up + 60.0), "gave up at a red light");
     assert_eq!(v.waiting, 0.0);
     // a jam, a yield: they count, and a red in between only pauses the clock
     assert!(!stand(&mut v, Why::Lead, give_up * 0.5));
     assert!(!stand(&mut v, Why::Light, 200.0));
-    assert!(!stand(&mut v, Why::Junction, give_up * 0.5 - 1.0));
+    assert!(!stand(&mut v, Why::People, give_up * 0.5 - 1.0));
     assert!(stand(&mut v, Why::None, 2.0), "waited the give-up time");
     // a creep is no progress; moving off takes the request back
     v.state.speed = 0.05;

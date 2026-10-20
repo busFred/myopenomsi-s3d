@@ -245,9 +245,9 @@ pub struct Vehicle {
     /// again (`Vehicle::give_up_clock`); a timetable bus's is the app's.
     pub gone: bool,
     /// [round 7 B1] Its waiting time, as SUMO counts it for `--time-to-teleport` (s): it runs
-    /// while the vehicle stands (`UNHELD_SPEED`) held by a yield or a merge, a jam (a lead, an
-    /// exit full), a body, a mutual refusal or nothing; it pauses at a red light, for people
-    /// and at its own stop; it restarts only when the vehicle moves (`give_up_clock`).
+    /// while the vehicle stands (`UNHELD_SPEED`) whatever holds it but a red light and its own
+    /// stop, which pause it; it restarts only when the vehicle moves (`give_up_clock`). The
+    /// app's removals read this clock.
     #[serde(default, alias = "held_by_nothing")]
     pub waiting: f32,
     /// Just put on the road: its speed is trimmed to what is ahead.
@@ -495,19 +495,16 @@ impl Vehicle {
     }
 
     /// [round 7 B1] The give-up clock, after this frame's decision (`last`), SUMO's waiting
-    /// time: standing (not faster than `UNHELD_SPEED`), it runs held by a yield or a merge
-    /// (`Why::Junction`, `Merge`), a jam (`Lead`, `ExitFull`), a body or a refusal
-    /// (`body_block`, `wait_for`: a mutual refusal too) or nothing; it pauses at a red light,
-    /// for people, a pull-out, the route's end and at its own stop; moving, it restarts. A
-    /// random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up (`gone`) - a gridlock or a
-    /// mutual refusal too, a 200 s red not - and is back in the traffic once it moves.
+    /// time: standing (not faster than `UNHELD_SPEED`) it runs, whatever holds the vehicle -
+    /// a yield, a jam, a body, people, a lead standing for good, a mutual refusal, nothing
+    /// (SUMO's "blocked") - but a red light and its own stop, which pause it; moving, it
+    /// restarts. A random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up (`gone`) - a
+    /// gridlock or a mutual refusal too, a 200 s red not - and is back in the traffic once it
+    /// moves. The app reads this clock (`Vehicle::waiting`) for its removals, no other.
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
         let moving = self.state.speed > UNHELD_SPEED;
-        let counts = match d.why {
-            Why::None | Why::Lead | Why::Junction | Why::ExitFull | Why::Merge => true,
-            _ => d.body_block.is_some() || d.wait_for.is_some(),
-        } && !self.external.at_stop;
+        let counts = d.why != Why::Light && !self.external.at_stop;
         if moving {
             self.waiting = 0.0;
         } else if counts {
