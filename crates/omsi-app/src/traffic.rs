@@ -2655,6 +2655,10 @@ impl Traffic {
             state.min_gap = state.min_gap.max(2.2);
         }
         let (front, rear, half_width) = extents(&ty, if bus.is_some() { 12.0 } else { 4.5 });
+        // [round 7 fix pass 1, 12] the whole consist (SUMO's vehicle length): the last coupled
+        // section's rear, not the front section's - followers stopped inside a BJ6180
+        // articulated bus's rear section
+        let rear = self.consist_rear(&ty).max(rear);
         state.front = front;
         state.rear = rear;
         state.length = front + rear;
@@ -4039,6 +4043,33 @@ impl Traffic {
         self.blocked_except(ty, pos, heading, None)
     }
 
+    /// [round 7 fix pass 1, 12] How far behind its origin (m) the consist of `ty` (its rear
+    /// sections, trailers, the cars of a unit) reaches standing straight: each car placed as
+    /// `blocked_except` places it, the farthest corner back.
+    fn consist_rear(&mut self, ty: &Arc<VehicleType>) -> f32 {
+        let (pos, heading) = (DVec3::ZERO, 0.0f64);
+        let mut back_most = 0.0f64;
+        let (mut origin, mut lead, mut lead_rev) = (pos, ty.clone(), false);
+        for (t, rev) in self.trailer_chain(ty) {
+            let (back, front) = omsi_sim::vehicle::coupling_points(&lead, lead_rev, &t, rev);
+            let (center, car_heading) = omsi_sim::vehicle::coupling_placement(
+                origin,
+                heading,
+                omsi_sim::vehicle::body_reversed(&lead.def, lead_rev),
+                back.y,
+                omsi_sim::vehicle::body_reversed(&t.def, rev),
+                front.y,
+            );
+            let b = omsi_sim::collision::Obb::from_box(t.def.bounding_box.unwrap_or(DEFAULT_BOX), center, car_heading);
+            // (heading 0: forward is +y)
+            back_most = b.corners().iter().map(|c| -c.y).fold(back_most, f64::max);
+            origin = center;
+            lead = t;
+            lead_rev = rev;
+        }
+        back_most as f32
+    }
+
     /// `blocked`, leaving out car `except` (a vehicle asking whether it could be put back
     /// where it stands).
     pub fn blocked_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
@@ -4931,6 +4962,7 @@ impl Traffic {
         vehicle.position = pos;
         vehicle.heading = heading;
         let (front, rear, half_width) = extents(&ty, 4.5);
+        let rear = self.consist_rear(&ty).max(rear);
         let mut state = AiState::new(0, 0.0, id);
         state.front = front;
         state.rear = rear;
