@@ -5255,8 +5255,8 @@ fn stubs(args: &[String]) -> Res<()> {
 /// [round 7 A2] The lane joins of a fixture's network: two street lanes running into one
 /// lane, by whether the compiled junctions know a meeting place between them (a foe of one
 /// movement for the other, by kind; `Junctions::foe_between`). Pieces of one way (one lane
-/// leads into the other, `Network::one_way_pieces`) have none by design and are counted
-/// apart; `uncovered` must be 0 (A2-full: every join of two ways is compiled). `--list`
+/// leads into the other, `Network::one_way_pieces`, or both leave one lane, `same_root`)
+/// have none by design and are counted apart; `uncovered` must be 0 (A2-full: every join of two ways is compiled). `--list`
 /// prints the pairs with none, `--why` with why.
 fn joins(args: &[String]) -> Res<()> {
     let list = args.iter().any(|a| a == "--list");
@@ -5282,7 +5282,7 @@ fn joins(args: &[String]) -> Res<()> {
                     match foe(a, b) {
                         Some(omsi_traffic::FoeKind::Merge) => merge += 1,
                         Some(_) => other += 1,
-                        None if net.one_way_pieces(a, b) => pieces += 1,
+                        None if net.one_way_pieces(a, b) || net.same_root(a, b) => pieces += 1,
                         None => {
                             let inside = js.of_lane.contains_key(&a) || js.of_lane.contains_key(&b);
                             let cat = match (js.of_lane.get(&a), js.of_lane.get(&b)) {

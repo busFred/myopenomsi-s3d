@@ -1320,7 +1320,7 @@ impl Network {
             let prev: Vec<usize> = self.prev[to].iter().copied().filter(|&p| p < len && p != to && street(&self.lanes[p])).collect();
             for (x, &i) in prev.iter().enumerate() {
                 for &j in &prev[x + 1..] {
-                    if self.crossings[i].iter().any(|c| c.other == j) || self.one_way_pieces(i, j) {
+                    if self.crossings[i].iter().any(|c| c.other == j) || self.one_way_pieces(i, j) || self.same_root(i, j) {
                         continue;
                     }
                     let (a, b) = (&self.lanes[i], &self.lanes[j]);
@@ -1340,11 +1340,31 @@ impl Network {
         // the lanes up to two links back from each side of a join, converging closer than a
         // car is wide, get the side-merge meeting place of `add_converging`
         for (i, j) in self.join_approaches() {
-            if self.add_converging(i, j) {
+            if !self.same_root(i, j) && self.add_converging(i, j) {
                 n += 1;
             }
         }
         n
+    }
+
+    /// [fix pass 2, 1a] Lanes `i` and `j` leave one lane together, directly or within two
+    /// links (a lane forking into twin pieces that rejoin, viz3 case03: 1106/1110 leave 1100
+    /// and rejoin into 1477/1481): pieces of ONE way, as SUMO makes the connections of one lane
+    /// that re-merge one internal edge - no meeting place between them, the queue order
+    /// decides (a merge band there stopped a refused car at its entry line 55 m from the car
+    /// it waited for, `plan::roll_up_point` taking own-fork side merges only).
+    pub fn same_root(&self, i: usize, j: usize) -> bool {
+        let back = |from: usize| -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut at = vec![from];
+            for _ in 0..2 {
+                at = at.iter().flat_map(|&l| self.prev.get(l).cloned().unwrap_or_default()).filter(|l| !out.contains(l)).collect();
+                out.extend(at.iter().copied());
+            }
+            out
+        };
+        let (bi, bj) = (back(i), back(j));
+        bi.iter().any(|r| bj.contains(r))
     }
 
     /// [round 7 A2-full fix] The pairs of street lanes that may converge before a lane join
