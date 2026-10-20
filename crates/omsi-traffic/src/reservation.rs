@@ -595,6 +595,13 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
         // (the zipper order decided per foe: [round6 J3])
         let mut zip_order: hashbrown::HashMap<usize, (bool, Option<((usize, usize, usize), usize)>)> = hashbrown::HashMap::new();
         for (my_piece, foe) in &my_foes {
+            // [fix pass 3, 6] a foe movement that is a piece of my own way through is ahead
+            // of me on my own chain (a lane and its successor): whoever is on it is my lead,
+            // never my junction foe (viz5 case08: #46191 on 10329 waited for #45700 standing
+            // 34 m ahead on 10074, its own successor)
+            if c.chain.iter().any(|&(m, _)| m == foe.movement) {
+                continue;
+            }
             let my_piece = *my_piece;
             // a meeting place I am in already: I am in the way of those coming, not they in
             // mine (a car standing in the box short of a later stretch it waits for is
