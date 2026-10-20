@@ -1349,9 +1349,9 @@ impl Network {
 
     /// [fix pass 2, 2] The swept-path meeting places of the crossing objects: a piece of an
     /// object and every lane of the object or leading into it whose last body length
-    /// (`SWEPT_BODY`) before its end lies in the piece's swept path - the two lanes' half
+    /// (`SWEPT_BUS_LENGTH`) before its end lies in the piece's swept path - the two lanes' half
     /// widths (their vehicles' room) and the off-tracking of a long vehicle in the piece's
-    /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R) - when nothing else is compiled
+    /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R, R no less than `SWEPT_MIN_RADIUS`) - when nothing else is compiled
     /// between the two: a meeting place over the two stretches, so a vehicle standing there
     /// counts as inside it and a refused vehicle stops before it. SUMO: any conflict between
     /// connection shapes is a foe (sumo.md 1.3); OMSI: a stop line can sit inside a tight
@@ -1393,10 +1393,13 @@ impl Network {
                     let bend = p.curvature.iter().fold(0.0f32, |m, c| m.max(c.abs()));
                     // (the two lanes' half widths - two lanes of a road side by side are no meeting
                     // place, round 4b x1 - and the piece's off-tracking)
-                    let reach = 0.5 * (p.width + b.width) + (SWEPT_WHEELBASE * SWEPT_WHEELBASE * 0.5 * bend).min(SWEPT_OFF_MAX);
+                    let radius = if bend > 0.0 { (1.0 / bend).max(SWEPT_MIN_RADIUS) } else { f32::INFINITY };
+                    let reach = 0.5 * (p.width + b.width) + SWEPT_WHEELBASE * SWEPT_WHEELBASE / (2.0 * radius);
                     let lb = b.length();
                     let (mut b0, mut b1, mut p0, mut p1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
-                    let mut sb = (lb - SWEPT_BODY).max(0.0);
+                    // (the last body length: where a vehicle stands at the lane's end, the bus and
+                    // the metre a car comes to rest short of its stop, `plan`'s `REST_SHORT`)
+                    let mut sb = (lb - SWEPT_BUS_LENGTH - 1.0).max(0.0);
                     loop {
                         let at = sb.min(lb);
                         if let Some((sp, d)) = p.nearest_point(b.at(at).0) {
@@ -1415,10 +1418,11 @@ impl Network {
                     if !b0.is_finite() {
                         continue;
                     }
-                    // (the way on from `b` meets the piece there already - the lead-in of a way
-                    // that crosses the turn a few metres on: its claim's chain carries that
-                    // meeting place, round 4 rule E)
-                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.other_at + c.other_after >= p0 - SWEPT_BODY * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BODY * 0.5)));
+                    // (the way on from `b` meets the piece there already - within half a bus of
+                    // the swept stretch, where a bus standing at `b`'s end reaches: the lead-in
+                    // of a way that crosses the turn a few metres on, its claim's chain carries
+                    // that meeting place, round 4 rule E)
+                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.other_at + c.other_after >= p0 - SWEPT_BUS_LENGTH * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BUS_LENGTH * 0.5)));
                     if covered {
                         continue;
                     }
@@ -3055,14 +3059,16 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     Ok(())
 }
 
-/// [fix pass 2, 2] The swept path (`Network::compile_swept`): the last this many metres of a
-/// lane are where a vehicle stands at its end (a 12 m bus and a metre) ...
-pub const SWEPT_BODY: f32 = 13.0;
-/// ... a long vehicle's wheelbase (m) for its off-tracking in a bend, wheelbase^2 / 2R (a
-/// 12 m bus's 6 m) ...
-pub const SWEPT_WHEELBASE: f32 = 6.0;
-/// ... and at most this much off-tracking (m): a bus in a 9 m radius turn.
-pub const SWEPT_OFF_MAX: f32 = 2.0;
+/// [fix pass 2, 2; pass 3, 9] The swept path (`Network::compile_swept`), from the stock
+/// timetable bus (`Vehicles/NEOMAN_Overhaul_V3/_12a_MAN_A21_2D.bus`): its length, the
+/// `[boundingbox]`'s 11.8 m ...
+pub const SWEPT_BUS_LENGTH: f32 = 11.8;
+/// ... its wheelbase, the two `[newachse]` `achse_long` 3.149 and -2.665 m apart, for the
+/// off-tracking wheelbase^2 / 2R in a bend of radius R (the piece's own curvature) ...
+pub const SWEPT_WHEELBASE: f32 = 3.149 + 2.665;
+/// ... and the tightest turn it makes, the 12.5 m outer turning circle every bus must manage
+/// (Directive 97/27/EC, annex I 7.6), which caps the off-tracking.
+pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 
 /// [round 7 A1] Ways on chosen by a tier below "open to me and leading on"
 /// (`AiState::choose_after`), per tier: [open but every way on from it closed, closed by my
