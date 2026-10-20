@@ -3147,7 +3147,8 @@ impl AiState {
     }
 
     /// A way planned on a network linked without the lit stubs (a recorded vehicle's
-    /// route and plan) takes the lit stubs it went round: where one lane of it is no longer
+    /// route, its plan, and the way on of a lane change under way, `change_plan`) takes the
+    /// lit stubs it went round: where one lane of it is no longer
     /// linked to the next and a lit stub between them is, the stub goes in. Returns whether
     /// anything changed.
     pub fn route_through_stubs(&mut self, net: &Network) -> bool {
@@ -3184,6 +3185,16 @@ impl AiState {
             changed = true;
             self.planned_next = plan.get(1).copied();
             self.ahead = plan.into_iter().skip(2).collect();
+        }
+        // [round 7 E3 fix] a lane change under way: the way on from the lane it moves to
+        // (`change_plan`, chosen when the change began) takes the stubs too (viz case13 #45279
+        // crossed lit stub 9114's red mid-change)
+        if let Some(c) = self.change {
+            let mut plan: Vec<usize> = std::iter::once(c.to).chain(self.change_plan.iter().copied()).collect();
+            if through(&mut plan, None) {
+                changed = true;
+                self.change_plan = plan.into_iter().skip(1).collect();
+            }
         }
         changed
     }
