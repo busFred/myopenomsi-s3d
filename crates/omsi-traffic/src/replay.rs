@@ -4,10 +4,10 @@
 //! did; at every further keyframe it measures how far it drifted and goes on from the
 //! recorded positions, so that one difference does not snowball.
 //!
-//! The replay runs with the current rules. The header's `switches` names the rules the
-//! game ran with, for information only; a recording made under other rules (format 1, or
-//! a list without all of [`crate::record::RULES`]: rule changes once behind switches, off)
-//! loads with a warning, as it will not reproduce bit-exactly.
+//! The replay runs with the current rules. The header names the rules the game ran with by
+//! their hash (`Header::rules`, format 4); a recording made under other rules - another
+//! hash, or a format before 4, which names none - loads with a warning, as it will not
+//! reproduce bit-exactly.
 //!
 //! ```no_run
 //! let mut r = omsi_traffic::replay::Replay::load(std::path::Path::new("jam.rec")).unwrap();
@@ -19,7 +19,7 @@
 //! ```
 
 use crate::junction::Junctions;
-use crate::record::{read_lines, write_file, Frame, Header, Record, RULES};
+use crate::record::{read_lines, rules_hash, write_file, Frame, Header, Record};
 use crate::sim::{External, Simulation, Vehicle};
 use hashbrown::HashMap;
 use omsi_sim::traffic::Network;
@@ -109,7 +109,10 @@ impl Replay {
             log::warn!("replay: {} lines of {} could not be read (the first: line {}: {})", skipped.len(), path.display(), skipped[0].0, skipped[0].1);
         }
         if let Some(why) = other_rules(&header) {
-            log::warn!("replay: {} was made under other rules ({why}): the replay runs with the current ones ({RULES}) and will not reproduce it bit-exactly", path.display());
+            log::warn!("replay: {} was made under other rules ({why}): the replay runs with the current ones ({}) and will not reproduce it bit-exactly", path.display(), rules_hash());
+        }
+        if header.version < 4 {
+            log::warn!("replay: {} is of format {}: fields added since (`record::VERSION`) read as their defaults where it lacks them", path.display(), header.version);
         }
         Ok(Replay::new(header, records, skipped, truncated))
     }
@@ -500,23 +503,17 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle) {
     st.route_index = st.route.iter().position(|&l| l == st.lane).unwrap_or(r.route_index);
 }
 
-/// Why the recording was made under other rules than the current ones ([`RULES`]), if it
-/// was: format 1 (before the rule switches, all off), or a switch list that lacks one of
-/// them. Such a recording does not replay bit-exactly.
+/// Why the recording was made under other rules than the current ones ([`rules_hash`]), if
+/// it was: another hash, or a format before 4, which names its rules only by the frozen
+/// switch list (`record::RULES`, unchanged since round 4 while the rules changed). Such a
+/// recording does not replay bit-exactly.
 pub fn other_rules(h: &Header) -> Option<String> {
-    match h.switches.as_deref() {
-        _ if h.version < 2 => Some(format!("format {}, before the rule switches", h.version)),
+    let now = rules_hash();
+    match h.rules.as_deref() {
+        _ if h.version < 4 => Some(format!("format {}, before the rules were named by their hash", h.version)),
         None => Some("no rules recorded".into()),
-        Some(list) => {
-            let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
-            let all = names.contains(&"all");
-            let lacking: Vec<&str> = RULES.split(',').filter(|r| !all && !names.contains(r)).collect();
-            if lacking.is_empty() {
-                None
-            } else {
-                Some(format!("recorded with \"{list}\", without {}", lacking.join(", ")))
-            }
-        }
+        Some(r) if r == now => None,
+        Some(r) => Some(format!("rules {r}, now {now}")),
     }
 }
 
