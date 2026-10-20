@@ -2567,7 +2567,7 @@ fn yields_to_people(why: omsi_traffic::Why) -> bool {
     matches!(why, omsi_traffic::Why::People | omsi_traffic::Why::Zebra)
 }
 /// [ROLLBACK r5-P6] Seconds of a vehicle's standing on the crossing after which the kerb no
-/// longer waits for it (people step round it, as P5 has them): a car abandoned on a zebra
+/// longer waits for it (people step round it): a car abandoned on a zebra
 /// (X10 case15, a 90 s queue) does not hold the kerb for good.
 const PED_OCCUPIED_CAP: f32 = 20.0;
 
@@ -2633,6 +2633,18 @@ const LANE_MIN_WIDTH: f64 = 2.5;
 /// [ROLLBACK r4c-P3] Whether `q` lies inside the footprint of a carriageway lane: within half
 /// its width and `KERB_CLEAR` of its axis.
 fn on_carriageway(net: &Network, q: DVec3) -> bool {
+    within_lanes(net, q, &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + KERB_CLEAR)
+}
+
+/// Whether `q` lies too close to a carriageway lane for somebody to wait there: within
+/// `waiter_reach` of its axis, the reach of the bus waiters ([round 6 B3]): a crossing's kerb
+/// spot at 1.55 m held a 2.6 m coach, which lets people go only beyond 1.58 m.
+fn in_waiter_reach(net: &Network, q: DVec3) -> bool {
+    within_lanes(net, q, &waiter_reach)
+}
+
+/// Whether `q` lies within `reach(lane)` of the axis of a street lane near it.
+fn within_lanes(net: &Network, q: DVec3, reach: &dyn Fn(&omsi_sim::traffic::Lane) -> f64) -> bool {
     let (cx, cy) = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
     let mut seen: Vec<usize> = Vec::new();
     for dx in -1..=1 {
@@ -2643,8 +2655,7 @@ fn on_carriageway(net: &Network, q: DVec3) -> bool {
                     continue;
                 }
                 seen.push(i);
-                let reach = (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + KERB_CLEAR;
-                if l.nearest_point(q).map(|(_, d)| d < reach).unwrap_or(false) {
+                if l.nearest_point(q).map(|(_, d)| d < reach(l)).unwrap_or(false) {
                     return true;
                 }
             }
@@ -2751,9 +2762,9 @@ fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> Vec<usize> {
 
 /// [ROLLBACK r4c-P3] Where somebody waits before stepping onto `next` at the end of `way` (the
 /// legs walked up to the kerb, the last first): a step back from the kerb and spread along
-/// it, outside every carriageway lane's footprint. A kerb inside one (a short piece at the
-/// kerb that lies in the lane: people waited 0.4 m in front of a bumper) is backed away from
-/// along the legs walked until the spot is outside.
+/// it, outside every street lane's waiter reach (`in_waiter_reach`). A kerb inside one (a
+/// short piece at the kerb that lies in the lane: people waited 0.4 m in front of a bumper)
+/// is backed away from along the legs walked until the spot is outside.
 fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, spread: f64, back: f64) -> DVec2 {
     let (start, _) = next.at(net, 0.0);
     let (_, h) = next.at(net, 0.3);
@@ -2761,14 +2772,14 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
     let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
     let end = way.first().map(|l| l.at(net, l.len()).0).unwrap_or(start);
     let first = end + (right * spread - fwd * back).extend(0.0);
-    if !on_carriageway(net, first) {
+    if !in_waiter_reach(net, first) {
         return first.truncate();
     }
     // [ROLLBACK r5-P7] the other side of the way first - the pavement's, where the spread
     // put them into a junction piece (2-5 people at "red light" 2-4 m inside the west arm
     // of X10 j392 lost a car its green, case07; case01b's j3 kerbs)
     let mirrored = end + (-right * spread - fwd * back).extend(0.0);
-    if !on_carriageway(net, mirrored) {
+    if !in_waiter_reach(net, mirrored) {
         return mirrored.truncate();
     }
     let mut last = end;
@@ -2782,7 +2793,7 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
             // tested: a lane beside the way takes every spot on its side)
             for off in [spread * 0.5, 0.0, -spread * 0.5, -spread, -KERB_SPREAD_MAX, KERB_SPREAD_MAX] {
                 let c = q + (right * off).extend(0.0);
-                if !on_carriageway(net, c) {
+                if !in_waiter_reach(net, c) {
                     return c.truncate();
                 }
             }
@@ -2795,7 +2806,7 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
 }
 
 /// [ROLLBACK r4c-L3] The point of a footpath within `reach` of `at` (and at its height) nearest to
-/// it outside every carriageway lane's footprint.
+/// it outside every street lane's waiter reach (`in_waiter_reach`).
 fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -> Option<DVec2> {
     let (cx, cy) = ((at.x / 50.0).floor() as i32, (at.y / 50.0).floor() as i32);
     let mut best: Option<(f64, DVec2)> = None;
@@ -2813,7 +2824,7 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
                 while s <= len {
                     let (q, _) = l.at(s);
                     let d = (q - at).truncate().length();
-                    if d <= reach && (q.z - at.z).abs() < 2.0 && best.map(|b| d < b.0).unwrap_or(true) && !on_carriageway(net, q) {
+                    if d <= reach && (q.z - at.z).abs() < 2.0 && best.map(|b| d < b.0).unwrap_or(true) && !in_waiter_reach(net, q) {
                         best = Some((d, q.truncate()));
                     }
                     s += 0.5;
@@ -2849,6 +2860,12 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // crossing at 0.5-0.7 m/s at a lit green passed, X10 #485, 25 step-ons)
     let start = next.at(net, 0.0).0.truncate();
     let near_cuts: Vec<DVec2> = cuts.iter().copied().filter(|x| (*x - start).length() <= PED_OCCUPIED_REACH).collect();
+    // ([ROLLBACK r4c-P5] or its box over the first 1.5 m of the way off the kerb, where no cut
+    // lies: a bus on the kerb stub; P5 held for 5 s of the person's own waiting, then they
+    // stepped round it - one rule now, review r7)
+    let (from, _) = next.at(net, 0.0);
+    let (ahead, _) = next.at(net, 1.5);
+    let way = (ahead - from).truncate().normalize_or_zero();
     let occupied = || {
         at.cars
             .iter()
@@ -2857,7 +2874,10 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             // the cap and 56 people stepped on at a lit green, X10 0837 car 485)
             .any(|car| {
                 let speed = car.vel.length();
-                speed < PED_CREEP_SPEED && !car.yielding && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5) && near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR))
+                speed < PED_CREEP_SPEED
+                    && !car.yielding
+                    && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5)
+                    && (near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)) || covers_path(&car.body, from.truncate(), way, 1.5))
             })
     };
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
@@ -2943,17 +2963,14 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     if occupied() {
         return Err(STANDS_ON);
     }
-    // [ROLLBACK r4c-P5] a vehicle whose box covers the first 1.5 m of the way across: one that
-    // stands there holds them for a few seconds only, then they step round it (a car held in
-    // a queue on the zebra and the people waiting for it to move stood for each other for
-    // good); one beside the way, or the player's bus with its nose short of it, does not hold
-    // (nine walkers were held 5 s each 1-1.5 m from the nose of a standing bus)
-    let (from, _) = next.at(net, 0.0);
-    let (ahead, _) = next.at(net, 1.5);
-    let way = (ahead - from).truncate().normalize_or_zero();
+    // [ROLLBACK r4c-P5] a vehicle moving across the first 1.5 m of the way holds them; one
+    // standing there is `occupied`'s (above: up to PED_OCCUPIED_CAP of its standing, then
+    // they step round it); one beside the way, or the player's bus with its nose short of
+    // it, does not hold (nine walkers were held 5 s each 1-1.5 m from the nose of a
+    // standing bus)
     for car in at.cars {
         let speed = car.vel.length();
-        if (speed >= 0.5 || held < 5.0) && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
+        if speed >= 0.5 && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
             return Err(STANDS_ON);
         }
     }
@@ -9913,10 +9930,15 @@ mod ped_tests {
         let bus = Block { center: DVec2::new(-7.25, -4.6), half: DVec2::new(1.25, 6.0), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
         let player = SeenCar { id: PLAYER_CAR, pos: bus.center, vel: DVec2::ZERO, half_len: 6.0, body: bus, yielding: false, stood: 30.0 };
         assert_eq!(kerb_with(player), Some("go"));
-        // with its nose over the way it holds them (a few seconds)
+        // with its nose over the way it holds them while it has stood under PED_OCCUPIED_CAP
+        // (the r5-P6 rule); one standing longer is stepped round at once (P5's own 5 s hold
+        // went, review r7)
         let mut over = player;
         over.body.center.x = -5.0;
+        over.stood = PED_OCCUPIED_CAP - 10.0;
         assert_eq!(kerb_with(over), Some("a vehicle stands on the crossing"));
+        over.stood = PED_OCCUPIED_CAP + 10.0;
+        assert_eq!(kerb_with(over), Some("go"));
     }
 
     /// A walker going north along a pavement (axis x = 0, 2.1 m wide) past a bus standing
