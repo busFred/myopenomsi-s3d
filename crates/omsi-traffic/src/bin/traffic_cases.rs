@@ -3251,8 +3251,9 @@ struct HeadSample {
     wait_rel: Option<&'static str>,
     wait_dist: f64,
     wait_red: bool,
-    /// [fix pass 3, 7] `wait_red`, and the waited vehicle's red line lies before its meeting
-    /// place with me (its claim's `red_at`): it is not coming, the wait is for nothing.
+    /// [fix pass 3, 7] `wait_red`, and the waited vehicle's red line - where its plan stops it
+    /// for the light (`Decision::stop`, its claim filing `light_red`) - lies before its
+    /// meeting place with me: it is not coming, the wait is for nothing.
     wait_red_before: bool,
 }
 
@@ -3750,7 +3751,9 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                                 (Some(c), Some(oc)) if oc.light_red && oc.junction == c.junction => {
                                     let foes = r.sim.junctions.foes_along_pieces(c.junction, &c.chain);
                                     let meet = oc.chain.iter().flat_map(|&(m, off)| foes.iter().filter(move |(_, f)| f.movement == m).map(move |(_, f)| off + f.theirs.0 - oc.s)).fold(f32::INFINITY, f32::min);
-                                    meet.is_finite() && oc.red_at <= meet + 0.5
+                                    // (its red line: where its plan stops it for the light)
+                                    let line = r.vehicles[k].last.stop.unwrap_or(f32::INFINITY);
+                                    meet.is_finite() && line <= meet + 0.5
                                 }
                                 _ => false,
                             }
@@ -4234,9 +4237,9 @@ struct Extra {
     /// of their lane (`Network::walks`), distinct vehicles and seconds.
     on_cut_vehicles: u64,
     on_cut_s: f64,
-    /// [fix pass 3, 7] Of `wait_far_red_s`, the head-seconds whose red-held foe's red line
-    /// lies before its meeting place with the head (a merge of two queues behind one lead is
-    /// not counted).
+    /// [fix pass 3, 7] Of `wait_far_red_s`, the head-seconds whose red-held foe (its claim
+    /// files `light_red`) stops for its light (its plan's stop) before its meeting place with
+    /// the head (a merge of two queues behind one lead is not counted).
     far_red_before_s: u64,
     events: Vec<String>,
 }
