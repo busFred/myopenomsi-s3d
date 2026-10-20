@@ -222,8 +222,15 @@ pub struct Vehicle {
     pub stopped: f32,
     /// (odometer at the last progress, seconds without any).
     pub progress: (f32, f32),
-    /// A random car that stood too long: leaves once out of sight.
+    /// A random vehicle that stood `GIVE_UP_UNSEEN` held by nothing: it asks to be taken off
+    /// the road once out of sight. The crate sets it and clears it when the vehicle moves
+    /// again (`Vehicle::give_up_clock`); a timetable bus's is the app's.
     pub gone: bool,
+    /// [round 7 B1] Seconds at a stretch it has stood held by nothing: no reason in its plan
+    /// (lead, light, yield, exit full, people, merge, ...), no lead close, no junction hold,
+    /// no foe or body it waits for, and not moving faster than `UNHELD_SPEED`.
+    #[serde(default)]
+    pub held_by_nothing: f32,
     /// Just put on the road: its speed is trimmed to what is ahead.
     pub fresh: f32,
     /// Seconds before a car leaving a parking space moves.
@@ -280,6 +287,15 @@ pub struct Vehicle {
     #[serde(default)]
     pub ease_for: Option<(u64, usize, f32)>,
 }
+
+/// [round 7 B1] A random vehicle that has stood held by nothing (`Vehicle::held_by_nothing`)
+/// this long at a stretch (s) gives up (`Vehicle::gone`): five minutes, SUMO's default
+/// `--time-to-teleport` of 300 s for a vehicle that waited too long (sumo.md 5.3,
+/// https://sumo.dlr.de/docs/Simulation/Why_Vehicles_are_teleporting.html).
+pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
+/// Faster than this (m/s) a vehicle is moving: its give-up clock restarts and a vehicle that
+/// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
+pub const UNHELD_SPEED: f32 = 0.1;
 
 /// Two vehicles holding each other at a junction where they have a meeting place negotiate:
 /// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
@@ -402,6 +418,7 @@ impl Vehicle {
             stopped: 0.0,
             progress: (0.0, 0.0),
             gone: false,
+            held_by_nothing: 0.0,
             fresh: 1.5,
             pull_out: 0.0,
             passing: None,
@@ -436,6 +453,30 @@ impl Vehicle {
     /// The body on the ground.
     pub fn obb(&self) -> Obb {
         Obb::vehicle(self.pos.truncate(), self.heading as f64, self.state.front as f64, self.state.rear as f64, self.half_width as f64)
+    }
+
+    /// [round 7 B1] The give-up clock, after this frame's decision (`last`): it runs while
+    /// the vehicle stands held by nothing and restarts on any hold or on moving faster than
+    /// `UNHELD_SPEED`; a random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up
+    /// (`gone`), and is back in the traffic once it moves. (Its gridlock is not a reason: a
+    /// queue or a junction hold restarts the clock.)
+    pub fn give_up_clock(&mut self, dt: f32) {
+        let d = &self.last;
+        let held = d.why != Why::None || d.held || d.hold.is_some() || d.wait_for.is_some() || d.body_block.is_some() || self.external.at_stop;
+        let moving = self.state.speed > UNHELD_SPEED;
+        if moving || held {
+            self.held_by_nothing = 0.0;
+        } else {
+            self.held_by_nothing += dt;
+        }
+        if self.serves_stops() || self.is_rail() {
+            return;
+        }
+        if moving {
+            self.gone = false;
+        } else if self.held_by_nothing > GIVE_UP_UNSEEN {
+            self.gone = true;
+        }
     }
 
     /// Standing still, held by something.
@@ -1576,13 +1617,9 @@ impl Simulation {
                 v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
             }
         }
-        // a random car that stands for ever asks to be taken away when nobody looks
-        if !v.serves_stops() && !v.is_rail() && plan.why != Why::Light {
-            let stood = v.stopped.max(v.progress.1);
-            if (stood > 60.0 && !matches!(plan.why, Why::Junction | Why::ExitFull)) || stood > 150.0 {
-                v.gone = true;
-            }
-        }
+        // a random car that stands held by nothing for minutes asks to be taken away when
+        // nobody looks
+        v.give_up_clock(dt);
         // indicators: what the car does, debounced so a flicker of the plan does not flash
         // (a pass shows the side it moves to from before it pulls out until it is back in its
         // lane: the bent way's offset alone showed the side it would come back to, the right

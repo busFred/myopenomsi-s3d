@@ -4180,6 +4180,10 @@ struct Extra {
     /// 40 m / 60 m ahead of its front (`Grant::at`; review-r6 case11's count).
     far_refused_40_s: f64,
     far_refused_60_s: f64,
+    /// [round 7 B1] Vehicles within the radius that gave up (`Vehicle::gone` set) during the
+    /// run: what the game may take off the road in view (its removal rules run in the app,
+    /// not here). One already given up at the first keyframe is not counted.
+    removed_in_view: u64,
     events: Vec<String>,
 }
 
@@ -4339,6 +4343,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
+    // (those given up: one already at the start is not counted)
+    let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4402,6 +4408,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             }
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
+            for v in &r.vehicles {
+                if !v.gone {
+                    gone_ids.remove(&v.id);
+                } else if gone_ids.insert(v.id) && near(v.pos) {
+                    ex.removed_in_view += 1;
+                    ex.events.push(format!("GONE {} t={now:.1} #{} {:?} lane {} s {:.1} v {:.2} stood {:.0} why={}", sc.name, v.id, v.class, v.state.lane, v.state.s, v.state.speed, v.stopped, why_name(v.last.why)));
+                }
+            }
             for v in &r.vehicles {
                 let st = &v.state;
                 match st.change {
@@ -4744,6 +4758,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("eases", e.eases.to_string()),
         ("ease_stand/pinned", format!("{:.0}/{:.0}", e.ease_stand_s, e.ease_pinned_s)),
         ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
+        ("removed_in_view", e.removed_in_view.to_string()),
     ]
 }
 
@@ -4768,6 +4783,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.pass_wrong_side_s += e.pass_wrong_side_s;
     t.pass_stranded_s += e.pass_stranded_s;
     t.eases += e.eases;
+    t.removed_in_view += e.removed_in_view;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
