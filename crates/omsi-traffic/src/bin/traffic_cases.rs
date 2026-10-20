@@ -3251,6 +3251,9 @@ struct HeadSample {
     wait_rel: Option<&'static str>,
     wait_dist: f64,
     wait_red: bool,
+    /// [fix pass 3, 7] `wait_red`, and the waited vehicle's red line lies before its meeting
+    /// place with me (its claim's `red_at`): it is not coming, the wait is for nothing.
+    wait_red_before: bool,
 }
 
 type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
@@ -3727,6 +3730,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     let mut wait_rel: Option<&'static str> = None;
     let mut wait_dist = 0.0f64;
     let mut wait_red = false;
+    let mut wait_red_before = false;
     let mut wait_body: Option<Body> = None;
     if let Some(w) = d.wait_for {
         match find_id(w) {
@@ -3737,6 +3741,22 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 let dist = (body_obb(r, o).center - v.pos.truncate()).length();
                 wait_dist = dist;
                 wait_red = matches!(o, Body::V(k) if r.vehicles[k].state.speed < 0.3 && r.vehicles[k].last.why == Why::Light);
+                wait_red_before = wait_red
+                    && match o {
+                        Body::V(k) => {
+                            let mine = r.sim.claims.iter().find(|(c, _)| c.vehicle == i).map(|x| &x.0);
+                            let theirs = r.sim.claims.iter().find(|(c, _)| c.vehicle == k).map(|x| &x.0);
+                            match (mine, theirs) {
+                                (Some(c), Some(oc)) if oc.light_red && oc.junction == c.junction => {
+                                    let foes = r.sim.junctions.foes_along_pieces(c.junction, &c.chain);
+                                    let meet = oc.chain.iter().flat_map(|&(m, off)| foes.iter().filter(move |(_, f)| f.movement == m).map(move |(_, f)| off + f.theirs.0 - oc.s)).fold(f32::INFINITY, f32::min);
+                                    meet.is_finite() && oc.red_at <= meet + 0.5
+                                }
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
                 let extra = match o {
                     Body::V(k) => {
                         let ov = &r.vehicles[k];
@@ -4082,7 +4102,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
         what
     };
     let red = if verdict == "red light" { light_red } else { None };
-    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing, wait_rel, wait_dist, wait_red }
+    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing, wait_rel, wait_dist, wait_red, wait_red_before }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4214,6 +4234,10 @@ struct Extra {
     /// of their lane (`Network::walks`), distinct vehicles and seconds.
     on_cut_vehicles: u64,
     on_cut_s: f64,
+    /// [fix pass 3, 7] Of `wait_far_red_s`, the head-seconds whose red-held foe's red line
+    /// lies before its meeting place with the head (a merge of two queues behind one lead is
+    /// not counted).
+    far_red_before_s: u64,
     events: Vec<String>,
 }
 
@@ -4269,6 +4293,7 @@ struct HeadTally {
     behind: bool,
     beside_red: bool,
     far_red: bool,
+    far_red_before: bool,
     person: bool,
 }
 
@@ -4281,6 +4306,7 @@ impl HeadTally {
             behind: h.wait_rel == Some("BEHIND"),
             beside_red: h.wait_rel == Some("BESIDE") && h.wait_red,
             far_red: h.wait_dist > 30.0 && h.wait_red,
+            far_red_before: h.wait_dist > 30.0 && h.wait_red_before,
             person: v.starts_with("person in front"),
         }
     }
@@ -4392,6 +4418,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             sc.wait_behind_s += h.behind as u8 as f64;
             sc.wait_beside_red_s += h.beside_red as u8 as f64;
             sc.wait_far_red_s += h.far_red as u8 as f64;
+            sc.extra.far_red_before_s += h.far_red_before as u64;
             sc.people_wait_s += h.person as u8 as f64;
         }
     };
@@ -4843,6 +4870,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
         ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
         ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
+        ("far_red_before", e.far_red_before_s.to_string()),
     ]
 }
 
@@ -4874,6 +4902,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.wait120 += e.wait120;
     t.on_cut_vehicles += e.on_cut_vehicles;
     t.on_cut_s += e.on_cut_s;
+    t.far_red_before_s += e.far_red_before_s;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
