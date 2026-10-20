@@ -379,6 +379,15 @@ impl Replay {
                     None => log::warn!("replay: vehicle {id} is in the game's order at {:.1} s but not here", f.time),
                 }
             }
+            // (a free run keeps the vehicles the game no longer lists: the game took them
+            // off under its rules at its time - a car deleted the frame its light turned
+            // green, standing 100 s - and this reorder silently dropped them, so every
+            // page showed the game's deletions on both sides whatever the rules did)
+            if self.free_run && !by_id.is_empty() {
+                let mut rest: Vec<Vehicle> = by_id.into_values().collect();
+                rest.sort_by_key(|v| v.id);
+                self.vehicles.extend(rest);
+            }
         }
         let ext: HashMap<u64, External> = f.externals.iter().copied().collect();
         let steer: HashMap<u64, crate::record::Steer> = f.steer.iter().copied().collect();
