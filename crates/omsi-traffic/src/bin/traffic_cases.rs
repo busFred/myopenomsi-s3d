@@ -96,6 +96,7 @@ fn main() {
         Some("ab") if args.len() >= 3 => ab(&args[2..]),
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
+        Some("joins") if args.len() >= 3 => joins(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -168,6 +169,21 @@ fn r2(x: f64) -> f64 {
     }
 }
 
+/// Seconds until light `i` of `ctl` next shows another state, if the clock keeps running
+/// (None within a whole cycle).
+fn time_to_change(ctl: &TrafficLightController, i: usize) -> Option<f32> {
+    let now = ctl.state(i);
+    let cycle = ctl.cycle_len();
+    let mut t = 0.25;
+    while t <= cycle {
+        if ctl.state_at(i, ctl.time + t) != now {
+            return Some(t as f32);
+        }
+        t += 0.25;
+    }
+    None
+}
+
 fn why_name(w: Why) -> &'static str {
     match w {
         Why::None => "none",
@@ -190,10 +206,10 @@ fn fmt_id(id: u64) -> String {
     }
 }
 
-/// A claimant named by its claim index (`Claim::vehicle`; a player's is `usize::MAX - k`).
+/// A claimant named by its claim index (`Claim::vehicle`; a player's `sim::player_claim`).
 fn fmt_claimant(r: &Replay, w: usize) -> String {
-    if w >= usize::MAX - 64 {
-        r.sim.players.get(usize::MAX - w).map(|p| format!("PLAYER{}", p.id)).unwrap_or("PLAYER?".into())
+    if let Some(id) = omsi_traffic::sim::claim_player(w) {
+        format!("PLAYER{id}")
     } else {
         r.vehicles.get(w).map(|o| format!("#{}", o.id)).unwrap_or("?".into())
     }
@@ -3235,6 +3251,10 @@ struct HeadSample {
     wait_rel: Option<&'static str>,
     wait_dist: f64,
     wait_red: bool,
+    /// [fix pass 3, 7] `wait_red`, and the waited vehicle's red line - where its plan stops it
+    /// for the light (`Decision::stop`, its claim filing `light_red`) - lies before its
+    /// meeting place with me: it is not coming, the wait is for nothing.
+    wait_red_before: bool,
 }
 
 type LightSample = (f64, f64, Option<DVec3>, Vec<(Vec<i32>, bool)>);
@@ -3530,11 +3550,11 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     );
     let _ = writeln!(
         b,
-        "  FIELDS: {} | impatience {:.2} (waited {:.0} s) amber {:?} passing {} at_stop {} stop_at {:?}",
+        "  FIELDS: {} | impatience {:.2} (waited {:.0} s) light decision {:?} passing {} at_stop {} stop_at {:?}",
         fields,
         v.impatience.value,
         v.impatience.waited,
-        v.amber,
+        v.light_decision,
         v.passing.map(|p| format!("lane {:?} side {:.1} aborted {}", p.lane, p.side, p.aborted)).unwrap_or("-".into()),
         v.external.at_stop,
         v.external.stop_at
@@ -3680,7 +3700,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 "  GEOM light {c}.{li} on lane {l}, line {:.1} m ahead of the front: {} now, changes in {}, go in {}{}",
                 d0 - st.front,
                 aspect_name(s0),
-                ctl.time_to_change(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
+                time_to_change(ctl, li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
                 ctl.time_until_go(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
                 if ctl.held { " (clock HELD)" } else { "" }
             );
@@ -3711,6 +3731,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     let mut wait_rel: Option<&'static str> = None;
     let mut wait_dist = 0.0f64;
     let mut wait_red = false;
+    let mut wait_red_before = false;
     let mut wait_body: Option<Body> = None;
     if let Some(w) = d.wait_for {
         match find_id(w) {
@@ -3721,6 +3742,24 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 let dist = (body_obb(r, o).center - v.pos.truncate()).length();
                 wait_dist = dist;
                 wait_red = matches!(o, Body::V(k) if r.vehicles[k].state.speed < 0.3 && r.vehicles[k].last.why == Why::Light);
+                wait_red_before = wait_red
+                    && match o {
+                        Body::V(k) => {
+                            let mine = r.sim.claims.iter().find(|(c, _)| c.vehicle == i).map(|x| &x.0);
+                            let theirs = r.sim.claims.iter().find(|(c, _)| c.vehicle == k).map(|x| &x.0);
+                            match (mine, theirs) {
+                                (Some(c), Some(oc)) if oc.light_red && oc.junction == c.junction => {
+                                    let foes = r.sim.junctions.foes_along_pieces(c.junction, &c.chain);
+                                    let meet = oc.chain.iter().flat_map(|&(m, off)| foes.iter().filter(move |(_, f)| f.movement == m).map(move |(_, f)| off + f.theirs.0 - oc.s)).fold(f32::INFINITY, f32::min);
+                                    // (its red line: where its plan stops it for the light)
+                                    let line = r.vehicles[k].last.stop.unwrap_or(f32::INFINITY);
+                                    meet.is_finite() && line <= meet + 0.5
+                                }
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
                 let extra = match o {
                     Body::V(k) => {
                         let ov = &r.vehicles[k];
@@ -4066,7 +4105,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
         what
     };
     let red = if verdict == "red light" { light_red } else { None };
-    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing, wait_rel, wait_dist, wait_red }
+    HeadSample { t, day, dist_player: ppos.map(|p| dist2(v.pos, p.x, p.y)).unwrap_or(0.0), fields, block: b, verdict, tags, red, stopped_field: v.stopped, standing, wait_rel, wait_dist, wait_red, wait_red_before }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4180,6 +4219,28 @@ struct Extra {
     /// 40 m / 60 m ahead of its front (`Grant::at`; review-r6 case11's count).
     far_refused_40_s: f64,
     far_refused_60_s: f64,
+    /// [round 7 B1] Vehicles within the radius that gave up (`Vehicle::gone` set by the
+    /// crate) during the run: what the game may take off the road in view (its removal rules
+    /// run in the app, not here). Not counted: one that came on the road (keyframe, spawn)
+    /// given up already, and a timetable bus (its `gone` is the app's, trip over).
+    removed_in_view: u64,
+    /// [round 7 SHOULD 9] Vehicles the run's network end took off within the radius (a lane
+    /// end in view), and of them, whole map, those taken off moving over 1 m/s.
+    end_in_view: u64,
+    end_moving: u64,
+    /// [round 7 B1] Distinct vehicles within the radius whose waiting time (`Vehicle::waiting`,
+    /// the give-up clock) passed 60 s and 120 s: the windows are shorter than the 300 s
+    /// give-up, so `removed_in_view` alone moves little.
+    wait60: u64,
+    wait120: u64,
+    /// [fix pass 2, 4] Vehicles within the radius standing with their body over a crossing cut
+    /// of their lane (`Network::walks`), distinct vehicles and seconds.
+    on_cut_vehicles: u64,
+    on_cut_s: f64,
+    /// [fix pass 3, 7] Of `wait_far_red_s`, the head-seconds whose red-held foe (its claim
+    /// files `light_red`) stops for its light (its plan's stop) before its meeting place with
+    /// the head (a merge of two queues behind one lead is not counted).
+    far_red_before_s: u64,
     events: Vec<String>,
 }
 
@@ -4235,6 +4296,7 @@ struct HeadTally {
     behind: bool,
     beside_red: bool,
     far_red: bool,
+    far_red_before: bool,
     person: bool,
 }
 
@@ -4247,6 +4309,7 @@ impl HeadTally {
             behind: h.wait_rel == Some("BEHIND"),
             beside_red: h.wait_rel == Some("BESIDE") && h.wait_red,
             far_red: h.wait_dist > 30.0 && h.wait_red,
+            far_red_before: h.wait_dist > 30.0 && h.wait_red_before,
             person: v.starts_with("person in front"),
         }
     }
@@ -4302,7 +4365,7 @@ fn stop_lines(net: &Network) -> Vec<StopLine> {
 }
 
 /// Replay one fixture free-running from its first keyframe to the end and score it.
-fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<Score> {
+fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch: bool) -> Res<Score> {
     let mut r = Replay::load(fixture)?;
     r.free_run = free_run;
     if !r.at(0) {
@@ -4339,6 +4402,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
+    // (those given up, and those seen: one that comes on the road given up is not counted)
+    let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
+    let mut gone_seen: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
+    let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
+    let mut on_cut_ids: HashSet<u64> = HashSet::new();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4353,6 +4421,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             sc.wait_behind_s += h.behind as u8 as f64;
             sc.wait_beside_red_s += h.beside_red as u8 as f64;
             sc.wait_far_red_s += h.far_red as u8 as f64;
+            sc.extra.far_red_before_s += h.far_red_before as u64;
             sc.people_wait_s += h.person as u8 as f64;
         }
     };
@@ -4400,8 +4469,44 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             for &id in &ids {
                 first_seen.entry(id).or_insert(now);
             }
+            for (t, id, v, pos) in std::mem::take(&mut r.ended) {
+                if near(pos) {
+                    ex.end_in_view += 1;
+                }
+                if v > 1.0 {
+                    ex.end_moving += 1;
+                    ex.events.push(format!("END-MOVING {} t={t:.1} #{id} v {v:.1} at ({:.0}, {:.0})", sc.name, pos.x, pos.y));
+                }
+            }
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
+            for v in r.vehicles.iter().filter(|v| v.state.speed < 0.3 && near(v.pos)) {
+                let st = &v.state;
+                let over = r.net.walks.get(st.lane).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| sa >= st.s - st.rear && sa <= st.s + st.front));
+                if over {
+                    ex.on_cut_s += fdt;
+                    if on_cut_ids.insert(v.id) {
+                        ex.on_cut_vehicles += 1;
+                    }
+                }
+            }
+            for v in r.vehicles.iter().filter(|v| !v.serves_stops() && near(v.pos)) {
+                if v.waiting > 60.0 && waited60.insert(v.id) {
+                    ex.wait60 += 1;
+                }
+                if v.waiting > 120.0 && waited120.insert(v.id) {
+                    ex.wait120 += 1;
+                }
+            }
+            for v in &r.vehicles {
+                let first = gone_seen.insert(v.id);
+                if !v.gone {
+                    gone_ids.remove(&v.id);
+                } else if gone_ids.insert(v.id) && !first && !v.serves_stops() && near(v.pos) {
+                    ex.removed_in_view += 1;
+                    ex.events.push(format!("GONE {} t={now:.1} #{} {:?} lane {} s {:.1} v {:.2} stood {:.0} why={}", sc.name, v.id, v.class, v.state.lane, v.state.s, v.state.speed, v.stopped, why_name(v.last.why)));
+                }
+            }
             for v in &r.vehicles {
                 let st = &v.state;
                 match st.change {
@@ -4461,6 +4566,26 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             prev_odo.insert(v.id, st.odometer);
             if !near(v.pos) {
                 continue;
+            }
+            // (`--pedtouch`, the round-6 reviewers' probe: a moving vehicle's body over a
+            // person's disc, 0.28 m, every frame, on stderr)
+            if pedtouch && st.speed >= 0.3 {
+                let b = v.obb();
+                for p in &r.sim.people {
+                    if (p.pos - v.pos).truncate().length() > 15.0 || (p.pos.z - v.pos.z).abs() > 2.5 {
+                        continue;
+                    }
+                    let sep = omsi_sim::collision::Obb::point(p.pos, 0.28).separation(&b);
+                    if sep < -0.01 {
+                        let coach = v.class == omsi_traffic::VehicleClass::Car && v.state.length >= 10.0;
+                        // (severe: deeper than a body radius, or moving over 1 m/s more than
+                        // 5 cm deep - the reviewers' gate; a car letting a player's passengers
+                        // out stands beside where the game put them: a replay artefact)
+                        let severe = -sep > 0.28 || (st.speed > 1.0 && -sep > 0.05);
+                        let note = if v.last.why == Why::LetOut { " artefact: passengers placed by the recording beside the run's car" } else { "" };
+                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
+                    }
+                }
             }
             // the front point crossing a stop line (the lit lane's start) between two frames
             let h = (v.heading as f64).to_radians();
@@ -4744,6 +4869,11 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("eases", e.eases.to_string()),
         ("ease_stand/pinned", format!("{:.0}/{:.0}", e.ease_stand_s, e.ease_pinned_s)),
         ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
+        ("removed_in_view", e.removed_in_view.to_string()),
+        ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
+        ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
+        ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
+        ("far_red_before", e.far_red_before_s.to_string()),
     ]
 }
 
@@ -4768,6 +4898,14 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.pass_wrong_side_s += e.pass_wrong_side_s;
     t.pass_stranded_s += e.pass_stranded_s;
     t.eases += e.eases;
+    t.removed_in_view += e.removed_in_view;
+    t.end_in_view += e.end_in_view;
+    t.end_moving += e.end_moving;
+    t.wait60 += e.wait60;
+    t.wait120 += e.wait120;
+    t.on_cut_vehicles += e.on_cut_vehicles;
+    t.on_cut_s += e.on_cut_s;
+    t.far_red_before_s += e.far_red_before_s;
     t.ease_stand_s += e.ease_stand_s;
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
@@ -4801,6 +4939,7 @@ fn ab(args: &[String]) -> Res<()> {
     let min_head: usize = opt(args, "--min-head").map(|s| s.parse()).transpose()?.unwrap_or(10);
     let jobs: usize = opt(args, "--jobs").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     let free_run = !args.iter().any(|a| a == "--reset");
+    let pedtouch = args.iter().any(|a| a == "--pedtouch");
 
     // (each fixture on its own: the order of the rows is the order given)
     let results: std::sync::Mutex<Vec<Option<Result<Score, String>>>> = std::sync::Mutex::new((0..fixtures.len()).map(|_| None).collect());
@@ -4811,7 +4950,7 @@ fn ab(args: &[String]) -> Res<()> {
                 let k = nextjob.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Some(path) = fixtures.get(k) else { break };
                 let t0 = std::time::Instant::now();
-                let res = ab_run(path, radius, min_head, free_run).map_err(|e| format!("{}: {e}", path.display()));
+                let res = ab_run(path, radius, min_head, free_run, pedtouch).map_err(|e| format!("{}: {e}", path.display()));
                 eprintln!("ab: {} done in {:.1} s", path.display(), t0.elapsed().as_secs_f64());
                 if let Ok(mut g) = results.lock() {
                     g[k] = Some(res);
@@ -4893,6 +5032,11 @@ fn ab(args: &[String]) -> Res<()> {
     }
     print!("{out}");
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
+    {
+        // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
+        let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
+        println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
+    }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting
         // place), frozen lane changes (runs/vehicles/s), phantom leads (vehicles/s), keep-back
@@ -5163,6 +5307,87 @@ fn stubs(args: &[String]) -> Res<()> {
 /// they start and end, and whether they lead into a common lane; the nearest first. (Converging lanes whose
 /// starts lie under 3 m apart are no merge to `compute_conflicts`: cars on them met side by
 /// side, round 4a.)
+/// [round 7 A2] The lane joins of a fixture's network: two street lanes running into one
+/// lane, by whether the compiled junctions know a meeting place between them (a foe of one
+/// movement for the other, by kind; `Junctions::foe_between`). Pieces of one way (one lane
+/// leads into the other, `Network::one_way_pieces`, or both leave one lane, `same_root`)
+/// have none by design and are counted apart; `uncovered` must be 0 (A2-full: every join of two ways is compiled). `--list`
+/// prints the pairs with none, `--why` with why.
+fn joins(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let (r, _) = grown(Path::new(f), true)?;
+        let (net, js) = (&r.net, &r.sim.junctions);
+        let foe = |a: usize, b: usize| -> Option<omsi_traffic::FoeKind> {
+            let (&(ja, ma), &(jb, mb)) = (js.of_lane.get(&a)?, js.of_lane.get(&b)?);
+            (ja == jb).then_some(())?;
+            js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb).map(|x| x.kind)
+        };
+        let street = |l: usize| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2;
+        let (mut merge, mut other, mut none_in, mut none_out) = (0, 0, 0, 0);
+        let mut cats: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut pieces = 0usize;
+        for n in 0..net.lanes.len() {
+            if !street(n) {
+                continue;
+            }
+            let prev: Vec<usize> = net.prev.get(n).map(|v| v.iter().copied().filter(|&p| street(p)).collect()).unwrap_or_default();
+            for (k, &a) in prev.iter().enumerate() {
+                for &b in &prev[k + 1..] {
+                    match foe(a, b) {
+                        Some(omsi_traffic::FoeKind::Merge) => merge += 1,
+                        Some(_) => other += 1,
+                        None if net.one_way_pieces(a, b) || net.same_root(a, b) => pieces += 1,
+                        None => {
+                            let inside = js.of_lane.contains_key(&a) || js.of_lane.contains_key(&b);
+                            let cat = match (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                                (None, None) => "none",
+                                (Some(x), Some(y)) if x.0 == y.0 => "same",
+                                (Some(_), Some(_)) => "two",
+                                _ => "one",
+                            };
+                            *cats.entry(cat).or_insert(0usize) += 1;
+                            if args.iter().any(|a| a == "--why") {
+                                let (la, lb) = (&net.lanes[a], &net.lanes[b]);
+                                let why = if la.key.map(|k| k.path) == lb.key.map(|k| k.path) && la.key.is_some() { "same path" } else if la.kind == LaneKind::Rail && lb.kind == LaneKind::Rail { "rail" } else if (la.start() - lb.start()).truncate().length() <= 3.0 { "starts within 3 m" } else { "other" };
+                                println!("  {cat} {a}/{b} into {n}: {why}; ends {:.1} m apart, lengths {:.1}/{:.1}, src {}/{}", (la.end() - lb.end()).truncate().length(), la.length(), lb.length(), la.source, lb.source);
+                            }
+                            if inside {
+                                none_in += 1;
+                            } else {
+                                none_out += 1;
+                            }
+                            if list {
+                                let e = net.lanes[n].start();
+                                println!("  join into {n} ({:.0}, {:.0}) from {a} and {b}: no meeting place, {}", e.x, e.y, if inside { "a lane in a junction" } else { "outside junctions" });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // [round 7 A2-full fix] lanes converging side by side before a join without a shared
+        // next lane: those that converge (a side merge compiled, `Network::join_approaches`)
+        // must be one junction's foes too
+        let (mut side_ok, mut side_none) = (0usize, 0usize);
+        for (a, b) in net.join_approaches() {
+            if !net.crossings.get(a).is_some_and(|v| v.iter().any(|c| c.other == b && c.side)) {
+                continue;
+            }
+            if foe(a, b).is_some() {
+                side_ok += 1;
+            } else {
+                side_none += 1;
+                if list {
+                    println!("  side-by-side {a}/{b}: no meeting place in a junction table");
+                }
+            }
+        }
+        println!("{f}: joins with a compiled merge {merge}, another kind of meeting place {other}, pieces of one way {pieces}; uncovered {}: touching a junction {none_in}, outside junctions {none_out} (lanes in junctions: {cats:?}); converging before a join: {side_ok} compiled, uncovered {side_none}", none_in + none_out);
+    }
+    Ok(())
+}
+
 fn converge(args: &[String]) -> Res<()> {
     let all = args.iter().any(|a| a == "--all");
     let fixtures: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
@@ -5319,7 +5544,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 let gaps: Vec<String> = found.iter().map(|&i| format!("#{} {:.2} m", r.vehicles[i].id, r.vehicles[i].obb().separation(&pb))).collect();
                 println!("t={t:.1} player {} ({:.1},{:.1}) hd {:.0} v {:.2} still {:.1} blinker {}; boxes to it: {}", p.id, p.pos.x, p.pos.y, p.heading, p.speed, p.still, p.blinker, gaps.join(", "));
             }
-            for (c, g) in r.sim.claims.iter().filter(|(c, _)| c.vehicle >= usize::MAX - 64) {
+            for (c, g) in r.sim.claims.iter().filter(|(c, _)| omsi_traffic::sim::claim_player(c.vehicle).is_some()) {
                 println!("t={t:.1}   player claim j{} m{} s {:.1} light_red {} blocked {} lead {:?} -> go {} wait_for {:?}", c.junction, c.movement, c.s, c.light_red, c.blocked, c.lead.map(|w| fmt_claimant(&r, w)), g.go, g.wait_for.map(|w| fmt_claimant(&r, w)));
             }
         }

@@ -7,53 +7,19 @@
 use crate::sim::Vehicle;
 use omsi_sim::traffic::{Lane, LaneKind};
 
-/// Why a lane is closed to a vehicle (for the debug overlay).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Closed {
-    /// Not a street (a footpath, a rail, a flight path).
-    Kind,
-    /// `[rule] no_cars`, `bus`, `trucks` by the vehicle's `[ai_veh_type]`.
-    Rules,
-    /// No random traffic of this vehicle's group drives here (`trafficdensity 0`).
-    Density,
-}
+pub use omsi_sim::traffic::Closed;
 
-/// Is `lane` open to `v` for driving along? A timetable vehicle on its route is open
-/// anywhere its route goes; this answers for the driver's own choices.
+/// Is `lane` open to `v` for driving along? (`omsi_sim::traffic::open_to`, the rule itself,
+/// which the way on at a fork in `AiState` asks too: [round 7 A1].)
 pub fn open_to(lane: &Lane, v: &Vehicle) -> Result<(), Closed> {
-    let st = &v.state;
-    let kind_ok = match lane.kind {
-        LaneKind::Street => !v.is_rail() && v.class != crate::driver::VehicleClass::Air,
-        LaneKind::Rail => v.is_rail(),
-        LaneKind::Air => v.class == crate::driver::VehicleClass::Air,
-        LaneKind::Sidewalk => false,
+    let kind = if v.is_rail() {
+        LaneKind::Rail
+    } else if v.class == crate::driver::VehicleClass::Air {
+        LaneKind::Air
+    } else {
+        LaneKind::Street
     };
-    if !kind_ok {
-        return Err(Closed::Kind);
-    }
-    if !lane.allows(st.veh_type) {
-        return Err(Closed::Rules);
-    }
-    // a scheduled bus goes where its route goes; everybody else needs the lane to carry
-    // traffic of their group
-    if st.route.is_empty() {
-        // (a vehicle of no group is a normal car: where the path names its groups, the
-        // first group's share counts, not the most any group gets - `density` is the
-        // greatest over all groups, so that a lane stays open to whoever is asked for)
-        let density = match st.traffic_pool.as_ref() {
-            Some((pool, defaults)) => lane.pool_density(defaults, *pool),
-            None if lane.group_density.is_empty() => lane.density,
-            None => lane.pool_density(&[1], 0),
-        };
-        if density <= 0.0 {
-            return Err(Closed::Density);
-        }
-    }
-    // (no test on the path's width: a tenth of the stock maps' street paths are drawn a
-    // metre wide where the lane is a full one - Spandau's ten-lane Altstädter Ring is
-    // all 1 m paths - and BeijingCity's bus lane is as wide as its cycle lane. What keeps
-    // a car off a cycle lane beyond a strip is the strip: `Lane::beside_each_other`.)
-    Ok(())
+    omsi_sim::traffic::open_to(lane, &v.state, kind)
 }
 
 /// Open, as a plain yes or no.

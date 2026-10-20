@@ -33,12 +33,77 @@ use std::sync::mpsc;
 /// The format's version (the header's first field). 2: vehicles carry their claim
 /// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it. 3: the
 /// lanes carry their drivable extent (`Lane::drivable`, round 5 L1); a recording without it
-/// reads back the lanes' half widths.
-pub const VERSION: u32 = 3;
-/// The rules a recording is made with, as its header names them (`Header::switches`): the
-/// rule changes once tried behind switches and accepted, now always on, and the junction
-/// rules of round 4 (a recording made before them replays under them, not bit-exactly).
+/// reads back the lanes' half widths. 4 ([round 7 E1]): the header names the rules by their
+/// hash (`Header::rules`, [`rules_hash`]), and every field added with a `serde(default)`
+/// since 3 is written - `Vehicle::passed_on_go`, `amber_line`, `zip_won`, `change_still`,
+/// `mutual`, `mutual_gap`, `ease_for`, `waiting`, `External::trip_over`,
+/// `Frame::steer`, `Frame::order`; a format-3 recording may lack some (read as their
+/// defaults, `Replay::load` warns).
+///
+/// [fix pass 1, 15] Compatibility rule: a recording is read by the tools of its format and
+/// later ones. On read, a field the recording has and the code no longer knows is ignored
+/// (no `deny_unknown_fields` anywhere), and a field the code has and the recording lacks
+/// takes its container's default - `Vehicle`, `AiState`, `External` and `DriverParams` are
+/// `serde(default)` (`Vehicle::default`, `AiState::default`: a car standing at the start of
+/// lane 0; `External::default`: no input) - except a driver field, which reads as unknown
+/// and then takes the preset of the vehicle's class (`DriverParams::fill_missing`, in
+/// `Replay::new`: a bus's missing `yellow_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
+/// e.g. format 4 in a round-6 tool) is not for that tool: `Replay::load` refuses it with that
+/// message, as fields it requires may be missing; read it with the branch's own tool.
+pub const VERSION: u32 = 4;
+/// The rule switches a recording names (`Header::switches`), for information: the rule
+/// changes once tried behind switches and accepted, now always on, and the junction rules of
+/// round 4. Frozen since round 4: which rules a recording was made under is
+/// [`rules_hash`]'s (format 4).
 pub const RULES: &str = "competitor_filter,signal_foes,stub_links,lights_first,right_of_way,blocked_foe,stop_placement,player_chain,amber_clear";
+/// [round 7 E1] The rules the traffic runs with, as a hash: FNV-1a (64 bit) over the
+/// sources of the rules - the driver, perception, plan, junctions, resolver, simulation,
+/// access rule (omsi-traffic) and the lane model (omsi-sim's traffic.rs) - with comment
+/// lines, blank lines and the test modules left out, so that a changed constant or rule changes it and a
+/// reworded comment does not. A recording names it (`Header::rules`); one naming another
+/// does not replay bit-exactly (`replay::other_rules`).
+pub fn rules_hash() -> String {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        const SOURCES: [&str; 9] = [
+            include_str!("driver.rs"),
+            include_str!("perception.rs"),
+            include_str!("plan.rs"),
+            include_str!("junction.rs"),
+            include_str!("reservation.rs"),
+            include_str!("sim.rs"),
+            include_str!("access.rs"),
+            include_str!("../../omsi-sim/src/traffic.rs"),
+            include_str!("../../omsi-sim/src/ai_motion.rs"),
+        ];
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for src in SOURCES {
+            // (the rules only: a test module, `#[cfg(test)] mod`, and what follows are left out)
+            let mut lines = src.lines().map(str::trim).peekable();
+            let mut rules: Vec<&str> = Vec::new();
+            while let Some(l) = lines.next() {
+                if l == "#[cfg(test)]" && lines.peek().is_some_and(|n| n.starts_with("mod ")) {
+                    break;
+                }
+                rules.push(l);
+            }
+            for line in rules.into_iter().filter(|l| !l.is_empty() && !l.starts_with("//")) {
+                for b in line.bytes().chain(std::iter::once(b'\n')) {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        format!("{h:016x}")
+    })
+    .clone()
+}
+
+/// [round 7 E3] The decision a person waiting at the kerb for a red light records
+/// (`PersonRecord::decision`): the replay leaves them out of the walkers (the game's
+/// `Humans::strollers`).
+pub const RED_LIGHT: &str = "red light";
+
 /// The memory keeps this many seconds (and the keyframe before them).
 pub const RING_SECS: f64 = 60.0;
 /// A keyframe of every vehicle this often (s): a replay starts at one, and a replay that
@@ -64,7 +129,10 @@ pub struct Header {
     /// What the network and the junction table derived from the lanes. The game grows its
     /// network tile by tile and some of it (a timetable's reverse twins of a junction's
     /// paths) comes out differently from linking all the lanes at once, so the replay
-    /// takes the game's own. Without it (a fixture written by hand) it is worked out.
+    /// takes the game's own links, conflicts and walks; the junction table it compiles
+    /// itself after the lit stubs (`Replay::new`), the recorded one is the game's for
+    /// comparison (`replay::recorded`, `traffic_cases stubs`). Without it (a fixture written
+    /// by hand) it is worked out.
     #[serde(default)]
     pub derived: Option<Derived>,
     /// (format 2) The rules the game ran with, for information: [`RULES`] since the rule
@@ -74,6 +142,9 @@ pub struct Header {
     /// bit-exactly (`Replay::load` warns).
     #[serde(default)]
     pub switches: Option<String>,
+    /// (format 4) The rules the game ran with, by their hash ([`rules_hash`]).
+    #[serde(default)]
+    pub rules: Option<String>,
 }
 
 /// The network's and the junction table's derived data (see [`Header::derived`]).
@@ -450,7 +521,8 @@ impl Recorder {
             time_scale: sim.time_scale,
             players: &sim.players,
             people,
-            walkers: &sim.walkers,
+            // ([round 7 E3] not with the people's legs: the replay rebuilds the list from them)
+            walkers: if people.iter().any(|p| p.leg.is_some()) { &[] } else { &sim.walkers },
             externals: &self.externals,
             steer,
             light_clocks: LightClocks(&sim.lights),
@@ -463,21 +535,6 @@ impl Recorder {
     pub fn keyframe(&mut self, time: f64, vehicles: &[Vehicle]) {
         self.last_keyframe = time;
         self.line(time, Kind::Keyframe, &RecordRef::Keyframe { time, vehicles });
-    }
-
-    /// A record the game writes itself (a vehicle changed, a note).
-    pub fn event(&mut self, rec: Record) {
-        let kind = match rec {
-            Record::LanesAdded { .. } | Record::LightsAdded { .. } => Kind::FileOnly,
-            Record::Keyframe { .. } => Kind::Keyframe,
-            Record::Parked { .. } => Kind::Parked,
-            _ => Kind::Other,
-        };
-        let time = rec.time();
-        match finite::to_string(&rec) {
-            Ok(text) => self.send(Msg::Line { time, kind, text }),
-            Err(e) => log::warn!("traffic recording: a record could not be written: {e}"),
-        }
     }
 
     /// The game changed vehicle `v`'s way between frames.
@@ -539,13 +596,14 @@ impl Recorder {
             }
         };
         format!(
-            "{{\"version\":{VERSION},\"map\":{},\"left_hand\":{},\"lights\":{},\"started_day_time\":{},\"trigger\":{},\"switches\":{},{}}}",
+            "{{\"version\":{VERSION},\"map\":{},\"left_hand\":{},\"lights\":{},\"started_day_time\":{},\"trigger\":{},\"switches\":{},\"rules\":{},{}}}",
             json(&map),
             net.left_hand,
             json(&sim.lights),
             json(&sim.day_time),
             json(&trigger),
             json(RULES),
+            json(&rules_hash()),
             net_part
         )
     }

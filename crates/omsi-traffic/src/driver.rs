@@ -5,6 +5,15 @@
 
 use omsi_sim::traffic::AiState;
 
+/// [round 7 D1] Under this speed (m/s) a vehicle stands: one threshold for every rule that
+/// asks whether a vehicle (a lead, a foe, a claimant, the player) stands (`Claim::standing`
+/// adds its 1 m/s hysteresis for a claimant that stood).
+pub const STANDING_SPEED: f32 = 0.3;
+
+/// A fed-up driver (`Impatience::claims_after`) takes a way they would yield on when the foe
+/// is still this many seconds away (s; the figure since b9568aa, not jittered per driver).
+pub const FED_UP_AFTER: f32 = 2.5;
+
 /// What kind of vehicle the driver is in: sets the preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VehicleClass {
@@ -36,17 +45,24 @@ impl VehicleClass {
         }
     }
 
-    pub fn is_bus(self) -> bool {
-        matches!(self, VehicleClass::Bus | VehicleClass::ScheduledBus)
+    /// [round 7 A4] A timetable bus: it serves stops (pulls in beside its people, keeps to
+    /// its bay, is never given up). A random bus (`Bus`) is heavy traffic like a truck.
+    pub fn serves_stops(self) -> bool {
+        self == VehicleClass::ScheduledBus
     }
 
+    /// A heavy vehicle (a bus, timetable or random, or a truck): its body and driver.
     pub fn heavy(self) -> bool {
         matches!(self, VehicleClass::Bus | VehicleClass::ScheduledBus | VehicleClass::Truck)
     }
 }
 
 /// Everything about how a driver drives, in one place. Units: metres, seconds, m/s².
+/// (Read from recordings: a field a recording lacks - one removed or added on another branch
+/// - reads as unknown (NaN) and is then the preset's of the vehicle's class,
+/// `DriverParams::fill_missing`; `record::VERSION`'s compatibility rule.)
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DriverParams {
     /// Time gap kept to the car ahead (IDM `tau`).
     pub tau: f32,
@@ -67,10 +83,9 @@ pub struct DriverParams {
     /// Gap accepted in the lane changed into (s, to the car behind there).
     pub lc_gap: f32,
     /// Lane-change motivation weights (LMRS / LC2013): the route needing it, a faster
-    /// lane, letting a neighbour in, keeping right.
+    /// lane, keeping right. (LC2013's cooperative weight has no rule here yet.)
     pub lc_strategic: f32,
     pub lc_speed_gain: f32,
-    pub lc_cooperate: f32,
     pub lc_keep_right: f32,
     /// How fast impatience grows while waiting (per second) and where it caps.
     pub impatience_rate: f32,
@@ -80,7 +95,26 @@ pub struct DriverParams {
     pub yellow_brake: f32,
 }
 
+impl Default for DriverParams {
+    /// Every field unknown (NaN): what a field a recording lacks is read as, until
+    /// `fill_missing` gives it the vehicle's class's preset.
+    fn default() -> DriverParams {
+        let n = f32::NAN;
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, gap_accept: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, yellow_brake: n }
+    }
+}
+
 impl DriverParams {
+    /// [fix pass 2, 5] The fields a recording lacked (NaN, `Default`) take the preset of
+    /// `class` (a bus's `yellow_brake` is a bus's, not a car's).
+    pub fn fill_missing(&mut self, class: VehicleClass) {
+        let p = DriverParams::preset(class);
+        macro_rules! fill {
+            ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
+        }
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, gap_accept, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, yellow_brake);
+    }
+
     /// The preset of a class, before jitter.
     pub fn preset(class: VehicleClass) -> DriverParams {
         let car = DriverParams {
@@ -95,7 +129,6 @@ impl DriverParams {
             lc_gap: 1.5,
             lc_strategic: 1.0,
             lc_speed_gain: 0.6,
-            lc_cooperate: 0.5,
             lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
@@ -156,7 +189,6 @@ impl DriverParams {
         st.desire = self.speed_factor;
         st.lat_accel = self.lat_accel;
         st.reaction = self.reaction;
-        st.accept_gap = self.gap_accept;
     }
 }
 
@@ -188,10 +220,10 @@ impl Impatience {
     }
 
     /// A driver this impatient takes a way they would yield on, if the foe is still
-    /// farther than this many seconds away.
+    /// farther than this many seconds away (`FED_UP_AFTER`, the same for every driver).
     pub fn claims_after(&self) -> Option<f32> {
         if self.value >= 0.999 {
-            Some(2.5)
+            Some(FED_UP_AFTER)
         } else {
             None
         }

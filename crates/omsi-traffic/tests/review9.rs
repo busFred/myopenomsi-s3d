@@ -228,7 +228,7 @@ fn review9_f_a_left_turner_clearing_on_amber_meets_the_oncoming_amber_runner() {
                 if t > phase - 1.0 && t < phase + 5.0 && (t * 30.0).round() as i32 % 6 == 0 {
                     log += &format!("\n t {t:.1} turner L{} s {:.1} v {:.1} {:?} wf {:?}", tr.state.lane, tr.state.s, tr.state.speed, tr.last.why, tr.last.wait_for);
                     for c in cars.iter().filter(|c| c.id != 1 && (c.pos.y > -40.0 && c.pos.y < 10.0)) {
-                        log += &format!(" | #{} y {:.1} v {:.1} {:?} wf {:?} hold {:?} stop {:?} amber {:?}", c.id, c.pos.y, c.state.speed, c.last.why, c.last.wait_for, c.last.hold, c.last.stop, c.amber);
+                        log += &format!(" | #{} y {:.1} v {:.1} {:?} wf {:?} hold {:?} stop {:?} amber {:?}", c.id, c.pos.y, c.state.speed, c.last.why, c.last.wait_for, c.last.hold, c.last.stop, c.light_decision);
                     }
                 }
             }

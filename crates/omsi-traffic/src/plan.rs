@@ -3,7 +3,7 @@
 //! No plan reads another vehicle's plan; the only cross-vehicle input is the junction
 //! grant.
 
-use crate::driver::VehicleClass;
+use crate::driver::{DriverParams, VehicleClass, STANDING_SPEED};
 use crate::perception::{JunctionView, NeighbourView, Perception, Seen, SignalView};
 use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
@@ -21,6 +21,8 @@ pub enum Why {
     Junction,
     ExitFull,
     People,
+    /// A pedestrian at a crossing (round 4's zebra check; [round 7 A3] not produced any more:
+    /// `People` holds for them. Kept for the recordings that name it.)
     Zebra,
     Service,
     Merge,
@@ -72,14 +74,13 @@ pub struct Plan {
     /// Held by something (the start reaction applies when it clears).
     pub held: bool,
     pub hold: Option<Hold>,
-    /// The claim index of the vehicle waited for at a junction (a player: `usize::MAX - k`).
+    /// The claim index of the vehicle waited for at a junction (a player: `sim::player_claim`).
     pub wait_for: Option<usize>,
     /// Id of the vehicle whose body across the way holds this one.
     pub body_block: Option<u64>,
-    /// At the line on green or yellow: the driver goes through whatever it turns to.
-    pub amber: Option<(usize, usize)>,
-    /// With `amber`: the gap from the front to that line (m).
-    pub amber_line: Option<f32>,
+    /// The decision at the light ahead taken at its amber onset (`light_call`): (light,
+    /// through, the gap from the front to its line).
+    pub light_decision: Option<((usize, usize), bool, f32)>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -109,24 +110,11 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
-    if !nb.allowed {
-        return (0.0, false);
-    }
-    // the solid line (`[rule] overtaking_prohib`) on either lane, and the pieces of a
-    // junction object: no change of the driver's own
-    if lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 {
+    if !may_change_to(net, me, nb) {
         return (0.0, false);
     }
     let mut desire = 0.0f32;
-    // a turn lane is never left within 150 m of its junction, and a turn ahead is taken
-    // from the lane that leads into it
-    let my_turn = st.turn_ahead(net, 150.0).map(|t| t.0).unwrap_or(0);
-    if my_turn != 0 && nb.turn != my_turn {
-        return (0.0, false);
-    }
-    if nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0 {
-        return (0.0, false);
-    }
+    let my_turn = st.turn_ahead(net, TURN_LANE_KEEP).map(|t| t.0).unwrap_or(0);
     if lane.turn == 0 && my_turn != 0 && nb.turn == my_turn && lane.turn != my_turn {
         desire = desire.max(1.0 * dp.lc_strategic);
     }
@@ -150,10 +138,29 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > KEEP_SIDE_REACH && open_on(net, me, nb.lane, st.s) {
         desire = desire.max(dp.lc_keep_right);
     }
-    if nb.runs_on < 40.0 {
-        return (0.0, false);
-    }
     (desire, gap_accepted(me, nb))
+}
+
+/// A turn lane is never left within this many metres (m) of its junction, nor one taken
+/// that leads into a turn the driver does not take before it runs on this far.
+const TURN_LANE_KEEP: f32 = 150.0;
+/// A lane beside that runs on less than this (m, `NeighbourView::runs_on`) is not changed
+/// onto.
+const CHANGE_RUNS_ON: f32 = 40.0;
+
+/// [round 7 D5] May the driver change onto `nb` of its own accord (a change for a reason of
+/// its own, a bypass; `change_desire` and `could_bypass` ask the same): the path's rules
+/// allow it there; no solid line (`[rule] overtaking_prohib`) on either lane, not on a
+/// junction object's piece; a turn lane is never left within `TURN_LANE_KEEP` of its
+/// junction, a turn ahead is taken from the lane that leads into it, and a turn lane is not
+/// taken for a turn the driver does not take; and `nb` runs on `CHANGE_RUNS_ON` at least.
+fn may_change_to(net: &Network, me: &Vehicle, nb: &NeighbourView) -> bool {
+    let lane = &net.lanes[me.state.lane];
+    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < CHANGE_RUNS_ON {
+        return false;
+    }
+    let my_turn = me.state.turn_ahead(net, TURN_LANE_KEEP).map(|t| t.0).unwrap_or(0);
+    !((my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < TURN_LANE_KEEP))
 }
 
 /// A keep-to-the-side change needs the target lane to reach this far on (m,
@@ -171,9 +178,8 @@ pub const KEEP_SIDE_OPEN_AHEAD: f32 = 60.0;
 /// asked, the way through is the junction's.
 fn open_on(net: &Network, me: &Vehicle, lane: usize, s: f32) -> bool {
     let st = &me.state;
-    // (`AiState::start_change`'s move: 2.8 to 4 s at the speed now, at least 12 m)
-    let change_len = (st.speed * (4.0 - st.speed * 0.04).clamp(2.8, 4.0)).max(12.0);
-    let need = change_len + KEEP_SIDE_OPEN_AHEAD;
+    // (`AiState::start_change`'s move)
+    let need = omsi_sim::traffic::change_length(st.speed) + KEEP_SIDE_OPEN_AHEAD;
     let mut cur = lane;
     let mut d = -net.beside_s(st.lane, lane, s);
     for _ in 0..16 {
@@ -231,7 +237,7 @@ fn obstacle_bus(sim: &Simulation, vehicles: &[Vehicle], id: u64) -> Option<(bool
         return Some((true, p.blinker as i32 == out, p.speed.abs() > 0.5));
     }
     let o = vehicles.iter().find(|o| o.id == id)?;
-    Some((o.is_bus(), o.blinker_shown.0 == out, o.state.speed > 0.5))
+    Some((o.serves_stops(), o.blinker_shown.0 == out, o.state.speed > 0.5))
 }
 
 /// Within this many metres of a junction (from the front to where its object begins) a car
@@ -243,6 +249,9 @@ pub const SQUEEZE_NEAR: f32 = 25.0;
 /// No light or junction within this many metres past the thing an in-lane squeeze goes
 /// round (Sobol's 25 m; the pass on the oncoming lane keeps 60 m behind the player).
 pub const SQUEEZE_ZONE: f32 = 25.0;
+/// A pass on the oncoming lane round the player keeps this far (m) from a light or a
+/// junction past it; round anything else `SQUEEZE_ZONE`, as a squeeze.
+pub const PASS_ZONE_PLAYER: f32 = 60.0;
 /// Seconds the player's bus has stood before a car squeezes past it inside the lane
 /// (Sobol's `player_squeeze` fired at 1.5 s; the oncoming-lane pass waits for 4 s and 3 s
 /// stopped itself).
@@ -272,14 +281,11 @@ pub const PERSON_RADIUS: f32 = 0.28;
 
 /// The thing passed must have settled sideways: not itself out on a pass (stepping back from
 /// an aborted squeeze, its lateral still moving), and its lateral where it means to be.
-fn lateral_settled(sim: &Simulation, vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool {
+fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool {
     match l.what {
         // (standing, its offset cannot change: the ramps run by the odometer)
-        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < 0.3 || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
-        Seen::Player(_) | Seen::Parked => {
-            let _ = sim;
-            true
-        }
+        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < STANDING_SPEED || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
+        Seen::Player(_) | Seen::Parked => true,
     }
 }
 
@@ -393,16 +399,10 @@ fn pausing_player(l: &crate::perception::Headway) -> bool {
 /// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
 /// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
 /// the thing standing and nobody passing on it the wrong way. (What the keep-back asks.)
-fn could_bypass(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
-    let lane = &net.lanes[me.state.lane];
-    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < 40.0 {
+fn could_bypass(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+    if !may_change_to(net, me, nb) {
         return false;
     }
-    let my_turn = me.state.turn_ahead(net, 150.0).map(|t| t.0).unwrap_or(0);
-    if (my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < 150.0) {
-        return false;
-    }
-    let _ = p;
     // (the gap there is the start's to accept, `change_desire`, and a car driving on ahead
     // there leaves the room: one going by in that lane now does not make the car roll up to 2 m behind the obstacle, from where it can never
     // steer out - fix pass 2, the queue behind a bus at its stop)
@@ -486,7 +486,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
             hi = t;
         }
     }
-    Some(hi * bypass_min_len(me.length(), side).max(BYPASS_LENGTH.min(bypass_min_len(me.length(), side))))
+    Some(hi * bypass_min_len(me.length(), side))
 }
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
@@ -494,7 +494,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
 pub const BYPASS_HOLD_SLACK: f32 = 0.5;
 
 /// Seconds a vehicle at the head of a queue stands, held by nothing, before the queue counts
-/// as one behind an obstacle (`Headway::standing_obstacle`'s 4 s for one standing unheld).
+/// as one behind an obstacle; `Headway::standing_obstacle` takes one standing unheld, or the player, as one after it.
 pub const QUEUE_OBSTACLE_STAND: f32 = 4.0;
 /// Vehicles of a queue looked along for its head (`behind_an_obstacle`).
 pub const QUEUE_LOOK: usize = 6;
@@ -507,13 +507,13 @@ pub const QUEUE_LOOK: usize = 6;
 /// pass 2: behind bus #22368 at its stop, viz5 case07, four cars closed up to 1.8-2.2 m and
 /// stood 60 s and more, none able to steer out).
 fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
-    if lead.speed >= 0.3 {
+    if lead.speed >= STANDING_SPEED {
         return false;
     }
     let (Seen::Vehicle(mut j) | Seen::Body(mut j)) = lead.what else { return false };
     for _ in 0..QUEUE_LOOK {
         let Some(o) = vehicles.get(j) else { return false };
-        if o.state.speed >= 0.3 || o.passing.is_some() || o.state.change.is_some() {
+        if o.state.speed >= STANDING_SPEED || o.passing.is_some() || o.state.change.is_some() {
             return false;
         }
         let why = o.last.why;
@@ -572,62 +572,82 @@ fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
 pub struct LightCall {
     /// Over the line now (no stop for the light).
     pub go: bool,
-    /// The light's mark is set (`Vehicle::amber`): the driver took the line on green or yellow.
-    pub mark: bool,
-    /// Holding the mark close to the line: it goes through as soon as nothing else holds
-    /// it (a queue it stands in), whatever the light shows by then.
-    pub marked_through: bool,
+    /// The decision taken at this light's amber onset - (light, through, the gap from the
+    /// front to its line) - kept until the light is no longer the one ahead or turns green
+    /// (`Vehicle::light_decision`).
+    pub decision: Option<((usize, usize), bool, f32)>,
 }
 
-/// Under this speed (m/s) a car is standing: it does not take a yellow (`light_call`).
-const STANDING_SPEED: f32 = 0.3;
+/// [round 7 D2] The braking (m/s²) a driver reckons with when asking whether it can still
+/// stop before a line or a meeting place: hard, short of an emergency stop (`MAX_BRAKE`).
+/// One figure for the light (`light_call`), the claim's committed and clearing tests and the
+/// player's red (before: 0.8 of `MAX_BRAKE` at the light, 0.7 at the junction).
+pub const HARD_BRAKE: f32 = omsi_sim::traffic::MAX_BRAKE * 0.8;
 
-/// The driver's call at the light: through on green, the dilemma zone on yellow, on red
-/// only with the mark close to the line or too late to stop.
+/// [round 7 D2] Too late to stop within `room` metres at `v` m/s braking `brake` (m/s²;
+/// `HARD_BRAKE` but inside a junction); under 1 m/s a car can always stop.
+pub fn cannot_stop(v: f32, room: f32, brake: f32) -> bool {
+    v > 1.0 && room < v * v / (2.0 * brake)
+}
+
+/// [fix pass 3, 1] The braking (m/s²) a driver always accepts to stop at an amber line,
+/// SUMO's `--tls.yellow.min-decel` (3 m/s², sumo.md §7: "the deceleration needed is compared
+/// against" it).
+pub const YELLOW_MIN_DECEL: f32 = 3.0;
+
+/// [fix pass 2, 4; pass 3, 1] Can the driver stop within `gap` (m) at `v` (m/s) on amber -
+/// SUMO's yellow: the vehicle stops when v²/2gap is within its decel or `YELLOW_MIN_DECEL`,
+/// whichever is more? Standing it can. (Its comfortable brake alone, 2 m/s², committed a car
+/// 56 m out at 14.86 m/s, needing 1.95, that crossed 1.8 s into red: viz case17 #60501.)
+pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
+    v <= STANDING_SPEED || (gap > 0.0 && v * v / (2.0 * gap) <= dp.comfort_brake.max(YELLOW_MIN_DECEL))
+}
+
+/// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
+/// on green; at amber onset the driver decides once whether it can stop with comfortable
+/// braking (`comfortable_stop`) - if not it is committed and goes, if so it stops - and keeps
+/// that decision while this light is the one ahead (`Vehicle::light_decision`); on red only a
+/// car that cannot stop at all (`cannot_stop`, `HARD_BRAKE`) or one committed at amber onset
+/// and still rolling crosses. Nothing is decided on green, no decision is extended past
+/// what the onset allowed, and a committed car that came to a stand waits for its green
+/// (round 6 J3: one standing short of its line set off over it on red, viz case07 #18558).
+/// (This replaces round 4's amber mark: taken on green 3 m out, extended 6 m on yellow,
+/// carried over frames and retired by `stale_amber` and a 2 s stand; x10 case03 #3145
+/// crossed its line on red on it.)
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     let st = &me.state;
     let dp = &me.params;
     let v = st.speed;
     let gap = sig.dist - st.front;
-    let comfortable = v * v / (2.0 * dp.comfort_brake * 1.4) + 1.0;
-    let possible = v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8);
     let queued = v < 1.0 && p.leader.map(|l| l.gap < 8.0).unwrap_or(false);
-    let marked = me.amber == Some((sig.ctl, sig.light));
+    let light = (sig.ctl, sig.light);
+    // (that light's line: the same light lights several approaches, viz3 case01's 1.0 three)
+    let line = st.odometer + gap;
+    let held = me.light_decision.filter(|d| d.0 == light && (d.2 - line).abs() < 2.0).map(|d| d.1);
     match sig.aspect {
-        Aspect::Green | Aspect::GreenYellow | Aspect::Dark => {
-            // at the line on green: through, whatever it turns to in a moment
-            LightCall { go: true, mark: gap < 3.0 && !queued && v > 1.0, marked_through: marked && gap < comfortable }
-        }
+        Aspect::Green | Aspect::GreenYellow | Aspect::Dark => LightCall { go: true, decision: None },
         Aspect::Yellow => {
-            // the dilemma zone: through when stopping is no longer comfortable; a
-            // driver who took the line on green just before goes a little further
-            // out ("had the mark" alone let a car two places back in a queue go).
-            // One already braking for the light stays on the brake: slowing, it
-            // came within "comfortable" of the line again and set off across on red.
-            // (and never from a standstill: at rest nothing is "too late to stop", as on red
-            // below; a car released from a junction hold standing 0.5 m before an amber line
-            // took the mark and crept over on red, viz case07 #18558)
-            let stopping = me.last.why == Why::Light && me.last.stop.is_some();
-            let go = v > STANDING_SPEED && !queued && !stopping && (gap < comfortable || (marked && gap < comfortable + 6.0));
-            LightCall { go, mark: go, marked_through: marked && gap < comfortable + 6.0 }
+            // (and never from a standstill or a queue: at rest nothing is "too late to stop";
+            // [fix pass 2, 4] nor into a box whose exit is not free - SUMO's no-block check,
+            // sumo.md: viz5 case05 #16535 took its amber with people 2.8 m past the line and
+            // stood 85.8 s inside - unless it cannot stop at all)
+            let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
+            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap + 0.5, HARD_BRAKE)));
+            LightCall { go: go && v > STANDING_SPEED, decision: Some((light, go, gap)) }
         }
-        // (a car standing with its bumper over the line waits like one behind it: at a
-        // standstill nothing is "too late to stop")
         Aspect::Red | Aspect::RedYellow => {
-            // ([round6 J3] the mark lets it on only while it rolls, as on yellow: an eased car
-            // following its partner in took the mark rolling 1.5-2 m/s 3 m short of the line,
-            // braked to a stand there and set off over it on red, viz case07 #18558, review-r6j)
-            let go = (marked && v > STANDING_SPEED && gap < comfortable && !queued) || (v > 1.0 && gap < possible - 0.5);
-            LightCall { go, mark: false, marked_through: marked && gap < comfortable }
+            let committed = held == Some(true) && v > STANDING_SPEED;
+            LightCall { go: committed || cannot_stop(v, gap + 0.5, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
         }
     }
 }
 
 /// The zebra band a car keeps its body out of: its front ZEBRA_STOP m before a pedestrian
-/// crossing's cut of its way (the zebra stop, as `perception::zebra_ahead`) to ZEBRA_PAST m
-/// past it (the crossing's width and a step; `hold_point`'s band since round 4).
-const ZEBRA_STOP: f32 = 2.5;
-const ZEBRA_PAST: f32 = 2.0;
+/// crossing's cut of its way (the zebra stop) to ZEBRA_PAST m past it (the crossing's width
+/// and a step; `hold_point`'s band since round 4). (Somebody on the crossing is held for by
+/// `perception::people_ahead`, the one people test since round 7 A3.)
+pub const ZEBRA_STOP: f32 = 2.5;
+pub const ZEBRA_PAST: f32 = 2.0;
 
 /// A lead slower than this (m/s) is a queue I come to rest behind, not one I follow through
 /// (`light_call`'s `queued`: under 1 m/s behind a lead).
@@ -747,11 +767,11 @@ const BESIDE_MAX: f64 = 4.0;
 const CONVERGE_LOOK: f32 = 20.0;
 
 /// [round6 J2] The body of the vehicle waited for (`Grant::wait_for`, the claims' index; a
-/// player's is `usize::MAX - k`) projected on the way through: (rear, front), distances from my
+/// player's `sim::player_claim`) projected on the way through: (rear, front), distances from my
 /// origin, when its origin lies within `BESIDE_MAX` of a piece of the way.
 fn waited_body_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], j: &JunctionView, w: usize) -> Option<(f32, f32)> {
-    let (pos, rear, front) = if w >= usize::MAX - 64 {
-        let p = sim.players.get(usize::MAX - w)?;
+    let (pos, rear, front) = if let Some(id) = crate::sim::claim_player(w) {
+        let p = sim.players.iter().find(|p| p.id == id)?;
         (p.pos, p.half_len, p.half_len)
     } else {
         let o = vehicles.get(w)?;
@@ -793,7 +813,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     }
     let me_k = me_index(vehicles, me);
     let standing_in = |m: usize, from: f32, to: f32| -> bool {
-        sim.claims.iter().any(|(c, _)| c.vehicle != me_k && c.speed < 0.3 && c.junction == j.junction && c.chain.iter().any(|&(cm, off)| cm == m && c.s - off + c.front >= from && c.s - off - c.rear <= to))
+        sim.claims.iter().any(|(c, _)| c.vehicle != me_k && c.speed < STANDING_SPEED && c.junction == j.junction && c.chain.iter().any(|&(cm, off)| cm == m && c.s - off + c.front >= from && c.s - off - c.rear <= to))
     };
     if !foes.iter().any(|(_, f)| (f.mine.0 - waited).abs() < 0.05 && f.side && standing_in(f.movement, f.theirs.0, f.theirs.1)) {
         return None;
@@ -828,7 +848,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         let lane = node.movements[m].lane;
         for occ in sim.occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
             let o = &vehicles[occ.vehicle];
-            if o.id == me.id || o.state.speed >= 0.3 {
+            if o.id == me.id || o.state.speed >= STANDING_SPEED {
                 continue;
             }
             if let Some(r) = rear_on_my_way(o.pos, o.state.rear) {
@@ -837,7 +857,7 @@ fn roll_up_point(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         }
         for &(k, _, _) in sim.player_occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
             let p = &sim.players[k];
-            if p.speed.abs() < 0.3 {
+            if p.speed.abs() < STANDING_SPEED {
                 if let Some(r) = rear_on_my_way(p.pos, p.half_len) {
                     stop = stop.min(r - me.state.min_gap);
                 }
@@ -853,6 +873,105 @@ fn me_index(vehicles: &[Vehicle], me: &Vehicle) -> usize {
 }
 
 /// Decide for vehicle `i`.
+/// [round 7 D3] Where a car its grant refuses stops (a distance from its origin): one ordered
+/// list of cases, the first that applies.
+///
+/// 0. `first`: at the line, where it can still stop there gently or stands (`line_stop`),
+///    else - already on the lead-in piece of a long object, or a line too near to stop at
+///    gently, whose bumper is over it - a metre short of the first meeting place of the way
+///    through (the claim counts it so; a line the bumper was over drew an emergency stop).
+///    Every hold but one for a foe at a known stretch stops there.
+/// 1. [round6 J1] held only by a foe standing for good far ahead (`Grant::roll_up`): up to
+///    its stretch (`hold_point`).
+/// 2. a side-merge stretch of my own fork that a vehicle stands in: up to it, behind that
+///    vehicle (`roll_up_point`).
+/// 3. refused for a foe: just before the first stretch it waits for (`hold_point`), not
+///    short of the first meeting place of its way (viz3 case03: a car waiting for a stretch
+///    22 m on stood 2.8 m in, on the fork shared with the turn pockets, and blocked the
+///    turners behind it) - except where its way converges with another lane short of that
+///    stretch that the junction knows no foe on (review9: refused cars stood beside, and
+///    rolled into, the very car they waited for, on 5229/5231, 1430/1179, 10814/10625):
+///    [round6 J2] only a convergence beginning within the stopping distance (`CONVERGE_LOOK`
+///    at least, counted from the line while short of it) stops the car at `first`; a
+///    farther one it rolls up to (the stop is pulled back before it), unless the vehicle
+///    waited for stands in it. (case01 #4252 froze across the player's lane for a
+///    convergence 90 m on, case11 #54242 mid-turn.) In order:
+///    a. one farther on only (`far_only`), or - past the line, or no longer able to stop
+///       there gently - one come near that lies `CONVERGE_LOOK` past the line or farther:
+///       before the convergence (`at`), not short of the first meeting place, inside the
+///       convergence or on a zebra cut (review-r6j);
+///    b. `first`, when it lies before the stretch's stop or a convergence is near, and the
+///       car can still stop there;
+///    c. a convergence near, past the line already: as soon as it can stop gently;
+///    d. the stretch's stop.
+fn refused_stop(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, g: &Grant) -> f32 {
+    let stop = refused_stop_cases(net, sim, vehicles, me, j, g);
+    // [fix pass 3, 4] off a crossing: a body that would stand over a crossing band at the
+    // stop (`pulled_back` only pulls back before bands ahead of the front, so a body already
+    // partly in one stopped there: x10 case04 #3222 at s 4.0 with its rear over the crossing
+    // at 2.2) goes forward until its rear is past the crossing and `ZEBRA_PAST` where the
+    // meeting place it waits for allows, else back to `ZEBRA_STOP` before the crossing while
+    // it can still stop there
+    let limit = match (g.hold, g.at) {
+        (Some(Hold::Foe), Some(waited)) => j.entry + waited - 1.0,
+        _ => j.conflict_start - 1.0,
+    };
+    off_crossing(net, sim, me, j, stop, limit.max(stop))
+}
+
+/// [fix pass 3, 4] `stop` moved off the crossing bands of `j`'s way (`walk_bands`) the body
+/// would stand over there: forward, the rear past the band, no farther than `limit`; else
+/// back before it while the front has not passed its start.
+fn off_crossing(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, mut stop: f32, limit: f32) -> f32 {
+    let len = me.length();
+    for w in walk_bands(net, sim, j) {
+        if w.0 < stop && w.1 > stop - len - REST_SHORT {
+            let forward = w.1 + len + REST_SHORT;
+            if forward <= limit {
+                stop = forward;
+            } else if w.0 > me.state.front - 0.3 {
+                stop = stop.min(w.0);
+            }
+        }
+    }
+    stop
+}
+
+/// The stop of `refused_stop` before it is moved off a crossing.
+fn refused_stop_cases(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, g: &Grant) -> f32 {
+    let st = &me.state;
+    let dp = &me.params;
+    let v = st.speed;
+    let at_line = j.line - 0.3;
+    let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
+    let line_stop = !j.inside && (gently || v < 0.5);
+    let first = if line_stop { at_line } else { j.conflict_start - 1.0 };
+    let (Some(Hold::Foe), Some(waited)) = (g.hold, g.at) else { return first };
+    if g.roll_up {
+        return hold_point(net, sim, me, j, waited);
+    }
+    if let Some(at) = roll_up_point(net, sim, vehicles, me, j, waited) {
+        return at;
+    }
+    let at = hold_point(net, sim, me, j, waited);
+    let look = st.front.max(j.line) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);
+    let waited_body = g.wait_for.and_then(|w| waited_body_on_way(net, sim, vehicles, j, w));
+    let bands = converge_bands(sim, j);
+    let ahead: Vec<&(f32, f32, usize)> = bands.iter().filter(|b| b.0 < j.entry + waited && b.1 > -st.rear).collect();
+    let converges = ahead.iter().any(|b| b.0 < look || waited_body.is_some_and(|(lo, hi)| lo < b.1 && hi > b.0));
+    let far_only = !converges && !ahead.is_empty();
+    let past_line_look = !ahead.is_empty() && ahead.iter().all(|b| b.0 >= j.line + CONVERGE_LOOK);
+    if (far_only || (converges && !line_stop && past_line_look)) && at > st.front - 0.3 {
+        at
+    } else if (at < first || converges) && first > st.front - 0.3 {
+        first
+    } else if converges {
+        at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
+    } else {
+        at
+    }
+}
+
 pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: &Perception, grant: Option<Grant>) -> Plan {
     let me = &vehicles[i];
     let st = &me.state;
@@ -904,10 +1023,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // light turned, it drives on; a later line, of that controller or not, holds it as any)
     if let Some(sig) = p.signal.filter(|s| !p.junction.as_ref().is_some_and(|j| j.clears_past(s, st.front))) {
         let call = light_call(me, p, &sig);
-        if call.mark {
-            out.amber = Some((sig.ctl, sig.light));
-            out.amber_line = Some(sig.dist - st.front);
-        }
+        out.light_decision = call.decision;
         if !call.go {
             min_stop(&mut out.stop, &mut out.why, Some(sig.dist), Why::Light);
         }
@@ -916,69 +1032,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // 3. the junction
     if let (Some(j), Some(g)) = (p.junction.as_ref(), grant) {
         if !g.go {
-            // at the line, or, already on the lead-in piece of a long object, short of
-            // the first meeting place of the way through
-            // (a line too near to stop at gently any more is no stop either: the car
-            // creeps on to the meeting place and stops short of that, as the claim counts
-            // it; a line the bumper is already over drew an emergency stop for a frame)
-            let at_line = j.entry - 0.3;
-            let gently = v * v / (2.0 * (at_line - st.front - 0.6).max(0.05)) <= dp.comfort_brake * 1.5;
-            let first = if !j.inside && (gently || v < 0.5) { at_line } else { j.conflict_start - 1.0 };
-            // refused for a foe: just before the first stretch it waits for, not short of the
-            // first meeting place of its way (viz3 case03: a car waiting for a stretch 22 m
-            // on stood 2.8 m in, on the fork shared with the turn pockets, and blocked the
-            // turners behind it)
-            // (not where its way converges with another lane short of that stretch, that the
-            // junction knows no foe on: there it stops at the line, or short of the first
-            // meeting place, as before; review9: refused cars stood beside, and rolled into, the
-            // very car they waited for, on 5229/5231, 1430/1179, 10814/10625)
-            // (a side-merge stretch of my own fork that a vehicle stands in: up to it, behind
-            // that vehicle, `roll_up_point`)
-            let at = match (g.hold, g.at) {
-                // [round6 J1] held only by a foe standing for good far ahead: up to its stretch
-                (Some(Hold::Foe), Some(waited)) if g.roll_up => hold_point(net, sim, me, j, waited),
-                (Some(Hold::Foe), Some(waited)) => match roll_up_point(net, sim, vehicles, me, j, waited) {
-                    Some(at) => at,
-                    None => {
-                        let at = hold_point(net, sim, me, j, waited);
-                        // [round6 J2] only a convergence beginning within the stopping distance
-                        // (`CONVERGE_LOOK` at least) stops the car at once; a farther one it rolls
-                        // up to (`at` is pulled back before it), unless the vehicle waited for
-                        // stands in it (review9: refused cars rolled into the very car they
-                        // waited for). (case01 #4252 froze across the player's lane for a
-                        // convergence 90 m on, case11 #54242 mid-turn.)
-                        // (from the line while short of it: a convergence near the line stops a
-                        // car rolling up to it there, as one standing at it)
-                        let look = st.front.max(j.entry) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);
-                        let waited_body = g.wait_for.and_then(|w| waited_body_on_way(net, sim, vehicles, j, w));
-                        let bands = converge_bands(sim, j);
-                        let converges = bands.iter().any(|b| b.0 < j.entry + waited && b.1 > -st.rear && (b.0 < look || waited_body.is_some_and(|(lo, hi)| lo < b.1 && hi > b.0)));
-                        // (one farther on only: the car rolls up to the stretch, `at`, pulled back
-                        // before the convergence, and keeps that stop once it is past its line,
-                        // where `first` would be short of the first meeting place, inside the
-                        // convergence or on a zebra cut, review-r6j)
-                        let ahead: Vec<&(f32, f32, usize)> = bands.iter().filter(|b| b.0 < j.entry + waited && b.1 > -st.rear).collect();
-                        let far_only = !converges && !ahead.is_empty();
-                        // (and one come near that lies farther than `CONVERGE_LOOK` past the line -
-                        // one a car standing at the line rolls up to - once the car is past its line
-                        // or can no longer stop there gently: before the convergence, `at`, not short
-                        // of the first meeting place, past it. Nearer ones as before.)
-                        let line_stop = !j.inside && (gently || v < 0.5);
-                        let past_line_look = !ahead.is_empty() && ahead.iter().all(|b| b.0 >= j.entry + CONVERGE_LOOK);
-                        if (far_only || (converges && !line_stop && past_line_look)) && at > st.front - 0.3 {
-                            at
-                        } else if (at < first || converges) && first > st.front - 0.3 {
-                            first
-                        } else if converges {
-                            // (past the line already: as soon as it can stop gently)
-                            at.min(st.front + v * v / (2.0 * dp.comfort_brake) + 0.3)
-                        } else {
-                            at
-                        }
-                    }
-                },
-                _ => first,
-            };
+            let at = refused_stop(net, sim, vehicles, me, j, &g);
             if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {
                 // second at a zipper merge, both rolling: in behind the other at my gap
                 out.hold = g.hold;
@@ -1015,7 +1069,6 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 4. people
     min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
-    min_stop(&mut out.stop, &mut out.why, p.zebra_stop, Why::Zebra);
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
@@ -1043,7 +1096,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
-        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.entry < 40.0).unwrap_or(false);
+        let near_junction = p.junction.as_ref().map(|j| !j.inside && j.line < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok) = change_desire(net, sim, me, p, &nb, near_junction);
@@ -1193,7 +1246,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let squeeze_end = real + squeeze_obstacle_len + st.front + st.rear + 2.0;
         let squeeze = (reach <= extent || over_line.is_some())
             && !player_out
-            && lateral_settled(sim, vehicles, &l)
+            && lateral_settled(vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
             && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
@@ -1208,7 +1261,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // round two standing cars with three more beyond and stood out there 110 s)
         let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
-        let zone = if squeeze { SQUEEZE_ZONE } else if player { 60.0 } else { 25.0 };
+        let zone = if squeeze || !player { SQUEEZE_ZONE } else { PASS_ZONE_PLAYER };
         let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
         // (an in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when the obstacle
         // stands within `SQUEEZE_NEAR`, and inside the junction already it may go where its
@@ -1224,8 +1277,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if squeeze && j.inside {
                 return squeeze_run > j.conflict_start && j.conflict_end > -st.rear;
             }
-            let keep = j.entry - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
-            j.entry < real + st.front + obstacle_len + zone || keep
+            let keep = j.line - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
+            j.line < real + st.front + obstacle_len + zone || keep
         }).unwrap_or(false);
         let road_ok = p.road_left > pass_len + real + 30.0;
         let oncoming = p.oncoming.filter(|o| !solid && o.side.abs() >= 2.3 && o.side.abs() <= 5.5 && !o.blocked);
@@ -1238,7 +1291,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         });
         let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
-        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, p, nb, &l));
+        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {
@@ -1254,7 +1307,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // on to 2 m behind a bus at its stop and could never steer out, viz5 case07 #37625)
         let bypass_room_held = bypass_possible && !pass_possible;
         let slack = if bypass_room_held { -BYPASS_HOLD_SLACK } else { 0.5 };
-        if (pass_possible || bypass_possible) && !(me.is_bus() && l.at_stop) && l.gap > room + slack {
+        if (pass_possible || bypass_possible) && !(me.serves_stops() && l.at_stop) && l.gap > room + slack {
             let dist = (l.gap - room).max(0.0);
             let need_brake = v * v / (2.0 * dist.max(0.1));
             if need_brake <= dp.comfort_brake * 1.5 {
@@ -1281,7 +1334,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if me.passing.is_none() && st.change.is_none() {
         if let Some(bay) = me.external.bay {
             out.lateral = Some(bay);
-        } else if !me.is_bus() {
+        } else if !me.serves_stops() {
             out.lateral = Some(p.kerb_swerve.unwrap_or(0.0));
             // [round 5 L3] easing past people beside the lane: gently, as a car edging out
             if p.people_swerve && v < 3.0 && out.accel_cap.is_none() {
@@ -1304,8 +1357,32 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if !st.route.is_empty() && st.route_index + 1 >= st.route.len() && st.planned_next.is_none() {
         let end = lane.length() - st.s - 0.5;
         let dead_end = lane.next.is_empty() && lane.kind == omsi_sim::traffic::LaneKind::Street;
-        if end < 150.0 && me.external.stop_at.is_none() && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
+        // ([fix pass 3, 10] nor where the stop it is asked for lies beyond the end of its
+        // route: the route's next part is not loaded yet, it waits at the end - a bus whose
+        // stop lay 76 m past its route's end drove off it, x10 case11 #18542)
+        let stop_beyond = me.external.stop_at.is_none_or(|sa| sa > end + st.front + 0.5);
+        if end < 150.0 && stop_beyond && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
             min_stop(&mut out.stop, &mut out.why, Some(end.max(0.0)), Why::End);
+        }
+    }
+
+    // 11. [fix pass 3, 2] keep the box clear, on every aspect (SUMO's no-block heuristic,
+    //     sumo.md §2): a car short of its junction's lit line does not cross it while where it
+    //     would come to rest - its stop (people, a refusal) or behind a lead standing or coming
+    //     to rest - lies between the line and the way's exit from the box; it holds at the line,
+    //     pulled back before a crossing there (viz5 case05 #16535 crossed on green into a box
+    //     its people stop lay in and stood 2.8 m in, over the crossing)
+    if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
+        let line = sig.dist;
+        if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 {
+            let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
+            let rest = [out.stop, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
+            let exit = j.entry + j.way_len;
+            if rest > line + 0.5 && rest < exit {
+                let hold = pulled_back(&walk_bands(net, sim, j), me, line);
+                out.stop = Some(hold);
+                out.why = Why::ExitFull;
+            }
         }
     }
 

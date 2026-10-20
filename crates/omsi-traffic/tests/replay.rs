@@ -217,7 +217,7 @@ fn lights_people_parked_cars_and_new_lanes_replay_too() {
 #[test]
 fn a_header_reads_back_as_it_was_written() {
     let (net, lights) = signalled_junction();
-    let h = Header { version: omsi_traffic::record::VERSION, map: "test".into(), left_hand: false, lanes: net.lanes.clone(), lights, started_day_time: 8.0 * 3600.0, trigger: None, derived: None, switches: None };
+    let h = Header { version: omsi_traffic::record::VERSION, map: "test".into(), left_hand: false, lanes: net.lanes.clone(), lights, started_day_time: 8.0 * 3600.0, trigger: None, derived: None, switches: None, rules: None };
     let text = serde_json::to_string(&h).expect("written");
     let back: Header = serde_json::from_str(&text).expect("read");
     assert_eq!(serde_json::to_string(&back).expect("written again"), text);
@@ -474,33 +474,57 @@ fn fixture(name: &str) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// A free run of a game recording made under the current rules must be the recording: the
-/// first 30 s of a fixture (`cargo test --release -p omsi-traffic --test replay free_run --
-/// --nocapture`; skipped when the fixture is not on this machine, or was made under other
-/// rules and cannot reproduce bit-exactly).
+/// A free run of a recording made under the current rules must be the recording: the first
+/// 30 s of it (`cargo test --release -p omsi-traffic --test replay free_run -- --nocapture`).
+/// [round 7 E1] Always a format-4 recording made here under the current rules (a signalled
+/// junction, a stream, a player standing by: the gate the game fixtures, all of formats
+/// before 4, can no longer be); and a game fixture too when one on this machine was made
+/// under the current rules.
 #[test]
 fn a_free_run_reproduces_a_game_recording_made_under_the_current_rules() {
+    let (net, lights) = signalled_junction();
+    let mut cars = Vec::new();
+    for k in 0..4 {
+        cars.push(car(10 + k, 0, 150.0 - 30.0 * k as f32, 13.0));
+        cars.push(car(20 + k, 3, 150.0 - 25.0 * k as f32, 10.0));
+    }
+    let path = temp("gate");
+    let mut hook = |t: f32, _: &mut Network, sim: &mut Simulation, _: &mut Vec<Vehicle>, _: &mut Recorder| {
+        sim.players = vec![PlayerView { id: 0, pos: DVec3::new(6.0, -40.0, 0.0), heading: 180.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: t, blinker: 0, signalling: 0.0, priority: false }];
+    };
+    record(net, lights, cars, 40.0, &path, &mut hook);
+    let r = Replay::load(&path).expect("the fixture reads");
+    assert_eq!(r.header.version, 4);
+    assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
+    free_run_reproduces(r, "the format-4 fixture");
+    let _ = std::fs::remove_file(&path);
     let Some(path) = fixture("case01-0811.rec") else {
-        eprintln!("no fixture case01-0811.rec: skipped");
+        eprintln!("no game fixture case01-0811.rec: only the format-4 one");
         return;
     };
-    let mut r = Replay::load(&path).expect("the fixture reads");
+    let r = Replay::load(&path).expect("the fixture reads");
     if let Some(why) = omsi_traffic::replay::other_rules(&r.header) {
-        eprintln!("{} was made under other rules ({why}): skipped", path.display());
+        eprintln!("{} was made under other rules ({why}): only the format-4 one", path.display());
         return;
     }
+    free_run_reproduces(r, "case01");
+}
+
+/// The first 30 s of a free run of `r` from its first keyframe stay within 1 cm of it, with
+/// nobody missing.
+fn free_run_reproduces(mut r: Replay, name: &str) {
     r.free_run = true;
     assert!(r.at(0));
     let t0 = r.sim.time;
     r.run_until(t0 + 30.0);
-    assert!(r.divergence.len() >= 5, "{} keyframes compared", r.divergence.len());
+    assert!(r.divergence.len() >= 5, "{name}: {} keyframes compared", r.divergence.len());
     let worst = r.divergence.iter().map(|d| d.1).fold(0.0f32, f32::max);
-    println!("free run, first 30 s of case01: {} keyframes, worst {:.4} m, {} vehicles missing", r.divergence.len(), worst, r.missing.len());
+    println!("free run, first 30 s of {name}: {} keyframes, worst {:.4} m, {} vehicles missing", r.divergence.len(), worst, r.missing.len());
     for (t, ds, id) in &r.divergence {
         println!("  {:6.1} s: {ds:.4} m (vehicle {id})", t - t0);
     }
-    assert!(worst < 0.01, "the free run drifted {worst:.3} m from the game in 30 s: {:?}", r.worst());
-    assert!(r.missing.is_empty(), "{:?}", r.missing.first());
+    assert!(worst < 0.01, "{name}: the free run drifted {worst:.3} m from the recording in 30 s: {:?}", r.worst());
+    assert!(r.missing.is_empty(), "{name}: {:?}", r.missing.first());
 }
 
 /// The claim standing hysteresis (`Vehicle::claim_standing`) is the
@@ -562,9 +586,10 @@ fn a_vehicle_without_the_standing_mark_reads_as_not_standing() {
     assert!(!old.claim_standing);
 }
 
-/// The header names the rules the game ran with (`record::RULES`), for information; the
-/// replay runs with the current rules whatever it says, and knows a recording made under
-/// others (format 1, or a switch list without all of them) for one it cannot reproduce.
+/// [round 7 E1] The header names the rules the game ran with by their hash
+/// (`record::rules_hash`, format 4); the replay runs with the current rules whatever it says,
+/// and knows a recording made under others (another hash, none, or a format before 4) for one
+/// it cannot reproduce.
 #[test]
 fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     let (net, lights) = signalled_junction();
@@ -574,18 +599,16 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     let r = Replay::load(&path).expect("the recording reads");
     let _ = std::fs::remove_file(&path);
     assert_eq!(r.header.version, omsi_traffic::record::VERSION);
+    assert_eq!(r.header.version, 4);
     assert_eq!(r.header.switches.as_deref(), Some(omsi_traffic::record::RULES));
+    assert_eq!(r.header.rules, Some(omsi_traffic::record::rules_hash()));
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
-    // what the switches were once: a list with all of them on (`all` too) is the current rules
-    let with = |v: u32, l: Option<&str>| Header { version: v, switches: l.map(str::to_string), ..r.header.clone() };
-    let current = omsi_traffic::record::RULES.replace(',', ", ") + ",pass_room";
-    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some(&current))), None);
-    // (round 4: the round-3 list lacks the junction rules added since)
-    assert!(omsi_traffic::replay::other_rules(&with(2, Some("signal_foes, stub_links,competitor_filter,pass_room"))).is_some_and(|w| w.contains("lights_first")));
-    assert_eq!(omsi_traffic::replay::other_rules(&with(2, Some("all"))), None);
-    // ... and one without some, or none recorded, or format 1, was made under other rules
-    assert!(omsi_traffic::replay::other_rules(&with(2, Some("competitor_filter,signal_foes"))).is_some_and(|w| w.contains("stub_links")));
-    assert!(omsi_traffic::replay::other_rules(&with(2, Some(""))).is_some());
+    let with = |v: u32, rules: Option<&str>| Header { version: v, rules: rules.map(str::to_string), ..r.header.clone() };
+    // another hash, none, or a format before 4 (whatever its switch list says): other rules
+    assert!(omsi_traffic::replay::other_rules(&with(4, Some("0123456789abcdef"))).is_some_and(|w| w.contains("0123456789abcdef")));
+    assert!(omsi_traffic::replay::other_rules(&with(4, None)).is_some());
+    let now = omsi_traffic::record::rules_hash();
+    assert!(omsi_traffic::replay::other_rules(&with(3, Some(&now))).is_some());
     assert!(omsi_traffic::replay::other_rules(&with(2, None)).is_some());
     assert!(omsi_traffic::replay::other_rules(&with(1, None)).is_some());
     // a replay of one runs with the current rules all the same (here, with no rule the
@@ -594,4 +617,33 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     assert!(old.at(0));
     while old.step() {}
     assert!(old.divergence.len() >= 2 && old.divergence.iter().all(|d| d.1 == 0.0), "{:?}", old.divergence);
+}
+
+/// [round 7 E2] A free run lays the game's stop from its own vehicle: a car the game stops at
+/// x = 150 (its `External::stop_at` counted from where the game had it), 10 m behind the game
+/// in the run after the first frame, still stops at x = 150, not 10 m short of it.
+#[test]
+fn a_free_run_keeps_the_games_stop_where_it_lies() {
+    let net = priority_junction();
+    let cars = vec![car(1, 0, 60.0, 10.0)];
+    let path = temp("stop");
+    let mut hook = |_: f32, _: &mut Network, _: &mut Simulation, cars: &mut Vec<Vehicle>, _: &mut Recorder| {
+        if let Some(c) = cars.first_mut() {
+            c.external.stop_at = Some(150.0 - c.state.s);
+        }
+    };
+    record(net, vec![], cars, 25.0, &path, &mut hook);
+    let mut r = Replay::load(&path).expect("reads");
+    let _ = std::fs::remove_file(&path);
+    r.free_run = true;
+    assert!(r.at(0));
+    // (a frame in step with the game: the stop is laid then; the run then falls behind)
+    assert!(r.step());
+    let v = r.vehicles.iter_mut().find(|v| v.id == 1).expect("the car");
+    v.state.s -= 10.0;
+    v.state.odometer -= 10.0;
+    while r.step() {}
+    let v = r.vehicles.iter().find(|v| v.id == 1).expect("the car");
+    let front = v.state.s + v.state.front;
+    assert!(v.state.speed < 0.1 && (front - 150.0).abs() < 2.0, "stood with its front at {front:.1} (speed {:.1})", v.state.speed);
 }

@@ -201,6 +201,31 @@ fn left_e(path: u16) -> omsi_sim::traffic::Lane {
     l
 }
 
+/// Send `v` into the first way flagged `turn` (1 left, 2 right) along its road (the only way
+/// on until a fork offers it), and plan on from there.
+fn wish(v: &mut Vehicle, net: &Network, turn: i32) {
+    let mut way: Vec<usize> = Vec::new();
+    let mut at = v.state.lane;
+    loop {
+        let next = &net.lanes[at].next;
+        let n = next.iter().copied().find(|&n| net.lanes[n].turn == turn);
+        match (n, next.as_slice()) {
+            (Some(n), _) => {
+                way.push(n);
+                break;
+            }
+            (None, [only]) => {
+                way.push(*only);
+                at = *only;
+            }
+            _ => panic!("no way with that turn"),
+        }
+    }
+    v.state.planned_next = Some(way[0]);
+    v.state.ahead = way[1..].to_vec();
+    v.state.plan_next(net);
+}
+
 fn car(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
     let mut st = AiState::new(lane, s, id);
     st.speed = speed;
@@ -483,8 +508,7 @@ fn fork_run(turn_first: bool) -> (Option<f32>, Run, f32, f32) {
     // stream: 31 cars 25 m apart at 13 m/s (60 s)
     let mut cars: Vec<Vehicle> = (0..31u64).map(|k| car(10 + k, 6, 1350.0 - 25.0 * k as f32, 13.0)).collect();
     let mut me = car(1, 0, 400.0, 11.0);
-    me.state.turn_wish = 1;
-    me.state.plan_next(&net);
+    wish(&mut me, &net, 1);
     cars.push(me);
     let (mut frames, mut entered_turn, mut my_brake, mut stream_brake) = (0, None, 0.0f32, 0.0f32);
     let r = run(&net, &mut sim, &mut cars, 75.0, |t, _, cars| {
@@ -525,8 +549,7 @@ fn f2_a_left_turner_facing_a_stream_for_90_s_never_goes_into_it() {
     let mut cars: Vec<Vehicle> = (0..53u64).map(|k| car(10 + k, 6, 1350.0 - 25.0 * k as f32, 13.0)).collect();
     // the remaining stream on the oncoming exit and beyond will not matter
     let mut me = car(1, 0, 520.0, 8.0);
-    me.state.turn_wish = 1;
-    me.state.plan_next(&net);
+    wish(&mut me, &net, 1);
     cars.push(me);
     let (mut frames, mut entered, mut stream_brake, mut longest_wait) = (0, None, 0.0f32, 0.0f32);
     let mut wait = 0.0f32;
@@ -582,16 +605,12 @@ fn f3_two_left_turners_facing_each_other() {
     for offset in [0.0f32, 1.0, 3.0] {
         let mut sim = Simulation::new(&net, vec![]);
         let mut a = car(1, 0, 300.0, 10.0);
-        a.state.turn_wish = 1;
-        a.state.plan_next(&net);
+        wish(&mut a, &net, 1);
         let mut b = car(2, 3, 300.0 - offset, 10.0);
-        b.state.turn_wish = 1;
-        b.state.plan_next(&net);
+        wish(&mut b, &net, 1);
         // a straight car behind each turner
-        let mut c = car(3, 0, 280.0, 10.0);
-        c.state.turn_wish = 0;
-        let mut d = car(4, 3, 280.0 - offset, 10.0);
-        d.state.turn_wish = 0;
+        let c = car(3, 0, 280.0, 10.0);
+        let d = car(4, 3, 280.0 - offset, 10.0);
         let mut cars = vec![a, b, c, d];
         let (mut frames, mut done) = (0, [None; 2]);
         let r = run(&net, &mut sim, &mut cars, 60.0, |t, _, cars| {
@@ -633,8 +652,7 @@ fn f3b_a_left_turner_with_a_straight_car_behind_it_and_nothing_else() {
     eprintln!("F3b left turn foes (lane, kind, mine, theirs, yields): {:?}", m.foes.iter().map(|f| (net_lane(&js, f.movement), f.kind, f.mine, f.theirs, f.yields)).collect::<Vec<_>>());
     let mut sim = Simulation::new(&net, vec![]);
     let mut a = car(1, 0, 300.0, 10.0);
-    a.state.turn_wish = 1;
-    a.state.plan_next(&net);
+    wish(&mut a, &net, 1);
     let mut b = car(3, 0, 285.0, 10.0);
     b.state.planned_next = Some(3);
     b.state.ahead = vec![4];

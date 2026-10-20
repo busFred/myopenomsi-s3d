@@ -4,7 +4,7 @@
 //! caller's, so the app keeps its own vehicle instances beside them and a test needs
 //! neither.
 
-use crate::driver::{DriverParams, Impatience, VehicleClass};
+use crate::driver::{DriverParams, Impatience, VehicleClass, STANDING_SPEED};
 use crate::junction::Junctions;
 use crate::perception::{self, Perception, Seen};
 use crate::plan::{self, Plan, Start, Why};
@@ -141,6 +141,7 @@ impl Passing {
 
 /// What the app tells the planner about this vehicle this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
@@ -182,6 +183,24 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
+/// [round 7 D6] A player's claim names it as `Decision::wait_for` does, `PLAYER_ID_BASE` +
+/// its id (`Claim::vehicle`, `Grant::wait_for`; an AI vehicle's is its index).
+pub fn player_claim(id: u32) -> usize {
+    (PLAYER_ID_BASE + id as u64) as usize
+}
+
+/// The player id a claim's vehicle names (`player_claim`), None for an AI vehicle's index.
+pub fn claim_player(vehicle: usize) -> Option<u32> {
+    (vehicle as u64).checked_sub(PLAYER_ID_BASE).map(|k| k as u32)
+}
+
+/// [round 7 D6] A body `lateral` metres off the axis of `lane`, `half_width` to either side,
+/// is wholly beside the lane by more than `PARKED_CLEAR` (`player_parked_beside`; perception's
+/// exit room, which counts a player there as off the lane).
+pub fn beside_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
+    lateral.abs() - half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
+}
+
 /// The lane a player's vehicle goes on into from `lane`: the only one, or at a fork the one
 /// its indicator points to (the furthest turn that way, a lane flagged with that turn first),
 /// else the straightest (a lane without a turn flag first).
@@ -209,8 +228,11 @@ fn player_next(net: &Network, lane: usize, blinker: u8) -> Option<usize> {
     })
 }
 
-/// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres.
+/// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres. (Read from
+/// a recording, a field it lacks takes `Vehicle::default()`'s, and a driver field its class's
+/// preset - `DriverParams::fill_missing`, `record::VERSION`'s rule.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Vehicle {
     pub id: u64,
     pub class: VehicleClass,
@@ -222,21 +244,31 @@ pub struct Vehicle {
     pub stopped: f32,
     /// (odometer at the last progress, seconds without any).
     pub progress: (f32, f32),
-    /// A random car that stood too long: leaves once out of sight.
+    /// A random vehicle that stood `GIVE_UP_UNSEEN` held by nothing: it asks to be taken off
+    /// the road once out of sight. The crate sets it and clears it when the vehicle moves
+    /// again (`Vehicle::give_up_clock`); a timetable bus's is the app's.
     pub gone: bool,
+    /// [round 7 B1] Its waiting time, as SUMO counts it for `--time-to-teleport` (s): it runs
+    /// while the vehicle stands (`UNHELD_SPEED`) whatever holds it but a red light and its own
+    /// stop, which pause it; it restarts only when the vehicle moves (`give_up_clock`). The
+    /// app's removals read this clock.
+    #[serde(default, alias = "held_by_nothing")]
+    pub waiting: f32,
     /// Just put on the road: its speed is trimmed to what is ahead.
     pub fresh: f32,
     /// Seconds before a car leaving a parking space moves.
     pub pull_out: f32,
     pub passing: Option<Passing>,
-    /// Past the line on green/yellow: goes through on red too.
-    pub amber: Option<(usize, usize)>,
+    /// [round 7 fix pass 1] The decision taken at the amber onset of the light ahead:
+    /// (controller, light), through or stop, and the odometer reading at its line
+    /// (`plan::light_call`, SUMO's yellow rule). Gone when that light is no longer ahead or
+    /// turns green.
+    #[serde(default)]
+    pub light_decision: Option<((usize, usize), bool, f32)>,
     pub external: External,
     pub last: Decision,
     /// Id of the vehicle followed last frame.
     pub lead_id: Option<u64>,
-    /// (vehicle id, time until) a lead is ignored to break a mutual wait.
-    pub ignore_lead: Option<(u64, f64)>,
     /// Indicator shown, and since when (debounced).
     pub blinker_shown: (i32, f64),
     /// World position of the origin and heading (degrees), from the way.
@@ -253,9 +285,6 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
-    /// With `amber`: the odometer reading at the line it marks.
-    #[serde(default)]
-    pub amber_line: Option<f32>,
     /// The zipper merge it last went first at: (the merge, its piece there, the time). The
     /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
     /// from these, so a keyframe restores it.
@@ -280,6 +309,38 @@ pub struct Vehicle {
     #[serde(default)]
     pub ease_for: Option<(u64, usize, f32)>,
 }
+
+/// [round 7 A9] A player's pulling away (m/s²) before it is measured
+/// (`Simulation::measure_players`: the figure its claims used as a constant, between a bus
+/// preset's 1.0 and a car's 1.8), the floor of the estimate, and how long (s) a measured
+/// acceleration takes to fade back to it.
+pub const PLAYER_ACCEL: f32 = 1.2;
+pub const PLAYER_ACCEL_MIN: f32 = 0.6;
+pub const PLAYER_ACCEL_MEMORY: f32 = 20.0;
+/// The gap (s) a player's claim names: the player's grant is never read (its driver decides),
+/// so it stands for the car driver's preset `gap_accept` (`DriverParams::preset`).
+pub const PLAYER_GAP: f32 = 4.0;
+
+/// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
+/// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
+/// and how far ahead it looks for one (`perception::junction_ahead`).
+pub fn claim_horizon(speed: f32) -> f32 {
+    omsi_sim::traffic::claim_horizon(speed)
+}
+
+/// [ROLLBACK r4d-B4] A timetable bus creeping up to its stop slower than this (m/s) has not
+/// moved off: its standing time (`Vehicle::stopped`) runs on (`STANDING_SPEED` would reset
+/// it in a 0.3-0.4 m/s creep).
+pub const CREPT_OFF_SPEED: f32 = 0.5;
+
+/// [round 7 B1] A random vehicle whose waiting time (`Vehicle::waiting`) reaches this (s)
+/// gives up (`Vehicle::gone`): five minutes, SUMO's default `--time-to-teleport` of 300 s for
+/// a vehicle that waited too long - in a jam, at a yield, blocked (sumo.md 5.3,
+/// https://sumo.dlr.de/docs/Simulation/Why_Vehicles_are_teleporting.html).
+pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
+/// Faster than this (m/s) a vehicle is moving: its waiting time restarts and a vehicle that
+/// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
+pub const UNHELD_SPEED: f32 = 0.1;
 
 /// Two vehicles holding each other at a junction where they have a meeting place negotiate:
 /// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
@@ -343,8 +404,8 @@ pub const PLAYER_LINE_PAST: f32 = 0.5;
 /// Seconds a player stands before it counts as held where it is: blocked to the junction
 /// claim (`Claim::blocked`), parked when beside the lane (`Simulation::player_parked_beside`).
 pub const PLAYER_STILL: f32 = 2.0;
-/// A standing player whose body is this far (m) clear of the lane's edge makes no junction
-/// claim: what a car keeps off a kerb (`perception::KERB_CLEAR`).
+/// A standing player whose body is this far (m) clear of the lane's edge is parked beside
+/// the lanes and makes no junction claim (`beside_lane`; x10 case10).
 pub const PARKED_CLEAR: f32 = 0.3;
 
 /// The lateral offset (m, right positive) of player `p` from lane `lane` at `s` along it.
@@ -387,6 +448,16 @@ fn offset_left(v: &Vehicle) -> bool {
 /// done in place, or given up (`AiState::settle_change`).
 pub const FROZEN_CHANGE: f32 = 5.0;
 
+impl Default for Vehicle {
+    /// A car standing on lane 0 (`Vehicle::new`), its driver unknown (`DriverParams::default`,
+    /// filled from the class's preset on reading): what a field a recording lacks is read as.
+    fn default() -> Vehicle {
+        let mut v = Vehicle::new(0, VehicleClass::Car, AiState::default(), 0.9, 1);
+        v.params = DriverParams::default();
+        v
+    }
+}
+
 impl Vehicle {
     pub fn new(id: u64, class: VehicleClass, state: AiState, half_width: f32, seed: u64) -> Vehicle {
         let mut state = state;
@@ -402,20 +473,19 @@ impl Vehicle {
             stopped: 0.0,
             progress: (0.0, 0.0),
             gone: false,
+            waiting: 0.0,
             fresh: 1.5,
             pull_out: 0.0,
             passing: None,
-            amber: None,
+            light_decision: None,
             external: External::default(),
             last: Decision::default(),
             lead_id: None,
-            ignore_lead: None,
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
             claim_standing: false,
             passed_on_go: None,
-            amber_line: None,
             zip_won: None,
             change_still: (0.0, 0.0),
             mutual: None,
@@ -438,13 +508,49 @@ impl Vehicle {
         Obb::vehicle(self.pos.truncate(), self.heading as f64, self.state.front as f64, self.state.rear as f64, self.half_width as f64)
     }
 
-    /// Standing still, held by something.
-    pub fn is_held(&self) -> bool {
-        self.state.speed < 0.3 && self.last.held
+    /// [round 7 B1] The give-up clock, after this frame's decision (`last`), SUMO's waiting
+    /// time: standing (not faster than `UNHELD_SPEED`) it runs, whatever holds the vehicle -
+    /// a yield, a jam, a body, people, a lead standing for good, a mutual refusal, nothing
+    /// (SUMO's "blocked") - but a red light and its own stop, which pause it; moving, it
+    /// restarts. A random vehicle whose clock passes `GIVE_UP_UNSEEN` gives up (`gone`) - a
+    /// gridlock or a mutual refusal too, a 200 s red not - and is back in the traffic once it
+    /// moves. The app reads this clock (`Vehicle::waiting`) for its removals, no other. (Two
+    /// differences from SUMO: it counts only the vehicle first in line before a junction and
+    /// names no red-light pause; this runs for every standing car of a queue and pauses at
+    /// red.)
+    pub fn give_up_clock(&mut self, dt: f32) {
+        let d = &self.last;
+        let moving = self.state.speed > UNHELD_SPEED;
+        let counts = d.why != Why::Light && !self.external.at_stop;
+        if moving {
+            self.waiting = 0.0;
+        } else if counts {
+            self.waiting += dt;
+        }
+        if self.serves_stops() || self.is_rail() {
+            return;
+        }
+        if moving {
+            self.gone = false;
+        } else if self.waiting > GIVE_UP_UNSEEN {
+            self.gone = true;
+        }
     }
 
-    pub fn is_bus(&self) -> bool {
-        self.class.is_bus()
+    /// Standing still, held by something.
+    pub fn is_held(&self) -> bool {
+        self.state.speed < STANDING_SPEED && self.last.held
+    }
+
+    /// [round 7 A4] A timetable bus (`VehicleClass::serves_stops`).
+    pub fn serves_stops(&self) -> bool {
+        self.class.serves_stops()
+    }
+
+    /// A heavy vehicle: any bus or a truck (`VehicleClass::heavy`); a random heavy vehicle
+    /// is `heavy() && !serves_stops()`.
+    pub fn heavy(&self) -> bool {
+        self.class.heavy()
     }
 
     pub fn is_rail(&self) -> bool {
@@ -478,8 +584,11 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
+    /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
+    /// speed last frame, the estimate).
+    pub player_pull: Vec<(u32, f32, f32)>,
     pub people: Vec<Person>,
-    /// Pedestrians on footpath lanes: (lane, distance), for push buttons and zebras.
+    /// Pedestrians on footpath lanes: (lane, distance), for push buttons.
     pub walkers: Vec<(usize, f32)>,
     pub parked: HashMap<usize, Vec<Parked>>,
     pub occupancy: HashMap<usize, Vec<Occupant>>,
@@ -521,6 +630,7 @@ impl Simulation {
             day_time: 0.0,
             time_scale: 1.0,
             players: Vec::new(),
+            player_pull: Vec::new(),
             people: Vec::new(),
             walkers: Vec::new(),
             parked: HashMap::new(),
@@ -671,6 +781,33 @@ impl Simulation {
         }
     }
 
+    /// [round 7 A9] Measure each player's pulling away: the hardest acceleration it showed,
+    /// easing back towards `PLAYER_ACCEL` over `PLAYER_ACCEL_MEMORY` s, never under
+    /// `PLAYER_ACCEL_MIN`. A player not seen before starts at `PLAYER_ACCEL`.
+    fn measure_players(&mut self, dt: f32) {
+        let ease = (dt / PLAYER_ACCEL_MEMORY).clamp(0.0, 1.0);
+        let mut next: Vec<(u32, f32, f32)> = Vec::with_capacity(self.players.len());
+        for p in &self.players {
+            let est = match self.player_pull.iter().find(|q| q.0 == p.id) {
+                Some(&(_, last, est)) if dt > 0.0 => {
+                    let a = (p.speed.abs() - last.abs()) / dt;
+                    let eased = est + (PLAYER_ACCEL - est) * ease;
+                    // (a jump of the speed - a teleport, a reset - is no acceleration)
+                    if a <= omsi_sim::traffic::MAX_BRAKE { eased.max(a) } else { eased }
+                }
+                Some(&(_, _, est)) => est,
+                None => PLAYER_ACCEL,
+            };
+            next.push((p.id, p.speed, est.max(PLAYER_ACCEL_MIN)));
+        }
+        self.player_pull = next;
+    }
+
+    /// The pulling away (m/s²) of the player with id `id` as measured (`measure_players`).
+    pub fn player_accel(&self, id: u32) -> f32 {
+        self.player_pull.iter().find(|q| q.0 == id).map(|q| q.2).unwrap_or(PLAYER_ACCEL)
+    }
+
     /// The light that governs footpath lane `lane`: its own, else that of the pedestrian
     /// crossing it is a piece of.
     pub fn crossing_light(&self, net: &Network, lane: usize) -> Option<(usize, usize)> {
@@ -729,7 +866,7 @@ impl Simulation {
     /// 9 cars 106 s.)
     fn player_parked_beside(net: &Network, lane: usize, s: f32, p: &PlayerView) -> bool {
         let lateral = player_lateral(net, lane, s, p);
-        p.still > PLAYER_STILL && p.speed.abs() < 0.3 && lateral.abs() - p.half_width > net.lanes[lane].width * 0.5 + PARKED_CLEAR
+        p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && beside_lane(net, lane, lateral, p.half_width)
     }
 
     fn update_lights(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
@@ -800,6 +937,7 @@ impl Simulation {
         self.removed.clear();
         self.changes_started.clear();
         self.held_at_red = 0;
+        self.measure_players(dt);
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
@@ -815,7 +953,6 @@ impl Simulation {
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
         // the line each vehicle has passed on green or yellow, written back with them
         let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
-        let mut stale_amber: Vec<usize> = Vec::new();
         for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
             let passed = p.junction.as_ref().and_then(|j| {
                 let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
@@ -829,30 +966,12 @@ impl Simulation {
             if passed != v.passed_on_go {
                 passed_now.push((i, passed));
             }
-            // the mark of a line taken on green or yellow (`Vehicle::amber`) is for that line:
-            // gone once neither the light ahead nor the junction's light is that light, or once
-            // the car is past that line and a line of the same light lies ahead (it stayed on
-            // after the junction, and the next approach under the same signal group went over
-            // its red on it: viz3 case01, light 1.0 lights three approaches)
-            if let Some(a) = v.amber {
-                let ahead = p.signal.filter(|s| (s.ctl, s.light) == a);
-                let here = p.junction.as_ref().and_then(|j| j.light).map(|(c, l, _)| (c, l));
-                let left = ahead.is_none() && here != Some(a);
-                let another = ahead.is_some_and(|s| s.dist > v.state.front + 0.5) && v.amber_line.is_some_and(|at| v.state.odometer > at + v.length() + 1.0);
-                // (or the line ahead lies further than a mark is ever taken at this speed:
-                // `plan::light_call`, a yellow within "comfortable", kept 6 m beyond it)
-                let comfortable = v.state.speed * v.state.speed / (2.0 * v.params.comfort_brake * 1.4) + 1.0;
-                let far = ahead.is_some_and(|s| s.dist - v.state.front > comfortable + 6.0);
-                if left || another || far {
-                    stale_amber.push(i);
-                }
-            }
             let Some(j) = p.junction.as_ref() else { continue };
             let st = &v.state;
-            // a claim is filed from eight seconds before the meeting place (at least 60 m,
-            // at most 220 m): the drivers who give way to this one see it coming in time
-            // to stop, not only once it is a braking distance from its own line
-            let horizon = (8.0 * st.speed + 30.0).clamp(60.0, 220.0);
+            // a claim is filed from `claim_horizon` before the meeting place: the drivers who
+            // give way to this one see it coming in time to stop, not only once it is a
+            // braking distance from its own line
+            let horizon = claim_horizon(st.speed);
             if !j.inside && j.conflict_start - st.front > horizon {
                 continue;
             }
@@ -869,8 +988,8 @@ impl Simulation {
             let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
             let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
             let room = next - st.front - 0.6;
-            let brake = if j.inside { st.decel * 1.5 } else { omsi_sim::traffic::MAX_BRAKE * 0.7 };
-            let cannot_stop = st.speed > 1.0 && room < st.speed * st.speed / (2.0 * brake);
+            let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
+            let cannot_stop = plan::cannot_stop(st.speed, room, brake);
             let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
@@ -886,13 +1005,17 @@ impl Simulation {
                 // `JunctionView::clears_past`, and the car standing there is held by it, not
                 // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
                 // committed to the cars waiting for it)
-                Some(sig) if (sig.dist <= light_line + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // ([fix pass 2, 1b] and any light that holds the claimant before its first
+                // meeting place, whatever the object's line: the light belongs to the claim -
+                // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
+                // `light_red false` for j783 and two cars stood refused for it 28 m apart)
+                Some(sig) if (sig.dist <= light_line.max(j.conflict_start) + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
-                    // call (too late to stop, the yellow it takes), or the mark of one
-                    // that took the line on green or yellow and is close to it (queued
-                    // there, it goes on as soon as its leader moves, whatever the light)
+                    // call (too late to stop, the yellow it takes), or one
+                    // committed at amber onset and still rolling (`plan::light_call`; one
+                    // standing at its red waits for its green and files `light_red`)
                     let call = plan::light_call(v, p, &sig);
-                    let through = call.go || call.marked_through;
+                    let through = call.go;
                     if through {
                         (false, None)
                     } else {
@@ -909,7 +1032,7 @@ impl Simulation {
             // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
             let was_standing = v.claim_standing;
-            standing_now.push((i, st.speed < 0.3 || (was_standing && st.speed <= 1.0)));
+            standing_now.push((i, st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0)));
             claim_of[i] = Some(claims.len());
             claims.push(Claim {
                 chain: j.chain.clone(),
@@ -929,37 +1052,35 @@ impl Simulation {
                 v_max: limit.min(st.max_speed_kmh / 3.6),
                 front: st.front,
                 rear: st.rear,
-                gap: v.impatience.gap(st.accept_gap),
+                gap: v.impatience.gap(v.params.gap_accept),
                 committed,
                 exit_room: j.exit_room,
                 impatience: v.impatience,
                 absolute: v.is_rail() || v.external.priority,
-                held: st.speed < 0.3 && v.last.held,
+                held: v.is_held(),
                 // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                 // answer or a full exit)
-                blocked: st.speed < 0.3 && v.last.held && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
                 // (people or a zebra in front of it, or a lead that stands too: nothing that
                 // lets it go on a schedule, as a light or a lead moving off does)
                 // in the box when its light turned: it clears it (rule F)
                 clearing: j.clearing && !light_red,
-                stuck: st.speed < 0.3
-                    && v.last.held
+                stuck: v.is_held()
                     && match v.last.why {
                         Why::People | Why::Zebra => true,
-                        Why::Lead => p.leader.is_some_and(|l| l.speed < 0.3 && l.gap < 12.0),
+                        Why::Lead => p.leader.is_some_and(|l| l.speed < STANDING_SPEED && l.gap < 12.0),
                         _ => false,
                     },
-                red_hysteresis: was_standing,
                 lanes: perception::way_lanes(net, st, 150.0),
                 light: j.light.map(|(c, l, _)| (c, l)),
                 id: v.id,
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
-                clear_ahead: [p.people_stop, p.zebra_stop, p.leader.filter(|l| l.speed < 0.3).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                 // (held by its service, or standing `FAR_FOE_STOOD` s or more)
                 // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
                 // from its first frame, review-r6j)
-                standing_long: st.speed < 0.3 && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
+                standing_long: st.speed < STANDING_SPEED && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
                 brake,
             });
         }
@@ -970,9 +1091,9 @@ impl Simulation {
         // AI vehicle: a claim of the first piece alone never met the oncoming left turner
         // on the piece after it, viz3 case11); off the lanes, the junction on the lanes
         // starting ahead of it, on its first piece
-        for (k, p) in self.players.iter().enumerate() {
+        for p in self.players.iter() {
             let v = p.speed.max(0.0);
-            let horizon = (8.0 * v + 30.0).clamp(60.0, 220.0);
+            let horizon = claim_horizon(v);
             // the way: (lane, distance from the vehicle's origin to the lane's start)
             let mut way: Vec<(usize, f32)> = Vec::new();
             if let Some((lane, s)) = self.player_lane(net, p) {
@@ -1032,6 +1153,10 @@ impl Simulation {
             });
             let Some((j, chain, s_on)) = hit else { continue };
             let Some(&(m, _)) = chain.first() else { continue };
+            // (the road's limit where it drives, as an AI claim's: the lane it is on, else the
+            // junction's piece it heads for)
+            let road_limit = way.first().map(|w| w.0).unwrap_or(self.junctions.nodes[j].movements[m].lane);
+            let road_limit = net.lanes.get(road_limit).map(|l| l.speed_limit_kmh / 3.6).unwrap_or(13.0);
             // where its meeting places begin along the way through (the end of the way when
             // it meets nobody), and the next one its front has not entered
             let foes = self.junctions.foes_along(j, &chain);
@@ -1044,7 +1169,7 @@ impl Simulation {
             }
             let next_ahead = foes.iter().map(|f| f.mine.0).filter(|&m0| m0 - front_at > 0.5).fold(f32::INFINITY, f32::min);
             let room = if next_ahead.is_finite() { next_ahead } else { cs } - front_at - 0.6;
-            let cannot_stop = v > 1.0 && room < v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.7);
+            let cannot_stop = plan::cannot_stop(v, room, plan::HARD_BRAKE);
             let committed = (next_ahead.is_infinite() && cs - front_at <= 0.5) || cannot_stop;
             // its light, as an AI car's: the first lit lane of its way before the first
             // meeting place, red (or red and yellow) at its line with room to stop there
@@ -1060,7 +1185,8 @@ impl Simulation {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
                     let gap = d - p.half_len;
-                    let can_stop = v < 1.0 || gap > v * v / (2.0 * omsi_sim::traffic::MAX_BRAKE * 0.8) + 0.5;
+                    // (as an AI car's `light_call`)
+                    let can_stop = !plan::cannot_stop(v, gap + 0.5, plan::HARD_BRAKE);
                     if red && can_stop {
                         (Some(lt), true, c.time_until_go(lt.1))
                     } else {
@@ -1072,7 +1198,7 @@ impl Simulation {
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
-            let blocked = p.still > PLAYER_STILL && p.speed.abs() < 0.3 && !light_red;
+            let blocked = p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && !light_red;
             // [round6 J5] standing, its lead: the AI vehicle in its corridor, its box
             // within `PLAYER_LEAD_REACH` ahead of the front and its centre within
             // `PLAYER_LEAD_ACROSS` of the axis (`traffic_cases heads`' queue in front of the
@@ -1081,7 +1207,7 @@ impl Simulation {
             // 1 m behind its tail)
             let player_foes: Vec<usize> = foes.iter().map(|f| f.movement).collect();
             let meets = |k: usize| claim_of[k].is_some_and(|ck| claims[ck].junction == j && !claims[ck].chain.iter().any(|&(cm, _)| cm == m) && claims[ck].chain.iter().any(|&(cm, _)| player_foes.contains(&cm)));
-            let lead = (p.still > PLAYER_STILL && p.speed.abs() < 0.3)
+            let lead = (p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED)
                 .then(|| {
                     let fwd = p.fwd();
                     let right = DVec2::new(fwd.y, -fwd.x);
@@ -1097,7 +1223,7 @@ impl Simulation {
                             // (one moving off from in front of it keeps it as its lead for
                             // `PLAYER_LEAD_AWAY`: refused again 3 m on, it stood and went)
                             let hk = (vehicles[k].heading as f64).to_radians();
-                            let away = vehicles[k].state.speed >= 0.3 && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
+                            let away = vehicles[k].state.speed >= STANDING_SPEED && DVec2::new(hk.sin(), hk.cos()).dot(fwd) > 0.0;
                             let reach = if away { PLAYER_LEAD_AWAY } else { PLAYER_LEAD_REACH };
                             // (wholly ahead of its front, but for half a metre: not a car alongside
                             // in a narrow piece beside it with its front just past the player's)
@@ -1119,16 +1245,16 @@ impl Simulation {
                 light_red,
                 until_go,
                 lead,
-                vehicle: usize::MAX - k,
+                vehicle: player_claim(p.id),
                 junction: j,
                 movement: m,
                 s: s_on,
                 speed: v,
-                accel: 1.2,
-                v_max: 14.0,
+                accel: self.player_accel(p.id),
+                v_max: road_limit,
                 front: p.half_len,
                 rear: p.half_len,
-                gap: 4.0,
+                gap: PLAYER_GAP,
                 committed,
                 exit_room: true,
                 impatience: Impatience::default(),
@@ -1137,14 +1263,13 @@ impl Simulation {
                 blocked,
                 stuck: false,
                 clearing: false,
-                red_hysteresis: false,
                 lanes: way,
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
                 standing_long: false,
-                brake: omsi_sim::traffic::MAX_BRAKE * 0.7,
+                brake: plan::HARD_BRAKE,
             });
         }
         for (i, standing) in standing_now {
@@ -1152,10 +1277,6 @@ impl Simulation {
         }
         for (i, passed) in passed_now {
             vehicles[i].passed_on_go = passed;
-        }
-        for i in stale_amber {
-            vehicles[i].amber = None;
-            vehicles[i].amber_line = None;
         }
         // the signal groups the claimants' lights belong to: which pairs never let vehicles
         // in together (worked out once per pair of lights, from the programs)
@@ -1184,7 +1305,7 @@ impl Simulation {
         }
         self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
-        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, net, &claims, &self.signal_groups);
+        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, &claims, &self.signal_groups);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // who went first at a zipper merge: it keeps going first while the two are engaged,
         // and the next tie there is the other side's ([round6 J3] written at the first
@@ -1265,12 +1386,12 @@ impl Simulation {
         let mut timers: Vec<(Option<(u64, f32)>, f32)> = Vec::with_capacity(vehicles.len());
         for v in vehicles.iter() {
             // (both standing: one rolling up to its stop is not held yet)
-            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < 0.3)).filter(|_| v.state.speed < 0.3);
+            let other = [v.last.wait_for, v.last.body_block].into_iter().flatten().find(|&id| by_id.get(&id).is_some_and(|&o| holds(&vehicles[o], v.id) && vehicles[o].state.speed < STANDING_SPEED)).filter(|_| v.state.speed < STANDING_SPEED);
             timers.push(match (other, v.mutual) {
                 (Some(o), Some((p, t))) if p == o => (Some((o, t + dt)), 0.0),
                 (Some(o), _) => (Some((o, dt)), 0.0),
                 // (not seen this frame: kept over a short gap while it stands)
-                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < 0.3 => (Some((p, t + dt)), v.mutual_gap + dt),
+                (None, Some((p, t))) if v.mutual_gap + dt < MUTUAL_GAP && v.state.speed < STANDING_SPEED => (Some((p, t + dt)), v.mutual_gap + dt),
                 (None, _) => (None, 0.0),
             });
         }
@@ -1284,7 +1405,7 @@ impl Simulation {
             if vehicles[a].id > oid || vehicles[a].ease_for.is_some() || vehicles[b].ease_for.is_some() {
                 continue;
             }
-            if vehicles[a].state.speed >= 0.3 || vehicles[b].state.speed >= 0.3 {
+            if vehicles[a].state.speed >= STANDING_SPEED || vehicles[b].state.speed >= STANDING_SPEED {
                 continue;
             }
             // (only at a frame the hold is seen: who is body-blocked is read from this frame)
@@ -1348,7 +1469,7 @@ impl Simulation {
         });
         let return_blocked = self.return_blocked(vehicles, i);
         let settle = if vehicles[i].state.change.is_some() && vehicles[i].change_still.1 + dt > FROZEN_CHANGE { self.settle_choice(net, vehicles, i) } else { None };
-        let wait_for = plan.wait_for.map(|k| if k >= usize::MAX - 64 { PLAYER_ID_BASE + self.players.get(usize::MAX - k).map(|p| p.id as u64).unwrap_or(0) } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
+        let wait_for = plan.wait_for.map(|k| if claim_player(k).is_some() { k as u64 } else { vehicles.get(k).map(|o| o.id).unwrap_or(0) });
         let lead_id = match plan.lead_seen {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
@@ -1356,13 +1477,10 @@ impl Simulation {
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
         v.lead_id = lead_id;
-        if plan.why == Why::Light && v.state.speed < 0.5 {
+        if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
             self.held_at_red += 1;
         }
-        if let Some(light) = plan.amber {
-            v.amber = Some(light);
-            v.amber_line = plan.amber_line.map(|gap| v.state.odometer + gap);
-        }
+        v.light_decision = plan.light_decision.map(|(l, go, gap)| (l, go, v.state.odometer + gap));
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
@@ -1413,7 +1531,7 @@ impl Simulation {
                 let lat = v.state.lateral;
                 if v.state.speed < 0.5 {
                     v.state.lateral_curve.clear();
-                    v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                    v.state.lateral_ramp = (lat, 0.0, odo, omsi_sim::traffic::s_curve_len(lat));
                 } else {
                     let back = (hold - odo - 0.5).clamp(2.0, 8.0);
                     v.state.lateral_curve = vec![(odo, lat), (odo + back, 0.0)];
@@ -1468,7 +1586,7 @@ impl Simulation {
         // a lane change that stands frozen part-way is settled where the body is
         match v.state.change {
             Some(c) => {
-                if v.state.speed >= 0.3 || (c.t - v.change_still.0).abs() > 0.01 {
+                if v.state.speed >= STANDING_SPEED || (c.t - v.change_still.0).abs() > 0.01 {
                     v.change_still = (c.t, 0.0);
                 } else {
                     v.change_still.1 += dt;
@@ -1483,11 +1601,11 @@ impl Simulation {
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
         v.pull_out = (v.pull_out - dt).max(0.0);
-        let standing = v.state.speed < 0.3;
-        // [ROLLBACK r4d-B4] a bus creeping up under 0.5 m/s has not moved off: its standing
-        // time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of its
-        // stop by people served the stop where it stood only after 12.7 s instead of 6)
-        let moving = if v.is_bus() { v.state.speed >= 0.5 } else { !standing };
+        let standing = v.state.speed < STANDING_SPEED;
+        // [ROLLBACK r4d-B4] a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
+        // standing time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of
+        // its stop by people served the stop where it stood only after 12.7 s instead of 6)
+        let moving = if v.serves_stops() { v.state.speed >= CREPT_OFF_SPEED } else { !standing };
         if standing && !v.external.at_stop {
             v.stopped += dt;
         } else if moving {
@@ -1507,15 +1625,12 @@ impl Simulation {
         if !(v.state.speed < 2.0 && !plan.held) {
             v.impatience.update(&v.params, dt, held);
         }
-        if v.stopped > 2.0 {
-            v.amber = None;
-        }
         // a pass runs its course: the bent way brings the car back by itself
         if obstacle_gone {
             // (a pass on its way back in from where it is: the bent way eases the offset off
             // as it drives, held out while a body beside it is in the way, `return_blocked`)
             let (odo, lat) = (v.state.odometer, v.state.lateral);
-            let back = (lat.abs() * 8.0).clamp(8.0, 30.0);
+            let back = omsi_sim::traffic::s_curve_len(lat);
             if let Some(p) = v.passing.as_mut() {
                 *p = Passing { side: lat, until: odo, block: odo, aborted: false, hold: odo, back_len: back, wait: 0.0, obstacle: None, ..*p };
             }
@@ -1534,7 +1649,7 @@ impl Simulation {
             if let Some(lat) = creep.filter(|_| v.state.speed < 0.1) {
                 v.state.lateral_curve.clear();
                 v.state.lateral = lat;
-                v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                v.state.lateral_ramp = (lat, 0.0, v.state.odometer, omsi_sim::traffic::s_curve_len(lat));
             }
         }
         if let Some(p) = v.passing {
@@ -1547,7 +1662,7 @@ impl Simulation {
                         v.state.lateral_curve.clear();
                         v.state.lateral = lat;
                         v.state.lateral_target = 0.0;
-                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                        v.state.lateral_ramp = (lat, 0.0, v.state.odometer, omsi_sim::traffic::s_curve_len(lat));
                     }
                 }
                 if v.state.speed < 0.1 && v.state.lateral.abs() <= SIDESTEP_DONE && (v.state.odometer >= p.hold - 0.3 || v.stopped > 1.0) {
@@ -1560,22 +1675,18 @@ impl Simulation {
                 }
             } else if v.state.odometer >= p.until + p.back_len {
                 v.passing = None;
-            } else if v.stopped > 8.0 && v.state.lateral.abs() < p.side.abs() * 0.5 {
+            } else if v.stopped > plan::PASS_STRANDED && v.state.lateral.abs() < p.side.abs() * 0.5 {
                 // never got out: give it up where it stands (the offset easing off as it drives)
                 v.passing = None;
                 let (odo, lat) = (v.state.odometer, v.state.lateral);
                 v.state.lateral_curve.clear();
                 v.state.lateral_target = 0.0;
-                v.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 8.0).clamp(8.0, 30.0));
+                v.state.lateral_ramp = (lat, 0.0, odo, omsi_sim::traffic::s_curve_len(lat));
             }
         }
-        // a random car that stands for ever asks to be taken away when nobody looks
-        if !v.is_bus() && !v.is_rail() && plan.why != Why::Light {
-            let stood = v.stopped.max(v.progress.1);
-            if (stood > 60.0 && !matches!(plan.why, Why::Junction | Why::ExitFull)) || stood > 150.0 {
-                v.gone = true;
-            }
-        }
+        // a random car that stands held by nothing for minutes asks to be taken away when
+        // nobody looks
+        v.give_up_clock(dt);
         // indicators: what the car does, debounced so a flicker of the plan does not flash
         // (a pass shows the side it moves to from before it pulls out until it is back in its
         // lane: the bent way's offset alone showed the side it would come back to, the right
