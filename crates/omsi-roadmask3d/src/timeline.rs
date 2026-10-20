@@ -147,7 +147,7 @@ impl Timeline {
                         s: v.state.s,
                         why,
                         state: VehicleState::of(why, standing),
-                        lead_id: v.last.lead_id.or(v.lead_id),
+                        lead_id: v.last.lead_id,
                         wait_for: v.last.wait_for,
                         stop_in: v.last.stop,
                         ahead,

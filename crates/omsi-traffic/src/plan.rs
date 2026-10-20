@@ -523,7 +523,7 @@ fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -
         if why != Why::Lead {
             return false;
         }
-        let Some(next) = o.lead_id.and_then(|id| vehicles.iter().position(|v| v.id == id)) else { return false };
+        let Some(next) = o.last.lead_id.and_then(|id| vehicles.iter().position(|v| v.id == id)) else { return false };
         j = next;
     }
     false

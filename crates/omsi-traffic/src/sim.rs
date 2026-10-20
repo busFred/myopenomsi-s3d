@@ -263,8 +263,6 @@ pub struct Vehicle {
     pub light_decision: Option<((usize, usize), bool, f32)>,
     pub external: External,
     pub last: Decision,
-    /// Id of the vehicle followed last frame.
-    pub lead_id: Option<u64>,
     /// Indicator shown, and since when (debounced).
     pub blinker_shown: (i32, f64),
     /// World position of the origin and heading (degrees), from the way.
@@ -466,7 +464,6 @@ impl Vehicle {
             light_decision: None,
             external: External::default(),
             last: Decision::default(),
-            lead_id: None,
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
@@ -1410,8 +1407,8 @@ impl Simulation {
             // cannot go anyway; the hash eased the one in front of a nose-to-tail pair, and it
             // stood `EASE_MAX` for the one behind it, viz case14 #46608/#50444)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].lead_id == Some(idb);
-            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].lead_id == Some(ida);
+            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].last.lead_id == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].last.lead_id == Some(ida);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a
@@ -1455,7 +1452,6 @@ impl Simulation {
         };
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
-        v.lead_id = lead_id;
         if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
             self.held_at_red += 1;
         }

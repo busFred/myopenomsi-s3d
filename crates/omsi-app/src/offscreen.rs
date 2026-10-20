@@ -1346,7 +1346,7 @@ pub(crate) fn run_offscreen(
             );
             if omsi_cfg::env::var_os("OMSI_DEBUG_STUCK").is_some() {
                 for c in t.cars.iter().filter(|c| c.ai.stopped > 30.0) {
-                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.ai.stopped, c.id, c.vehicle.ty.def.type_name, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.ai.lead_id.unwrap_or(0), c.ai.last.why.name(), c.ai.last.stop.unwrap_or(0.0), c.ai.last.wait_for.unwrap_or(0));
+                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.ai.stopped, c.id, c.vehicle.ty.def.type_name, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.ai.last.lead_id.unwrap_or(0), c.ai.last.why.name(), c.ai.last.stop.unwrap_or(0.0), c.ai.last.wait_for.unwrap_or(0));
                 }
             }
             for c in t.cars.iter().filter(|c| c.ai.stopped > 60.0).take(4) {

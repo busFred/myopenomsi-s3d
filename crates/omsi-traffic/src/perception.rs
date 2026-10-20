@@ -513,7 +513,7 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
             return;
         }
         // the one behind that follows me is not my lead
-        if o.lead_id == Some(me.id) {
+        if o.last.lead_id == Some(me.id) {
             let rel = (o.pos - me.pos).truncate();
             let h = (me.heading as f64).to_radians();
             if rel.dot(DVec2::new(h.sin(), h.cos())) < 0.0 {
@@ -700,7 +700,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             cut_in = true;
         }
         // the one behind that follows me is not my lead
-        if o.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
+        if o.last.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
             continue;
         }
         {
@@ -742,7 +742,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
             if gap < -0.5 || gap > look || occ.lateral.abs() > me.half_width + o.half_width + LEAD_MARGIN as f32 {
                 continue;
             }
-            if o.lead_id == Some(me.id) {
+            if o.last.lead_id == Some(me.id) {
                 continue;
             }
             let standing_for = if o.external.at_stop { o.external.standing_for.max(o.stopped) } else { o.stopped };
