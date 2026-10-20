@@ -311,3 +311,30 @@ fn the_players_pulling_away_is_measured() {
     }
     assert!(sim.player_accel(3) < 1.4, "faded to {:.2}", sim.player_accel(3));
 }
+
+/// [fix pass 2, 2] A lane whose stop line lies in a tight turn's swept path (the turn's axis
+/// passing 3 m from its end: two 3 m lanes' half widths and a bus's off-tracking) meets the
+/// turn there: a meeting place is compiled between them.
+#[test]
+fn a_stop_line_in_a_tight_turns_sweep_is_a_meeting_place() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKey, LaneKind, Network};
+    let piece = |pts: &[(f64, f64)], path: u16| {
+        let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.0);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 1, path });
+        l
+    };
+    // a right turn of 10 m radius from (0, 0) heading north to (10, 10) heading east; a lane
+    // of the same object ending at (3.5, 4.0), heading north-east, beside the turn's inside
+    let turn: Vec<(f64, f64)> = (0..=9).map(|k| {
+        let a = std::f64::consts::FRAC_PI_2 * k as f64 / 9.0;
+        (10.0 - 10.0 * a.cos(), 10.0 * a.sin())
+    }).collect();
+    let lanes = vec![piece(&turn, 0), piece(&[(-6.0, -6.0), (3.5, 4.0)], 1)];
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    assert!(net.crossings[0].iter().any(|c| c.other == 1), "no meeting place: {:?}", net.crossings[0]);
+}

@@ -815,7 +815,7 @@ impl Network {
         self.crossings = vec![Vec::new(); self.lanes.len()];
         self.walks = vec![Vec::new(); self.lanes.len()];
         let (n, walks) = self.conflicts_from(0);
-        let joins = self.compile_joins();
+        let joins = self.compile_joins() + self.compile_swept();
         log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {walks} footpath crossings");
     }
 
@@ -1347,6 +1347,94 @@ impl Network {
         n
     }
 
+    /// [fix pass 2, 2] The swept-path meeting places of the crossing objects: a piece of an
+    /// object and every lane of the object or leading into it whose last body length
+    /// (`SWEPT_BODY`) before its end lies in the piece's swept path - the two lanes' half
+    /// widths (their vehicles' room) and the off-tracking of a long vehicle in the piece's
+    /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R) - when nothing else is compiled
+    /// between the two: a meeting place over the two stretches, so a vehicle standing there
+    /// counts as inside it and a refused vehicle stops before it. SUMO: any conflict between
+    /// connection shapes is a foe (sumo.md 1.3); OMSI: a stop line can sit inside a tight
+    /// turn's sweep (x10 case03: bus #587 turning right on 2577 swept #3221 standing at
+    /// 2605's end, no meeting place between them). Returns how many were added.
+    pub fn compile_swept(&mut self) -> usize {
+        let len = self.lanes.len();
+        self.conflicts.resize(len, Vec::new());
+        self.crossings.resize(len, Vec::new());
+        let street = |l: &Lane| l.kind == LaneKind::Street && l.points.len() >= 2;
+        let mut by_object: std::collections::BTreeMap<((i32, i32), i64), Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, l) in self.lanes.iter().enumerate() {
+            if l.source == 2 && street(l) {
+                if let Some(k) = l.key {
+                    by_object.entry((k.tile, k.id)).or_default().push(i);
+                }
+            }
+        }
+        let mut n = 0;
+        for pieces in by_object.values() {
+            // (the object's lanes and the lanes leading into them)
+            let mut near: Vec<usize> = pieces.clone();
+            for &p in pieces {
+                for &q in self.prev.get(p).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if !near.contains(&q) && self.lanes.get(q).is_some_and(street) {
+                        near.push(q);
+                    }
+                }
+            }
+            for &pi in pieces {
+                for &bi in &near {
+                    if pi == bi || self.crossings[pi].iter().any(|c| c.other == bi) {
+                        continue;
+                    }
+                    if self.one_way_pieces(pi, bi) || self.same_root(pi, bi) || self.links_within(pi, bi, 3) || self.links_within(bi, pi, 3) {
+                        continue;
+                    }
+                    let (p, b) = (&self.lanes[pi], &self.lanes[bi]);
+                    let bend = p.curvature.iter().fold(0.0f32, |m, c| m.max(c.abs()));
+                    // (the two lanes' half widths - two lanes of a road side by side are no meeting
+                    // place, round 4b x1 - and the piece's off-tracking)
+                    let reach = 0.5 * (p.width + b.width) + (SWEPT_WHEELBASE * SWEPT_WHEELBASE * 0.5 * bend).min(SWEPT_OFF_MAX);
+                    let lb = b.length();
+                    let (mut b0, mut b1, mut p0, mut p1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+                    let mut sb = (lb - SWEPT_BODY).max(0.0);
+                    loop {
+                        let at = sb.min(lb);
+                        if let Some((sp, d)) = p.nearest_point(b.at(at).0) {
+                            if (d as f32) < reach && sp > 0.05 && sp < p.length() - 0.05 {
+                                b0 = b0.min(at);
+                                b1 = b1.max(at);
+                                p0 = p0.min(sp);
+                                p1 = p1.max(sp);
+                            }
+                        }
+                        if at >= lb {
+                            break;
+                        }
+                        sb += 0.5;
+                    }
+                    if !b0.is_finite() {
+                        continue;
+                    }
+                    // (the way on from `b` meets the piece there already - the lead-in of a way
+                    // that crosses the turn a few metres on: its claim's chain carries that
+                    // meeting place, round 4 rule E)
+                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.other_at + c.other_after >= p0 - SWEPT_BODY * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BODY * 0.5)));
+                    if covered {
+                        continue;
+                    }
+                    let (pa, ba) = ((p0 + p1) * 0.5, (b0 + b1) * 0.5);
+                    let (ph, bh) = (((p1 - p0) * 0.5).max(0.5), ((b1 - b0) * 0.5).max(0.5));
+                    self.conflicts[pi].push(bi);
+                    self.conflicts[bi].push(pi);
+                    self.crossings[pi].push(Crossing { other: bi, at: pa, other_at: ba, merge: false, before: ph, after: ph, other_before: bh, other_after: bh, side: false });
+                    self.crossings[bi].push(Crossing { other: pi, at: ba, other_at: pa, merge: false, before: bh, after: bh, other_before: ph, other_after: ph, side: false });
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// [fix pass 2, 1a] Lanes `i` and `j` leave one lane together, directly or within two
     /// links (a lane forking into twin pieces that rejoin, viz3 case03: 1106/1110 leave 1100
     /// and rejoin into 1477/1481): pieces of ONE way, as SUMO makes the connections of one lane
@@ -1431,7 +1519,7 @@ impl Network {
                 }
             }
         }
-        n + self.compile_joins()
+        n + self.compile_joins() + self.compile_swept()
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -2050,6 +2138,7 @@ impl Network {
         // every lane now leads (a dead end may go on into the new tiles)
         self.conflicts_from(first);
         self.compile_joins();
+        self.compile_swept();
         self.update_reach_from(first);
         self.clip_drivable(first);
         first..end
@@ -2967,6 +3056,15 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     // a car off a cycle lane beyond a strip is the strip: `Lane::beside_each_other`.)
     Ok(())
 }
+
+/// [fix pass 2, 2] The swept path (`Network::compile_swept`): the last this many metres of a
+/// lane are where a vehicle stands at its end (a 12 m bus and a metre) ...
+pub const SWEPT_BODY: f32 = 13.0;
+/// ... a long vehicle's wheelbase (m) for its off-tracking in a bend, wheelbase^2 / 2R (a
+/// 12 m bus's 6 m) ...
+pub const SWEPT_WHEELBASE: f32 = 6.0;
+/// ... and at most this much off-tracking (m): a bus in a 9 m radius turn.
+pub const SWEPT_OFF_MAX: f32 = 2.0;
 
 /// [round 7 A1] Ways on chosen by a tier below "open to me and leading on"
 /// (`AiState::choose_after`), per tier: [open but every way on from it closed, closed by my
