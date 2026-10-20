@@ -3261,6 +3261,18 @@ impl AiState {
         }
         if choices.is_empty() {
             None
+        } else if best == 2 {
+            // ([fix pass 2, 7] lanes another group drives: by how much traffic they carry, a
+            // lane at 0.001 not as likely as one at 1.0)
+            let total: f32 = choices.iter().map(|&n| net.lanes[n].density).sum();
+            let mut pick = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0) * total;
+            for &n in &choices {
+                if pick < net.lanes[n].density {
+                    return Some(n);
+                }
+                pick -= net.lanes[n].density;
+            }
+            choices.last().copied()
         } else {
             if let Some((pool, defaults)) = self.traffic_pool.clone().filter(|_| weighted) {
                 let total: f32 = choices.iter().map(|&n| net.lanes[n].pool_density(&defaults, pool)).sum();
