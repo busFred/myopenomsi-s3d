@@ -1297,8 +1297,11 @@ impl Network {
         false
     }
 
-    /// [round 7 A2-full] The meeting place of every lane join: two street lanes that run into
-    /// one lane (both in its `prev`) and have none yet - spline lanes outside any crossing
+    /// [round 7 A2-full] The meeting place of every lane join, as SUMO makes every join a
+    /// junction node with a response matrix or a zipper (`NBNode`, `NBRequest`): in OMSI a
+    /// junction table came only from crossing objects, so two spline lanes joining outside one
+    /// had none and a first-come rule in perception decided there (deleted). Here: two street
+    /// lanes that run into one lane (both in its `prev`) and have none yet - spline lanes outside any crossing
     /// object, a spline lane joining an object's way out, two pieces of one object that start
     /// within 3 m of each other (which `conflicts_from` leaves out) - a merge at their ends, as
     /// `conflicts_from` compiles one (`meeting_extent` back from the end, half a metre on).
