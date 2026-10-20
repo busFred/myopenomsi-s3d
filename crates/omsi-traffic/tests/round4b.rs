@@ -377,12 +377,12 @@ fn x2_my_follower_that_has_me_as_its_lead_is_not_my_lead() {
     net.lanes.push(road(&[(50.0, 5.0), (0.0, 5.0)], 3));
     let net = finish(net);
     let mut follower = car(2, 2, 20.0, 0.0);
-    follower.lead_id = Some(1);
+    follower.last.lead_id = Some(1);
     let mut cars = vec![car(1, 0, 40.0, 3.0), follower];
     let p = seen(&net, &mut cars, 0);
     assert!(p.leader.is_none(), "{:?}", p.leader);
     // counter-case: not following me, it is in my way
-    cars[1].lead_id = None;
+    cars[1].last.lead_id = None;
     let p = seen(&net, &mut cars, 0);
     assert!(p.leader.is_some_and(|l| l.gap > 20.0), "{:?}", p.leader);
 }
@@ -817,7 +817,7 @@ fn held_each_other_led(red: bool, wait_for: &[u64], blocked: &[u64], led: &[u64]
             me.state.speed = 0.0;
             me.last.wait_for = wait_for.contains(&me.id).then_some(other);
             me.last.body_block = (blocked.contains(&me.id) && body_now).then_some(other);
-            me.lead_id = led.contains(&me.id).then_some(other);
+            me.last.lead_id = led.contains(&me.id).then_some(other);
         }
         sim.negotiate(&mut cars, &claim_of, DT);
         if let Some(e) = cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j, t))) {

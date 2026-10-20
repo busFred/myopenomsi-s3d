@@ -152,7 +152,7 @@ pub(crate) fn follow_id(args: &Args, traffic: Option<&traffic::Traffic>) -> Opti
             if let Some(id) = BUS.with(|c| c.get()).filter(|id| t.car_pose(*id).is_some()) {
                 return Some(id);
             }
-            let id = t.cars.iter().filter(|c| c.is_bus() && c.ai.state.speed > 2.0).map(|c| c.id).min()?;
+            let id = t.cars.iter().filter(|c| c.serves_stops() && c.ai.state.speed > 2.0).map(|c| c.id).min()?;
             BUS.with(|c| c.set(Some(id)));
             Some(id)
         }
@@ -166,7 +166,7 @@ pub(crate) fn follow_id(args: &Args, traffic: Option<&traffic::Traffic>) -> Opti
         "steer" => traffic?
             .cars
             .iter()
-            .filter(|c| c.ai.state.speed > 1.0 && !c.is_bus())
+            .filter(|c| c.ai.state.speed > 1.0 && !c.serves_stops())
             .max_by(|a, b| a.body.steer.abs().total_cmp(&b.body.steer.abs()))
             .map(|c| c.id),
         v if v.starts_with("type:") => {

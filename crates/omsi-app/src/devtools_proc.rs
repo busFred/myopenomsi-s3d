@@ -9,8 +9,7 @@
 //! * window → game: `hello` (the window is up: send everything), `view <key> <0|1>` (an
 //!   overlay on or off), `watch|unwatch <v|s> <name>` (a variable of the player's vehicle to
 //!   show: `v` numeric, `s` string), `set <v|s> <name> <value>` (write it once),
-//!   `hold <v|s> <name> <value>` (write it every frame) and `release <v|s> <name>`, and
-//!   `tune <key> <value>` (a value of the AI avoidance, see `traffic::TUNE`);
+//!   `hold <v|s> <name> <value>` (write it every frame) and `release <v|s> <name>`;
 //! * game → window: `view <key> <0|1>`, `vehicle <name>`, `names_begin` / `name <v|s> <name>` /
 //!   `names_end` (all the variables of the player's vehicle), `watched <v|s> <name>`,
 //!   `held <v|s> <name> <value>` and `val <v|s> <name> <value>` (the watched ones, five times
@@ -413,12 +412,6 @@ pub(crate) fn tick(dev: &mut DevToolsProc, mut player: Option<&mut crate::player
                 }
             }
             "release" if f.len() >= 3 => dev.holds.retain(|h| !(h.0 == is_str && h.1 == name)),
-            // [ROLLBACK tune-104] a slider of the AI avoidance
-            "tune" if f.len() >= 3 => {
-                if let Ok(v) = f[2].trim().replace(',', ".").parse::<f32>() {
-                    crate::traffic::set_tune(f[1], v);
-                }
-            }
             _ => {}
         }
     }
@@ -429,9 +422,6 @@ pub(crate) fn tick(dev: &mut DevToolsProc, mut player: Option<&mut crate::player
         dev.weights_last.clear();
         for key in VIEW_KEYS {
             dev.send(format!("view\t{key}\t{}", dev.view.get(key) as u8));
-        }
-        for (k, t) in crate::traffic::TUNE.iter().enumerate() {
-            dev.send(format!("tune\t{}\t{}", t.0, crate::traffic::tune(k)));
         }
         for (s, n) in &dev.watch {
             dev.send(format!("watched\t{}\t{}", if *s { "s" } else { "v" }, clean(n)));
@@ -940,7 +930,7 @@ pub(crate) fn marks(
                         line(&mut out, a, b, [255, 230, 60, 255], 2.2);
                         label_at(&mut out, b, [255, 230, 60, 255], 4.0, format!("{} {:.1} m", last.why.name(), d));
                     }
-                    if let (Some(id), Some(l)) = (c.ai.lead_id, last.lead) {
+                    if let (Some(id), Some(l)) = (c.ai.last.lead_id, last.lead) {
                         if let Some(q) = by_id.get(&id) {
                             line(&mut out, pos + lift, *q + lift, [60, 160, 255, 255], 1.6);
                             label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{id}, gap {:.1} m", l.gap));

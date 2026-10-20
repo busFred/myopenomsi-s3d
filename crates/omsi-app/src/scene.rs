@@ -827,6 +827,38 @@ pub struct ObjectEdit {
     pub deleted: bool,
 }
 
+/// Whether the options' parked-car count `max` (`Settings::ai_max_parked`: 0 = every space,
+/// -1 = none, else at most that many) lets one more stand with `live` standing.
+pub(crate) fn parked_cap_allows(max: i64, live: usize) -> bool {
+    match max {
+        m if m < 0 => false,
+        0 => true,
+        m => (live as i64) < m,
+    }
+}
+
+#[cfg(test)]
+mod parked_cap_tests {
+    /// 0 every space, -1 none, 5 at most five - and five taken by threads side by side
+    /// through the one atomic step never become more.
+    #[test]
+    fn c5_the_parked_cap() {
+        use super::parked_cap_allows as allows;
+        assert!(allows(0, 10_000) && !allows(-1, 0) && allows(5, 4) && !allows(5, 5));
+        let live = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..100 {
+                        let _ = live.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| allows(5, n).then_some(n + 1));
+                    }
+                });
+            }
+        });
+        assert_eq!(live.into_inner(), 5);
+    }
+}
+
 /// A parked car of a loaded tile (see [`World::parked_objects`]).
 #[derive(Clone)]
 pub struct ParkedObject {
@@ -2083,9 +2115,9 @@ pub struct World {
     /// Counts the changes of the loaded tiles (see [`World::refresh_tile_lists`]): whoever
     /// keeps what it derived from the stops, the waiting places or the ground looks again.
     pub tiles_generation: std::sync::atomic::AtomicU64,
-    /// Parked cars placed on `[carpark_p]` spaces: world position and heading (deg), for
-    /// the traffic to steer round (see `lane_tiles`).
-    pub parked_cars: Mutex<Vec<(DVec3, f64)>>,
+    /// Parked cars placed on `[carpark_p]` spaces: world position, heading (deg) and
+    /// `[boundingbox]`, for the traffic to steer round (see `lane_tiles`).
+    pub parked_cars: Mutex<Vec<crate::traffic::ParkedCar>>,
     /// The boxes of the parked cars of the loaded tiles, which people walk round.
     pub parked_boxes: Mutex<Arc<Vec<omsi_sim::collision::Obb>>>,
     /// Placed objects with particle systems (chimney smoke, the fireworks, a memorial's
@@ -2096,11 +2128,12 @@ pub struct World {
     /// overlaps one, and sends the workshop's team out when the bus stands in none.
     pub petrol_stations: Mutex<Vec<omsi_sim::collision::Obb>>,
     /// Parked cars standing in the loaded tiles, and the options' `[AIMaxCountParked]`
-    /// (0 = every space the map fills, -1 = none): past it the spaces stay empty.
+    /// (0 = every space the map fills, -1 = none): past it the spaces stay empty
+    /// (`World::parked_room`, asked as each tile's objects are put in).
     pub parked_live: std::sync::atomic::AtomicUsize,
-    pub parked_max: i64,
+    pub parked_max: std::sync::atomic::AtomicI64,
     /// [ROLLBACK parkedpct-98] percent of the car park spaces that hold a car
-    pub parked_pct: i64,
+    pub parked_pct: std::sync::atomic::AtomicI64,
     /// [ROLLBACK parked-95] What makes the parked cars differ from one run - and one load of a
     /// tile - to the next: a salt drawn at the start and a count of the car parks placed.
     pub park_salt: u64,
@@ -2917,6 +2950,9 @@ impl World {
     }
 
     pub fn open(root: &Path, global_cfg: &Path, date: i32) -> Result<World> {
+        // (the options' parked cars, their count and share: the defaults until the app sets
+        // its own, `set_parked_options`)
+        let settings = crate::settings::Settings::default();
         let global = GlobalCfg::load(global_cfg)
             .with_context(|| format!("loading {}", global_cfg.display()))?;
         let map_dir = global.dir().to_path_buf();
@@ -3040,8 +3076,8 @@ impl World {
             light_maps_generation: std::sync::atomic::AtomicU64::new(0),
             light_map_atlas: Mutex::new(None),
             parked_live: std::sync::atomic::AtomicUsize::new(0),
-            parked_max: crate::settings::Settings::load().ai_max_parked as i64,
-            parked_pct: crate::settings::Settings::load().ai_parked_pct as i64,
+            parked_max: std::sync::atomic::AtomicI64::new(settings.ai_max_parked as i64),
+            parked_pct: std::sync::atomic::AtomicI64::new(settings.ai_parked_pct as i64),
             park_salt: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x5eed),
             park_seq: std::sync::atomic::AtomicU64::new(0),
             signal_routes,
@@ -4436,6 +4472,23 @@ impl World {
         (files, tex)
     }
 
+    /// Take the place of one more parked car in the loaded tiles if the options'
+    /// `[AIMaxCountParked]` allow it (`parked_cap_allows`): one atomic step on `parked_live`,
+    /// which the tiles give back as they go.
+    fn take_parked_room(&self) -> bool {
+        let max = self.parked_max.load(std::sync::atomic::Ordering::Relaxed);
+        self.parked_live
+            .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| parked_cap_allows(max, n).then_some(n + 1))
+            .is_ok()
+    }
+
+    /// The options' parked cars (`ai_max_parked`, `ai_parked_pct`), as the app's settings
+    /// have them: set before the tiles come in.
+    pub fn set_parked_options(&self, settings: &crate::settings::Settings) {
+        self.parked_max.store(settings.ai_max_parked as i64, std::sync::atomic::Ordering::Relaxed);
+        self.parked_pct.store(settings.ai_parked_pct as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The type an object record puts on the map: a parking space gets a random car of the
     /// map's parklist (a quarter of them stay empty, as in the original). None when nothing
     /// is to be placed; a missing type is counted and logged once.
@@ -4478,8 +4531,8 @@ impl World {
         // [ROLLBACK parkedpct-98] the options' share of the spaces holds a car, each space drawn on
         // its own, as in Omsi.exe: no count of cars over the map (a count filled the tiles
         // that loaded first and left the ones after them bare)
-        let share = self.parked_pct.clamp(0, 100) as u64;
-        if (h >> 8) % 100 >= share {
+        let share = self.parked_pct.load(std::sync::atomic::Ordering::Relaxed).clamp(0, 100) as u64;
+        if (h >> 8) % 100 >= share || self.parked_max.load(std::sync::atomic::Ordering::Relaxed) < 0 {
             stats.lock().empty_spaces += 1;
             return None;
         }
@@ -4954,7 +5007,7 @@ impl World {
         } else {
             Vec::new()
         };
-        let mut parked_cars: Vec<(DVec3, f64)> = Vec::new();
+        let mut parked_cars: Vec<crate::traffic::ParkedCar> = Vec::new();
         let mut objects: Vec<PlacedObject> = Vec::new();
         let mut trees = Vec::new();
         let debug_objects = omsi_cfg::env::var_os("OMSI_DEBUG_OBJECTS").is_some();
@@ -4965,6 +5018,11 @@ impl World {
             let Some(Pose { pos, rot: xf }) = *fp else {
                 continue;
             };
+            // (the options' count of parked cars stands: the space stays empty; the place is
+            // taken in the count at once, so tiles put in side by side cannot overshoot it)
+            if o.parked && !self.take_parked_room() {
+                continue;
+            }
             if let (true, Placement::Ground { x, y, .. }) = (debug_float, &o.place) {
                 // how far the object stood off the ground when it was placed before the
                 // roads and crossings had pulled the ground about
@@ -4991,12 +5049,12 @@ impl World {
                 }
             }
             if o.parked {
+                // (counted in `parked_live` by `take_parked_room`)
                 state.parked_count += 1;
-                self.parked_live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if o.parked && first_load {
                 // on the ground: the lane match of the traffic is by distance in 3D
-                parked_cars.push((pos, heading));
+                parked_cars.push((pos, heading, ot.sco.bounding_box));
             }
             if ot.sco.is_bus_stop {
                 state.bus_stops.push((

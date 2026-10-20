@@ -69,16 +69,9 @@ const OMSI_PAX_DOORS: usize = 8;
 /// radius people on the pavement came within 0.46 m, and two walking past each other or a
 /// group crossing the road merged into one another in the picture.
 const BODY_OUTSIDE: f64 = 0.28;
-/// [ROLLBACK around-86] Blocked this long (seconds) wanting to go on, somebody passes through
-/// everything - others, vehicles, walls - for `GHOST_FOR` seconds: the way out of any jam.
-const STUCK_AFTER: f32 = 4.0;
-/// [ROLLBACK pedhold-1] A stroller pressed against something that does not move (a car
-/// standing on the crossing) steps past it sooner.
-const STUCK_AFTER_STROLL: f32 = 1.5;
 /// [ROLLBACK pedhold-1] How far off their pavement (m) a stroller is still drawn back onto
-/// it (`OFF_PATH` for everybody else: the people off a bus must not slide to the kerb).
+/// it by its corridor (`path_corridor_band`).
 const STROLL_BAND: f64 = 2.0;
-const GHOST_FOR: f32 = 1.0;
 
 /// [ROLLBACK around-86] The two corners (world) to walk through to get round the box `b` from
 /// `here` going in `dir`: the corner at the nearer end on the side one stands at, then the one on
@@ -438,9 +431,7 @@ impl Humans {
             if p.around.is_some() {
                 lines.push("goes round a bus or a lorry".to_string());
             }
-            if p.ghost > 0.0 {
-                lines.push(format!("collisions off for {:.1} s", p.ghost));
-            } else if p.stuck > 0.5 {
+            if p.stuck > 0.5 {
                 lines.push(format!("blocked for {:.1} s", p.stuck));
             }
             out.push(NpcDebug { at, lines, rgba, path });
@@ -1737,7 +1728,6 @@ fn stroll_candidate(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLigh
         && net.lanes[l].length() > 4.0
         && !net.lanes[l].no_unsched // [ROLLBACK unsched-93]
         && !core_piece(ped, net, lights, l)
-        && net.lanes[l].traffic_light.is_none()
 }
 
 /// [ROLLBACK r4c-P1] The crossing starting with `walk.legs[start]`: the pieces on from it that
@@ -2301,7 +2291,10 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                     }
                 }
                 let next = walk.legs[walk.leg + 1];
-                // (put down on a crossing, not at a kerb: the rest of it, this piece too)
+                // (on a crossing piece, not at a kerb: at the end of a crossing's last piece
+                // every crosser is here - `walk.cross` was just taken - and the span from this
+                // piece steps them off it without a kerb decision; once also somebody put
+                // down on a crossing, which no longer happens since r5-P1/P6b)
                 let mid = !walk.kerb_hold && ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
                 // [ROLLBACK r5-P2] (back at the near end after turning round on a crossing with
                 // no pavement leg to stand on: decided as at a kerb - the light and the cars
@@ -2574,7 +2567,7 @@ fn yields_to_people(why: omsi_traffic::Why) -> bool {
     matches!(why, omsi_traffic::Why::People | omsi_traffic::Why::Zebra)
 }
 /// [ROLLBACK r5-P6] Seconds of a vehicle's standing on the crossing after which the kerb no
-/// longer waits for it (people step round it, as P5 has them): a car abandoned on a zebra
+/// longer waits for it (people step round it): a car abandoned on a zebra
 /// (X10 case15, a 90 s queue) does not hold the kerb for good.
 const PED_OCCUPIED_CAP: f32 = 20.0;
 
@@ -2640,6 +2633,18 @@ const LANE_MIN_WIDTH: f64 = 2.5;
 /// [ROLLBACK r4c-P3] Whether `q` lies inside the footprint of a carriageway lane: within half
 /// its width and `KERB_CLEAR` of its axis.
 fn on_carriageway(net: &Network, q: DVec3) -> bool {
+    within_lanes(net, q, &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + KERB_CLEAR)
+}
+
+/// Whether `q` lies too close to a carriageway lane for somebody to wait there: within
+/// `waiter_reach` of its axis, the reach of the bus waiters ([round 6 B3]): a crossing's kerb
+/// spot at 1.55 m held a 2.6 m coach, which lets people go only beyond 1.58 m.
+fn in_waiter_reach(net: &Network, q: DVec3) -> bool {
+    within_lanes(net, q, &waiter_reach)
+}
+
+/// Whether `q` lies within `reach(lane)` of the axis of a street lane near it.
+fn within_lanes(net: &Network, q: DVec3, reach: &dyn Fn(&omsi_sim::traffic::Lane) -> f64) -> bool {
     let (cx, cy) = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
     let mut seen: Vec<usize> = Vec::new();
     for dx in -1..=1 {
@@ -2650,8 +2655,7 @@ fn on_carriageway(net: &Network, q: DVec3) -> bool {
                     continue;
                 }
                 seen.push(i);
-                let reach = (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + KERB_CLEAR;
-                if l.nearest_point(q).map(|(_, d)| d < reach).unwrap_or(false) {
+                if l.nearest_point(q).map(|(_, d)| d < reach(l)).unwrap_or(false) {
                     return true;
                 }
             }
@@ -2758,9 +2762,9 @@ fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> Vec<usize> {
 
 /// [ROLLBACK r4c-P3] Where somebody waits before stepping onto `next` at the end of `way` (the
 /// legs walked up to the kerb, the last first): a step back from the kerb and spread along
-/// it, outside every carriageway lane's footprint. A kerb inside one (a short piece at the
-/// kerb that lies in the lane: people waited 0.4 m in front of a bumper) is backed away from
-/// along the legs walked until the spot is outside.
+/// it, outside every street lane's waiter reach (`in_waiter_reach`). A kerb inside one (a
+/// short piece at the kerb that lies in the lane: people waited 0.4 m in front of a bumper)
+/// is backed away from along the legs walked until the spot is outside.
 fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, spread: f64, back: f64) -> DVec2 {
     let (start, _) = next.at(net, 0.0);
     let (_, h) = next.at(net, 0.3);
@@ -2768,14 +2772,14 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
     let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
     let end = way.first().map(|l| l.at(net, l.len()).0).unwrap_or(start);
     let first = end + (right * spread - fwd * back).extend(0.0);
-    if !on_carriageway(net, first) {
+    if !in_waiter_reach(net, first) {
         return first.truncate();
     }
     // [ROLLBACK r5-P7] the other side of the way first - the pavement's, where the spread
     // put them into a junction piece (2-5 people at "red light" 2-4 m inside the west arm
     // of X10 j392 lost a car its green, case07; case01b's j3 kerbs)
     let mirrored = end + (-right * spread - fwd * back).extend(0.0);
-    if !on_carriageway(net, mirrored) {
+    if !in_waiter_reach(net, mirrored) {
         return mirrored.truncate();
     }
     let mut last = end;
@@ -2789,7 +2793,7 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
             // tested: a lane beside the way takes every spot on its side)
             for off in [spread * 0.5, 0.0, -spread * 0.5, -spread, -KERB_SPREAD_MAX, KERB_SPREAD_MAX] {
                 let c = q + (right * off).extend(0.0);
-                if !on_carriageway(net, c) {
+                if !in_waiter_reach(net, c) {
                     return c.truncate();
                 }
             }
@@ -2802,7 +2806,7 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
 }
 
 /// [ROLLBACK r4c-L3] The point of a footpath within `reach` of `at` (and at its height) nearest to
-/// it outside every carriageway lane's footprint.
+/// it outside every street lane's waiter reach (`in_waiter_reach`).
 fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -> Option<DVec2> {
     let (cx, cy) = ((at.x / 50.0).floor() as i32, (at.y / 50.0).floor() as i32);
     let mut best: Option<(f64, DVec2)> = None;
@@ -2820,7 +2824,7 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
                 while s <= len {
                     let (q, _) = l.at(s);
                     let d = (q - at).truncate().length();
-                    if d <= reach && (q.z - at.z).abs() < 2.0 && best.map(|b| d < b.0).unwrap_or(true) && !on_carriageway(net, q) {
+                    if d <= reach && (q.z - at.z).abs() < 2.0 && best.map(|b| d < b.0).unwrap_or(true) && !in_waiter_reach(net, q) {
                         best = Some((d, q.truncate()));
                     }
                     s += 0.5;
@@ -2856,6 +2860,12 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     // crossing at 0.5-0.7 m/s at a lit green passed, X10 #485, 25 step-ons)
     let start = next.at(net, 0.0).0.truncate();
     let near_cuts: Vec<DVec2> = cuts.iter().copied().filter(|x| (*x - start).length() <= PED_OCCUPIED_REACH).collect();
+    // ([ROLLBACK r4c-P5] or its box over the first 1.5 m of the way off the kerb, where no cut
+    // lies: a bus on the kerb stub; P5 held for 5 s of the person's own waiting, then they
+    // stepped round it - one rule now, review r7)
+    let (from, _) = next.at(net, 0.0);
+    let (ahead, _) = next.at(net, 1.5);
+    let way = (ahead - from).truncate().normalize_or_zero();
     let occupied = || {
         at.cars
             .iter()
@@ -2864,7 +2874,10 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             // the cap and 56 people stepped on at a lit green, X10 0837 car 485)
             .any(|car| {
                 let speed = car.vel.length();
-                speed < PED_CREEP_SPEED && !car.yielding && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5) && near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR))
+                speed < PED_CREEP_SPEED
+                    && !car.yielding
+                    && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5)
+                    && (near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)) || covers_path(&car.body, from.truncate(), way, 1.5))
             })
     };
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
@@ -2950,17 +2963,14 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     if occupied() {
         return Err(STANDS_ON);
     }
-    // [ROLLBACK r4c-P5] a vehicle whose box covers the first 1.5 m of the way across: one that
-    // stands there holds them for a few seconds only, then they step round it (a car held in
-    // a queue on the zebra and the people waiting for it to move stood for each other for
-    // good); one beside the way, or the player's bus with its nose short of it, does not hold
-    // (nine walkers were held 5 s each 1-1.5 m from the nose of a standing bus)
-    let (from, _) = next.at(net, 0.0);
-    let (ahead, _) = next.at(net, 1.5);
-    let way = (ahead - from).truncate().normalize_or_zero();
+    // [ROLLBACK r4c-P5] a vehicle moving across the first 1.5 m of the way holds them; one
+    // standing there is `occupied`'s (above: up to PED_OCCUPIED_CAP of its standing, then
+    // they step round it); one beside the way, or the player's bus with its nose short of
+    // it, does not hold (nine walkers were held 5 s each 1-1.5 m from the nose of a
+    // standing bus)
     for car in at.cars {
         let speed = car.vel.length();
-        if (speed >= 0.5 || held < 5.0) && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
+        if speed >= 0.5 && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
             return Err(STANDS_ON);
         }
     }
@@ -3063,9 +3073,9 @@ fn seg_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<DVec2> {
 /// look for another.
 const DOOR_OPENING_GRACE: f64 = 3.0;
 
-/// [ROLLBACK nocoll-93] Whether people on foot collide with anything at all (false: none).
-const NPC_COLLISIONS: bool = false;
-/// [ROLLBACK solidcars-1] ... except vehicles, which are solid to people on the ground:
+/// [ROLLBACK solidcars-1] People on foot collide with nothing (not each other, not the
+/// scenery: [ROLLBACK nocoll-93], they only hindered) except vehicles, which are solid to
+/// people on the ground:
 /// somebody with a car in front of them stops (and waits, then goes round it) instead of
 /// walking into it. People still pass through each other and the scenery as before.
 const VEHICLE_COLLISIONS: bool = true;
@@ -3077,7 +3087,6 @@ const STANDING_REACH: f64 = 10.0; // [ROLLBACK reach-93] was 30.0
 const STANDING_GIVE_UP: f32 = 1.0;
 /// [ROLLBACK party-70] The share of the waiting who wait with others (two to four).
 const PARTY_CHANCE: f32 = 0.22;
-const STANDING_GIVE_UP_UNSEEN: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 enum State {
@@ -3187,7 +3196,6 @@ pub struct Person {
     /// The last decision at a kerb (`may_cross`): "go", or why they wait - for the traffic
     /// recording, which shows why somebody froze.
     last_decision: Option<&'static str>,
-    ghost: f32,
     /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
     /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
     step_out: Option<(DVec2, f32)>,
@@ -3196,9 +3204,6 @@ pub struct Person {
     /// Seconds left going round something in the way off the pavement's line (a lamp post
     /// on the path): the corridor does not pull them back into it meanwhile.
     detour: f32,
-    /// Which way round (+1 anticlockwise, -1 clockwise) while `detour` lasts: round a corner
-    /// the sides' own choices flipped each other and people shuffled at a post.
-    detour_side: f64,
     /// [ROLLBACK r4c-P5] The way they wanted to walk last, and the seconds since they last turned
     /// round (beside a standing vehicle: at most once in `PED_TURN_EVERY`).
     want_dir: DVec2,
@@ -3275,19 +3280,10 @@ impl Want {
 }
 
 /// Velocity towards `to`, easing into the stop over the last metre.
-/// Somebody off the pavement's path by more than this beyond its corridor (just off a bus,
-/// at its door) walks onto it at their own pace before the corridor holds them; within it
-/// (a nudge of the crowd) the corridor takes them back.
-const OFF_PATH: f64 = 0.1;
-
-/// The corridor a walker at `pos` keeps to: none while they are still well off it. Eased
-/// into it at up to 0.6 m/s (twice a step) on top of walking there, the people getting off
-/// a bus slid sideways from its door to the pavement at twice their pace (#1033, #1079).
-fn path_corridor(pos: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Option<(DVec2, DVec2, f64)> {
-    path_corridor_band(pos, corridor, OFF_PATH)
-}
-
-/// [ROLLBACK pedhold-1] `path_corridor` with the band given: a stroller nudged off the
+/// The corridor a walker at `pos` keeps to: none while they are more than `band` off it.
+/// Eased into it at up to 0.6 m/s (twice a step) on top of walking there, the people
+/// getting off a bus slid sideways from its door to the pavement at twice their pace
+/// (#1033, #1079). [ROLLBACK pedhold-1] A stroller nudged off the
 /// pavement by the others (three abreast at a kerb) is drawn back from up to `STROLL_BAND`
 /// away; at 0.1 m they walked on along the kerb line in the carriageway, and a car stood
 /// behind them for good.
@@ -3326,8 +3322,6 @@ pub struct Humans {
     next_id: u32,
     /// Seconds since the start.
     time: f64,
-    wall_cells: HashMap<(i32, i32, i32), Vec<(Block, f64, f64)>>,
-    wall_key: (usize, usize, usize, f64),
     /// Passenger cabins by vehicle files (the front vehicle and its coupled parts).
     cabins: HashMap<Vec<PathBuf>, Option<Arc<Cabin>>>,
     player_cabin: Option<Arc<Cabin>>,
@@ -3674,8 +3668,6 @@ impl Humans {
             rng: 0x1234_5678_9ABC_DEF1,
             next_id: 1,
             time: 0.0,
-            wall_cells: HashMap::new(),
-            wall_key: (0, 0, 0, 0.0),
             cabins: HashMap::new(),
             player_cabin: None,
             player_next_stop: None,
@@ -4338,11 +4330,9 @@ impl Humans {
             still: 0.0,
             on_crossing: false,
             last_decision: None,
-            ghost: 0.0,
             step_out: None,
             car_wait: 0.0,
             detour: 0.0,
-            detour_side: 0.0,
             around: None,
             want_dir: DVec2::ZERO,
             turned: PED_TURN_EVERY,
@@ -5431,7 +5421,7 @@ impl Humans {
                 })
                 .collect();
             let mut visits = HashMap::new();
-            for c in t.cars.iter().filter(|c| c.is_bus()) {
+            for c in t.cars.iter().filter(|c| c.serves_stops()) {
                 let from_eye = self.eye.map(|e| (c.vehicle.position - e.pos).length()).unwrap_or(f64::MAX);
                 if (c.vehicle.position - near).length().min(from_eye) > 400.0 && !riding.contains(&c.id) {
                     continue;
@@ -5806,117 +5796,6 @@ impl Humans {
             .collect()
     }
 
-    /// Nobody on foot walks into a wall: the scenery's collision boxes and meshes (shelters,
-    /// fences, walls, buildings with a collision mesh) between knee and head height stop a
-    /// step that would enter one, keeping the part of it along the wall. Somebody already
-    /// inside one (a waiting place the map put in a shelter's box) is left alone - pushed
-    /// out, they jumped. People used to walk through everything but the vehicles.
-    fn keep_out_of_walls(&mut self, world: &World, who: &[usize], ground: &mut [(usize, Walker)]) {
-        const R: f64 = 0.22;
-        const CELL: f64 = 12.0;
-        let collision = world.collision.lock();
-        let places: Vec<DVec2> = world.waiting_places.lock().iter().map(|w| w.1.truncate()).collect();
-        let (boxes, meshes, since) = (collision.boxes.len(), collision.meshes.len(), self.wall_key.3);
-        if (boxes, meshes, places.len()) != (self.wall_key.0, self.wall_key.1, self.wall_key.2) || self.time - since > 2.0 || self.time < since {
-            self.wall_cells.clear();
-            self.wall_key = (boxes, meshes, places.len(), self.time);
-        }
-        let mut cells = std::mem::take(&mut self.wall_cells);
-        for (k, w) in ground.iter_mut() {
-            let i = who[*k];
-            // (a ghost passes through walls as well, see `STUCK_AFTER`)
-            if w.fixed || w.ghost || self.people[i].place != Place::Ground {
-                continue;
-            }
-            let p0 = self.people[i].position.truncate();
-            if (w.pos - p0).length_squared() < 1e-8 {
-                continue;
-            }
-            let z = self.people[i].position.z;
-            let key = ((p0.x / CELL).floor() as i32, (p0.y / CELL).floor() as i32, z.floor() as i32);
-            let walls = cells.entry(key).or_insert_with(|| {
-                let c = DVec2::new((key.0 as f64 + 0.5) * CELL, (key.1 as f64 + 0.5) * CELL);
-                let probe = omsi_sim::collision::Obb {
-                    center: c,
-                    half: DVec2::splat(CELL * 0.5 + 2.0),
-                    heading: 0.0,
-                    z0: key.2 as f64 - 1.0,
-                    z1: key.2 as f64 + 3.5,
-                    velocity: DVec2::ZERO,
-                    mass: 0.0,
-                    pole: None,
-                    id: -1,
-                };
-                let near = collision.obstacles_near(&probe);
-                let reach = near.iter().map(|o| (o.center - c).length() + o.half.length() + 1.0).fold(0.0, f64::max);
-                let local: Vec<DVec2> = places.iter().copied().filter(|q| (*q - c).length() < reach).collect();
-                near.into_iter()
-                    .filter(|o| {
-                        // a shelter given as one solid box has its waiting places inside:
-                        // people go in there
-                        let b = Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO };
-                        !local.iter().any(|q| (*q - o.center).length() < o.half.length() + 1.0 && b.near(*q, 0.3))
-                    })
-                    .map(|o| {
-                        (
-                            Block {
-                                center: o.center,
-                                half: o.half + DVec2::splat(R),
-                                heading: o.heading,
-                                vel: DVec2::ZERO,
-                            },
-                            o.z0,
-                            o.z1,
-                        )
-                    })
-                    .collect()
-            });
-            for (b, z0, z1) in walls.iter() {
-                // between the knees and the head of somebody standing here
-                if *z0 > z + 1.6 || *z1 < z + 0.5 {
-                    continue;
-                }
-                if (w.pos - b.center).length_squared() >= b.half.length_squared() || !b.near(w.pos, 0.0) || b.near(p0, -0.01) {
-                    continue;
-                }
-                let (q, inside) = b.closest(w.pos);
-                if !inside {
-                    continue;
-                }
-                // onto the wall's face, keeping the step along it
-                if omsi_cfg::env::var_os("OMSI_DEBUG_WALLS").is_some() {
-                    log::info!("t={:.1} pax {} ({}) kept out of a wall ({:.1} x {:.1} m, heights {:.1}..{:.1}) at ({:.2}, {:.2}), its centre ({:.2}, {:.2}), want ({:.2}, {:.2}) vel ({:.2}, {:.2})", self.time, self.people[i].label(), self.people[i].state.name(), b.half.x * 2.0, b.half.y * 2.0, z0 - z, z1 - z, w.pos.x, w.pos.y, b.center.x, b.center.y, w.want.x, w.want.y, w.vel.x, w.vel.y);
-                }
-                let n = (q - w.pos).try_normalize().unwrap_or(DVec2::ZERO);
-                w.pos = q + n * 0.005;
-                let vn = w.vel.dot(n);
-                if vn < 0.0 {
-                    w.vel -= n * vn;
-                }
-                let fresh = self.people[i].detour <= 0.0;
-                self.people[i].detour = 2.0;
-                w.corridor = None;
-                // walking straight at it: round it, the way that turns least from where they
-                // want to go (a lamp post or a pillar stopped people dead)
-                let speed = w.want.length();
-                let t = DVec2::new(-n.y, n.x);
-                if fresh || self.people[i].detour_side == 0.0 {
-                    let along = w.want.dot(t);
-                    self.people[i].detour_side = if along.abs() > 0.05 * speed {
-                        along.signum()
-                    } else if i % 2 == 0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                }
-                if speed > 0.2 && w.vel.dot(t) * self.people[i].detour_side < 0.4 * speed {
-                    w.vel = t * self.people[i].detour_side * speed * 0.8;
-                }
-            }
-        }
-        self.wall_cells = cells;
-    }
 
 
     /// Keep only the people the map's `humans.txt` names, an entry listed twice counting
@@ -6554,7 +6433,7 @@ impl Humans {
                 }
                 let h = c.vehicle.heading.to_radians();
                 let fwd = DVec2::new(h.sin(), h.cos());
-                let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
+                let bb = c.vehicle.ty.def.bounding_box.unwrap_or(crate::traffic::DEFAULT_BOX);
                 let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
                 let body = Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.ai.state.speed as f64 };
                 // [ROLLBACK pedyield-1] (and whether it is stopping for somebody on foot:
@@ -6770,9 +6649,9 @@ impl Humans {
                 give: w.give,
                 space: 0,
                 fixed,
-                // [ROLLBACK nocoll-93] people on foot touch nothing: not each other, not the
-                // scenery, not the bus (they only hindered)
-                ghost: !NPC_COLLISIONS || p.ghost > 0.0,
+                // [ROLLBACK nocoll-93] people on foot touch nothing but the vehicles (`solid`):
+                // not each other, not the scenery
+                ghost: true,
                 solid: VEHICLE_COLLISIONS,
                 corridor: if p.detour > 0.0 { None } else { w.corridor },
             });
@@ -6781,8 +6660,7 @@ impl Humans {
         let near_blocks: Vec<Block> = blocks.into_iter().filter(|b| walkers.iter().any(|w| b.near(w.pos, 25.0))).collect();
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
-        let mut ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
-        self.keep_out_of_walls(world, &who, &mut ground);
+        let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
         let mut moved = vec![false; self.people.len()];
         for (k, w) in ground {
             let i = who[k];
@@ -6896,7 +6774,7 @@ impl Humans {
                 // (taken away; the spawner puts a pedestrian where one belongs): at once when out
                 // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
                 let gone = !self.seen(self.people[i].position) && self.far_from_players(self.people[i].position, STROLL_RADIUS);
-                if gone || t >= STANDING_GIVE_UP || (t >= STANDING_GIVE_UP_UNSEEN && !self.seen(self.people[i].position)) {
+                if gone || t >= STANDING_GIVE_UP {
                     remove.push(i);
                 }
                 Want::stand(None, Activity::Stand)
@@ -6904,13 +6782,6 @@ impl Humans {
             _ => Want::stand(None, Activity::Stand),
         }
     }
-
-
-
-
-
-
-
 
     /// Where a walk along the pavement takes somebody next.
     fn walk_want(
@@ -6952,7 +6823,6 @@ impl Humans {
         bus_ix: &HashMap<BusId, usize>,
     ) {
         let dt64 = dt as f64;
-        let time = self.time;
         let p = &mut self.people[i];
         let speed = w.vel.length();
         p.still = still_after(p.still, speed as f32, dt);
@@ -6963,19 +6833,6 @@ impl Humans {
             p.stuck = 0.0;
         }
         p.detour = (p.detour - dt).max(0.0);
-        if p.ghost > 0.0 {
-            p.ghost -= dt;
-        } else if p.stuck > if matches!(p.state, State::Strolling(_)) { STUCK_AFTER_STROLL } else { STUCK_AFTER } {
-            p.ghost = GHOST_FOR;
-            p.stuck = 0.0;
-            if debug_pax() {
-                log::info!(
-                    "t={time:.1} pax {} ({}) is stuck and slips past",
-                    p.label(),
-                    p.state.name()
-                );
-            }
-        }
         p.vel = w.vel;
         match p.place {
             Place::Ground => {
@@ -8231,6 +8088,8 @@ mod tests {
     /// m/s), and on the path in the end.
     #[test]
     fn off_a_bus_people_walk_onto_the_pavement_at_their_pace() {
+        // (a band of 0.1 m: the corridor holds once they are on the path)
+        const OFF_A_BUS: f64 = 0.1;
         let walk = |held: bool| {
             let pace = 1.1;
             let mut w = Walker::new(DVec2::new(3.0, 0.0), 0.25, 0);
@@ -8242,7 +8101,7 @@ mod tests {
                 let (a, b) = (DVec2::new(0.0, s - 2.0), DVec2::new(0.0, s + 2.5));
                 w.want = (DVec2::new(0.0, s + 1.3) - w.pos).normalize_or_zero() * pace;
                 let c = Some((a, b, 0.5));
-                w.corridor = if held { c } else { path_corridor(w.pos, c) };
+                w.corridor = if held { c } else { path_corridor_band(w.pos, c, OFF_A_BUS) };
                 crowd::step(std::slice::from_mut(&mut w), &[], &params, dt);
                 track.push(w.pos);
             }
@@ -8255,8 +8114,8 @@ mod tests {
         let held = walk(true).0;
         assert!(held > 1.5, "{held:.2} m/s");
         // on the path the corridor holds again
-        assert!(path_corridor(DVec2::new(0.55, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_some());
-        assert!(path_corridor(DVec2::new(3.0, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_none());
+        assert!(path_corridor_band(DVec2::new(0.55, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5)), OFF_A_BUS).is_some());
+        assert!(path_corridor_band(DVec2::new(3.0, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5)), OFF_A_BUS).is_none());
     }
 
     #[test]
@@ -10071,10 +9930,15 @@ mod ped_tests {
         let bus = Block { center: DVec2::new(-7.25, -4.6), half: DVec2::new(1.25, 6.0), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
         let player = SeenCar { id: PLAYER_CAR, pos: bus.center, vel: DVec2::ZERO, half_len: 6.0, body: bus, yielding: false, stood: 30.0 };
         assert_eq!(kerb_with(player), Some("go"));
-        // with its nose over the way it holds them (a few seconds)
+        // with its nose over the way it holds them while it has stood under PED_OCCUPIED_CAP
+        // (the r5-P6 rule); one standing longer is stepped round at once (P5's own 5 s hold
+        // went, review r7)
         let mut over = player;
         over.body.center.x = -5.0;
+        over.stood = PED_OCCUPIED_CAP - 10.0;
         assert_eq!(kerb_with(over), Some("a vehicle stands on the crossing"));
+        over.stood = PED_OCCUPIED_CAP + 10.0;
+        assert_eq!(kerb_with(over), Some("go"));
     }
 
     /// A walker going north along a pavement (axis x = 0, 2.1 m wide) past a bus standing

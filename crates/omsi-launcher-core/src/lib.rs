@@ -204,7 +204,8 @@ pub fn omsi_options(root: &Path) -> Option<OmsiOptions> {
         v["ai_max_humans"] = json!(x.max(1));
     }
     if let Some(x) = num("aimaxcountparked") {
-        v["ai_max_parked"] = json!((x as i64).max(0));
+        // (-1: no parked cars at all, as `ai_max_parked` documents)
+        v["ai_max_parked"] = json!((x as i64).max(-1));
     }
     if let Some(x) = num("aipassfactor") {
         v["pax_density"] = json!((x / 100.0).clamp(0.0, 3.0));

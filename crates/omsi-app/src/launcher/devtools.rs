@@ -117,8 +117,6 @@ struct Tools {
     view: [bool; 16],
     /// [ROLLBACK aidebug-89] What the game said about the player's bus sign and the nearest stop.
     sign: Vec<String>,
-    /// [ROLLBACK tune-104] The values of the AI avoidance (by `traffic::TUNE`) as set now.
-    tune: Vec<f32>,
     /// The list of switches is open.
     overlays_open: bool,
     /// [ROLLBACK gfx-119] 0: reloads and variables; 1: overlays; 2: the mirror editor; 3: AI debug.
@@ -292,7 +290,6 @@ impl Tools {
         Tools {
             view: [false; 16],
             sign: Vec::new(),
-            tune: crate::traffic::TUNE.iter().map(|t| t.2).collect(),
             overlays_open: true,
             page: 0,
             weights: [0.0; 3],
@@ -331,11 +328,6 @@ impl Tools {
             "view" if f.len() >= 3 => {
                 if let Some(i) = VIEW_KEYS.iter().position(|k| *k == f[1]) {
                     self.view[i] = f[2] == "1";
-                }
-            }
-            "tune" if f.len() >= 3 => {
-                if let (Some(i), Ok(v)) = (crate::traffic::TUNE.iter().position(|t| t.0 == f[1]), f[2].trim().replace(',', ".").parse::<f32>()) {
-                    self.tune[i] = v;
                 }
             }
             "weights" if f.len() >= 4 => {
@@ -548,31 +540,6 @@ impl Tools {
             y += 6.0;
             let hint = "People are shown within 70 m, cars within 160 m of the camera; people further than 25 m show two lines only. Colours of people: yellow waiting, cyan going to the bus, green in the bus, pink going out, grey strolling. Cars: blue ways (orange when held), box green (red when held), yellow = the nearest thing ahead, blue = the car in front, pink = a body in the way.";
             y += ui.paragraph(hint, Vec2::new(pad, y), w, 12.5, Weight::Regular, TEXT_DIM) + 14.0;
-            // [ROLLBACK tune-104] the values of the cars' going round the player's vehicle, live
-            ui.text("Cars going round the player's vehicle: values (live)", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
-            y += 26.0;
-            for (k, t) in crate::traffic::TUNE.iter().enumerate() {
-                ui.text(t.1, Vec2::new(pad, y + 13.0), 13.0, Weight::Regular, TEXT, Align::Left);
-                let mut v = self.tune[k];
-                let sw = (w - 400.0).clamp(160.0, 400.0);
-                if ui.slider(&format!("dt-tune-{k}"), Rect::new(pad + 390.0, y, sw, 26.0), &mut v, t.3, t.4, t.5, "", &|x| num(x)) {
-                    self.tune[k] = v;
-                    out.push(format!("tune\t{}\t{}", t.0, num(v)));
-                }
-                y += 30.0;
-            }
-            y += 4.0;
-            if ui.button("dt-tune-reset", Rect::new(pad, y, 150.0, 30.0), "Defaults", None, ButtonKind::Normal) {
-                for (k, t) in crate::traffic::TUNE.iter().enumerate() {
-                    self.tune[k] = t.2;
-                    out.push(format!("tune\t{}\t{}", t.0, num(t.2)));
-                }
-            }
-            if ui.button("dt-tune-copy", Rect::new(pad + 158.0, y, 150.0, 30.0), "Copy values", None, ButtonKind::Primary) {
-                let text: Vec<String> = crate::traffic::TUNE.iter().enumerate().map(|(k, t)| format!("{} = {}", t.0, num(self.tune[k]))).collect();
-                ui.clipboard_out = Some(text.join("\r\n"));
-            }
-            y += 40.0;
             y - r.y
         });
     }

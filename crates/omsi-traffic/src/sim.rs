@@ -160,6 +160,29 @@ pub struct External {
     /// rather than standing there (`plan` rule 10).
     #[serde(default)]
     pub trip_over: bool,
+    /// [round 7 A7] A timetable bus ahead of its timetable drives at this share of its
+    /// driver's speed factor (`AiState::desire`), set at the start of the frame.
+    #[serde(default)]
+    pub pace: Option<f32>,
+    /// [round 7 A7] An indicator the app shows (a car pulling into a parking space: 2,
+    /// right), held for a second (`AiState::signal`/`signal_time`), set at the start of the
+    /// frame.
+    #[serde(default)]
+    pub signal: Option<i32>,
+}
+
+impl External {
+    /// What of the frame's inputs goes straight into the way (`pace`, `signal`): written
+    /// here rather than by the app, so the recording carries them.
+    pub fn apply(&self, st: &mut AiState, params: &DriverParams) {
+        if let Some(p) = self.pace {
+            st.desire = params.speed_factor * p;
+        }
+        if let Some(s) = self.signal {
+            st.signal = s;
+            st.signal_time = 1.0;
+        }
+    }
 }
 
 /// The last decision, kept for consumers and the debug overlay. Other vehicles are named
@@ -267,8 +290,6 @@ pub struct Vehicle {
     pub light_decision: Option<((usize, usize), bool, f32)>,
     pub external: External,
     pub last: Decision,
-    /// Id of the vehicle followed last frame.
-    pub lead_id: Option<u64>,
     /// Indicator shown, and since when (debounced).
     pub blinker_shown: (i32, f64),
     /// World position of the origin and heading (degrees), from the way.
@@ -480,7 +501,6 @@ impl Vehicle {
             light_decision: None,
             external: External::default(),
             last: Decision::default(),
-            lead_id: None,
             blinker_shown: (0, 0.0),
             pos: DVec3::ZERO,
             heading: 0.0,
@@ -938,6 +958,9 @@ impl Simulation {
         self.changes_started.clear();
         self.held_at_red = 0;
         self.measure_players(dt);
+        for v in vehicles.iter_mut() {
+            v.external.apply(&mut v.state, &v.params);
+        }
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
@@ -1431,8 +1454,8 @@ impl Simulation {
             // cannot go anyway; the hash eased the one in front of a nose-to-tail pair, and it
             // stood `EASE_MAX` for the one behind it, viz case14 #46608/#50444)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].lead_id == Some(idb);
-            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].lead_id == Some(ida);
+            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].last.lead_id == Some(idb);
+            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].last.lead_id == Some(ida);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a
@@ -1476,7 +1499,6 @@ impl Simulation {
         };
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
-        v.lead_id = lead_id;
         if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
             self.held_at_red += 1;
         }

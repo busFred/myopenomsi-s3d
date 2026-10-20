@@ -941,7 +941,7 @@ impl Schedule {
         traffic
             .cars
             .iter()
-            .position(|c| c.is_bus() && !c.ai.gone && self.car_departure.get(&c.id) == Some(&k))
+            .position(|c| c.serves_stops() && !c.released && self.car_departure.get(&c.id) == Some(&k))
     }
 
     /// The timetable buses at the end of their trip: each takes its tour's next trip on
@@ -1282,7 +1282,6 @@ impl Schedule {
                 continue;
             }
             crate::traffic::warm_up(world, ty, hof.clone());
-            t.prime_pull_out_room(ty, true);
             for (tr, _) in t.trailer_chain(ty) {
                 if seen.insert(tr.def.path.clone()) {
                     crate::traffic::warm_up(world, &tr, None);
@@ -2706,7 +2705,7 @@ impl Schedule {
                 if !track_is_air(traffic, section[k]) && !world.has_ground(p.x, p.y) {
                     return Err("tile unloaded");
                 }
-                if traffic.blocked(&ty, p, h as f64) || !traffic.spawn_clear(&ty, p, h as f64) {
+                if !traffic.spawn_clear(&ty, p, h as f64) {
                     return Err("no free lane");
                 }
                 if !traffic.may_appear(world, p) {
@@ -2739,7 +2738,7 @@ impl Schedule {
         // not into a vehicle that happens to be there (the player's bus at its stop, a car),
         // nor just in front of one driving up to that place: try again in a moment
         let at_heading = traffic.net.lanes[section[start_index]].at(s).1 as f64;
-        if traffic.blocked(&ty, at_pos, at_heading) || !traffic.spawn_clear(&ty, at_pos, at_heading)
+        if !traffic.spawn_clear(&ty, at_pos, at_heading)
         {
             log::debug!("trip {trip_name}: a vehicle stands where the bus would appear");
             self.fail_reason = Some("no free lane");
@@ -2754,7 +2753,7 @@ impl Schedule {
             && traffic
             .cars
             .iter()
-            .any(|c| c.is_bus() && !c.ai.gone && (c.vehicle.position - at_pos).length() < 50.0)
+            .any(|c| c.serves_stops() && !c.released && (c.vehicle.position - at_pos).length() < 50.0)
         {
             log::debug!(
                 "trip {trip_name}: its stand is taken, the bus comes at its departure time"

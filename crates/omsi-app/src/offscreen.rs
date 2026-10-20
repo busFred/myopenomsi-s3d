@@ -31,7 +31,7 @@ pub(crate) fn run_offscreen(
     crate::lights::load_smoke_texture(&mut renderer, &args.root);
     crate::lights::set_corona_root(&args.root);
     let mut scene = renderer.new_scene();
-    let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &renderer, &mut scene))?;
+    let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &settings, &renderer, &mut scene))?;
     // the map's own route arrows, with OMSI 2's route arrows
     world.show_help_arrows(&renderer, &mut scene, settings.nav_arrows);
     let lan_seed = lan_off.as_ref().map(lan::population_seed);
@@ -460,7 +460,7 @@ pub(crate) fn run_offscreen(
                     }
                     Some(crate::admin::TrafficOrder::Clear) => {
                         if let Some(t) = traffic.as_mut() {
-                            let ids: Vec<u64> = t.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
+                            let ids: Vec<u64> = t.cars.iter().filter(|c| !c.serves_stops()).map(|c| c.id).collect();
                             for id in &ids {
                                 t.remove_car(&world, &renderer, &mut scene, *id);
                             }
@@ -1346,7 +1346,7 @@ pub(crate) fn run_offscreen(
             );
             if omsi_cfg::env::var_os("OMSI_DEBUG_STUCK").is_some() {
                 for c in t.cars.iter().filter(|c| c.ai.stopped > 30.0) {
-                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.ai.stopped, c.id, c.vehicle.ty.def.type_name, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.ai.lead_id.unwrap_or(0), c.ai.last.why.name(), c.ai.last.stop.unwrap_or(0.0), c.ai.last.wait_for.unwrap_or(0));
+                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.ai.stopped, c.id, c.vehicle.ty.def.type_name, c.ai.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.ai.last.lead_id.unwrap_or(0), c.ai.last.why.name(), c.ai.last.stop.unwrap_or(0.0), c.ai.last.wait_for.unwrap_or(0));
                 }
             }
             for c in t.cars.iter().filter(|c| c.ai.stopped > 60.0).take(4) {
@@ -1362,8 +1362,8 @@ pub(crate) fn run_offscreen(
                 );
             }
         }
-        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
-        for c in t.cars.iter().filter(|c| c.is_bus()) {
+        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
+        for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
             if omsi_cfg::env::var_os("OMSI_DEBUG_PROPS").is_some() {
                 for v in [

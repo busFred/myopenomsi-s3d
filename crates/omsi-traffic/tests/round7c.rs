@@ -268,26 +268,31 @@ fn the_way_is_planned_to_the_claim_horizon() {
     assert!(planned < 150.0, "slow: planned {planned:.0} m");
 }
 
-/// [fix pass 1, 15] A vehicle record missing a driver field (removed on another branch, e.g.
-/// `yellow_brake`) still reads, the field as the car preset's; one with a field the code no
-/// longer knows reads too.
+/// [fix pass 1, 15] A vehicle record with a driver field the code no longer knows still
+/// reads (`yellow_brake`, removed in round 7 A5, is in every recording before it), and one
+/// missing a driver field reads too, the field as the car preset's.
 #[test]
 fn a_vehicle_record_without_a_removed_driver_field_still_reads() {
     let v = standing(VehicleClass::Car);
     let text = omsi_traffic::finite::to_string(&v).expect("written");
-    let without = text.replace(",\"yellow_brake\":2.5", "").replace("\"yellow_brake\":2.5,", "");
-    assert!(!without.contains("yellow_brake"), "the field is gone from the text");
-    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without yellow_brake");
+    let old = text.replacen("\"tau\":", "\"yellow_brake\":2.5,\"tau\":", 1);
+    assert!(old.contains("yellow_brake"), "an old record carries the field");
+    let back: Vehicle = omsi_traffic::finite::from_str(&old).expect("reads with yellow_brake");
+    assert_eq!(back.params, v.params);
+    let without = text.replacen("\"impatience_max\":1.0,", "", 1).replacen(",\"impatience_max\":1.0", "", 1);
+    assert!(!without.contains("impatience_max"), "the field is gone from the text");
+    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without impatience_max");
     back.params.fill_missing(back.class);
-    assert_eq!(back.params.yellow_brake, omsi_traffic::DriverParams::preset(VehicleClass::Car).yellow_brake);
-    // a bus's missing field is a bus's
-    let bus = standing(VehicleClass::Bus);
+    assert_eq!(back.params.impatience_max, omsi_traffic::DriverParams::preset(VehicleClass::Car).impatience_max);
+    // a bus's missing field is a bus's (`fill_missing` takes the class's preset)
+    let bus = standing(VehicleClass::ScheduledBus);
     let text = omsi_traffic::finite::to_string(&bus).expect("written");
-    let without = text.replace(",\"yellow_brake\":1.8", "").replace("\"yellow_brake\":1.8,", "");
-    assert!(!without.contains("yellow_brake"));
-    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads");
+    let needle = format!("\"comfort_brake\":{}", bus.params.comfort_brake);
+    let without = text.replacen(&format!("{needle},"), "", 1).replacen(&format!(",{needle}"), "", 1);
+    assert!(!without.contains("comfort_brake"), "the field is gone from the text");
+    let mut back: Vehicle = omsi_traffic::finite::from_str(&without).expect("reads without comfort_brake");
     back.params.fill_missing(back.class);
-    assert_eq!(back.params.yellow_brake, 1.8);
+    assert_eq!(back.params.comfort_brake, omsi_traffic::DriverParams::preset(VehicleClass::ScheduledBus).comfort_brake);
     // and a vehicle missing whole fields of its own and of its way reads too
     let bare: Vehicle = omsi_traffic::finite::from_str("{\"id\":7,\"class\":\"Bus\",\"state\":{\"lane\":3,\"s\":12.5}}").expect("reads a bare vehicle");
     assert_eq!((bare.id, bare.state.lane), (7, 3));

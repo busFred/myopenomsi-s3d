@@ -57,6 +57,14 @@ impl VehicleClass {
     }
 }
 
+/// A vehicle heavier than this (t, its `[mass]`) takes bends no harder than
+/// `HEAVY_LAT_ACCEL`, whatever its class (`DriverParams::by_mass`): a van of `[ai_veh_type]`
+/// 0 over 6 t bends like a lorry (the app's rule, by mass, until round 7).
+pub const HEAVY_MASS: f32 = 6.0;
+/// The bend acceleration of buses, lorries and heavy vans (m/s²; the app's value until
+/// round 7).
+pub const HEAVY_LAT_ACCEL: f32 = 1.6;
+
 /// Everything about how a driver drives, in one place. Units: metres, seconds, m/s².
 /// (Read from recordings: a field a recording lacks - one removed or added on another branch
 /// - reads as unknown (NaN) and is then the preset's of the vehicle's class,
@@ -90,9 +98,6 @@ pub struct DriverParams {
     /// How fast impatience grows while waiting (per second) and where it caps.
     pub impatience_rate: f32,
     pub impatience_max: f32,
-    /// Patience at a yellow light: go through when the stop would need more than this
-    /// braking (m/s²).
-    pub yellow_brake: f32,
 }
 
 impl Default for DriverParams {
@@ -100,19 +105,19 @@ impl Default for DriverParams {
     /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
         let n = f32::NAN;
-        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, gap_accept: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, yellow_brake: n }
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, gap_accept: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n }
     }
 }
 
 impl DriverParams {
     /// [fix pass 2, 5] The fields a recording lacked (NaN, `Default`) take the preset of
-    /// `class` (a bus's `yellow_brake` is a bus's, not a car's).
+    /// `class` (a bus's `comfort_brake` is a bus's, not a car's).
     pub fn fill_missing(&mut self, class: VehicleClass) {
         let p = DriverParams::preset(class);
         macro_rules! fill {
             ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
         }
-        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, gap_accept, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, yellow_brake);
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, gap_accept, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max);
     }
 
     /// The preset of a class, before jitter.
@@ -123,6 +128,8 @@ impl DriverParams {
             accel: 1.8,
             comfort_brake: 2.0,
             speed_factor: 1.0,
+            // (the app overrode it with 2.4-3.0 by seed until round 7; at 2.7 the junction
+            // test j6 rolls into the merge stretch: the crate's value stays the one value)
             lat_accel: 2.2,
             reaction: 0.8,
             gap_accept: 4.0,
@@ -132,15 +139,24 @@ impl DriverParams {
             lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
-            yellow_brake: 2.5,
         };
+        // (buses and lorries take bends more gently than cars: the app's 1.6 for every
+        // heavy vehicle, until round 7)
+        let bus = DriverParams { tau: 1.6, min_gap: 2.5, accel: 1.0, comfort_brake: 1.5, lat_accel: HEAVY_LAT_ACCEL, gap_accept: 5.0, lc_gap: 2.0, lc_speed_gain: 0.2, ..car };
         match class {
             VehicleClass::Car => car,
             VehicleClass::Taxi => DriverParams { tau: 1.0, accel: 2.2, speed_factor: 1.08, gap_accept: 3.2, impatience_rate: 1.0 / 20.0, ..car },
-            VehicleClass::Bus | VehicleClass::ScheduledBus => DriverParams { tau: 1.6, min_gap: 2.5, accel: 1.0, comfort_brake: 1.5, lat_accel: 1.4, gap_accept: 5.0, lc_gap: 2.0, lc_speed_gain: 0.2, yellow_brake: 1.8, ..car },
-            VehicleClass::Truck => DriverParams { tau: 1.8, min_gap: 3.0, accel: 0.8, comfort_brake: 1.5, speed_factor: 0.95, lat_accel: 1.3, gap_accept: 5.5, lc_gap: 2.5, lc_speed_gain: 0.2, yellow_brake: 1.8, ..car },
-            VehicleClass::Rail => DriverParams { tau: 3.0, min_gap: 10.0, accel: 0.8, comfort_brake: 0.8, lat_accel: 1.0, gap_accept: 0.0, impatience_rate: 0.0, yellow_brake: 1.0, ..car },
-            VehicleClass::Air => DriverParams { tau: 5.0, min_gap: 50.0, accel: 1.0, comfort_brake: 0.5, lat_accel: 1.0, gap_accept: 0.0, impatience_rate: 0.0, ..car },
+            VehicleClass::Bus => bus,
+            // a timetable bus brakes for its stops the way the town's drivers brake for a
+            // light: with 1.5 m/s² of "comfortable" braking the planner braked at half that
+            // and crept up to every stop for a hundred metres (the app's override until
+            // round 7, now the one value the IDM and the plan both read)
+            VehicleClass::ScheduledBus => DriverParams { comfort_brake: 2.1, ..bus },
+            VehicleClass::Truck => DriverParams { tau: 1.8, min_gap: 3.0, accel: 0.8, comfort_brake: 1.5, speed_factor: 0.95, lat_accel: HEAVY_LAT_ACCEL, gap_accept: 5.5, lc_gap: 2.5, lc_speed_gain: 0.2, ..car },
+            VehicleClass::Rail => DriverParams { tau: 3.0, min_gap: 10.0, accel: 0.8, comfort_brake: 0.8, lat_accel: 1.0, gap_accept: 0.0, impatience_rate: 0.0, ..car },
+            // (an aircraft follows its flight path at its speed: bends never slow it, the
+            // app's 50 m/s² until round 7; it speeds up and slows down at 0.5 m/s²)
+            VehicleClass::Air => DriverParams { tau: 5.0, min_gap: 50.0, accel: 0.5, comfort_brake: 0.5, lat_accel: 50.0, gap_accept: 0.0, impatience_rate: 0.0, ..car },
         }
     }
 
@@ -177,6 +193,16 @@ impl DriverParams {
             lc_speed_gain: j(p.lc_speed_gain, 0.2),
             impatience_rate: j(p.impatience_rate, 0.5),
             ..p
+        }
+    }
+
+    /// The parameters of a vehicle of `mass_t` tonnes: one over `HEAVY_MASS` takes bends no
+    /// harder than `HEAVY_LAT_ACCEL`.
+    pub fn by_mass(self, mass_t: f32) -> DriverParams {
+        if mass_t > HEAVY_MASS {
+            DriverParams { lat_accel: self.lat_accel.min(HEAVY_LAT_ACCEL), ..self }
+        } else {
+            self
         }
     }
 
@@ -227,6 +253,21 @@ impl Impatience {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod mass_tests {
+    use super::{DriverParams, HEAVY_LAT_ACCEL};
+    use crate::VehicleClass;
+
+    /// A car-class vehicle over 6 t bends like a lorry; a light one keeps its own.
+    #[test]
+    fn a5_a_heavy_van_bends_like_a_lorry() {
+        let car = DriverParams::seeded(VehicleClass::Car, 7);
+        assert_eq!(car.by_mass(7.5).lat_accel, car.lat_accel.min(HEAVY_LAT_ACCEL));
+        assert_eq!(car.by_mass(1.3).lat_accel, car.lat_accel);
+        assert!(car.by_mass(7.5).lat_accel <= HEAVY_LAT_ACCEL);
     }
 }
 

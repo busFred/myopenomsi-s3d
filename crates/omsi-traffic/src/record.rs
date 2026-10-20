@@ -47,7 +47,7 @@ use std::sync::mpsc;
 /// `serde(default)` (`Vehicle::default`, `AiState::default`: a car standing at the start of
 /// lane 0; `External::default`: no input) - except a driver field, which reads as unknown
 /// and then takes the preset of the vehicle's class (`DriverParams::fill_missing`, in
-/// `Replay::new`: a bus's missing `yellow_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
+/// `Replay::new`: a bus's missing `comfort_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
 /// e.g. format 4 in a round-6 tool) is not for that tool: `Replay::load` refuses it with that
 /// message, as fields it requires may be missing; read it with the branch's own tool.
 pub const VERSION: u32 = 4;
