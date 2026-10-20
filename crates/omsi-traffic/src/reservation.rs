@@ -370,20 +370,20 @@ fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize
     false
 }
 
-/// Links of a lead chain followed by `held_by` and `held_by_standing` (a three-car ring).
+/// Links of a chain followed by `held_by`, `held_by_standing` and `held_off` (a three-car ring).
 const LEAD_CHAIN: usize = 4;
 
 /// The standing claim `k` cannot come while what holds it holds (rule C): it is stuck itself
 /// (people, a zebra, a standing lead in front of it), or it stands refused by the junction
 /// (the first pass's `wait_for`) for one that is, or for one refused for one that is, within
-/// four steps. (Not for `me`: a foe waiting for me is `held_by`'s.) Never a player (its
+/// `LEAD_CHAIN` steps. (Not for `me`: a foe waiting for me is `held_by`'s.) Never a player (its
 /// grant is not read: it moves off whenever its driver does), and no link is followed from a
 /// member that is blocked without being stuck: its refusal says nothing (a blocked claimant
 /// drops nobody), what holds it lets it go on a schedule, and `START_DELAY` decides (review9:
 /// a foe 1 m out behind a lead moving off was dropped through a stuck third car).
 fn held_off(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
     let mut at = k;
-    for step in 0..4 {
+    for step in 0..LEAD_CHAIN {
         let o = &claims[at];
         if !o.standing() || o.committed || is_player(o.vehicle) {
             return false;
@@ -399,11 +399,22 @@ fn held_off(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain
             return false;
         }
         match claim_of.get(&w) {
-            Some(&next) if next != k && step < 3 => at = next,
+            Some(&next) if next != k && step + 1 < LEAD_CHAIN => at = next,
             _ => return false,
         }
     }
     false
+}
+
+/// [round 7 D4] The foe `o` (its claim as it stands on the piece of the meeting place `foe`;
+/// `claim` as filed, along the first piece of its chain) comes after me, `c`, whatever its
+/// speed or the table: one test, three cases in order -
+/// 1. behind me in my own lane (`behind_in_my_lane`), wherever it is;
+/// 2. not in the meeting place yet, merging in behind me (`merging_behind`);
+/// 3. not in the meeting place yet nor committed to it, behind me on a piece both our ways
+///    take (`behind_on_my_way`): one in it or committed is never dropped.
+fn behind_me(c: &Claim, o: &Claim, claim: &Claim, foe: &crate::junction::Foe, their_inside: bool) -> bool {
+    behind_in_my_lane(c, o, foe.theirs.0 - o.s) || (!their_inside && (merging_behind(c, o, foe) || (!o.committed && behind_on_my_way(c, claim))))
 }
 
 /// `o` is behind `c` on its own way: some piece of the junction is on both ways, `c`'s
@@ -646,14 +657,13 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 if me_in && !their_inside {
                     continue;
                 }
-                // behind me in my own lane, or merging in behind me: it
-                // comes after me at any speed, committed or not
-                if behind_in_my_lane(c, &claims[ok], foe.theirs.0 - o.s) || (!their_inside && merging_behind(c, o, foe)) {
+                // behind me (in my own lane, merging in behind me, or on a piece both our ways
+                // take): it comes after me at any speed, `behind_me`
+                if behind_me(c, o, &claims[ok], foe, their_inside) {
                     continue;
                 }
                 let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
-                // my own follower, or one behind me on a piece both our
-                // ways take, comes after me whatever the table says; one already in the
+                // my own follower comes after me whatever the table says; one already in the
                 // meeting place or committed to it is never dropped
                 // (the follower only while it stands: a lead is one frame's perception and
                 // flickers between two cars side by side into a merge; one rolling at 3 m/s
@@ -663,7 +673,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // case05: a bus at the head of the queue it had just left waited 8.6 s for
                 // three cars rolling up behind it, each a competitor from its own speed until
                 // it had come to a full stop)
-                if !their_inside && !o.committed && (behind_on_my_way(c, &claims[ok]) || (o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
+                if !their_inside && !o.committed && ((o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
                     continue;
                 }
                 // a foe standing at its red light is not coming before its light goes:
