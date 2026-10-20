@@ -212,3 +212,38 @@ fn two_spline_lanes_converging_into_one_have_a_compiled_merge_and_do_not_meet() 
     assert!(side_held, "the side road's car never gave way");
     assert!(closest > 0.3, "the two came within {closest:.2} m");
 }
+
+/// [fix pass 1, 13] The swerve round a parked car protruding into the lane is measured from the
+/// lane's axis, not from the swerved way: its target holds steady while the car passes.
+#[test]
+fn the_swerve_round_a_parked_car_does_not_flicker() {
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
+    use omsi_traffic::{Parked, Simulation};
+    let mut net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(400.0, 0.0, 0.0)], LaneKind::Street, 3.5)], ..Default::default() };
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    let mut sim = Simulation::new(&net, vec![]);
+    // its flank 0.25 m into the lane's strip of a 0.9 m car
+    sim.parked.insert(0, vec![Parked { s: 150.0, lateral: 2.0, half_width: 0.9, half_len: 2.2 }]);
+    let mut st = AiState::new(0, 100.0, 1);
+    st.speed = 8.0;
+    st.front = 2.0;
+    st.rear = 2.0;
+    st.length = 4.0;
+    let mut v = Vehicle::new(1, VehicleClass::Car, st, 0.9, 7919);
+    v.fresh = 0.0;
+    v.state.plan_next(&net);
+    let mut vs = vec![v];
+    let mut targets: Vec<f32> = Vec::new();
+    for _ in 0..(8.0 / DT) as usize {
+        sim.tick(&net, DT, &mut vs);
+        if (vs[0].state.s - 150.0).abs() < 25.0 {
+            targets.push(vs[0].state.lateral_target);
+        }
+    }
+    let flips = targets.windows(2).filter(|w| (w[0] - w[1]).abs() > 0.05).count();
+    assert!(targets.iter().any(|&t| t < -0.05), "no swerve: {targets:?}");
+    assert!(flips <= 2, "the swerve target changed {flips} times: {targets:?}");
+}

@@ -911,6 +911,8 @@ fn player_on_way(sim: &Simulation, me: &Vehicle, way: &WayPts, look: f32) -> Opt
 /// Parked cars on the way: a blocking one as a headway, a protruding one as a swerve.
 fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Option<Headway>, Option<f32>) {
     let st = &me.state;
+    // (where the plan's lateral is the kerb swerve: no pass, no lane change, no bay)
+    let swerve_holds = me.passing.is_none() && st.change.is_none() && me.external.bay.is_none();
     let mut lead: Option<Headway> = None;
     let mut swerve: Option<f32> = None;
     for &(l, d0) in way {
@@ -922,7 +924,11 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
             if !(-6.0..=100.0).contains(&along) {
                 continue;
             }
-            let my_lat = st.lateral_ahead(along.max(0.0));
+            // ([fix pass 1, 13] against the offset the car holds without the kerb swerve - the
+            // lane's axis where the swerve is the plan's lateral, `plan` rule 9: measured
+            // against `lateral_ahead`, which includes the swerve itself, the need flickered
+            // 0 / -0.35 / 0 frame by frame on 37 cars of a run)
+            let my_lat = if swerve_holds { 0.0 } else { st.lateral_ahead(along.max(0.0)) };
             let lat = p.lateral - my_lat;
             let clearance = me.half_width + p.half_width + 0.35;
             if lat.abs() >= clearance {
