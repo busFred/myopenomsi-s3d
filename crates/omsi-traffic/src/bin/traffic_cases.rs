@@ -4195,9 +4195,10 @@ struct Extra {
     /// 40 m / 60 m ahead of its front (`Grant::at`; review-r6 case11's count).
     far_refused_40_s: f64,
     far_refused_60_s: f64,
-    /// [round 7 B1] Vehicles within the radius that gave up (`Vehicle::gone` set) during the
-    /// run: what the game may take off the road in view (its removal rules run in the app,
-    /// not here). One already given up at the first keyframe is not counted.
+    /// [round 7 B1] Vehicles within the radius that gave up (`Vehicle::gone` set by the
+    /// crate) during the run: what the game may take off the road in view (its removal rules
+    /// run in the app, not here). Not counted: one that came on the road (keyframe, spawn)
+    /// given up already, and a timetable bus (its `gone` is the app's, trip over).
     removed_in_view: u64,
     events: Vec<String>,
 }
@@ -4358,8 +4359,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
-    // (those given up: one already at the start is not counted)
+    // (those given up, and those seen: one that comes on the road given up is not counted)
     let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
+    let mut gone_seen: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4424,9 +4426,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool) -> Res<S
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
             for v in &r.vehicles {
+                let first = gone_seen.insert(v.id);
                 if !v.gone {
                     gone_ids.remove(&v.id);
-                } else if gone_ids.insert(v.id) && near(v.pos) {
+                } else if gone_ids.insert(v.id) && !first && !v.serves_stops() && near(v.pos) {
                     ex.removed_in_view += 1;
                     ex.events.push(format!("GONE {} t={now:.1} #{} {:?} lane {} s {:.1} v {:.2} stood {:.0} why={}", sc.name, v.id, v.class, v.state.lane, v.state.s, v.state.speed, v.stopped, why_name(v.last.why)));
                 }
