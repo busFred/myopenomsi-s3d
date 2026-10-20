@@ -6416,7 +6416,7 @@ impl Humans {
                 }
                 let h = c.vehicle.heading.to_radians();
                 let fwd = DVec2::new(h.sin(), h.cos());
-                let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
+                let bb = c.vehicle.ty.def.bounding_box.unwrap_or(crate::traffic::DEFAULT_BOX);
                 let o = omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading);
                 let body = Block { center: o.center, half: o.half, heading: o.heading, vel: fwd * c.ai.state.speed as f64 };
                 // [ROLLBACK pedyield-1] (and whether it is stopping for somebody on foot:

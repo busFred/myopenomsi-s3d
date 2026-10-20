@@ -2705,7 +2705,7 @@ impl Schedule {
                 if !track_is_air(traffic, section[k]) && !world.has_ground(p.x, p.y) {
                     return Err("tile unloaded");
                 }
-                if traffic.blocked(&ty, p, h as f64) || !traffic.spawn_clear(&ty, p, h as f64) {
+                if !traffic.spawn_clear(&ty, p, h as f64) {
                     return Err("no free lane");
                 }
                 if !traffic.may_appear(world, p) {
@@ -2738,7 +2738,7 @@ impl Schedule {
         // not into a vehicle that happens to be there (the player's bus at its stop, a car),
         // nor just in front of one driving up to that place: try again in a moment
         let at_heading = traffic.net.lanes[section[start_index]].at(s).1 as f64;
-        if traffic.blocked(&ty, at_pos, at_heading) || !traffic.spawn_clear(&ty, at_pos, at_heading)
+        if !traffic.spawn_clear(&ty, at_pos, at_heading)
         {
             log::debug!("trip {trip_name}: a vehicle stands where the bus would appear");
             self.fail_reason = Some("no free lane");

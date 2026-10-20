@@ -157,6 +157,12 @@ impl AiCar {
         self.bus.is_some()
     }
 
+    /// Standing, as the traffic's own rules take it (`omsi_traffic::driver::STANDING_SPEED`):
+    /// what every "queued behind" test here asks of a vehicle.
+    pub fn standing(&self) -> bool {
+        self.ai.state.speed.abs() < omsi_traffic::driver::STANDING_SPEED
+    }
+
     /// Bound to rails (a train, a tram).
     pub fn is_rail(&self) -> bool {
         self.body.kind == MotionKind::Rail
@@ -471,8 +477,6 @@ pub struct Traffic {
     /// `[sound_ai]` configurations by file.
     sound_cfgs: HashMap<std::path::PathBuf, Option<Arc<omsi_vehicle::SoundCfg>>>,
     root: std::path::PathBuf,
-    /// Car-frames spent waiting for a red light (statistics).
-    pub held_at_red: usize,
     /// Who wants a timetable bus to stop (`Humans::stop_wishes`): the buses somebody
     /// aboard wants to get off, the stops where somebody waits. None without passengers:
     /// every bus then serves every stop.
@@ -632,8 +636,19 @@ fn hhmmss() -> String {
     format!("{:02}{:02}{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// `[boundingbox]` of a vehicle that gives none.
-const DEFAULT_BOX: [f32; 6] = [2.5, 12.0, 3.0, 0.0, 0.0, 1.5];
+/// Two bodies count as inside each other past this depth (m): a touch of 20 cm is the
+/// bodies' rounding (`Traffic::overlaps`, the recordings' "overlap" trigger and the
+/// `OMSI_CHECK_OVERLAP` log).
+const OVERLAP_DEPTH: f64 = 0.2;
+
+/// How far (m) a vehicle put on the road keeps its bodies from every other vehicle's
+/// (`Traffic::spawn_clear`): the stricter of the two tests it replaces (footprints with 1 m
+/// on each side, 2 m between; the timetable's bodies with 0.5 m).
+const SPAWN_BODY_CLEAR: f64 = 2.0;
+
+/// `[boundingbox]` of a vehicle that gives none (bus-sized: the traffic's bodies and the
+/// people's view of the AI cars, `Humans`, use this one value).
+pub(crate) const DEFAULT_BOX: [f32; 6] = [2.5, 12.0, 3.0, 0.0, 0.0, 1.5];
 
 /// The bodies of a vehicle and of the parts coupled to it, where they stand.
 pub fn vehicle_bodies(v: &VehicleInstance) -> Vec<omsi_sim::collision::Obb> {
@@ -1130,7 +1145,6 @@ impl Traffic {
             trailer_types: HashMap::new(),
             sound_cfgs: HashMap::new(),
             root: root.to_path_buf(),
-            held_at_red: 0,
             stop_wishes: None,
             player_still: 0.0,
             day_time: 0.0,
@@ -1652,19 +1666,10 @@ impl Traffic {
     /// in plain sight of the mirrors, and a bus waiting at the edge of the loaded route
     /// vanished beside the player's bus because the camera was looking ahead. Further off:
     /// beyond what is drawn, out of the picture, or behind something.
+    /// (`Viewer::hides_plainly`, or behind something past `NEVER_VANISH_WITHIN`: one rule.)
     pub fn hidden(&self, world: &World, p: DVec3, r: f64) -> bool {
         let Some(v) = self.viewer else { return true };
-        let d = (p - v.pos).length();
-        if d < NEVER_VANISH_WITHIN {
-            return false;
-        }
-        if !v.draws(d, r) {
-            return true;
-        }
-        if d < NEAR_HIDE {
-            return self.occluded(world, &v, p, r);
-        }
-        !v.frames(p, r) || self.occluded(world, &v, p, r)
+        v.hides_plainly(p, r) || ((p - v.pos).length() >= NEVER_VANISH_WITHIN && self.occluded(world, &v, p, r))
     }
 
     /// Spawn cars until `target` are within `spawn_radius` of `center`; despawn far ones.
@@ -1715,9 +1720,9 @@ impl Traffic {
         let standing: hashbrown::HashSet<u64> = self
             .cars
             .iter()
-            .filter(|c| c.ai.state.speed.abs() < 0.3)
+            .filter(|c| c.standing())
             .map(|c| c.id)
-            .chain(self.sim.players.iter().filter(|p| p.speed.abs() < 0.3).map(|p| omsi_traffic::sim::PLAYER_ID_BASE + p.id as u64))
+            .chain(self.sim.players.iter().filter(|p| p.speed.abs() < omsi_traffic::driver::STANDING_SPEED).map(|p| omsi_traffic::sim::PLAYER_ID_BASE + p.id as u64))
             .collect();
         let mut i = 0;
         let mut off_ground = 0usize;
@@ -2876,34 +2881,30 @@ impl Traffic {
     /// (or right up against) another vehicle or the player's: a timetable bus used to be
     /// checked only for a vehicle origin within 9 m, and a layover bus appeared inside the
     /// articulated bus waiting at the same stand.
-    pub fn spawn_clear(&self, ty: &VehicleType, pos: DVec3, heading: f64) -> bool {
+    pub fn spawn_clear(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64) -> bool {
         self.spawn_clear_except(ty, pos, heading, None)
     }
 
     /// `spawn_clear`, leaving out car `except` (a vehicle asking whether it could be put
-    /// back where it stands).
-    pub fn spawn_clear_except(&self, ty: &VehicleType, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
-        let (front, rear, half_w) = extents(ty, 12.0);
-        let h = heading.to_radians();
-        let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
-        let me = Footprint {
-            car: usize::MAX,
-            center: pos.truncate() + fwd * ((front - rear) * 0.5) as f64,
-            fwd,
-            right,
-            half_len: ((front + rear) * 0.5) as f64,
-            half_w: half_w as f64,
-            speed: 0.0,
-            z: pos.z,
-        };
-        if self.footprints().iter().any(|f| {
-            Some(f.car) != except
-                && (f.center - me.center).length() < f.half_len + me.half_len + 5.0
-                && (f.z - me.z).abs() < 4.0
-                && f.overlaps(&me, 1.0)
-        }) {
+    /// back where it stands). The bodies of the vehicle and of the parts coupled to it are
+    /// compared with `SPAWN_BODY_CLEAR` to spare (not centres: an articulated bus reaches
+    /// 6 m ahead of its origin and 12 m behind it, and one put down 9.3 m from the player's
+    /// bus stood 1.8 m inside it) with every other vehicle's and `keep_clear`.
+    pub fn spawn_clear_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
+        let bodies = self.consist_bodies(ty, pos, heading);
+        let reach = bodies.iter().map(|b| (b.center - pos.truncate()).length() + b.half.length()).fold(0.0, f64::max) + 40.0;
+        let touches = |o: &omsi_sim::collision::Obb| bodies.iter().any(|b| b.overlaps(o));
+        let taken = self.keep_clear.iter().any(|o| touches(o))
+            || self
+                .cars
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| Some(*i) != except && (c.vehicle.position - pos).length() < reach)
+                .any(|(_, c)| vehicle_bodies(&c.vehicle).iter().any(|o| touches(o)));
+        if taken {
             return false;
         }
+        let (front, rear, half_w) = extents(ty, 12.0);
         // nor just in front of a car driving up to that place (it would have to stop hard)
         let in_front = self.cars.iter().enumerate().filter(|(i, _)| Some(*i) != except).any(|(_, c)| {
             let rel = pos - c.vehicle.position;
@@ -2923,8 +2924,12 @@ impl Traffic {
         if in_front {
             return false;
         }
+        // nor close to the player's (a wider margin: in plain sight)
         match self.player {
             Some((c, ph, hl, hw, _)) => {
+                let h = heading.to_radians();
+                let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
+                let me = Footprint { car: usize::MAX, center: pos.truncate() + fwd * ((front - rear) * 0.5) as f64, fwd, right, half_len: ((front + rear) * 0.5) as f64, half_w: half_w as f64, speed: 0.0, z: pos.z };
                 let h = ph.to_radians();
                 let p = Footprint {
                     car: usize::MAX,
@@ -3028,8 +3033,8 @@ impl Traffic {
         let Some(my_stop) = me.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id) else { return (false, false) };
         let stop_of = |c: &AiCar| c.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id);
         let lead_close = match (me.ai.last.lead_seen, me.ai.last.lead_id, me.ai.last.lead) {
-            (Some(Seen::Player(_)), _, Some(l)) => l.gap < 9.0 && player.is_some_and(|p| p.4.abs() < 0.3),
-            (_, Some(id), Some(l)) => l.gap < 9.0 && self.cars.iter().find(|o| o.id == id).is_some_and(|o| o.ai.state.speed.abs() < 0.3 && o.at_stop() && stop_of(o) == Some(my_stop)),
+            (Some(Seen::Player(_)), _, Some(l)) => l.gap < 9.0 && player.is_some_and(|p| p.4.abs() < omsi_traffic::driver::STANDING_SPEED),
+            (_, Some(id), Some(l)) => l.gap < 9.0 && self.cars.iter().find(|o| o.id == id).is_some_and(|o| o.standing() && o.at_stop() && stop_of(o) == Some(my_stop)),
             _ => false,
         };
         let follower_close = self.cars.iter().enumerate().any(|(j, o)| {
@@ -3046,7 +3051,7 @@ impl Traffic {
         while k < chain.len() && chain.len() <= 30 {
             let id = chain[k];
             for o in &self.cars {
-                if o.ai.state.speed < 0.3 && o.ai.last.lead_id == Some(id) && !chain.contains(&o.id) {
+                if o.standing() && o.ai.last.lead_id == Some(id) && !chain.contains(&o.id) {
                     chain.push(o.id);
                 }
             }
@@ -3060,7 +3065,7 @@ impl Traffic {
     fn fan_cover(&self, i: usize) -> Vec<usize> {
         let c = &self.cars[i];
         let st = &c.ai.state;
-        if c.bus.is_none() || c.is_rail() || st.speed >= 0.3 {
+        if c.bus.is_none() || c.is_rail() || !c.standing() {
             return Vec::new();
         }
         let through = |l: usize| self.through.through(&self.net, l, c.id);
@@ -3079,7 +3084,7 @@ impl Traffic {
         let others: Vec<crate::bus_service::FanOther> = self
             .cars
             .iter()
-            .filter(|o| o.id != me && o.ai.state.speed < 0.3)
+            .filter(|o| o.id != me && o.standing())
             .map(|o| {
                 let st = &o.ai.state;
                 let way: Vec<(usize, f32)> = omsi_traffic::perception::way_lanes(&self.net, st, reach + st.front).into_iter().map(|(l, d)| (l, d - st.front)).collect();
@@ -3168,7 +3173,7 @@ impl Traffic {
                 why.get_or_insert("every place to come back at is in the player's sight");
                 return false;
             }
-            if self.blocked_except(&ty, q, h as f64, Some(i)) || !self.spawn_clear_except(&ty, q, h as f64, Some(i)) {
+            if !self.spawn_clear_except(&ty, q, h as f64, Some(i)) {
                 why.get_or_insert("no place to come back at is free");
                 return false;
             }
@@ -3293,9 +3298,9 @@ impl Traffic {
             let (fan_secs, fan_queued) = self.fan_queue(i, &fan);
             let queue_behind_secs = if self.cars[i].bus.is_some() {
                 let me = &self.cars[i];
-                let cars = self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me.id) && o.ai.state.speed < 0.3).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
+                let cars = self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me.id) && o.standing()).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
                 // the player's bus standing close behind it, heading the same way, counts too
-                let player_behind = player.filter(|p| p.4.abs() < 0.3).map_or(0.0, |p| {
+                let player_behind = player.filter(|p| p.4.abs() < omsi_traffic::driver::STANDING_SPEED).map_or(0.0, |p| {
                     let h = (me.ai.heading as f64).to_radians();
                     let fwd = DVec2::new(h.sin(), h.cos());
                     let rel = (p.0 - me.ai.pos).truncate();
@@ -3439,7 +3444,6 @@ impl Traffic {
             c.ai = v;
         }
         self.day_time = self.sim.day_time;
-        self.held_at_red = self.sim.held_at_red;
         let mut remove: Vec<usize> = self.sim.removed.clone();
         remove.extend(respawn.iter().copied());
         remove.sort_unstable_by(|a, b| b.cmp(a));
@@ -3704,21 +3708,40 @@ impl Traffic {
         }
     }
 
-    /// Two AI cars whose bodies are inside each other by more than 20 cm (their ids).
+    /// Two AI cars whose bodies are inside each other by more than 20 cm (their ids): the
+    /// first pair `overlaps` finds.
     fn overlapping_pair(&self) -> Option<(u64, u64)> {
-        for (i, c) in self.cars.iter().enumerate() {
-            let a = c.ai.obb();
-            for j in self.sim.vehicles_near(c.ai.pos, 10.0) {
-                let Some(o) = self.cars.get(j).filter(|_| j > i) else { continue };
-                if (c.ai.pos.z - o.ai.pos.z).abs() > 3.0 || (c.ai.pos - o.ai.pos).truncate().length() > 30.0 {
-                    continue;
+        self.overlaps(None, &[]).into_iter().next().map(|(a, b, ..)| (self.cars[a].id, self.cars[b].id))
+    }
+
+    /// Every two bodies inside each other by more than `OVERLAP_DEPTH`: (car, other car or
+    /// `usize::MAX` for the player box `Some(k)` of `player` then `others`, where). The AI
+    /// cars by their `footprints` (coupled parts too), the players by their boxes.
+    fn overlaps(&self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) -> Vec<(usize, usize, Option<usize>, DVec2)> {
+        let feet = self.footprints();
+        let boxes: Vec<Footprint> = player
+            .iter()
+            .chain(others.iter().map(|(_, b)| b))
+            .map(|&(c, h, hl, hw, v)| {
+                let hr = h.to_radians();
+                Footprint { car: usize::MAX, center: c.truncate(), fwd: DVec2::new(hr.sin(), hr.cos()), right: DVec2::new(hr.cos(), -hr.sin()), half_len: hl as f64, half_w: hw as f64, speed: v, z: c.z }
+            })
+            .collect();
+        let inside = |fa: &Footprint, fb: &Footprint| (fa.z - fb.z).abs() <= 3.0 && fa.overlaps(fb, -OVERLAP_DEPTH);
+        let mut out = Vec::new();
+        for (a, fa) in feet.iter().enumerate() {
+            for fb in feet.iter().skip(a + 1) {
+                if fb.car != fa.car && inside(fa, fb) {
+                    out.push((fa.car, fb.car, None, fa.center));
                 }
-                if a.separation(&o.ai.obb()) < -0.2 {
-                    return Some((c.id, o.id));
+            }
+            for (k, fb) in boxes.iter().enumerate() {
+                if inside(fa, fb) {
+                    out.push((fa.car, usize::MAX, Some(k), fa.center));
                 }
             }
         }
-        None
+        out
     }
 
     /// `OMSI_TRAFFIC_NETWORK_DUMP=<folder>`: the network and its junctions as
@@ -3738,50 +3761,36 @@ impl Traffic {
         }
     }
 
-    /// Log every two bodies inside each other (each pair once in ten seconds); returns how
-    /// many new ones there were.
+    /// Log every two bodies inside each other (`overlaps`; each pair once in ten seconds);
+    /// returns how many new ones there were.
     fn check_overlaps(&mut self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) -> usize {
         static SEEN: std::sync::OnceLock<parking_lot::Mutex<HashMap<(u64, u64), f32>>> = std::sync::OnceLock::new();
         let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
-        let feet = self.footprints();
-        let boxes: Vec<(u64, Footprint)> = player
-            .iter()
-            .map(|b| (u64::MAX, *b))
-            .chain(others.iter().map(|(id, b)| (u64::MAX - 1 - *id as u64, *b)))
-            .map(|(id, (c, h, hl, hw, v))| {
-                let hr = h.to_radians();
-                (id, Footprint { car: usize::MAX, center: c.truncate(), fwd: DVec2::new(hr.sin(), hr.cos()), right: DVec2::new(hr.cos(), -hr.sin()), half_len: hl as f64, half_w: hw as f64, speed: v, z: c.z })
-            })
-            .collect();
         let why = |c: &AiCar| format!("{} v {:.1} lane {} s {:.1} lat {:.2} why {:?} passing {} change {}", c.vehicle.ty.def.path.file_stem().unwrap_or_default().to_string_lossy(), c.ai.state.speed, c.ai.state.lane, c.ai.state.s, c.ai.state.lateral, c.ai.last.why, c.ai.passing.is_some(), c.ai.state.change.is_some());
-        let found = std::cell::Cell::new(0usize);
-        for (a, fa) in feet.iter().enumerate() {
-            let ca = &self.cars[fa.car];
-            let hit = |other: u64, fb: &Footprint, desc: String| {
-                if (fa.z - fb.z).abs() > 3.0 || !fa.overlaps(fb, -0.2) {
-                    return;
+        let mut found = 0usize;
+        for (a, b, k, at) in self.overlaps(player, others) {
+            let ca = &self.cars[a];
+            // (the player boxes: u64::MAX for the player, below it the others by their id)
+            let (other, desc) = match k {
+                None => (self.cars[b].id, format!("car {} ({})", self.cars[b].id, why(&self.cars[b]))),
+                Some(k) => {
+                    let (id, speed) = if player.is_some() && k == 0 { (u64::MAX, player.map_or(0.0, |p| p.4)) } else {
+                        let (pid, b) = others[k - player.is_some() as usize];
+                        (u64::MAX - 1 - pid as u64, b.4)
+                    };
+                    (id, format!("player box {} v {:.1}", u64::MAX - id, speed))
                 }
-                let key = (ca.id.min(other), ca.id.max(other));
-                let mut m = seen.lock();
-                if m.get(&key).is_some_and(|t| self.time - *t < 10.0) {
-                    return;
-                }
-                m.insert(key, self.time);
-                log::info!("t={:.1}: OVERLAP car {} ({}) with {} at ({:.1}, {:.1})", self.time, ca.id, why(ca), desc, fa.center.x, fa.center.y);
-                found.set(found.get() + 1);
             };
-            for fb in feet.iter().skip(a + 1) {
-                if fb.car == fa.car {
-                    continue;
-                }
-                let cb = &self.cars[fb.car];
-                hit(cb.id, fb, format!("car {} ({})", cb.id, why(cb)));
+            let key = (ca.id.min(other), ca.id.max(other));
+            let mut m = seen.lock();
+            if m.get(&key).is_some_and(|t| self.time - *t < 10.0) {
+                continue;
             }
-            for (id, fb) in &boxes {
-                hit(*id, fb, format!("player box {} v {:.1}", u64::MAX - id, fb.speed));
-            }
+            m.insert(key, self.time);
+            log::info!("t={:.1}: OVERLAP car {} ({}) with {} at ({:.1}, {:.1})", self.time, ca.id, why(ca), desc, at.x, at.y);
+            found += 1;
         }
-        found.get()
+        found
     }
 
     /// `OMSI_DEBUG_LIGHTS`: every change of the lights of the chosen programs, with the
@@ -3949,18 +3958,9 @@ impl Traffic {
         }
     }
 
-    /// Would a vehicle of type `ty` with its origin at `pos`, heading `heading` (and its
-    /// coupled parts, straight behind it) touch one that is already there - an AI vehicle,
-    /// or one of `keep_clear`? Bodies are compared with half a metre to spare, not centres:
-    /// an articulated bus reaches 6 m ahead of its origin and 12 m behind it, and one put
-    /// down 9.3 m from the player's bus stood 1.8 m inside it.
-    pub fn blocked(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64) -> bool {
-        self.blocked_except(ty, pos, heading, None)
-    }
-
     /// [round 7 fix pass 1, 12] How far behind its origin (m) the consist of `ty` (its rear
     /// sections, trailers, the cars of a unit) reaches standing straight: each car placed as
-    /// `blocked_except` places it, the farthest corner back.
+    /// `consist_bodies` places it, the farthest corner back.
     fn consist_rear(&mut self, ty: &Arc<VehicleType>) -> f32 {
         let (pos, heading) = (DVec3::ZERO, 0.0f64);
         let mut back_most = 0.0f64;
@@ -3985,11 +3985,11 @@ impl Traffic {
         back_most as f32
     }
 
-    /// `blocked`, leaving out car `except` (a vehicle asking whether it could be put back
-    /// where it stands).
-    pub fn blocked_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
+    /// The bodies a vehicle of `ty` would have with its origin at `pos`, heading `heading`,
+    /// and its coupled parts straight behind it, each grown by `SPAWN_BODY_CLEAR`.
+    fn consist_bodies(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64) -> Vec<omsi_sim::collision::Obb> {
         let grown = |mut b: omsi_sim::collision::Obb| {
-            b.half += glam::DVec2::splat(0.5);
+            b.half += glam::DVec2::splat(SPAWN_BODY_CLEAR);
             b
         };
         let mut bodies = vec![grown(omsi_sim::collision::Obb::from_box(
@@ -4019,19 +4019,7 @@ impl Traffic {
             lead = t;
             lead_rev = rev;
         }
-        let reach = bodies
-            .iter()
-            .map(|b| (b.center - pos.truncate()).length() + b.half.length())
-            .fold(0.0, f64::max)
-            + 40.0;
-        let touches = |o: &omsi_sim::collision::Obb| bodies.iter().any(|b| b.overlaps(o));
-        self.keep_clear.iter().any(|o| touches(o))
-            || self
-                .cars
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| Some(*i) != except && (c.vehicle.position - pos).length() < reach)
-                .any(|(_, c)| vehicle_bodies(&c.vehicle).iter().any(|o| touches(o)))
+        bodies
     }
 
     /// The lanes the other way along one-way paths `lanes` (see `Schedule`'s route
