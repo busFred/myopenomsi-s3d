@@ -279,13 +279,7 @@ impl Lane {
         DVec3::new(xy.x, xy.y, lin.z)
     }
 
-    /// Position and heading at `s`, continued straight along the end tangents beyond either
-    /// end of the lane.
-    pub fn at_ext(&self, s: f32) -> (DVec3, f32) {
-        self.at_ext_with(s, &mut Tangents::default())
-    }
-
-    /// The heading of `at_ext`, without the point.
+    /// The heading of `at_ext_with`, without the point.
     fn heading_at_ext(&self, s: f32) -> f32 {
         if s < 0.0 {
             self.start_heading()
@@ -951,21 +945,6 @@ impl Network {
         la.turn != 0 && lb.turn == 0
     }
 
-    /// Review: the baseline rule (9d814a7), for comparison.
-    pub fn must_yield_old(&self, a: usize, b: usize) -> bool {
-        let (la, lb) = (&self.lanes[a], &self.lanes[b]);
-        if la.kind == LaneKind::Rail { return false; }
-        if lb.kind == LaneKind::Rail { return true; }
-        if (la.priority - lb.priority).abs() > 0.5 { return la.priority < lb.priority; }
-        let rel = wrap_deg(lb.start_heading() - la.start_heading());
-        let across = if self.left_hand { 2 } else { 1 };
-        if rel.abs() > 135.0 { return la.turn == across && lb.turn != across; }
-        let rel = if self.left_hand { -rel } else { rel };
-        if rel < -30.0 { return true; }
-        if rel > 30.0 { return false; }
-        la.turn != 0 && lb.turn == 0
-    }
-
     /// Where lanes `a` and `b` meet, along `a` (the crossing point, or `a`'s end at a merge;
     /// `a`'s end when the network does not know the place), and whether it is a merge.
     pub fn meeting_on(&self, a: usize, b: usize) -> (f32, bool) {
@@ -1148,54 +1127,6 @@ impl Network {
             }
         }
         best
-    }
-
-    /// [ROLLBACK lanes-107] The street lanes running alongside the line through `p` along
-    /// `fwd` (a unit vector) within `within` metres to either side: (lateral offset of the
-    /// lane's middle, positive to the right of `fwd`, its half width). For roads laid out as
-    /// objects, where nothing links a lane to its neighbours and the ground has no asphalt
-    /// beside the path.
-    pub fn lanes_beside(&self, p: DVec3, fwd: DVec2, within: f64) -> Vec<(f32, f32)> {
-        let right = DVec2::new(fwd.y, -fwd.x);
-        let cx = (p.x / GRID_CELL).floor() as i32;
-        let cy = (p.y / GRID_CELL).floor() as i32;
-        let mut out: Vec<(f32, f32)> = Vec::new();
-        let mut seen: Vec<usize> = Vec::new();
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for &i in self
-                    .grid
-                    .get(&(cx + dx, cy + dy))
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
-                {
-                    if seen.contains(&i) {
-                        continue;
-                    }
-                    seen.push(i);
-                    let o = &self.lanes[i];
-                    if o.kind != LaneKind::Street {
-                        continue;
-                    }
-                    let Some((os, d)) = o.nearest_point(p) else {
-                        continue;
-                    };
-                    if d > within {
-                        continue;
-                    }
-                    let (q, oh) = o.at(os);
-                    let hr = (oh as f64).to_radians();
-                    let along = DVec2::new(hr.sin(), hr.cos());
-                    if along.dot(fwd).abs() < 0.9 {
-                        continue;
-                    }
-                    let lat = (q - p).truncate().dot(right) as f32;
-                    let w = if o.width > 1.0 { o.width } else { 3.0 };
-                    out.push((lat, w * 0.5));
-                }
-            }
-        }
-        out
     }
 
     /// The lanes traffic comes from towards distance `s` of `lane`, walked backwards over
@@ -2605,21 +2536,6 @@ impl TrafficLightController {
         self.state_at(i, self.time)
     }
 
-    /// Seconds until light `i` next shows another state, if the clock keeps running (None
-    /// within a whole cycle).
-    pub fn time_to_change(&self, i: usize) -> Option<f32> {
-        let now = self.state(i);
-        let cycle = self.cycle_len();
-        let mut t = 0.25;
-        while t <= cycle {
-            if self.state_at(i, self.time + t) != now {
-                return Some(t as f32);
-            }
-            t += 0.25;
-        }
-        None
-    }
-
     /// Seconds until light `i` lets vehicles go (0 while it does), if the clock keeps
     /// running; None when it never does within a cycle.
     pub fn time_until_go(&self, i: usize) -> Option<f32> {
@@ -2635,22 +2551,6 @@ impl TrafficLightController {
             t += 0.25;
         }
         None
-    }
-
-    /// Index of the phase light `i` is in (debugging).
-    pub fn phase_index(&self, i: usize) -> i32 {
-        let phases = match self.lights.get(i) {
-            Some(p) if !p.is_empty() => p,
-            _ => return -1,
-        };
-        let mut x = self.time.rem_euclid(self.cycle_len()) as f32;
-        for (k, (_, dur)) in phases.iter().enumerate() {
-            if x < *dur {
-                return k as i32;
-            }
-            x -= dur;
-        }
-        phases.len() as i32 - 1
     }
 
     /// Seconds until light `i` leaves the state it shows now while the clock runs on
@@ -2791,8 +2691,6 @@ pub struct AiState {
     pub change_plan: Vec<usize>,
     /// The lane the car came from (the way behind it, for the rear axle).
     pub prev_lane: Option<usize>,
-    /// Seconds spent waiting to enter a crossing (deadlock breaker).
-    pub yield_time: f32,
     /// Fixed lane sequence (timetable track); empty = wander randomly.
     pub route: Vec<usize>,
     /// Position in `route` of the current lane.
@@ -2814,9 +2712,6 @@ pub struct AiState {
     /// between the points. While the odometer is short of the last point this is the offset
     /// (the S-curve above holds from there on, and the planner leaves it at 0 to 0).
     pub lateral_curve: Vec<(f32, f32)>,
-    /// A turn the car has taken a turn lane for (1 left, 2 right): the way out of the
-    /// junction is chosen to match.
-    pub turn_wish: i32,
     /// Indicator the driver sets for a manoeuvre of its own (pulling away from a stop),
     /// held while `signal_time` runs.
     pub signal: i32,
@@ -2890,30 +2785,6 @@ pub fn arrival_time(dist: f32, v: f32, a: f32, v_max: f32) -> f32 {
     } else {
         t_up + (dist - d_up) / v_max
     }
-}
-
-/// How far along its S-curve (smoothstep, 0..1) a car moving back from the lane `side`
-/// metres to the left has to be before its middle is `clear` metres from that lane's
-/// middle (out of the way of the traffic there).
-pub fn ramp_progress_for(side: f32, clear: f32) -> f32 {
-    if clear <= 0.0 {
-        return 0.0;
-    }
-    if side <= clear {
-        return 1.0;
-    }
-    // the offset left is side × (1 − smoothstep(t)); it is clear once smoothstep(t) ≥ clear / side
-    let want = clear / side;
-    let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..20 {
-        let mid = 0.5 * (lo + hi);
-        if smooth01(mid) < want {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    hi
 }
 
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
@@ -3028,7 +2899,7 @@ impl LaneSeq {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3080,14 +2951,7 @@ impl AiState {
         let pooled = self.traffic_pool.is_some().then(|| open_to(true)).filter(|o| !o.is_empty());
         let weighted = pooled.is_some();
         let open = pooled.unwrap_or_else(|| open_to(false));
-        let mut choices = if open.is_empty() { next.clone() } else { open };
-        if self.turn_wish != 0 {
-            let wished: Vec<usize> = choices.iter().copied().filter(|&n| net.lanes[n].turn == self.turn_wish).collect();
-            if !wished.is_empty() {
-                choices = wished;
-                self.turn_wish = 0;
-            }
-        }
+        let choices = if open.is_empty() { next.clone() } else { open };
         if choices.is_empty() {
             None
         } else {
@@ -3560,7 +3424,8 @@ impl AiState {
 
     /// Advance along the network. `obstacle` = distance from the car's origin to the rear of
     /// a standing vehicle ahead (m), `stop_at` = distance from its origin to a stop line
-    /// (m). False at a dead end (the car is taken off the road).
+    /// (m). False at a dead end (the car is taken off the road). (The tests' plain driver.)
+    #[cfg(test)]
     pub fn advance(&mut self, net: &Network, dt: f32, obstacle: Option<f32>, stop_at: Option<f32>) -> bool {
         let lead = obstacle.map(|d| Lead { gap: d - self.front, speed: 0.0, acc: 0.0 });
         self.drive(net, dt, lead, stop_at)
@@ -4298,7 +4163,6 @@ mod tests {
         b.turn = 1;
         let net = object_net(vec![a, b]);
         assert!(!net.crossings[0].is_empty(), "they cross");
-        assert!(net.must_yield_old(1, 0) && !net.must_yield_old(0, 1), "baseline: the turner yields");
         assert!(net.must_yield(1, 0) && !net.must_yield(0, 1), "the left turner must still yield to the oncoming straight (fails on r4a: the straight yields)");
     }
 
@@ -4492,16 +4356,6 @@ mod tests {
         assert!((arrival_time(60.0, 15.0, 2.0, 10.0) - 4.0).abs() < 1e-3);
     }
 
-    #[test]
-    fn moving_back_in_clears_the_oncoming_lane_part_way() {
-        // 3.3 m over, 2.05 m needed to the oncoming lane's middle: 62 % of the offset
-        let t = ramp_progress_for(3.3, 2.05);
-        assert!((smooth01(t) - 2.05 / 3.3).abs() < 1e-4, "{t}");
-        assert!(t > 0.5 && t < 0.7, "{t}");
-        assert_eq!(ramp_progress_for(3.3, 0.0), 0.0);
-        assert_eq!(ramp_progress_for(2.0, 2.5), 1.0);
-        assert!(ramp_progress_for(3.3, 1.5) < t);
-    }
 }
 
 #[cfg(test)]

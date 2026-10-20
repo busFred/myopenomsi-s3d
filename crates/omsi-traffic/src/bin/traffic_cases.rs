@@ -168,6 +168,21 @@ fn r2(x: f64) -> f64 {
     }
 }
 
+/// Seconds until light `i` of `ctl` next shows another state, if the clock keeps running
+/// (None within a whole cycle).
+fn time_to_change(ctl: &TrafficLightController, i: usize) -> Option<f32> {
+    let now = ctl.state(i);
+    let cycle = ctl.cycle_len();
+    let mut t = 0.25;
+    while t <= cycle {
+        if ctl.state_at(i, ctl.time + t) != now {
+            return Some(t as f32);
+        }
+        t += 0.25;
+    }
+    None
+}
+
 fn why_name(w: Why) -> &'static str {
     match w {
         Why::None => "none",
@@ -3680,7 +3695,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 "  GEOM light {c}.{li} on lane {l}, line {:.1} m ahead of the front: {} now, changes in {}, go in {}{}",
                 d0 - st.front,
                 aspect_name(s0),
-                ctl.time_to_change(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
+                time_to_change(ctl, li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
                 ctl.time_until_go(li).map(|x| format!("{x:.0} s")).unwrap_or("never".into()),
                 if ctl.held { " (clock HELD)" } else { "" }
             );
