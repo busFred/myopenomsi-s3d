@@ -595,7 +595,7 @@ impl App {
         setup_sky(&self.args, &renderer, &mut scene, self.envir.as_ref(), self.weather.as_ref());
         // the window streams the tiles around the camera unless a fixed area was asked for
         if !self.args.all && self.args.radius.is_none() {
-            match open_world(&self.args) {
+            match open_world(&self.args, &self.settings) {
                 Ok((w, cam, _)) => {
                     let w = Arc::new(w);
                     let distance = self
@@ -629,7 +629,7 @@ impl App {
             self.last = Instant::now();
             return;
         }
-        match load_world(&self.args, &renderer, &mut scene) {
+        match load_world(&self.args, &self.settings, &renderer, &mut scene) {
             Ok((w, cam)) => self.start_world(Arc::new(w), cam, &renderer, &mut scene),
             Err(e) => {
                 log::error!("{e:#}");

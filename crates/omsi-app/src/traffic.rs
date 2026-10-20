@@ -843,6 +843,8 @@ impl Traffic {
     /// Build the network from the lanes collected by `World::build_scene` and load the AI
     /// car types of the map's `ailists.cfg` (the `[aigroup_2]` groups that are not depots).
     pub fn new(root: &Path, world: &World, target: usize) -> Result<Traffic> {
+        // (read once: the options' share of random traffic and count of timetable vehicles)
+        let settings = crate::settings::Settings::load();
         let (lanes, parked_cars, lane_tiles) = take_from_tiles(world);
         let mut net = Network {
             lanes,
@@ -1143,8 +1145,8 @@ impl Traffic {
             first_yield: None,
             first_passer: None,
             density_curve: world.global.traffic_density_road.clone(),
-            unsched_factor: crate::settings::Settings::load().ai_unsched_factor,
-            max_scheduled: crate::settings::Settings::load().ai_max_scheduled,
+            unsched_factor: settings.ai_unsched_factor,
+            max_scheduled: settings.ai_max_scheduled,
             viewer: None,
             occluders: None,
             walkers: Vec::new(),

@@ -31,7 +31,7 @@ pub(crate) fn run_offscreen(
     crate::lights::load_smoke_texture(&mut renderer, &args.root);
     crate::lights::set_corona_root(&args.root);
     let mut scene = renderer.new_scene();
-    let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &renderer, &mut scene))?;
+    let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &settings, &renderer, &mut scene))?;
     // the map's own route arrows, with OMSI 2's route arrows
     world.show_help_arrows(&renderer, &mut scene, settings.nav_arrows);
     let lan_seed = lan_off.as_ref().map(lan::population_seed);

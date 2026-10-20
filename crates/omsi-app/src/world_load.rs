@@ -34,7 +34,7 @@ pub(crate) fn season_folder_on(args: &Args, global: &omsi_map::GlobalCfg, day_of
 /// Open the map (global.cfg, season, chrono) and work out where the view starts: the
 /// camera, and the point the tiles are loaded around (the spawn entry point when a vehicle
 /// is requested).
-pub(crate) fn open_world(args: &Args) -> Result<(World, Camera, DVec3)> {
+pub(crate) fn open_world(args: &Args, settings: &crate::settings::Settings) -> Result<(World, Camera, DVec3)> {
     let map_cfg = omsi_cfg::resolve_path(&args.root, &args.map);
     let date = start_clock(args).date_code();
     let world = match crate::duty_start::take_preopened(&map_cfg, date) {
@@ -42,6 +42,7 @@ pub(crate) fn open_world(args: &Args) -> Result<(World, Camera, DVec3)> {
         None => World::open(&args.root, &map_cfg, date)?,
     };
     *world.start_clock.lock() = start_clock(args);
+    world.set_parked_options(settings);
     {
         let (kind, folder) = season_folder(args, &world.global);
         log::info!(
@@ -104,9 +105,9 @@ pub(crate) fn spawn_point(args: &Args, world: Option<&World>) -> Option<DVec3> {
     world.entry_point_place(ep).map(|p| p.0)
 }
 
-pub(crate) fn load_world(args: &Args, renderer: &Renderer, scene: &mut Scene) -> Result<(World, Camera)> {
+pub(crate) fn load_world(args: &Args, settings: &crate::settings::Settings, renderer: &Renderer, scene: &mut Scene) -> Result<(World, Camera)> {
     let t0 = Instant::now();
-    let (world, camera, center) = open_world(args)?;
+    let (world, camera, center) = open_world(args, settings)?;
     let tile_of = |p: DVec3| {
         (
             (p.x / omsi_map::tile_size()).floor() as i32,
