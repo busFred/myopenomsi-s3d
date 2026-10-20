@@ -1328,6 +1328,26 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
+    // 11. [fix pass 3, 2] keep the box clear, on every aspect (SUMO's no-block heuristic,
+    //     sumo.md §2): a car short of its junction's lit line does not cross it while where it
+    //     would come to rest - its stop (people, a refusal) or behind a lead standing or coming
+    //     to rest - lies between the line and the way's exit from the box; it holds at the line,
+    //     pulled back before a crossing there (viz5 case05 #16535 crossed on green into a box
+    //     its people stop lay in and stood 2.8 m in, over the crossing)
+    if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
+        let line = sig.dist;
+        if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 {
+            let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
+            let rest = [out.stop, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
+            let exit = j.entry + j.way_len;
+            if rest > line + 0.5 && rest < exit {
+                let hold = pulled_back(&walk_bands(net, sim, j), me, line);
+                out.stop = Some(hold);
+                out.why = Why::ExitFull;
+            }
+        }
+    }
+
     out.held = out.stop.is_some() || p.leader.map(|l| l.gap < 12.0).unwrap_or(false);
     if out.why == Why::None && out.lead.is_some() {
         out.why = Why::Lead;
