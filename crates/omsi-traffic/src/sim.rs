@@ -306,6 +306,17 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
+    /// [J7-3] Asked to make room for a car changing into this one's lane because its own ends:
+    /// (its id, the gap from this one's front to its rear, its speed, the gap its acceptance
+    /// needs from this one; `Plan::help`). Set by the asker each frame it asks, read by this
+    /// one's plan, cleared when this one acts.
+    #[serde(default)]
+    pub help_for: Option<(u64, f32, f32, f32)>,
+    /// [J7-3, fix pass 1] SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
+    /// once with the speed and falls with `LOOK_AHEAD_SPEED_MEMORY` per second, so a car that has
+    /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
+    #[serde(default)]
+    pub look_ahead_speed: f32,
     /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
     /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
     /// vehicle, so a keyframe carries it.
@@ -508,6 +519,8 @@ impl Vehicle {
             claim_standing: false,
             passed_on_go: None,
             change_still: (0.0, 0.0),
+            help_for: None,
+            look_ahead_speed: 0.0,
             zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
@@ -595,6 +608,11 @@ const GRID: f64 = 50.0;
 fn cell(p: DVec3) -> (i32, i32) {
     ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
 }
+
+/// [J7-3] Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
+/// end, turn, obstacle, speed gain, keep side), every simulation of the process (diagnostics,
+/// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
+pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
@@ -1514,6 +1532,21 @@ impl Simulation {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
+        // [J7-3] the follower asked to make room hears it (it reads it in its next plan); my own
+        // request, read in this frame's plan, is used up
+        vehicles[i].help_for = None;
+        if let Some((f, gap, speed, need)) = plan.help {
+            let me_id = vehicles[i].id;
+            if let Some(o) = vehicles.get_mut(f) {
+                o.help_for = Some((me_id, gap, speed, need));
+            }
+        }
+        {
+            // (SUMO LC2013: up at once, down with the memory per step of a second)
+            let v = &mut vehicles[i];
+            let m = plan::LOOK_AHEAD_SPEED_MEMORY.powf(dt);
+            v.look_ahead_speed = if v.state.speed >= v.look_ahead_speed { v.state.speed } else { m * v.look_ahead_speed + (1.0 - m) * v.state.speed };
+        }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
         if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
@@ -1536,6 +1569,9 @@ impl Simulation {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    if let Some(w) = plan.change_why {
+                        CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             Some(Start::Bypass { to, dir, out_len }) => {

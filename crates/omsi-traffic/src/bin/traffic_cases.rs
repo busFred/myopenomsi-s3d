@@ -5061,6 +5061,9 @@ fn ab(args: &[String]) -> Res<()> {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
         let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
+        // [J7-3] lane changes of the drivers' own started, by what won them
+        let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
+        println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting
