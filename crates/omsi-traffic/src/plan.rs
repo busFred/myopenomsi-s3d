@@ -947,11 +947,13 @@ fn refused_stop_cases(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
     let line_stop = !j.inside && (gently || v < 0.5);
     let first = if line_stop { at_line } else { j.conflict_start - 1.0 };
     let (Some(Hold::Foe), Some(waited)) = (g.hold, g.at) else { return first };
-    if g.roll_up {
-        return hold_point(net, sim, me, j, waited);
-    }
+    // ([J7-1] the side merge of my own fork first: a roll-up for a foe standing for good, at any
+    // distance since the time test has no reach, stops behind the vehicle standing in it too)
     if let Some(at) = roll_up_point(net, sim, vehicles, me, j, waited) {
         return at;
+    }
+    if g.roll_up {
+        return hold_point(net, sim, me, j, waited);
     }
     let at = hold_point(net, sim, me, j, waited);
     let look = st.front.max(j.line) + CONVERGE_LOOK + v * v / (2.0 * dp.comfort_brake);

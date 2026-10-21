@@ -706,6 +706,33 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         if o.last.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
             continue;
         }
+        // [J7-1] a body crossing my way that is out of my corridor before my front can be where
+        // it is: no lead - SUMO's follower case of `MSLink::blockedByFoe` at a crossing (its
+        // leave time before my arrival), the junction leader that has passed the conflict point
+        // by the time ego arrives (`MSVehicle::adaptToJunctionLeader`, `MSLink::getLeaderInfo`).
+        // (Its leave time is where its body leaves my corridor at its sideways speed: OMSI's
+        // junction pieces give the body, not SUMO's conflict point.) (The junction let the other through 1 s ahead
+        // of me by the time test; braking for its body as a lead standing across the way, a
+        // 13 m/s main road car braked 5 m/s² for a side car out of its way 1.3 s before it
+        // came, adversarial2 F5b.)
+        // (only one on its way across: not one held - a stop of its own or a lead near, its
+        // `Decision::held` - which may come to rest in my corridor; SUMO's `willPass`. A car held
+        // by its lead 4.9 m on, crossing at 1.4 m/s, was dropped and stopped in my corridor,
+        // viz case01 #1674/#118)
+        if !on_way && !cut_in && o.state.speed >= STANDING_SPEED && !o.last.held {
+            let right = DVec2::new(f.y, -f.x);
+            let q = way.pts[k].1;
+            let lats = ob.corners().map(|c| (c - q).dot(right));
+            let (lo, hi) = (lats.iter().copied().fold(f64::INFINITY, f64::min), lats.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            let v_lat = o.state.speed as f64 * o_fwd.dot(right);
+            let t_clear = if v_lat > 1e-3 { (w - lo) / v_lat } else if v_lat < -1e-3 { (hi + w) / -v_lat } else { f64::INFINITY };
+            // (my limit as the claim's, `Simulation::tick`)
+            let v_max = (net.lanes[st.lane].speed_limit_kmh / 3.6 * st.desire).min(st.max_speed_kmh / 3.6);
+            let t_me = omsi_sim::traffic::arrival_time(gap.max(0.0), st.speed, st.accel, v_max);
+            if (t_clear as f32) < t_me {
+                continue;
+            }
+        }
         {
             let oh = (o.heading as f64).to_radians();
             ahead.push((gap, far - st.front, o.state.speed * DVec2::new(oh.sin(), oh.cos()).dot(f) as f32));

@@ -112,6 +112,32 @@ fn review4_merging_behind_at_speed() {
     assert!(worst.2 > -3.0, "the main road car braked {:.1} m/s² (D {} m, min gap {:.2} m)", worst.2, worst.0, worst.1);
 }
 
+/// [J7-1, fix pass 1] C2 with impatience (SUMO's: the side car has waited 179 s, I = 1): it
+/// takes a gap the main road car fills only by braking within its comfortable brake
+/// (`computeFoeArrivalTimeBraking` at decel times I), never a hard brake.
+#[test]
+fn review4_merging_behind_at_speed_with_impatience() {
+    let net = merge_net();
+    let mut worst = (0.0f32, 0.0f32, f32::INFINITY);
+    for d in (40..=140).step_by(5) {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut side = car(1, 2, net.lanes[2].length() - 2.0 - 0.3, 0.0);
+        side.state.planned_next = Some(3);
+        side.state.ahead = vec![4];
+        side.waiting = 179.0;
+        let main_s = net.lanes[0].length() - (d as f32 - 10.0) - 2.0;
+        let mut main = car(2, 0, main_s, 13.5);
+        main.state.planned_next = Some(1);
+        main.state.ahead = vec![4];
+        let mut cars = vec![side, main];
+        let (_, gap, acc) = drive(&net, &mut sim, &mut cars, 14.0, &|v: &Vehicle| v.state.lane == 4, 2, 0.5);
+        if acc < worst.2 {
+            worst = (d as f32, gap, acc);
+        }
+    }
+    assert!(worst.2 > -3.0 && worst.1 > 0.3, "the main road car braked {:.1} m/s² (D {} m, min gap {:.2} m)", worst.2, worst.0, worst.1);
+}
+
 /// (C3) A main road car (right of way, west) stands at its red, held by the light; the light
 /// turns green at 5 s. A side road car (south, green, gives way) comes up at 8 m/s. The
 /// standing main road car is "blocked" (why=Light) and dropped when the side car is out

@@ -915,7 +915,13 @@ fn r1_a_car_on_the_lit_piece_past_its_line_at_red() {
             }
         });
         eprintln!("R1 put down standing with its front {s0} m past the line (red for 40 s): crossed the cross street at {crossed_at:?}, min gap {:.2} {:?}", r.min_gap, r.min_pair);
-        assert!(s0 < 0.5 || crossed_at.is_none(), "a car standing with its front {s0} m past its line crossed on red at {crossed_at:?}");
+        // ([J7-1] with its rear past its line - put down 5 m in - the light is behind it: it is
+        // on the junction, SUMO's internal lane, and crosses in a gap of the stream that SUMO's
+        // time test accepts, `JM_TIMEGAP_MINOR`, never into it; the driver's own 4 s found none
+        // in the 4.6 s stream before. Its rear still short of the line, its red holds it)
+        let rear_past = s0 > 4.0 + 0.5;
+        assert!(s0 < 0.5 || rear_past || crossed_at.is_none(), "a car standing with its front {s0} m past its line crossed on red at {crossed_at:?}");
+        assert!(r.min_gap > 2.0, "crossed into the stream: min gap {:.2}", r.min_gap);
     }
 }
 

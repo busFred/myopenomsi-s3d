@@ -358,3 +358,34 @@ fn rule_d_a_held_car_where_its_way_converges_with_another_lane_first_stops_out_o
     assert!(at <= -19.5 || (at - 4.0 >= -0.1 && at <= 17.5), "stood with its front at x = {at:.1}, its body in the converging lead-ins or the main road");
     assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
 }
+/// [J7-1, fix pass 2] B3 in the simulation: the eastbound way crosses the side road at x 0 and
+/// its light's stub lies past that meeting place (x 5..6). A car rolling up to the red files it
+/// (`Claim::light_red`) with its line along the way through (`red_at`, 20 m: the stub's start
+/// 20 m into the piece from x -15). Before, only a red short of the first meeting place was
+/// filed and the foes took the car standing at its red for one coming.
+#[test]
+fn j71_a_red_past_the_first_meeting_place_is_filed() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1)); // 0
+    net.lanes.push(piece(&[(-15.0, 0.0), (5.0, 0.0)], 0, 128.0)); // 1
+    let mut stub = piece(&[(5.0, 0.0), (6.0, 0.0)], 1, 128.0); // 2
+    stub.traffic_light = Some((0, 0));
+    net.lanes.push(stub);
+    net.lanes.push(piece(&[(6.0, 0.0), (40.0, 0.0)], 2, 128.0)); // 3
+    net.lanes.push(road(&[(40.0, 0.0), (400.0, 0.0)], 2)); // 4
+    net.lanes.push(road(&[(0.0, -300.0), (0.0, -15.0)], 3)); // 5
+    net.lanes.push(piece(&[(0.0, -15.0), (0.0, 15.0)], 3, 128.0)); // 6
+    net.lanes.push(road(&[(0.0, 15.0), (0.0, 300.0)], 4)); // 7
+    let net = finish(net);
+    let ctl = TrafficLightController::new(vec![vec![(0, 60.0)]], 60.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 0, 230.0, 8.0)];
+    let mut filed = None;
+    run(&net, &mut sim, &mut cars, 20.0, |_, sim, _| {
+        if let Some((c, _)) = sim.claims.iter().find(|(c, _)| c.vehicle == 0 && c.light_red) {
+            filed.get_or_insert(c.red_at);
+        }
+    });
+    let red_at = filed.expect("the red past the first meeting place was never filed");
+    assert!((red_at - 20.0).abs() < 1.0, "red_at {red_at}");
+}

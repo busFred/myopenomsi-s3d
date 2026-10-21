@@ -538,7 +538,9 @@ fn the_claim_standing_hysteresis_is_kept_with_the_vehicle_across_keyframes() {
     // a queue on the side road at the main road, a stream on the main road
     let mut cars = Vec::new();
     for k in 0..5 {
-        cars.push(car(10 + k, 0, 170.0 - 25.0 * k as f32, 12.0));
+        // ([J7-1] 28 m apart: with SUMO's time test the side road car took the 25 m gaps with no
+        // creep at a keyframe; the test needs one creeping off there)
+        cars.push(car(10 + k, 0, 170.0 - 28.0 * k as f32, 12.0));
     }
     for k in 0..4 {
         cars.push(car(30 + k, 3, 182.0 - 7.0 * k as f32, 0.0));
