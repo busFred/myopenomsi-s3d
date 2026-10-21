@@ -306,11 +306,11 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
-    /// The zipper merge it last went first at: (the merge, its piece there, the time). The
-    /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
-    /// from these, so a keyframe restores it.
+    /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
+    /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
+    /// vehicle, so a keyframe carries it.
     #[serde(default)]
-    pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    pub zip_behind: Option<u64>,
     /// A lane change under way: (its progress when it last moved on, seconds since while
     /// standing). Frozen for `FROZEN_CHANGE` it is settled where the body is
     /// (`AiState::settle_change`).
@@ -338,10 +338,10 @@ pub struct Vehicle {
 pub const PLAYER_ACCEL: f32 = 1.2;
 pub const PLAYER_ACCEL_MIN: f32 = 0.6;
 pub const PLAYER_ACCEL_MEMORY: f32 = 20.0;
-/// [J7-1] The comfortable braking (m/s²) a player's claim names, what an AI claimant reckons
-/// the player can brake with for it (`Claim::decel`): the timetable bus preset's
-/// (`DriverParams::preset(ScheduledBus).comfort_brake`, the vehicle a player drives).
-pub const PLAYER_DECEL: f32 = 2.1;
+/// [J7-1, J7-2] The driver a player's claim names (what an AI claimant reckons the player brakes
+/// with and keeps behind a foe that cuts in, `Claim::decel`, `tau`, `min_gap`): the timetable
+/// bus preset, the vehicle a player drives.
+pub const PLAYER_PRESET: VehicleClass = VehicleClass::ScheduledBus;
 
 /// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
 /// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
@@ -507,8 +507,8 @@ impl Vehicle {
             heading: 0.0,
             claim_standing: false,
             passed_on_go: None,
-            zip_won: None,
             change_still: (0.0, 0.0),
+            zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
             ease_for: None,
@@ -1091,6 +1091,8 @@ impl Simulation {
                 decel: v.params.comfort_brake,
                 waiting: v.waiting,
                 lead_gap: p.leader.map(|l| (l.gap, l.speed)),
+                zip_behind: v.zip_behind,
+                body_block: p.body_block,
                 tau: v.params.tau,
                 min_gap: v.params.min_gap,
                 committed,
@@ -1295,12 +1297,14 @@ impl Simulation {
                 v_max: road_limit,
                 front: p.half_len,
                 rear: p.half_len,
-                decel: PLAYER_DECEL,
+                decel: DriverParams::preset(PLAYER_PRESET).comfort_brake,
                 // (its grant is not read: no impatience of its own)
                 waiting: 0.0,
                 lead_gap: None,
-                tau: DriverParams::preset(VehicleClass::ScheduledBus).tau,
-                min_gap: DriverParams::preset(VehicleClass::ScheduledBus).min_gap,
+                zip_behind: None,
+                body_block: None,
+                tau: DriverParams::preset(PLAYER_PRESET).tau,
+                min_gap: DriverParams::preset(PLAYER_PRESET).min_gap,
                 committed,
                 exit_room: true,
                 impatience: Impatience::default(),
@@ -1340,32 +1344,20 @@ impl Simulation {
                 }
             }
         }
-        // who went first last at each zipper merge, from the vehicles (the latest per merge)
-        let mut last_won: HashMap<(usize, usize, usize), (f64, usize, u64)> = HashMap::new();
-        for v in vehicles.iter() {
-            if let Some((key, piece, t)) = v.zip_won {
-                if last_won.get(&key).map(|w| t > w.0 || (t == w.0 && v.id < w.2)).unwrap_or(true) {
-                    last_won.insert(key, (t, piece, v.id));
-                }
-            }
-        }
-        self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
+        // ([J7-2] no zipper memory: SUMO's zipper speed is a function of this frame's claims)
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
         self.foe_trace.clear();
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
         let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
-        // who went first at a zipper merge: it keeps going first while the two are engaged,
-        // and the next tie there is the other side's ([round6 J3] written at the first
-        // decision, not only on go: refused for a third, the winner stays first, and the pair's
-        // order does not flip as their distances change)
-        for (g, c) in grants.iter().zip(&claims) {
-            if let Some((key, piece)) = g.zip {
-                // (a player's win is not remembered: no keyframe would carry it)
-                if let Some(v) = vehicles.get_mut(c.vehicle) {
-                    v.zip_won = Some((key, piece, self.time));
-                    self.signal_groups.zipper.insert(key, (piece, c.id));
-                }
+        // [J7-2, fix pass 2] the zipper order kept with the vehicles while engaged
+        for v in vehicles.iter_mut() {
+            v.zip_behind = None;
+        }
+        for (c, g) in claims.iter().zip(&grants) {
+            let foe_id = g.zipper.and_then(|z| claims.iter().find(|o| o.vehicle == z.foe)).map(|o| o.id);
+            if let Some(v) = vehicles.get_mut(c.vehicle) {
+                v.zip_behind = foe_id;
             }
         }
 

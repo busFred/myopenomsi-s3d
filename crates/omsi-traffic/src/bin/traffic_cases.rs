@@ -4248,6 +4248,9 @@ struct Extra {
     /// leader.
     follower_go_s: f64,
     leader_go_s: f64,
+    /// [J7-2] Vehicle-seconds within the radius with a zipper speed (`Grant::zipper`: the foe
+    /// ahead at a merge caps the speed, or the queue-entry stop behind it).
+    zipper_capped_s: f64,
     events: Vec<String>,
 }
 
@@ -4476,6 +4479,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 if r.vehicles.get(c.vehicle).is_some_and(|v| near(v.pos)) {
                     ex.follower_go_s += g.follower_go as f64 * fdt;
                     ex.leader_go_s += g.leader_go as f64 * fdt;
+                    ex.zipper_capped_s += g.zipper.is_some() as u8 as f64 * fdt;
                 }
             }
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
@@ -4891,6 +4895,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
         ("far_red_before", e.far_red_before_s.to_string()),
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
+        ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
     ]
 }
 
@@ -4929,6 +4934,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.far_refused_60_s += e.far_refused_60_s;
     t.follower_go_s += e.follower_go_s;
     t.leader_go_s += e.leader_go_s;
+    t.zipper_capped_s += e.zipper_capped_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -5599,13 +5605,13 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         for &i in &found {
             if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {
                 println!(
-                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} lead {:?} eased {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?} follow {:?} zip {:?}",
+                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} lead {:?} eased {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?} follow {:?} zipper {:?}",
                     r.vehicles[i].id, c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked, c.stuck, c.held, c.clearing, c.exit_room,
                     c.lead.map(|w| fmt_claimant(&r, w)), c.yields_now.map(|w| fmt_claimant(&r, w)),
                     g.go, g.wait_for.map(|w| fmt_claimant(&r, w)), g.hold, g.at,
                     // (the distance from the front to the stretch waited for)
                     g.at.map(|a| ((a - (c.s + c.front)) * 10.0).round() / 10.0),
-                    g.follow.map(|(gap, v)| ((gap * 10.0).round() / 10.0, (v * 10.0).round() / 10.0)), g.zip.map(|z| z.1)
+                    g.follow.map(|(gap, v)| ((gap * 10.0).round() / 10.0, (v * 10.0).round() / 10.0)), g.zipper.map(|z| (fmt_claimant(&r, z.foe), (z.gap * 10.0).round() / 10.0, (z.arrive * 100.0).round() / 100.0, (z.floor * 100.0).round() / 100.0, z.stop))
                 );
                 // [J7-1] per foe: SUMO's time test (my in/out, theirs, their arrival as my
                 // impatience sees it, the case), or what took it out of the test

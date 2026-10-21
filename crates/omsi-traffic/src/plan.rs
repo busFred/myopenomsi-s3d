@@ -1036,7 +1036,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         if !g.go {
             let at = refused_stop(net, sim, vehicles, me, j, &g);
             if let (Some((gap, speed)), Some(w)) = (g.follow, g.wait_for.filter(|&w| w < vehicles.len())) {
-                // second at a zipper merge, both rolling: in behind the other at my gap
+                // eased off for the other of a mutual hold rolling on into a merge of the two
+                // ahead: in behind it at my gap (`reservation::eased_follow`)
                 out.hold = g.hold;
                 out.wait_for = g.wait_for;
                 let behind = Lead { gap, speed, acc: 0.0 };
@@ -1049,6 +1050,27 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 out.wait_for = g.wait_for;
                 let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };
                 min_stop(&mut out.stop, &mut out.why, Some(at), w);
+            }
+        }
+    }
+
+    // [J7-2] the zipper speed (SUMO's `getZipperSpeed`) for the foe ahead at a merge that crosses
+    // nothing: whatever the grant otherwise says, a cap on the acceleration - the gentler of
+    // following that foe where it stands along the merged way (the model's own answer for it as a
+    // lead) and arriving `tau` after its rear, no harder than the blended brake - or, the foe
+    // standing at the join, the queue-entry stop behind it (my lead)
+    if let Some(z) = grant.and_then(|g| g.zipper) {
+        let behind = Lead { gap: z.gap, speed: z.speed, acc: 0.0 };
+        if z.stop {
+            if out.lead.map(|l| z.gap < l.gap).unwrap_or(true) {
+                out.lead = Some(behind);
+                out.lead_seen = (z.foe < vehicles.len()).then_some(Seen::Vehicle(z.foe));
+            }
+        } else {
+            let follow = st.desired_accel(net, Some(behind), None);
+            let cap = follow.max(z.arrive).max(z.floor);
+            if cap < st.accel {
+                out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
             }
         }
     }
@@ -1166,7 +1188,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         } else {
             if st.odometer < pass.block + 2.0 {
                 // edging out: gently
-                out.accel_cap = Some(omsi_sim::ai_motion::PULL_OUT_ACCEL);
+                out.accel_cap = Some(out.accel_cap.map_or(omsi_sim::ai_motion::PULL_OUT_ACCEL, |c| c.min(omsi_sim::ai_motion::PULL_OUT_ACCEL)));
             }
             // the thing being passed no longer holds the car (the bent way clears it)
             if let Some(l) = p.leader {
