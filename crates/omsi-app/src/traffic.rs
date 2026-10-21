@@ -2034,7 +2034,10 @@ impl Traffic {
                     let v = self.viewer;
                     // ([round 7 B1] with the rule that took it, its distance from the eye, its
                     // last hold and its waiting time, the give-up clock)
-                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting);
+                    // ([round 7 R7-1] and what it follows: the lead's id and gap and whether
+                    // that lead stands, the queue test of the in-view rule)
+                    let lead = lead_of(&c.ai.last);
+                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} standing {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), lead.is_some_and(|l| standing.contains(&l)), in_a_queue(lead, c.ai.last.lead, &standing));
                 }
                 self.orphan_sounds.extend(c.sounds);
                 for r in std::iter::once(c.render).chain(c.trailer_renders) {
@@ -3766,6 +3769,15 @@ impl Traffic {
         self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
+            if self.debug_population {
+                // [round 7 R7-1] every removal is logged with its rule: the traffic's own
+                // (the network's end: no way on) and a timetable bus's last resort (its own
+                // line too) as the population's are
+                let p = c.vehicle.position;
+                let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(f64::NAN);
+                let rule = if respawn.contains(&i) { "a timetable bus taken off as the last resort" } else { "the network's end, no way on" };
+                log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {rule}; {:.0} m from the eye, lane {}, v {:.1}, why {}, stood {:.0} s, waiting {:.1} s", self.time, c.id, p.x, p.y, from_eye, c.ai.state.lane, c.ai.state.speed, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting);
+            }
             if c.serves_stops() {
                 self.riders_out.push(c.id);
             }
