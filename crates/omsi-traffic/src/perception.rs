@@ -1452,8 +1452,8 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
         // a queueing lane, not a box to keep clear: counting it put the "box" of BeijingCity's
         // twin stub chains 60 m on, where the exit queue's tail closed it for 25 s with the
-        // crossing itself clear, viz3 case03 #4436; the resolver's side-merge rules and the
-        // roll-up stop, `plan::roll_up_point`, keep a car off the one standing beside)
+        // crossing itself clear, viz3 case03 #4436; the zipper of a side merge, [J7-2], keeps a
+        // car off the one standing beside)
         let first = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
         let last = foes.iter().filter(|f| !f.side).map(|f| f.mine.1).fold(0.0f32, f32::max);
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };

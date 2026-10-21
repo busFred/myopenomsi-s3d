@@ -1035,10 +1035,19 @@ impl Simulation {
             // of the junction, it goes on unless it can stop gently)
             let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
             let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
-            let room = next - st.front - 0.6;
             let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
-            let cannot_stop = plan::cannot_stop(st.speed, room, brake);
-            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
+            // ([J7-4, fix pass 1] SUMO's waiting positions: committed when the first place it can
+            // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
+            // place's band - not only when it cannot stop before the meeting place itself: a car
+            // let go onto a crossing and refused there stood on it 50 s, viz case06 #15801)
+            let next_wait = plan::next_wait(net, self, v, j, brake);
+            // ([fix pass 2] committed - in the way of everybody - only when it cannot stop before its
+            // next meeting place, `plan::cannot_stop`; short of its next waiting position it is
+            // committed only to the meeting places it would block, foe by foe, `Claim::next_wait`:
+            // a crawler at 1.1 m/s could stop within 0.3 m and is no `willPass`, and standing 0.8 m
+            // short of a meeting place it went into a 12 m/s foe, x10 case01 #158/#1058)
+            let room = next - st.front - 0.6;
+            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, room, brake);
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
             // the way before the first meeting place with another way, wherever the object
@@ -1111,6 +1120,7 @@ impl Simulation {
                 lead_gap: p.leader.map(|l| (l.gap, l.speed)),
                 zip_behind: v.zip_behind,
                 body_block: p.body_block,
+                next_wait: next_wait - j.entry,
                 tau: v.params.tau,
                 min_gap: v.params.min_gap,
                 committed,
@@ -1137,10 +1147,6 @@ impl Simulation {
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
                 clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
-                // (held by its service, or standing `FAR_FOE_STOOD` s or more)
-                // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
-                // from its first frame, review-r6j)
-                standing_long: st.speed < STANDING_SPEED && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
                 brake,
             });
         }
@@ -1321,6 +1327,7 @@ impl Simulation {
                 lead_gap: None,
                 zip_behind: None,
                 body_block: None,
+                next_wait: f32::NEG_INFINITY,
                 tau: DriverParams::preset(PLAYER_PRESET).tau,
                 min_gap: DriverParams::preset(PLAYER_PRESET).min_gap,
                 committed,
@@ -1336,7 +1343,6 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
-                standing_long: false,
                 brake: plan::HARD_BRAKE,
             });
         }

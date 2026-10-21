@@ -258,3 +258,4 @@ fn j73_a_lane_ending_past_an_object_is_left_on_the_approach() {
     assert!(changed && !on_closed, "changed {changed}, on the closed lane {on_closed}: {:?}", cars.iter().map(|c| (c.state.lane, c.state.s)).collect::<Vec<_>>());
     assert!(least > 0.3 || cars.len() < 2);
 }
+

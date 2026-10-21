@@ -358,6 +358,36 @@ fn rule_d_a_held_car_where_its_way_converges_with_another_lane_first_stops_out_o
     assert!(at <= -19.5 || (at - 4.0 >= -0.1 && at <= 17.5), "stood with its front at x = {at:.1}, its body in the converging lead-ins or the main road");
     assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
 }
+
+/// [J7-4, fix pass 1] SUMO's waiting positions (viz case06 #15801's shape): the eastbound car is
+/// let go across the zebra (x 23, band 20.5..25) towards the main road (x 30) and a main road
+/// car shows up as it rolls over the band; there is no room for its body between the band and
+/// the main road's stretch. It either waits short of the band or, once it cannot, goes through
+/// (committed to the next place it can wait): it never comes to rest with its body on the
+/// band, and nobody touches. Swept over where the main road car appears.
+#[test]
+fn j74_a_car_never_comes_to_rest_on_a_crossing_band() {
+    let net = long_way_through(false);
+    let mut bad = Vec::new();
+    for (k, v) in (0..48).flat_map(|k| [3.0f32, 4.5, 6.0, 8.0].map(|v| (k, v))) {
+        let mut sim = Simulation::new(&net, vec![]);
+        // the eastbound car at 3-8 m/s, front at x -10; the main road car 20-138 m out at 12 m/s
+        let mut cars = vec![car(1, 0, 285.0 - 2.0 - 10.0, v), car(10, 6, 385.0 - 20.0 - 2.5 * k as f32 - 2.0, 12.0)];
+        let mut on_band = None;
+        let min_gap = run(&net, &mut sim, &mut cars, 25.0, |t, _, cars| {
+            let me = cars.iter().find(|c| c.id == 1).unwrap();
+            let (front, rear) = (front_x(me), front_x(me) - 4.0);
+            if me.state.speed < 0.1 && front > 20.5 && rear < 25.0 && on_band.is_none() {
+                on_band = Some((t, front));
+            }
+        });
+        if on_band.is_some() || min_gap < 0.3 {
+            bad.push((k, v, on_band, min_gap));
+        }
+    }
+    assert!(bad.is_empty(), "(case, stood on the band at (t, front x), least gap): {bad:?}");
+}
+
 /// [J7-1, fix pass 2] B3 in the simulation: the eastbound way crosses the side road at x 0 and
 /// its light's stub lies past that meeting place (x 5..6). A car rolling up to the red files it
 /// (`Claim::light_red`) with its line along the way through (`red_at`, 20 m: the stub's start
@@ -388,4 +418,40 @@ fn j71_a_red_past_the_first_meeting_place_is_filed() {
     });
     let red_at = filed.expect("the red past the first meeting place was never filed");
     assert!((red_at - 20.0).abs() < 1.0, "red_at {red_at}");
+}
+
+/// [J7-4, fix pass 2] Held for a full exit once inside: the eastbound car is past the side road
+/// (x 0) on its way to the zebra (band 20.5..25) and the main road (x 30, its meeting place from
+/// x 28) when the exit is full (a car standing at its start) and the queue reaches back into
+/// the junction (a car standing with its rear at x 33). Where it has the room to stop short of
+/// the zebra it waits there, before every band; else it never stands on the zebra. Before, the
+/// hold's target was the first meeting place, behind it: the car followed the queue and stood
+/// in the main road's meeting place here, on the walk in viz case11 #38790/#38867. Swept over
+/// where it is and how fast; nobody touches.
+#[test]
+fn j74_a_car_held_for_a_full_exit_inside_waits_short_of_every_band() {
+    let net = long_way_through(false);
+    let mut bad = Vec::new();
+    for (x, v) in (0..14).flat_map(|k| [1.5f32, 3.0, 4.5, 6.0].map(|v| (4.0 + 1.2 * k as f32, v))) {
+        let mut sim = Simulation::new(&net, vec![]);
+        // (the piece starts at x -15; each standing car held where it is by a parked box just
+        // ahead of it - a car told to stand still creeps)
+        sim.parked.insert(2, vec![omsi_traffic::Parked { s: 7.0, lateral: 0.0, half_width: 0.9, half_len: 2.0 }]);
+        sim.parked.insert(1, vec![omsi_traffic::Parked { s: 31.0 + 15.0 + 6.5, lateral: 0.0, half_width: 0.9, half_len: 2.0 }]);
+        let mut cars = vec![car(1, 1, x + 15.0 - 2.0, v), car(2, 2, 2.5, 0.0), car(3, 1, 31.0 + 15.0 + 2.0, 0.0)];
+        // (room to stop short of the zebra at the driver's comfortable brake)
+        let room = 20.5 - x - 0.6 >= v * v / (2.0 * cars[0].params.comfort_brake);
+        let mut rest = None;
+        let min_gap = run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+            let me = cars.iter().find(|c| c.id == 1).unwrap();
+            if me.state.speed < 0.1 && rest.is_none() {
+                rest = Some(front_x(me));
+            }
+        });
+        let on_zebra = rest.is_some_and(|f| f > 20.5 && f - 4.0 < 25.0);
+        if (room && rest.is_none_or(|f| f > 20.5)) || on_zebra || min_gap < 0.3 {
+            bad.push((x, v, rest, min_gap));
+        }
+    }
+    assert!(bad.is_empty(), "(front x, speed, came to rest at front x, least gap): {bad:?}");
 }

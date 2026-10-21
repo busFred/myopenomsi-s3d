@@ -46,10 +46,14 @@ pub struct Claim {
     /// (`Perception::body_block`): at a zipper that one is ahead of it whatever the arrival
     /// rule says.
     pub body_block: Option<u64>,
-    /// [J7-1, J7-2] The time gap it keeps to the car ahead (s, the driver's `tau`) and its
-    /// standing gap (m, `min_gap`): how it follows its lead (`planned_window`); at a zipper it
-    /// arrives `tau` after the foe ahead (`getZipperSpeed`), and with both, whether it could
-    /// follow a foe that cuts in ahead (`zipper_cap`).
+    /// [J7-4, fix pass 1] The first place along the way through (the chain's distances) where it
+    /// can come to rest with its body on no band (`plan::next_wait`; -INFINITY: not known, a
+    /// player): it cannot wait short of it, so it is in the way of whoever comes to the meeting
+    /// places before it (SUMO's `willPass`), and it is refused only for those past it.
+    pub next_wait: f32,
+    /// [J7-2] The time gap it keeps to the car ahead (s, the driver's `tau`): at a zipper it
+    /// arrives this long after the foe ahead (`getZipperSpeed`); and its standing gap (m,
+    /// `min_gap`): with both, whether it could follow a foe that cuts in ahead (`zipper_cap`).
     pub tau: f32,
     pub min_gap: f32,
     /// Already inside the junction, or too close to the line to stop before it: holds its
@@ -106,10 +110,6 @@ pub struct Claim {
     /// Distance from the origin to where the front will have to stop for people, a zebra or
     /// a standing lead ahead (INFINITY: nothing seen).
     pub clear_ahead: f32,
-    /// Standing for good: held by its service (a bus at or for its stop, `Why::Service`) or
-    /// standing `FAR_FOE_STOOD` s or more. Inside a meeting place it is not leaving on the
-    /// schedule of its acceleration, and a claimant refused for it rolls up (`Grant::roll_up`).
-    pub standing_long: bool,
     /// The brake (m/s²) its committed test reckons with (`Simulation::tick`: the vehicle's
     /// own `decel * 1.5` inside the object, `plan::HARD_BRAKE` before it).
     pub brake: f32,
@@ -167,10 +167,6 @@ pub struct Grant {
     /// Refused for a foe: where the first stretch it waits for begins, along the way
     /// through (the chain's distances). The car stops just before it (`plan`).
     pub at: Option<f32>,
-    /// [round6 J1] Refused only for foes standing for good in their meeting places
-    /// (`Claim::standing_long`): the car rolls up to the stretch (`at`), whatever lies short of
-    /// it (`plan`). ([J7-1] at any distance: the time test has no reach.)
-    pub roll_up: bool,
     /// [J7-1] Foes (claimants on a foe movement) this claim was let go for by SUMO's time test
     /// this frame: as the follower (the foe out of the stretch `JM_TIMEGAP_MINOR` before I
     /// am in it) and as the leader (I am out `JM_TIMEGAP_MINOR` before it is in). (`ab`'s
@@ -181,11 +177,11 @@ pub struct Grant {
 
 impl Grant {
     pub fn go(vehicle: usize) -> Grant {
-        Grant { vehicle, go: true, wait_for: None, hold: None, follow: None, zipper: None, at: None, roll_up: false, follower_go: 0, leader_go: 0 }
+        Grant { vehicle, go: true, wait_for: None, hold: None, follow: None, zipper: None, at: None, follower_go: 0, leader_go: 0 }
     }
 
     pub fn refused(vehicle: usize, wait_for: Option<usize>, hold: Hold) -> Grant {
-        Grant { vehicle, go: false, wait_for, hold: Some(hold), follow: None, zipper: None, at: None, roll_up: false, follower_go: 0, leader_go: 0 }
+        Grant { vehicle, go: false, wait_for, hold: Some(hold), follow: None, zipper: None, at: None, follower_go: 0, leader_go: 0 }
     }
 }
 
@@ -200,10 +196,6 @@ pub const JM_TIMEGAP_MINOR: f32 = 1.0;
 pub const TIME_TO_IMPATIENCE: f32 = 180.0;
 /// [J7-1] SUMO's vType `impatience` default: none before any waiting (sumo.md §2.7).
 pub const IMPATIENCE_BASE: f32 = 0.0;
-/// [round6 J1] A vehicle standing this long (s) stands for good as far as far claimants go
-/// (`Claim::standing_long`; review-r6 fix 3: the layover bus of case11 stood minutes): a
-/// claimant refused for it rolls up to its stretch (`Grant::roll_up`).
-pub const FAR_FOE_STOOD: f32 = 30.0;
 /// Impatience at which a driver goes first in front of a foe that stands and waits too.
 const HALF_FED_UP: f32 = 0.5;
 /// [J7-2] SUMO's `getZipperSpeed` blend (s): the braking a zipper cap may ask for goes from the
@@ -229,6 +221,9 @@ pub struct ZipCap {
     /// has not been past it `tau` (`getZipperSpeed`'s target): a position bound, I do not enter
     /// before my turn (a constant-deceleration bound let the follower creep in, x10 case12).
     pub hold: Option<f32>,
+    /// [J7-4, fix pass 1] The foe is in the stretch already (its front past the start): a cap
+    /// that brings me to rest behind it puts me at a waiting position (`plan`).
+    pub inside: bool,
 }
 
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
@@ -497,7 +492,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     }
     let gap = (p_f - o_len) - p_e;
     if o.speed < STANDING_SPEED && p_f >= 0.0 {
-        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None });
+        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true });
     }
     let d_e = -p_e;
     let t_target = arrival_time(o_len - p_f, o.speed, o.accel, o.v_max) + red_shift + c.tau;
@@ -513,7 +508,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     let floor = -(w * c.decel + (1.0 - w) * MAX_BRAKE);
     // (short of the start while the foe's rear has not been past it for `tau`: wait at the start)
     let hold = (d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
-    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold })
+    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0 })
 }
 
 /// [J7-2] The car-following model's (IDM's) acceleration for the claimant behind a lead `gap` m
@@ -918,9 +913,6 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
         let mut zip_cap: Option<ZipCap> = None;
         // the first stretch waited for (rule D: the car stops just before it)
         let mut hold_at = f32::INFINITY;
-        // [round6 J1] refused for foes standing for good in their meeting places only (each
-        // wait so far one): the car rolls up to the stretch ([J7-1] at any distance)
-        let mut only_standing_long = true;
         let (mut follower_go, mut leader_go) = (0u16, 0u16);
         for (my_piece, foe) in &my_foes {
             // [fix pass 3, 6] a foe movement that is a piece of my own way through is ahead
@@ -943,6 +935,9 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
             // (in it as a foe sees one in it, `their_inside`: a front half a metre short of it
             // counted as in, the foe saw it out, and both went; review9)
             let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
+            // ([J7-4, fix pass 2] one it cannot wait short of, `Claim::next_wait`: it holds its way
+            // through it unless the foe is in it or arriving while it would be - then it waits)
+            let wait_short_of = foe.kind != FoeKind::Merge && !me_in && foe.mine.0 < c.next_wait;
             let (my_in, _) = window(c, foe.mine.0, foe.mine.1);
             for &(ok, shift) in expanded.get(&(c.junction, foe.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle && Some(claims[k].vehicle) != eased_for) {
                 // (one eased off for me in a mutual hold: not in my way at the junction; its
@@ -987,15 +982,14 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                         t.push(FoeTrace { claimant: c.vehicle, foe: o.vehicle, movement: foe.movement, times, skip });
                     }
                 };
-                // ([round6 J1] standing for good in the meeting place - its service, or
-                // `FAR_FOE_STOOD` s: a claimant refused for it rolls up to the stretch
-                // (`Grant::roll_up`), not to the line: case11's #54242 stood at its line refused for
-                // the layover bus #40523 with its stretch 203 m ahead. [J7-1] the time test has no
-                // reach: round 6's `FAR_FOE_REACH` 40 m is gone with the other distance windows;
-                // refused, not let go, at any distance: a far claimant let go counted as a foe for
-                // others while it stood in its queue, viz2 case12 #40303 waited 22 s for #40927
-                // 74 m away, review-r6j)
-                let stands_for_good = their_inside && o.speed < STANDING_SPEED && o.standing_long;
+                // ([round6 J1] a claimant refused for one standing in the meeting place stops at
+                // the stretch, as every refused one does, `plan::refused_stop` [J7-4], not at the
+                // line: case11's #54242 stood at its line refused for the layover bus #40523 with
+                // its stretch 203 m ahead. [J7-1] the time test has no reach: round 6's
+                // `FAR_FOE_REACH` 40 m and `FAR_FOE_STOOD` 30 s are gone with the other distance
+                // and time windows; refused, not let go, at any distance: a far claimant let go
+                // counted as a foe for others while it stood in its queue, viz2 case12 #40303
+                // waited 22 s for #40927 74 m away, review-r6j)
                 // [J7-2] two ways running into one another (or side by side) that cross nowhere
                 // else: SUMO's zipper (`getZipperSpeed`), never a refusal, the foe ahead caps my
                 // speed (`zipper_cap`)
@@ -1155,6 +1149,10 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                     continue;
                 }
                 let times = foe_times(c, o, foe.mine, foe.theirs, (their_in, their_out), foe.kind == FoeKind::Merge);
+                if wait_short_of && !their_inside && times.case != FoeCase::Conflict {
+                    note("committed_short_of", Some(times));
+                    continue;
+                }
                 // ([J7-1] a blocked claimant too: its window comes from its lead's motion,
                 // `planned_window`, or it does not come; base let any claimant go ahead of a foe at
                 // its red whose window it cleared, viz2 case08 #20367)
@@ -1223,7 +1221,6 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                                     }
                                     if !take_anyway {
                                         hold_at = hold_at.min(foe.mine.0);
-                                        only_standing_long = false;
                                     }
                                     continue;
                                 }
@@ -1242,7 +1239,6 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                         wait_for = Some((o.vehicle, their_in));
                     }
                     hold_at = hold_at.min(foe.mine.0);
-                    only_standing_long &= stands_for_good;
                 } else if (their_inside || (o.committed && times.their_in <= times.my_out)) && !(c.clearing && o.clearing && !claims[ok].committed && !their_inside) {
                     // ([J7-1] committed but coming only after I am out: no foe of mine - SUMO's
                     // major link does not look at a minor one at all, and the minor one took the
@@ -1256,7 +1252,6 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                         wait_for = Some((o.vehicle, their_out));
                     }
                     hold_at = hold_at.min(foe.mine.0);
-                    only_standing_long &= stands_for_good;
                 }
             }
         }
@@ -1270,10 +1265,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
             Some((v, _)) => Grant { at: hold_at.is_finite().then_some(hold_at), zipper: zip_cap, ..Grant::refused(c.vehicle, Some(v), Hold::Foe) },
             None => Grant { zipper: zip_cap, ..Grant::go(c.vehicle) },
         });
-        // [round6 J1] refused for foes standing for good in their meeting places only: rolling up
-        // to the stretch
         if let Some(g) = out[k].as_mut() {
-            g.roll_up = !g.go && g.hold == Some(Hold::Foe) && only_standing_long;
             g.follower_go = follower_go;
             g.leader_go = leader_go;
         }
@@ -1307,7 +1299,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, standing_long: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -3220,17 +3212,17 @@ mod tests {
     }
 
     /// [round6 J1] A foe standing for good in the meeting place (its service, or 30 s and more)
-    /// holds claimants whose stretch with it begins farther than `FAR_FOE_REACH` from their front
-    /// only as a roll-up (refused, `roll_up`, the stop at the stretch); nearer, as any foe.
+    /// holds claimants at any distance, refused for its stretch (`Grant::at`: the plan stops them
+    /// there, [J7-4]); ([J7-1] round 6's `FAR_FOE_REACH`, nearer which it was an ordinary
+    /// refusal and beyond a roll-up, is gone).
     #[test]
-    fn j1_a_claimant_is_held_by_a_foe_standing_for_good_inside_as_a_roll_up() {
+    fn j1_a_claimant_is_held_by_a_foe_standing_for_good_inside_at_any_distance() {
         let (_, js) = four_way(128.0, 128.0);
         let stretch = js.nodes[0].movements[0].foes[0].mine.0;
         let theirs = js.nodes[0].movements[0].foes[0].theirs;
         // the foe stands in the middle of the meeting place, held there (its lead, its stop)
         let mut foe = claim(2, 1, (theirs.0 + theirs.1) * 0.5, 0.0);
         foe.held = true;
-        foe.standing_long = true;
         let grant = |front_to_stretch: f32, speed: f32, brake: f32, foe: &Claim| -> Grant {
             let mut me = claim(1, 0, stretch - front_to_stretch - 2.0, speed);
             me.brake = brake;
@@ -3239,18 +3231,12 @@ mod tests {
             assert!(!g.go && g.wait_for == Some(2), "not refused for it: {g:?}");
             g
         };
-        // standing or rolling, at any distance: a roll-up to the stretch (never let go: a far
-        // claimant let go counted as a foe for others, viz2 case12). ([J7-1] round 6's reach,
-        // `FAR_FOE_REACH` 40 m or the gentle stop, within which it was an ordinary refusal, is
-        // gone with the other distance windows)
+        // standing or rolling, at any distance: refused for the stretch (never let go: a far
+        // claimant let go counted as a foe for others, viz2 case12)
         for (d, v, b) in [(100.0, 0.0, 5.6), (60.0, 8.0, 5.6), (30.0, 0.0, 5.6), (8.0, 0.0, 5.6), (50.0, 14.0, 5.6), (50.0, 13.0, 1.8)] {
             let g = grant(d, v, b, &foe);
-            assert!(g.roll_up && g.at == Some(stretch), "{d} m off at {v} m/s: {g:?}");
+            assert!(g.at == Some(stretch), "{d} m off at {v} m/s: {g:?}");
         }
-        // a foe standing inside for a while only (not for good): an ordinary refusal at any distance
-        let mut short = foe.clone();
-        short.standing_long = false;
-        assert!(!grant(100.0, 0.0, 5.6, &short).roll_up, "a foe not standing for good gave a roll-up");
     }
 
 
