@@ -189,3 +189,20 @@ fn p81_a_bus_pulls_in_beside_its_own_stops_waiters_only() {
     assert!(other.0 && other.1 > 0.0, "a waiter of another stop not held for by the car rule: {other:?}");
     assert!(inside.0 && inside.1 > 0.0, "drove into a waiter of its own stop inside its footprint: {inside:?}");
 }
+
+/// [P8 map data, light_call] On red a car that cannot stop before its line braking hard goes
+/// on; "cannot stop" is reckoned to the line itself, no half metre past it: at 10 m/s the hard
+/// stop takes 7.81 m, so 7.6 m before the line it goes (before: it stopped 0.2 m over the
+/// line), 8.0 m before it stops.
+#[test]
+fn light_call_reckons_to_the_line() {
+    use omsi_sim::traffic::Aspect;
+    use omsi_traffic::perception::{Perception, SignalView};
+    let mut c = car(1, vec![0], 50.0, 10.0);
+    c.state.speed = 10.0;
+    let p = Perception::default();
+    let at = |gap: f32| SignalView { dist: c.state.front + gap, ctl: 0, light: 0, aspect: Aspect::Red, until_go: None };
+    assert!((10.0f32 * 10.0 / (2.0 * omsi_traffic::plan::HARD_BRAKE) - 7.8125).abs() < 1e-3);
+    assert!(omsi_traffic::plan::light_call(&c, &p, &at(7.6)).go, "stops over the line instead of clearing it");
+    assert!(!omsi_traffic::plan::light_call(&c, &p, &at(8.0)).go, "runs a red it can stop for");
+}

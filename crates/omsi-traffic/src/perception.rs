@@ -1211,12 +1211,18 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // people on it treat me as an obstacle, SUMO's pedestrian side, sumo.md §4.3)
     let covering = lanes.iter().any(|&(l, d0)| net.walks.get(l).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front)));
     // [P8-5] SUMO's crossing test (`MSLink::getLeaderInfo` with `blockedAtDist`, sumo.md 4.3):
-    // for every crossing my way cuts whose zebra stop my front has not passed (SUMO keeps
-    // driving once on top of it: `distToCrossing - jmStoplineCrossingGap >= -SAFETY_GAP`;
-    // here once past the stop before it, the strip and body tests below decide, so that a
-    // car that could not stop short does not stand on the crossing), anybody on its
-    // walk who is in my band or walking towards it from within `JM_CROSSING_GAP` holds me
-    // short of the crossing, whatever their pace (viz4 case04 #18965 moved off at a crossing
+    // for every crossing my way cuts whose zebra stop (`plan::ZEBRA_STOP` before the cut) my
+    // front has not passed - a position test, no braking test, as SUMO's (`distToCrossing -
+    // jmStoplineCrossingGap >= -SAFETY_GAP`: SUMO stops 1 m before the crossing and asks until
+    // it is on top of it; here the stop is 2.5 m before and the test runs to it, OMSI's
+    // crossing geometry; past it the strip and body tests below decide) - anybody on its
+    // walk who is in my band (crossing flag or not) or, with the crossing flag, walks
+    // towards it from within `JM_CROSSING_GAP` holds me short of the crossing, whatever
+    // their pace (position, direction and waiting time, no pace, as blockedAtDist). Not
+    // implemented: SUMO's `myApproachingPersons` (MSLink.cpp, a vehicle already on the
+    // junction braking for a person who will reach the crossing first), nor its "stopped
+    // less than 2 s ago still walks" for somebody whose step is zero (the person's walking
+    // direction is not kept here) (viz4 case04 #18965 moved off at a crossing
     // while a walker 3.5 m off its axis came at 1.7 m/s; the strip test saw them in its
     // 2 s step only once they were 0.4 m from its flank). Kerb waiters (on the walking area,
     // not the crossing) and bus waiters are no crossing users.
