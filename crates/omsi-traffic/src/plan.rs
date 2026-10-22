@@ -1491,7 +1491,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
+        // [P8-2] a pass on the oncoming lane sweeps its path as the squeeze and the bypass
+        // do: the body out, level with what it passes and back in clear of every body and
+        // person by `SQUEEZE_CLEARANCE` (`squeeze_clear`), and turned along its S-curve
+        // (`bypass_sweep_clear`) - not only the oncoming lane's gap (the last test, the
+        // costly one)
+        let pass_level = real + obstacle_len + st.front + st.rear + 2.0;
+        let pass_swept = || squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, pass_level, Passing::back_len_for(side)) && bypass_sweep_clear(net, sim, vehicles, me, side, out_len, pass_level);
+        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free && pass_swept()));
         // (or round it into the lane beside, `Start::Bypass`)
         let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
