@@ -829,7 +829,9 @@ pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
 /// (round 6 J3: one standing short of its line set off over it on red, viz case07 #18558).
 /// (This replaces round 4's amber mark: taken on green 3 m out, extended 6 m on yellow,
 /// carried over frames and retired by `stale_amber` and a 2 s stand; x10 case03 #3145
-/// crossed its line on red on it.)
+/// crossed its line on red on it.) [P8 map data] "Cannot stop" is reckoned to the line
+/// itself, as SUMO's red: the half metre past the line it allowed (round 4's `possible -
+/// 0.5`, carried into round 7's D2) had no source and let a stop lie over the line.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     let st = &me.state;
     let dp = &me.params;
@@ -848,12 +850,12 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // sumo.md: viz5 case05 #16535 took its amber with people 2.8 m past the line and
             // stood 85.8 s inside - unless it cannot stop at all)
             let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
-            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap + 0.5, HARD_BRAKE)));
+            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap, HARD_BRAKE)));
             LightCall { go: go && v > STANDING_SPEED, decision: Some((light, go, gap)) }
         }
         Aspect::Red | Aspect::RedYellow => {
             let committed = held == Some(true) && v > STANDING_SPEED;
-            LightCall { go: committed || cannot_stop(v, gap + 0.5, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
+            LightCall { go: committed || cannot_stop(v, gap, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
         }
     }
 }
