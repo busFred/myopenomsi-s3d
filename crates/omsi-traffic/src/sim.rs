@@ -1703,6 +1703,14 @@ impl Simulation {
         if v.pulling_out && v.pull_out <= 0.0 && (v.state.lateral.abs() <= SIDESTEP_DONE || v.state.change.is_some() || v.passing.is_some()) {
             v.pulling_out = false;
         }
+        // ([fix pass 1] standing at its offset with its signalling time run, its way out is the
+        // shortest move its body can steer from rest, `plan::bypass_min_len`, starting where it
+        // stands: the strip `plan::pull_out_clear` tested)
+        if v.pulling_out && v.pull_out <= 0.0 && v.state.speed < STANDING_SPEED {
+            let (lat, odo) = (v.state.lateral, v.state.odometer);
+            v.state.lateral_target = 0.0;
+            v.state.lateral_ramp = (lat, 0.0, odo, plan::bypass_min_len(v.length(), lat));
+        }
         let standing = v.state.speed < STANDING_SPEED;
         // [ROLLBACK r4d-B4] a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
         // standing time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of

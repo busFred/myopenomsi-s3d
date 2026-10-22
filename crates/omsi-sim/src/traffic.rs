@@ -3107,7 +3107,7 @@ pub struct LaneChange {
 pub const HEADING_CHORD: f32 = 1.5;
 
 /// Smoothstep 0..1.
-fn smooth01(t: f32) -> f32 {
+pub fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }

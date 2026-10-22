@@ -3,7 +3,7 @@
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
-use omsi_traffic::{Simulation, Vehicle, VehicleClass};
+use omsi_traffic::{Person, Simulation, Vehicle, VehicleClass};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -47,6 +47,7 @@ fn pulled_out(id: u64, s: f32, lat: f32) -> Vehicle {
     c.state.lateral_target = 0.0;
     c.state.lateral_ramp = (lat, 0.0, c.state.odometer, (lat * 6.0).clamp(8.0, 16.0));
     c.pull_out = 2.0;
+    c.pulling_out = true;
     c.state.blinker = 1;
     c
 }
@@ -180,3 +181,75 @@ fn h8_4_a_refused_car_inside_a_long_object_stops_before_the_zebra_short_of_the_c
     assert!(front <= cut - ZEBRA_STOP + 0.05 && front > cut - ZEBRA_STOP - 3.0, "rests with its front {:.1} m short of the cut ({why})", cut - front);
 }
 
+
+fn person(x: f64, y: f64, vx: f64, vy: f64) -> Person {
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: if vx == 0.0 && vy == 0.0 { 10.0 } else { 0.0 }, waiting_for_bus: false, at_kerb: false }
+}
+
+/// [H8-8, fix pass 1] The one pull-out rule (`plan::pull_out_clear`, which the game asks before
+/// the parked object leaves the kerb and the crate asks while a pull-out stands at its offset):
+/// a follower inside its OWN secure gap (its minGap, its headway and its braking, SUMO's
+/// `getSecureGap`; a bus braking at 1.5 m/s² needs more than a car) or somebody on the strip the
+/// body sweeps from the offset onto the lane refuses it; somebody walking along the pavement
+/// past the parked spot, behind it, does not (Jiangzhaikou #1913).
+#[test]
+fn h8_8_the_pull_out_rule_followers_secure_gap_and_the_swept_strip() {
+    use omsi_traffic::plan::{bypass_min_len, pull_out_clear, pull_out_followers, secure_gap_behind, PullOutFollower};
+    use omsi_traffic::DriverParams;
+    let net = one_lane();
+    let mut sim = Simulation::new(&net, vec![]);
+    let (s, lat, front, rear, hw) = (100.0f32, 3.0f32, 2.0f32, 2.0f32, 0.9f32);
+    let ramp = bypass_min_len(front + rear, lat);
+    // (a bus and a car at 12 m/s: each its own gap; the bus needs more)
+    let bus = PullOutFollower { gap: 0.0, speed: 12.0, params: DriverParams::preset(VehicleClass::ScheduledBus) };
+    let carp = PullOutFollower { gap: 0.0, speed: 12.0, params: DriverParams::preset(VehicleClass::Car) };
+    assert!(secure_gap_behind(&bus) > secure_gap_behind(&carp), "bus {:.1} car {:.1}", secure_gap_behind(&bus), secure_gap_behind(&carp));
+    // the followers found on the lane: a car 30 m behind the rear at 12 m/s
+    let on = |l: usize| if l == 0 { vec![(s - rear - 30.0 - 2.0, 2.0, 12.0, DriverParams::preset(VehicleClass::Car))] } else { vec![] };
+    sim.build_occupancy(&net, &[]);
+    let f = pull_out_followers(&net, &sim, 0, s, rear, &on);
+    assert_eq!(f.len(), 1);
+    assert!((f[0].gap - 30.0).abs() < 0.01, "{:?}", f[0]);
+    let need = secure_gap_behind(&f[0]);
+    assert!(!pull_out_clear(&net, &sim, &f, 0, s, lat, front, rear, hw, ramp), "30 m < {need:.1} m needed");
+    let far = [PullOutFollower { gap: need + 1.0, ..f[0] }];
+    assert!(pull_out_clear(&net, &sim, &far, 0, s, lat, front, rear, hw, ramp));
+    // somebody standing on the lane's edge where the body goes out: refused
+    sim.people = vec![person(1.2, (s + ramp * 0.6) as f64, 0.0, 0.0)];
+    sim.build_occupancy(&net, &[]);
+    assert!(!pull_out_clear(&net, &sim, &far, 0, s, lat, front, rear, hw, ramp), "a person on the strip");
+    // a walker on the pavement behind the parked spot, walking away from it: clear
+    sim.people = vec![person(3.4, (s - 6.0) as f64, 0.0, -1.2)];
+    sim.build_occupancy(&net, &[]);
+    assert!(pull_out_clear(&net, &sim, &far, 0, s, lat, front, rear, hw, ramp), "a walker behind it, going away");
+}
+
+/// [H8-8, fix pass 1] A recorded pull-out standing at its offset with somebody standing on its way
+/// out stays parked (`Why::PullOut`), and drives out from its offset onto the lane once they have
+/// gone; at no time is its body over them.
+#[test]
+fn h8_8_a_pull_out_waits_for_somebody_on_its_way_out_then_drives_from_its_offset() {
+    let net = one_lane();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![pulled_out(1, 100.0, 3.0)];
+    let mut touched = false;
+    let mut left_at = None;
+    let mut lat_when_moving = 0.0f32;
+    run(&net, &mut sim, &mut cars, 20.0, |t, sim| {
+        sim.people = if t < 6.0 { vec![person(1.2, 105.0, 0.0, 0.0)] } else { vec![] };
+    }, |t, sim, cars| {
+        let c = &cars[0];
+        for p in &sim.people {
+            touched |= omsi_sim::collision::Obb::point(p.pos, 0.28).separation(&c.obb()) < 0.0;
+        }
+        if left_at.is_none() && c.state.speed > 0.3 {
+            left_at = Some(t);
+            lat_when_moving = c.state.lateral;
+        }
+    });
+    let t = left_at.expect("never left");
+    assert!(t >= 6.0, "left at {t:.1} s with somebody on its way out");
+    assert!(lat_when_moving > 2.5, "it drove from its offset, not from the lane: {lat_when_moving:.2}");
+    assert!(cars[0].state.lateral.abs() < 0.1, "not on its lane at the end: {:.2}", cars[0].state.lateral);
+    assert!(!touched);
+}

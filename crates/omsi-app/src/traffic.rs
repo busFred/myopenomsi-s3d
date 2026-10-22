@@ -349,6 +349,7 @@ const DRIVER_NEAR: f64 = 70.0;
 /// Within this distance of the camera no car appears or vanishes, seen or not: the mirrors
 /// and a turn of the head see what is near (see [`Traffic::may_appear`]).
 const NEVER_VANISH_WITHIN: f64 = 150.0;
+
 /// Within this distance a vehicle appears or vanishes only behind something, wherever the
 /// player looks (see `Traffic::hidden`).
 const NEAR_HIDE: f64 = 350.0;
@@ -2198,6 +2199,22 @@ impl Traffic {
                 why.push("road not clear".into());
                 continue;
             }
+            // [round 8 H8-8, fix pass 1] the parked object stays parked until its lane has room
+            // for it: the one pull-out rule of the traffic (`plan::pull_out_clear`, as SUMO
+            // re-inserts a parked vehicle only where `isInsertionSuccess` passes) - every vehicle
+            // driving up the lane, the players too, has its own secure gap behind it, and nobody
+            // is on the strip its body sweeps from its offset onto the lane; then it drives out
+            // from where it is parked over the shortest move it can steer from rest
+            let (front, rear, half_w) = extents(&ty, 12.0);
+            let ramp = omsi_traffic::plan::bypass_min_len(front + rear, lat);
+            let on_lane = |lane: usize| -> Vec<(f32, f32, f32, omsi_traffic::DriverParams)> {
+                self.cars.iter().filter(|c| c.ai.state.lane == lane).map(|c| (c.ai.state.s, c.ai.state.front, c.ai.state.speed, c.ai.params)).collect()
+            };
+            let followers = omsi_traffic::plan::pull_out_followers(&self.net, &self.sim, l, s, rear, &on_lane);
+            if !omsi_traffic::plan::pull_out_clear(&self.net, &self.sim, &followers, l, s, lat, front, rear, half_w, ramp) {
+                why.push("its lane has no room behind it, or somebody is on its way out".into());
+                continue;
+            }
             if world.depart_parked(renderer, scene, key).is_none() {
                 continue;
             }
@@ -2209,21 +2226,21 @@ impl Traffic {
                 }
             }
             let seed = self.rand();
-            // [round 8 H8-8] put on the lane where `spawn_clear` found it has room (the bodies
-            // there, and nobody driving up to it within their braking distance), not at its
-            // parking offset: SUMO's parked vehicle is off the lane and re-enters by insertion
-            // where the lane has room. At its offset it ran the lane's people test over the
-            // pavement and never re-entered (Jiangzhaikou #1913 stood 482 s 3.15 m right of lane
-            // 1129, held by the walkers under its own body); a people test on the lane's
-            // footprint instead drove its body over the pavement into them (viz case10/08/04/07:
-            // 820 frames of body over a person, a probe).
+            // (where it was parked, its way eased onto the lane's axis over `ramp`; a pull-out to
+            // the crate, `Vehicle::pulling_out`, so the same rule holds it while it signals)
             let id = self.create_car(world, renderer, scene, center, LaneKind::Street, l, s, ty.clone(), seed, None, None, Some(0.0), None);
+            let net = &self.net;
             if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
+                car.ai.state.lateral = lat;
+                car.ai.state.lateral_target = 0.0;
+                car.ai.state.lateral_ramp = (lat, 0.0, car.ai.state.odometer, ramp);
+                car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
                 car.ai.pull_out = 2.0 + (seed % 1000) as f32 / 400.0;
+                car.ai.pulling_out = true;
                 car.ai.state.blinker = 1;
             }
             if debug {
-                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, from {lat:.1} m right of lane {l}, put on the lane", ty.def.path.display(), p.pos.x, p.pos.y);
+                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {lat:.1} m right of lane {l}", ty.def.path.display(), p.pos.x, p.pos.y);
             }
             return;
         }
@@ -5387,3 +5404,4 @@ mod respawn_sight_tests {
         assert!(!v.hides_plainly(DVec3::new(0.0, 280.0, 0.0), 8.0));
     }
 }
+
