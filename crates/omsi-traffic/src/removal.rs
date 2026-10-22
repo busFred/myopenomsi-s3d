@@ -4,9 +4,7 @@
 //! by is written into the recording (`Record::Remove`).
 
 use crate::perception::Seen;
-use crate::sim::{Decision, PlayerView, Vehicle, GIVE_UP_UNSEEN, PLAYER_ID_BASE};
-use crate::driver::STANDING_SPEED;
-use hashbrown::HashSet;
+use crate::sim::{Decision, Vehicle, GIVE_UP_UNSEEN, PLAYER_ID_BASE};
 use serde::{Deserialize, Serialize};
 
 /// A car that gave up (or a timetable bus let go) goes in view too once the crate's give-up
@@ -16,6 +14,8 @@ use serde::{Deserialize, Serialize};
 /// minutes between giving up and going in view, 60 s and 240 s; the in-view removal is
 /// never earlier than giving up.) (Moved from omsi-app's traffic.rs.)
 pub const IN_VIEW_GRACE: f32 = 180.0;
+/// (A distance window SUMO does not have: SUMO teleports the front car of a blocked queue
+/// wherever it stands. Left as it is for the user to decide, round 8 H8-9.)
 pub const GAVE_UP_DIST: f64 = 40.0;
 
 /// [round5 C4] A lead standing within this (m) makes a car that gave up a queued car, not a
@@ -66,33 +66,27 @@ pub fn lead_of(d: &Decision) -> Option<u64> {
     })
 }
 
-/// The vehicles standing now, the players too (as `PLAYER_ID_BASE` + id).
-pub fn standing_ids<'a>(vehicles: impl IntoIterator<Item = &'a Vehicle>, players: &[PlayerView]) -> HashSet<u64> {
-    vehicles
-        .into_iter()
-        .filter(|v| v.state.speed.abs() < STANDING_SPEED)
-        .map(|v| v.id)
-        .chain(players.iter().filter(|p| p.speed.abs() < STANDING_SPEED).map(|p| PLAYER_ID_BASE + p.id as u64))
-        .collect()
-}
-
-/// [round5 C4] Whether a car follows a vehicle standing now (`standing`, [`standing_ids`])
-/// within `QUEUE_LEAD`: in a queue, whatever its own hold reads.
+/// [round5 C4] Whether a car follows a vehicle within `QUEUE_LEAD`: in a queue, whatever its
+/// own hold reads.
 /// [round 7 B5] SUMO's rule for the in-view removal: only the car at the front of a blocked
-/// queue goes - one whose own lead does not stand (or that has none); every car behind a
-/// standing lead stays, given up or not, the lead given up or not (each link of the chain
-/// is asked of its own lead, so the chain is never cut in its middle). A gridlock with no
-/// front car is removed only out of sight.
-pub fn in_a_queue(d: &Decision, standing: &HashSet<u64>) -> bool {
-    lead_of(d).is_some_and(|id| standing.contains(&id)) && d.lead.is_some_and(|l| l.gap < QUEUE_LEAD)
+/// queue goes; every car behind a vehicle stays, given up or not, the lead given up or not
+/// (each link of the chain is asked of its own lead, so the chain is never cut in its
+/// middle). A gridlock with no front car is removed only out of sight.
+/// [round 8 H8-9] No speed test: SUMO's waiting time runs only for the vehicle first before
+/// the junction (sumo.md 5.3, `MSLane::executeMovements` teleports the lane's front vehicle),
+/// so a car with a vehicle lead on its approach is in a queue whether that lead stands or
+/// creeps this frame (x10 c08 #1477, a mid-queue car, was taken off the frame its lead #1261
+/// crept: the speed was sampled in one frame).
+pub fn in_a_queue(d: &Decision) -> bool {
+    lead_of(d).is_some() && d.lead.is_some_and(|l| l.gap < QUEUE_LEAD)
 }
 
 /// Whether vehicle `v`, done (`finished`: given up, or a timetable bus let go), goes in view
 /// `from_eye` (m) from the eye: its waiting time past `GIVE_UP_UNSEEN + IN_VIEW_GRACE`,
 /// beyond `GAVE_UP_DIST`, not in a queue (SUMO's time-to-teleport for the front of a jam,
 /// sumo.md 5.3).
-pub fn goes_in_view(finished: bool, v: &Vehicle, from_eye: f64, standing: &HashSet<u64>) -> bool {
-    finished && v.waiting > GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(&v.last, standing)
+pub fn goes_in_view(finished: bool, v: &Vehicle, from_eye: f64) -> bool {
+    finished && v.waiting > GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(&v.last)
 }
 
 #[cfg(test)]
@@ -101,35 +95,45 @@ mod tests {
     use omsi_sim::traffic::Lead;
 
     /// The queue of fix2-jzk600 at t=595: player <- #150 <- #119 <- #163 (given up) <- #101
-    /// <- #112, all standing 2-6 m apart. No car of it may go in view: #150 follows the
-    /// player, the rest follow standing cars, the given-up #163 too and #101 behind it. With
-    /// the player gone the front car #150 is the only one that may.
+    /// <- #112, all 2-6 m apart. No car of it may go in view: #150 follows the player, the
+    /// rest follow cars, the given-up #163 too and #101 behind it. With the player gone the
+    /// front car #150 is the only one that may.
     #[test]
-    fn b5_only_the_front_car_of_a_standing_queue_may_go_in_view() {
+    fn b5_only_the_front_car_of_a_queue_may_go_in_view() {
         let gap = |g: f32| Some(Lead { gap: g, speed: 0.0, acc: 0.0 });
         let follows = |id: Option<u64>, player: Option<u32>| Decision { lead_id: id, lead_seen: player.map(Seen::Player), lead: gap(3.0), ..Default::default() };
-        let chain = [(150u64, follows(None, Some(0))), (119, follows(Some(150), None)), (163, follows(Some(119), None)), (101, follows(Some(163), None)), (112, follows(Some(101), None))];
-        let mut standing: HashSet<u64> = chain.iter().map(|c| c.0).collect();
-        standing.insert(PLAYER_ID_BASE);
+        let mut chain = vec![(150u64, follows(None, Some(0))), (119, follows(Some(150), None)), (163, follows(Some(119), None)), (101, follows(Some(163), None)), (112, follows(Some(101), None))];
         assert_eq!(lead_of(&chain[0].1), Some(PLAYER_ID_BASE));
-        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(d, &standing)).map(|c| c.0).collect();
+        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(d)).map(|c| c.0).collect();
         assert!(removable.is_empty(), "{removable:?}");
-        standing.remove(&PLAYER_ID_BASE);
-        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(d, &standing)).map(|c| c.0).collect();
+        chain[0].1 = follows(None, None);
+        chain[0].1.lead = None;
+        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(d)).map(|c| c.0).collect();
         assert_eq!(removable, vec![150]);
     }
 
-    /// The no-lead car against an invisible wall still goes; one behind a standing vehicle
-    /// within QUEUE_LEAD stays; behind a moving one, or one farther off, it goes.
+    /// The no-lead car against an invisible wall still goes; one behind a vehicle within
+    /// QUEUE_LEAD stays, one farther off goes.
     #[test]
-    fn c4_a_car_behind_a_standing_lead_is_queued_not_a_phantom() {
-        let standing: HashSet<u64> = [7u64].into_iter().collect();
+    fn c4_a_car_behind_a_lead_is_queued_not_a_phantom() {
         let d = |id: Option<u64>, gap: Option<f32>| Decision { lead_id: id, lead: gap.map(|gap| Lead { gap, speed: 0.0, acc: 0.0 }), ..Default::default() };
-        assert!(!in_a_queue(&d(None, None), &standing));
-        assert!(in_a_queue(&d(Some(7), Some(2.2)), &standing));
-        assert!(in_a_queue(&d(Some(7), Some(QUEUE_LEAD - 0.5)), &standing));
-        assert!(!in_a_queue(&d(Some(7), Some(QUEUE_LEAD + 0.5)), &standing));
-        assert!(!in_a_queue(&d(Some(8), Some(2.2)), &standing));
+        assert!(!in_a_queue(&d(None, None)));
+        assert!(in_a_queue(&d(Some(7), Some(2.2))));
+        assert!(in_a_queue(&d(Some(7), Some(QUEUE_LEAD - 0.5))));
+        assert!(!in_a_queue(&d(Some(7), Some(QUEUE_LEAD + 0.5))));
+    }
+
+    /// [H8-9] x10 c08 #1477: a mid-queue car whose lead #1261 crept for a frame (`lead 1261 gap
+    /// 4.0 standing false`) was taken for the front of the queue and removed. In a queue is a
+    /// vehicle lead on its approach, whatever that lead's speed this frame.
+    #[test]
+    fn h8_9_a_creeping_lead_keeps_the_car_in_its_queue() {
+        let creeping = Decision { lead_id: Some(1261), lead: Some(Lead { gap: 4.0, speed: 0.4, acc: 0.3 }), ..Default::default() };
+        assert!(in_a_queue(&creeping));
+        let mut v = Vehicle { last: creeping, waiting: GIVE_UP_UNSEEN + IN_VIEW_GRACE + 1.0, ..Default::default() };
+        assert!(!goes_in_view(true, &v, 111.0));
+        v.last = Decision::default();
+        assert!(goes_in_view(true, &v, 111.0));
     }
 
     /// The give-up clock and the distance: before GIVE_UP_UNSEEN + IN_VIEW_GRACE it stays,
@@ -137,12 +141,11 @@ mod tests {
     #[test]
     fn r7_in_view_only_after_the_grace_and_beyond_the_distance() {
         let mut v = Vehicle::default();
-        let none = HashSet::new();
         v.waiting = GIVE_UP_UNSEEN + IN_VIEW_GRACE - 1.0;
-        assert!(!goes_in_view(true, &v, 100.0, &none));
+        assert!(!goes_in_view(true, &v, 100.0));
         v.waiting = GIVE_UP_UNSEEN + IN_VIEW_GRACE + 1.0;
-        assert!(goes_in_view(true, &v, 100.0, &none));
-        assert!(!goes_in_view(true, &v, GAVE_UP_DIST - 1.0, &none));
-        assert!(!goes_in_view(false, &v, 100.0, &none));
+        assert!(goes_in_view(true, &v, 100.0));
+        assert!(!goes_in_view(true, &v, GAVE_UP_DIST - 1.0));
+        assert!(!goes_in_view(false, &v, 100.0));
     }
 }

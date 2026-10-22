@@ -1851,9 +1851,6 @@ impl Traffic {
         self.advance_dormant();
         // the cars somebody stands behind
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.last.lead_id).collect();
-        // [round5 C4] the vehicles standing now, the players too: a car that gave up behind
-        // one of them is in a queue, not a phantom
-        let standing = omsi_traffic::removal::standing_ids(self.cars.iter().map(|c| &c.ai), &self.sim.players);
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1935,7 +1932,7 @@ impl Traffic {
                 first(&[
                     (&|| dist > VISIBLE_RANGE * OUT_OF_RANGE && from_eye > NEAR_HIDE, "out of range"),
                     (&|| hidden(), if finished { "finished, out of sight" } else { "out of sight" }),
-                    (&|| goes_in_view(finished, &c.ai, from_eye, &standing), "finished, in view after its grace"),
+                    (&|| goes_in_view(finished, &c.ai, from_eye), "finished, in view after its grace"),
                 ])
             } else {
                 None
@@ -1983,10 +1980,10 @@ impl Traffic {
                     // ([round 7 B1] with the rule that took it, its distance from the eye, its
                     // last hold and its waiting time, the give-up clock)
                     // ([round 7 R7-1] and what it follows: the lead's id and gap and whether
-                    // that lead stands, the queue test of the in-view rule)
+                    // its speed, the queue test of the in-view rule)
                     let lead = lead_of(&c.ai.last);
-                    let in_queue = in_a_queue(&c.ai.last, &standing);
-                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} standing {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), lead.is_some_and(|l| standing.contains(&l)), in_queue);
+                    let in_queue = in_a_queue(&c.ai.last);
+                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} speed {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.speed)).unwrap_or("-".into()), in_queue);
                 }
                 self.orphan_sounds.extend(c.sounds);
                 for r in std::iter::once(c.render).chain(c.trailer_renders) {
