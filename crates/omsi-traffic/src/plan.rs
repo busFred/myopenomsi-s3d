@@ -87,6 +87,9 @@ pub struct Plan {
     pub help: Option<(usize, f32, f32, f32)>,
     /// [J7-3] What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
+    /// [round 8 H8-1] A car leaving a parking space is held where it is parked because its
+    /// lane has no room behind it: its `pull_out` clock waits.
+    pub pull_out_held: bool,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -1135,9 +1138,17 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
-    if me.pull_out > 0.0 {
+    // [round 8 H8-1] a car leaving a parking space starts only when its lane has room behind
+    // it: the follower there not within the gap a lane change needs from it (`gap_needed_behind`:
+    // its standing gap, the time gap and the braking distance of the speed it closes in at) -
+    // SUMO's parked vehicle re-enters by insertion, which checks the follower's secure gap on the
+    // lane it enters (`MSLane::isInsertionSuccess`, `getSecureGap`). Until then it stays parked
+    // and its clock waits (x10 case08: #11387 pulled out with bus #11125 coming up at 12 m/s)
+    let pull_out_held = me.pulling_out && v < STANDING_SPEED && p.own_lane.is_some_and(|own| !gap_parts(me, &own).0);
+    if me.pull_out > 0.0 || pull_out_held {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
     }
+    out.pull_out_held = pull_out_held;
     if let Some(d) = p.letting_out {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + (d - 1.0).max(0.0)), Why::LetOut);
     }

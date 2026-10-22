@@ -300,6 +300,9 @@ pub struct Perception {
     pub v_want: f32,
     /// [J7-3] Where my lane ends for me ahead (`lane_end`).
     pub lane_end: Option<LaneEnd>,
+    /// [round 8 H8-1] My own lane seen as the lane I move into, for a car leaving a parking
+    /// space (`Vehicle::pulling_out`): its follower there (`NeighbourView::behind`).
+    pub own_lane: Option<NeighbourView>,
 }
 
 /// The lanes ahead along the car's way with the distance from the origin to each one's
@@ -1902,6 +1905,9 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             }
             if let Some(r) = lane.right {
                 p.right = neighbour(net, sim, vehicles, i, r, 2);
+            }
+            if me.pulling_out {
+                p.own_lane = neighbour(net, sim, vehicles, i, st.lane, 0);
             }
             // the oncoming lane matters behind something standing, or while out on it
             let standing = p.leader.map(|l| l.standing_obstacle() && l.gap < 45.0).unwrap_or(false);
