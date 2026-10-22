@@ -90,6 +90,10 @@ pub struct Plan {
     /// [Q8-4] The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
+    /// [Q8-3] SUMO LC2013's keep-right accumulation this frame (per second, `keep_right_rate`):
+    /// `Vehicle::keep_right` grows by it; None where no lane beside on the keep side is one the
+    /// driver may change onto (the wish is left as it is).
+    pub keep_right_rate: Option<f32>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -274,12 +278,12 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
             wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
         }
     }
-    // keep to the side when the road is clear (the target lane reaching `KEEP_SIDE_REACH` on,
-    // and open to me along the move and on: `open_on`; the target piece's own run-on of 40 m
-    // cut keep-right 21-34 %, 201 of 446 went onto pieces under 40 m of lanes cut into short
-    // spline pieces, review r6l)
-    let keep_side = if sim.left_hand { 1 } else { 2 };
-    if nb.dir == keep_side && !near_junction && p.leader.map(|l| l.gap > 60.0).unwrap_or(true) && nb.ahead.map(|a| a.0 > 70.0).unwrap_or(true) && nb.runs_on > KEEP_SIDE_REACH && open_on(net, me, nb.lane, st.s) {
+    // [Q8-3] keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
+    // (`Vehicle::keep_right`, `keep_right_rate`) past its threshold, onto a lane open to me along
+    // the move and on (`open_on`); a speed-gain or strategic wish outweighs it (round 5's gates -
+    // lead over 60 m, the lane beside free 70 m, not near a junction, running on 200 m - are gone:
+    // how long the driver could keep its speed there is the accumulator's rate)
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -318,14 +322,152 @@ fn may_change_to(net: &Network, me: &Vehicle, nb: &NeighbourView) -> bool {
     !((my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < TURN_LANE_KEEP))
 }
 
-/// A keep-to-the-side change needs the target lane to reach this far on (m,
-/// `NeighbourView::runs_on`: round 5's rule) ...
-pub const KEEP_SIDE_REACH: f32 = 200.0;
-/// ... and the lanes it runs into (one after the other, while each has a single next) open
-/// to the car for the move's length and this many metres more (m: what a driver sees of the
-/// lane markings ahead; viz5 case04 #5644 changed onto 3470's bus lane, which runs into
-/// 3474's, closed to it).
+/// A keep-to-the-side change needs the lanes the target runs into (one after the other, while
+/// each has a single next) open to the car for the move's length and this many metres more (m:
+/// what a driver sees of the lane markings ahead; viz5 case04 #5644 changed onto 3470's bus
+/// lane, which runs into 3474's, closed to it).
 pub const KEEP_SIDE_OPEN_AHEAD: f32 = 60.0;
+
+/// [Q8-3] SUMO LC2013's `KEEP_RIGHT_TIME` (s): "the number of seconds after which a vehicle
+/// should move to the right lane" - with the lane beside free for its whole acceptance time
+/// the wish reaches its threshold in this long.
+pub const KEEP_RIGHT_TIME: f32 = 5.0;
+/// [Q8-3] The accumulated keep-right wish (`Vehicle::keep_right`) asks for the change once it
+/// reaches this: SUMO's `myKeepRightProbability * lcKeepRight < -myChangeProbThresholdRight`
+/// with the default `lcKeepRight` 1, the accumulator counted in units of the threshold.
+pub const KEEP_RIGHT_THRESHOLD: f32 = 1.0;
+/// [Q8-3] SUMO LC2013's legacy acceptance time (`lcKeepRightAcceptanceTime` -1, its default):
+/// `7 * roadSpeedFactor * max(1, v)` seconds.
+pub const KEEP_RIGHT_ACCEPTANCE: f32 = 7.0;
+/// [Q8-3] SUMO LC2013 accumulates the keep-right wish only while the current lane is not faster
+/// than the lane beside by more than this (m/s: `thisLaneVSafe - 5 / 3.6 > neighLaneVSafe`).
+pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
+/// [Q8-3] SUMO LC2013's `TURN_LANE_DIST` (m): "the distance at which a lane leading elsewhere is
+/// considered to be a turn-lane that must be avoided" - a driver on the lane that runs on does not
+/// leave it for a keep-right onto one that runs on less than this (`stays_on_best`).
+pub const TURN_LANE_DIST: f32 = 200.0;
+/// [Q8-3] SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so
+/// the distance a lane beside runs on (`neighDist`), are looked along.
+pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
+/// [Q8-3] SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
+/// allowed (`avoidOvertakeRight` is false), above it the time on the lane beside is bounded by
+/// catching up with my own leader.
+pub const CONGESTED_SPEED: f32 = 60.0 / 3.6;
+
+/// The side a driver keeps to: 2 right, 1 left on a left-hand-traffic map.
+fn keep_side(sim: &Simulation) -> i32 {
+    if sim.left_hand {
+        1
+    } else {
+        2
+    }
+}
+
+/// [Q8-3] SUMO LC2013's strategic stays that come before its keep-right layer, for the lane beside
+/// `nb` when my own lane runs on further (SUMO: `bestLaneOffset == 0`): VARIANT_21 `stayOnBest`,
+/// the lane beside runs on less than `TURN_LANE_DIST`; and "could not change back and forth in
+/// time", twice its run is under the strategic distance (`lane_end_look`).
+fn stays_on_best(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView) -> bool {
+    let st = &me.state;
+    let overtaking = nb.dir == if sim.left_hand { 2 } else { 1 };
+    let short = TURN_LANE_DIST.max(0.5 * lane_end_look(me.look_ahead_speed.max(st.speed), overtaking, me));
+    let theirs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), short);
+    theirs < short && open_run(net, me, st.lane, st.s, short) > theirs
+}
+
+/// [Q8-3] How far (m, at most `cap`) a car at `s` on `lane` can drive on along it and the lanes it
+/// runs into while they are open to it (`access::is_open`; a junction object's piece is the
+/// junction's): SUMO's best-lane length (`neighDist`, `currentDist`) for a car with no route -
+/// at a fork the way on that runs furthest. (`NeighbourView::runs_on` is the network's reach,
+/// which counts no closed lane out and stops counting at `REACH_MAX`.)
+fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
+    // (at most `OPEN_RUN_LANES` lanes looked at: past that the way is taken to run on)
+    fn walk(net: &Network, me: &Vehicle, lane: usize, d: f32, cap: f32, budget: &mut usize) -> f32 {
+        let Some(l) = net.lanes.get(lane) else { return d };
+        if *budget == 0 {
+            return cap;
+        }
+        *budget -= 1;
+        if l.source != 2 && !crate::access::is_open(l, me) {
+            return d;
+        }
+        let end = d + l.length();
+        if end >= cap {
+            return cap;
+        }
+        let mut best = end;
+        for &n in &l.next {
+            best = best.max(walk(net, me, n, end, cap, budget));
+            if best >= cap {
+                break;
+            }
+        }
+        best
+    }
+    let Some(l) = net.lanes.get(lane) else { return 0.0 };
+    let mut budget = OPEN_RUN_LANES;
+    walk(net, me, lane, -s.min(l.length()), cap, &mut budget).min(cap)
+}
+
+/// [Q8-3] `open_run` looks at no more than this many lanes (the network's own reach is counted
+/// over the same chains, `Network::compute_reach`).
+const OPEN_RUN_LANES: usize = 64;
+
+/// [Q8-3] SUMO's Krauss `maximumSafeFollowSpeed` (on insertion: no reaction step): the highest
+/// speed from which the driver, braking at `b` after `tau`, stays behind a lead `gap` m ahead at
+/// `vl` m/s braking as hard; a stop `gap` m ahead with `vl` 0 (`maximumSafeStopSpeed`).
+fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
+    let b = b.max(0.1);
+    let room = gap.max(0.0) + vl.max(0.0).powi(2) / (2.0 * b);
+    -b * tau + ((b * tau).powi(2) + 2.0 * b * room).sqrt()
+}
+
+/// [Q8-3] SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
+/// side, `nb` (`MSLCM_LC2013::_wantsChange`, "honor the obligation to keep right"): 0 while my
+/// lane is faster than that one by `KEEP_RIGHT_FASTER` (the anticipated safe speeds behind each
+/// lane's leader, `anticipateFollowSpeed`); else the share of the acceptance time
+/// (`KEEP_RIGHT_ACCEPTANCE`) the driver could drive at its desired speed there - bounded by how far
+/// the lane runs on less its braking distance, by closing on a slower leader there to its secure
+/// gap, and above `CONGESTED_SPEED` by catching up with my own slower leader (no overtaking on the
+/// keep side) - over `KEEP_RIGHT_TIME`.
+pub fn keep_right_rate(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
+    let st = &me.state;
+    let dp = &me.params;
+    let (b, tau) = (dp.comfort_brake, dp.tau);
+    let v_max = p.v_want.max(0.1);
+    let mine = net.reach.get(st.lane).copied().unwrap_or(0.0) - st.s;
+    let this_safe = v_max.min(match p.leader {
+        Some(l) => safe_speed(l.gap, l.speed, b, tau),
+        None => safe_speed(mine, 0.0, b, tau),
+    });
+    let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
+    let nb_safe = nb_max.min(match nb.ahead {
+        Some((g, vl)) => safe_speed(g, vl, b, tau),
+        None => safe_speed(nb.runs_on, 0.0, b, tau),
+    });
+    if this_safe - KEEP_RIGHT_FASTER > nb_safe {
+        return 0.0;
+    }
+    let limit = net.lanes.get(st.lane).map_or(v_max, |l| (l.speed_limit_kmh / 3.6).max(0.1));
+    let acceptance = KEEP_RIGHT_ACCEPTANCE * (v_max / limit) * st.speed.max(1.0);
+    let brake_gap = v_max * tau + v_max * v_max / (2.0 * b.max(0.1));
+    // (SUMO's `neighDist`, how far the lane beside runs on, is its best lanes' length up to
+    // `lcStrategicLookahead`; the network's reach stops counting at `REACH_MAX`: a lane that
+    // reaches that far runs on as far as LC2013 looks)
+    let runs = if nb.runs_on + net.beside_s(st.lane, nb.lane, st.s) >= omsi_sim::traffic::REACH_MAX { LC_STRATEGIC_LOOKAHEAD } else { nb.runs_on };
+    let mut full_gap = (runs - brake_gap).max(0.0);
+    let mut seconds = acceptance.min(full_gap / v_max);
+    if let Some((g, vl)) = nb.ahead.filter(|a| a.1 < v_max) {
+        let secure = (v_max * tau + v_max * v_max / (2.0 * b.max(0.1)) - vl.max(0.0).powi(2) / (2.0 * b.max(0.1))).max(0.0);
+        full_gap = full_gap.min(g - secure).max(0.0);
+        seconds = seconds.min(full_gap / (v_max - vl));
+    }
+    if let Some(l) = p.leader.filter(|l| st.speed >= CONGESTED_SPEED && l.speed < v_max) {
+        full_gap = full_gap.min(l.gap);
+        seconds = seconds.min(full_gap / (v_max - l.speed));
+    }
+    KEEP_RIGHT_THRESHOLD * (seconds / acceptance.max(0.1)) / KEEP_RIGHT_TIME
+}
 
 /// Is `lane` (from beside distance `s` of my lane) and the chain of lanes it runs into open
 /// to me (`access::is_open`) for a lane change's length and `KEEP_SIDE_OPEN_AHEAD` more? The
@@ -1155,6 +1297,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             out.start = Some(Start::RouteChange { to, dir });
         } else if st.change.is_none() {
             min_stop(&mut out.stop, &mut out.why, Some(lane.length() - 1.0), Why::Merge);
+        }
+    }
+
+    // [Q8-3] SUMO LC2013's keep-right wish accumulates every step the driver is not changing
+    // lanes (`wantsChange` runs each step), towards a lane beside on the keep side it may change
+    // onto
+    if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
+        // (a strategic stay comes first and leaves the wish as it is)
+        if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, me, nb) && !stays_on_best(net, sim, me, nb)) {
+            out.keep_right_rate = Some(keep_right_rate(net, me, p, &nb));
         }
     }
 

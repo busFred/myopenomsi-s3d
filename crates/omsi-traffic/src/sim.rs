@@ -317,6 +317,11 @@ pub struct Vehicle {
     /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
     #[serde(default)]
     pub look_ahead_speed: f32,
+    /// [Q8-3] SUMO LC2013's keep-right wish (`myKeepRightProbability`, in units of its threshold,
+    /// `plan::KEEP_RIGHT_THRESHOLD`): accumulates by `Plan::keep_right_rate`, back to 0 when a lane
+    /// change starts (LC2013's `changed()`); kept with the vehicle, so a keyframe carries it.
+    #[serde(default)]
+    pub keep_right: f32,
     /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
     /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
     /// the car stands - a latch, not a margin.
@@ -526,6 +531,7 @@ impl Vehicle {
             change_still: (0.0, 0.0),
             help_for: None,
             look_ahead_speed: 0.0,
+            keep_right: 0.0,
             lane_end_stop: None,
             zip_behind: None,
             mutual: None,
@@ -1558,6 +1564,10 @@ impl Simulation {
             let v = &mut vehicles[i];
             let m = plan::LOOK_AHEAD_SPEED_MEMORY.powf(dt);
             v.look_ahead_speed = if v.state.speed >= v.look_ahead_speed { v.state.speed } else { m * v.look_ahead_speed + (1.0 - m) * v.state.speed };
+            // [Q8-3] the keep-right wish accumulates (SUMO: per action step)
+            if let Some(r) = plan.keep_right_rate {
+                v.keep_right += r * dt;
+            }
         }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
@@ -1584,6 +1594,7 @@ impl Simulation {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    v.keep_right = 0.0;
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1592,12 +1603,14 @@ impl Simulation {
             Some(Start::Bypass { to, dir, out_len }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_bypass(net, to, dir, out_len);
+                    v.keep_right = 0.0;
                     v.stopped = 0.0;
                 }
             }
             Some(Start::RouteChange { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_route_change(net, to, dir);
+                    v.keep_right = 0.0;
                 }
             }
             Some(Start::Pass(p)) => {
