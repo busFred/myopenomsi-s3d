@@ -206,7 +206,9 @@ fn two_spline_lanes_converging_into_one_have_a_compiled_merge_and_do_not_meet() 
         sim.tick(&net, DT, &mut vs);
         sim.update_positions(&net, &mut vs);
         closest = closest.min(vs[0].obb().separation(&vs[1].obb()));
-        side_held |= vs[1].last.why == Why::Junction;
+        // ([J7-2] the side road's car gives way by the zipper: capped by the main road car ahead
+        // of it, or refused)
+        side_held |= vs[1].last.why == Why::Junction || sim.claims.iter().any(|(c, g)| c.vehicle == 1 && g.zipper.is_some_and(|z| z.foe == 0));
     }
     assert!(side_held, "the side road's car never gave way");
     assert!(closest > 0.3, "the two came within {closest:.2} m");

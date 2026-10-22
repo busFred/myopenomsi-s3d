@@ -170,7 +170,9 @@ fn merger_past_standing_player(x: f64, y: f64) -> (f32, bool) {
     let mut cars = vec![car(1, 4, 130.0, 8.0)];
     let mut waited = false;
     run(&net, &mut sim, &mut cars, 20.0, |_, sim, cars| {
-        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7);
+        // ([J7-2] at a merge that crosses nothing the bus is the zipper's foe ahead: the
+        // queue-entry stop behind it, or a refusal for it)
+        waited |= cars[0].last.wait_for == Some(PLAYER_ID_BASE + 7) || sim.claims.iter().any(|(c, g)| c.vehicle == 0 && g.zipper.is_some_and(|z| z.stop && z.foe == omsi_traffic::sim::player_claim(7)));
         sim.players = vec![player];
     });
     (cars[0].pos.x as f32, waited)
@@ -356,9 +358,11 @@ fn rolls_up_in_twin_chains(pocket: bool) -> (f32, bool) {
     mine.state.ahead = vec![2, 3, 4, 5];
     let mut cars = vec![blocker, mine];
     let mut waited = false;
-    let min_gap = run(&net, &mut sim, &mut cars, 25.0, |_, _, cars| {
+    let min_gap = run(&net, &mut sim, &mut cars, 25.0, |_, sim, cars| {
         let c = cars.iter().find(|c| c.id == 1).unwrap();
-        waited |= c.last.wait_for == Some(9);
+        // ([J7-2] the standing car is the zipper's foe ahead: the queue-entry stop behind it)
+        let (me, it) = (cars.iter().position(|c| c.id == 1).unwrap(), cars.iter().position(|c| c.id == 9).unwrap());
+        waited |= c.last.wait_for == Some(9) || sim.claims.iter().any(|(cl, g)| cl.vehicle == me && g.zipper.is_some_and(|z| z.stop && z.foe == it));
         cars.iter_mut().find(|c| c.id == 9).unwrap().state.speed = 0.0;
     });
     assert!(min_gap > 0.3, "touched: {min_gap:.2} m");
@@ -370,17 +374,21 @@ fn rolls_up_in_twin_chains(pocket: bool) -> (f32, bool) {
 fn j6_refused_for_the_twin_chains_queue_the_car_rolls_up_behind_it_not_to_the_line() {
     let (x, waited) = rolls_up_in_twin_chains(false);
     assert!(waited, "never refused for the standing car");
-    // a metre before the A3/B3 stretch (x = 20), well past where it stood before (x = 5, the
-    // bands of the chains contiguous from +15 on, pulled back to the first)
-    assert!(x > 17.0 && x <= 19.5, "stood with its front at x = {x:.1}");
+    // ([J7-2] the A3/B3 side merge is a zipper: the standing car is the foe ahead, and the car
+    // joins its queue behind it, its standing gap behind its rear at x = 30 - well past where it
+    // stood before round 6, x = 5; round 6 stopped it a metre before the stretch, x = 19)
+    assert!(x > 26.0 && x <= 28.5, "stood with its front at x = {x:.1}");
 }
 
 #[test]
-fn j6_a_chain_with_another_entry_keeps_the_hold_at_the_line() {
+fn j6_a_chain_with_another_entry_queues_behind_the_standing_car_too() {
     // (viz3 case03: a stretch shared with turn pockets that have their own entries)
+    // ([J7-2] the zipper's queue behind the standing car whatever comes into the chains: the
+    // pocket's cars are zipper foes of mine at the same stretch, one file behind it, so the hold
+    // at the line round 6 kept here for them is gone)
     let (x, waited) = rolls_up_in_twin_chains(true);
     assert!(waited, "never refused for the standing car");
-    assert!(x < 8.0, "rolled up to x = {x:.1} although a side road comes into the chain");
+    assert!(x > 26.0 && x <= 28.5, "stood with its front at x = {x:.1}");
 }
 
 

@@ -70,9 +70,9 @@ fn run(net: &Network, sim: &mut Simulation, vehicles: &mut Vec<Vehicle>, secs: f
 }
 
 
-/// Review7: the zipper's "who went last" lives in `Simulation::signal_groups`, which no keyframe
-/// carries. A simulation restored from a keyframe (the vehicles, as `Replay::at` and the reset
-/// replay do) and the one that made it part ways at the next level tie.
+/// Review7: a simulation restored from a keyframe (the vehicles, as `Replay::at` and the reset
+/// replay do) and the one that made it do not part at a zipper. ([J7-2] SUMO's zipper speed is a
+/// function of the frame's claims: no memory of who went last is left to carry.)
 #[test]
 fn review7_zipper_memory_survives_a_keyframe_restore() {
     // two parallel approaches 4 m apart merge into one exit inside object 9
@@ -101,12 +101,12 @@ fn review7_zipper_memory_survives_a_keyframe_restore() {
         sim.tick(&net, DT, &mut cars);
         for &i in &sim.removed { cars.remove(i); }
         t += DT;
-        if snap.is_none() && t >= 20.0 && !sim.signal_groups.zipper.is_empty() {
+        if snap.is_none() && t >= 20.0 && sim.claims.iter().any(|(_, g)| g.zipper.is_some()) {
             snap = Some((sim.time, cars.clone(), sim.signal_groups.clone()));
         }
         if snap.is_some() { a_traj.push(cars.iter().map(|v| (v.id, v.pos.x, v.pos.y)).collect()); }
     }
-    let (time, cars_at, groups) = snap.expect("no zipper tie in 20 s");
+    let (time, cars_at, groups) = snap.expect("no zipper cap in 20 s");
     let drift = |with_memory: bool| -> f64 {
     let mut cars2 = cars_at.clone();
     let mut sim2 = Simulation::new(&net, vec![]);

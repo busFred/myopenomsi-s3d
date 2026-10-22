@@ -2933,7 +2933,7 @@ pub struct AiState {
     /// The driver (`TPathInfo`'s rowdy_factor & co): how fast they like to go relative to
     /// the limit, the time gap they keep to the car ahead (s), the distance they stop
     /// behind it (m) and how long they take to move off when the way clears (s) (the gap
-    /// in the cross traffic they accept at a junction is `DriverParams::gap_accept`). `accel` is how hard they pull
+    /// kept to a foe at a junction is `reservation::JM_TIMEGAP_MINOR`). `accel` is how hard they pull
     /// away and `decel` how hard they like to brake.
     pub desire: f32,
     pub headway: f32,

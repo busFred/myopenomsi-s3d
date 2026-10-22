@@ -86,8 +86,6 @@ pub struct DriverParams {
     pub lat_accel: f32,
     /// Seconds from the way clearing to moving off.
     pub reaction: f32,
-    /// Gap in the crossing traffic accepted at a junction (s), before impatience.
-    pub gap_accept: f32,
     /// Gap accepted in the lane changed into (s, to the car behind there).
     pub lc_gap: f32,
     /// Lane-change motivation weights (LMRS / LC2013): the route needing it, a faster
@@ -105,7 +103,7 @@ impl Default for DriverParams {
     /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
         let n = f32::NAN;
-        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, gap_accept: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n }
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n }
     }
 }
 
@@ -117,7 +115,7 @@ impl DriverParams {
         macro_rules! fill {
             ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
         }
-        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, gap_accept, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max);
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max);
     }
 
     /// The preset of a class, before jitter.
@@ -132,7 +130,6 @@ impl DriverParams {
             // test j6 rolls into the merge stretch: the crate's value stays the one value)
             lat_accel: 2.2,
             reaction: 0.8,
-            gap_accept: 4.0,
             lc_gap: 1.5,
             lc_strategic: 1.0,
             lc_speed_gain: 0.6,
@@ -142,21 +139,21 @@ impl DriverParams {
         };
         // (buses and lorries take bends more gently than cars: the app's 1.6 for every
         // heavy vehicle, until round 7)
-        let bus = DriverParams { tau: 1.6, min_gap: 2.5, accel: 1.0, comfort_brake: 1.5, lat_accel: HEAVY_LAT_ACCEL, gap_accept: 5.0, lc_gap: 2.0, lc_speed_gain: 0.2, ..car };
+        let bus = DriverParams { tau: 1.6, min_gap: 2.5, accel: 1.0, comfort_brake: 1.5, lat_accel: HEAVY_LAT_ACCEL, lc_gap: 2.0, lc_speed_gain: 0.2, ..car };
         match class {
             VehicleClass::Car => car,
-            VehicleClass::Taxi => DriverParams { tau: 1.0, accel: 2.2, speed_factor: 1.08, gap_accept: 3.2, impatience_rate: 1.0 / 20.0, ..car },
+            VehicleClass::Taxi => DriverParams { tau: 1.0, accel: 2.2, speed_factor: 1.08, impatience_rate: 1.0 / 20.0, ..car },
             VehicleClass::Bus => bus,
             // a timetable bus brakes for its stops the way the town's drivers brake for a
             // light: with 1.5 m/s² of "comfortable" braking the planner braked at half that
             // and crept up to every stop for a hundred metres (the app's override until
             // round 7, now the one value the IDM and the plan both read)
             VehicleClass::ScheduledBus => DriverParams { comfort_brake: 2.1, ..bus },
-            VehicleClass::Truck => DriverParams { tau: 1.8, min_gap: 3.0, accel: 0.8, comfort_brake: 1.5, speed_factor: 0.95, lat_accel: HEAVY_LAT_ACCEL, gap_accept: 5.5, lc_gap: 2.5, lc_speed_gain: 0.2, ..car },
-            VehicleClass::Rail => DriverParams { tau: 3.0, min_gap: 10.0, accel: 0.8, comfort_brake: 0.8, lat_accel: 1.0, gap_accept: 0.0, impatience_rate: 0.0, ..car },
+            VehicleClass::Truck => DriverParams { tau: 1.8, min_gap: 3.0, accel: 0.8, comfort_brake: 1.5, speed_factor: 0.95, lat_accel: HEAVY_LAT_ACCEL, lc_gap: 2.5, lc_speed_gain: 0.2, ..car },
+            VehicleClass::Rail => DriverParams { tau: 3.0, min_gap: 10.0, accel: 0.8, comfort_brake: 0.8, lat_accel: 1.0, impatience_rate: 0.0, ..car },
             // (an aircraft follows its flight path at its speed: bends never slow it, the
             // app's 50 m/s² until round 7; it speeds up and slows down at 0.5 m/s²)
-            VehicleClass::Air => DriverParams { tau: 5.0, min_gap: 50.0, accel: 0.5, comfort_brake: 0.5, lat_accel: 50.0, gap_accept: 0.0, impatience_rate: 0.0, ..car },
+            VehicleClass::Air => DriverParams { tau: 5.0, min_gap: 50.0, accel: 0.5, comfort_brake: 0.5, lat_accel: 50.0, impatience_rate: 0.0, ..car },
         }
     }
 
@@ -186,7 +183,6 @@ impl DriverParams {
             speed_factor: j(p.speed_factor, 0.1),
             lat_accel: j(p.lat_accel, 0.2),
             reaction: j(p.reaction, -0.5),
-            gap_accept: j(p.gap_accept, -0.3),
             lc_gap: j(p.lc_gap, -0.3),
             // (jittered a little only: the desire has to clear the planner's threshold
             // for every driver, or a slow driver sits behind a crawler for ever)

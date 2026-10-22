@@ -306,11 +306,22 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
-    /// The zipper merge it last went first at: (the merge, its piece there, the time). The
-    /// junction grants' memory of who went last (`reservation::Context::zipper`) is built
-    /// from these, so a keyframe restores it.
+    /// [J7-3] Asked to make room for a car changing into this one's lane because its own ends:
+    /// (its id, the gap from this one's front to its rear, its speed, the gap its acceptance
+    /// needs from this one; `Plan::help`). Set by the asker each frame it asks, read by this
+    /// one's plan, cleared when this one acts.
     #[serde(default)]
-    pub zip_won: Option<((usize, usize, usize), usize, f64)>,
+    pub help_for: Option<(u64, f32, f32, f32)>,
+    /// [J7-3, fix pass 1] SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
+    /// once with the speed and falls with `LOOK_AHEAD_SPEED_MEMORY` per second, so a car that has
+    /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
+    #[serde(default)]
+    pub look_ahead_speed: f32,
+    /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
+    /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
+    /// vehicle, so a keyframe carries it.
+    #[serde(default)]
+    pub zip_behind: Option<u64>,
     /// A lane change under way: (its progress when it last moved on, seconds since while
     /// standing). Frozen for `FROZEN_CHANGE` it is settled where the body is
     /// (`AiState::settle_change`).
@@ -338,9 +349,10 @@ pub struct Vehicle {
 pub const PLAYER_ACCEL: f32 = 1.2;
 pub const PLAYER_ACCEL_MIN: f32 = 0.6;
 pub const PLAYER_ACCEL_MEMORY: f32 = 20.0;
-/// The gap (s) a player's claim names: the player's grant is never read (its driver decides),
-/// so it stands for the car driver's preset `gap_accept` (`DriverParams::preset`).
-pub const PLAYER_GAP: f32 = 4.0;
+/// [J7-1, J7-2] The driver a player's claim names (what an AI claimant reckons the player brakes
+/// with and keeps behind a foe that cuts in, `Claim::decel`, `tau`, `min_gap`): the timetable
+/// bus preset, the vehicle a player drives.
+pub const PLAYER_PRESET: VehicleClass = VehicleClass::ScheduledBus;
 
 /// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
 /// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
@@ -506,8 +518,10 @@ impl Vehicle {
             heading: 0.0,
             claim_standing: false,
             passed_on_go: None,
-            zip_won: None,
             change_still: (0.0, 0.0),
+            help_for: None,
+            look_ahead_speed: 0.0,
+            zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
             ease_for: None,
@@ -595,6 +609,11 @@ fn cell(p: DVec3) -> (i32, i32) {
     ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
 }
 
+/// [J7-3] Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
+/// end, turn, obstacle, speed gain, keep side), every simulation of the process (diagnostics,
+/// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
+pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
@@ -633,6 +652,10 @@ pub struct Simulation {
     pub signal_groups: reservation::Context,
     /// This frame's claims and their grants (diagnostics: `traffic_cases watch`).
     pub claims: Vec<(Claim, Grant)>,
+    /// [J7-1] Keep the resolver's account of every claim's foes this frame (`foe_trace`):
+    /// set by the tools (`traffic_cases watch`), never by the game.
+    pub trace_foes: bool,
+    pub foe_trace: Vec<reservation::FoeTrace>,
 }
 
 /// How far on (m) a pass coming back in looks for a body beside it, and runs straight when
@@ -664,6 +687,8 @@ impl Simulation {
             held_at_red: 0,
             signal_groups: reservation::Context::default(),
             claims: Vec::new(),
+            trace_foes: false,
+            foe_trace: Vec::new(),
         }
     }
 
@@ -1010,20 +1035,29 @@ impl Simulation {
             // of the junction, it goes on unless it can stop gently)
             let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
             let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
-            let room = next - st.front - 0.6;
             let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
-            let cannot_stop = plan::cannot_stop(st.speed, room, brake);
-            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || cannot_stop;
+            // ([J7-4, fix pass 1] SUMO's waiting positions: committed when the first place it can
+            // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
+            // place's band - not only when it cannot stop before the meeting place itself: a car
+            // let go onto a crossing and refused there stood on it 50 s, viz case06 #15801)
+            let next_wait = plan::next_wait(net, self, v, j, brake);
+            // ([fix pass 2] committed - in the way of everybody - only when it cannot stop before its
+            // next meeting place, `plan::cannot_stop`; short of its next waiting position it is
+            // committed only to the meeting places it would block, foe by foe, `Claim::next_wait`:
+            // a crawler at 1.1 m/s could stop within 0.3 m and is no `willPass`, and standing 0.8 m
+            // short of a meeting place it went into a 12 m/s foe, x10 case01 #158/#1058)
+            let room = next - st.front - 0.6;
+            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, room, brake);
             let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
             // the light at this junction's line, if the driver is held by one: any light on
             // the way before the first meeting place with another way, wherever the object
             // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
             // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
             let light_line = j.light_line;
-            let (light_red, until_go) = match p.signal {
+            let (light_red, until_go, red_at) = match p.signal {
                 // (clearing the box: the light it passed holds it no more,
                 // `JunctionView::clears_past`)
-                Some(sig) if j.clears_past(&sig, st.front) => (false, None),
+                Some(sig) if j.clears_past(&sig, st.front) => (false, None, f32::INFINITY),
                 // (or, clearing the box, a later line of the way through: it holds the car as any,
                 // `JunctionView::clears_past`, and the car standing there is held by it, not
                 // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
@@ -1032,7 +1066,11 @@ impl Simulation {
                 // meeting place, whatever the object's line: the light belongs to the claim -
                 // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
                 // `light_red false` for j783 and two cars stood refused for it 28 m apart)
-                Some(sig) if (sig.dist <= light_line.max(j.conflict_start) + 1.0 || (j.clearing && sig.dist < j.entry + j.way_len)) && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                // ([J7-1] every red on the way through, with where its line lies, `red_at`: the
+                // resolver holds the claimant before the meeting places past that line only; a red
+                // past the first meeting place went unfiled and the foes took the car standing at
+                // it for one coming, x10 case12 #19087, red at 31 m, meeting place at 41 m)
+                Some(sig) if sig.dist < j.entry + j.way_len && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
                     // not held by a light it goes through: the plan's own
                     // call (too late to stop, the yellow it takes), or one
                     // committed at amber onset and still rolling (`plan::light_call`; one
@@ -1040,18 +1078,19 @@ impl Simulation {
                     let call = plan::light_call(v, p, &sig);
                     let through = call.go;
                     if through {
-                        (false, None)
+                        (false, None, f32::INFINITY)
                     } else {
-                        (true, sig.until_go)
+                        // ([J7-1] its line along the way through, the claim's distances)
+                        (true, sig.until_go, sig.dist - j.entry)
                     }
                 }
-                _ => (false, None),
+                _ => (false, None, f32::INFINITY),
             };
             // standing at its red short of the first meeting place with
             // another way, a car is committed to nothing: the merge of the lead-in with its
             // own stub put its "first meeting place" behind its bumper, and the foes took
             // the car waiting at its red for one already on its way across
-            let committed = committed && !(light_red && st.speed < 0.5 && light_line - st.front > 0.5);
+            let committed = committed && !(light_red && st.speed < 0.5 && (red_at + j.entry).min(light_line) - st.front > 0.5);
             // standing, with hysteresis (`Claim::standing`):
             // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
             let was_standing = v.claim_standing;
@@ -1062,6 +1101,7 @@ impl Simulation {
                 was_standing,
                 light_red,
                 until_go,
+                red_at,
                 lead: match p.leader.map(|l| l.what) {
                     Some(Seen::Vehicle(o)) | Some(Seen::Body(o)) => Some(o),
                     _ => None,
@@ -1075,7 +1115,14 @@ impl Simulation {
                 v_max: limit.min(st.max_speed_kmh / 3.6),
                 front: st.front,
                 rear: st.rear,
-                gap: v.impatience.gap(v.params.gap_accept),
+                decel: v.params.comfort_brake,
+                waiting: v.waiting,
+                lead_gap: p.leader.map(|l| (l.gap, l.speed)),
+                zip_behind: v.zip_behind,
+                body_block: p.body_block,
+                next_wait: next_wait - j.entry,
+                tau: v.params.tau,
+                min_gap: v.params.min_gap,
                 committed,
                 exit_room: j.exit_room,
                 impatience: v.impatience,
@@ -1100,10 +1147,6 @@ impl Simulation {
                 yields_now: None,
                 // (where people, a zebra or a standing lead will stop the front)
                 clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
-                // (held by its service, or standing `FAR_FOE_STOOD` s or more)
-                // (not a stop requested ahead, `stop_at`: a bus held by its lead in the box has one
-                // from its first frame, review-r6j)
-                standing_long: st.speed < STANDING_SPEED && (v.external.at_stop || v.last.why == Why::Service || v.stopped >= reservation::FAR_FOE_STOOD),
                 brake,
             });
         }
@@ -1198,25 +1241,25 @@ impl Simulation {
             // meeting place, red (or red and yellow) at its line with room to stop there
             // (not a stretch it runs side by side with another lane before its light, `Foe::side`;
             // nor a detector, `perception::detector_light`)
-            let cs_line = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
-            let line_limit = -s_on + if cs_line.is_finite() { cs_line } else { way_len } + 1.0;
+            // ([J7-1] any red on the way through, with its line, `red_at`, as an AI claim's)
+            let line_limit = -s_on + way_len;
             // ([round6 J4] until its REAR is half a metre past the lit lane's start, as an AI
             // car's `signal_ahead`: the front 0.8 m past its stub, the player's bus lost its red,
             // stood blocked and held a green stream, case07 #37076 21 s)
             let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d + p.half_len > -PLAYER_LINE_PAST).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
-            let (light, light_red, until_go) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
+            let (light, light_red, until_go, red_at) = match lit.and_then(|((ctl, li), d)| self.lights.get(ctl).map(|c| ((ctl, li), d, c))) {
                 Some((lt, d, c)) => {
                     let red = matches!(TrafficLightController::aspect(c.state(lt.1)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow);
                     let gap = d - p.half_len;
                     // (as an AI car's `light_call`)
                     let can_stop = !plan::cannot_stop(v, gap + 0.5, plan::HARD_BRAKE);
                     if red && can_stop {
-                        (Some(lt), true, c.time_until_go(lt.1))
+                        (Some(lt), true, c.time_until_go(lt.1), s_on + d)
                     } else {
-                        (Some(lt), false, None)
+                        (Some(lt), false, None, f32::INFINITY)
                     }
                 }
-                None => (None, false, None),
+                None => (None, false, None, f32::INFINITY),
             };
             // standing more than 2 s (at a stop, in a queue, waiting to turn): blocked, as an
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
@@ -1267,6 +1310,7 @@ impl Simulation {
                 was_standing: false,
                 light_red,
                 until_go,
+                red_at,
                 lead,
                 vehicle: player_claim(p.id),
                 junction: j,
@@ -1277,7 +1321,15 @@ impl Simulation {
                 v_max: road_limit,
                 front: p.half_len,
                 rear: p.half_len,
-                gap: PLAYER_GAP,
+                decel: DriverParams::preset(PLAYER_PRESET).comfort_brake,
+                // (its grant is not read: no impatience of its own)
+                waiting: 0.0,
+                lead_gap: None,
+                zip_behind: None,
+                body_block: None,
+                next_wait: f32::NEG_INFINITY,
+                tau: DriverParams::preset(PLAYER_PRESET).tau,
+                min_gap: DriverParams::preset(PLAYER_PRESET).min_gap,
                 committed,
                 exit_room: true,
                 impatience: Impatience::default(),
@@ -1291,7 +1343,6 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
-                standing_long: false,
                 brake: plan::HARD_BRAKE,
             });
         }
@@ -1317,30 +1368,20 @@ impl Simulation {
                 }
             }
         }
-        // who went first last at each zipper merge, from the vehicles (the latest per merge)
-        let mut last_won: HashMap<(usize, usize, usize), (f64, usize, u64)> = HashMap::new();
-        for v in vehicles.iter() {
-            if let Some((key, piece, t)) = v.zip_won {
-                if last_won.get(&key).map(|w| t > w.0 || (t == w.0 && v.id < w.2)).unwrap_or(true) {
-                    last_won.insert(key, (t, piece, v.id));
-                }
-            }
-        }
-        self.signal_groups.zipper = last_won.into_iter().map(|(k, (_, piece, id))| (k, (piece, id))).collect();
+        // ([J7-2] no zipper memory: SUMO's zipper speed is a function of this frame's claims)
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
-        let grants: Vec<Grant> = reservation::resolve_with(&self.junctions, &claims, &self.signal_groups);
+        self.foe_trace.clear();
+        let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
+        let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
-        // who went first at a zipper merge: it keeps going first while the two are engaged,
-        // and the next tie there is the other side's ([round6 J3] written at the first
-        // decision, not only on go: refused for a third, the winner stays first, and the pair's
-        // order does not flip as their distances change)
-        for (g, c) in grants.iter().zip(&claims) {
-            if let Some((key, piece)) = g.zip {
-                // (a player's win is not remembered: no keyframe would carry it)
-                if let Some(v) = vehicles.get_mut(c.vehicle) {
-                    v.zip_won = Some((key, piece, self.time));
-                    self.signal_groups.zipper.insert(key, (piece, c.id));
-                }
+        // [J7-2, fix pass 2] the zipper order kept with the vehicles while engaged
+        for v in vehicles.iter_mut() {
+            v.zip_behind = None;
+        }
+        for (c, g) in claims.iter().zip(&grants) {
+            let foe_id = g.zipper.and_then(|z| claims.iter().find(|o| o.vehicle == z.foe)).map(|o| o.id);
+            if let Some(v) = vehicles.get_mut(c.vehicle) {
+                v.zip_behind = foe_id;
             }
         }
 
@@ -1370,14 +1411,14 @@ impl Simulation {
                     return None;
                 }
                 // (the other still short of, or in, the first meeting place of the two beyond
-                // where I stand, its rear not yet `CLEAR_MARGIN` s of its speed past that
+                // where I stand, its rear not yet `JM_TIMEGAP_MINOR` s of its speed past that
                 // stretch's end. [round6 J3] Not every meeting place of the chain: two merging
                 // run on along one way, and the ease held the one behind until the other had
                 // left the whole object, review-r6 case03/06)
                 let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
                 let my_front = mine.s + mine.front;
                 let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
-                let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::CLEAR_MARGIN * theirs.speed.max(0.0));
+                let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::JM_TIMEGAP_MINOR * theirs.speed.max(0.0));
                 inside.then_some((k, o))
             })();
             match keep {
@@ -1497,6 +1538,21 @@ impl Simulation {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
+        // [J7-3] the follower asked to make room hears it (it reads it in its next plan); my own
+        // request, read in this frame's plan, is used up
+        vehicles[i].help_for = None;
+        if let Some((f, gap, speed, need)) = plan.help {
+            let me_id = vehicles[i].id;
+            if let Some(o) = vehicles.get_mut(f) {
+                o.help_for = Some((me_id, gap, speed, need));
+            }
+        }
+        {
+            // (SUMO LC2013: up at once, down with the memory per step of a second)
+            let v = &mut vehicles[i];
+            let m = plan::LOOK_AHEAD_SPEED_MEMORY.powf(dt);
+            v.look_ahead_speed = if v.state.speed >= v.look_ahead_speed { v.state.speed } else { m * v.look_ahead_speed + (1.0 - m) * v.state.speed };
+        }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
         if plan.why == Why::Light && v.state.speed < STANDING_SPEED {
@@ -1519,6 +1575,9 @@ impl Simulation {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    if let Some(w) = plan.change_why {
+                        CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             Some(Start::Bypass { to, dir, out_len }) => {

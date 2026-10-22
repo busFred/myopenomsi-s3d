@@ -158,7 +158,7 @@ impl Junctions {
     /// an object's way goes into that object as one of its movements, and joins of spline
     /// lanes alone make a junction of their own (`JOIN_TILE`), so that every join has a
     /// meeting place in one junction table (`foe_between`). Junctions keep their index (a new
-    /// one comes at the end), so what a vehicle remembers of one (`ease_for`, `zip_won`)
+    /// one comes at the end), so what a vehicle remembers of one (`ease_for`)
     /// stays right.
     pub fn extend(&mut self, net: &Network, first: usize) {
         let _ = first;
@@ -443,7 +443,8 @@ impl Junctions {
     }
 
     /// Two movements merging into one another that no rule of the table separates (neither
-    /// gives way to the other): they take turns (`reservation`'s zipper).
+    /// gives way to the other): SUMO's zipper node. ([J7-2] `reservation`'s zipper speed takes
+    /// every merge that crosses nothing, the table ordering the pair where it says who yields.)
     pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
         foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
     }

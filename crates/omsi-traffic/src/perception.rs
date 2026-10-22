@@ -233,6 +233,12 @@ pub struct NeighbourView {
     pub ahead: Option<(f32, f32)>,
     /// Nearest vehicle behind there: (gap to my rear, its speed).
     pub behind: Option<(f32, f32)>,
+    /// [J7-3] That vehicle's index, when it is an AI vehicle (the one asked to make room,
+    /// `plan`'s cooperation).
+    pub behind_id: Option<usize>,
+    /// [J7-3, fix pass 2] That vehicle's standing gap (m; a player's: the timetable bus preset's):
+    /// the gap a change needs from it at rest (`plan::gap_needed_behind`).
+    pub behind_min_gap: f32,
     /// How far the lane and its successors run on from beside me (m).
     pub runs_on: f32,
     /// A turn (1 left, 2 right) the lane leads into within 150 m, 0 none.
@@ -292,6 +298,8 @@ pub struct Perception {
     pub ahead: Vec<(f32, f32, f32)>,
     /// The current lane's limit at the driver's desire (m/s).
     pub v_want: f32,
+    /// [J7-3] Where my lane ends for me ahead (`lane_end`).
+    pub lane_end: Option<LaneEnd>,
 }
 
 /// The lanes ahead along the car's way with the distance from the origin to each one's
@@ -705,6 +713,33 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // the one behind that follows me is not my lead
         if o.last.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
             continue;
+        }
+        // [J7-1] a body crossing my way that is out of my corridor before my front can be where
+        // it is: no lead - SUMO's follower case of `MSLink::blockedByFoe` at a crossing (its
+        // leave time before my arrival), the junction leader that has passed the conflict point
+        // by the time ego arrives (`MSVehicle::adaptToJunctionLeader`, `MSLink::getLeaderInfo`).
+        // (Its leave time is where its body leaves my corridor at its sideways speed: OMSI's
+        // junction pieces give the body, not SUMO's conflict point.) (The junction let the other through 1 s ahead
+        // of me by the time test; braking for its body as a lead standing across the way, a
+        // 13 m/s main road car braked 5 m/s² for a side car out of its way 1.3 s before it
+        // came, adversarial2 F5b.)
+        // (only one on its way across: not one held - a stop of its own or a lead near, its
+        // `Decision::held` - which may come to rest in my corridor; SUMO's `willPass`. A car held
+        // by its lead 4.9 m on, crossing at 1.4 m/s, was dropped and stopped in my corridor,
+        // viz case01 #1674/#118)
+        if !on_way && !cut_in && o.state.speed >= STANDING_SPEED && !o.last.held {
+            let right = DVec2::new(f.y, -f.x);
+            let q = way.pts[k].1;
+            let lats = ob.corners().map(|c| (c - q).dot(right));
+            let (lo, hi) = (lats.iter().copied().fold(f64::INFINITY, f64::min), lats.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            let v_lat = o.state.speed as f64 * o_fwd.dot(right);
+            let t_clear = if v_lat > 1e-3 { (w - lo) / v_lat } else if v_lat < -1e-3 { (hi + w) / -v_lat } else { f64::INFINITY };
+            // (my limit as the claim's, `Simulation::tick`)
+            let v_max = (net.lanes[st.lane].speed_limit_kmh / 3.6 * st.desire).min(st.max_speed_kmh / 3.6);
+            let t_me = omsi_sim::traffic::arrival_time(gap.max(0.0), st.speed, st.accel, v_max);
+            if (t_clear as f32) < t_me {
+                continue;
+            }
         }
         {
             let oh = (o.heading as f64).to_radians();
@@ -1417,8 +1452,8 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
         // a queueing lane, not a box to keep clear: counting it put the "box" of BeijingCity's
         // twin stub chains 60 m on, where the exit queue's tail closed it for 25 s with the
-        // crossing itself clear, viz3 case03 #4436; the resolver's side-merge rules and the
-        // roll-up stop, `plan::roll_up_point`, keep a car off the one standing beside)
+        // crossing itself clear, viz3 case03 #4436; the zipper of a side merge, [J7-2], keeps a
+        // car off the one standing beside)
         let first = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
         let last = foes.iter().filter(|f| !f.side).map(|f| f.mine.1).fold(0.0f32, f32::max);
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };
@@ -1532,9 +1567,12 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
     let mut behind: Option<(f32, f32)> = None;
+    let mut behind_id: Option<usize> = None;
+    let mut behind_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
     let mut foreign = false;
-    // (d_rel: the other's origin relative to the place beside me; front/rear its extents)
-    let mut note = |d_rel: f32, front: f32, rear: f32, speed: f32, occ_foreign: bool| {
+    // (d_rel: the other's origin relative to the place beside me; front/rear its extents; the
+    // vehicle's index, None for a player)
+    let mut note = |d_rel: f32, front: f32, rear: f32, speed: f32, occ_foreign: bool, who: Option<usize>| {
         if occ_foreign {
             foreign = true;
         }
@@ -1547,21 +1585,25 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             let gap = -d_rel - front - st.rear;
             if behind.map(|b| gap < b.0).unwrap_or(true) {
                 behind = Some((gap, speed));
+                behind_id = who;
+                if let Some(o) = who.and_then(|k| vehicles.get(k)) {
+                    behind_min_gap = o.params.min_gap;
+                }
             }
         }
     };
-    let lane_users = |l: usize, offset: f32, note: &mut dyn FnMut(f32, f32, f32, f32, bool)| {
+    let lane_users = |l: usize, offset: f32, note: &mut dyn FnMut(f32, f32, f32, f32, bool, Option<usize>)| {
         for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             if occ.vehicle == i {
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign);
+            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign, Some(occ.vehicle));
         }
         // the players' vehicles are there like anybody else
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let p = &sim.players[k];
-            note(s + offset - s_b, p.half_len, p.half_len, p.speed, false);
+            note(s + offset - s_b, p.half_len, p.half_len, p.speed, false, None);
         }
     };
     lane_users(nb, 0.0, &mut note);
@@ -1584,7 +1626,96 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         d += net.lanes[n].length();
         cur = n;
     }
-    Some(NeighbourView { lane: nb, dir, ahead, behind, runs_on, turn, foreign, allowed })
+    Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+}
+
+/// [J7-3] Why my lane ends for me (`LaneEnd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneEndKind {
+    /// The way runs into a lane closed to me (all the ways on at its fork are: the fork's
+    /// ranked choice took a closed one).
+    Closed,
+    /// The way ends (no lane on).
+    DeadEnd,
+    /// The way runs into a merge where it gives way to a way the lane beside me leads to.
+    Merge,
+}
+
+/// [J7-3] Where my lane ends for me ahead (SUMO LC2013's dead lane / best lanes, sumo.md 3.2):
+/// the distance from my front (to the closed lane's start, the way's end, or the start of the
+/// merge stretch I give way at), why, and for a merge the lane beside me whose way the merge
+/// joins (`toward`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LaneEnd {
+    pub dist: f32,
+    pub kind: LaneEndKind,
+    pub toward: Option<usize>,
+}
+
+/// `from` is `target`, or leads into it within a few lanes (`next`, every branch).
+fn leads_to(net: &Network, from: usize, target: usize) -> bool {
+    let mut at = vec![from];
+    for _ in 0..4 {
+        if at.contains(&target) {
+            return true;
+        }
+        at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+    }
+    at.contains(&target)
+}
+
+/// [J7-3] The first place along my way (`way`, within `look` m of my front) where my lane ends
+/// for me (`LaneEnd`).
+fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)], look: f32) -> Option<LaneEnd> {
+    let st = &me.state;
+    let cur = net.lanes.get(st.lane)?;
+    let beside = [cur.left, cur.right];
+    // ([fix pass 2] the way as far as the strategic look-ahead, past the planned way where it does
+    // not fork - SUMO's best lanes look far ahead: the planned way, eight seconds, ended on a
+    // junction piece 170 m short of the closed lane, and the car found the end only on the piece,
+    // where it has no neighbour)
+    let mut way: Vec<(usize, f32)> = way.to_vec();
+    while let Some(&(l, d0)) = way.last() {
+        let lane = &net.lanes[l];
+        let next = d0 + lane.length();
+        if next - st.front > look || lane.next.len() != 1 || way.len() > 64 {
+            break;
+        }
+        way.push((lane.next[0], next));
+    }
+    for (k, &(l, d0)) in way.iter().enumerate() {
+        if d0 - st.front > look {
+            break;
+        }
+        let lane = &net.lanes[l];
+        // (a junction piece has no rules of its own: the way through is the junction's)
+        if k > 0 && lane.source != 2 && !crate::access::is_open(lane, me) {
+            return Some(LaneEnd { dist: d0 - st.front, kind: LaneEndKind::Closed, toward: None });
+        }
+        if let Some(&(j, m)) = sim.junctions.of_lane.get(&l) {
+            let node = &sim.junctions.nodes[j];
+            for f in &node.movements[m].foes {
+                if f.kind != FoeKind::Merge || !f.yields || f.side {
+                    continue;
+                }
+                let at = d0 + f.mine.0 - st.front;
+                if !(0.0..=look).contains(&at) {
+                    continue;
+                }
+                let fl = node.movements[f.movement].lane;
+                if let Some(nb) = beside.iter().flatten().copied().find(|&nb| leads_to(net, nb, fl)) {
+                    return Some(LaneEnd { dist: at, kind: LaneEndKind::Merge, toward: Some(nb) });
+                }
+            }
+        }
+        if k + 1 == way.len() && lane.next.is_empty() {
+            let end = d0 + lane.length() - st.front;
+            if end <= look {
+                return Some(LaneEnd { dist: end, kind: LaneEndKind::DeadEnd, toward: None });
+            }
+        }
+    }
+    None
 }
 
 /// The oncoming lane and how long it stays clear (only looked for behind a standing thing).
@@ -1782,6 +1913,11 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         }
     }
     p.route_change = st.route_change_due(net);
+    // [J7-3] (within the strategic look-ahead towards the overtaking side, the longer one)
+    if lane.kind == LaneKind::Street && !me.is_rail() && (lane.left.is_some() || lane.right.is_some()) {
+        let look = crate::plan::lane_end_look(me.look_ahead_speed.max(st.speed), true, me);
+        p.lane_end = lane_end(net, sim, me, &p.way, look);
+    }
     p
 }
 

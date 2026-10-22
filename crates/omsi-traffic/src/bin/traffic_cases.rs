@@ -3742,22 +3742,24 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 let dist = (body_obb(r, o).center - v.pos.truncate()).length();
                 wait_dist = dist;
                 wait_red = matches!(o, Body::V(k) if r.vehicles[k].state.speed < 0.3 && r.vehicles[k].last.why == Why::Light);
+                // ([J7-1, fix pass 2] where the waited car's way meets the head's, found along the
+                // waited car's own lanes - not through its claim, which may be filed at another
+                // junction or none: the old reading needed the two claims at one junction and read
+                // 0 for red lines short of the meeting places)
                 wait_red_before = wait_red
                     && match o {
-                        Body::V(k) => {
-                            let mine = r.sim.claims.iter().find(|(c, _)| c.vehicle == i).map(|x| &x.0);
-                            let theirs = r.sim.claims.iter().find(|(c, _)| c.vehicle == k).map(|x| &x.0);
-                            match (mine, theirs) {
-                                (Some(c), Some(oc)) if oc.light_red && oc.junction == c.junction => {
-                                    let foes = r.sim.junctions.foes_along_pieces(c.junction, &c.chain);
-                                    let meet = oc.chain.iter().flat_map(|&(m, off)| foes.iter().filter(move |(_, f)| f.movement == m).map(move |(_, f)| off + f.theirs.0 - oc.s)).fold(f32::INFINITY, f32::min);
-                                    // (its red line: where its plan stops it for the light)
-                                    let line = r.vehicles[k].last.stop.unwrap_or(f32::INFINITY);
-                                    meet.is_finite() && line <= meet + 0.5
-                                }
-                                _ => false,
+                        Body::V(k) => match r.sim.claims.iter().find(|(c, _)| c.vehicle == i).map(|x| &x.0) {
+                            Some(c) => {
+                                let node = &r.sim.junctions.nodes[c.junction];
+                                let foes = r.sim.junctions.foes_along_pieces(c.junction, &c.chain);
+                                let way = omsi_traffic::perception::way_lanes(net, &r.vehicles[k].state, 150.0);
+                                let meet = foes.iter().filter_map(|(_, f)| way.iter().find(|&&(l, _)| l == node.movements[f.movement].lane).map(|&(_, d)| d + f.theirs.0)).fold(f32::INFINITY, f32::min);
+                                // (its red line: where its plan stops it for the light)
+                                let line = r.vehicles[k].last.stop.unwrap_or(f32::INFINITY);
+                                meet.is_finite() && line <= meet + 0.5
                             }
-                        }
+                            None => false,
+                        },
                         _ => false,
                     };
                 let extra = match o {
@@ -4241,6 +4243,14 @@ struct Extra {
     /// files `light_red`) stops for its light (its plan's stop) before its meeting place with
     /// the head (a merge of two queues behind one lead is not counted).
     far_red_before_s: u64,
+    /// [J7-1] Foe-seconds within the radius let go by SUMO's time test (`Grant::follower_go`,
+    /// `leader_go`: the foes of a claim each frame, times the frame): as the follower and as the
+    /// leader.
+    follower_go_s: f64,
+    leader_go_s: f64,
+    /// [J7-2] Vehicle-seconds within the radius with a zipper speed (`Grant::zipper`: the foe
+    /// ahead at a merge caps the speed, or the queue-entry stop behind it).
+    zipper_capped_s: f64,
     events: Vec<String>,
 }
 
@@ -4463,6 +4473,13 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
                 if to_at > 60.0 {
                     ex.far_refused_60_s += fdt;
+                }
+            }
+            for (c, g) in &r.sim.claims {
+                if r.vehicles.get(c.vehicle).is_some_and(|v| near(v.pos)) {
+                    ex.follower_go_s += g.follower_go as f64 * fdt;
+                    ex.leader_go_s += g.leader_go as f64 * fdt;
+                    ex.zipper_capped_s += g.zipper.is_some() as u8 as f64 * fdt;
                 }
             }
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
@@ -4848,6 +4865,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     sc.deferred_spawns = r.deferred_spawns;
     sc.dropped_spawns = r.dropped_spawns;
     ex.unjust_stream_s = sc.extra.unjust_stream_s;
+    // ([J7-1, fix pass 2] the head tallies' far_red_before is carried over too: overwritten here,
+    // it read 0 whatever the definition)
+    ex.far_red_before_s = sc.extra.far_red_before_s;
     sc.extra = ex;
     Ok(sc)
 }
@@ -4874,6 +4894,8 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
         ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
         ("far_red_before", e.far_red_before_s.to_string()),
+        ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
+        ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
     ]
 }
 
@@ -4910,6 +4932,9 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.ease_pinned_s += e.ease_pinned_s;
     t.far_refused_40_s += e.far_refused_40_s;
     t.far_refused_60_s += e.far_refused_60_s;
+    t.follower_go_s += e.follower_go_s;
+    t.leader_go_s += e.leader_go_s;
+    t.zipper_capped_s += e.zipper_capped_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -5036,6 +5061,9 @@ fn ab(args: &[String]) -> Res<()> {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
         let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
+        // [J7-3] lane changes of the drivers' own started, by what won them
+        let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
+        println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting
@@ -5524,6 +5552,8 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
     if !r.at(0) {
         return Err("the fixture has no keyframe".into());
     }
+    // [J7-1] the resolver's account of the claims' foes (times and the case per foe)
+    r.sim.trace_foes = true;
     let mut next = from.max(r.sim.time);
     while r.step() {
         let t = r.sim.time;
@@ -5578,14 +5608,26 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         for &i in &found {
             if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {
                 println!(
-                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} lead {:?} eased {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?} follow {:?} zip {:?}",
+                    "t={t:.1}   claim #{} j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} stuck {} held {} clearing {} exit_room {} lead {:?} eased {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?} follow {:?} zipper {:?}",
                     r.vehicles[i].id, c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked, c.stuck, c.held, c.clearing, c.exit_room,
                     c.lead.map(|w| fmt_claimant(&r, w)), c.yields_now.map(|w| fmt_claimant(&r, w)),
                     g.go, g.wait_for.map(|w| fmt_claimant(&r, w)), g.hold, g.at,
                     // (the distance from the front to the stretch waited for)
                     g.at.map(|a| ((a - (c.s + c.front)) * 10.0).round() / 10.0),
-                    g.follow.map(|(gap, v)| ((gap * 10.0).round() / 10.0, (v * 10.0).round() / 10.0)), g.zip.map(|z| z.1)
+                    g.follow.map(|(gap, v)| ((gap * 10.0).round() / 10.0, (v * 10.0).round() / 10.0)), g.zipper.map(|z| (fmt_claimant(&r, z.foe), (z.gap * 10.0).round() / 10.0, (z.arrive * 100.0).round() / 100.0, (z.floor * 100.0).round() / 100.0, z.stop))
                 );
+                // [J7-1] per foe: SUMO's time test (my in/out, theirs, their arrival as my
+                // impatience sees it, the case), or what took it out of the test
+                for f in r.sim.foe_trace.iter().filter(|f| f.claimant == i) {
+                    let lane = r.sim.junctions.nodes[c.junction].movements.get(f.movement).map(|m| m.lane).unwrap_or(usize::MAX);
+                    match f.times {
+                        Some(ft) => println!(
+                            "t={t:.1}     foe {} on {lane}: me in {:.2} out {:.2}, it in {:.2} (impatient {:.2}) out {:.2} -> {:?} (impatience {:.2})",
+                            fmt_claimant(&r, f.foe), ft.my_in, ft.my_out, ft.their_in, ft.their_in_impatient, ft.their_out, ft.case, omsi_traffic::reservation::impatience_of(c)
+                        ),
+                        None => println!("t={t:.1}     foe {} on {lane}: {}", fmt_claimant(&r, f.foe), f.skip),
+                    }
+                }
             }
         }
         for (x, &a) in found.iter().enumerate() {

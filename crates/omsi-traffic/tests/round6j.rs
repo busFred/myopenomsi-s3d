@@ -122,10 +122,13 @@ fn j2_a_refused_car_rolls_up_past_a_convergence_far_ahead_and_stops_at_once_for_
     let (at, gap) = converge_far_stand((28.0, 42.0));
     assert!((at > 20.0 && at <= 27.0) || (at - 4.0 >= 42.0 && at < 48.6), "stood with its front at x = {at:.1}");
     assert!(gap > 0.3, "touched: {gap:.2} m");
-    // the convergence 5-20 m on, within CONVERGE_LOOK of the line: at once, at the line, as
-    // before (review9 5229/5231, 10814/10625: near bands unchanged)
-    let (at, _) = converge_far_stand((5.0, 20.0));
-    assert!(at <= 0.0 && at > -1.5, "stood with its front at x = {at:.1}, not at the line");
+    // the convergence 5-20 m on: [J7-4] one stop rule (`plan::refused_stop`), the same as for the
+    // far one - before the stretch it waits for, its body wholly out of the convergence (before
+    // it or past it); round 6 stopped it at the line for a convergence within `CONVERGE_LOOK`
+    // (review9 5229/5231, 10814/10625: no body inside the band, which holds)
+    let (at, gap) = converge_far_stand((5.0, 20.0));
+    assert!((at > -1.5 && at <= 4.0) || (at - 4.0 >= 20.0 && at < 48.6), "stood with its front at x = {at:.1}");
+    assert!(gap > 0.3, "touched: {gap:.2} m");
 }
 
 /// J2: my way (piece 1, x 0..70, priority 64) is crossed at x ~ 43 by piece 5 (priority 192),
@@ -162,12 +165,14 @@ fn waited_beside(stream_from: f32, stream_v: f32) -> f32 {
 }
 
 #[test]
-fn j2_the_waited_vehicle_standing_in_a_far_convergence_stops_the_car_at_its_line() {
+fn j2_the_waited_vehicle_standing_in_a_far_convergence_stops_the_car_short_of_it() {
     // the car waited for crawls at 0.3 m/s with its body in the stretch beside mine where the
-    // convergence lies (x 26..36, 26 m past the line): the car stops at once, at its line, not
-    // rolling up beside it (review9: refused cars rolled into the very car they waited for)
+    // convergence lies (x 26..36, 26 m past the line): [J7-4] the car stops before the
+    // convergence, short of the waited car's rear (x 30 less its standing gap), never beside it
+    // (review9: refused cars rolled into the very car they waited for); round 6 stopped it at
+    // its line for a waited body in a convergence
     let at = waited_beside(36.0, 0.3);
-    assert!(at <= 0.0 && at > -1.5, "stood with its front at x = {at:.1}, not at the line");
+    assert!(at > -1.5 && at <= 26.0, "stood with its front at x = {at:.1}");
     // the queue rolling at 2 m/s further on: the car rolls up, its body out of the convergence
     let at = waited_beside(30.0, 2.0);
     assert!(at > 5.0 && at <= 25.0, "stood with its front at x = {at:.1}");
