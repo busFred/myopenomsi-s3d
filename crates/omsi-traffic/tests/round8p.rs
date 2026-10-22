@@ -114,3 +114,38 @@ fn p84_the_hold_runs_the_waiting_clock() {
     assert_eq!(vs[0].last.why, Why::PullOut);
     assert!(vs[0].waiting > 5.0, "waiting clock {:.1}", vs[0].waiting);
 }
+
+/// A two-way road east (lane 0, y = 0) and back (lane 1, y = 3.5), 3 m lanes, a car parked in
+/// lane 0 at 200 m; `far`: another parked at the oncoming lane's far kerb level with it, 1.8 m
+/// off that lane's axis: its flank 0.0 m from where the passing body's flank will be.
+fn pass_round_parked(far: bool) -> bool {
+    let mut a = lane(&[(0.0, 0.0), (2000.0, 0.0)]);
+    a.width = 3.0;
+    let mut b = lane(&[(2000.0, 3.5), (0.0, 3.5)]);
+    b.width = 3.0;
+    let net = finish(vec![a, b]);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.parked.insert(0, vec![omsi_traffic::Parked { s: 200.0, lateral: 0.0, half_width: 0.9, half_len: 2.2 }]);
+    if far {
+        sim.parked.insert(1, vec![omsi_traffic::Parked { s: 1800.0, lateral: 1.8, half_width: 0.9, half_len: 2.2 }]);
+    }
+    let mut vs = vec![car(1, vec![0], 150.0, 8.0)];
+    let mut started = false;
+    let mut t = 0.0;
+    while t < 30.0 {
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        started |= vs[0].passing.is_some_and(|p| p.lane.is_some());
+        t += DT;
+    }
+    started
+}
+
+/// [P8-2, pass 1 S2] The pass on the oncoming lane is swept against parked cars too: round a
+/// car parked in the lane it goes; with another parked at the far kerb flush with the passing
+/// body, the path is not clear by SQUEEZE_CLEARANCE and it does not start (before: it did).
+#[test]
+fn p82_no_pass_into_a_car_parked_in_the_oncoming_lane() {
+    assert!(pass_round_parked(false), "no pass round a lone parked car");
+    assert!(!pass_round_parked(true), "a pass started into a car parked in the oncoming lane");
+}

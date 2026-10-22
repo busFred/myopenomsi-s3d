@@ -1212,6 +1212,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // while a walker 3.5 m off its axis came at 1.7 m/s; the strip test saw them in its
     // 2 s step only once they were 0.4 m from its flank). Kerb waiters (on the walking area,
     // not the crossing) and bus waiters are no crossing users.
+    let sideways = me.passing.is_some() || st.change.is_some_and(|c| c.bypass);
     let on_walks = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + (JM_CROSSING_GAP + me.half_width) as f64) };
     for z in zebras.iter().filter(|z| z.along - crate::plan::ZEBRA_STOP > st.front) {
         let lat = st.lateral_ahead(z.along);
@@ -1295,6 +1296,26 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
             if at.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0) {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
+            }
+        }
+        // [P8 pass 1, S2] a pass or bypass moving sideways: the body as it will go on the bent
+        // way over one body length against where they are and where their step takes them,
+        // held short of the first place it would cover them (SUMO checks the target lane's
+        // pedestrians for every change, MSLaneChanger: `targetLane->hasPedestrians()`): the
+        // strip test exempts somebody level with the body and outside its footprint, whom the
+        // sideways move reaches (viz3 case11 #29300 passed out into a walker level with it)
+        if sideways {
+            let mut safe = 0.0f32;
+            for &(d, q, fwd) in way.pts.iter().skip(1) {
+                if d > st.front + st.rear {
+                    break;
+                }
+                let pose = omsi_sim::collision::Obb::vehicle(q, fwd.x.atan2(fwd.y).to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+                if positions.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&pose) < 0.0) {
+                    holders.push(Holder { stop: st.front + safe, along: st.front + safe, axis: 0.0, swervable: false });
+                    break;
+                }
+                safe = d;
             }
         }
         for (i, &(d, q, fwd)) in way.pts.iter().enumerate() {

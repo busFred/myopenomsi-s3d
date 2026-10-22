@@ -769,6 +769,32 @@ pub const BYPASS_TURN_MARGIN: f32 = 0.5;
 /// (`AiState::start_bypass`'s move: `side` metres over `out_len`, the body turned along the
 /// curve, not only shifted as `squeeze_clear` has it), up to `level` metres on?
 fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, side: f32, out_len: f32, level: f32) -> bool {
+    body_sweep_clear(net, sim, vehicles, me, &[], &[], side, out_len, level)
+}
+
+/// [P8 pass 1, S2] The parked cars within `reach` metres of my origin as boxes, on any lane
+/// (one parked at the far kerb of the oncoming lane is in a pass's path), as `squeeze_clear`
+/// lays them.
+fn parked_boxes(net: &Network, sim: &Simulation, me: &Vehicle, reach: f32) -> Vec<Obb> {
+    let mut out = Vec::new();
+    for (&l, list) in &sim.parked {
+        let Some(lane) = net.lanes.get(l) else { continue };
+        for pk in list {
+            let (q, h) = lane.at(pk.s.min(lane.length()));
+            if (q - me.pos).truncate().length() > (reach + pk.half_len + pk.half_width) as f64 {
+                continue;
+            }
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            out.push(Obb::vehicle(q.truncate() + right * pk.lateral as f64, h as f64, pk.half_len as f64, pk.half_len as f64, pk.half_width as f64));
+        }
+    }
+    out
+}
+
+/// `bypass_sweep_clear` against parked cars (`parked`) and people's discs (`people`) as well.
+#[allow(clippy::too_many_arguments)]
+fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32) -> bool {
     let st = &me.state;
     let near = sim.vehicles_near(me.pos, (level + 20.0) as f64);
     let clearance = SQUEEZE_CLEARANCE as f64;
@@ -792,6 +818,9 @@ fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
             }
         }
         if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+            return false;
+        }
+        if parked.iter().chain(people).any(|o| o.separation(&b) < clearance) {
             return false;
         }
         d += 0.5;
@@ -1551,7 +1580,17 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // squeeze's linear corridor (`squeeze_clear`: from a queue gap behind a parked car its
         // straight ramp cut the car passed and the pass never came - adversarial b1c).
         let pass_out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
-        let pass_swept = || squeeze || bypass_sweep_clear(net, sim, vehicles, me, side, pass_out_len, real + obstacle_len + st.front + st.rear + 2.0);
+        // ([pass 1, S2] and the parked cars along the way and the people near it, as the
+        // squeeze's corridor has them)
+        let pass_swept = || {
+            if squeeze {
+                return true;
+            }
+            let level = real + obstacle_len + st.front + st.rear + 2.0;
+            let parked = parked_boxes(net, sim, me, level + st.front);
+            let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level)
+        };
         if pass_possible && ready && pass_swept() {
             let out_len = pass_out_len;
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
