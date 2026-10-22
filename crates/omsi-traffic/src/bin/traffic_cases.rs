@@ -4216,6 +4216,9 @@ struct Extra {
     /// Of `unjust_hold_s`, the head-seconds "for a vehicle behind/beside" that is moving faster
     /// than 1 m/s (a stream coming alongside).
     unjust_stream_s: u64,
+    /// [round 8 H8-6] Of `unjust_hold_s`, the head-seconds whose verdict is a deadlock ring
+    /// (`heads`: wait_for, else lead, else body_block, back to the vehicle).
+    ring_s: u64,
     /// Mutual holds negotiated: a car eased off for the other (`Vehicle::ease_for`), whole map.
     eases: u64,
     /// Seconds an eased-off car stands past `EASE_PIN_AFTER` (whole map), and of them those
@@ -4328,6 +4331,8 @@ struct HeadTally {
     far_red: bool,
     far_red_before: bool,
     person: bool,
+    /// [round 8 H8-6] The verdict is a deadlock ring.
+    ring: bool,
 }
 
 impl HeadTally {
@@ -4341,6 +4346,7 @@ impl HeadTally {
             far_red: h.wait_dist > 30.0 && h.wait_red,
             far_red_before: h.wait_dist > 30.0 && h.wait_red_before,
             person: v.starts_with("person in front"),
+            ring: v.starts_with("deadlock ring"),
         }
     }
 }
@@ -4445,6 +4451,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             sc.head_s += 1.0;
             sc.unjust_hold_s += h.unjust as u8 as f64;
             sc.extra.unjust_stream_s += (h.unjust && h.stream) as u64;
+            sc.extra.ring_s += h.ring as u64;
             sc.wait_behind_s += h.behind as u8 as f64;
             sc.wait_beside_red_s += h.beside_red as u8 as f64;
             sc.wait_far_red_s += h.far_red as u8 as f64;
@@ -4885,6 +4892,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     sc.deferred_spawns = r.deferred_spawns;
     sc.dropped_spawns = r.dropped_spawns;
     ex.unjust_stream_s = sc.extra.unjust_stream_s;
+    ex.ring_s = sc.extra.ring_s;
     // ([J7-1, fix pass 2] the head tallies' far_red_before is carried over too: overwritten here,
     // it read 0 whatever the definition)
     ex.far_red_before_s = sc.extra.far_red_before_s;
@@ -4897,6 +4905,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
     vec![
         ("ovl_nospawn", e.overlap_nospawn_s.to_string()),
         ("unjust_stream", e.unjust_stream_s.to_string()),
+        ("ring_s", e.ring_s.to_string()),
         ("close_foe", format!("{}/{}", e.close_foe_pairs, e.close_foe_s)),
         ("close_nofoe", format!("{}/{}", e.close_nofoe_pairs, e.close_nofoe_s)),
         ("frozen", format!("{}/{}/{}", e.frozen_runs, e.frozen_vehicles, e.frozen_s)),
@@ -4925,6 +4934,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.close_foe_s += e.close_foe_s;
     t.overlap_nospawn_s += e.overlap_nospawn_s;
     t.unjust_stream_s += e.unjust_stream_s;
+    t.ring_s += e.ring_s;
     t.close_nofoe_s += e.close_nofoe_s;
     t.close_foe_pairs += e.close_foe_pairs;
     t.close_nofoe_pairs += e.close_nofoe_pairs;
