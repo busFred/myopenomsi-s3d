@@ -642,6 +642,11 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
+    /// [Q8-1 fix pass 2] Each player's waiting time (SUMO's, as `Vehicle::waiting`): it runs while
+    /// the player's vehicle stands, pauses while its red holds it (its claim's `light_red` last
+    /// frame, or with no claim the light of a lane it stands on), restarts with motion
+    /// (`player_waiting`).
+    pub player_wait: HashMap<u32, f32>,
     /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
     /// speed last frame, the estimate).
     pub player_pull: Vec<(u32, f32, f32)>,
@@ -692,6 +697,7 @@ impl Simulation {
             day_time: 0.0,
             time_scale: 1.0,
             players: Vec::new(),
+            player_wait: HashMap::new(),
             player_pull: Vec::new(),
             people: Vec::new(),
             walkers: Vec::new(),
@@ -995,6 +1001,28 @@ impl Simulation {
     }
 
     /// One frame of `dt` seconds for every vehicle.
+    /// [Q8-1 fix pass 2] The players' waiting time (`player_wait`), as `Vehicle::give_up_clock`.
+    fn player_waiting(&mut self, net: &Network, dt: f32) {
+        let mut red: Vec<u32> = self.claims.iter().filter(|(c, _)| c.light_red).filter_map(|(c, _)| claim_player(c.vehicle)).collect();
+        for (&l, list) in &self.player_occupancy {
+            let Some((ctl, li)) = net.lanes.get(l).and_then(|ln| ln.traffic_light) else { continue };
+            let Some(c) = self.lights.get(ctl) else { continue };
+            if matches!(omsi_sim::traffic::TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow) {
+                red.extend(list.iter().filter_map(|&(k, _, _)| self.players.get(k).map(|p| p.id)));
+            }
+        }
+        let ids: Vec<(u32, bool)> = self.players.iter().map(|p| (p.id, p.speed.abs() > UNHELD_SPEED)).collect();
+        self.player_wait.retain(|id, _| ids.iter().any(|x| x.0 == *id));
+        for (id, moving) in ids {
+            let w = self.player_wait.entry(id).or_insert(0.0);
+            if moving {
+                *w = 0.0;
+            } else if !red.contains(&id) {
+                *w += dt;
+            }
+        }
+    }
+
     pub fn tick(&mut self, net: &Network, dt: f32, vehicles: &mut [Vehicle]) {
         self.time += dt as f64;
         self.day_time += dt as f64 * self.time_scale;
@@ -1008,6 +1036,7 @@ impl Simulation {
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
+        self.player_waiting(net, dt);
 
         // perception: read-only over everything
         let perceptions: Vec<Perception> = (0..vehicles.len()).map(|i| perception::perceive(net, self, vehicles, i)).collect();

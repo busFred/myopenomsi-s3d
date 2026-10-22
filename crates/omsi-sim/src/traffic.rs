@@ -3082,9 +3082,11 @@ pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
 const STOP_LINE_GAP: f32 = 0.6;
 /// [Q8-1] A car backing up out of a packed queue does so at walking pace (m/s,
-/// `AiState::reverse_step`): [fix pass 1] "Schrittgeschwindigkeit" as Austria's Supreme Court set
-/// it, 5 km/h (OGH 23.03.2007, 2Ob262/05a; German courts give 7-10 km/h, no binding value:
-/// de.wikipedia.org/wiki/Schrittgeschwindigkeit). (SUMO has no reversing of road vehicles.)
+/// `AiState::reverse_step`): [fix pass 2] 5 km/h, which the Austrian Supreme Court's decision
+/// OGH 23.03.2007, 2Ob262/05a equates with "Schrittgeschwindigkeit" in the lower court's findings
+/// (https://ris.bka.gv.at/Dokumente/Justiz/JJT_20070323_OGH0002_0020OB00262_05A0000_000/JJT_20070323_OGH0002_0020OB00262_05A0000_000.html),
+/// not as a definition; for Germany de.wikipedia ("Schrittgeschwindigkeit") gives the courts'
+/// 7-10 km/h. (SUMO has no reversing of road vehicles.)
 pub const REVERSE_SPEED: f32 = 5.0 / 3.6;
 
 /// A lane change: the car moves over from its lane to `to` along `length` metres of road

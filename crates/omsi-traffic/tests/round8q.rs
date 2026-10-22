@@ -390,3 +390,27 @@ fn q81_fix1_a_player_held_by_its_red_or_indicating_heads_no_queue_to_back_out_of
         assert_eq!(backed, blinker == 0, "blinker {blinker}");
     }
 }
+
+#[test]
+fn q81_fix2_a_queue_behind_a_head_at_a_red_does_not_back_up_at_the_green() {
+    // (safety recheck S1: viz case12 head #45205 stood at its red until the green and read 57 s
+    // "held by nothing" there; #45372 backed up 0.74 s before the queue moved) the head's standing
+    // is SUMO's waiting time, which the red paused: at the green it is no queue head
+    let mut net = two_lanes();
+    net.lanes[3].traffic_light = Some((0, 0));
+    net.lanes[2].traffic_light = Some((0, 0));
+    let ctl = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 60.0), (6, 60.0)]], 120.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    let mut cars = vec![car(1, 1, 120.0, 10.0), car(2, 1, 80.0, 10.0), car(3, 1, 40.0, 10.0)];
+    // (one lane's queue: no change of their own on the way up; the escape reads no cooldown)
+    for c in cars.iter_mut() {
+        c.state.change_cooldown = 1000.0;
+    }
+    let (mut back, mut green_seen) = (false, false);
+    run(&net, &mut sim, &mut cars, 75.0, |t, _, cars| {
+        back |= cars.iter().any(|c| c.state.speed < -0.01 || c.reversing.is_some());
+        green_seen |= t > 61.0 && cars.iter().any(|c| c.state.speed > 1.0);
+    });
+    assert!(green_seen, "the queue never moved off at the green");
+    assert!(!back, "a car backed up at the green");
+}
