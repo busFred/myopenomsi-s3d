@@ -681,6 +681,70 @@ fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -
     false
 }
 
+/// [P8-4] The pull-back into the lane is sampled at this spacing (m), as the bypass's sweep
+/// (`bypass_sweep_clear`).
+const REENTRY_STEP: f32 = 0.5;
+
+/// [P8-4] A vehicle out of its lane on its way back in: its body clear of the lane's axis (a
+/// car passing in the lane gets by it), no pass or change of its own, the offset it is asked
+/// for (a bay, the bus service sends 0 as it leaves one; else its target) nearer the lane
+/// than where it is, and the way's sideways ramp not run out yet (`AiState::lateral_ramp`:
+/// the bus service's `depart`, a parked car's pull-out).
+fn reentering(me: &Vehicle) -> bool {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    let to = me.external.bay.unwrap_or(st.lateral_target);
+    me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
+}
+
+/// [P8-4] Is the way back into the lane clear (SUMO: a stopped vehicle goes back into the
+/// traffic only through the insertion checks, sumo.md 5.2: its followers at a safe distance
+/// by their own car-following, i.e. able to stop for it)? My body on the bent way over what
+/// is left of the ramp (`shifted_body`, the way carries the ramp), turned along it as the
+/// bypass's sweep, against every other vehicle's and player's box reaching ahead by its
+/// comfortable stopping distance; a vehicle going my way with its rear ahead of my front is a
+/// lead, not a threat. (x10 case08: timetable bus #10940 swung out of its bay across the lane
+/// beside, into #11059 coming at 8.9 m/s 14 m away, 0.58 m deep.)
+fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle) -> bool {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    let left = (x0 + len - st.odometer).max(0.0);
+    let n = (left / REENTRY_STEP).ceil() as usize;
+    let poses: Vec<Obb> = (0..=n).map(|k| shifted_body(net, me, (k as f32 * REENTRY_STEP).min(left), 0.0)).collect();
+    let hr = (me.heading as f64).to_radians();
+    let fwd = DVec2::new(hr.sin(), hr.cos());
+    let reach = (left + st.front + st.rear) as f64;
+    // (every vehicle, not those within some radius: one far off and fast is a threat too;
+    // the few re-entering vehicles of a frame afford the pass over all)
+    for o in vehicles {
+        if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 {
+            continue;
+        }
+        let stop = o.state.speed * o.state.speed / (2.0 * o.params.comfort_brake);
+        if (o.pos - me.pos).truncate().length() > reach + (o.state.front + o.half_width + stop) as f64 {
+            continue;
+        }
+        let oh = (o.heading as f64).to_radians();
+        let same_way = DVec2::new(oh.sin(), oh.cos()).dot(fwd) > 0.0;
+        if same_way && (o.pos - me.pos).truncate().dot(fwd) - o.state.rear as f64 > st.front as f64 {
+            continue;
+        }
+        let reach_box = Obb::vehicle(o.pos.truncate(), o.heading as f64, (o.state.front + stop) as f64, o.state.rear as f64, o.half_width as f64);
+        if poses.iter().any(|b| reach_box.separation(b) < 0.0) {
+            return false;
+        }
+    }
+    let player_brake = DriverParams::preset(crate::sim::PLAYER_PRESET).comfort_brake;
+    !sim.players.iter().any(|pl| {
+        if (pl.pos.z - me.pos.z).abs() > 3.0 {
+            return false;
+        }
+        let stop = (pl.speed * pl.speed / (2.0 * player_brake)) as f64;
+        let b = pl.obb(stop, 0.0);
+        poses.iter().any(|q| b.separation(q) < 0.0)
+    })
+}
+
 /// What the corner of a body turned on the bypass's curve reaches beyond its shifted box (m):
 /// half a metre at 30 degrees for a 2 m front overhang.
 pub const BYPASS_TURN_MARGIN: f32 = 0.5;
@@ -1136,6 +1200,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
     if me.pull_out > 0.0 {
+        min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
+    }
+    // [P8-4] standing out of the lane and about to move back in - a bus leaving its bay, a
+    // parked car pulling out once its moment is over: one rule, held until the way back in
+    // is clear of anybody who could not stop for it (`reentry_clear`)
+    if v < STANDING_SPEED && reentering(me) && !reentry_clear(net, sim, vehicles, me) {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
     }
     if let Some(d) = p.letting_out {
