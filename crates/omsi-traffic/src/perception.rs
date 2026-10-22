@@ -1160,6 +1160,18 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
     out
 }
 
+/// [P8-1] Is `pos` level with where my body will stand at the stop I am coming up to
+/// (`External::stop_at`, my front's place there): along my way between my rear and my front
+/// as they will stand, a body's radius either side - the stop's own places.
+fn at_stop_place(me: &Vehicle, way: &WayPts, pos: DVec2) -> bool {
+    let Some(stop) = me.external.stop_at else { return false };
+    let Some(k) = way.nearest(pos, f64::INFINITY) else { return false };
+    let (d, q, fwd) = way.pts[k];
+    let along = d + (pos - q).dot(fwd) as f32;
+    let r = crate::plan::PERSON_RADIUS;
+    along >= stop - me.state.front - me.state.rear - r && along <= stop + r
+}
+
 /// The people in the strip ahead: where to stop for them, and the shift inside the drawn
 /// road that lets the car past the ones beside its lane instead, with where to stop once
 /// shifted (for whom the shift does not clear). `parked_swerve`: a swerve round a parked car
@@ -1237,9 +1249,15 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             continue;
         }
         let at_kerb_of_stop = own_stop && !on_crossing && (standing || p.waiting_for_bus);
+        // [P8-1] somebody waiting for a bus at the stop this bus is coming up to, level with
+        // where its body will stand there (`at_stop_place`): round 4d's pull-in beside them
+        // holds for them only inside its footprint. Any other waiter - at another stop, or
+        // for a bus going by - is held for by the car rule (viz5 case02: timetable buses drove
+        // through waiters standing 0.3 m inside their flank away from their own stop)
+        let my_waiter = p.waiting_for_bus && own_stop && at_stop_place(me, way, p.pos.truncate());
         let half = if on_crossing {
             me.half_width + 1.5
-        } else if p.waiting_for_bus && me.serves_stops() {
+        } else if my_waiter {
             me.half_width - 0.3
         } else if at_kerb_of_stop {
             // (its footprint and 0.3 m clear of it)
@@ -1258,7 +1276,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let t = if stepping_in { (dist / v.max(1.0)).clamp(2.0, STEP_LOOK) } else { (dist / v.max(1.0)).min(2.0) };
         let later = p.pos.truncate() + p.vel * t as f64;
         // (where somebody waiting for a bus is, not where their shuffle would take them)
-        let positions: &[DVec2] = if at_kerb_of_stop || (p.waiting_for_bus && me.serves_stops()) { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
+        let positions: &[DVec2] = if at_kerb_of_stop || my_waiter { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
         // ([fix pass 1, 2; pass 2, 3] anybody whose body is over mine - beside it or behind
         // the front plane, now or where their step takes them - holds the car where it stands
         // until they are clear of it (SUMO: vehicles brake for persons on their lane): the
