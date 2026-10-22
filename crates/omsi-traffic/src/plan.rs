@@ -283,11 +283,12 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
         }
     }
     // [Q8-3] keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
-    // (`Vehicle::keep_right`, `keep_right_rate`) past its threshold, onto a lane open to me along
-    // the move and on (`open_on`); a speed-gain or strategic wish outweighs it (round 5's gates -
+    // (`Vehicle::keep_right`, `keep_right_rate`) past its threshold, unless SUMO's strategic stays
+    // hold (`stays_on_best`, over the lanes open to me: [fix pass 1] no `open_on` window); a speed-
+    // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (round 5's gates -
     // lead over 60 m, the lane beside free 70 m, not near a junction, running on 200 m - are gone:
     // how long the driver could keep its speed there is the accumulator's rate)
-    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) && open_on(net, me, nb.lane, st.s) {
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -434,12 +435,15 @@ fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
 /// the lane runs on less its braking distance, by closing on a slower leader there to its secure
 /// gap, and above `CONGESTED_SPEED` by catching up with my own slower leader (no overtaking on the
 /// keep side) - over `KEEP_RIGHT_TIME`.
-pub fn keep_right_rate(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
+pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
     let st = &me.state;
     let dp = &me.params;
     let (b, tau) = (dp.comfort_brake, dp.tau);
     let v_max = p.v_want.max(0.1);
-    let mine = net.reach.get(st.lane).copied().unwrap_or(0.0) - st.s;
+    // ([fix pass 1] SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
+    // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
+    let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
+    let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
     let this_safe = v_max.min(match p.leader {
         Some(l) => safe_speed(l.gap, l.speed, b, tau),
         None => safe_speed(mine, 0.0, b, tau),
@@ -447,7 +451,7 @@ pub fn keep_right_rate(net: &Network, me: &Vehicle, p: &Perception, nb: &Neighbo
     let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
     let nb_safe = nb_max.min(match nb.ahead {
         Some((g, vl)) => safe_speed(g, vl, b, tau),
-        None => safe_speed(nb.runs_on, 0.0, b, tau),
+        None => safe_speed(runs, 0.0, b, tau),
     });
     if this_safe - KEEP_RIGHT_FASTER > nb_safe {
         return 0.0;
@@ -455,10 +459,6 @@ pub fn keep_right_rate(net: &Network, me: &Vehicle, p: &Perception, nb: &Neighbo
     let limit = net.lanes.get(st.lane).map_or(v_max, |l| (l.speed_limit_kmh / 3.6).max(0.1));
     let acceptance = KEEP_RIGHT_ACCEPTANCE * (v_max / limit) * st.speed.max(1.0);
     let brake_gap = v_max * tau + v_max * v_max / (2.0 * b.max(0.1));
-    // (SUMO's `neighDist`, how far the lane beside runs on, is its best lanes' length up to
-    // `lcStrategicLookahead`; the network's reach stops counting at `REACH_MAX`: a lane that
-    // reaches that far runs on as far as LC2013 looks)
-    let runs = if nb.runs_on + net.beside_s(st.lane, nb.lane, st.s) >= omsi_sim::traffic::REACH_MAX { LC_STRATEGIC_LOOKAHEAD } else { nb.runs_on };
     let mut full_gap = (runs - brake_gap).max(0.0);
     let mut seconds = acceptance.min(full_gap / v_max);
     if let Some((g, vl)) = nb.ahead.filter(|a| a.1 < v_max) {
@@ -466,7 +466,14 @@ pub fn keep_right_rate(net: &Network, me: &Vehicle, p: &Perception, nb: &Neighbo
         full_gap = full_gap.min(g - secure).max(0.0);
         seconds = seconds.min(full_gap / (v_max - vl));
     }
-    if let Some(l) = p.leader.filter(|l| st.speed >= CONGESTED_SPEED && l.speed < v_max) {
+    // ([fix pass 1] SUMO compares my desired speed with the leader's maximum on its lane,
+    // `getVehicleMaxSpeed`, not its speed now: a player's vehicle or a parked car is taken at my
+    // lane's limit)
+    let leader_max = |l: &crate::perception::Headway| match l.what {
+        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map_or(limit, |o| net.lanes.get(o.state.lane).map_or(limit, |ol| (ol.speed_limit_kmh * o.state.desire).min(o.state.max_speed_kmh).max(3.0) / 3.6)),
+        Seen::Player(_) | Seen::Parked => limit,
+    };
+    if let Some(l) = p.leader.filter(|l| st.speed >= CONGESTED_SPEED && leader_max(l) < v_max) {
         full_gap = full_gap.min(l.gap);
         seconds = seconds.min(full_gap / (v_max - l.speed));
     }
@@ -1501,7 +1508,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
         // (a strategic stay comes first and leaves the wish as it is)
         if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, me, nb) && !stays_on_best(net, sim, me, nb)) {
-            out.keep_right_rate = Some(keep_right_rate(net, me, p, &nb));
+            out.keep_right_rate = Some(keep_right_rate(net, vehicles, me, p, &nb));
         }
     }
 
