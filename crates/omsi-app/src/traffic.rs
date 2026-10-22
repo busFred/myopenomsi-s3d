@@ -2209,18 +2209,21 @@ impl Traffic {
                 }
             }
             let seed = self.rand();
+            // [round 8 H8-8] put on the lane where `spawn_clear` found it has room (the bodies
+            // there, and nobody driving up to it within their braking distance), not at its
+            // parking offset: SUMO's parked vehicle is off the lane and re-enters by insertion
+            // where the lane has room. At its offset it ran the lane's people test over the
+            // pavement and never re-entered (Jiangzhaikou #1913 stood 482 s 3.15 m right of lane
+            // 1129, held by the walkers under its own body); a people test on the lane's
+            // footprint instead drove its body over the pavement into them (viz case10/08/04/07:
+            // 820 frames of body over a person, a probe).
             let id = self.create_car(world, renderer, scene, center, LaneKind::Street, l, s, ty.clone(), seed, None, None, Some(0.0), None);
-            let net = &self.net;
             if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
-                car.ai.state.lateral = lat;
-                car.ai.state.lateral_target = 0.0;
-                car.ai.state.lateral_ramp = (lat, 0.0, car.ai.state.odometer, (lat * 6.0).clamp(8.0, 16.0));
-                car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
                 car.ai.pull_out = 2.0 + (seed % 1000) as f32 / 400.0;
                 car.ai.state.blinker = 1;
             }
             if debug {
-                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {lat:.1} m right of lane {l}", ty.def.path.display(), p.pos.x, p.pos.y);
+                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, from {lat:.1} m right of lane {l}, put on the lane", ty.def.path.display(), p.pos.x, p.pos.y);
             }
             return;
         }

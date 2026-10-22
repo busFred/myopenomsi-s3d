@@ -285,8 +285,9 @@ pub struct Vehicle {
     /// `pull_out`, standing off the lane's axis, until its way's offset has come back to the axis
     /// (`SIDESTEP_DONE`).
     /// It starts only when its lane has room behind it (SUMO: a parked vehicle is off the lane
-    /// and re-enters by insertion, `MSLane::isInsertionSuccess`'s follower gap), and its people
-    /// test runs on the lane's footprint it moves into ([round 8 H8-8], `perception`).
+    /// and re-enters by insertion, `MSLane::isInsertionSuccess`'s follower gap). (Since round 8
+    /// H8-8 the game puts a pull-out on the lane itself where `spawn_clear` finds room,
+    /// `Traffic::pull_out_parked`; a recording's pull-out at its parking offset is held here.)
     #[serde(default)]
     pub pulling_out: bool,
     pub passing: Option<Passing>,
