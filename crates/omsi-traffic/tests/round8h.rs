@@ -116,3 +116,67 @@ fn h8_1_a_pull_out_with_room_behind_leaves_on_time() {
     let t = left_at.expect("never left its space");
     assert!(t < 3.0, "left at {t:.1} s, its pull_out is 2 s");
 }
+
+/// A lane of crossing object 9 (source 2).
+fn piece(pts: &[(f64, f64)], path: u16, kind: LaneKind, priority: f32) -> omsi_sim::traffic::Lane {
+    let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), kind, 3.5);
+    l.source = 2;
+    l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+    l.priority = priority;
+    l
+}
+
+/// [H8-4] Zebra-then-crossing inside a long object: an eastbound car already inside object 9
+/// (its piece x -15..60, so its line is behind it) is refused for a stream on the northbound
+/// priority piece at x = 25; the object's zebra cuts its way at x = 20, so the stretch it waits
+/// for begins right after the zebra. J7-4's waiting positions (`legal_before` over
+/// `wait_bands`, the walk bands among them) pull the refused stop back before the zebra: it
+/// comes to rest refused (`Why::Junction`) with its front at most `ZEBRA_STOP` short of the cut,
+/// and its body is never over the zebra band (cut - ZEBRA_STOP .. cut + ZEBRA_PAST) while the
+/// stream passes.
+#[test]
+fn h8_4_a_refused_car_inside_a_long_object_stops_before_the_zebra_short_of_the_crossing() {
+    use omsi_traffic::plan::{ZEBRA_PAST, ZEBRA_STOP};
+    let mut net = Network::default();
+    net.lanes.push(road((-300.0, 0.0), (-15.0, 0.0), 1, 0));
+    net.lanes.push(piece(&[(-15.0, 0.0), (60.0, 0.0)], 0, LaneKind::Street, 0.0));
+    net.lanes.push(road((60.0, 0.0), (400.0, 0.0), 2, 0));
+    net.lanes.push(piece(&[(25.0, -40.0), (25.0, 40.0)], 1, LaneKind::Street, 10.0));
+    net.lanes.push(piece(&[(20.0, -8.0), (20.0, 8.0)], 2, LaneKind::Sidewalk, 0.0));
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    net.compute_reach();
+    assert!(net.walks[1].iter().any(|&(w, _, _)| w == 4), "the zebra cuts the piece: {:?}", net.walks[1]);
+    assert!(net.crossings[1].iter().any(|c| c.other == 3 && !c.merge), "the pieces cross: {:?}", net.crossings[1]);
+    let mut sim = Simulation::new(&net, vec![]);
+    // (a stream of nine on the priority piece, 14 m apart at 9 m/s; the car rolls in at 7 m/s
+    // 5 m inside the object)
+    let mut cars = vec![car(1, 1, 7.0, 7.0)];
+    cars.extend((0..9u64).map(|k| car(10 + k, 3, 28.0 - 14.0 * k as f32, 9.0)));
+    for c in cars.iter_mut().skip(1) {
+        c.state.prev_lane = None;
+    }
+    let cut = 20.0 + 15.0; // along the piece
+    let (mut over_zebra, mut rest) = (false, None);
+    run(&net, &mut sim, &mut cars, 15.0, nobody, |_, _, cars| {
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if std::env::var_os("H8_DEBUG").is_some() {
+            eprintln!("lane {} s {:.1} v {:.2} why {} stop {:?} wf {:?} | {}", me.state.lane, me.state.s, me.state.speed, me.last.why.name(), me.last.stop, me.last.wait_for, cars.iter().skip(1).map(|c| format!("{}:{}/{:.0}/{:.1}", c.id, c.state.lane, c.state.s, c.state.speed)).collect::<Vec<_>>().join(" "));
+        }
+        let (front, rear) = (me.state.s + me.state.front, me.state.s - me.state.rear);
+        if me.state.lane == 1 && front > cut - ZEBRA_STOP && rear < cut + ZEBRA_PAST {
+            over_zebra = true;
+        }
+        if me.state.speed < 0.05 && rest.is_none() {
+            rest = Some((me.state.lane, front, me.last.why.name()));
+        }
+    });
+    let (lane, front, why) = rest.expect("never came to rest");
+    eprintln!("rests on {lane} with its front {:.2} m short of the cut, why {why}", cut - front);
+    assert_eq!(lane, 1, "rest on the piece");
+    assert!(!over_zebra, "its body was over the zebra band");
+    assert_eq!(why, "yield", "refused at the junction (Why::Junction)");
+    assert!(front <= cut - ZEBRA_STOP + 0.05 && front > cut - ZEBRA_STOP - 3.0, "rests with its front {:.1} m short of the cut ({why})", cut - front);
+}
+
