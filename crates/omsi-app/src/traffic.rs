@@ -8,7 +8,7 @@ use glam::{DVec2, DVec3};
 use hashbrown::HashMap;
 use omsi_render::{Renderer, Scene};
 use omsi_sim::ai_motion::{AiBody, MotionKind};
-use omsi_sim::traffic::{AiState, Aspect, LaneKind, Lead, Network, TrafficLightController};
+use omsi_sim::traffic::{AiState, Aspect, LaneKind, Network, TrafficLightController};
 use omsi_sim::vehicle::AiFrame;
 use omsi_sim::{VehicleInstance, VehicleType};
 use omsi_traffic::{External, Parked, Person, PlayerView, Seen, Vehicle as AiVehicle, VehicleClass, Why};
@@ -80,43 +80,12 @@ const STOOD_LONG: f32 = 150.0;
 /// for two and a half minutes.
 const QUEUE_BEHIND_STAND: f32 = 25.0;
 const QUEUE_BEHIND_DIST: f64 = 25.0;
-/// A car that gave up (or a timetable bus let go) goes in view too once the crate's give-up
-/// clock (`Vehicle::waiting`, the one clock) has run this much (s) past
-/// `GIVE_UP_UNSEEN`, beyond `GAVE_UP_DIST` (m) and not in a queue: kept until nobody saw it,
-/// a jam at a junction the player watched never cleared. (The grace is the round-4 rule's
-/// three minutes between giving up and going in view, 60 s and 240 s; the in-view removal is
-/// never earlier than giving up.)
-const IN_VIEW_GRACE: f32 = 180.0;
-const GAVE_UP_DIST: f64 = 40.0;
+// ([round 7 R7-1 fix 1] IN_VIEW_GRACE, GAVE_UP_DIST, QUEUE_LEAD, `in_a_queue` and `lead_of`
+// are the crate's, `omsi_traffic::removal`: the free-run replay asks the same rule)
+use omsi_traffic::removal::{goes_in_view, lead_of, in_a_queue, RemoveRule};
 /// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
 /// eye): a margin over what is drawn.
 const OUT_OF_RANGE: f64 = 1.3;
-
-/// [round5 C4] A lead standing within this (m) makes a car that gave up a queued car, not a
-/// phantom against an invisible wall (x10 case15: the two cars in front of the player went at
-/// 90 s with their leads 2.2 m ahead; a queue gap is 2-7 m, a car held by nothing has no lead).
-const QUEUE_LEAD: f32 = 10.0;
-
-/// [round5 C4] Whether a car follows a vehicle standing now (`standing`: the ids, players as
-/// `PLAYER_ID_BASE` + id) within `QUEUE_LEAD`: in a queue, whatever its own hold reads.
-/// [round 7 B5] SUMO's rule for the in-view removal: only the car at the front of a blocked
-/// queue goes - one whose own lead does not stand (or that has none); every car behind a
-/// standing lead stays, given up or not, the lead given up or not (each link of the chain
-/// is asked of its own lead, so the chain is never cut in its middle). A gridlock with no
-/// front car is removed only out of sight.
-fn in_a_queue(lead_id: Option<u64>, lead: Option<Lead>, standing: &hashbrown::HashSet<u64>) -> bool {
-    lead_id.is_some_and(|id| standing.contains(&id)) && lead.is_some_and(|l| l.gap < QUEUE_LEAD)
-}
-
-/// [round 7 B5] The id of what decision `d` follows: an AI vehicle's (`Decision::lead_id`) or
-/// a player's, as `PLAYER_ID_BASE` + its id (the crate names a player lead in `lead_seen`
-/// only; `plan::bypass_start` forms the id the same way).
-fn lead_of(d: &omsi_traffic::Decision) -> Option<u64> {
-    d.lead_id.or(match d.lead_seen {
-        Some(Seen::Player(id)) => Some(omsi_traffic::sim::PLAYER_ID_BASE + id as u64),
-        _ => None,
-    })
-}
 
 #[cfg(test)]
 mod spawn_queue_tests {
@@ -172,43 +141,17 @@ mod spawn_queue_tests {
     }
 }
 
-#[cfg(test)]
-mod queue_tests {
-    use super::{in_a_queue, QUEUE_LEAD};
-    use omsi_sim::traffic::Lead;
+// ([round 7 R7-1 fix 1] the queue tests moved with the rule to omsi_traffic::removal)
 
-    /// The no-lead car against an invisible wall still goes; one behind a standing vehicle
-    /// within QUEUE_LEAD stays; behind a moving one, or one farther off, it goes.
-    /// [round 7 B5] The queue of fix2-jzk600 at t=595: player <- #150 <- #119 <- #163 (given
-    /// up) <- #101 <- #112, all standing 2-6 m apart. No car of it may go in view: #150 follows
-    /// the player, the rest follow standing cars, the given-up #163 too and #101 behind it.
-    /// With the player gone the front car #150 is the only one that may.
-    #[test]
-    fn b5_only_the_front_car_of_a_standing_queue_may_go_in_view() {
-        use super::lead_of;
-        use omsi_traffic::{sim::PLAYER_ID_BASE, Decision, Seen};
-        let gap = |g: f32| Some(Lead { gap: g, speed: 0.0, acc: 0.0 });
-        let follows = |id: Option<u64>, player: Option<u32>| Decision { lead_id: id, lead_seen: player.map(Seen::Player), lead: gap(3.0), ..Default::default() };
-        let chain = [(150u64, follows(None, Some(0))), (119, follows(Some(150), None)), (163, follows(Some(119), None)), (101, follows(Some(163), None)), (112, follows(Some(101), None))];
-        let mut standing: hashbrown::HashSet<u64> = chain.iter().map(|c| c.0).collect();
-        standing.insert(PLAYER_ID_BASE);
-        assert_eq!(lead_of(&chain[0].1), Some(PLAYER_ID_BASE));
-        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(lead_of(d), d.lead, &standing)).map(|c| c.0).collect();
-        assert!(removable.is_empty(), "{removable:?}");
-        standing.remove(&PLAYER_ID_BASE);
-        let removable: Vec<u64> = chain.iter().filter(|(_, d)| !in_a_queue(lead_of(d), d.lead, &standing)).map(|c| c.0).collect();
-        assert_eq!(removable, vec![150]);
-    }
-
-    #[test]
-    fn c4_a_car_behind_a_standing_lead_is_queued_not_a_phantom() {
-        let standing: hashbrown::HashSet<u64> = [7u64].into_iter().collect();
-        let lead = |gap: f32| Some(Lead { gap, speed: 0.0, acc: 0.0 });
-        assert!(!in_a_queue(None, None, &standing));
-        assert!(in_a_queue(Some(7), lead(2.2), &standing));
-        assert!(in_a_queue(Some(7), lead(QUEUE_LEAD - 0.5), &standing));
-        assert!(!in_a_queue(Some(7), lead(QUEUE_LEAD + 0.5), &standing));
-        assert!(!in_a_queue(Some(8), lead(2.2), &standing));
+/// [round 7 R7-1 fix 1] The recorded rule of a population removal, by the reason it logs.
+fn removal_rule(why: &str) -> RemoveRule {
+    match why {
+        "its ground unloaded" => RemoveRule::GroundUnloaded,
+        "out of range" => RemoveRule::OutOfRange,
+        "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
+        w if w.starts_with("at a dead end") || w.starts_with("at the loaded route's end") => RemoveRule::DeadEnd,
+        _ => RemoveRule::Other,
     }
 }
 
@@ -1910,13 +1853,7 @@ impl Traffic {
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.last.lead_id).collect();
         // [round5 C4] the vehicles standing now, the players too: a car that gave up behind
         // one of them is in a queue, not a phantom
-        let standing: hashbrown::HashSet<u64> = self
-            .cars
-            .iter()
-            .filter(|c| c.standing())
-            .map(|c| c.id)
-            .chain(self.sim.players.iter().filter(|p| p.speed.abs() < omsi_traffic::driver::STANDING_SPEED).map(|p| omsi_traffic::sim::PLAYER_ID_BASE + p.id as u64))
-            .collect();
+        let standing = omsi_traffic::removal::standing_ids(self.cars.iter().map(|c| &c.ai), &self.sim.players);
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1998,12 +1935,23 @@ impl Traffic {
                 first(&[
                     (&|| dist > VISIBLE_RANGE * OUT_OF_RANGE && from_eye > NEAR_HIDE, "out of range"),
                     (&|| hidden(), if finished { "finished, out of sight" } else { "out of sight" }),
-                    (&|| finished && c.ai.waiting > omsi_traffic::sim::GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(lead_of(&c.ai.last), c.ai.last.lead, &standing), "finished, in view after its grace"),
+                    (&|| goes_in_view(finished, &c.ai, from_eye, &standing), "finished, in view after its grace"),
                 ])
             } else {
                 None
             };
             let remove = reason.is_some();
+            if let Some(why) = reason {
+                // [round 7 R7-1 fix 1] the rule into the recording, with whether the eye saw it
+                let rule = removal_rule(why);
+                let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
+                let seen = match rule {
+                    RemoveRule::OutOfSight => false,
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    _ => frames(),
+                };
+                self.recorder.note_remove(c.id, rule, seen, c.ai.waiting);
+            }
             if remove && sleeps_instead {
                 let c = self.cars.swap_remove(i);
                 asleep += 1;
@@ -2034,7 +1982,11 @@ impl Traffic {
                     let v = self.viewer;
                     // ([round 7 B1] with the rule that took it, its distance from the eye, its
                     // last hold and its waiting time, the give-up clock)
-                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting);
+                    // ([round 7 R7-1] and what it follows: the lead's id and gap and whether
+                    // that lead stands, the queue test of the in-view rule)
+                    let lead = lead_of(&c.ai.last);
+                    let in_queue = in_a_queue(&c.ai.last, &standing);
+                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} standing {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), lead.is_some_and(|l| standing.contains(&l)), in_queue);
                 }
                 self.orphan_sounds.extend(c.sounds);
                 for r in std::iter::once(c.render).chain(c.trailer_renders) {
@@ -3766,6 +3718,21 @@ impl Traffic {
         self.save_on_trouble(overlaps > 0);
         for i in remove {
             let c = self.cars.swap_remove(i);
+            {
+                let p = c.vehicle.position;
+                let r = (c.ai.state.length as f64 * 0.5).max(2.0);
+                let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else { RemoveRule::NetworkEnd };
+                self.recorder.note_remove(c.id, rule, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+            }
+            if self.debug_population {
+                // [round 7 R7-1] every removal is logged with its rule: the traffic's own
+                // (the network's end: no way on) and a timetable bus's last resort (its own
+                // line too) as the population's are
+                let p = c.vehicle.position;
+                let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(f64::NAN);
+                let rule = if respawn.contains(&i) { "a timetable bus taken off as the last resort" } else { "the network's end, no way on" };
+                log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {rule}; {:.0} m from the eye, lane {}, v {:.1}, why {}, stood {:.0} s, waiting {:.1} s", self.time, c.id, p.x, p.y, from_eye, c.ai.state.lane, c.ai.state.speed, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting);
+            }
             if c.serves_stops() {
                 self.riders_out.push(c.id);
             }
@@ -4389,6 +4356,11 @@ impl Traffic {
             return false;
         };
         let c = self.cars.swap_remove(i);
+        {
+            let p = c.vehicle.position;
+            let r = (c.ai.state.length as f64 * 0.5).max(2.0);
+            self.recorder.note_remove_unnamed(c.id, RemoveRule::Other, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+        }
         if c.serves_stops() {
             self.riders_out.push(c.id);
         }
@@ -4557,6 +4529,7 @@ impl Traffic {
             match self.cars[i].park {
                 Some(p) if p.done => {
                     let c = self.cars.swap_remove(i);
+                    self.recorder.note_remove(c.id, RemoveRule::Parked, false, c.ai.waiting);
                     if world.return_parked(renderer, scene, p.key) {
                         let st = &c.ai.state;
                         let spot = Parked { s: p.s, lateral: p.lat, half_width: c.ai.half_width, half_len: (st.front + st.rear) * 0.5 };

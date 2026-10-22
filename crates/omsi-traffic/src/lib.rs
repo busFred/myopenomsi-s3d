@@ -23,6 +23,7 @@ pub mod perception;
 pub mod plan;
 pub mod record;
 pub mod replay;
+pub mod removal;
 pub mod reservation;
 pub mod sim;
 

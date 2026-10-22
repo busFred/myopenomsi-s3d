@@ -4221,11 +4221,15 @@ struct Extra {
     /// 40 m / 60 m ahead of its front (`Grant::at`; review-r6 case11's count).
     far_refused_40_s: f64,
     far_refused_60_s: f64,
-    /// [round 7 B1] Vehicles within the radius that gave up (`Vehicle::gone` set by the
-    /// crate) during the run: what the game may take off the road in view (its removal rules
-    /// run in the app, not here). Not counted: one that came on the road (keyframe, spawn)
-    /// given up already, and a timetable bus (its `gone` is the app's, trip over).
+    /// [round 7 R7-1 fix 1] Vehicles within the radius taken off the road in view by a rule
+    /// of the population's (`Replay::removals`, `RemoveRule::gated`: not the network's end
+    /// nor the ground going): a free run, by the game's in-view rule
+    /// (`removal::goes_in_view`, which the app asks too); replaying a game recording as
+    /// recorded, the game's own removals the eye saw (`Record::Remove`).
     removed_in_view: u64,
+    /// Of them, their waiting times (`Vehicle::waiting`, the give-up clock) when they went,
+    /// summed.
+    removed_in_view_s: f64,
     /// [round 7 SHOULD 9] Vehicles the run's network end took off within the radius (a lane
     /// end in view), and of them, whole map, those taken off moving over 1 m/s.
     end_in_view: u64,
@@ -4251,6 +4255,10 @@ struct Extra {
     /// [J7-2] Vehicle-seconds within the radius with a zipper speed (`Grant::zipper`: the foe
     /// ahead at a merge caps the speed, or the queue-entry stop behind it).
     zipper_capped_s: f64,
+    /// [round 7 R7-1] With `--pedtouch`: frames a moving vehicle's body is severely over a
+    /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
+    /// player's passengers out not counted).
+    pedtouch_severe: u64,
     events: Vec<String>,
 }
 
@@ -4412,9 +4420,6 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // (a pass under way: whether its sideways move was seen yet)
     // (those under way at the start are not counted)
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
-    // (those given up, and those seen: one that comes on the road given up is not counted)
-    let mut gone_ids: HashSet<u64> = r.vehicles.iter().filter(|v| v.gone).map(|v| v.id).collect();
-    let mut gone_seen: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
     let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
     let mut on_cut_ids: HashSet<u64> = HashSet::new();
     // (an eased-off car standing: since when; the last frame's time)
@@ -4515,13 +4520,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.wait120 += 1;
                 }
             }
-            for v in &r.vehicles {
-                let first = gone_seen.insert(v.id);
-                if !v.gone {
-                    gone_ids.remove(&v.id);
-                } else if gone_ids.insert(v.id) && !first && !v.serves_stops() && near(v.pos) {
+            for m in std::mem::take(&mut r.removals) {
+                if m.rule.is_some_and(|k| k.gated()) && m.seen && near(m.pos) {
                     ex.removed_in_view += 1;
-                    ex.events.push(format!("GONE {} t={now:.1} #{} {:?} lane {} s {:.1} v {:.2} stood {:.0} why={}", sc.name, v.id, v.class, v.state.lane, v.state.s, v.state.speed, v.stopped, why_name(v.last.why)));
+                    ex.removed_in_view_s += m.waiting as f64;
+                    ex.events.push(format!("REMOVED-IN-VIEW {} t={:.1} #{} {:?} waiting {:.0} at ({:.0}, {:.0})", sc.name, m.time, m.id, m.rule, m.waiting, m.pos.x, m.pos.y));
                 }
             }
             for v in &r.vehicles {
@@ -4600,6 +4603,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         // out stands beside where the game put them: a replay artefact)
                         let severe = -sep > 0.28 || (st.speed > 1.0 && -sep > 0.05);
                         let note = if v.last.why == Why::LetOut { " artefact: passengers placed by the recording beside the run's car" } else { "" };
+                        ex.pedtouch_severe += (severe && note.is_empty()) as u64;
                         eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
                     }
                 }
@@ -4890,6 +4894,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("ease_stand/pinned", format!("{:.0}/{:.0}", e.ease_stand_s, e.ease_pinned_s)),
         ("refused>40/>60", format!("{:.0}/{:.0}", e.far_refused_40_s, e.far_refused_60_s)),
         ("removed_in_view", e.removed_in_view.to_string()),
+        ("removed_in_view_s", format!("{:.0}", e.removed_in_view_s)),
         ("end_in_view/moving", format!("{}/{}", e.end_in_view, e.end_moving)),
         ("waited>60/>120", format!("{}/{}", e.wait60, e.wait120)),
         ("on_cut v/s", format!("{}/{:.0}", e.on_cut_vehicles, e.on_cut_s)),
@@ -4921,6 +4926,8 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.pass_stranded_s += e.pass_stranded_s;
     t.eases += e.eases;
     t.removed_in_view += e.removed_in_view;
+    t.removed_in_view_s += e.removed_in_view_s;
+    t.pedtouch_severe += e.pedtouch_severe;
     t.end_in_view += e.end_in_view;
     t.end_moving += e.end_moving;
     t.wait60 += e.wait60;
@@ -5056,6 +5063,16 @@ fn ab(args: &[String]) -> Res<()> {
         let _ = writeln!(out, "(recorded with switches: {l}; {n} of {} fixtures)", scores.len());
     }
     print!("{out}");
+    // [round 7 R7-1] the gated totals on one line, the common report's before/after row:
+    // none of these may rise
+    println!(
+        "GATE overlap_s {:.0} red_cross {} removed_in_view {} removed_in_view_s {:.0} pedtouch_severe {}",
+        total.overlap_s,
+        total.red_cross,
+        total.extra.removed_in_view,
+        total.extra.removed_in_view_s,
+        if pedtouch { total.extra.pedtouch_severe.to_string() } else { "not run (--pedtouch)".into() }
+    );
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures

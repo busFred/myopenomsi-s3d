@@ -16,6 +16,7 @@
 
 use crate::finite;
 use crate::junction::Junctions;
+use crate::removal::RemoveRule;
 use crate::sim::{External, Parked, Person, PlayerView, Simulation, Vehicle};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -275,7 +276,20 @@ pub enum Record {
     /// Every vehicle, before the frame of the same time.
     Keyframe { time: f64, vehicles: Vec<Vehicle> },
     Spawn { time: f64, vehicle: Vehicle, type_name: String },
-    Remove { time: f64, id: u64 },
+    /// [round 7 R7-1 fix 1] With the rule the game took it off by (`None`: an older
+    /// recording, or a removal nobody named), whether the eye saw it (in frame and not
+    /// behind a building, as the game judged; the traffic's own network end: in frame) and
+    /// its waiting time then (`Vehicle::waiting`).
+    Remove {
+        time: f64,
+        id: u64,
+        #[serde(default)]
+        rule: Option<RemoveRule>,
+        #[serde(default)]
+        seen: bool,
+        #[serde(default)]
+        waiting: f32,
+    },
     /// The game changed a vehicle's way outside the frame (a timetable bus given its next
     /// trip or let go, its route extended).
     VehicleChanged { time: f64, vehicle: Vehicle },
@@ -312,7 +326,7 @@ enum RecordRef<'a> {
     Frame(FrameRef<'a>),
     Keyframe { time: f64, vehicles: &'a [Vehicle] },
     Spawn { time: f64, vehicle: &'a Vehicle, type_name: &'a str },
-    Remove { time: f64, id: u64 },
+    Remove { time: f64, id: u64, rule: Option<RemoveRule>, seen: bool, waiting: f32 },
     VehicleChanged { time: f64, vehicle: &'a Vehicle },
     LanesAdded { time: f64, first: usize, lanes: &'a [Lane] },
     LightsAdded { time: f64, first: usize, lights: &'a [TrafficLightController] },
@@ -389,6 +403,9 @@ pub struct Recorder {
     /// The vehicles' ids in the order of the last frame, and as a set.
     order: Vec<u64>,
     known: HashSet<u64>,
+    /// [round 7 R7-1 fix 1] The rule (and seen, waiting) of each vehicle the game is taking
+    /// off, named by `note_remove` before the frame that finds it gone.
+    remove_rules: HashMap<u64, (RemoveRule, bool, f32)>,
     ids: Vec<u64>,
     /// A fingerprint of the parked cars last written.
     parked_print: Option<u64>,
@@ -415,6 +432,7 @@ impl Recorder {
             last_keyframe: f64::NEG_INFINITY,
             order: Vec::new(),
             known: HashSet::new(),
+            remove_rules: HashMap::new(),
             ids: Vec::new(),
             parked_print: None,
             net_cache: None,
@@ -457,6 +475,18 @@ impl Recorder {
         }
     }
 
+    /// [round 7 R7-1 fix 1] The game is taking vehicle `id` off by `rule` (`seen`: the eye
+    /// saw it; `waiting`: its waiting time): written with its `Record::Remove`.
+    pub fn note_remove(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
+        // (the ring of the last minute records too: every removal is named)
+        self.remove_rules.insert(id, (rule, seen, waiting));
+    }
+
+    /// `note_remove` unless a rule was named already (the general ways off the road).
+    pub fn note_remove_unnamed(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
+        self.remove_rules.entry(id).or_insert((rule, seen, waiting));
+    }
+
     pub fn is_recording(&self) -> bool {
         self.full.is_some()
     }
@@ -491,7 +521,11 @@ impl Recorder {
                 let mut gone: Vec<u64> = self.known.difference(&now).copied().collect();
                 gone.sort_unstable();
                 for id in gone {
-                    self.line(time, Kind::Other, &RecordRef::Remove { time, id });
+                    let (rule, seen, waiting) = match self.remove_rules.remove(&id) {
+                        Some((r, s, w)) => (Some(r), s, w),
+                        None => (None, false, 0.0),
+                    };
+                    self.line(time, Kind::Other, &RecordRef::Remove { time, id, rule, seen, waiting });
                 }
             }
             self.known = now;
