@@ -20,6 +20,7 @@
 
 use crate::junction::Junctions;
 use crate::record::{read_lines, rules_hash, write_file, Frame, Header, Record};
+use crate::removal::RemoveRule;
 use crate::sim::{External, Simulation, Vehicle};
 use hashbrown::HashMap;
 use omsi_sim::traffic::Network;
@@ -37,6 +38,19 @@ const IN_SYNC: f32 = 0.01;
 
 /// A spawn is put off when a vehicle is this close ahead on its lane (m, bumper to bumper).
 const SPAWN_GAP: f32 = 6.0;
+
+/// [round 7 R7-1 fix 1] A vehicle the population took off (`Replay::removals`).
+#[derive(Debug, Clone, Copy)]
+pub struct Removal {
+    pub time: f64,
+    pub id: u64,
+    pub rule: Option<RemoveRule>,
+    /// The eye saw it (the game's judgement; a free run's in-view rule: true).
+    pub seen: bool,
+    /// Its waiting time (`Vehicle::waiting`) then.
+    pub waiting: f32,
+    pub pos: glam::DVec3,
+}
 
 pub struct Replay {
     pub header: Header,
@@ -94,6 +108,11 @@ pub struct Replay {
     /// The vehicles the run's own network end took off (`Simulation::removed`): (time, id,
     /// speed, place). Appended frame by frame; a caller may drain it.
     pub ended: Vec<(f64, u64, f32, glam::DVec3)>,
+    /// [round 7 R7-1 fix 1] The population's removals: replaying as recorded, the game's
+    /// (`Record::Remove` with the rule it wrote); in a free run, the run's own by the game's
+    /// in-view rule (`removal::goes_in_view`, the eye at the player). Appended frame by
+    /// frame; a caller may drain it.
+    pub removals: Vec<Removal>,
     /// [round 7 E2] Free run: the light clocks were taken from the recording (the first
     /// frame after the starting keyframe); from then on they run on with the run's own
     /// demand (`Simulation::update_lights`).
@@ -158,7 +177,7 @@ impl Replay {
         }
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
         let (net, sim) = build(&header);
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new(), game_at: HashMap::new() };
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), removals: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new(), game_at: HashMap::new() };
         r.stub_links();
         r
     }
@@ -247,7 +266,7 @@ impl Replay {
 
     fn apply(&mut self, i: usize) {
         // (lent out while it is applied, and put back: the replay can start over)
-        let rec = std::mem::replace(&mut self.records[i], Record::Remove { time: 0.0, id: u64::MAX });
+        let rec = std::mem::replace(&mut self.records[i], Record::Remove { time: 0.0, id: u64::MAX, rule: None, seen: false, waiting: 0.0 });
         self.apply_record(&rec);
         self.records[i] = rec;
     }
@@ -289,8 +308,13 @@ impl Replay {
                     None => self.vehicles.push(v),
                 }
             }
-            Record::Remove { id, .. } => {
+            Record::Remove { time, id, rule, seen, waiting } => {
                 let id = *id;
+                if !self.free_run {
+                    if let Some(v) = self.vehicles.iter().find(|v| v.id == id) {
+                        self.removals.push(Removal { time: *time, id, rule: *rule, seen: *seen, waiting: *waiting, pos: v.pos });
+                    }
+                }
                 // (a free run drives its own vehicles: the game's removal of one, made
                 // under the game's rules at the game's time, is not applied to a vehicle
                 // this run still has - a car the game deleted the second its light turned
@@ -528,6 +552,24 @@ impl Replay {
             if i < self.vehicles.len() {
                 let v = self.vehicles.swap_remove(i);
                 self.ended.push((sim.time, v.id, v.state.speed, v.pos));
+            }
+        }
+        // [round 7 R7-1 fix 1] a free run takes off, as the game does, a car that gave up and
+        // goes in view by the game's rule (the eye: the player, the recording has no camera;
+        // out of sight the game takes it off earlier, which a run cannot tell)
+        if self.free_run {
+            if let Some(eye) = sim.players.first().map(|p| p.pos) {
+                let standing = crate::removal::standing_ids(&self.vehicles, &sim.players);
+                let mut i = 0;
+                while i < self.vehicles.len() {
+                    let v = &self.vehicles[i];
+                    if crate::removal::goes_in_view(v.gone && !v.serves_stops(), v, (v.pos - eye).length(), &standing) {
+                        let v = self.vehicles.swap_remove(i);
+                        self.removals.push(Removal { time: sim.time, id: v.id, rule: Some(RemoveRule::InViewAfterGrace), seen: true, waiting: v.waiting, pos: v.pos });
+                    } else {
+                        i += 1;
+                    }
+                }
             }
         }
     }
