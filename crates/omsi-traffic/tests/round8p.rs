@@ -1,8 +1,8 @@
 //! Round 8 P8 (people and buses): pull back into the lane (P8-4), buses and waiters (P8-1),
 //! the pass's sweep (P8-2), the people strip on a bend (P8-5).
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKind, Network};
-use omsi_traffic::{Simulation, Vehicle, VehicleClass, Why};
+use omsi_traffic::{Person, Simulation, Vehicle, VehicleClass, Why};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -148,4 +148,44 @@ fn pass_round_parked(far: bool) -> bool {
 fn p82_no_pass_into_a_car_parked_in_the_oncoming_lane() {
     assert!(pass_round_parked(false), "no pass round a lone parked car");
     assert!(!pass_round_parked(true), "a pass started into a car parked in the oncoming lane");
+}
+
+/// A timetable bus serving stops `serves` drives east at 8 m/s past somebody waiting for a bus
+/// at stop `waits_at`, standing at x 120 `off` m right of its way: (held for them, least
+/// distance between their disc and its body).
+fn bus_past_waiter(serves: [Option<i64>; 2], waits_at: Option<i64>, off: f64) -> (bool, f64) {
+    let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut vs = vec![bus(1, vec![0], 60.0, 8.0)];
+    sim.people = vec![Person { pos: DVec3::new(120.0, -off, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: true, at_kerb: false, waits_at }];
+    let (mut held, mut min, mut t) = (false, f64::INFINITY, 0.0);
+    sim.update_positions(&net, &mut vs);
+    while t < 15.0 {
+        vs[0].external.serves = serves;
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        held |= vs[0].last.why == Why::People;
+        min = min.min(omsi_sim::collision::Obb::point(sim.people[0].pos, 0.28).separation(&vs[0].obb()));
+        t += DT;
+    }
+    (held, min)
+}
+
+/// [P8-1, pass 1 B1] A bus pulls in beside the waiters of the stops it serves - the one it
+/// comes up to and the one it served last, known by the stop they wait at - held only by one
+/// whose body is over its footprint; a waiter of any other stop is held for by the car rule.
+/// No contact either way (round 4d's 0.3 m inside the flank is gone).
+#[test]
+fn p81_a_bus_pulls_in_beside_its_own_stops_waiters_only() {
+    // 1.54 m off the way: clear of a 1.25 m half-wide body and a 0.28 m disc, inside the car
+    // rule's 1.25 + 0.3
+    let own = bus_past_waiter([Some(7), None], Some(7), 1.54);
+    let last = bus_past_waiter([Some(8), Some(7)], Some(7), 1.54);
+    let other = bus_past_waiter([Some(8), None], Some(7), 1.54);
+    let inside = bus_past_waiter([Some(7), None], Some(7), 1.0);
+    eprintln!("own {own:?} last {last:?} other {other:?} inside {inside:?}");
+    assert!(!own.0 && own.1 > 0.0, "held by (or touched) a waiter of its next stop beside it: {own:?}");
+    assert!(!last.0 && last.1 > 0.0, "held by (or touched) a waiter of the stop it served: {last:?}");
+    assert!(other.0 && other.1 > 0.0, "a waiter of another stop not held for by the car rule: {other:?}");
+    assert!(inside.0 && inside.1 > 0.0, "drove into a waiter of its own stop inside its footprint: {inside:?}");
 }

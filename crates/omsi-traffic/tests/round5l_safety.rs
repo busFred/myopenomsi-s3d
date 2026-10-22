@@ -109,7 +109,7 @@ fn sedan(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
     v
 }
 fn walker(x: f64, y: f64, vx: f64, vy: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
 }
 fn walkers_beside(x0: f64) -> Vec<Person> {
     (0..4).map(|k| walker(x0 + k as f64 * 0.7, -1.3 - 0.07 * k as f64, 0.0, 0.1)).collect()

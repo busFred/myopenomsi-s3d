@@ -1180,18 +1180,6 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
     out
 }
 
-/// [P8-1] Is `pos` level with where my body will stand at the stop I am coming up to
-/// (`External::stop_at`, my front's place there): along my way between my rear and my front
-/// as they will stand, a body's radius either side - the stop's own places.
-fn at_stop_place(me: &Vehicle, way: &WayPts, pos: DVec2) -> bool {
-    let Some(stop) = me.external.stop_at else { return false };
-    let Some(k) = way.nearest(pos, f64::INFINITY) else { return false };
-    let (d, q, fwd) = way.pts[k];
-    let along = d + (pos - q).dot(fwd) as f32;
-    let r = crate::plan::PERSON_RADIUS;
-    along >= stop - me.state.front - me.state.rear - r && along <= stop + r
-}
-
 /// The people in the strip ahead: where to stop for them, and the shift inside the drawn
 /// road that lets the car past the ones beside its lane instead, with where to stop once
 /// shifted (for whom the shift does not clear). `parked_swerve`: a swerve round a parked car
@@ -1270,16 +1258,20 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             continue;
         }
         let at_kerb_of_stop = own_stop && !on_crossing && (standing || p.waiting_for_bus);
-        // [P8-1] somebody waiting for a bus at the stop this bus is coming up to, level with
-        // where its body will stand there (`at_stop_place`): round 4d's pull-in beside them
-        // holds for them only inside its footprint. Any other waiter - at another stop, or
-        // for a bus going by - is held for by the car rule (viz5 case02: timetable buses drove
-        // through waiters standing 0.3 m inside their flank away from their own stop)
-        let my_waiter = p.waiting_for_bus && own_stop && at_stop_place(me, way, p.pos.truncate());
+        // [P8-1, pass 1 B1] somebody waiting for a bus at a stop this bus serves - the one it
+        // comes up to or stands at, or the one it served last (`External::serves`, the
+        // waiter's `Person::waits_at`, the stop as the people know it, not a place in metres):
+        // the bus pulls in beside them, held for them only where they stand and only where
+        // their body is over its footprint, as for anybody touching it (round 4d's
+        // `half_width - 0.3`, a planned contact 0.3 m inside the flank with no source, is
+        // gone; SUMO's waiting persons stand on the stop's platform, off the lane, sumo.md
+        // 6.1). Every other waiter - at another stop, for a bus going by - is held for by the
+        // car rule (viz5 case02: timetable buses drove through waiters away from their stop).
+        let my_waiter = p.waiting_for_bus && me.serves_stops() && p.waits_at.is_some() && me.external.serves.contains(&p.waits_at);
         let half = if on_crossing {
             me.half_width + 1.5
         } else if my_waiter {
-            me.half_width - 0.3
+            me.half_width + crate::plan::PERSON_RADIUS
         } else if at_kerb_of_stop {
             // (its footprint and 0.3 m clear of it)
             me.half_width + KERB_CLEAR
@@ -2154,7 +2146,7 @@ mod crossing_tests {
     fn a_walker_on_the_crossing_holds_the_car_until_past_its_band() {
         let net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::new(-12.0, 0.0, 0.0), DVec3::new(12.0, 0.0, 0.0)], LaneKind::Sidewalk, 3.0)], ..Default::default() };
         let z = ZebraCut { walk: 0, along: 20.0, at: DVec2::ZERO, right: DVec2::X, half: 2.5 };
-        let p = |x: f64, vx: f64, on: bool, still: f32| Person { pos: DVec3::new(x, 0.0, 0.0), vel: DVec2::new(vx, 0.0), on_crossing: on, still, waiting_for_bus: false, at_kerb: false };
+        let p = |x: f64, vx: f64, on: bool, still: f32| Person { pos: DVec3::new(x, 0.0, 0.0), vel: DVec2::new(vx, 0.0), on_crossing: on, still, waiting_for_bus: false, at_kerb: false, waits_at: None };
         // coming in from 4 m at 1.8 m/s: held (2.3 m from the band, within 10 m)
         assert!(z.blocked_by(&net, &p(4.0, -1.8, true, 0.0), 0.9, 0.0));
         // the same walking away, past the band: not

@@ -64,6 +64,10 @@ pub struct Person {
     /// the carriageway: clear of a vehicle whose footprint they stand outside.
     #[serde(default)]
     pub at_kerb: bool,
+    /// [P8 pass 1, B1] The stop (its map object id, `bus_service::Stop::id`) somebody waiting
+    /// for a bus waits at: a timetable bus serving that stop pulls in beside them.
+    #[serde(default)]
+    pub waits_at: Option<i64>,
 }
 
 /// A parked car beside a lane.
@@ -145,6 +149,10 @@ impl Passing {
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
+    /// [P8 pass 1, B1] The stops a timetable bus serves here (map object ids): the one it
+    /// comes up to or stands at, and the one it served last. Their waiters (`Person::
+    /// waits_at`) are the ones it pulls in beside.
+    pub serves: [Option<i64>; 2],
     /// Lateral offset into a bay.
     pub bay: Option<f32>,
     /// Indicator off whatever the planner says (doors open).
