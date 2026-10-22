@@ -322,10 +322,11 @@ pub struct Vehicle {
     /// change starts (LC2013's `changed()`); kept with the vehicle, so a keyframe carries it.
     #[serde(default)]
     pub keep_right: f32,
-    /// [Q8-1] Backing up out of a packed queue: the metres still to go back
-    /// (`plan::queue_escape`, `AiState::reverse_step`); kept with the vehicle.
+    /// [Q8-1] Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
+    /// [fix pass 1] (the odometer where it is to stand, fixed when it began or when it was told to
+    /// stop; stopping); kept with the vehicle.
     #[serde(default)]
-    pub reversing: Option<f32>,
+    pub reversing: Option<(f32, bool)>,
     /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
     /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
     /// the car stands - a latch, not a margin.
@@ -571,7 +572,8 @@ impl Vehicle {
     /// red.)
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
-        let moving = self.state.speed > UNHELD_SPEED;
+        // ([Q8-1 fix pass 1] backing up is moving too: SUMO's waiting time restarts with any motion)
+        let moving = self.state.speed.abs() > UNHELD_SPEED;
         let counts = d.why != Why::Light && !self.external.at_stop;
         if moving {
             self.waiting = 0.0;
@@ -1683,18 +1685,18 @@ impl Simulation {
             }
         }
         // [Q8-1] backing up out of a packed queue instead of driving: begun with the lateral
-        // offset frozen where it is, over once the metres are gone or the plan stops it (at rest)
-        let alive = if let Some(left) = plan.reverse {
+        // offset frozen where it is; [fix pass 1] to the place the plan fixed, over once it stands
+        // there
+        let alive = if let Some((target, stopping)) = plan.reverse {
             if v.reversing.is_none() {
                 v.state.freeze_lateral();
             }
-            let back = v.state.reverse_step(net, dt, left);
-            let left = (left - back).max(0.0);
-            v.reversing = if left <= 0.0 && v.state.speed.abs() < 1e-3 {
+            v.state.reverse_step(net, dt, (v.state.odometer - target).max(0.0));
+            v.reversing = if v.state.odometer - target <= 1e-3 && v.state.speed.abs() < 1e-3 {
                 v.state.speed = 0.0;
                 None
             } else {
-                Some(left)
+                Some((target, stopping))
             };
             true
         } else {

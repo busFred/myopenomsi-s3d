@@ -251,3 +251,142 @@ fn q81_a_red_light_queue_never_backs_up() {
     assert_eq!(cars[0].last.why, omsi_traffic::Why::Light);
     assert!(cars.iter().all(|c| c.stopped > 30.0), "{:?}", cars.iter().map(|c| c.stopped).collect::<Vec<_>>());
 }
+
+/// [Q8-1 fix pass 1] The tail of a packed queue of two (car 2) backs up; at the frame it first
+/// backs faster than 0.5 m/s `inject` changes the scene. (How far it backed beyond the place fixed
+/// when it began, the least distance from it to any other body, to any person, whether it backed.)
+fn backing_with(inject: impl Fn(&mut Simulation, &mut Vec<Vehicle>, &Vehicle), secs: f32) -> (f32, f32, f32, bool) {
+    let net = two_lanes();
+    let mut cars = packed_queue(&net, 2, 2.0, 30.0);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.update_positions(&net, &mut cars);
+    let (mut planned, mut done, mut over, mut least, mut least_p, mut backed) = (None::<f32>, false, 0.0f32, f32::INFINITY, f32::INFINITY, false);
+    let mut t = 0.0;
+    while t < secs {
+        sim.tick(&net, DT, &mut cars);
+        let Some(k) = cars.iter().position(|c| c.id == 2) else { break };
+        let me = cars[k].clone();
+        if planned.is_none() {
+            planned = me.reversing.map(|r| r.0);
+        }
+        backed |= me.state.speed < -0.05;
+        if !done && me.state.speed < -0.5 {
+            inject(&mut sim, &mut cars, &me);
+            done = true;
+        }
+        if let Some(p) = planned.filter(|_| me.reversing.is_some() || me.state.speed < 0.0) {
+            over = over.max(p - me.state.odometer);
+        }
+        for o in cars.iter().filter(|o| o.id != 2) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        for q in &sim.people {
+            least_p = least_p.min(me.obb().separation(&omsi_sim::collision::Obb::point(q.pos, 0.28)) as f32);
+        }
+        t += DT;
+    }
+    (over, least, least_p, backed)
+}
+
+/// Where car `me`'s rear is, `d` metres further back along x (the lanes run along x).
+fn behind(me: &Vehicle, d: f64) -> f64 {
+    me.pos.x - me.state.rear as f64 - d
+}
+
+#[test]
+fn q81_fix1_a_backing_car_stops_for_a_person_or_a_car_that_appears_behind_it() {
+    // (safety B1: it held its speed and backed into them, -1.18 m and -1.80 m)
+    let (over, _, least_p, backed) = backing_with(|sim, _, me| {
+        sim.people.push(Person { pos: DVec3::new(behind(me, 1.5), -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false });
+    }, 25.0);
+    eprintln!("person 1.5 m behind: over {over:.2} least person {least_p:.2}");
+    assert!(backed && least_p > 0.3, "backed into the person: {least_p:.2}");
+    assert!(over <= 0.0, "backed {over:.2} m past the place fixed");
+    let (over, least, _, backed) = backing_with(|_, cars, me| {
+        let mut c = car(9, 1, (behind(me, 1.5) - 2.0) as f32, 0.0);
+        c.pull_out = 1000.0;
+        cars.push(c);
+    }, 25.0);
+    eprintln!("car 1.5 m behind: over {over:.2} least {least:.2}");
+    assert!(backed && least > 0.3, "backed into the car: {least:.2}");
+}
+
+#[test]
+fn q81_fix1_a_backing_car_stops_when_the_queue_moves_and_never_backs_past_the_place_fixed() {
+    // (safety B1: the head left, it backed 6 m more at -0.9 m/s; x10 case12 #18778 15 m for 6.6)
+    let (over, least, _, backed) = backing_with(|_, cars, _| {
+        cars.retain(|c| c.id != 5);
+    }, 25.0);
+    eprintln!("head gone: over {over:.2} least {least:.2}");
+    assert!(backed && over <= 0.0, "backed {over:.2} m past the place fixed");
+}
+
+#[test]
+fn q81_fix1_followers_rolling_up_during_the_whole_backing_are_not_backed_into() {
+    // (safety S2) a car, a bus and a motorbike rolling up behind the tail at 10 m/s from 40 m
+    for (class, len, hw) in [(VehicleClass::Car, 4.0f32, 0.9f32), (VehicleClass::Bus, 12.0, 1.25), (VehicleClass::Car, 2.0, 0.4)] {
+        let (over, least, _, backed) = backing_with(move |_, cars, me| {
+            let mut st = AiState::new(1, (behind(me, 40.0) - len as f64 * 0.5) as f32, 9);
+            st.speed = 10.0;
+            st.front = len * 0.5;
+            st.rear = len * 0.5;
+            st.length = len;
+            st.max_speed_kmh = 50.0;
+            st.change_cooldown = 100.0;
+            let mut f = Vehicle::new(9, class, st, hw, 9 * 7919);
+            f.fresh = 0.0;
+            cars.push(f);
+        }, 30.0);
+        eprintln!("{class:?} {len} m follower: backed {backed} over {over:.2} least {least:.2}");
+        assert!(least > 0.3, "{class:?} {len} m: touched {least:.2}");
+        assert!(over <= 0.0);
+    }
+}
+
+#[test]
+fn q81_fix1_no_backing_off_its_own_lane_or_onto_a_crossing() {
+    // (safety B3) the tail stands 1 m from its lane's start (a junction piece behind it): no
+    // backing over the lane's start; and a zebra where it would come to rest: no backing either
+    let net = two_lanes();
+    let mut cars = packed_queue(&net, 1, 2.0, 30.0);
+    // (car 1 moved up to 1 m from the start of lane 1: a queue of one behind a bus parked there)
+    cars[0].state.s = 2.0 + 2.0 + 6.0 + 1.0;
+    cars[1].state.s = 2.0 + 1.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut backed = false;
+    run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        backed |= cars.iter().any(|c| c.id == 1 && c.state.speed < -0.05);
+    });
+    assert!(!backed, "backed off its own lane");
+    let mut net = two_lanes();
+    // (a crossing cut 3 m behind the tail's rear, ped crossing on lane 1)
+    let tail = packed_queue(&net, 1, 2.0, 30.0)[1].state.s;
+    net.walks[1].push((0, tail - 2.0 - 3.0, 0.0));
+    let mut cars = packed_queue(&net, 1, 2.0, 30.0);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut backed = false;
+    run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        backed |= cars.iter().any(|c| c.id == 1 && c.state.speed < -0.05);
+    });
+    assert!(!backed, "backed onto a zebra band");
+}
+
+#[test]
+fn q81_fix1_a_player_held_by_its_red_or_indicating_heads_no_queue_to_back_out_of() {
+    // (safety B2: behind the player standing at a red with its indicator on, the seventh car backed
+    // up 2 s after the green and never went round) the player's bus stands where the bus stood:
+    // indicating, no car backs up; not indicating and held by nothing, the tail does
+    for blinker in [1u8, 0] {
+        let net = two_lanes();
+        let mut cars = packed_queue(&net, 2, 2.0, 30.0);
+        cars.retain(|c| c.id != 5);
+        let mut sim = Simulation::new(&net, vec![]);
+        sim.players.push(omsi_traffic::PlayerView { id: 0, pos: DVec3::new(203.0, -3.5, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 60.0, blinker, signalling: 30.0, priority: false });
+        let mut backed = false;
+        run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+            backed |= cars.iter().any(|c| c.state.speed < -0.05);
+        });
+        eprintln!("player blinker {blinker}: backed {backed}");
+        assert_eq!(backed, blinker == 0, "blinker {blinker}");
+    }
+}

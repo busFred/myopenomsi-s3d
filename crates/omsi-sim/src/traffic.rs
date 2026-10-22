@@ -3082,9 +3082,10 @@ pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
 const STOP_LINE_GAP: f32 = 0.6;
 /// [Q8-1] A car backing up out of a packed queue does so at walking pace (m/s,
-/// `AiState::reverse_step`): 4 km/h, the lower end of "Schrittgeschwindigkeit" (4-7 km/h, German
-/// case law for manoeuvring). (SUMO has no reversing of road vehicles.)
-pub const REVERSE_SPEED: f32 = 4.0 / 3.6;
+/// `AiState::reverse_step`): [fix pass 1] "Schrittgeschwindigkeit" as Austria's Supreme Court set
+/// it, 5 km/h (OGH 23.03.2007, 2Ob262/05a; German courts give 7-10 km/h, no binding value:
+/// de.wikipedia.org/wiki/Schrittgeschwindigkeit). (SUMO has no reversing of road vehicles.)
+pub const REVERSE_SPEED: f32 = 5.0 / 3.6;
 
 /// A lane change: the car moves over from its lane to `to` along `length` metres of road
 /// (by distance, not by time: a car that has to stop halfway stands still, and so does its
@@ -3766,8 +3767,8 @@ impl AiState {
     /// slowing at the driver's comfortable brake to stand where `left` runs out; the speed is
     /// negative meanwhile, the odometer runs back (the wheels turn backwards) and the lateral
     /// offset stays where it is (the ramps run by the odometer: the caller freezes them,
-    /// `freeze_lateral`). Back over the start of the lane onto the one it came from; with none
-    /// known it stops there. Returns the distance moved back.
+    /// `freeze_lateral`). [fix pass 1] Never over the start of its own lane: it stops there.
+    /// Returns the distance moved back.
     pub fn reverse_step(&mut self, net: &Network, dt: f32, left: f32) -> f32 {
         self.change_cooldown = (self.change_cooldown - dt).max(0.0);
         let left = left.max(0.0);
@@ -3778,24 +3779,13 @@ impl AiState {
         let mut back = (-(v0 + v1) * 0.5 * dt).clamp(0.0, left);
         let mut v1 = if back >= left { 0.0 } else { v1 };
         self.s -= back;
-        while self.s < 0.0 {
-            match self.prev_lane.filter(|&p| p < net.lanes.len()) {
-                Some(p) => {
-                    if let Some(n) = self.planned_next {
-                        self.ahead.insert(0, n);
-                    }
-                    self.planned_next = Some(self.lane);
-                    self.lane = p;
-                    self.s += net.lanes[p].length();
-                    self.prev_lane = None;
-                }
-                None => {
-                    back += self.s;
-                    self.s = 0.0;
-                    v1 = 0.0;
-                }
-            }
+        // ([fix pass 1] never back over the start of its own lane: the escape keeps the body on it)
+        if self.s < 0.0 {
+            back += self.s;
+            self.s = 0.0;
+            v1 = 0.0;
         }
+        let _ = net;
         self.odometer -= back;
         self.acc = if dt > 0.0 { (v1 - v0) / dt } else { 0.0 };
         self.speed = v1;
