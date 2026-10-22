@@ -1562,6 +1562,13 @@ impl Simulation {
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
+        // [P8 pass 1, S1] held out of its lane on the way back in: the ramp back begins where
+        // the body would first feel it once let go - its start kept a heading chord ahead of
+        // the standing body, so the body is not drawn turned into the lane while it waits
+        // (x10 case08 #10940 stood turned 17 degrees, heading 168 -> 152, for 3 s)
+        if plan.reentry_held {
+            v.state.lateral_ramp.2 = v.state.odometer + omsi_sim::traffic::HEADING_CHORD;
+        }
         // a lane change begins only when nobody started one into the same stretch this
         // frame (the perception was taken before anybody moved)
         let mut change_into = |to: usize, s_to: f32| -> bool {

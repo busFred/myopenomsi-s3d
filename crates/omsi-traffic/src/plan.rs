@@ -87,6 +87,9 @@ pub struct Plan {
     pub help: Option<(usize, f32, f32, f32)>,
     /// [J7-3] What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
+    /// [P8 pass 1, S1] Held standing out of its lane on the way back in (`reentry_clear`):
+    /// the ramp back is not begun while held (`Simulation` keeps its start ahead of the body).
+    pub reentry_held: bool,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -108,11 +111,19 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
 /// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
 /// (the follower need not brake hard). (`informFollower` asks for it, [J7-3].)
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
+    accepted_gap(me, nb.behind_min_gap, vb, v)
+}
+
+/// The gap (m) I accept in front of a follower whose standing gap is `min_gap`, coming at `vb`
+/// m/s while I go at `v`: its standing gap, my accepted time gap at its speed and what it
+/// sheds braking at my comfort to my speed. (`gap_needed_behind`'s, and since [P8-4] the
+/// re-entry's from out of the lane, `reentry_clear`.)
+fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
     // ([fix pass 2] the follower's own standing gap, not a fixed 2 m: the helper opens exactly
     // this gap, `informFollower`, one function on both sides; a follower resting at its 1.57 m
     // standing gap behind the changer was never accepted, and both stood)
-    nb.behind_min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
+    min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
 }
 
 /// [`gap_accepted`]'s two halves: (the follower there need not brake hard, there is room ahead).
@@ -694,7 +705,9 @@ fn reentering(me: &Vehicle) -> bool {
     let st = &me.state;
     let (_, _, x0, len) = st.lateral_ramp;
     let to = me.external.bay.unwrap_or(st.lateral_target);
-    me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
+    // (not a settled lane change's offset easing in place, `Simulation::sidestep`: it moves
+    // sideways standing, not back into the traffic)
+    !st.settled_offset && me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
 }
 
 /// [P8-4] Is the way back into the lane clear (SUMO: a stopped vehicle goes back into the
@@ -720,7 +733,10 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 {
             continue;
         }
-        let stop = o.state.speed * o.state.speed / (2.0 * o.params.comfort_brake);
+        // ([P8 pass 1, S1] the gap a lane change accepts in front of it, `accepted_gap`: its
+        // standing gap, the time gap and its braking to my standstill - not its bare braking
+        // distance, with which a car at 13.9 m/s 40 m behind had to brake at 3.1-3.3 m/s²)
+        let stop = accepted_gap(me, o.params.min_gap, o.state.speed, st.speed);
         if (o.pos - me.pos).truncate().length() > reach + (o.state.front + o.half_width + stop) as f64 {
             continue;
         }
@@ -734,12 +750,12 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
             return false;
         }
     }
-    let player_brake = DriverParams::preset(crate::sim::PLAYER_PRESET).comfort_brake;
+    let player_gap = DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
     !sim.players.iter().any(|pl| {
         if (pl.pos.z - me.pos.z).abs() > 3.0 {
             return false;
         }
-        let stop = (pl.speed * pl.speed / (2.0 * player_brake)) as f64;
+        let stop = accepted_gap(me, player_gap, pl.speed, st.speed) as f64;
         let b = pl.obb(stop, 0.0);
         poses.iter().any(|q| b.separation(q) < 0.0)
     })
@@ -1209,6 +1225,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // is clear of anybody who could not stop for it (`reentry_clear`)
     if v < STANDING_SPEED && reentering(me) && !reentry_clear(net, sim, vehicles, me) {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
+        out.reentry_held = true;
     }
     if let Some(d) = p.letting_out {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + (d - 1.0).max(0.0)), Why::LetOut);
