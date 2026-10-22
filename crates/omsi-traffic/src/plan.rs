@@ -1632,6 +1632,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
+    // 10b. [round 8 H8-7, fix pass 1] the edge of the loaded tiles (`Lane::loaded_edge`): the
+    //      road goes on into a tile that is not loaded; the car stops before the lane's end, as a
+    //      bus at its loaded route's end, and the game takes it off once nobody sees it (a
+    //      dead-end removal) or lets it on when the tile comes
+    if let Some(&(el, d0)) = p.way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())) {
+        let end = d0 + net.lanes[el].length() - 0.5;
+        min_stop(&mut out.stop, &mut out.why, Some(end.max(st.front - 0.3)), Why::End);
+    }
+
     // 11. [fix pass 3, 2] keep the box clear, on every aspect (SUMO's no-block heuristic,
     //     sumo.md §2): a car short of its junction's lit line does not cross it while where it
     //     would come to rest - its stop (people, a refusal) or behind a lead standing or coming

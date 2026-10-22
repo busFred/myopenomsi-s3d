@@ -253,3 +253,38 @@ fn h8_8_a_pull_out_waits_for_somebody_on_its_way_out_then_drives_from_its_offset
     assert!(cars[0].state.lateral.abs() < 0.1, "not on its lane at the end: {:.2}", cars[0].state.lateral);
     assert!(!touched);
 }
+
+/// [H8-7, fix pass 1] A lane that ends at the loaded tiles' edge (`Lane::loaded_edge`): the car
+/// stops before its end (`Why::End`) and is not taken off the network; a lane ending at the map's
+/// own end is driven off as before (`Simulation::removed`).
+#[test]
+fn h8_7_a_car_stops_at_the_loaded_edge_and_drives_off_the_maps_end() {
+    for edge in [true, false] {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
+        net.lanes[0].loaded_edge = edge;
+        net.link(1.5);
+        net.compute_conflicts();
+        net.compute_reach();
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(1, 0, 20.0, 12.0)];
+        let mut gone = false;
+        let mut t = 0.0;
+        sim.update_positions(&net, &mut cars);
+        while t < 40.0 && !gone {
+            sim.tick(&net, DT, &mut cars);
+            gone = !sim.removed.is_empty();
+            for &i in &sim.removed {
+                cars.remove(i);
+            }
+            t += DT;
+        }
+        if edge {
+            assert!(!gone, "driven off the loaded edge");
+            let c = &cars[0];
+            assert!(c.state.speed < 0.3 && c.last.why.name() == "end" && c.state.s + c.state.front <= 200.0, "s {:.1} v {:.1} why {}", c.state.s, c.state.speed, c.last.why.name());
+        } else {
+            assert!(gone, "the map's end: driven off as before");
+        }
+    }
+}

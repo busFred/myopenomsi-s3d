@@ -149,6 +149,7 @@ fn removal_rule(why: &str) -> RemoveRule {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
         w if w.starts_with("at a dead end") || w.starts_with("at the loaded route's end") => RemoveRule::DeadEnd,
         _ => RemoveRule::Other,
@@ -350,6 +351,16 @@ const DRIVER_NEAR: f64 = 70.0;
 /// and a turn of the head see what is near (see [`Traffic::may_appear`]).
 const NEVER_VANISH_WITHIN: f64 = 150.0;
 
+/// Lane ends within this distance (m) of a lane start are linked (`Network::link`, the value
+/// the network has always been linked with).
+const LANE_LINK_TOL: f64 = 1.5;
+
+/// [round 8 H8-7, fix pass 1] Whether world point `probe` lies on a tile of the map (`has_tile`)
+/// whose lanes are not loaded (`lane_tiles`): the way on from a lane end there is not loaded.
+fn loaded_edge_at(probe: DVec3, tile_size: f64, has_tile: &dyn Fn((i32, i32)) -> bool, lane_tiles: &hashbrown::HashSet<(i32, i32)>) -> bool {
+    let key = ((probe.x / tile_size).floor() as i32, (probe.y / tile_size).floor() as i32);
+    has_tile(key) && !lane_tiles.contains(&key)
+}
 /// Within this distance a vehicle appears or vanishes only behind something, wherever the
 /// player looks (see `Traffic::hidden`).
 const NEAR_HIDE: f64 = 350.0;
@@ -993,7 +1004,7 @@ impl Traffic {
         if net.left_hand {
             log::info!("traffic: the map drives on the left");
         }
-        net.link(1.5);
+        net.link(LANE_LINK_TOL);
         let mut types = Vec::new();
         let mut groups: Vec<omsi_map::ailists::UnschedGroup> = Vec::new();
         let mut group_uvg: Vec<Option<usize>> = Vec::new();
@@ -1327,6 +1338,7 @@ impl Traffic {
             overlap_checked: 0.0,
         };
         t.sort_parked(parked_cars, lanes);
+        t.mark_loaded_edges(world);
         if let Ok(path) = omsi_cfg::env::var("OMSI_TRAFFIC_RECORD") {
             if let Err(e) = t.start_recording(Path::new(&path)) {
                 log::warn!("traffic: cannot record to {path}: {e}");
@@ -1895,6 +1907,10 @@ impl Traffic {
                 && c.ai.state.speed < 0.1
                 && c.ai.state.route.last() == Some(&c.ai.state.lane)
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
+            // [round 8 H8-7, fix pass 1] stopped at the edge of the loaded tiles
+            let at_loaded_edge = c.ai.last.why == Why::End
+                && c.ai.stopped > AT_END_STAND
+                && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
             let sleeps_instead = !c.serves_stops() && !c.ai.gone && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
@@ -1914,6 +1930,18 @@ impl Traffic {
                 first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
             } else if !random {
                 None
+            } else if at_loaded_edge {
+                // [round 8 H8-7, fix pass 1] standing at the edge of the loaded tiles (`Lane::
+                // loaded_edge`, the crate stops it there): it goes by the rule of a timetable bus
+                // at its loaded route's end (`at_edge` above: once nobody sees it, or far off, or
+                // after long), a dead-end removal, gated and counted (it drove off the loaded
+                // network in view as "the network's end": 607 in frame at 873 m, Jiangzhaikou;
+                // held until hidden alone, 91 cars queued there in 600 s with the road in view)
+                first(&[
+                    (&|| hidden(), "at the loaded tiles' edge, out of sight"),
+                    (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded tiles' edge, far off"),
+                    (&|| c.ai.stopped > STOOD_LONG, "at the loaded tiles' edge, long"),
+                ])
             } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at a dead end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at a dead end, long"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
                 // (and in view too once others wait behind it: a fire engine at the end of a
                 // dead-end street held a queue of fourteen cars for two and a half minutes)
@@ -4864,6 +4892,22 @@ impl Traffic {
 }
 
 impl Traffic {
+    /// [round 8 H8-7, fix pass 1] Mark the street lanes that end at the edge of the loaded tiles
+    /// (`Lane::loaded_edge`): no lane on, and the road's way on - `LANE_LINK_TOL` past the end,
+    /// where a lane going on would be linked - lies on a tile of the map whose lanes are not
+    /// loaded. (The "network's end" 873 m ahead at Jiangzhaikou, lanes 149-155 at y = -2455,
+    /// is the loaded tiles' edge: 7 of the map's 91 tiles are loaded at the start.)
+    pub fn mark_loaded_edges(&mut self, world: &World) {
+        let ts = omsi_map::tile_size();
+        for l in self.net.lanes.iter_mut() {
+            l.loaded_edge = l.kind == LaneKind::Street && l.next.is_empty() && !l.points.is_empty() && {
+                let (end, h) = (l.end(), (l.end_heading() as f64).to_radians());
+                let probe = end + DVec3::new(h.sin(), h.cos(), 0.0) * LANE_LINK_TOL;
+                loaded_edge_at(probe, ts, &|k| world.has_tile(k), &self.lane_tiles)
+            };
+        }
+    }
+
     /// Take in what the tiles loaded since the last call brought: their lanes (linked into
     /// the network, whose existing indices stay valid), their parked cars (sorted onto the
     /// lanes once those are in) and the light programs of their crossings.
@@ -4875,7 +4919,7 @@ impl Traffic {
             if self.recorder.is_recording() {
                 self.recorder.lanes_added(self.sim.time, self.net.lanes.len(), &new);
             }
-            added = self.net.extend(new, 1.5);
+            added = self.net.extend(new, LANE_LINK_TOL);
             self.sim.network_grew(&self.net, added.start);
             self.street_weight += self.net.lanes[added.clone()].iter().filter_map(street_lane_weight).sum::<f64>();
             log::debug!(
@@ -4887,6 +4931,9 @@ impl Traffic {
         if !tiles.is_empty() {
             self.lane_tiles.extend(tiles);
             self.lanes_generation += 1;
+        }
+        if n > 0 {
+            self.mark_loaded_edges(world);
         }
         self.sort_parked(parked_cars, added);
         // new crossings bring their light programs; the running ones keep their clocks
@@ -5405,3 +5452,26 @@ mod respawn_sight_tests {
     }
 }
 
+#[cfg(test)]
+mod loaded_edge_tests {
+    use super::*;
+
+    /// [round 8 H8-7, fix pass 1] A lane end whose way on lies on a tile of the map that is not
+    /// loaded is the loaded tiles' edge (the car stops there and goes once hidden, a dead-end
+    /// removal); one whose way on lies on a loaded tile, or off the map, is the network's end; the
+    /// removal is a gated dead-end rule.
+    #[test]
+    fn h8_7_the_loaded_edge_is_a_tile_of_the_map_not_loaded() {
+        let ts = 300.0;
+        let map: hashbrown::HashSet<(i32, i32)> = [(0, 0), (0, 1)].into_iter().collect();
+        let has = |k: (i32, i32)| map.contains(&k);
+        let mut loaded: hashbrown::HashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
+        let probe = DVec3::new(10.0, 300.0 + LANE_LINK_TOL, 0.0);
+        assert!(loaded_edge_at(probe, ts, &has, &loaded), "the next tile is the map's, not loaded");
+        loaded.insert((0, 1));
+        assert!(!loaded_edge_at(probe, ts, &has, &loaded), "loaded: a real end");
+        assert!(!loaded_edge_at(DVec3::new(-10.0, 100.0, 0.0), ts, &has, &loaded), "off the map");
+        assert_eq!(removal_rule("at the loaded tiles' edge, out of sight"), RemoveRule::DeadEnd);
+        assert!(RemoveRule::DeadEnd.gated());
+    }
+}
