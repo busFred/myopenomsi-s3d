@@ -77,7 +77,12 @@ pub fn lead_of(d: &Decision) -> Option<u64> {
 /// the junction (sumo.md 5.3, `MSLane::executeMovements` teleports the lane's front vehicle),
 /// so a car with a vehicle lead on its approach is in a queue whether that lead stands or
 /// creeps this frame (x10 c08 #1477, a mid-queue car, was taken off the frame its lead #1261
-/// crept: the speed was sampled in one frame).
+/// crept: the speed was sampled in one frame). ([fix pass 1] Stricter than SUMO, which
+/// teleports the first vehicle of each LANE that is not moving (`MSLane::executeMovements`,
+/// `firstNotStopped`), so also a car in mid-queue at a lane boundary; OMSI's spline lanes are
+/// short - a queue of a few cars spans several of them, a lane boundary mid-queue is the rule -
+/// so here a car with a vehicle lead in front of it is in the queue whatever lane that lead is
+/// on.)
 pub fn in_a_queue(d: &Decision) -> bool {
     lead_of(d).is_some() && d.lead.is_some_and(|l| l.gap < QUEUE_LEAD)
 }
