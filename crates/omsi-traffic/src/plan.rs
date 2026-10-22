@@ -1493,14 +1493,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        // [P8-2] a pass on the oncoming lane sweeps its path as the squeeze and the bypass
-        // do: the body out, level with what it passes and back in clear of every body and
-        // person by `SQUEEZE_CLEARANCE` (`squeeze_clear`), and turned along its S-curve
-        // (`bypass_sweep_clear`) - not only the oncoming lane's gap (the last test, the
-        // costly one)
-        let pass_level = real + obstacle_len + st.front + st.rear + 2.0;
-        let pass_swept = || squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, pass_level, Passing::back_len_for(side)) && bypass_sweep_clear(net, sim, vehicles, me, side, out_len, pass_level);
-        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free && pass_swept()));
+        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
         let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
@@ -1532,8 +1525,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // has closed up (no 3 s stop of its own); a pass waits for 3 s stopped
         let early = squeeze && player && v < SQUEEZE_START_SPEED;
         let ready = (me.stopped >= 3.0 || early || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
-        if pass_possible && ready {
-            let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
+        // [P8-2] a pass on the oncoming lane starts only when its path is swept as the
+        // bypass's is (`bypass_sweep_clear`): the body turned along its S-curve (the out
+        // length it will drive) out and level with what it passes, clear of every vehicle's
+        // and player's body by `SQUEEZE_CLEARANCE` - not on the oncoming lane's gap alone.
+        // Only the start: the keep-back still reads the pass as possible (gating it too made a
+        // car close up and later start where it should not - round4b x6), and not the
+        // squeeze's linear corridor (`squeeze_clear`: from a queue gap behind a parked car its
+        // straight ramp cut the car passed and the pass never came - adversarial b1c).
+        let pass_out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
+        let pass_swept = || squeeze || bypass_sweep_clear(net, sim, vehicles, me, side, pass_out_len, real + obstacle_len + st.front + st.rear + 2.0);
+        if pass_possible && ready && pass_swept() {
+            let out_len = pass_out_len;
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
             let lane = if squeeze { None } else { oncoming.map(|o| o.lane) };
             let wait = if squeeze { SQUEEZE_SIGNAL } else { omsi_sim::traffic::SIGNAL_BEFORE_CHANGE };
