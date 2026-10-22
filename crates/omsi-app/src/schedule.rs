@@ -485,6 +485,21 @@ const PIN_MOVING: f32 = 1.0;
 /// bus's comfortable braking, `DriverParams::preset` Bus `comfort_brake`).
 const PIN_DECEL: f32 = 1.5;
 
+/// [P8-3] Where a tour's bus handed its next trip at `s0` on its lane (`lane_len` m long) and
+/// moving at `v0` stops for that trip's first stop, which lies just behind it: where it
+/// stands, or on the move where it comes to rest braking at `PIN_DECEL` - when that lies on
+/// its lane. On the move with that rest past the lane's end the stop counts as passed (None), as SUMO's
+/// `MSBaseVehicle::addStop` refuses a stop on the vehicle's lane within its brake gap ("too
+/// close to brake"): clamped to the lane's end, the pin on a short last lane stood the bus
+/// at the mouth of the junction beyond, braking harder than its comfort to get there.
+fn first_stop_pin(s0: f32, v0: f32, lane_len: f32) -> Option<f32> {
+    if v0 <= PIN_MOVING {
+        return Some((s0 + 0.3).min(lane_len));
+    }
+    let pin = s0 + v0 * v0 / (2.0 * PIN_DECEL) + 0.3;
+    (pin <= lane_len).then_some(pin)
+}
+
 /// A tour's bus takes its next trip on only from one of the trip's first lanes (or a short
 /// way onto one of them): Omsi.exe starts every trip at its beginning.
 const TOUR_ENTRY_LANES: usize = 4;
@@ -2561,15 +2576,15 @@ impl Schedule {
             // the stops from the bus on; one just behind it on its lane is where it stands -
             // [round 6 B2] or, handed over on the move at the end of its track, where it comes
             // to rest braking gently (pinned at its front it stopped dead from speed)
-            let pin = if v0 > PIN_MOVING { s0 + v0 * v0 / (2.0 * PIN_DECEL) + 0.3 } else { s0 + 0.3 };
-            let pin = pin.min(traffic.net.lanes[lane0].length());
+            // ([P8-3] on its lane, or not at all: `first_stop_pin`)
+            let pin = first_stop_pin(s0, v0, traffic.net.lanes[lane0].length());
             let stops: Vec<(usize, f32, f32, f64, i64, f32)> = stops
                 .into_iter()
                 .filter(|st| st.0 >= from)
                 .filter_map(|(ri, ss, lat, t, id, side)| {
                     let nri = (ri as isize + shift) as usize;
                     if nri == 0 && ss <= s0 + 0.3 {
-                        (s0 - ss < 25.0).then_some((0, pin, 0.0, t, id, side))
+                        pin.filter(|_| s0 - ss < 25.0).map(|pin| (0, pin, 0.0, t, id, side))
                     } else {
                         Some((nri, ss, lat, t, id, side))
                     }
@@ -5492,6 +5507,22 @@ impl PlayerDuty {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// [P8-3] The first stop behind a bus handed its next trip: where it stands when it
+    /// creeps, where it comes to rest braking gently on the move - and passed, not clamped
+    /// to the lane's end, when that rest lies beyond its lane.
+    #[test]
+    fn a_first_stop_the_bus_cannot_brake_for_on_its_lane_is_passed() {
+        // creeping: where it stands
+        assert_eq!(first_stop_pin(10.0, 0.5, 12.0), Some(10.3));
+        // 8 m/s with 30 m of lane left: 8^2 / 3 = 21.3 m on
+        let pin = first_stop_pin(10.0, 8.0, 40.0).unwrap();
+        assert!((pin - (10.0 + 64.0 / 3.0 + 0.3)).abs() < 1e-3);
+        // the same on a short last lane (8 m left): passed, not pinned at the lane's end
+        assert_eq!(first_stop_pin(10.0, 8.0, 18.0), None);
+        // standing at the very end: where it stands
+        assert_eq!(first_stop_pin(17.8, 0.0, 18.0), Some(18.0));
+    }
 
     /// [ROLLBACK r4d-B1] A road east (lanes 0, 1) whose bridge the map left without paths:
     /// lane 1 ends in nothing at x = 200, the track goes on 300 m further on (lanes 2, 3).
