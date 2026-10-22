@@ -317,6 +317,11 @@ pub struct Vehicle {
     /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
     #[serde(default)]
     pub look_ahead_speed: f32,
+    /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
+    /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
+    /// the car stands - a latch, not a margin.
+    #[serde(default)]
+    pub lane_end_stop: Option<f32>,
     /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
     /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
     /// vehicle, so a keyframe carries it.
@@ -521,6 +526,7 @@ impl Vehicle {
             change_still: (0.0, 0.0),
             help_for: None,
             look_ahead_speed: 0.0,
+            lane_end_stop: None,
             zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
@@ -1562,6 +1568,9 @@ impl Simulation {
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
+        // [Q8-4] the last-resort stop's latch: dropped with a start or standing (the plan places it
+        // afresh only while the wish is blocked)
+        v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
         // a lane change begins only when nobody started one into the same stretch this
         // frame (the perception was taken before anybody moved)
         let mut change_into = |to: usize, s_to: f32| -> bool {

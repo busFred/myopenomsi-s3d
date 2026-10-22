@@ -87,6 +87,9 @@ pub struct Plan {
     pub help: Option<(usize, f32, f32, f32)>,
     /// [J7-3] What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
+    /// [Q8-4] The last-resort stop before a lane's end placed this frame (the odometer where the
+    /// front stops, `Vehicle::lane_end_stop`).
+    pub lane_end_stop: Option<f32>,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -1235,12 +1238,17 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // has to, within its comfortable stopping distance (SUMO's vehicle stops at a dead
             // lane's end as late as its model lets it: braking earlier, it slowed beside the
             // follower that braked to make room, and the gap never opened)
+            // ([Q8-4] once placed it is kept - a latch, `Vehicle::lane_end_stop` - until the change
+            // starts or the car stands: placed and dropped by the brake test frame by frame, it
+            // flicked on and off in the last metre, an 8 m/s² brake-light flicker)
             if let Some(e) = p.lane_end.filter(|e| e.kind != LaneEndKind::Merge) {
                 let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
                 let room = change_space(0.0, st.accel).max(bypass_min_len(me.length(), side));
-                let at = st.front + e.dist - room;
-                if at > st.front - 0.3 && at - st.front <= v * v / (2.0 * dp.comfort_brake) {
+                let latched = me.lane_end_stop.filter(|_| v >= STANDING_SPEED).map(|o| st.front + (o - st.odometer));
+                let at = latched.unwrap_or(st.front + e.dist - room);
+                if latched.is_some() || (at > st.front - 0.3 && at - st.front <= v * v / (2.0 * dp.comfort_brake)) {
                     min_stop(&mut out.stop, &mut out.why, Some(at), Why::Merge);
+                    out.lane_end_stop = Some(st.odometer + (at - st.front));
                 }
             }
         }

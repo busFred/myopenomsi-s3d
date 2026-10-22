@@ -259,3 +259,39 @@ fn j73_a_lane_ending_past_an_object_is_left_on_the_approach() {
     assert!(least > 0.3 || cars.len() < 2);
 }
 
+
+/// [Q8-4] The last-resort stop before a lane's end, with no gap in the lane beside (a queue
+/// standing there): once placed it is kept until the car stands - it flicked on and off frame by
+/// frame in the last metre (an 8 m/s² brake-light flicker) - and the car stands before the end.
+#[test]
+fn q84_the_last_resort_stop_at_a_lane_end_is_a_latch() {
+    let net = lane_drop(&[3]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 1, 450.0, 12.0)];
+    // (the open lane packed beside the last 120 m: no gap)
+    for k in 0..24u64 {
+        let mut c = car(100 + k, 0, 480.0 + 5.0 * k as f32, 0.0);
+        c.pull_out = 1000.0;
+        c.state.change_cooldown = 100.0;
+        cars.push(c);
+    }
+    let (mut placed, mut dropped, mut on_closed, mut hardest) = (false, 0usize, false, 0.0f32);
+    run(&net, &mut sim, &mut cars, 30.0, |_, cars| {
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
+        on_closed |= me.state.lane == 3;
+        let stop = me.last.why == omsi_traffic::Why::Merge;
+        if me.state.speed >= 0.3 {
+            if placed && !stop {
+                dropped += 1;
+            }
+            placed = stop;
+            hardest = hardest.max(-me.state.acc);
+        }
+    });
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    eprintln!("lane-end stop: dropped while rolling {dropped}, hardest {hardest:.1} m/s², stands at s {:.1} v {:.2}", me.state.s, me.state.speed);
+    assert!(!on_closed, "drove into the closed lane");
+    assert_eq!(dropped, 0, "the last-resort stop was dropped while rolling");
+    assert!(me.state.speed < 0.3 && me.state.lane == 1, "did not stand before the end");
+    assert!(hardest < omsi_sim::traffic::MAX_BRAKE, "braked {hardest:.1} m/s²");
+}
