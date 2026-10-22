@@ -322,6 +322,10 @@ pub struct Vehicle {
     /// change starts (LC2013's `changed()`); kept with the vehicle, so a keyframe carries it.
     #[serde(default)]
     pub keep_right: f32,
+    /// [Q8-1] Backing up out of a packed queue: the metres still to go back
+    /// (`plan::queue_escape`, `AiState::reverse_step`); kept with the vehicle.
+    #[serde(default)]
+    pub reversing: Option<f32>,
     /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
     /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
     /// the car stands - a latch, not a margin.
@@ -532,6 +536,7 @@ impl Vehicle {
             help_for: None,
             look_ahead_speed: 0.0,
             keep_right: 0.0,
+            reversing: None,
             lane_end_stop: None,
             zip_behind: None,
             mutual: None,
@@ -1677,7 +1682,24 @@ impl Simulation {
                 n += 1;
             }
         }
-        let alive = v.state.drive(net, dt, plan.lead, plan.stop);
+        // [Q8-1] backing up out of a packed queue instead of driving: begun with the lateral
+        // offset frozen where it is, over once the metres are gone or the plan stops it (at rest)
+        let alive = if let Some(left) = plan.reverse {
+            if v.reversing.is_none() {
+                v.state.freeze_lateral();
+            }
+            let back = v.state.reverse_step(net, dt, left);
+            let left = (left - back).max(0.0);
+            v.reversing = if left <= 0.0 && v.state.speed.abs() < 1e-3 {
+                v.state.speed = 0.0;
+                None
+            } else {
+                Some(left)
+            };
+            true
+        } else {
+            v.state.drive(net, dt, plan.lead, plan.stop)
+        };
         // a change of the driver's own whose target lane (moving on along its plan) is closed
         // to it: given up while the body is less than half over (viz5 case04 #5644 went on from
         // 3470's rule-less bus lane piece into 3474's)

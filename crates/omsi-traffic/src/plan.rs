@@ -90,6 +90,9 @@ pub struct Plan {
     /// [Q8-4] The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
+    /// [Q8-1] Backing up out of a packed queue: the metres still to go back this frame (0: stop
+    /// backing up - the strip behind is no longer clear or the queue moves; `queue_escape`).
+    pub reverse: Option<f32>,
     /// [Q8-3] SUMO LC2013's keep-right accumulation this frame (per second, `keep_right_rate`):
     /// `Vehicle::keep_right` grows by it; None where no lane beside on the keep side is one the
     /// driver may change onto (the wish is left as it is).
@@ -826,6 +829,138 @@ fn behind_an_obstacle(vehicles: &[Vehicle], lead: &crate::perception::Headway) -
     false
 }
 
+/// [Q8-1] A car stood this long (s) behind a queue whose head is an obstacle backs up to the room
+/// a bypass needs (`queue_escape`): as long as anything standing takes to be an obstacle whatever
+/// holds it (`perception::HELD_OBSTACLE_STAND`, the cleanup's one definition).
+pub const QUEUE_ESCAPE_STAND: f32 = crate::perception::HELD_OBSTACLE_STAND;
+
+/// [Q8-1] Is the standing `lead` in a queue an escape is for - its head (`QUEUE_LOOK` vehicles on
+/// at most, linked by their leads) an obstacle of `behind_an_obstacle`'s kinds (at the end of its
+/// way, or standing `QUEUE_OBSTACLE_STAND` held by nothing) or a player's vehicle standing as
+/// long - but not a bus at its stop (it serves it, its doors open: keep-back only) and never a
+/// queue at a red light, a junction or people (their heads are held by them)? (The player's bus
+/// carries no door state: standing in a lane it is taken as one standing for good.)
+fn escape_head(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
+    if lead.speed >= STANDING_SPEED {
+        return false;
+    }
+    let player_stands = |id: u32| sim.players.iter().find(|p| p.id == id).is_some_and(|p| p.speed.abs() < STANDING_SPEED && p.still >= QUEUE_OBSTACLE_STAND);
+    let mut j = match lead.what {
+        Seen::Vehicle(j) | Seen::Body(j) => j,
+        Seen::Player(id) => return player_stands(id),
+        Seen::Parked => return false,
+    };
+    for _ in 0..QUEUE_LOOK {
+        let Some(o) = vehicles.get(j) else { return false };
+        if o.state.speed.abs() >= STANDING_SPEED || o.passing.is_some() || o.state.change.is_some() || o.reversing.is_some() {
+            return false;
+        }
+        let why = o.last.why;
+        if o.external.at_stop || why == Why::Service {
+            return false;
+        }
+        if why == Why::End || (!o.last.held && why != Why::Lead && o.stopped >= QUEUE_OBSTACLE_STAND) {
+            return o.blinker_shown.0 == 0;
+        }
+        if why != Why::Lead {
+            return false;
+        }
+        match o.last.lead_seen {
+            Some(Seen::Player(id)) => return player_stands(id),
+            _ => {}
+        }
+        let Some(next) = o.last.lead_id.and_then(|id| vehicles.iter().position(|v| v.id == id)) else { return false };
+        j = next;
+    }
+    false
+}
+
+/// [Q8-1] Is the strip behind me clear for backing up `back` m and keeping my standing gap
+/// there: my body moved back along my way over every half metre of `back` + `min_gap` touches no
+/// vehicle, player's vehicle, parked car or person by `SQUEEZE_CLEARANCE` - a vehicle on the move
+/// taken where it comes to rest braking comfortably (backing up into a car rolling up behind)?
+fn rear_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, back: f32) -> bool {
+    let st = &me.state;
+    let reach = back + st.min_gap;
+    let clearance = SQUEEZE_CLEARANCE as f64;
+    let near = sim.vehicles_near(me.pos, (reach + st.rear + 60.0) as f64);
+    let others: Vec<Obb> = near
+        .iter()
+        .filter(|&&j| vehicles[j].id != me.id && (vehicles[j].pos.z - me.pos.z).abs() <= 3.0)
+        .map(|&j| {
+            let o = &vehicles[j];
+            let v = o.state.speed;
+            if v.abs() < STANDING_SPEED {
+                return o.obb();
+            }
+            // (where it comes to rest)
+            let d = v.signum() * v * v / (2.0 * o.params.comfort_brake.max(0.1));
+            let p = o.state.way_point(net, d).truncate();
+            let p2 = o.state.way_point(net, d + 1.0).truncate();
+            let f = (p2 - p).normalize_or_zero();
+            let h = if f.length_squared() < 0.5 { o.heading as f64 } else { f.x.atan2(f.y).to_degrees() };
+            Obb::vehicle(p, h, o.state.front as f64, o.state.rear as f64, o.half_width as f64)
+        })
+        .collect();
+    let people = sim.people_near(me.pos, (reach + st.rear + 5.0) as f64);
+    let mut parked: Vec<Obb> = Vec::new();
+    for (&l, list) in sim.parked.iter() {
+        let Some(lane) = net.lanes.get(l) else { continue };
+        for pk in list {
+            let (q, h) = lane.at(pk.s.min(lane.length()));
+            if (q - me.pos).truncate().length() > (reach + st.rear + 10.0) as f64 {
+                continue;
+            }
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            parked.push(Obb::vehicle(q.truncate() + right * pk.lateral as f64, h as f64, pk.half_len as f64, pk.half_len as f64, pk.half_width as f64));
+        }
+    }
+    let mut x = 0.5f32.min(reach);
+    loop {
+        let b = shifted_body(net, me, -x, 0.0);
+        if others.iter().chain(parked.iter()).any(|o| o.separation(&b) < clearance) {
+            return false;
+        }
+        if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+            return false;
+        }
+        if people.iter().any(|&k| (sim.people[k].pos.z - me.pos.z).abs() <= 2.5 && Obb::point(sim.people[k].pos, PERSON_RADIUS as f64).separation(&b) < clearance) {
+            return false;
+        }
+        if x >= reach {
+            return true;
+        }
+        x = (x + 0.5).min(reach);
+    }
+}
+
+/// [Q8-1] The packed-queue escape: a car that has stood `QUEUE_ESCAPE_STAND` behind a queue whose
+/// head is an obstacle (`escape_head`), held by nothing but its lead, with a lane beside it may
+/// bypass into (`could_bypass`) but nearer its lead than the room the bypass's steerable move needs
+/// (`bypass_room`), backs up to that room when the strip behind it is clear for it (`rear_clear`;
+/// so the rearmost goes first and the queue dissolves from the back), then pulls out with the
+/// round-6 bypass. The metres to back up. (SUMO has no reversing: its vehicles are points on a
+/// lane that change lanes from any gap; an OMSI car's body must steer round the car in front,
+/// and a queue packed to its standing gap behind a vehicle standing for good stood for ever - the
+/// user's viz5 case08, five cars 1.9-2.3 m apart behind T11 #44422 for 11 minutes.)
+fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception) -> Option<f32> {
+    let st = &me.state;
+    if st.speed.abs() >= STANDING_SPEED || me.stopped < QUEUE_ESCAPE_STAND || st.change.is_some() || me.passing.is_some() || !st.route.is_empty() || me.is_rail() || me.class == VehicleClass::Air || me.serves_stops() {
+        return None;
+    }
+    let l = p.leader?;
+    if !escape_head(sim, vehicles, &l) {
+        return None;
+    }
+    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l)).fold(f32::INFINITY, f32::min);
+    if !need.is_finite() || l.gap >= need - BYPASS_HOLD_SLACK {
+        return None;
+    }
+    let back = need - l.gap;
+    rear_clear(net, sim, vehicles, me, back).then_some(back)
+}
+
 /// What the corner of a body turned on the bypass's curve reaches beyond its shifted box (m):
 /// half a metre at 30 degrees for a 2 m front overhang.
 pub const BYPASS_TURN_MARGIN: f32 = 0.5;
@@ -1297,6 +1432,27 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             out.start = Some(Start::RouteChange { to, dir });
         } else if st.change.is_none() {
             min_stop(&mut out.stop, &mut out.why, Some(lane.length() - 1.0), Why::Merge);
+        }
+    }
+
+    // [Q8-1] backing up out of a packed queue (`queue_escape`): under way, on while the strip
+    // behind stays clear and the queue stands; begun only when nothing but the lead holds the car
+    if let Some(left) = me.reversing {
+        let queue_stands = p.leader.is_none_or(|l| l.speed < STANDING_SPEED);
+        let go_on = left > 0.0 && queue_stands && rear_clear(net, sim, vehicles, me, left);
+        // (stopped: within its comfortable brake from the walking pace, well inside the standing
+        // gap `rear_clear` keeps)
+        out.reverse = Some(if go_on { left } else { st.speed * st.speed / (2.0 * st.decel.max(0.5)) });
+        out.held = true;
+        out.why = if out.why == Why::None { Why::Lead } else { out.why };
+        return out;
+    }
+    if out.stop.is_none() && out.start.is_none() && p.people_stop.is_none() {
+        if let Some(back) = queue_escape(net, sim, vehicles, me, p) {
+            out.reverse = Some(back);
+            out.held = true;
+            out.why = if out.why == Why::None { Why::Lead } else { out.why };
+            return out;
         }
     }
 
