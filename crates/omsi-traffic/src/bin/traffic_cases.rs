@@ -5554,11 +5554,13 @@ fn converge(args: &[String]) -> Res<()> {
     Ok(())
 }
 
-/// `watch <fixture> --ids a,b [--from t] [--to t] [--every 0.5] [--reset]`: the free run (or
-/// with `--reset` the reset-at-keyframes replay) of a fixture, printing the named vehicles'
+/// `watch <fixture> --ids a,b [--from t] [--to t] [--every 0.5] [--reset] [--player]`: the free run
+/// (or with `--reset` the reset-at-keyframes replay) of a fixture, printing the named vehicles'
 /// state every `--every` seconds between the times (the replay's clock): lane, place, speed,
 /// lateral offset, lane change, pass, the decision, the indicator, and the least distance between
-/// the boxes of each pair of them.
+/// the boxes of each pair of them; each one's claim with its foes' arrival and leave times and the
+/// case taken. `--player`: the players too, their distance to the named ones and their claims
+/// with the same per-foe account ([R7-3]).
 fn watch(fixture: &Path, args: &[String]) -> Res<()> {
     let ids: Vec<u64> = opt(args, "--ids").unwrap_or("").split(',').filter_map(|x| x.trim().trim_start_matches('#').parse().ok()).collect();
     let from: f64 = opt(args, "--from").map(|s| s.parse()).transpose()?.unwrap_or(f64::NEG_INFINITY);
@@ -5592,7 +5594,14 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 println!("t={t:.1} player {} ({:.1},{:.1}) hd {:.0} v {:.2} still {:.1} blinker {}; boxes to it: {}", p.id, p.pos.x, p.pos.y, p.heading, p.speed, p.still, p.blinker, gaps.join(", "));
             }
             for (c, g) in r.sim.claims.iter().filter(|(c, _)| omsi_traffic::sim::claim_player(c.vehicle).is_some()) {
-                println!("t={t:.1}   player claim j{} m{} s {:.1} light_red {} blocked {} lead {:?} -> go {} wait_for {:?}", c.junction, c.movement, c.s, c.light_red, c.blocked, c.lead.map(|w| fmt_claimant(&r, w)), g.go, g.wait_for.map(|w| fmt_claimant(&r, w)));
+                println!(
+                    "t={t:.1}   player claim j{} m{} chain {:?} s {:.1} v {:.2} committed {} light_red {} until_go {:?} blocked {} lead {:?} -> go {} wait_for {:?} hold {:?} at {:?} to_at {:?}",
+                    c.junction, c.movement, c.chain.iter().map(|&(m, o)| (r.sim.junctions.nodes[c.junction].movements[m].lane, (o * 10.0).round() / 10.0)).collect::<Vec<_>>(), c.s, c.speed, c.committed, c.light_red, c.until_go, c.blocked,
+                    c.lead.map(|w| fmt_claimant(&r, w)), g.go, g.wait_for.map(|w| fmt_claimant(&r, w)), g.hold, g.at, g.at.map(|a| ((a - (c.s + c.front)) * 10.0).round() / 10.0)
+                );
+                // [R7-3] the player's claim as `watch` shows an AI claim: per foe, SUMO's time test
+                // (my in/out, theirs, their arrival as the claim's impatience sees it, the case)
+                print_foes(&r, t, c);
             }
         }
         for &i in &found {
@@ -5635,16 +5644,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 );
                 // [J7-1] per foe: SUMO's time test (my in/out, theirs, their arrival as my
                 // impatience sees it, the case), or what took it out of the test
-                for f in r.sim.foe_trace.iter().filter(|f| f.claimant == i) {
-                    let lane = r.sim.junctions.nodes[c.junction].movements.get(f.movement).map(|m| m.lane).unwrap_or(usize::MAX);
-                    match f.times {
-                        Some(ft) => println!(
-                            "t={t:.1}     foe {} on {lane}: me in {:.2} out {:.2}, it in {:.2} (impatient {:.2}) out {:.2} -> {:?} (impatience {:.2})",
-                            fmt_claimant(&r, f.foe), ft.my_in, ft.my_out, ft.their_in, ft.their_in_impatient, ft.their_out, ft.case, omsi_traffic::reservation::impatience_of(c)
-                        ),
-                        None => println!("t={t:.1}     foe {} on {lane}: {}", fmt_claimant(&r, f.foe), f.skip),
-                    }
-                }
+                print_foes(&r, t, c);
             }
         }
         for (x, &a) in found.iter().enumerate() {
@@ -5655,6 +5655,22 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// [J7-1, R7-3] The resolver's account of claim `c`'s foes this frame (`Simulation::foe_trace`), one
+/// line each: SUMO's time test - my arrival at and leaving of the shared stretch, the foe's, its
+/// arrival as my impatience sees it, the case taken - or what took the foe out of the test.
+fn print_foes(r: &Replay, t: f64, c: &omsi_traffic::Claim) {
+    for f in r.sim.foe_trace.iter().filter(|f| f.claimant == c.vehicle) {
+        let lane = r.sim.junctions.nodes[c.junction].movements.get(f.movement).map(|m| m.lane).unwrap_or(usize::MAX);
+        match f.times {
+            Some(ft) => println!(
+                "t={t:.1}     foe {} on {lane}: me in {:.2} out {:.2}, it in {:.2} (impatient {:.2}) out {:.2} -> {:?} (impatience {:.2})",
+                fmt_claimant(r, f.foe), ft.my_in, ft.my_out, ft.their_in, ft.their_in_impatient, ft.their_out, ft.case, omsi_traffic::reservation::impatience_of(c)
+            ),
+            None => println!("t={t:.1}     foe {} on {lane}: {}", fmt_claimant(r, f.foe), f.skip),
+        }
+    }
 }
 
 /// `lights <fixture> [--bus]`: every light of the fixture's programs with the lanes it is bound
