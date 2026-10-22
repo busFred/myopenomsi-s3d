@@ -1901,7 +1901,11 @@ impl Traffic {
             // (the rules are asked in order, lazily: `hidden` casts rays)
             let first = |rules: &[(&dyn Fn() -> bool, &'static str)]| rules.iter().find(|r| r.0()).map(|r| r.1);
             let hidden = || self.hidden(world, p, r);
-            let reason: Option<&'static str> = if unloaded {
+            // [round 8 H8-7] the ground going is no reason of its own to vanish in view: it
+            // waits behind `hidden()` like every other removal (the tiles go at 170-200 m, and
+            // 129 cars went within 200 m of the eye in 300 s at Jiangzhaikou, in frame); one in
+            // sight stays until it is not, or another rule below takes it
+            let reason: Option<&'static str> = if unloaded && hidden() {
                 Some("its ground unloaded")
             } else if at_edge {
                 // (its trip comes back with the tiles; kept until nobody saw it, a bus stood
@@ -1944,7 +1948,7 @@ impl Traffic {
                 let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
                 let seen = match rule {
                     RemoveRule::OutOfSight => false,
-                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
                     _ => frames(),
                 };
                 self.recorder.note_remove(c.id, rule, seen, c.ai.waiting);

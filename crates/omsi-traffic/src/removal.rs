@@ -49,10 +49,11 @@ pub enum RemoveRule {
 
 impl RemoveRule {
     /// Whether this removal is the one `ab` gates as "removed in view": a rule of the
-    /// population's, not the network's end or the ground going (a lane end in view and the
-    /// tiles are round 8, H8-7), nor a car that parked.
+    /// population's, not the network's end (a lane end in view), nor a car that parked.
+    /// ([round 8 H8-7] the ground going is gated too: it waits behind the app's `hidden()`
+    /// like every other population rule.)
     pub fn gated(self) -> bool {
-        !matches!(self, RemoveRule::NetworkEnd | RemoveRule::GroundUnloaded | RemoveRule::Parked)
+        !matches!(self, RemoveRule::NetworkEnd | RemoveRule::Parked)
     }
 }
 
