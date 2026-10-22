@@ -167,10 +167,21 @@ impl Replay {
     }
 
     pub fn new(header: Header, mut records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
+        let waiting_of_old = |v: &Vehicle| if v.last.why == crate::plan::Why::Light || (v.serves_stops() && v.external.at_stop) { 0.0 } else { v.stopped };
         // ([fix pass 2, 5] a driver field a record lacked: its class's preset)
+        // ([round 8 Q8 fill] a recording before format 4 has no `Vehicle::waiting`, SUMO's
+        // waiting time: it is the time standing, `stopped`, but where the recorded decision is a red
+        // light or a timetable bus at its own stop - which pause the clock (`give_up_clock`) -
+        // where it is 0; read as 0, SUMO's impatience restarted at every window's start)
+        let fill_waiting = header.version < 4;
         for rec in &mut records {
             match rec {
-                Record::Keyframe { vehicles, .. } => vehicles.iter_mut().for_each(|v| v.params.fill_missing(v.class)),
+                Record::Keyframe { vehicles, .. } => vehicles.iter_mut().for_each(|v| {
+                    v.params.fill_missing(v.class);
+                    if fill_waiting {
+                        v.waiting = waiting_of_old(v);
+                    }
+                }),
                 Record::Spawn { vehicle, .. } | Record::VehicleChanged { vehicle, .. } => vehicle.params.fill_missing(vehicle.class),
                 _ => {}
             }
@@ -303,6 +314,9 @@ impl Replay {
                         if self.header.version < 2 {
                             v.claim_standing = o.claim_standing;
                         }
+                        if self.header.version < 4 {
+                            v.waiting = o.waiting;
+                        }
                         *o = v
                     }
                     None => self.vehicles.push(v),
@@ -333,7 +347,15 @@ impl Replay {
                         // (the way changes, not where the vehicle is; one where the game
                         // has it is the game's)
                         Some(i) if !in_step(&self.vehicles[i], &v) => take_way(&mut self.vehicles[i], &v, &self.net),
-                        Some(i) => self.vehicles[i] = v,
+                        Some(i) => {
+                            // ([round 8 Q8 fill] a recording before format 4 has no waiting time:
+                            // the replay's own runs on)
+                            let mut v = v;
+                            if self.header.version < 4 {
+                                v.waiting = self.vehicles[i].waiting;
+                            }
+                            self.vehicles[i] = v
+                        }
                         None => self.spawn_free(*time, v),
                     }
                     return;
@@ -343,6 +365,9 @@ impl Replay {
                         let mut v = v;
                         if self.header.version < 2 {
                             v.claim_standing = o.claim_standing;
+                        }
+                        if self.header.version < 4 {
+                            v.waiting = o.waiting;
                         }
                         *o = v
                     }
