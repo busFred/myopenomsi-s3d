@@ -5608,7 +5608,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             let st = &v.state;
             let d = &v.last;
             println!(
-                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1}",
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {}",
                 v.id,
                 st.lane,
                 st.s,
@@ -5627,7 +5627,10 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 d.hold,
                 d.body_block,
                 v.blinker_shown,
-                v.stopped
+                v.stopped,
+                v.external.serves,
+                v.external.stop_at.map(|x| x - st.front),
+                v.external.at_stop
             );
         }
         // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the
@@ -5641,7 +5644,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                         continue;
                     }
                     let sep = omsi_sim::collision::Obb::point(p.pos, PERSON_RADIUS).separation(&b);
-                    println!("t={t:.1}   person {k} near #{} ({:.2},{:.2}) vel ({:.2},{:.2}) sep {sep:.2} still {:.1} crossing {} kerb {} bus {}", v.id, p.pos.x, p.pos.y, p.vel.x, p.vel.y, p.still, p.on_crossing, p.at_kerb, p.waiting_for_bus);
+                    println!("t={t:.1}   person {k} near #{} ({:.2},{:.2}) vel ({:.2},{:.2}) sep {sep:.2} still {:.1} crossing {} kerb {} bus {} stop {:?}", v.id, p.pos.x, p.pos.y, p.vel.x, p.vel.y, p.still, p.on_crossing, p.at_kerb, p.waiting_for_bus, p.waits_at);
                 }
             }
         }
