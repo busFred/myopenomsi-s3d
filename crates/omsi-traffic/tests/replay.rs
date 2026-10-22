@@ -649,3 +649,32 @@ fn a_free_run_keeps_the_games_stop_where_it_lies() {
     let front = v.state.s + v.state.front;
     assert!(v.state.speed < 0.1 && (front - 150.0).abs() < 2.0, "stood with its front at {front:.1} (speed {:.1})", v.state.speed);
 }
+
+/// [round 8 Q8 fill] A recording before format 4 carries no `Vehicle::waiting`: the replay takes
+/// the time standing (`stopped`) for it, but 0 where the recorded decision is a red light or a
+/// timetable bus at its own stop (they pause SUMO's waiting time); format 4 keeps its own.
+#[test]
+fn a_recording_before_format_4_reads_its_waiting_time_from_the_time_standing() {
+    let (net, lights) = signalled_junction();
+    let mut held = car(1, 0, 10.0, 0.0);
+    held.stopped = 50.0;
+    held.last.why = omsi_traffic::Why::Lead;
+    let mut at_red = car(2, 0, 20.0, 0.0);
+    at_red.stopped = 40.0;
+    at_red.last.why = omsi_traffic::Why::Light;
+    let mut bus = car(3, 0, 30.0, 0.0);
+    bus.class = VehicleClass::ScheduledBus;
+    bus.stopped = 30.0;
+    bus.external.at_stop = true;
+    let kf = || omsi_traffic::record::Record::Keyframe { time: 1.0, vehicles: vec![held.clone(), at_red.clone(), bus.clone()] };
+    let waits = |version: u32| -> Vec<f32> {
+        let h = Header { version, map: "test".into(), left_hand: false, lanes: net.lanes.clone(), lights: lights.clone(), started_day_time: 8.0 * 3600.0, trigger: None, derived: None, switches: None, rules: None };
+        let r = Replay::new(h, vec![kf()], Vec::new(), false);
+        r.records.iter().find_map(|rec| match rec {
+            omsi_traffic::record::Record::Keyframe { vehicles, .. } => Some(vehicles.iter().map(|v| v.waiting).collect()),
+            _ => None,
+        }).unwrap()
+    };
+    assert_eq!(waits(3), vec![50.0, 0.0, 0.0]);
+    assert_eq!(waits(omsi_traffic::record::VERSION), vec![0.0, 0.0, 0.0]);
+}
