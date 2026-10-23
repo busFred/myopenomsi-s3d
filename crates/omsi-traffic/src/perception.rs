@@ -1248,6 +1248,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // while a walker 3.5 m off its axis came at 1.7 m/s; the strip test saw them in its
     // 2 s step only once they were 0.4 m from its flank). Kerb waiters (on the walking area,
     // not the crossing) and bus waiters are no crossing users.
+    let sideways = me.passing.is_some() || st.change.is_some_and(|c| c.bypass);
     let on_walks = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + (JM_CROSSING_GAP + me.half_width) as f64) };
     for z in zebras.iter().filter(|z| z.along - crate::plan::ZEBRA_STOP > st.front) {
         let lat = st.lateral_ahead(z.along);
@@ -1335,75 +1336,65 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             // covers a crossing: it clears the crossing forward - viz3 case20 #59845 stopped at
             // 3.7 m/s with the crossing under it and stood 78 s with a walker's projected step
             // inside its body)
-            // ([P8 pass 3, A2/R1] where their step takes them only while I stand or creep
-            // (moving off into somebody crossing through my flank, x10 case03 #2786): moving, a
-            // walker coming at my flank is decided by the time slots below, never by stopping
-            // with my body across their line)
-            let stepping = (on_crossing || p.vel.length() >= STEP_SPEED as f64) && !covering && v < STANDING_SPEED;
+            let stepping = (on_crossing || p.vel.length() >= STEP_SPEED as f64) && !covering;
             let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
-            if at.iter().any(|&pos| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0) {
+            let inside = |pos: DVec2| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0;
+            // ([pass 2, R1] out on a pass or bypass, somebody only their step brings over my
+            // body, whose line my rear passes at my present speed before they reach my flank,
+            // is passed first - SUMO's time slots - not
+            // stopped for with my body left across their path)
+            let passed_first = || {
+                let hb = (me.heading as f64).to_radians();
+                let (f, r) = (DVec2::new(hb.sin(), hb.cos()), DVec2::new(hb.cos(), -hb.sin()));
+                let rel = p.pos.truncate() - me.pos.truncate();
+                let (along, off) = (rel.dot(f) as f32, rel.dot(r) as f32);
+                let toward = -(p.vel.dot(r) as f32) * off.signum();
+                let gap = off.abs() - me.half_width - crate::plan::PERSON_RADIUS;
+                sideways && v >= STANDING_SPEED && toward > 0.0 && gap > 0.0 && along + st.rear > 0.0 && (along + st.rear) / v < gap / toward
+            };
+            if inside(positions[0]) || (at.len() > 1 && at[1..].iter().any(|&pos| inside(pos)) && !passed_first()) {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
         }
-        // [P8 pass 3, A2 + R1] somebody walking: SUMO's time-slot conflict test (MSLink's
-        // approach and leave times, J7-1's between vehicles) between my body and the walker
-        // crossing my way - my slot from my front reaching their line (my fastest arrival,
-        // `arrival_time`) to my rear clearing it (at my present speed; from rest, my
-        // acceleration), theirs from their body entering my swept band (my half width and
-        // their radius about the bent way, a pass's lateral included) to leaving it, at their
-        // speed and heading (in the band and not leaving it: until for ever). Overlapping
-        // slots - going on would meet them -: if they are in my path by the time my front gets
-        // there, they are my leader and I stop short of them, as hard as it takes (SUMO: a
-        // person ahead in the vehicle's width is a leader); if they would only reach my flank
-        // while I pass, I stop short of their line when my hard brake still can
-        // (`plan::cannot_stop`, `HARD_BRAKE`) and otherwise go on - braking then only leaves my
-        // body across their line longer. The stop is ahead of my front: round 4's 1.5 m before
-        // them, or the zebra stop on a crossing. Slots apart, I go on. Their line at or behind my front: no stop -
-        // stopping would only leave my body across their line (the body test above takes one
-        // inside my body). This
-        // replaces the strip's projected step (2 s, STEP_LOOK 4 s) for walkers, and the pass's
-        // own sweep: one rule for all driving. (OMSI's people do not avoid cars as SUMO's
-        // MSPModel walkers do, so the car keeps the walker's side of the slot too.) Not
-        // latched per person: the game's people carry no identity from frame to frame.
-        let walker = p.vel.length() >= STEP_SPEED as f64 && !my_waiter && !at_kerb_of_stop;
-        if walker {
-            if let Some((k, al)) = way.segment_of(p.pos.truncate(), reach + st.front) {
-                let (d, q, _) = way.pts[k];
-                let fwd = (way.pts[k + 1].1 - q).normalize_or_zero();
-                let right = DVec2::new(fwd.y, -fwd.x);
-                let off = (p.pos.truncate() - q).dot(right) as f32;
-                let toward = -(p.vel.dot(right) as f32) * off.signum();
-                // (the band SUMO asks the walkers about, `MSLink::getLeaderInfo`'s width +
-                // SAFETY_GAP, and their body's radius)
-                let band = me.half_width + CROSSING_SAFETY_GAP * 0.5 + crate::plan::PERSON_RADIUS;
-                let slot = if off.abs() < band {
-                    Some((0.0, if toward < -1e-3 { (band - off.abs()) / -toward } else if toward > 1e-3 { (off.abs() + band) / toward } else { f32::INFINITY }))
-                } else if toward > 1e-3 {
-                    Some(((off.abs() - band) / toward, (off.abs() + band) / toward))
-                } else {
-                    None
-                };
-                if let Some((t_in, t_out)) = slot {
-                    let mid = if t_out.is_finite() { (t_in + t_out) * 0.5 } else { 0.0 };
-                    let line = d + al + p.vel.dot(fwd) as f32 * mid;
-                    if line > st.front {
-                        let r = crate::plan::PERSON_RADIUS;
-                        let v_max = net.lanes.get(st.lane).map_or(st.max_speed_kmh, |l| l.speed_limit_kmh * st.desire).min(st.max_speed_kmh) / 3.6;
-                        let t_front = arrival_time((line - r - st.front).max(0.0), v, st.accel, v_max);
-                        let t_rear = if v >= STANDING_SPEED { (line + r + st.rear) / v } else { arrival_time(line + r + st.rear, v, st.accel, v_max) };
-                        if t_front < t_out && t_in < t_rear {
-                            let stop = match cut {
-                                Some(z) if on_crossing && z.along - crate::plan::ZEBRA_STOP > st.front => z.along - crate::plan::ZEBRA_STOP,
-                                _ => line - 1.5,
-                            };
-                            if t_in <= t_front || !crate::plan::cannot_stop(v, (line - r - st.front).max(0.0), crate::plan::HARD_BRAKE) {
-                                holders.push(Holder { stop: stop.max(st.front), along: line, axis: 0.0, swervable: false });
-                            }
-                        }
-                    }
+        // [P8 pass 1, S2] a pass or bypass moving sideways: the body as it will go on the bent
+        // way over one body length against where they are and where their step takes them,
+        // held short of the first place it would cover them (SUMO checks the target lane's
+        // pedestrians for every change, MSLaneChanger: `targetLane->hasPedestrians()`): the
+        // strip test exempts somebody level with the body and outside its footprint, whom the
+        // sideways move reaches (viz3 case11 #29300 passed out into a walker level with it)
+        if sideways {
+            // ([pass 2, R1] timed: the person where they will be when the body reaches each
+            // pose (my arrival there at my speed and acceleration, `arrival_time`), and never a
+            // stop that leaves the body across their path - none when I cannot stop short of
+            // the meeting pose (`plan::cannot_stop`, the hard brake), none when the pose I
+            // would stop in lies on their walk from now to `later`: then I go on, as SUMO
+            // refuses a change into pedestrians only while it can still brake for them,
+            // MSLaneChanger. A hold without timing stopped a passing car across a walker's line
+            // in the reviewer's probe, -1.21 m)
+            let disc = |at: DVec2| omsi_sim::collision::Obb::point(at.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64);
+            let v_max = st.max_speed_kmh / 3.6;
+            let path_hits = |pose: &omsi_sim::collision::Obb| {
+                let from = p.pos.truncate();
+                let n = ((later - from).length() / (2.0 * crate::plan::PERSON_RADIUS as f64)).ceil().max(1.0) as usize;
+                (0..=n).any(|j| disc(from + (later - from) * (j as f64 / n as f64)).separation(pose) < 0.0)
+            };
+            let pose_at = |q: DVec2, fwd: DVec2| omsi_sim::collision::Obb::vehicle(q, fwd.x.atan2(fwd.y).to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+            let mut safe = (0.0f32, me.obb());
+            for &(d, q, fwd) in way.pts.iter().skip(1) {
+                if d > st.front + st.rear {
+                    break;
                 }
+                let pose = pose_at(q, fwd);
+                let t = arrival_time(d, v, st.accel, v_max) as f64;
+                let at = if p.vel.length() >= STEP_SPEED as f64 { p.pos.truncate() + p.vel * t } else { p.pos.truncate() };
+                if disc(at).separation(&pose) < 0.0 {
+                    if !crate::plan::cannot_stop(v, safe.0, crate::plan::HARD_BRAKE) && !path_hits(&safe.1) {
+                        holders.push(Holder { stop: st.front + safe.0, along: st.front + safe.0, axis: 0.0, swervable: false });
+                    }
+                    break;
+                }
+                safe = (d, pose);
             }
-            continue;
         }
         // ([pass 1, S3] each position on the slice of the way it lies nearest to)
         let slices: Vec<Option<(usize, f32)>> = positions.iter().map(|&pos| way.segment_of(pos, reach + st.front)).collect();
@@ -1441,12 +1432,6 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             };
             for (&pos, slice) in positions.iter().zip(&slices) {
                 let Some((_, along)) = slice.filter(|&(k, _)| k == i) else { continue };
-                // ([P8 pass 3, A2] the strip is the way ahead of my front: a position level
-                // with or behind my front plane is no leader - SUMO's leaders are ahead of the
-                // front - and is the body test's)
-                if d + along <= st.front {
-                    continue;
-                }
                 let along = along as f64;
                 let r = pos - q;
                 let across_way = r.dot(right) as f32;
@@ -1496,6 +1481,22 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // occupies; elsewhere 1.5 m short of them)
                 // (a crossing whose zebra stop the front has passed: where the person is, as
                 // anywhere else - the car does not drive on into them)
+                // ([pass 2, R1] out on a pass or bypass, where only their step brings them into my
+                // strip: if my rear is past their line at my present speed before they reach my
+                // strip, I go first - SUMO's time slots, a
+                // vehicle that passes before the foe arrives is the leader - rather than
+                // braking into their path: a car out on a pass at 7 m/s stopped hard for a walker
+                // stepping off the far kerb 2 m ahead and stood across their line, -1.21 m)
+                if sideways && pos != p.pos.truncate() && across < half {
+                    let toward = -(p.vel.dot(right) as f32) * now_way.signum();
+                    if toward > 0.0 && now_way.abs() >= half && v >= STANDING_SPEED {
+                        let t_in = (now_way.abs() - half) / toward;
+                        let t_clear = (d + along as f32 + st.rear) / v;
+                        if t_clear < t_in {
+                            continue;
+                        }
+                    }
+                }
                 let stop = match cut {
                     Some(z) if on_crossing && z.along - crate::plan::ZEBRA_STOP > st.front => z.along - crate::plan::ZEBRA_STOP,
                     _ => d + along as f32 - 1.5,
