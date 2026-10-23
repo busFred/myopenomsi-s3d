@@ -70,7 +70,9 @@ const AT_END_STAND: f32 = 0.5;
 const AT_END_STAND_BUS: f32 = 20.0;
 /// Standing this long (s) beyond `FAR_OFF_DIST` (m) from the eye, too far for the
 /// renderer to draw it plainly: a bus stood with its passengers at the far end of a
-/// straight road for good (r4d).
+/// straight road for good (r4d). For a timetable bus at its loaded route's end (`at_edge`)
+/// and the dead-end rule only ([round 8 H8-7 fix pass 2] not for a car at the loaded tiles'
+/// edge, which goes by the round-7 in-view rule).
 const FAR_OFF_STAND: f32 = 8.0;
 const FAR_OFF_DIST: f64 = 180.0;
 /// Standing this long (s) at a dead end or the loaded route's end goes in any case.
@@ -149,6 +151,7 @@ fn removal_rule(why: &str) -> RemoveRule {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        w if w.starts_with("at the loaded tiles' edge, in view") => RemoveRule::InViewAfterGrace,
         w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
         w if w.starts_with("at a dead end") || w.starts_with("at the loaded route's end") => RemoveRule::DeadEnd,
@@ -1951,16 +1954,16 @@ impl Traffic {
             } else if !random {
                 None
             } else if at_loaded_edge {
-                // [round 8 H8-7, fix pass 1] standing at the edge of the loaded tiles (`Lane::
-                // loaded_edge`, the crate stops it there): it goes by the rule of a timetable bus
-                // at its loaded route's end (`at_edge` above: once nobody sees it, or far off, or
-                // after long), a dead-end removal, gated and counted (it drove off the loaded
-                // network in view as "the network's end": 607 in frame at 873 m, Jiangzhaikou;
-                // held until hidden alone, 91 cars queued there in 600 s with the road in view)
+                // [round 8 H8-7, fix pass 2] standing at the edge of the loaded tiles (`Lane::
+                // loaded_edge`, the crate stops it there): it goes once nobody sees it, or in view
+                // by the round-7 rule every other car has (`goes_in_view`: given up, its grace
+                // run, beyond GAVE_UP_DIST, the front of its queue) - nothing else; a dead-end
+                // removal, gated and counted (it drove off the loaded network in view as "the
+                // network's end": 607 in frame at 873 m, Jiangzhaikou). The bus route end's
+                // FAR_OFF/STOOD_LONG are a timetable bus's alone.
                 first(&[
                     (&|| hidden(), "at the loaded tiles' edge, out of sight"),
-                    (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded tiles' edge, far off"),
-                    (&|| c.ai.stopped > STOOD_LONG, "at the loaded tiles' edge, long"),
+                    (&|| goes_in_view(c.ai.gone, &c.ai, from_eye), "at the loaded tiles' edge, in view after its grace"),
                 ])
             } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at a dead end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at a dead end, long"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
                 // (and in view too once others wait behind it: a fire engine at the end of a
@@ -5521,6 +5524,7 @@ mod loaded_edge_tests {
         assert!(!loaded_edge_at(probe, ts, &has, &loaded), "loaded: a real end");
         assert!(!loaded_edge_at(DVec3::new(-10.0, 100.0, 0.0), ts, &has, &loaded), "off the map");
         assert_eq!(removal_rule("at the loaded tiles' edge, out of sight"), RemoveRule::DeadEnd);
-        assert!(RemoveRule::DeadEnd.gated());
+        assert_eq!(removal_rule("at the loaded tiles' edge, in view after its grace"), RemoveRule::InViewAfterGrace);
+        assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
     }
 }
