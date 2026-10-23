@@ -206,3 +206,30 @@ fn light_call_reckons_to_the_line() {
     assert!(omsi_traffic::plan::light_call(&c, &p, &at(7.6)).go, "stops over the line instead of clearing it");
     assert!(!omsi_traffic::plan::light_call(&c, &p, &at(8.0)).go, "runs a red it can stop for");
 }
+
+/// [P8-4, pass 2 A1] A car out of its lane with a car queued right behind it in the lane
+/// (stood up to it as its lead, 1 m off its rear) moves back in: a standing follower needs no
+/// gap (SUMO's secure gap at v = 0 is 0), and where it stands now is no move (viz5 case06
+/// #18756 stood 90 s held by the car queued behind it).
+#[test]
+fn p84_a_car_queued_behind_does_not_keep_it_out_for_good() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (400.0, 0.0)])]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut p = car(1, vec![0], 200.0, 0.0);
+    p.state.lateral = -1.2;
+    p.state.lateral_target = 0.0;
+    let odo = p.state.odometer;
+    p.state.lateral_ramp = (-1.2, 0.0, odo, 9.6);
+    let behind = car(2, vec![0], 200.0 - 4.5 - 1.0, 0.0);
+    let mut vs = vec![p, behind];
+    let (mut go, mut t) = (-1.0f32, 0.0);
+    while t < 10.0 {
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        if go < 0.0 && vs[0].state.speed > 0.3 {
+            go = t;
+        }
+        t += DT;
+    }
+    assert!(go >= 0.0 && go < 3.0, "held by the car queued behind it: goes at {go:.1}");
+}

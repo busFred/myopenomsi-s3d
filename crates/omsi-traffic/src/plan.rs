@@ -723,7 +723,9 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     let (_, _, x0, len) = st.lateral_ramp;
     let left = (x0 + len - st.odometer).max(0.0);
     let n = (left / REENTRY_STEP).ceil() as usize;
-    let poses: Vec<Obb> = (0..=n).map(|k| shifted_body(net, me, (k as f32 * REENTRY_STEP).min(left), 0.0)).collect();
+    // ([pass 2, A1] the poses it has not reached yet: where it stands now is no move into
+    // anybody's way - a car queued behind it stands there already)
+    let poses: Vec<Obb> = (1..=n.max(1)).map(|k| shifted_body(net, me, (k as f32 * REENTRY_STEP).min(left), 0.0)).collect();
     let hr = (me.heading as f64).to_radians();
     let fwd = DVec2::new(hr.sin(), hr.cos());
     let reach = (left + st.front + st.rear) as f64;
@@ -736,7 +738,10 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         // ([P8 pass 1, S1] the gap a lane change accepts in front of it, `accepted_gap`: its
         // standing gap, the time gap and its braking to my standstill - not its bare braking
         // distance, with which a car at 13.9 m/s 40 m behind had to brake at 3.1-3.3 m/s²)
-        let stop = accepted_gap(me, o.params.min_gap, o.state.speed, st.speed);
+        // ([pass 2, A1] standing, none: SUMO's secure gap at v = 0 is 0 - a car standing behind
+        // waiting for me as its lead brakes for nobody; with its standing gap counted, one
+        // queued 2 m behind held #18756 in viz5 case06 for good)
+        let stop = if o.state.speed < STANDING_SPEED { 0.0 } else { accepted_gap(me, o.params.min_gap, o.state.speed, st.speed) };
         if (o.pos - me.pos).truncate().length() > reach + (o.state.front + o.half_width + stop) as f64 {
             continue;
         }
@@ -755,7 +760,7 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         if (pl.pos.z - me.pos.z).abs() > 3.0 {
             return false;
         }
-        let stop = accepted_gap(me, player_gap, pl.speed, st.speed) as f64;
+        let stop = if pl.speed < STANDING_SPEED { 0.0 } else { accepted_gap(me, player_gap, pl.speed, st.speed) as f64 };
         let b = pl.obb(stop, 0.0);
         poses.iter().any(|q| b.separation(q) < 0.0)
     })
