@@ -233,3 +233,49 @@ fn p84_a_car_queued_behind_does_not_keep_it_out_for_good() {
     }
     assert!(go >= 0.0 && go < 3.0, "held by the car queued behind it: goes at {go:.1}");
 }
+
+/// A pass round a parked car (as `pass_round_parked`); once the car is `trig` m out, a
+/// person appears `dx` ahead of its front at y0 and walks across at vy: the least distance
+/// between them and whether the car was held for them.
+fn pass_person(trig: f32, dx: f64, y0: f64, vy: f64) -> (f64, bool) {
+    let mut a = lane(&[(0.0, 0.0), (2000.0, 0.0)]);
+    a.width = 3.0;
+    let mut b = lane(&[(2000.0, 3.5), (0.0, 3.5)]);
+    b.width = 3.0;
+    let net = finish(vec![a, b]);
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.parked.insert(0, vec![omsi_traffic::Parked { s: 200.0, lateral: 0.0, half_width: 0.9, half_len: 2.2 }]);
+    let mut vs = vec![car(1, vec![0], 150.0, 8.0)];
+    sim.update_positions(&net, &mut vs);
+    let (mut t, mut spawned, mut min, mut held) = (0.0f32, false, f64::INFINITY, false);
+    while t < 40.0 {
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        let c = &vs[0];
+        if !spawned && c.passing.is_some() && c.state.lateral.abs() >= trig {
+            spawned = true;
+            sim.people = vec![Person { pos: DVec3::new(c.pos.x + c.state.front as f64 + dx, y0, 0.0), vel: DVec2::new(0.0, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }];
+        }
+        if spawned {
+            let pp = &mut sim.people[0];
+            pp.pos.y += pp.vel.y * DT as f64;
+            held |= vs[0].last.why == Why::People;
+            min = min.min(omsi_sim::collision::Obb::point(sim.people[0].pos, 0.28).separation(&vs[0].obb()));
+        }
+        t += DT;
+    }
+    (min, held)
+}
+
+/// [P8-2, pass 2 R1] A walker steps out across the oncoming lane 2 m ahead of a car out on a
+/// pass at 7 m/s: the car cannot stop short of them, so it is not stopped across their line -
+/// it goes on (the reviewer's probe: the untimed hold stopped it there, -1.21 m); one far
+/// enough ahead to stop for is stopped for, clear of them.
+#[test]
+fn p82_a_passing_car_is_never_stopped_across_a_walkers_line() {
+    let (near, _) = pass_person(2.5, 2.0, 6.5, -1.4);
+    let (far, far_held) = pass_person(2.5, 12.0, 6.5, -1.4);
+    eprintln!("near {near:.2}, far {far:.2} held {far_held}");
+    assert!(near > -0.28, "stopped across the walker's line: {near:.2} m");
+    assert!(far > 0.0, "touched a walker it could stop for: {far:.2} m");
+}
