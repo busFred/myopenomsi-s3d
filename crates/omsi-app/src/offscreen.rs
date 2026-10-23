@@ -970,6 +970,22 @@ pub(crate) fn run_offscreen(
                 .passenger_density((run_clock.time / 3600.0) as f32)
                 * settings.pax_density;
             h.time_of_day = run_clock.time;
+            // [P8 pass 2, harness] where buses leave for in the next 20 minutes - whom the
+            // people appearing at the stops wait for - renewed every 15 s of the clock, as the
+            // window does (app_events.rs, [ROLLBACK soon-90]/[reshuffle-91]); without it no
+            // waiter was ever put down at a stop in an offscreen run with --schedule
+            if let Some(s) = schedule.as_ref() {
+                let step = (run_clock.time - h.clock_seen + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
+                let jumped = h.clock_seen.is_finite() && step.abs() > 90.0 + dt as f64 * settings.time_speed as f64 * 5.0;
+                h.clock_seen = run_clock.time;
+                if jumped || (run_clock.time - h.soon_clock).abs() > 15.0 {
+                    h.soon_clock = run_clock.time;
+                    h.soon = Some(s.soon_targets(run_clock.time, duty.as_ref(), 20.0 * 60.0));
+                }
+                if jumped {
+                    h.reshuffle_waiting();
+                }
+            }
             // populate stops near every LAN player every 2 seconds, as app_events.rs
             // does every 2 s near the local player.  At startup `center` is ZERO (no
             // player bus on a headless server), so stops on the actual map – which can
