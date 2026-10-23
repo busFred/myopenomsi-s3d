@@ -1230,7 +1230,8 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     let zebras = zebra_cuts(net, me, lanes);
     // ([fix pass 3, 3] my body already over a crossing my way cuts: I clear it forward - the
     // people on it treat me as an obstacle, SUMO's pedestrian side, sumo.md §4.3)
-    let covering = lanes.iter().any(|&(l, d0)| net.walks.get(l).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front)));
+    let covered_walks: Vec<usize> = lanes.iter().flat_map(|&(l, d0)| net.walks.get(l).map(|ws| ws.as_slice()).unwrap_or(&[]).iter().filter(move |&&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front).map(|&(w, _, _)| w)).collect();
+    let covering = !covered_walks.is_empty();
     // [P8-5] SUMO's crossing test (`MSLink::getLeaderInfo` with `blockedAtDist`, sumo.md 4.3):
     // for every crossing my way cuts whose zebra stop (`plan::ZEBRA_STOP` before the cut) my
     // front has not passed - a position test, no braking test, as SUMO's (`distToCrossing -
@@ -1277,7 +1278,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // ahead is on the next crossing and holds as any)
         let hd = (me.heading as f64).to_radians();
         let ahead_of_front = rel.truncate().dot(DVec2::new(hd.sin(), hd.cos())) as f32 - st.front;
-        if covering && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
+        // ([P8 pass 3, C1] only somebody on a walk my body covers: one on the next walk - a
+        // crowd stepping onto a short walk a turn crosses 3 m on - is tested as anybody, by
+        // the walker's time slots below; w2-jzk #1902 re-accelerated into them)
+        let on_covered_walk = covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
+        if on_covered_walk && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
             if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
