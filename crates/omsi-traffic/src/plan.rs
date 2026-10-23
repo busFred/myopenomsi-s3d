@@ -823,7 +823,7 @@ fn behind_an_obstacle(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perc
 /// escape, `queue_escape`): `AtStop`, a bus held at its stop; `ForGood`, a vehicle at the end of
 /// its way, or one standing `QUEUE_OBSTACLE_STAND` held by nothing - an AI vehicle not indicating,
 /// a player's vehicle not indicating and not held by its red (its claim's `light_red`), [fix pass
-/// 2] the standing counted on SUMO's waiting time, which a red pauses; None, a
+/// 3] the standing counted as continuous time held by nothing; None, a
 /// queue that is the road (a red light, a junction, people: their heads are held by them) or
 /// anything moving or manoeuvring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,9 +836,10 @@ fn queue_head(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::
     if lead.speed.abs() >= STANDING_SPEED {
         return None;
     }
-    // ([fix pass 2] standing for good counts on SUMO's waiting time, which a red pauses
-    // (`Vehicle::waiting`, `Simulation::player_wait`): a head standing at its red is not standing
-    // for good at its green)
+    // ([fix pass 3] standing for good counts the time standing held by nothing, continuous
+    // (`Vehicle::unheld_for`, `Simulation::player_wait`): a head held by its red, people or the
+    // junction is not standing for good on the frame it is let go - SUMO's waiting time runs on
+    // under people and junction holds)
     let player_head = |id: u32| {
         let held_by_red = sim.claims.iter().any(|(c, _)| crate::sim::claim_player(c.vehicle) == Some(id) && c.light_red);
         let waited = sim.player_wait.get(&id).copied().unwrap_or(0.0);
@@ -858,7 +859,7 @@ fn queue_head(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::
         if o.external.at_stop || why == Why::Service {
             return (o.blinker_shown.0 == 0).then_some(QueueHead::AtStop);
         }
-        if why == Why::End || (!o.last.held && why != Why::Lead && o.waiting >= QUEUE_OBSTACLE_STAND) {
+        if why == Why::End || (!o.last.held && why != Why::Lead && o.unheld_for >= QUEUE_OBSTACLE_STAND) {
             return (o.blinker_shown.0 == 0).then_some(QueueHead::ForGood);
         }
         if why != Why::Lead {

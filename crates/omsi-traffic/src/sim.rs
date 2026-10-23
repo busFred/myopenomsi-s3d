@@ -332,6 +332,11 @@ pub struct Vehicle {
     /// the car stands - a latch, not a margin.
     #[serde(default)]
     pub lane_end_stop: Option<f32>,
+    /// [Q8-1 fix pass 3] Seconds standing held by nothing (its decision's `held` false: no stop of
+    /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
+    /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
+    #[serde(default)]
+    pub unheld_for: f32,
     /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
     /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
     /// vehicle, so a keyframe carries it.
@@ -389,6 +394,9 @@ pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
 /// Faster than this (m/s) a vehicle is moving: its waiting time restarts and a vehicle that
 /// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
 pub const UNHELD_SPEED: f32 = 0.1;
+/// [Q8-1 fix pass 3] `player_waiting` follows the lanes a player's vehicle stands on into this many
+/// lanes on (a count of lanes, as `plan::runs_past`'s 16) for the next lit one.
+pub const PLAYER_LIGHT_LOOK: usize = 16;
 
 /// Two vehicles holding each other at a junction where they have a meeting place negotiate:
 /// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
@@ -539,6 +547,7 @@ impl Vehicle {
             keep_right: 0.0,
             reversing: None,
             lane_end_stop: None,
+            unheld_for: 0.0,
             zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
@@ -642,10 +651,8 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
-    /// [Q8-1 fix pass 2] Each player's waiting time (SUMO's, as `Vehicle::waiting`): it runs while
-    /// the player's vehicle stands, pauses while its red holds it (its claim's `light_red` last
-    /// frame, or with no claim the light of a lane it stands on), restarts with motion
-    /// (`player_waiting`).
+    /// [Q8-1 fix pass 2-3] Each player's time standing held by nothing (`player_waiting`): the
+    /// player's `Vehicle::unheld_for`.
     pub player_wait: HashMap<u32, f32>,
     /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
     /// speed last frame, the estimate).
@@ -1000,29 +1007,64 @@ impl Simulation {
         }
     }
 
-    /// One frame of `dt` seconds for every vehicle.
-    /// [Q8-1 fix pass 2] The players' waiting time (`player_wait`), as `Vehicle::give_up_clock`.
-    fn player_waiting(&mut self, net: &Network, dt: f32) {
+    /// [Q8-1 fix pass 2-3] The players' time standing held by nothing (`player_wait`), as an AI
+    /// head's `Vehicle::unheld_for`: it runs while the player's vehicle stands and is set back to 0
+    /// when it moves or a red holds it - its claim's `light_red` last frame, the light of a lane it
+    /// stands on, the first lit lane its lanes lead into (the next lit stub along its way: through
+    /// lanes with one way on, every way on at a fork), or the red its follower waits at
+    /// (`Why::Light`).
+    fn player_waiting(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
+        let is_red = |l: usize| -> Option<bool> {
+            let (ctl, li) = net.lanes.get(l)?.traffic_light?;
+            let c = self.lights.get(ctl)?;
+            Some(matches!(omsi_sim::traffic::TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow))
+        };
+        // (the first lit lane along `l`'s ways on: `Some(red)` where one is found)
+        let ahead_red = |l: usize| -> bool {
+            let mut front: Vec<usize> = vec![l];
+            for _ in 0..PLAYER_LIGHT_LOOK {
+                let mut next: Vec<usize> = Vec::new();
+                for &x in &front {
+                    match is_red(x) {
+                        Some(red) => {
+                            if red {
+                                return true;
+                            }
+                        }
+                        None => next.extend(net.lanes.get(x).map(|ln| ln.next.clone()).unwrap_or_default()),
+                    }
+                }
+                if next.is_empty() {
+                    return false;
+                }
+                front = next;
+            }
+            false
+        };
         let mut red: Vec<u32> = self.claims.iter().filter(|(c, _)| c.light_red).filter_map(|(c, _)| claim_player(c.vehicle)).collect();
         for (&l, list) in &self.player_occupancy {
-            let Some((ctl, li)) = net.lanes.get(l).and_then(|ln| ln.traffic_light) else { continue };
-            let Some(c) = self.lights.get(ctl) else { continue };
-            if matches!(omsi_sim::traffic::TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow) {
+            if ahead_red(l) {
                 red.extend(list.iter().filter_map(|&(k, _, _)| self.players.get(k).map(|p| p.id)));
+            }
+        }
+        for v in vehicles {
+            if let (Why::Light, Some(Seen::Player(id))) = (v.last.why, v.last.lead_seen) {
+                red.push(id);
             }
         }
         let ids: Vec<(u32, bool)> = self.players.iter().map(|p| (p.id, p.speed.abs() > UNHELD_SPEED)).collect();
         self.player_wait.retain(|id, _| ids.iter().any(|x| x.0 == *id));
         for (id, moving) in ids {
             let w = self.player_wait.entry(id).or_insert(0.0);
-            if moving {
+            if moving || red.contains(&id) {
                 *w = 0.0;
-            } else if !red.contains(&id) {
+            } else {
                 *w += dt;
             }
         }
     }
 
+    /// One frame of `dt` seconds for every vehicle.
     pub fn tick(&mut self, net: &Network, dt: f32, vehicles: &mut [Vehicle]) {
         self.time += dt as f64;
         self.day_time += dt as f64 * self.time_scale;
@@ -1036,7 +1078,7 @@ impl Simulation {
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
-        self.player_waiting(net, dt);
+        self.player_waiting(net, vehicles, dt);
 
         // perception: read-only over everything
         let perceptions: Vec<Perception> = (0..vehicles.len()).map(|i| perception::perceive(net, self, vehicles, i)).collect();
@@ -1773,6 +1815,8 @@ impl Simulation {
             v.progress.1 += dt;
         }
         let held = standing && plan.held;
+        // [Q8-1 fix pass 3] the time standing held by nothing, continuous
+        v.unheld_for = if standing && !plan.held { v.unheld_for + dt } else { 0.0 };
         // A driver who is let go but has hardly rolled yet (the start reaction takes a moment,
         // then the car creeps off) keeps the impatience that earned the go. It used to cool
         // the moment the hold lifted for a frame, which took the squeeze away again before

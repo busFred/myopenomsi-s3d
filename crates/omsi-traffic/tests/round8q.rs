@@ -414,3 +414,55 @@ fn q81_fix2_a_queue_behind_a_head_at_a_red_does_not_back_up_at_the_green() {
     assert!(green_seen, "the queue never moved off at the green");
     assert!(!back, "a car backed up at the green");
 }
+
+#[test]
+fn q81_fix3_a_head_let_go_by_people_is_not_a_head_on_the_frame_it_is_let_go() {
+    // (safety recheck pass 2, S2: viz3 case10 #26738 backed on the frame its head #26737, held by
+    // people, was let go) the head's standing for good is its continuous time held by nothing
+    let net = two_lanes();
+    let mut cars = vec![car(1, 1, 150.0, 0.0), car(2, 1, 144.0, 0.0), car(3, 1, 138.0, 0.0)];
+    for c in cars.iter_mut() {
+        c.stopped = 60.0;
+        c.waiting = 60.0;
+        c.state.change_cooldown = 1000.0;
+    }
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.people.push(Person { pos: DVec3::new(155.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false });
+    let (mut back, mut people_held) = (false, false);
+    let mut t = 0.0;
+    // (released once all have stood the escape's 25 s)
+    while t < 55.0 {
+        if (t - 40.0f32).abs() < DT * 0.5 {
+            sim.people.clear();
+        }
+        sim.tick(&net, DT, &mut cars);
+        people_held |= cars[0].last.why == omsi_traffic::Why::People;
+        back |= cars.iter().any(|c| c.state.speed < -0.01 || c.reversing.is_some());
+        t += DT;
+    }
+    assert!(people_held, "the head was never held by the person");
+    assert!(!back, "a car backed up when the head was let go");
+}
+
+#[test]
+fn q81_fix3_a_player_whose_way_leads_into_a_red_heads_no_queue() {
+    // (safety recheck pass 2, S1: the player stood 40 m short of its light with no claim, its own
+    // lane unlit, and its clock ran on) the lane its way leads into is lit red: no head
+    let mut net = two_lanes();
+    net.lanes[3].traffic_light = Some((0, 0));
+    net.lanes[2].traffic_light = Some((0, 0));
+    let ctl = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 1000.0)]], 1000.0);
+    // (the player's bus stands 60 m short of the line, two cars packed behind it)
+    let mut cars = vec![car(1, 1, 140.0, 0.0), car(2, 1, 134.0, 0.0)];
+    for c in cars.iter_mut() {
+        c.stopped = 30.0;
+        c.state.change_cooldown = 0.0;
+    }
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    sim.players.push(omsi_traffic::PlayerView { id: 0, pos: DVec3::new(150.0, -3.5, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 60.0, blinker: 0, signalling: 0.0, priority: false });
+    let mut back = false;
+    run(&net, &mut sim, &mut cars, 50.0, |_, _, cars| {
+        back |= cars.iter().any(|c| c.state.speed < -0.05);
+    });
+    assert!(!back, "backed up behind a player whose way leads into its red");
+}
