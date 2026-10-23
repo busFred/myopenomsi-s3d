@@ -156,6 +156,23 @@ fn removal_rule(why: &str) -> RemoveRule {
     }
 }
 
+/// [round 8 H8-8, fix pass 2] A parked object that signals to pull out: which, its AI type, the
+/// lane point it leaves onto and its offset there, its body's extents, when its signalling time
+/// has run (`Traffic::time`), its seed.
+#[derive(Clone)]
+struct PendingPullOut {
+    key: i64,
+    ty: Arc<VehicleType>,
+    lane: usize,
+    s: f32,
+    lat: f32,
+    front: f32,
+    rear: f32,
+    half_w: f32,
+    ready_at: f32,
+    seed: u64,
+}
+
 /// What makes a new car a timetable bus (`Traffic::create_car`).
 pub struct BusSetup {
     /// The trip's lanes, as far as the loaded tiles have them.
@@ -695,6 +712,8 @@ pub struct Traffic {
     auto_saves: (u32, f32),
     /// When the cars were last looked over for two inside each other (`time`).
     overlap_checked: f32,
+    /// [round 8 H8-8, fix pass 2] A parked object signalling to pull out (`advance_pull_out`).
+    pending_pull_out: Option<PendingPullOut>,
 }
 
 /// At most this many minutes of traffic are saved by themselves in a session (a car stuck,
@@ -1336,6 +1355,7 @@ impl Traffic {
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
             overlap_checked: 0.0,
+            pending_pull_out: None,
         };
         t.sort_parked(parked_cars, lanes);
         t.mark_loaded_edges(world);
@@ -2163,7 +2183,69 @@ impl Traffic {
     /// goes (its space stays empty) and the AI car of the same folder takes its place, in
     /// the parking position, indicating, and pulls out into its lane once the road behind
     /// it is clear. Called with every population pass (about every two seconds).
+    /// [round 8 H8-1/H8-8, fix pass 2] The parked object that signals to pull out
+    /// (`pending_pull_out`): once its signalling time has run, the frame the one pull-out rule
+    /// passes (`plan::pull_out_clear`: every vehicle driving up the lane, the players too, beyond
+    /// its own secure gap; nobody on the strip its body sweeps from its offset onto the lane) and
+    /// its lane point is clear (`spawn_clear`), it leaves the kerb: the AI car is made where it
+    /// was parked, `pulling_out`, and drives out over the shortest move it can steer from rest.
+    /// Until then it stays a parked object (SUMO: a parked vehicle enters only when
+    /// `isInsertionSuccess` passes, MSVehicleTransfer.cpp ~135-149); no AI car waits at the offset.
+    /// (The scenery object shows no indicator: the time runs, the lamps do not blink.)
+    fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
+        let Some(pp) = self.pending_pull_out.clone() else { return };
+        let parked = world.parked_objects.lock().get(&pp.key).map(|p| p.pos);
+        let Some(ppos) = parked else {
+            self.pending_pull_out = None;
+            return;
+        };
+        if self.time < pp.ready_at {
+            return;
+        }
+        let ramp = omsi_traffic::plan::bypass_min_len(pp.front + pp.rear, pp.lat);
+        let on_lane = |lane: usize| -> Vec<(f32, f32, f32, omsi_traffic::DriverParams)> {
+            self.cars.iter().filter(|c| c.ai.state.lane == lane).map(|c| (c.ai.state.s, c.ai.state.front, c.ai.state.speed, c.ai.params)).collect()
+        };
+        let followers = omsi_traffic::plan::pull_out_followers(&self.net, &self.sim, pp.lane, pp.s, pp.rear, &on_lane);
+        if !omsi_traffic::plan::pull_out_clear(&self.net, &self.sim, &followers, pp.lane, pp.s, pp.lat, pp.front, pp.rear, pp.half_w, ramp) {
+            return;
+        }
+        let (q, h) = self.net.lanes[pp.lane].at(pp.s);
+        if !self.spawn_clear(&pp.ty, q, h as f64) {
+            return;
+        }
+        self.pending_pull_out = None;
+        if world.depart_parked(renderer, scene, pp.key).is_none() {
+            return;
+        }
+        if let Some(list) = self.parked.get_mut(&pp.lane) {
+            if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - pp.s).abs().total_cmp(&(list[b].s - pp.s).abs())) {
+                if (list[j].s - pp.s).abs() < 3.0 {
+                    list.swap_remove(j);
+                }
+            }
+        }
+        let id = self.create_car(world, renderer, scene, center, LaneKind::Street, pp.lane, pp.s, pp.ty.clone(), pp.seed, None, None, Some(0.0), None);
+        let net = &self.net;
+        if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
+            car.ai.state.lateral = pp.lat;
+            car.ai.state.lateral_target = 0.0;
+            car.ai.state.lateral_ramp = (pp.lat, 0.0, car.ai.state.odometer, ramp);
+            car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
+            car.ai.pull_out = 0.0;
+            car.ai.pulling_out = true;
+            car.ai.state.blinker = 1;
+        }
+        if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
+            log::info!("parked car {} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {:.1} m right of lane {}", pp.key, pp.ty.def.path.display(), ppos.x, ppos.y, pp.lat, pp.lane);
+        }
+    }
+
     pub fn pull_out_parked(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
+        if self.pending_pull_out.is_some() {
+            self.advance_pull_out(world, renderer, scene, center);
+            return;
+        }
         if self.rand_f() >= PULL_OUT_CHANCE {
             return;
         }
@@ -2227,48 +2309,15 @@ impl Traffic {
                 why.push("road not clear".into());
                 continue;
             }
-            // [round 8 H8-8, fix pass 1] the parked object stays parked until its lane has room
-            // for it: the one pull-out rule of the traffic (`plan::pull_out_clear`, as SUMO
-            // re-inserts a parked vehicle only where `isInsertionSuccess` passes) - every vehicle
-            // driving up the lane, the players too, has its own secure gap behind it, and nobody
-            // is on the strip its body sweeps from its offset onto the lane; then it drives out
-            // from where it is parked over the shortest move it can steer from rest
+            // [round 8 H8-8, fix pass 2] it signals as the parked object (SUMO's parked vehicle
+            // indicates while parked, MSVehicleTransfer), and the car is made only when it moves
+            // (`advance_pull_out`)
             let (front, rear, half_w) = extents(&ty, 12.0);
-            let ramp = omsi_traffic::plan::bypass_min_len(front + rear, lat);
-            let on_lane = |lane: usize| -> Vec<(f32, f32, f32, omsi_traffic::DriverParams)> {
-                self.cars.iter().filter(|c| c.ai.state.lane == lane).map(|c| (c.ai.state.s, c.ai.state.front, c.ai.state.speed, c.ai.params)).collect()
-            };
-            let followers = omsi_traffic::plan::pull_out_followers(&self.net, &self.sim, l, s, rear, &on_lane);
-            if !omsi_traffic::plan::pull_out_clear(&self.net, &self.sim, &followers, l, s, lat, front, rear, half_w, ramp) {
-                why.push("its lane has no room behind it, or somebody is on its way out".into());
-                continue;
-            }
-            if world.depart_parked(renderer, scene, key).is_none() {
-                continue;
-            }
-            if let Some(list) = self.parked.get_mut(&l) {
-                if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - s).abs().total_cmp(&(list[b].s - s).abs())) {
-                    if (list[j].s - s).abs() < 3.0 {
-                        list.swap_remove(j);
-                    }
-                }
-            }
             let seed = self.rand();
-            // (where it was parked, its way eased onto the lane's axis over `ramp`; a pull-out to
-            // the crate, `Vehicle::pulling_out`, so the same rule holds it while it signals)
-            let id = self.create_car(world, renderer, scene, center, LaneKind::Street, l, s, ty.clone(), seed, None, None, Some(0.0), None);
-            let net = &self.net;
-            if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
-                car.ai.state.lateral = lat;
-                car.ai.state.lateral_target = 0.0;
-                car.ai.state.lateral_ramp = (lat, 0.0, car.ai.state.odometer, ramp);
-                car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
-                car.ai.pull_out = 2.0 + (seed % 1000) as f32 / 400.0;
-                car.ai.pulling_out = true;
-                car.ai.state.blinker = 1;
-            }
+            let ready_at = self.time + 2.0 + (seed % 1000) as f32 / 400.0;
+            self.pending_pull_out = Some(PendingPullOut { key, ty, lane: l, s, lat, front, rear, half_w, ready_at, seed });
             if debug {
-                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {lat:.1} m right of lane {l}", ty.def.path.display(), p.pos.x, p.pos.y);
+                log::info!("parked car {key} at ({:.1}, {:.1}) signals to pull out, {lat:.1} m right of lane {l}", p.pos.x, p.pos.y);
             }
             return;
         }
