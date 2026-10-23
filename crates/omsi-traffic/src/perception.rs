@@ -372,8 +372,13 @@ impl WayPts {
         let qs = st.way_points(net, ds.iter().copied());
         let mut prev = qs[0].truncate();
         for (&d, q) in ds.iter().zip(&qs).skip(1) {
-            zs.push(q.z);
             let q2 = q.truncate();
+            // ([P8 pass 2, R3] a sample on top of the one before - a way's end sampled twice -
+            // is left out: a zero-length slice has no heading and left its wedge uncovered)
+            if !pts.is_empty() && (q2 - prev).length_squared() < 1e-12 {
+                continue;
+            }
+            zs.push(q.z);
             let fwd = (q2 - prev).normalize_or_zero();
             pts.push((d, q2, fwd));
             prev = q2;
