@@ -512,11 +512,14 @@ fn bus_lane_with_a_ruleless_piece() -> Network {
     finish(net)
 }
 
-/// A car on the left lane of the first piece at `s` and 14 m/s, keen to keep right.
+/// A car on the left lane of the first piece at `s` and 14 m/s, keen to keep right ([Q8-3] its
+/// LC2013 keep-right wish accumulated to the threshold already: these tests are about where it
+/// may go, not when).
 fn keen(s: f32) -> Vehicle {
     let mut me = car(1, 0, s, 14.0);
     me.state.change_cooldown = 0.0;
     me.params.lc_keep_right = 1.0;
+    me.keep_right = omsi_traffic::plan::KEEP_RIGHT_THRESHOLD;
     me.state.max_speed_kmh = 50.4;
     me
 }

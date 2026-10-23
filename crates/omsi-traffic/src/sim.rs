@@ -317,6 +317,26 @@ pub struct Vehicle {
     /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
     #[serde(default)]
     pub look_ahead_speed: f32,
+    /// [Q8-3] SUMO LC2013's keep-right wish (`myKeepRightProbability`, in units of its threshold,
+    /// `plan::KEEP_RIGHT_THRESHOLD`): accumulates by `Plan::keep_right_rate`, back to 0 when a lane
+    /// change starts (LC2013's `changed()`); kept with the vehicle, so a keyframe carries it.
+    #[serde(default)]
+    pub keep_right: f32,
+    /// [Q8-1] Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
+    /// [fix pass 1] (the odometer where it is to stand, fixed when it began or when it was told to
+    /// stop; stopping); kept with the vehicle.
+    #[serde(default)]
+    pub reversing: Option<(f32, bool)>,
+    /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
+    /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
+    /// the car stands - a latch, not a margin.
+    #[serde(default)]
+    pub lane_end_stop: Option<f32>,
+    /// [Q8-1 fix pass 3] Seconds standing held by nothing (its decision's `held` false: no stop of
+    /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
+    /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
+    #[serde(default)]
+    pub unheld_for: f32,
     /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
     /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
     /// vehicle, so a keyframe carries it.
@@ -374,6 +394,9 @@ pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
 /// Faster than this (m/s) a vehicle is moving: its waiting time restarts and a vehicle that
 /// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
 pub const UNHELD_SPEED: f32 = 0.1;
+/// [Q8-1 fix pass 3] `player_waiting` follows the lanes a player's vehicle stands on into this many
+/// lanes on (a count of lanes, as `plan::runs_past`'s 16) for the next lit one.
+pub const PLAYER_LIGHT_LOOK: usize = 16;
 
 /// Two vehicles holding each other at a junction where they have a meeting place negotiate:
 /// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
@@ -521,6 +544,10 @@ impl Vehicle {
             change_still: (0.0, 0.0),
             help_for: None,
             look_ahead_speed: 0.0,
+            keep_right: 0.0,
+            reversing: None,
+            lane_end_stop: None,
+            unheld_for: 0.0,
             zip_behind: None,
             mutual: None,
             mutual_gap: 0.0,
@@ -554,7 +581,8 @@ impl Vehicle {
     /// red.)
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
-        let moving = self.state.speed > UNHELD_SPEED;
+        // ([Q8-1 fix pass 1] backing up is moving too: SUMO's waiting time restarts with any motion)
+        let moving = self.state.speed.abs() > UNHELD_SPEED;
         let counts = d.why != Why::Light && !self.external.at_stop;
         if moving {
             self.waiting = 0.0;
@@ -623,6 +651,9 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
+    /// [Q8-1 fix pass 2-3] Each player's time standing held by nothing (`player_waiting`): the
+    /// player's `Vehicle::unheld_for`.
+    pub player_wait: HashMap<u32, f32>,
     /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
     /// speed last frame, the estimate).
     pub player_pull: Vec<(u32, f32, f32)>,
@@ -673,6 +704,7 @@ impl Simulation {
             day_time: 0.0,
             time_scale: 1.0,
             players: Vec::new(),
+            player_wait: HashMap::new(),
             player_pull: Vec::new(),
             people: Vec::new(),
             walkers: Vec::new(),
@@ -975,6 +1007,63 @@ impl Simulation {
         }
     }
 
+    /// [Q8-1 fix pass 2-3] The players' time standing held by nothing (`player_wait`), as an AI
+    /// head's `Vehicle::unheld_for`: it runs while the player's vehicle stands and is set back to 0
+    /// when it moves or a red holds it - its claim's `light_red` last frame, the light of a lane it
+    /// stands on, the first lit lane its lanes lead into (the next lit stub along its way: through
+    /// lanes with one way on, every way on at a fork), or the red its follower waits at
+    /// (`Why::Light`).
+    fn player_waiting(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
+        let is_red = |l: usize| -> Option<bool> {
+            let (ctl, li) = net.lanes.get(l)?.traffic_light?;
+            let c = self.lights.get(ctl)?;
+            Some(matches!(omsi_sim::traffic::TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow))
+        };
+        // (the first lit lane along `l`'s ways on: `Some(red)` where one is found)
+        let ahead_red = |l: usize| -> bool {
+            let mut front: Vec<usize> = vec![l];
+            for _ in 0..PLAYER_LIGHT_LOOK {
+                let mut next: Vec<usize> = Vec::new();
+                for &x in &front {
+                    match is_red(x) {
+                        Some(red) => {
+                            if red {
+                                return true;
+                            }
+                        }
+                        None => next.extend(net.lanes.get(x).map(|ln| ln.next.clone()).unwrap_or_default()),
+                    }
+                }
+                if next.is_empty() {
+                    return false;
+                }
+                front = next;
+            }
+            false
+        };
+        let mut red: Vec<u32> = self.claims.iter().filter(|(c, _)| c.light_red).filter_map(|(c, _)| claim_player(c.vehicle)).collect();
+        for (&l, list) in &self.player_occupancy {
+            if ahead_red(l) {
+                red.extend(list.iter().filter_map(|&(k, _, _)| self.players.get(k).map(|p| p.id)));
+            }
+        }
+        for v in vehicles {
+            if let (Why::Light, Some(Seen::Player(id))) = (v.last.why, v.last.lead_seen) {
+                red.push(id);
+            }
+        }
+        let ids: Vec<(u32, bool)> = self.players.iter().map(|p| (p.id, p.speed.abs() > UNHELD_SPEED)).collect();
+        self.player_wait.retain(|id, _| ids.iter().any(|x| x.0 == *id));
+        for (id, moving) in ids {
+            let w = self.player_wait.entry(id).or_insert(0.0);
+            if moving || red.contains(&id) {
+                *w = 0.0;
+            } else {
+                *w += dt;
+            }
+        }
+    }
+
     /// One frame of `dt` seconds for every vehicle.
     pub fn tick(&mut self, net: &Network, dt: f32, vehicles: &mut [Vehicle]) {
         self.time += dt as f64;
@@ -989,6 +1078,7 @@ impl Simulation {
         self.update_positions(net, vehicles);
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
+        self.player_waiting(net, vehicles, dt);
 
         // perception: read-only over everything
         let perceptions: Vec<Perception> = (0..vehicles.len()).map(|i| perception::perceive(net, self, vehicles, i)).collect();
@@ -1552,6 +1642,10 @@ impl Simulation {
             let v = &mut vehicles[i];
             let m = plan::LOOK_AHEAD_SPEED_MEMORY.powf(dt);
             v.look_ahead_speed = if v.state.speed >= v.look_ahead_speed { v.state.speed } else { m * v.look_ahead_speed + (1.0 - m) * v.state.speed };
+            // [Q8-3] the keep-right wish accumulates (SUMO: per action step)
+            if let Some(r) = plan.keep_right_rate {
+                v.keep_right += r * dt;
+            }
         }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
@@ -1562,6 +1656,9 @@ impl Simulation {
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
+        // [Q8-4] the last-resort stop's latch: dropped with a start or standing (the plan places it
+        // afresh only while the wish is blocked)
+        v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
         // a lane change begins only when nobody started one into the same stretch this
         // frame (the perception was taken before anybody moved)
         let mut change_into = |to: usize, s_to: f32| -> bool {
@@ -1575,6 +1672,7 @@ impl Simulation {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    v.keep_right = 0.0;
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1583,12 +1681,14 @@ impl Simulation {
             Some(Start::Bypass { to, dir, out_len }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_bypass(net, to, dir, out_len);
+                    v.keep_right = 0.0;
                     v.stopped = 0.0;
                 }
             }
             Some(Start::RouteChange { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_route_change(net, to, dir);
+                    v.keep_right = 0.0;
                 }
             }
             Some(Start::Pass(p)) => {
@@ -1655,7 +1755,24 @@ impl Simulation {
                 n += 1;
             }
         }
-        let alive = v.state.drive(net, dt, plan.lead, plan.stop);
+        // [Q8-1] backing up out of a packed queue instead of driving: begun with the lateral
+        // offset frozen where it is; [fix pass 1] to the place the plan fixed, over once it stands
+        // there
+        let alive = if let Some((target, stopping)) = plan.reverse {
+            if v.reversing.is_none() {
+                v.state.freeze_lateral();
+            }
+            v.state.reverse_step(net, dt, (v.state.odometer - target).max(0.0));
+            v.reversing = if v.state.odometer - target <= 1e-3 && v.state.speed.abs() < 1e-3 {
+                v.state.speed = 0.0;
+                None
+            } else {
+                Some((target, stopping))
+            };
+            true
+        } else {
+            v.state.drive(net, dt, plan.lead, plan.stop)
+        };
         // a change of the driver's own whose target lane (moving on along its plan) is closed
         // to it: given up while the body is less than half over (viz5 case04 #5644 went on from
         // 3470's rule-less bus lane piece into 3474's)
@@ -1698,6 +1815,8 @@ impl Simulation {
             v.progress.1 += dt;
         }
         let held = standing && plan.held;
+        // [Q8-1 fix pass 3] the time standing held by nothing, continuous
+        v.unheld_for = if standing && !plan.held { v.unheld_for + dt } else { 0.0 };
         // A driver who is let go but has hardly rolled yet (the start reaction takes a moment,
         // then the car creeps off) keeps the impatience that earned the go. It used to cool
         // the moment the hold lifted for a frame, which took the squeeze away again before

@@ -3081,6 +3081,13 @@ pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::syn
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
 const STOP_LINE_GAP: f32 = 0.6;
+/// [Q8-1] A car backing up out of a packed queue does so at walking pace (m/s,
+/// `AiState::reverse_step`): [fix pass 2] 5 km/h, which the Austrian Supreme Court's decision
+/// OGH 23.03.2007, 2Ob262/05a equates with "Schrittgeschwindigkeit" in the lower court's findings
+/// (https://ris.bka.gv.at/Dokumente/Justiz/JJT_20070323_OGH0002_0020OB00262_05A0000_000/JJT_20070323_OGH0002_0020OB00262_05A0000_000.html),
+/// not as a definition; for Germany de.wikipedia ("Schrittgeschwindigkeit") gives the courts'
+/// 7-10 km/h. (SUMO has no reversing of road vehicles.)
+pub const REVERSE_SPEED: f32 = 5.0 / 3.6;
 
 /// A lane change: the car moves over from its lane to `to` along `length` metres of road
 /// (by distance, not by time: a car that has to stop halfway stands still, and so does its
@@ -3755,6 +3762,46 @@ impl AiState {
             let within = (self.speed * 4.0).clamp(25.0, 60.0);
             self.turn_ahead(net, within).map(|t| t.0).unwrap_or(0)
         };
+    }
+
+    /// [Q8-1] Back up along the way behind by at most `left` m this step (the traffic's queue
+    /// escape, `omsi_traffic::plan`): from rest at `ai_motion::PULL_OUT_ACCEL` to `REVERSE_SPEED`,
+    /// slowing at the driver's comfortable brake to stand where `left` runs out; the speed is
+    /// negative meanwhile, the odometer runs back (the wheels turn backwards) and the lateral
+    /// offset stays where it is (the ramps run by the odometer: the caller freezes them,
+    /// `freeze_lateral`). [fix pass 1] Never over the start of its own lane: it stops there.
+    /// Returns the distance moved back.
+    pub fn reverse_step(&mut self, net: &Network, dt: f32, left: f32) -> f32 {
+        self.change_cooldown = (self.change_cooldown - dt).max(0.0);
+        let left = left.max(0.0);
+        let b = self.decel.max(0.5);
+        let want = -REVERSE_SPEED.min((2.0 * b * left).sqrt());
+        let v0 = self.speed.min(0.0);
+        let v1 = if want < v0 { (v0 - crate::ai_motion::PULL_OUT_ACCEL * dt).max(want) } else { (v0 + b * dt).min(want) };
+        let mut back = (-(v0 + v1) * 0.5 * dt).clamp(0.0, left);
+        let mut v1 = if back >= left { 0.0 } else { v1 };
+        self.s -= back;
+        // ([fix pass 1] never back over the start of its own lane: the escape keeps the body on it)
+        if self.s < 0.0 {
+            back += self.s;
+            self.s = 0.0;
+            v1 = 0.0;
+        }
+        let _ = net;
+        self.odometer -= back;
+        self.acc = if dt > 0.0 { (v1 - v0) / dt } else { 0.0 };
+        self.speed = v1;
+        self.braking = false;
+        self.held = false;
+        back
+    }
+
+    /// [Q8-1] The lateral offset stays where it is while the odometer runs back (`reverse_step`):
+    /// no ramp or bent way left to follow, a new one starts from here as the car drives on.
+    pub fn freeze_lateral(&mut self) {
+        let lat = self.lateral;
+        self.lateral_curve.clear();
+        self.lateral_ramp = (lat, lat, self.odometer, 0.1);
     }
 
     /// Advance along the network. `obstacle` = distance from the car's origin to the rear of

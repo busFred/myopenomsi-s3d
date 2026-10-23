@@ -358,7 +358,15 @@ impl AiBody {
         let right = DVec2::new(fwd.y, -fwd.x);
         // the planner's position along the way leads; the body keeps up with it
         let along = (target - self.rear).dot(fwd) as f32;
-        let v = if speed < 0.02 && along.abs() < 0.05 { 0.0 } else { (speed + 1.5 * along).clamp(0.0, speed + 3.0) };
+        // ([Q8-1] backing up, `AiState::reverse_step`: the body follows backwards, the wheels straight)
+        let reversing = speed < -0.02 || (speed <= 0.02 && along < -0.05);
+        let v = if reversing {
+            (speed + 1.5 * along).clamp(speed.min(0.0) - 3.0, 0.0)
+        } else if speed < 0.02 && along.abs() < 0.05 {
+            0.0
+        } else {
+            (speed + 1.5 * along).clamp(0.0, speed + 3.0)
+        };
         let look = (1.2 * self.wheelbase).max(3.5) + 0.6 * speed.min(20.0);
         let g = way(self.rot_long + look).truncate() - self.rear;
         let alpha = (g.dot(right) as f32).atan2(g.dot(fwd) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
@@ -385,7 +393,7 @@ impl AiBody {
                 }
             }
         }
-        let want = (2.0 * self.wheelbase * alpha.sin() / reach).atan().to_degrees().clamp(-limit, limit);
+        let want = if reversing { 0.0 } else { (2.0 * self.wheelbase * alpha.sin() / reach).atan().to_degrees().clamp(-limit, limit) };
         if dt > 0.0 {
             let rate = self.steer_rate * dt * if limit > self.max_steer { 1.5 } else { 1.0 };
             self.steer_cmd += (want - self.steer_cmd).clamp(-rate, rate);
@@ -711,6 +719,35 @@ mod tests {
         assert!(body.heading > 60.0 && body.heading < 300.0, "heading {}", body.heading);
         assert!(worst_jump < 3.0, "yaw rate jumps by {worst_jump} deg/s in one frame");
         assert!(worst_off < 0.6, "rear axle {worst_off} m off the way");
+    }
+
+    #[test]
+    fn backs_up_straight_along_its_way() {
+        // [Q8-1] the planner's place moves back 4 m at walking pace (negative speed): the body
+        // follows backwards, keeps its heading and does not jump
+        let def = golf();
+        let mut body = AiBody::new(&def, MotionKind::Road);
+        let way = |s: f64| move |d: f32| DVec3::new(0.0, s + d as f64, 10.0);
+        let mut s = 20.0f64;
+        body.place(&way(s), None, None, 0.0);
+        let dt = 1.0 / 30.0;
+        let y0 = body.position.y;
+        let mut worst_step = 0.0f64;
+        let mut last = body.position;
+        for k in 0..240 {
+            let v = if k < 120 { -crate::traffic::REVERSE_SPEED } else { 0.0 };
+            if s > 16.0 {
+                s = (s + (v * dt) as f64).max(16.0);
+            }
+            let speed = if s > 16.0 { v } else { 0.0 };
+            body.step(dt, speed, &way(s), None, None);
+            worst_step = worst_step.max((body.position - last).truncate().length());
+            last = body.position;
+        }
+        assert!((body.position.y - (y0 - 4.0)).abs() < 0.2, "backed to {:.2} from {y0:.2}", body.position.y);
+        assert!(body.position.x.abs() < 0.05, "drifted {:.2} m sideways", body.position.x);
+        assert!(body.heading.rem_euclid(360.0) < 1.0 || body.heading.rem_euclid(360.0) > 359.0, "heading {}", body.heading);
+        assert!(worst_step < 0.1, "jumped {worst_step:.2} m in a frame");
     }
 
     #[test]
