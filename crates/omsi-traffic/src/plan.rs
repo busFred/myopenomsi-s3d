@@ -98,6 +98,9 @@ pub struct Plan {
     /// `Vehicle::keep_right` grows by it; None where no lane beside on the keep side is one the
     /// driver may change onto (the wish is left as it is).
     pub keep_right_rate: Option<f32>,
+    /// [round 8 H8-1] A car leaving a parking space is held where it is parked because its
+    /// lane has no room behind it: its `pull_out` clock waits.
+    pub pull_out_held: bool,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -132,6 +135,144 @@ fn gap_parts(me: &Vehicle, nb: &NeighbourView) -> (bool, bool) {
     let ok_behind = nb.behind.map(|(g, vb)| g >= gap_needed_behind(me, nb, vb, v)).unwrap_or(true);
     let ok_ahead = nb.ahead.map(|(g, va)| g > 2.0 + (v - va).max(0.0) * 1.5).unwrap_or(true);
     (ok_behind, ok_ahead)
+}
+
+/// [round 8 H8-1/H8-8, fix pass 1] A vehicle behind a car about to pull out of a parking space,
+/// on the lane it pulls out onto (or a lane leading into it): the gap from its front to the
+/// pull-out's rear along the lane (m), its speed and its own driver.
+#[derive(Debug, Clone, Copy)]
+pub struct PullOutFollower {
+    pub gap: f32,
+    pub speed: f32,
+    pub params: DriverParams,
+}
+
+/// SUMO's insertion test of the follower (`MSLane::isInsertionSuccess`: the follower's own
+/// `getSecureGap`, its headway and its braking, behind a vehicle put down at speed 0, plus its
+/// minGap): the gap that follower needs (m). No impatience: an insertion has none.
+pub fn secure_gap_behind(f: &PullOutFollower) -> f32 {
+    f.params.min_gap + f.speed * f.params.tau + f.speed * f.speed / (2.0 * f.params.comfort_brake.max(0.1))
+}
+
+/// The vehicles behind lane `lane` at `s` (the pull-out's origin, `rear` behind it to its
+/// rear): on that lane and back over the lanes leading into it as far as the slowest-braking
+/// preset at the lane's limit needs (`secure_gap_behind`), the players too (their preset's
+/// driver). `on_lane(l)` gives the AI vehicles on lane `l`: (s, front, speed, driver).
+pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, rear: f32, on_lane: &dyn Fn(usize) -> Vec<(f32, f32, f32, DriverParams)>) -> Vec<PullOutFollower> {
+    let Some(l) = net.lanes.get(lane) else { return Vec::new() };
+    let v_lim = l.speed_limit_kmh.max(0.0) / 3.6;
+    let reach = secure_gap_behind(&PullOutFollower { gap: 0.0, speed: v_lim, params: DriverParams::preset(VehicleClass::ScheduledBus) });
+    let player = DriverParams::preset(crate::sim::PLAYER_PRESET);
+    let mut out = Vec::new();
+    // (lane, how far its start lies behind the pull-out's origin)
+    let mut frontier: Vec<(usize, f32)> = vec![(lane, -s)];
+    let mut seen: Vec<usize> = vec![lane];
+    while let Some((cur, start)) = frontier.pop() {
+        let mut add = |os: f32, front: f32, speed: f32, params: DriverParams| {
+            let at = start + os;
+            if cur == lane && at >= 0.0 {
+                return;
+            }
+            out.push(PullOutFollower { gap: -at - front - rear, speed, params });
+        };
+        for (os, front, speed, params) in on_lane(cur) {
+            add(os, front, speed, params);
+        }
+        for &(k, ps, _) in sim.player_occupancy.get(&cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(p) = sim.players.get(k) {
+                add(ps, p.half_len, p.speed, player);
+            }
+        }
+        if -start > reach {
+            continue;
+        }
+        for &pl in net.prev.get(cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if !seen.contains(&pl) {
+                seen.push(pl);
+                frontier.push((pl, start - net.lanes[pl].length()));
+            }
+        }
+    }
+    out
+}
+
+/// [round 8 H8-8, fix pass 1] Nobody is on the strip a pull-out's body sweeps from its parking
+/// offset onto its lane: the body at lane `lane`, `s` + d, `lateral` eased to 0 over `ramp_len`
+/// m as `AiState::lateral_ramp` does, for d from where it stands to the ramp's end (a walker
+/// passing through the parked body holds it until through - leaving them out, the car drove off
+/// with a walker inside its body, viz case15 #54577, a probe; the walkers on the pavement beside
+/// and behind it, which held Jiangzhaikou #1913 at its offset, are not on the strip); each person
+/// where they are and where they will be
+/// when the body is at that metre, driving from rest at `PULL_OUT_ACCEL` (SUMO's insertion fails
+/// on a person on the footprint, `MSLane::checkForPedestrians`; on its way it brakes for persons
+/// on its lane).
+pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32) -> bool {
+    let Some(l) = net.lanes.get(lane) else { return true };
+    let (q, _) = l.at(s.min(l.length()));
+    !sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0).into_iter().any(|k| on_pull_out_strip(net, lane, s, lateral, front, rear, half_width, ramp_len, v, &sim.people[k]))
+}
+
+/// [round 8 H8-8, fix pass 2] Whether person `p` is on the strip (`pull_out_strip_clear`): where
+/// they are, or where they will be when the body is at that metre - the car driving on from `v`
+/// m/s at `PULL_OUT_ACCEL` up to the lane's limit (`arrival_time`; pass 1 timed it from rest even
+/// when moving).
+pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32, p: &crate::sim::Person) -> bool {
+    let Some(l) = net.lanes.get(lane) else { return false };
+    let len = l.length();
+    let v_lim = l.speed_limit_kmh.max(1.0) / 3.6;
+    let mut d = 0.0f32;
+    while d <= ramp_len + 0.01 {
+        let at = (s + d).min(len);
+        let (q, h) = l.at(at);
+        let hr = (h as f64).to_radians();
+        let lat = lateral * (1.0 - omsi_sim::traffic::smooth01(d / ramp_len.max(0.1)));
+        let c = q.truncate() + DVec2::new(hr.cos(), -hr.sin()) * lat as f64;
+        let body = Obb::vehicle(c, h as f64, front as f64, rear as f64, half_width as f64);
+        let later = p.pos.truncate() + p.vel * arrival_time(d, v.max(0.0), omsi_sim::ai_motion::PULL_OUT_ACCEL, v_lim) as f64;
+        if [p.pos.truncate(), later].iter().any(|&x| Obb::point(x.extend(p.pos.z), PERSON_RADIUS as f64).separation(&body) < 0.0) {
+            return true;
+        }
+        d += 1.0;
+    }
+    false
+}
+
+/// [round 8 H8-8, fix pass 2] The rest of a pull-out's way out (m): the steerable move from rest
+/// while it has not left (`bypass_min_len`), else what is left of its ramp.
+pub fn pull_out_ramp_left(me: &Vehicle) -> f32 {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    if st.speed < STANDING_SPEED && me.pull_out > 0.0 {
+        bypass_min_len(me.length(), st.lateral)
+    } else {
+        (x0 + len - st.odometer).max(1.0)
+    }
+}
+
+/// [round 8 H8-8, fix pass 2] The one exemption the people test makes for a car pulling out of a
+/// parking space (`people_ahead` asks it for every person): somebody under or beside its parked
+/// body - level with it, from its rear to its front - who is not on the strip it sweeps onto its
+/// lane (`on_pull_out_strip`) is not in its way (the walkers passing over the pavement at its
+/// spot, Jiangzhaikou #1913). Everybody else is tested as by any car (pass 1 switched the test
+/// off while the strip was clear: probes hit people just past the strip at 3-4 m/s).
+pub fn pull_out_exempt(net: &Network, me: &Vehicle, p: &crate::sim::Person) -> bool {
+    if !me.pulling_out {
+        return false;
+    }
+    let st = &me.state;
+    let hr = (me.heading as f64).to_radians();
+    let along = (p.pos - me.pos).truncate().dot(DVec2::new(hr.sin(), hr.cos())) as f32;
+    let level = along >= -st.rear - PERSON_RADIUS && along <= st.front + PERSON_RADIUS;
+    level && !on_pull_out_strip(net, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, pull_out_ramp_left(me), st.speed, p)
+}
+
+/// [round 8 H8-1/H8-8, fix pass 1] The one pull-out rule, for the parked object the app takes
+/// off the kerb and for a recorded pull-out standing at its offset: every follower has its
+/// secure gap (`secure_gap_behind`) and nobody is on the strip its body sweeps
+/// (`pull_out_strip_clear`). SUMO re-inserts a parked vehicle only when `isInsertionSuccess`
+/// passes (`MSVehicleTransfer`); OMSI draws the body, so the car then drives from its offset.
+pub fn pull_out_clear(net: &Network, sim: &Simulation, followers: &[PullOutFollower], lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32) -> bool {
+    followers.iter().all(|f| f.gap >= secure_gap_behind(f)) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len, 0.0)
 }
 
 /// [J7-3] SUMO LC2013's strategic look-ahead (`MSLCM_LC2013::LOOK_FORWARD`, s): a lane that
@@ -1501,14 +1642,30 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // 4. people
+    // 4. people ([round 8 H8-8, fix pass 2] a pull-out too: `people_ahead` leaves out only the
+    // people under or beside its parked body off its way out, `pull_out_exempt`)
     min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
-    if me.pull_out > 0.0 {
+    // [round 8 H8-1] a car leaving a parking space starts only when its lane has room behind
+    // it: the follower there not within the gap a lane change needs from it (`gap_needed_behind`:
+    // its standing gap, the time gap and the braking distance of the speed it closes in at) -
+    // SUMO's parked vehicle re-enters by insertion, which checks the follower's secure gap on the
+    // lane it enters (`MSLane::isInsertionSuccess`, `getSecureGap`). Until then it stays parked
+    // and its clock waits (x10 case08: #11387 pulled out with bus #11125 coming up at 12 m/s)
+    let pull_out_held = me.pulling_out && v < STANDING_SPEED && {
+        let on_lane = |l: usize| -> Vec<(f32, f32, f32, DriverParams)> {
+            sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|o| o.vehicle != i).filter_map(|o| vehicles.get(o.vehicle).map(|x| (o.s, x.state.front, x.state.speed, x.params))).collect()
+        };
+        let followers = pull_out_followers(net, sim, st.lane, st.s, st.rear, &on_lane);
+        let ramp = bypass_min_len(me.length(), st.lateral);
+        !pull_out_clear(net, sim, &followers, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, ramp)
+    };
+    if me.pull_out > 0.0 || pull_out_held {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
     }
+    out.pull_out_held = pull_out_held;
     if let Some(d) = p.letting_out {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + (d - 1.0).max(0.0)), Why::LetOut);
     }
@@ -1908,6 +2065,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         if end < 150.0 && stop_beyond && me.class == VehicleClass::ScheduledBus && !dead_end && !me.external.trip_over {
             min_stop(&mut out.stop, &mut out.why, Some(end.max(0.0)), Why::End);
         }
+    }
+
+    // 10b. [round 8 H8-7, fix pass 1] the edge of the loaded tiles (`Lane::loaded_edge`): the
+    //      road goes on into a tile that is not loaded; the car stops before the lane's end, as a
+    //      bus at its loaded route's end, and the game takes it off once nobody sees it (a
+    //      dead-end removal) or lets it on when the tile comes
+    if let Some(&(el, d0)) = p.way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())) {
+        let end = d0 + net.lanes[el].length() - 0.5;
+        min_stop(&mut out.stop, &mut out.why, Some(end.max(st.front - 0.3)), Why::End);
     }
 
     // 11. [fix pass 3, 2] keep the box clear, on every aspect (SUMO's no-block heuristic,

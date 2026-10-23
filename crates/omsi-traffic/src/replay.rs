@@ -584,11 +584,10 @@ impl Replay {
         // out of sight the game takes it off earlier, which a run cannot tell)
         if self.free_run {
             if let Some(eye) = sim.players.first().map(|p| p.pos) {
-                let standing = crate::removal::standing_ids(&self.vehicles, &sim.players);
                 let mut i = 0;
                 while i < self.vehicles.len() {
                     let v = &self.vehicles[i];
-                    if crate::removal::goes_in_view(v.gone && !v.serves_stops(), v, (v.pos - eye).length(), &standing) {
+                    if crate::removal::goes_in_view(v.gone && !v.serves_stops(), v, (v.pos - eye).length()) {
                         let v = self.vehicles.swap_remove(i);
                         self.removals.push(Removal { time: sim.time, id: v.id, rule: Some(RemoveRule::InViewAfterGrace), seen: true, waiting: v.waiting, pos: v.pos });
                     } else {

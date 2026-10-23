@@ -281,6 +281,15 @@ pub struct Vehicle {
     pub fresh: f32,
     /// Seconds before a car leaving a parking space moves.
     pub pull_out: f32,
+    /// [round 8 H8-1] A car leaving a parking space that is not on its lane yet: from its
+    /// `pull_out`, standing off the lane's axis, until its way's offset has come back to the axis
+    /// (`SIDESTEP_DONE`).
+    /// It starts only when its lane has room behind it (SUMO: a parked vehicle is off the lane
+    /// and re-enters by insertion, `MSLane::isInsertionSuccess`'s follower gap). (Since round 8
+    /// H8-8 the game puts a pull-out on the lane itself where `spawn_clear` finds room,
+    /// `Traffic::pull_out_parked`; a recording's pull-out at its parking offset is held here.)
+    #[serde(default)]
+    pub pulling_out: bool,
     pub passing: Option<Passing>,
     /// [round 7 fix pass 1] The decision taken at the amber onset of the light ahead:
     /// (controller, light), through or stop, and the odometer reading at its line
@@ -532,6 +541,7 @@ impl Vehicle {
             waiting: 0.0,
             fresh: 1.5,
             pull_out: 0.0,
+            pulling_out: false,
             passing: None,
             light_decision: None,
             external: External::default(),
@@ -1798,7 +1808,26 @@ impl Simulation {
         }
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
-        v.pull_out = (v.pull_out - dt).max(0.0);
+        // ([round 8 H8-1] the pull-out's clock runs only while its lane has room behind it:
+        // until then the car stays where it is parked, `Plan::pull_out_held`)
+        if v.pull_out > 0.0 && v.state.lateral.abs() > SIDESTEP_DONE {
+            v.pulling_out = true;
+        }
+        if !plan.pull_out_held {
+            v.pull_out = (v.pull_out - dt).max(0.0);
+        }
+        // (on its lane: its offset back on the axis, or another manoeuvre took it over)
+        if v.pulling_out && v.pull_out <= 0.0 && (v.state.lateral.abs() <= SIDESTEP_DONE || v.state.change.is_some() || v.passing.is_some()) {
+            v.pulling_out = false;
+        }
+        // ([fix pass 1] standing at its offset with its signalling time run, its way out is the
+        // shortest move its body can steer from rest, `plan::bypass_min_len`, starting where it
+        // stands: the strip `plan::pull_out_clear` tested)
+        if v.pulling_out && v.pull_out <= 0.0 && v.state.speed < STANDING_SPEED {
+            let (lat, odo) = (v.state.lateral, v.state.odometer);
+            v.state.lateral_target = 0.0;
+            v.state.lateral_ramp = (lat, 0.0, odo, plan::bypass_min_len(v.length(), lat));
+        }
         let standing = v.state.speed < STANDING_SPEED;
         // [ROLLBACK r4d-B4] a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
         // standing time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of

@@ -70,7 +70,9 @@ const AT_END_STAND: f32 = 0.5;
 const AT_END_STAND_BUS: f32 = 20.0;
 /// Standing this long (s) beyond `FAR_OFF_DIST` (m) from the eye, too far for the
 /// renderer to draw it plainly: a bus stood with its passengers at the far end of a
-/// straight road for good (r4d).
+/// straight road for good (r4d). For a timetable bus at its loaded route's end (`at_edge`)
+/// and the dead-end rule only ([round 8 H8-7 fix pass 2] not for a car at the loaded tiles'
+/// edge, which goes by the round-7 in-view rule).
 const FAR_OFF_STAND: f32 = 8.0;
 const FAR_OFF_DIST: f64 = 180.0;
 /// Standing this long (s) at a dead end or the loaded route's end goes in any case.
@@ -149,10 +151,29 @@ fn removal_rule(why: &str) -> RemoveRule {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        w if w.starts_with("at the loaded tiles' edge, in view") => RemoveRule::InViewAfterGrace,
+        w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
         w if w.starts_with("at a dead end") || w.starts_with("at the loaded route's end") => RemoveRule::DeadEnd,
         _ => RemoveRule::Other,
     }
+}
+
+/// [round 8 H8-8, fix pass 2] A parked object that signals to pull out: which, its AI type, the
+/// lane point it leaves onto and its offset there, its body's extents, when its signalling time
+/// has run (`Traffic::time`), its seed.
+#[derive(Clone)]
+struct PendingPullOut {
+    key: i64,
+    ty: Arc<VehicleType>,
+    lane: usize,
+    s: f32,
+    lat: f32,
+    front: f32,
+    rear: f32,
+    half_w: f32,
+    ready_at: f32,
+    seed: u64,
 }
 
 /// What makes a new car a timetable bus (`Traffic::create_car`).
@@ -349,6 +370,17 @@ const DRIVER_NEAR: f64 = 70.0;
 /// Within this distance of the camera no car appears or vanishes, seen or not: the mirrors
 /// and a turn of the head see what is near (see [`Traffic::may_appear`]).
 const NEVER_VANISH_WITHIN: f64 = 150.0;
+
+/// Lane ends within this distance (m) of a lane start are linked (`Network::link`, the value
+/// the network has always been linked with).
+const LANE_LINK_TOL: f64 = 1.5;
+
+/// [round 8 H8-7, fix pass 1] Whether world point `probe` lies on a tile of the map (`has_tile`)
+/// whose lanes are not loaded (`lane_tiles`): the way on from a lane end there is not loaded.
+fn loaded_edge_at(probe: DVec3, tile_size: f64, has_tile: &dyn Fn((i32, i32)) -> bool, lane_tiles: &hashbrown::HashSet<(i32, i32)>) -> bool {
+    let key = ((probe.x / tile_size).floor() as i32, (probe.y / tile_size).floor() as i32);
+    has_tile(key) && !lane_tiles.contains(&key)
+}
 /// Within this distance a vehicle appears or vanishes only behind something, wherever the
 /// player looks (see `Traffic::hidden`).
 const NEAR_HIDE: f64 = 350.0;
@@ -683,6 +715,8 @@ pub struct Traffic {
     auto_saves: (u32, f32),
     /// When the cars were last looked over for two inside each other (`time`).
     overlap_checked: f32,
+    /// [round 8 H8-8, fix pass 2] A parked object signalling to pull out (`advance_pull_out`).
+    pending_pull_out: Option<PendingPullOut>,
 }
 
 /// At most this many minutes of traffic are saved by themselves in a session (a car stuck,
@@ -992,7 +1026,7 @@ impl Traffic {
         if net.left_hand {
             log::info!("traffic: the map drives on the left");
         }
-        net.link(1.5);
+        net.link(LANE_LINK_TOL);
         let mut types = Vec::new();
         let mut groups: Vec<omsi_map::ailists::UnschedGroup> = Vec::new();
         let mut group_uvg: Vec<Option<usize>> = Vec::new();
@@ -1324,8 +1358,10 @@ impl Traffic {
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
             overlap_checked: 0.0,
+            pending_pull_out: None,
         };
         t.sort_parked(parked_cars, lanes);
+        t.mark_loaded_edges(world);
         if let Ok(path) = omsi_cfg::env::var("OMSI_TRAFFIC_RECORD") {
             if let Err(e) = t.start_recording(Path::new(&path)) {
                 log::warn!("traffic: cannot record to {path}: {e}");
@@ -1851,9 +1887,6 @@ impl Traffic {
         self.advance_dormant();
         // the cars somebody stands behind
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.last.lead_id).collect();
-        // [round5 C4] the vehicles standing now, the players too: a car that gave up behind
-        // one of them is in a queue, not a phantom
-        let standing = omsi_traffic::removal::standing_ids(self.cars.iter().map(|c| &c.ai), &self.sim.players);
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1897,6 +1930,10 @@ impl Traffic {
                 && c.ai.state.speed < 0.1
                 && c.ai.state.route.last() == Some(&c.ai.state.lane)
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
+            // [round 8 H8-7, fix pass 1] stopped at the edge of the loaded tiles
+            let at_loaded_edge = c.ai.last.why == Why::End
+                && c.ai.stopped > AT_END_STAND
+                && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
             let sleeps_instead = !c.serves_stops() && !c.ai.gone && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
@@ -1904,7 +1941,11 @@ impl Traffic {
             // (the rules are asked in order, lazily: `hidden` casts rays)
             let first = |rules: &[(&dyn Fn() -> bool, &'static str)]| rules.iter().find(|r| r.0()).map(|r| r.1);
             let hidden = || self.hidden(world, p, r);
-            let reason: Option<&'static str> = if unloaded {
+            // [round 8 H8-7] the ground going is no reason of its own to vanish in view: it
+            // waits behind `hidden()` like every other removal (the tiles go at 170-200 m, and
+            // 129 cars went within 200 m of the eye in 300 s at Jiangzhaikou, in frame); one in
+            // sight stays until it is not, or another rule below takes it
+            let reason: Option<&'static str> = if unloaded && hidden() {
                 Some("its ground unloaded")
             } else if at_edge {
                 // (its trip comes back with the tiles; kept until nobody saw it, a bus stood
@@ -1912,6 +1953,18 @@ impl Traffic {
                 first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
             } else if !random {
                 None
+            } else if at_loaded_edge {
+                // [round 8 H8-7, fix pass 2] standing at the edge of the loaded tiles (`Lane::
+                // loaded_edge`, the crate stops it there): it goes once nobody sees it, or in view
+                // by the round-7 rule every other car has (`goes_in_view`: given up, its grace
+                // run, beyond GAVE_UP_DIST, the front of its queue) - nothing else; a dead-end
+                // removal, gated and counted (it drove off the loaded network in view as "the
+                // network's end": 607 in frame at 873 m, Jiangzhaikou). The bus route end's
+                // FAR_OFF/STOOD_LONG are a timetable bus's alone.
+                first(&[
+                    (&|| hidden(), "at the loaded tiles' edge, out of sight"),
+                    (&|| goes_in_view(c.ai.gone, &c.ai, from_eye), "at the loaded tiles' edge, in view after its grace"),
+                ])
             } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at a dead end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at a dead end, long"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
                 // (and in view too once others wait behind it: a fire engine at the end of a
                 // dead-end street held a queue of fourteen cars for two and a half minutes)
@@ -1935,7 +1988,7 @@ impl Traffic {
                 first(&[
                     (&|| dist > VISIBLE_RANGE * OUT_OF_RANGE && from_eye > NEAR_HIDE, "out of range"),
                     (&|| hidden(), if finished { "finished, out of sight" } else { "out of sight" }),
-                    (&|| goes_in_view(finished, &c.ai, from_eye, &standing), "finished, in view after its grace"),
+                    (&|| goes_in_view(finished, &c.ai, from_eye), "finished, in view after its grace"),
                 ])
             } else {
                 None
@@ -1947,7 +2000,7 @@ impl Traffic {
                 let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
                 let seen = match rule {
                     RemoveRule::OutOfSight => false,
-                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
                     _ => frames(),
                 };
                 self.recorder.note_remove(c.id, rule, seen, c.ai.waiting);
@@ -1983,10 +2036,10 @@ impl Traffic {
                     // ([round 7 B1] with the rule that took it, its distance from the eye, its
                     // last hold and its waiting time, the give-up clock)
                     // ([round 7 R7-1] and what it follows: the lead's id and gap and whether
-                    // that lead stands, the queue test of the in-view rule)
+                    // its speed, the queue test of the in-view rule)
                     let lead = lead_of(&c.ai.last);
-                    let in_queue = in_a_queue(&c.ai.last, &standing);
-                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} standing {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), lead.is_some_and(|l| standing.contains(&l)), in_queue);
+                    let in_queue = in_a_queue(&c.ai.last);
+                    log::info!("population t={:.1}: car {} removed at ({:.0}, {:.0}), {:.0} m from the player, in frame {}, behind a building {}, {}; {:.0} m from the eye, why {}, stood {:.0} s, waiting {:.1} s, lead {} gap {} speed {}, in a queue {}", self.time, c.id, p.x, p.y, dist, v.map(|v| v.frames(p, r)).unwrap_or(false), v.map(|v| self.occluded(world, &v, p, r)).unwrap_or(false), reason.unwrap_or("-"), from_eye, c.ai.last.why.name(), c.ai.stopped, c.ai.waiting, lead.map(|l| l.to_string()).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.gap)).unwrap_or("-".into()), c.ai.last.lead.map(|l| format!("{:.1}", l.speed)).unwrap_or("-".into()), in_queue);
                 }
                 self.orphan_sounds.extend(c.sounds);
                 for r in std::iter::once(c.render).chain(c.trailer_renders) {
@@ -2133,7 +2186,69 @@ impl Traffic {
     /// goes (its space stays empty) and the AI car of the same folder takes its place, in
     /// the parking position, indicating, and pulls out into its lane once the road behind
     /// it is clear. Called with every population pass (about every two seconds).
+    /// [round 8 H8-1/H8-8, fix pass 2] The parked object that signals to pull out
+    /// (`pending_pull_out`): once its signalling time has run, the frame the one pull-out rule
+    /// passes (`plan::pull_out_clear`: every vehicle driving up the lane, the players too, beyond
+    /// its own secure gap; nobody on the strip its body sweeps from its offset onto the lane) and
+    /// its lane point is clear (`spawn_clear`), it leaves the kerb: the AI car is made where it
+    /// was parked, `pulling_out`, and drives out over the shortest move it can steer from rest.
+    /// Until then it stays a parked object (SUMO: a parked vehicle enters only when
+    /// `isInsertionSuccess` passes, MSVehicleTransfer.cpp ~135-149); no AI car waits at the offset.
+    /// (The scenery object shows no indicator: the time runs, the lamps do not blink.)
+    fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
+        let Some(pp) = self.pending_pull_out.clone() else { return };
+        let parked = world.parked_objects.lock().get(&pp.key).map(|p| p.pos);
+        let Some(ppos) = parked else {
+            self.pending_pull_out = None;
+            return;
+        };
+        if self.time < pp.ready_at {
+            return;
+        }
+        let ramp = omsi_traffic::plan::bypass_min_len(pp.front + pp.rear, pp.lat);
+        let on_lane = |lane: usize| -> Vec<(f32, f32, f32, omsi_traffic::DriverParams)> {
+            self.cars.iter().filter(|c| c.ai.state.lane == lane).map(|c| (c.ai.state.s, c.ai.state.front, c.ai.state.speed, c.ai.params)).collect()
+        };
+        let followers = omsi_traffic::plan::pull_out_followers(&self.net, &self.sim, pp.lane, pp.s, pp.rear, &on_lane);
+        if !omsi_traffic::plan::pull_out_clear(&self.net, &self.sim, &followers, pp.lane, pp.s, pp.lat, pp.front, pp.rear, pp.half_w, ramp) {
+            return;
+        }
+        let (q, h) = self.net.lanes[pp.lane].at(pp.s);
+        if !self.spawn_clear(&pp.ty, q, h as f64) {
+            return;
+        }
+        self.pending_pull_out = None;
+        if world.depart_parked(renderer, scene, pp.key).is_none() {
+            return;
+        }
+        if let Some(list) = self.parked.get_mut(&pp.lane) {
+            if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - pp.s).abs().total_cmp(&(list[b].s - pp.s).abs())) {
+                if (list[j].s - pp.s).abs() < 3.0 {
+                    list.swap_remove(j);
+                }
+            }
+        }
+        let id = self.create_car(world, renderer, scene, center, LaneKind::Street, pp.lane, pp.s, pp.ty.clone(), pp.seed, None, None, Some(0.0), None);
+        let net = &self.net;
+        if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
+            car.ai.state.lateral = pp.lat;
+            car.ai.state.lateral_target = 0.0;
+            car.ai.state.lateral_ramp = (pp.lat, 0.0, car.ai.state.odometer, ramp);
+            car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
+            car.ai.pull_out = 0.0;
+            car.ai.pulling_out = true;
+            car.ai.state.blinker = 1;
+        }
+        if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
+            log::info!("parked car {} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {:.1} m right of lane {}", pp.key, pp.ty.def.path.display(), ppos.x, ppos.y, pp.lat, pp.lane);
+        }
+    }
+
     pub fn pull_out_parked(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
+        if self.pending_pull_out.is_some() {
+            self.advance_pull_out(world, renderer, scene, center);
+            return;
+        }
         if self.rand_f() >= PULL_OUT_CHANCE {
             return;
         }
@@ -2197,29 +2312,15 @@ impl Traffic {
                 why.push("road not clear".into());
                 continue;
             }
-            if world.depart_parked(renderer, scene, key).is_none() {
-                continue;
-            }
-            if let Some(list) = self.parked.get_mut(&l) {
-                if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - s).abs().total_cmp(&(list[b].s - s).abs())) {
-                    if (list[j].s - s).abs() < 3.0 {
-                        list.swap_remove(j);
-                    }
-                }
-            }
+            // [round 8 H8-8, fix pass 2] it signals as the parked object (SUMO's parked vehicle
+            // indicates while parked, MSVehicleTransfer), and the car is made only when it moves
+            // (`advance_pull_out`)
+            let (front, rear, half_w) = extents(&ty, 12.0);
             let seed = self.rand();
-            let id = self.create_car(world, renderer, scene, center, LaneKind::Street, l, s, ty.clone(), seed, None, None, Some(0.0), None);
-            let net = &self.net;
-            if let Some(car) = self.cars.iter_mut().find(|c| c.id == id) {
-                car.ai.state.lateral = lat;
-                car.ai.state.lateral_target = 0.0;
-                car.ai.state.lateral_ramp = (lat, 0.0, car.ai.state.odometer, (lat * 6.0).clamp(8.0, 16.0));
-                car.body = place_body(net, &car.ai.state, &mut car.vehicle, MotionKind::Road);
-                car.ai.pull_out = 2.0 + (seed % 1000) as f32 / 400.0;
-                car.ai.state.blinker = 1;
-            }
+            let ready_at = self.time + 2.0 + (seed % 1000) as f32 / 400.0;
+            self.pending_pull_out = Some(PendingPullOut { key, ty, lane: l, s, lat, front, rear, half_w, ready_at, seed });
             if debug {
-                log::info!("parked car {key} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {lat:.1} m right of lane {l}", ty.def.path.display(), p.pos.x, p.pos.y);
+                log::info!("parked car {key} at ({:.1}, {:.1}) signals to pull out, {lat:.1} m right of lane {l}", p.pos.x, p.pos.y);
             }
             return;
         }
@@ -4843,6 +4944,22 @@ impl Traffic {
 }
 
 impl Traffic {
+    /// [round 8 H8-7, fix pass 1] Mark the street lanes that end at the edge of the loaded tiles
+    /// (`Lane::loaded_edge`): no lane on, and the road's way on - `LANE_LINK_TOL` past the end,
+    /// where a lane going on would be linked - lies on a tile of the map whose lanes are not
+    /// loaded. (The "network's end" 873 m ahead at Jiangzhaikou, lanes 149-155 at y = -2455,
+    /// is the loaded tiles' edge: 7 of the map's 91 tiles are loaded at the start.)
+    pub fn mark_loaded_edges(&mut self, world: &World) {
+        let ts = omsi_map::tile_size();
+        for l in self.net.lanes.iter_mut() {
+            l.loaded_edge = l.kind == LaneKind::Street && l.next.is_empty() && !l.points.is_empty() && {
+                let (end, h) = (l.end(), (l.end_heading() as f64).to_radians());
+                let probe = end + DVec3::new(h.sin(), h.cos(), 0.0) * LANE_LINK_TOL;
+                loaded_edge_at(probe, ts, &|k| world.has_tile(k), &self.lane_tiles)
+            };
+        }
+    }
+
     /// Take in what the tiles loaded since the last call brought: their lanes (linked into
     /// the network, whose existing indices stay valid), their parked cars (sorted onto the
     /// lanes once those are in) and the light programs of their crossings.
@@ -4854,7 +4971,7 @@ impl Traffic {
             if self.recorder.is_recording() {
                 self.recorder.lanes_added(self.sim.time, self.net.lanes.len(), &new);
             }
-            added = self.net.extend(new, 1.5);
+            added = self.net.extend(new, LANE_LINK_TOL);
             self.sim.network_grew(&self.net, added.start);
             self.street_weight += self.net.lanes[added.clone()].iter().filter_map(street_lane_weight).sum::<f64>();
             log::debug!(
@@ -4866,6 +4983,9 @@ impl Traffic {
         if !tiles.is_empty() {
             self.lane_tiles.extend(tiles);
             self.lanes_generation += 1;
+        }
+        if n > 0 {
+            self.mark_loaded_edges(world);
         }
         self.sort_parked(parked_cars, added);
         // new crossings bring their light programs; the running ones keep their clocks
@@ -5381,5 +5501,30 @@ mod respawn_sight_tests {
         let v = viewer().with_culling(0.0, 300.0);
         assert!(v.hides_plainly(DVec3::new(0.0, 330.0, 0.0), 8.0));
         assert!(!v.hides_plainly(DVec3::new(0.0, 280.0, 0.0), 8.0));
+    }
+}
+
+#[cfg(test)]
+mod loaded_edge_tests {
+    use super::*;
+
+    /// [round 8 H8-7, fix pass 1] A lane end whose way on lies on a tile of the map that is not
+    /// loaded is the loaded tiles' edge (the car stops there and goes once hidden, a dead-end
+    /// removal); one whose way on lies on a loaded tile, or off the map, is the network's end; the
+    /// removal is a gated dead-end rule.
+    #[test]
+    fn h8_7_the_loaded_edge_is_a_tile_of_the_map_not_loaded() {
+        let ts = 300.0;
+        let map: hashbrown::HashSet<(i32, i32)> = [(0, 0), (0, 1)].into_iter().collect();
+        let has = |k: (i32, i32)| map.contains(&k);
+        let mut loaded: hashbrown::HashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
+        let probe = DVec3::new(10.0, 300.0 + LANE_LINK_TOL, 0.0);
+        assert!(loaded_edge_at(probe, ts, &has, &loaded), "the next tile is the map's, not loaded");
+        loaded.insert((0, 1));
+        assert!(!loaded_edge_at(probe, ts, &has, &loaded), "loaded: a real end");
+        assert!(!loaded_edge_at(DVec3::new(-10.0, 100.0, 0.0), ts, &has, &loaded), "off the map");
+        assert_eq!(removal_rule("at the loaded tiles' edge, out of sight"), RemoveRule::DeadEnd);
+        assert_eq!(removal_rule("at the loaded tiles' edge, in view after its grace"), RemoveRule::InViewAfterGrace);
+        assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
     }
 }
