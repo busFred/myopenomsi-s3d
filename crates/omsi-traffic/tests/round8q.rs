@@ -466,3 +466,38 @@ fn q81_fix3_a_player_whose_way_leads_into_a_red_heads_no_queue() {
     });
     assert!(!back, "backed up behind a player whose way leads into its red");
 }
+
+#[test]
+fn j82_a_car_that_goes_at_amber_onset_and_then_slows_stops_at_the_line() {
+    // [J8-2] (viz3 case18 #52423) at the amber onset 26 m from the line at 13.4 m/s it cannot stop
+    // within 3 m/s² and goes; a person on the road short of the line makes it brake; able to stop
+    // then, it stops at the line when the person has gone (SUMO re-tests `yellow && canBrake` every
+    // step), never over it at red
+    let mut net = two_lanes();
+    net.lanes[3].traffic_light = Some((0, 0));
+    // (green 10 s, amber 3 s, red)
+    let ctl = omsi_sim::traffic::TrafficLightController::new(vec![vec![(6, 10.0), (10, 3.0), (0, 60.0)]], 73.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    // (the line at x 210: at 13.4 m/s, 26 m out after 10 s: start 10 s * 13.4 m further back)
+    let mut me = car(1, 1, 210.0 - 2.0 - 26.0 - 134.0, 13.4);
+    me.state.max_speed_kmh = 48.24;
+    me.state.change_cooldown = 1000.0;
+    let mut cars = vec![me];
+    // (somebody on the road 6 m short of the line from the amber onset to 1 s into the red)
+    let mut over_at_red = false;
+    let mut t = 0.0f32;
+    while t < 30.0 {
+        if (t - 10.0).abs() < DT * 0.5 {
+            sim.people.push(Person { pos: DVec3::new(204.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false });
+        }
+        if (t - 14.0).abs() < DT * 0.5 {
+            sim.people.clear();
+        }
+        sim.tick(&net, DT, &mut cars);
+        let c = &cars[0];
+        let front_x = c.pos.x + c.state.front as f64;
+        over_at_red |= t > 13.0 && c.state.lane == 1 && front_x > 210.0 + 0.05;
+        t += DT;
+    }
+    assert!(!over_at_red, "crossed its line at red");
+}

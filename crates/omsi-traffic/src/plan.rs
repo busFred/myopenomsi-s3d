@@ -1087,9 +1087,9 @@ pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
 }
 
 /// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
-/// on green; at amber onset the driver decides once whether it can stop with comfortable
-/// braking (`comfortable_stop`) - if not it is committed and goes, if so it stops - and keeps
-/// that decision while this light is the one ahead (`Vehicle::light_decision`); on red only a
+/// on green; on amber the driver asks every frame whether it can stop with comfortable
+/// braking (`stops_comfortably`) - if not it goes, if so it stops ([J8-2] SUMO re-tests it every
+/// step; the last amber answer is kept as `Vehicle::light_decision`); on red only a
 /// car that cannot stop at all (`cannot_stop`, `HARD_BRAKE`) or one committed at amber onset
 /// and still rolling crosses. Nothing is decided on green, no decision is extended past
 /// what the onset allowed, and a committed car that came to a stand waits for its green
@@ -1115,12 +1115,20 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // sumo.md: viz5 case05 #16535 took its amber with people 2.8 m past the line and
             // stood 85.8 s inside - unless it cannot stop at all)
             let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
-            let go = held.unwrap_or_else(|| v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap + 0.5, HARD_BRAKE)));
+            // ([J8-2] SUMO's yellow rule, re-tested every step (`MSVehicle::planMoveInternal`:
+            // `yellow && canBrake`, canBrake = the brake gap at the vehicle's decel - here its
+            // comfortable brake or `--tls.yellow.min-decel` 3 m/s², whichever is more - within the
+            // distance to the line): a car that slowed for anything and can then stop, stops; the
+            // decision is not kept from the amber onset. The line is the stop place: no 0.5 m past
+            // it. viz3 case18 #52423 decided "go" once at the onset 26 m out, braked for people and
+            // crossed at red at 2 m/s)
+            let _ = held;
+            let go = v > STANDING_SPEED && !queued && !stops_comfortably(v, gap, dp) && (exit_free || cannot_stop(v, gap, HARD_BRAKE));
             LightCall { go: go && v > STANDING_SPEED, decision: Some((light, go, gap)) }
         }
         Aspect::Red | Aspect::RedYellow => {
             let committed = held == Some(true) && v > STANDING_SPEED;
-            LightCall { go: committed || cannot_stop(v, gap + 0.5, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
+            LightCall { go: committed || cannot_stop(v, gap, HARD_BRAKE), decision: held.map(|h| (light, h, gap)) }
         }
     }
 }
