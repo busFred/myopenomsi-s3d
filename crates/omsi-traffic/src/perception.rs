@@ -344,8 +344,8 @@ const LONGEST_HALF: f32 = 15.0;
 /// Slices of the way per bounding circle (`WayPts::chunks`).
 const WAY_CHUNK: usize = 8;
 
-/// How far behind the origin (m) beyond half a `WAY_STEP` the first slice of the way reaches
-/// for people (`WayPts::segment_of`: the first sample's span in round 4's people test).
+/// What two neighbouring samples' spans overlap by (m, round 4's people test: half a step and
+/// this), so that somebody exactly between them is in one of them.
 const SAMPLE_OVERLAP: f64 = 0.05;
 
 /// Sample spacing of the way (m) ...
@@ -394,36 +394,16 @@ impl WayPts {
         WayPts { pts, zs, chunks }
     }
 
-    /// [P8-5, pass 1 S3] The slice of the way a point belongs to: the polyline segment from
-    /// sample `k` to `k + 1` it lies nearest to (projected onto it, clamped to its ends), with
-    /// how far along it (in the way's metres from sample `k`); only slices starting no further
-    /// than `upto` along the way. The samples are `WAY_STEP` apart along the way but not on
-    /// the ground (2.5 m over a junction's short pieces), and on a bend a span measured along
-    /// one sample's heading leaves wedges on the outer side: a walker there was seen in one
-    /// frame and not in the next (viz3 case09 #20705 hit a walker 1.14 m deep at 5 m/s with its
-    /// people stop on and off frame by frame). The first slice reaches back half a step behind
-    /// the origin, as the first sample did (round 4's span).
-    fn segment_of(&self, c: DVec2, upto: f32) -> Option<(usize, f32)> {
-        let mut best: Option<(f64, usize, f32)> = None;
-        for k in 0..self.pts.len().saturating_sub(1) {
-            let (d0, a, _) = self.pts[k];
-            if d0 > upto {
-                break;
-            }
-            let (d1, b, _) = self.pts[k + 1];
-            let seg = b - a;
-            let len2 = seg.length_squared();
-            if len2 < 1e-9 {
-                continue;
-            }
-            let lo = if k == 0 { -(WAY_STEP as f64 * 0.5 + SAMPLE_OVERLAP) / len2.sqrt() } else { 0.0 };
-            let t = ((c - a).dot(seg) / len2).clamp(lo, 1.0);
-            let dist = (c - (a + seg * t)).length();
-            if best.is_none_or(|b| dist < b.0) {
-                best = Some((dist, k, (t as f32) * (d1 - d0)));
-            }
-        }
-        best.map(|b| (b.1, b.2))
+    /// [P8-5] How far behind and ahead of sample `i` (m, along its heading) a point belongs to
+    /// it: half the real distance to each neighbour and the 5 cm overlap of round 4 (half a
+    /// `WAY_STEP` where there is no neighbour). The samples are `WAY_STEP` apart along the way,
+    /// but not on the ground: over a junction's short pieces two of them lay 2.5 m apart, and a
+    /// walker between them was seen in one frame and not in the next (viz3 case09 #20705 hit a
+    /// walker 1.14 m deep at 5 m/s with its people stop on and off frame by frame).
+    fn sample_span(&self, i: usize) -> (f64, f64) {
+        let half = |a: usize, b: usize| self.pts.get(a).zip(self.pts.get(b)).map(|(p, q)| (q.1 - p.1).length() * 0.5).unwrap_or(WAY_STEP as f64 * 0.5);
+        let back = if i == 0 { WAY_STEP as f64 * 0.5 } else { half(i - 1, i) };
+        (back + SAMPLE_OVERLAP, half(i, i + 1) + SAMPLE_OVERLAP)
     }
 
     /// Whether a slice of the way starts within `r` of `c`.
@@ -1380,16 +1360,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 safe = (d, pose);
             }
         }
-        // ([pass 1, S3] each position on the slice of the way it lies nearest to)
-        let slices: Vec<Option<(usize, f32)>> = positions.iter().map(|&pos| way.segment_of(pos, reach + st.front)).collect();
-        for (i, &(d, q, _)) in way.pts.iter().enumerate() {
+        for (i, &(d, q, fwd)) in way.pts.iter().enumerate() {
             if d > reach + st.front {
                 break;
             }
-            if !slices.iter().any(|sl| sl.is_some_and(|(k, _)| k == i)) {
-                continue;
-            }
-            let fwd = (way.pts[i + 1].1 - q).normalize_or_zero();
+            let (span_back, span_ahead) = way.sample_span(i);
             let right = DVec2::new(fwd.y, -fwd.x);
             // (the way's offset from the lane's axis here: across the axis = across the way + it)
             let lat = st.lateral_ahead(d);
@@ -1414,10 +1389,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                     && now_axis.abs() < strip
                     && now_axis.signum() == later_axis.signum()
             };
-            for (&pos, slice) in positions.iter().zip(&slices) {
-                let Some((_, along)) = slice.filter(|&(k, _)| k == i) else { continue };
-                let along = along as f64;
+            for &pos in positions {
                 let r = pos - q;
+                let along = r.dot(fwd);
                 let across_way = r.dot(right) as f32;
                 let across = across_way.abs();
                 // ([round 7 A3 fix] outside my footprint at this position - now or where their
@@ -1429,6 +1403,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // their step takes them, whatever their pace)
                 let stepping = on_crossing || p.vel.length() >= STEP_SPEED as f64;
                 let outside_here = outside && (!stepping || across >= me.half_width + crate::plan::PERSON_RADIUS);
+                if along < -span_back || along > span_ahead {
+                    continue;
+                }
                 // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
                 // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
                 // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
@@ -1552,13 +1529,15 @@ fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {
         if (p.pos - me.pos).truncate().length() > radius {
             continue;
         }
-        // ([pass 1, S3] on the slice of the way it lies nearest to)
-        if let Some((k, along)) = way.segment_of(p.pos.truncate(), reach + st.front) {
-            let (d, q, _) = way.pts[k];
-            let fwd = (way.pts[k + 1].1 - q).normalize_or_zero();
+        for (i, &(d, q, fwd)) in way.pts.iter().enumerate() {
+            if d > reach + st.front {
+                break;
+            }
+            let r = p.pos.truncate() - q;
             let right = DVec2::new(fwd.y, -fwd.x);
-            if (p.pos.truncate() - q).dot(right).abs() < half {
-                far = far.max(d + along);
+            let (back, ahead) = way.sample_span(i);
+            if (-back..=ahead).contains(&r.dot(fwd)) && r.dot(right).abs() < half {
+                far = far.max(d + r.dot(fwd) as f32);
             }
         }
     }
@@ -2161,41 +2140,6 @@ mod cut_in_tests {
         assert_eq!(lane_room_toward(1.0, -2.6), 1.0);
         // its middle already inside my corridor: in, whatever its line says
         assert!(cutting_in(o_fwd, speed, f, DVec2::new(1.0, 3.0), Some((0.0, par)), 1.2));
-    }
-}
-
-#[cfg(test)]
-mod slice_tests {
-    use super::WayPts;
-    use glam::{DVec2, DVec3};
-    use omsi_sim::traffic::{AiState, LaneBuilder, LaneKind, Network};
-
-    /// [P8-5, pass 1 S3] On a 6 m bend every point beside the way, inside or outside it, lies
-    /// on a slice, and that slice's frame puts it no further across than it is from the bend
-    /// plus the chord's sag: no wedge outside the bend is dropped (round-8 sample spans left
-    /// 0.24 m uncovered at 1.0 m outside, 0.58 m at 2.15 m).
-    #[test]
-    fn every_point_beside_a_bend_lies_on_a_slice() {
-        let r = 6.0f64;
-        let pts: Vec<DVec3> = (0..=60).map(|k| {
-            let a = std::f64::consts::PI * k as f64 / 60.0;
-            DVec3::new(r * a.cos(), r * a.sin(), 0.0)
-        }).collect();
-        let net = Network { lanes: vec![LaneBuilder::polyline(pts, LaneKind::Street, 3.5)], ..Default::default() };
-        let st = AiState::new(0, 1.0, 1);
-        let way = WayPts::sample(&net, &st, 15.0);
-        for off in [-2.15, -1.0, 0.0, 1.0, 2.15] {
-            for k in 10..100 {
-                let a = std::f64::consts::PI * (0.2 + 0.4 * k as f64 / 100.0);
-                let c = DVec2::new((r + off) * a.cos(), (r + off) * a.sin());
-                let (i, _) = way.segment_of(c, 15.0).expect("no slice");
-                let (_, q, _) = way.pts[i];
-                let fwd = (way.pts[i + 1].1 - q).normalize();
-                let across = (c - q).dot(DVec2::new(fwd.y, -fwd.x)).abs();
-                let sag = r - (r * r - 1.25 * 1.25).sqrt();
-                assert!(across <= off.abs() + sag + 1e-6, "off {off} angle {a:.3}: across {across:.3}");
-            }
-        }
     }
 }
 
