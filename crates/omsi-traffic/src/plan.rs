@@ -814,8 +814,8 @@ pub const QUEUE_LOOK: usize = 6;
 /// then kept back at the room a bypass needs before the queue packs to 2 m (round 6 L2 fix
 /// pass 2: behind bus #22368 at its stop, viz5 case07, four cars closed up to 1.8-2.2 m and
 /// stood 60 s and more, none able to steer out).
-fn behind_an_obstacle(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
-    queue_head(sim, vehicles, lead).is_some()
+fn behind_an_obstacle(net: &Network, sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::Headway) -> bool {
+    queue_head(net, sim, vehicles, lead).is_some()
 }
 
 /// [Q8-1 fix pass 1] What heads the queue the standing `lead` is the tail of (`QUEUE_LOOK`
@@ -832,7 +832,38 @@ enum QueueHead {
     ForGood,
 }
 
-fn queue_head(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::Headway) -> Option<QueueHead> {
+/// A lead nearer than this (m) holds the car (`Plan::held`: the start reaction applies when it
+/// clears); [Q8-1 follow-up] the same test holds a player's vehicle for `queue_head`.
+pub const HELD_LEAD_GAP: f32 = 12.0;
+
+/// [Q8-1 follow-up] Is player `id`'s vehicle blocked by a vehicle ahead - an AI vehicle on a lane it
+/// stands on, or on a lane that one runs into, whose rear is within `HELD_LEAD_GAP` of its front -
+/// as an AI head is held by a lead near (`Plan::held`)?
+fn player_blocked(net: &Network, sim: &Simulation, vehicles: &[Vehicle], id: u32) -> bool {
+    let Some(k) = sim.players.iter().position(|p| p.id == id) else { return false };
+    let half = sim.players[k].half_len;
+    for (&l, list) in &sim.player_occupancy {
+        for &(pk, ps, _) in list.iter().filter(|o| o.0 == k) {
+            let _ = pk;
+            let front = ps + half;
+            let ahead = |lane: usize, offset: f32| {
+                sim.occupancy.get(&lane).is_some_and(|occ| {
+                    occ.iter().any(|o| {
+                        let rear = o.s + offset - vehicles.get(o.vehicle).map_or(0.0, |v| v.state.rear);
+                        rear >= front - 0.5 && rear - front < HELD_LEAD_GAP
+                    })
+                })
+            };
+            let len = net.lanes.get(l).map_or(0.0, |ln| ln.length());
+            if ahead(l, 0.0) || net.lanes.get(l).is_some_and(|ln| ln.next.iter().any(|&n| ahead(n, len))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn queue_head(net: &Network, sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::Headway) -> Option<QueueHead> {
     if lead.speed.abs() >= STANDING_SPEED {
         return None;
     }
@@ -843,7 +874,8 @@ fn queue_head(sim: &Simulation, vehicles: &[Vehicle], lead: &crate::perception::
     let player_head = |id: u32| {
         let held_by_red = sim.claims.iter().any(|(c, _)| crate::sim::claim_player(c.vehicle) == Some(id) && c.light_red);
         let waited = sim.player_wait.get(&id).copied().unwrap_or(0.0);
-        sim.players.iter().find(|p| p.id == id).is_some_and(|p| p.speed.abs() < STANDING_SPEED && waited >= QUEUE_OBSTACLE_STAND && p.blinker == 0 && !held_by_red).then_some(QueueHead::ForGood)
+        let blocked = player_blocked(net, sim, vehicles, id);
+        sim.players.iter().find(|p| p.id == id).is_some_and(|p| p.speed.abs() < STANDING_SPEED && waited >= QUEUE_OBSTACLE_STAND && p.blinker == 0 && !held_by_red && !blocked).then_some(QueueHead::ForGood)
     };
     let mut j = match lead.what {
         Seen::Vehicle(j) | Seen::Body(j) => j,
@@ -997,7 +1029,7 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         return None;
     }
     let l = p.leader?;
-    if queue_head(sim, vehicles, &l) != Some(QueueHead::ForGood) {
+    if queue_head(net, sim, vehicles, &l) != Some(QueueHead::ForGood) {
         return None;
     }
     let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l)).fold(f32::INFINITY, f32::min);
@@ -1684,7 +1716,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
         }
-    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle() || pausing_player(l) || behind_an_obstacle(sim, vehicles, l)) {
+    } else if let Some(l) = p.leader.filter(|l| l.standing_obstacle() || pausing_player(l) || behind_an_obstacle(net, sim, vehicles, l)) {
         // (the player's bus pausing 1.5 s is squeezed past inside the lane; everything else
         // waits for it to be a standing obstacle; a car standing in a queue behind one is only
         // kept back from, for a bypass round them, `behind_an_obstacle`)
@@ -1898,7 +1930,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    out.held = out.stop.is_some() || p.leader.map(|l| l.gap < 12.0).unwrap_or(false);
+    out.held = out.stop.is_some() || p.leader.map(|l| l.gap < HELD_LEAD_GAP).unwrap_or(false);
     if out.why == Why::None && out.lead.is_some() {
         out.why = Why::Lead;
     }

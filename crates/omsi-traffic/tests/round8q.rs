@@ -501,3 +501,26 @@ fn j82_a_car_that_goes_at_amber_onset_and_then_slows_stops_at_the_line() {
     }
     assert!(!over_at_red, "crossed its line at red");
 }
+
+#[test]
+fn q81_followup_a_player_blocked_by_a_vehicle_ahead_heads_no_queue() {
+    // (safety final recheck) the player's bus 2 m behind an AI car held where it stands (pulling
+    // out), indicator off, no light: it is held by its lead as an AI head would be (`Plan::held`'s
+    // lead near), so the two cars packed behind it do not back up
+    let net = two_lanes();
+    let mut held = car(9, 1, 203.0, 0.0);
+    held.pull_out = 1000.0;
+    held.stopped = 60.0;
+    let mut cars = vec![held, car(1, 1, 183.0, 0.0), car(2, 1, 177.0, 0.0)];
+    for c in cars.iter_mut().skip(1) {
+        c.stopped = 30.0;
+        c.state.change_cooldown = 0.0;
+    }
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.players.push(omsi_traffic::PlayerView { id: 0, pos: DVec3::new(193.0, -3.5, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 60.0, blinker: 0, signalling: 0.0, priority: false });
+    let mut back = false;
+    run(&net, &mut sim, &mut cars, 30.0, |_, _, cars| {
+        back |= cars.iter().any(|c| c.state.speed < -0.05);
+    });
+    assert!(!back, "backed up behind a player held by the car in front of it");
+}
