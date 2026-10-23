@@ -1388,6 +1388,14 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             };
             for (&pos, slice) in positions.iter().zip(&slices) {
                 let Some((_, along)) = slice.filter(|&(k, _)| k == i) else { continue };
+                // ([pass 2, A2] the strip is the way ahead of my front: a position level with
+                // or behind my front plane is no leader of mine - SUMO's leaders are ahead of
+                // the front - and is left to the body test above; a step landing in the rear
+                // half gave a stop 4.15 m behind the front and slowed viz case12 #45414 on a
+                // crossing into the walker's path)
+                if d + along <= st.front {
+                    continue;
+                }
                 let along = along as f64;
                 let r = pos - q;
                 let across_way = r.dot(right) as f32;
