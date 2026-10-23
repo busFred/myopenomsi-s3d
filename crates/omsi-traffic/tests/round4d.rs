@@ -133,7 +133,7 @@ fn to_the_stop(v: &mut Vehicle) {
 }
 
 fn person(x: f64, y: f64, waiting: bool) -> omsi_traffic::Person {
-    omsi_traffic::Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: waiting, at_kerb: false }
+    omsi_traffic::Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: waiting, at_kerb: false, waits_at: None }
 }
 
 /// [ROLLBACK r4d-B4] Four people standing at the kerb 2.5 m beside the bus's nose (1.3 m

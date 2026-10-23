@@ -210,7 +210,7 @@ fn q81_no_backing_up_into_a_person_or_a_car_behind() {
     let net = two_lanes();
     let cars = packed_queue(&net, 2, 2.0, 30.0);
     let tail = cars.iter().find(|c| c.id == 2).map(|c| c.state.s).unwrap();
-    let person = Person { pos: DVec3::new((tail - 2.0 - 2.5) as f64, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false };
+    let person = Person { pos: DVec3::new((tail - 2.0 - 2.5) as f64, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None };
     let e = escape(&net, cars, vec![person], 2, 20.0);
     eprintln!("person behind: backed {:?} least person {:.2}", e.backed, e.least_person);
     assert!(e.backed[1] < 0.05, "backed up towards the person: {:?}", e.backed);
@@ -297,7 +297,7 @@ fn behind(me: &Vehicle, d: f64) -> f64 {
 fn q81_fix1_a_backing_car_stops_for_a_person_or_a_car_that_appears_behind_it() {
     // (safety B1: it held its speed and backed into them, -1.18 m and -1.80 m)
     let (over, _, least_p, backed) = backing_with(|sim, _, me| {
-        sim.people.push(Person { pos: DVec3::new(behind(me, 1.5), -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false });
+        sim.people.push(Person { pos: DVec3::new(behind(me, 1.5), -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
     }, 25.0);
     eprintln!("person 1.5 m behind: over {over:.2} least person {least_p:.2}");
     assert!(backed && least_p > 0.3, "backed into the person: {least_p:.2}");
@@ -427,7 +427,7 @@ fn q81_fix3_a_head_let_go_by_people_is_not_a_head_on_the_frame_it_is_let_go() {
         c.state.change_cooldown = 1000.0;
     }
     let mut sim = Simulation::new(&net, vec![]);
-    sim.people.push(Person { pos: DVec3::new(155.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false });
+    sim.people.push(Person { pos: DVec3::new(155.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
     let (mut back, mut people_held) = (false, false);
     let mut t = 0.0;
     // (released once all have stood the escape's 25 s)
@@ -488,7 +488,7 @@ fn j82_a_car_that_goes_at_amber_onset_and_then_slows_stops_at_the_line() {
     let mut t = 0.0f32;
     while t < 30.0 {
         if (t - 10.0).abs() < DT * 0.5 {
-            sim.people.push(Person { pos: DVec3::new(204.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false });
+            sim.people.push(Person { pos: DVec3::new(204.0, -3.5, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 60.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
         }
         if (t - 14.0).abs() < DT * 0.5 {
             sim.people.clear();

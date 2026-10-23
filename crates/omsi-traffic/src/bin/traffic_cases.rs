@@ -10,7 +10,7 @@
 //! traffic_cases ab <fixture>... [--radius 200] [--json out.json] [--min-head 10] [--reset] [--jobs N]
 //! traffic_cases stubs <fixture>... [--all]
 //! traffic_cases converge <fixture>... [--all]
-//! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset]
+//! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset] [--people]
 //! traffic_cases foes <fixture> <lane>...
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
@@ -4509,6 +4509,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.on_cut_s += fdt;
                     if on_cut_ids.insert(v.id) {
                         ex.on_cut_vehicles += 1;
+                        ex.events.push(format!("ON-CUT {} t={now:.1} #{} lane {} s {:.1} why {}", sc.name, v.id, st.lane, st.s, why_name(v.last.why)));
                     }
                 }
             }
@@ -5176,6 +5177,13 @@ fn grown(fixture: &Path, lit: bool) -> Res<(Replay, usize)> {
             let added = r.net.extend(lanes.clone(), 1.5);
             r.sim.network_grew(&r.net, added.start);
         }
+        // ([P8 map data] and the light programs loaded with them, as the replay adds them:
+        // `lights` lists every controller the run had)
+        if let Record::LightsAdded { first, lights, .. } = rec {
+            let from = (*first).min(r.sim.lights.len());
+            let skip = r.sim.lights.len() - from;
+            r.sim.lights.extend(lights.iter().skip(skip).cloned());
+        }
     }
     r.records = records;
     Ok((r, header_lanes))
@@ -5609,7 +5617,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             let st = &v.state;
             let d = &v.last;
             println!(
-                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1}",
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {}",
                 v.id,
                 st.lane,
                 st.s,
@@ -5628,8 +5636,26 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 d.hold,
                 d.body_block,
                 v.blinker_shown,
-                v.stopped
+                v.stopped,
+                v.external.serves,
+                v.external.stop_at.map(|x| x - st.front),
+                v.external.at_stop
             );
+        }
+        // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the
+        // body's separation from its box, the step, and what the people test reads of them)
+        if args.iter().any(|a| a == "--people") {
+            for &i in &found {
+                let v = &r.vehicles[i];
+                let b = v.obb();
+                for (k, p) in r.sim.people.iter().enumerate() {
+                    if (p.pos - v.pos).truncate().length() > 25.0 || (p.pos.z - v.pos.z).abs() > 2.5 {
+                        continue;
+                    }
+                    let sep = omsi_sim::collision::Obb::point(p.pos, PERSON_RADIUS).separation(&b);
+                    println!("t={t:.1}   person {k} near #{} ({:.2},{:.2}) vel ({:.2},{:.2}) sep {sep:.2} still {:.1} crossing {} kerb {} bus {} stop {:?}", v.id, p.pos.x, p.pos.y, p.vel.x, p.vel.y, p.still, p.on_crossing, p.at_kerb, p.waiting_for_bus, p.waits_at);
+                }
+            }
         }
         for &i in &found {
             if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {

@@ -64,6 +64,10 @@ pub struct Person {
     /// the carriageway: clear of a vehicle whose footprint they stand outside.
     #[serde(default)]
     pub at_kerb: bool,
+    /// [P8 pass 1, B1] The stop (its map object id, `bus_service::Stop::id`) somebody waiting
+    /// for a bus waits at: a timetable bus serving that stop pulls in beside them.
+    #[serde(default)]
+    pub waits_at: Option<i64>,
 }
 
 /// A parked car beside a lane.
@@ -145,6 +149,10 @@ impl Passing {
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
+    /// [P8 pass 1, B1] The stops a timetable bus serves here (map object ids): the one it
+    /// comes up to or stands at, and the one it served last. Their waiters (`Person::
+    /// waits_at`) are the ones it pulls in beside.
+    pub serves: [Option<i64>; 2],
     /// Lateral offset into a bay.
     pub bay: Option<f32>,
     /// Indicator off whatever the planner says (doors open).
@@ -1669,6 +1677,13 @@ impl Simulation {
         // [Q8-4] the last-resort stop's latch: dropped with a start or standing (the plan places it
         // afresh only while the wish is blocked)
         v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
+        // [P8 pass 1, S1] held out of its lane on the way back in: the ramp back begins where
+        // the body would first feel it once let go - its start kept a heading chord ahead of
+        // the standing body, so the body is not drawn turned into the lane while it waits
+        // (x10 case08 #10940 stood turned 17 degrees, heading 168 -> 152, for 3 s)
+        if plan.reentry_held {
+            v.state.lateral_ramp.2 = v.state.odometer + omsi_sim::traffic::HEADING_CHORD;
+        }
         // a lane change begins only when nobody started one into the same stretch this
         // frame (the perception was taken before anybody moved)
         let mut change_into = |to: usize, s_to: f32| -> bool {

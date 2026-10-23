@@ -189,6 +189,9 @@ pub struct PersonRecord {
     /// Waiting at a kerb to cross (`Person::at_kerb`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub at_kerb: bool,
+    /// The stop they wait at (`Person::waits_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waits_at: Option<i64>,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -203,12 +206,12 @@ fn is_false(v: &bool) -> bool {
 impl PersonRecord {
     /// The person as the frame sees them.
     pub fn person(&self) -> Person {
-        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb }
+        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb, waits_at: self.waits_at }
     }
 
     /// A record of somebody the game told nothing more about.
     pub fn from_person(p: &Person) -> PersonRecord {
-        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb }
+        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at }
     }
 
     /// Take the frame's own values over (the extras stay).
@@ -219,6 +222,7 @@ impl PersonRecord {
         self.still = p.still;
         self.waiting_for_bus = p.waiting_for_bus;
         self.at_kerb = p.at_kerb;
+        self.waits_at = p.waits_at;
     }
 }
 

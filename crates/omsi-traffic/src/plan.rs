@@ -101,6 +101,9 @@ pub struct Plan {
     /// [round 8 H8-1] A car leaving a parking space is held where it is parked because its
     /// lane has no room behind it: its `pull_out` clock waits.
     pub pull_out_held: bool,
+    /// [P8 pass 1, S1] Held standing out of its lane on the way back in (`reentry_clear`):
+    /// the ramp back is not begun while held (`Simulation` keeps its start ahead of the body).
+    pub reentry_held: bool,
 }
 
 fn min_stop(stop: &mut Option<f32>, why: &mut Why, d: Option<f32>, w: Why) {
@@ -122,11 +125,19 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
 /// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
 /// (the follower need not brake hard). (`informFollower` asks for it, [J7-3].)
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
+    accepted_gap(me, nb.behind_min_gap, vb, v)
+}
+
+/// The gap (m) I accept in front of a follower whose standing gap is `min_gap`, coming at `vb`
+/// m/s while I go at `v`: its standing gap, my accepted time gap at its speed and what it
+/// sheds braking at my comfort to my speed (`gap_needed_behind`'s; [merge P8/H8] the way back
+/// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`).
+fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
     // ([fix pass 2] the follower's own standing gap, not a fixed 2 m: the helper opens exactly
     // this gap, `informFollower`, one function on both sides; a follower resting at its 1.57 m
     // standing gap behind the changer was never accepted, and both stood)
-    nb.behind_min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
+    min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
 }
 
 /// [`gap_accepted`]'s two halves: (the follower there need not brake hard, there is room ahead).
@@ -267,12 +278,15 @@ pub fn pull_out_exempt(net: &Network, me: &Vehicle, p: &crate::sim::Person) -> b
 }
 
 /// [round 8 H8-1/H8-8, fix pass 1] The one pull-out rule, for the parked object the app takes
-/// off the kerb and for a recorded pull-out standing at its offset: every follower has its
-/// secure gap (`secure_gap_behind`) and nobody is on the strip its body sweeps
+/// off the kerb, for a recorded pull-out standing at its offset and ([merge P8/H8], P8-4) for any
+/// vehicle standing out of its lane on its way back in, a bus leaving its bay: every moving
+/// follower has its secure gap (`secure_gap_behind`), a standing one only room for its body, and nobody is on the strip its body sweeps
 /// (`pull_out_strip_clear`). SUMO re-inserts a parked vehicle only when `isInsertionSuccess`
 /// passes (`MSVehicleTransfer`); OMSI draws the body, so the car then drives from its offset.
 pub fn pull_out_clear(net: &Network, sim: &Simulation, followers: &[PullOutFollower], lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32) -> bool {
-    followers.iter().all(|f| f.gap >= secure_gap_behind(f)) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len, 0.0)
+    // ([merge P8/H8] a standing follower reaches only its own body, SUMO's secure gap at v = 0
+    // being 0: one queued right behind a car out of its lane held it for good, viz5 case06 #18756)
+    followers.iter().all(|f| if f.speed < STANDING_SPEED { f.gap >= 0.0 } else { f.gap >= secure_gap_behind(f) }) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len, 0.0)
 }
 
 /// [J7-3] SUMO LC2013's strategic look-ahead (`MSLCM_LC2013::LOOK_FORWARD`, s): a lane that
@@ -1185,6 +1199,70 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     rear_clear(net, sim, vehicles, me, back).then_some(back)
 }
 
+/// [P8-4] The pull-back into the lane is sampled at this spacing (m), as the bypass's sweep
+/// (`bypass_sweep_clear`).
+const REENTRY_STEP: f32 = 0.5;
+
+/// [P8-4] A vehicle out of its lane on its way back in: its body clear of the lane's axis (a
+/// car passing in the lane gets by it), no pass or change of its own, the offset it is asked
+/// for (a bay, the bus service sends 0 as it leaves one; else its target) nearer the lane
+/// than where it is, and the way's sideways ramp not run out yet (`AiState::lateral_ramp`:
+/// the bus service's `depart`, a parked car's pull-out).
+fn reentering(me: &Vehicle) -> bool {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    let to = me.external.bay.unwrap_or(st.lateral_target);
+    // (not a settled lane change's offset easing in place, `Simulation::sidestep`: it moves
+    // sideways standing, not back into the traffic)
+    !st.settled_offset && me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
+}
+
+/// [P8-4] Is the way back into the lane clear of bodies standing on it? My body on the bent way
+/// over what is left of the ramp (`shifted_body`, the way carries the ramp), turned along it as
+/// the bypass's sweep, against every other vehicle's and player's box where it is now; a
+/// vehicle going my way with its rear ahead of my front is a lead, not a threat. [merge P8/H8]
+/// No gap of its own: who comes up behind and must be able to stop for me is the one pull-out
+/// rule's (`pull_out_clear`: each follower's own secure gap, the players too); this sweep adds
+/// only the bodies the way back in would run into (a van standing beside my nose). (x10 case08:
+/// timetable bus #10940 swung out of its bay across the lane beside, into #11059 coming at
+/// 8.9 m/s 14 m away, 0.58 m deep.)
+fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle) -> bool {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    let left = (x0 + len - st.odometer).max(0.0);
+    let n = (left / REENTRY_STEP).ceil() as usize;
+    // ([pass 2, A1] the poses it has not reached yet: where it stands now is no move into
+    // anybody's way - a car queued behind it stands there already)
+    let poses: Vec<Obb> = (1..=n.max(1)).map(|k| shifted_body(net, me, (k as f32 * REENTRY_STEP).min(left), 0.0)).collect();
+    let hr = (me.heading as f64).to_radians();
+    let fwd = DVec2::new(hr.sin(), hr.cos());
+    let reach = (left + st.front + st.rear) as f64;
+    for o in vehicles {
+        if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 {
+            continue;
+        }
+        if (o.pos - me.pos).truncate().length() > reach + (o.state.front + o.half_width) as f64 {
+            continue;
+        }
+        let oh = (o.heading as f64).to_radians();
+        let same_way = DVec2::new(oh.sin(), oh.cos()).dot(fwd) > 0.0;
+        if same_way && (o.pos - me.pos).truncate().dot(fwd) - o.state.rear as f64 > st.front as f64 {
+            continue;
+        }
+        let body = o.obb();
+        if poses.iter().any(|b| body.separation(b) < 0.0) {
+            return false;
+        }
+    }
+    !sim.players.iter().any(|pl| {
+        if (pl.pos.z - me.pos.z).abs() > 3.0 {
+            return false;
+        }
+        let b = pl.obb(0.0, 0.0);
+        poses.iter().any(|q| b.separation(q) < 0.0)
+    })
+}
+
 /// What the corner of a body turned on the bypass's curve reaches beyond its shifted box (m):
 /// half a metre at 30 degrees for a 2 m front overhang.
 pub const BYPASS_TURN_MARGIN: f32 = 0.5;
@@ -1193,6 +1271,32 @@ pub const BYPASS_TURN_MARGIN: f32 = 0.5;
 /// (`AiState::start_bypass`'s move: `side` metres over `out_len`, the body turned along the
 /// curve, not only shifted as `squeeze_clear` has it), up to `level` metres on?
 fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, side: f32, out_len: f32, level: f32) -> bool {
+    body_sweep_clear(net, sim, vehicles, me, &[], &[], side, out_len, level)
+}
+
+/// [P8 pass 1, S2] The parked cars within `reach` metres of my origin as boxes, on any lane
+/// (one parked at the far kerb of the oncoming lane is in a pass's path), as `squeeze_clear`
+/// lays them.
+fn parked_boxes(net: &Network, sim: &Simulation, me: &Vehicle, reach: f32) -> Vec<Obb> {
+    let mut out = Vec::new();
+    for (&l, list) in &sim.parked {
+        let Some(lane) = net.lanes.get(l) else { continue };
+        for pk in list {
+            let (q, h) = lane.at(pk.s.min(lane.length()));
+            if (q - me.pos).truncate().length() > (reach + pk.half_len + pk.half_width) as f64 {
+                continue;
+            }
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            out.push(Obb::vehicle(q.truncate() + right * pk.lateral as f64, h as f64, pk.half_len as f64, pk.half_len as f64, pk.half_width as f64));
+        }
+    }
+    out
+}
+
+/// `bypass_sweep_clear` against parked cars (`parked`) and people's discs (`people`) as well.
+#[allow(clippy::too_many_arguments)]
+fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32) -> bool {
     let st = &me.state;
     let near = sim.vehicles_near(me.pos, (level + 20.0) as f64);
     let clearance = SQUEEZE_CLEARANCE as f64;
@@ -1216,6 +1320,9 @@ fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
             }
         }
         if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+            return false;
+        }
+        if parked.iter().chain(people).any(|o| o.separation(&b) < clearance) {
             return false;
         }
         d += 0.5;
@@ -1269,7 +1376,9 @@ pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
 /// (round 6 J3: one standing short of its line set off over it on red, viz case07 #18558).
 /// (This replaces round 4's amber mark: taken on green 3 m out, extended 6 m on yellow,
 /// carried over frames and retired by `stale_amber` and a 2 s stand; x10 case03 #3145
-/// crossed its line on red on it.)
+/// crossed its line on red on it.) [P8 map data] "Cannot stop" is reckoned to the line
+/// itself, as SUMO's red: the half metre past the line it allowed (round 4's `possible -
+/// 0.5`, carried into round 7's D2) had no source and let a stop lie over the line.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
     let st = &me.state;
     let dp = &me.params;
@@ -1654,18 +1763,27 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // SUMO's parked vehicle re-enters by insertion, which checks the follower's secure gap on the
     // lane it enters (`MSLane::isInsertionSuccess`, `getSecureGap`). Until then it stays parked
     // and its clock waits (x10 case08: #11387 pulled out with bus #11125 coming up at 12 m/s)
-    let pull_out_held = me.pulling_out && v < STANDING_SPEED && {
+    // [P8-4, merge P8/H8] standing out of the lane and about to move back in - a parked car
+    // pulling out, a bus leaving its bay (`reentering`) - is the same case: one rule,
+    // `pull_out_clear` (every follower up its lane, the players too, beyond its own secure gap, a
+    // standing one reaching only its own body; nobody on the strip its body sweeps), over what is
+    // left of its way out, and no body standing on that way (`reentry_clear`)
+    let leaving = v < STANDING_SPEED && (me.pulling_out || reentering(me));
+    let leave_held = leaving && {
         let on_lane = |l: usize| -> Vec<(f32, f32, f32, DriverParams)> {
             sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|o| o.vehicle != i).filter_map(|o| vehicles.get(o.vehicle).map(|x| (o.s, x.state.front, x.state.speed, x.params))).collect()
         };
         let followers = pull_out_followers(net, sim, st.lane, st.s, st.rear, &on_lane);
-        let ramp = bypass_min_len(me.length(), st.lateral);
-        !pull_out_clear(net, sim, &followers, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, ramp)
+        let ramp = if me.pulling_out { bypass_min_len(me.length(), st.lateral) } else { pull_out_ramp_left(me) };
+        !pull_out_clear(net, sim, &followers, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, ramp) || !reentry_clear(net, sim, vehicles, me)
     };
-    if me.pull_out > 0.0 || pull_out_held {
+    let pull_out_held = leave_held && me.pulling_out;
+    if me.pull_out > 0.0 || leave_held {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + 0.1), Why::PullOut);
     }
     out.pull_out_held = pull_out_held;
+    // (held out of its lane on the way back in, not parked: the ramp back waits for the hold)
+    out.reentry_held = leave_held && !me.pulling_out;
     if let Some(d) = p.letting_out {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + (d - 1.0).max(0.0)), Why::LetOut);
     }
@@ -2018,8 +2136,28 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // has closed up (no 3 s stop of its own); a pass waits for 3 s stopped
         let early = squeeze && player && v < SQUEEZE_START_SPEED;
         let ready = (me.stopped >= 3.0 || early || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
-        if pass_possible && ready {
-            let out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
+        // [P8-2] a pass on the oncoming lane starts only when its path is swept as the
+        // bypass's is (`bypass_sweep_clear`): the body turned along its S-curve (the out
+        // length it will drive) out and level with what it passes, clear of every vehicle's
+        // and player's body by `SQUEEZE_CLEARANCE` - not on the oncoming lane's gap alone.
+        // Only the start: the keep-back still reads the pass as possible (gating it too made a
+        // car close up and later start where it should not - round4b x6), and not the
+        // squeeze's linear corridor (`squeeze_clear`: from a queue gap behind a parked car its
+        // straight ramp cut the car passed and the pass never came - adversarial b1c).
+        let pass_out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
+        // ([pass 1, S2] and the parked cars along the way and the people near it, as the
+        // squeeze's corridor has them)
+        let pass_swept = || {
+            if squeeze {
+                return true;
+            }
+            let level = real + obstacle_len + st.front + st.rear + 2.0;
+            let parked = parked_boxes(net, sim, me, level + st.front);
+            let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level)
+        };
+        if pass_possible && ready && pass_swept() {
+            let out_len = pass_out_len;
             let until = st.odometer + real + obstacle_len + st.front + st.rear + 2.0;
             let lane = if squeeze { None } else { oncoming.map(|o| o.lane) };
             let wait = if squeeze { SQUEEZE_SIGNAL } else { omsi_sim::traffic::SIGNAL_BEFORE_CHANGE };

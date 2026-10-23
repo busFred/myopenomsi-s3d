@@ -58,6 +58,9 @@ pub struct BusService {
     /// the planner's `External::bay`. None between stops, where the traffic's own rules
     /// (the kerb swerve, the settle creep) place it in its lane.
     pub bay_wish: Option<f32>,
+    /// [P8 pass 1, B1] The stop it served last (its map object id): with the front stop, the
+    /// stops whose waiters it pulls in beside (`External::serves`).
+    pub served: Option<i64>,
     pub stops: VecDeque<Stop>,
     pub phase: Phase,
     /// Seconds in the current phase.
@@ -734,6 +737,7 @@ impl BusService {
             rerouted: false,
             ahead_by: 0.0,
             bay_wish: None,
+            served: None,
             pace: 1.0,
             pace_target: None,
             left_early: false,
@@ -945,7 +949,7 @@ impl BusService {
             // the next one
             self.take_detour(st, ctx.net, d, ctx.day_time, ctx.id);
         } else {
-            self.stops.pop_front();
+            self.served = self.stops.pop_front().map(|s| s.id);
             crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
         }
         self.near_d = f32::INFINITY;

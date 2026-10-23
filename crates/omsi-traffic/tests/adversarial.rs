@@ -516,7 +516,7 @@ fn b6a_a_pedestrian_walking_out_from_the_kerb_is_not_run_over() {
         if pos.y < 5.0 {
             pos += (vel * DT as f64).extend(0.0);
         }
-        sim.people = vec![Person { pos, vel: if pos.y < 5.0 { vel } else { DVec2::ZERO }, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false }];
+        sim.people = vec![Person { pos, vel: if pos.y < 5.0 { vel } else { DVec2::ZERO }, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }];
         hit = hit.min(cars[0].obb().separation(&person_box(pos)) as f32);
     });
     eprintln!("b6a: nearest car-person {:.2} m, brake {:.1}", hit, r.hardest_brake);
@@ -534,7 +534,7 @@ fn b6b_a_pedestrian_stepping_out_2m_ahead_of_a_crawling_car() {
         if t > 1.0 && !placed {
             // steps out 2 m in front of the bumper, into the lane
             let x = cars[0].state.s as f64 + cars[0].state.front as f64 + 2.0;
-            sim.people = vec![Person { pos: DVec3::new(x, -0.5, 0.0), vel: DVec2::new(0.0, 1.2), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false }];
+            sim.people = vec![Person { pos: DVec3::new(x, -0.5, 0.0), vel: DVec2::new(0.0, 1.2), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }];
             placed = true;
         }
         if let Some(p) = sim.people.first() {
@@ -690,7 +690,7 @@ fn d_cost_of_a_frame_with_300_vehicles_and_200_people() {
     }
     let people: Vec<Person> = (0..200).map(|i| {
         let lane = i % 12;
-        Person { pos: DVec3::new(10.0 + 5.0 * (i / 12) as f64 * 12.0 % 990.0, 30.0 * lane as f64 - 4.5, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: false, at_kerb: false }
+        Person { pos: DVec3::new(10.0 + 5.0 * (i / 12) as f64 * 12.0 % 990.0, 30.0 * lane as f64 - 4.5, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
     }).collect();
     sim.people = people;
     // warm up

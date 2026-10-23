@@ -4041,13 +4041,18 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb())
+                // ([P8 pass 1, B1] the stop a waiter waits at, `Person::waits_at`)
+                let waits_at = match &p.state {
+                    State::Pax(x) if x.inside.is_none() => x.stop,
+                    _ => None,
+                };
+                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at)
             })
             .collect()
     }
@@ -4081,6 +4086,10 @@ impl Humans {
                     decision: p.last_decision.map(Cow::Borrowed),
                     pace: if matches!(p.state, State::Strolling(_)) { p.walk_pace as f32 } else { p.pace as f32 },
                     at_kerb: p.at_kerb(),
+                    waits_at: match &p.state {
+                        State::Pax(x) if x.inside.is_none() => x.stop,
+                        _ => None,
+                    },
                 }
             })
             .collect()

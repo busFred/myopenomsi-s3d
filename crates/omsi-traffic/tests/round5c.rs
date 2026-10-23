@@ -80,7 +80,7 @@ fn road_with_a_zebra(zebra: bool) -> Network {
 }
 
 fn person(x: f64, y: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
 }
 
 // C1 ----------------------------------------------------------------------------------
@@ -356,4 +356,47 @@ fn c1_a_red_light_waiter_inside_my_footprint_is_never_crawled_through() {
         }
     });
     assert!(o.min_gap > 0.0 && o.front_at_min > 23.0, "waiter at y 1.4: gap {:.2}, front {:.1}", o.min_gap, o.front_at_min);
+}
+
+/// The road with two crossings of the object: walk A at x = 10 (lane 3) and walk B 3.3 m on at
+/// x = 13.3 (lane 4).
+fn road_with_two_walks() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1));
+    net.lanes.push(piece(&[(-15.0, 0.0), (45.0, 0.0)], 0, LaneKind::Street));
+    net.lanes.push(road(&[(45.0, 0.0), (400.0, 0.0)], 2));
+    net.lanes.push(piece(&[(10.0, -8.0), (10.0, 8.0)], 3, LaneKind::Sidewalk));
+    net.lanes.push(piece(&[(13.3, -8.0), (13.3, 8.0)], 4, LaneKind::Sidewalk));
+    finish(net)
+}
+
+/// [round 8 P8 pass 3, C1] A car standing with its body over walk A (front at x 11.3) clears
+/// forward only past the people on walk A: somebody on walk B, 2 m ahead of its front in its
+/// lane, holds it (round 7's rule exempted every on-crossing person within ZEBRA_PAST of the
+/// front and it drove into them); with people only on walk A, beside its body behind its front,
+/// it clears forward.
+#[test]
+fn c1_a_car_over_one_walk_is_held_by_people_on_the_next_and_clears_past_its_own() {
+    let net = road_with_two_walks();
+    assert!(net.walks[1].iter().any(|&(w, _, _)| w == 3) && net.walks[1].iter().any(|&(w, _, _)| w == 4), "both walks cut the piece: {:?}", net.walks[1]);
+    // (the piece starts at x -15: origin at x 9.3, front 11.3, rear 7.3 - over walk A)
+    let over_a = || car(1, 1, 24.3, 0.0);
+    // somebody on walk B in the lane, 2 m ahead of the front
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.people = vec![Person { on_crossing: true, ..person(13.3, -0.3) }];
+    let mut cars = vec![over_a()];
+    let (mut held, mut least) = (0.0f32, f64::INFINITY);
+    run(&net, &mut sim, &mut cars, 4.0, |_, sim, cars| {
+        if cars[0].last.why == Why::People {
+            held += DT;
+        }
+        least = least.min(omsi_sim::collision::Obb::point(sim.people[0].pos, 0.28).separation(&cars[0].obb()));
+    });
+    assert!(held > 3.0 && least > 0.0, "drove on into somebody on the next walk: held {held:.1} s, {least:.2} m");
+    // only somebody on walk A, beside the body (outside its footprint), behind the front
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.people = vec![Person { on_crossing: true, ..person(10.0, 2.0) }];
+    let mut cars = vec![over_a()];
+    run(&net, &mut sim, &mut cars, 6.0, |_, _, _| {});
+    assert!(front_x(&cars[0]) > 30.0, "did not clear forward past its own walk: front at {:.1}", front_x(&cars[0]));
 }
