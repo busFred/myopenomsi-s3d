@@ -1244,8 +1244,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let hd = (me.heading as f64).to_radians();
         let ahead_of_front = rel.truncate().dot(DVec2::new(hd.sin(), hd.cos())) as f32 - st.front;
         // ([P8 pass 3, C1] only somebody on a walk my body covers: one on the next walk - a
-        // crowd stepping onto a short walk a turn crosses 3 m on - is tested as anybody, by
-        // the walker's time slots below; w2-jzk #1902 re-accelerated into them)
+        // crowd stepping onto a short walk a turn crosses 3 m on - goes through the ordinary
+        // strip and body tests below like anybody; w2-jzk #1902 re-accelerated into them.
+        // SUMO's approaching-persons rule, myApproachingPersons, is not implemented: round 9)
         let on_covered_walk = covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
         if on_covered_walk && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
             if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
