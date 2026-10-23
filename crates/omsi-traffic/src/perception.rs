@@ -395,8 +395,7 @@ impl WayPts {
     }
 
     /// [P8-5, pass 1 S3] The slice of the way a point belongs to: the polyline segment from
-    /// sample `k` to `k + 1` it lies nearest to (projected onto it, clamped to its ends at the
-    /// joints between slices), with
+    /// sample `k` to `k + 1` it lies nearest to (projected onto it, clamped to its ends), with
     /// how far along it (in the way's metres from sample `k`); only slices starting no further
     /// than `upto` along the way. The samples are `WAY_STEP` apart along the way but not on
     /// the ground (2.5 m over a junction's short pieces), and on a bend a span measured along
@@ -417,23 +416,8 @@ impl WayPts {
             if len2 < 1e-9 {
                 continue;
             }
-            // (clamped at the joints between slices - the wedge outside a bend lies past the
-            // end of one and before the start of the next - but not past the way's ends: a
-            // point behind the first slice or beyond the last is on no slice)
             let lo = if k == 0 { -(WAY_STEP as f64 * 0.5 + SAMPLE_OVERLAP) / len2.sqrt() } else { 0.0 };
-            let t = (c - a).dot(seg) / len2;
-            // (past this slice's end: on it only in the wedge where it is also before the next
-            // slice's start; before its start, never - the previous slice's wedge has it)
-            if t < lo {
-                continue;
-            }
-            if t > 1.0 {
-                let Some(&(dn, n, _)) = self.pts.get(k + 2) else { continue };
-                if dn - d1 <= 0.0 || (c - b).dot(n - b) >= 0.0 || self.pts[k + 1].0 > upto {
-                    continue;
-                }
-            }
-            let t = t.min(1.0);
+            let t = ((c - a).dot(seg) / len2).clamp(lo, 1.0);
             let dist = (c - (a + seg * t)).length();
             if best.is_none_or(|b| dist < b.0) {
                 best = Some((dist, k, (t as f32) * (d1 - d0)));
@@ -2212,19 +2196,6 @@ mod slice_tests {
                 assert!(across <= off.abs() + sag + 1e-6, "off {off} angle {a:.3}: across {across:.3}");
             }
         }
-        // behind the origin (beyond the first slice's half step) and beyond the way's end: on
-        // no slice
-        let (_, q0, f0) = way.pts[0];
-        let across_of = |c: DVec2, upto: f32| way.segment_of(c, upto).map(|(i, _)| {
-            let (_, q, _) = way.pts[i];
-            let fwd = (way.pts[i + 1].1 - q).normalize();
-            (c - q).dot(DVec2::new(fwd.y, -fwd.x)).abs()
-        });
-        assert!(across_of(q0 - (way.pts[1].1 - q0).normalize() * 5.0, 15.0).is_none_or(|a| a > 2.15), "a point 5 m behind the origin is on the strip ({f0:?})");
-        let (_, qn, _) = *way.pts.iter().rev().find(|p| p.0 <= 15.0).unwrap();
-        let k = way.pts.iter().position(|p| p.1 == qn).unwrap();
-        let dir = (qn - way.pts[k - 1].1).normalize();
-        assert!(across_of(qn + dir * 5.0, way.pts[k - 1].0).is_none_or(|a| a > 2.15), "a point beyond the last slice is on the strip");
     }
 }
 
