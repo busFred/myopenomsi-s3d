@@ -1136,6 +1136,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         if rel.truncate().length() > radius || rel.z.abs() > 2.5 {
             continue;
         }
+        // [round 8 H8-8, fix pass 2] a car pulling out of a parking space: not the walkers under
+        // or beside its parked body who are off its way out
+        if crate::plan::pull_out_exempt(net, me, p) {
+            continue;
+        }
         let standing = p.vel.length() < 0.3;
         // [round 7 A3] somebody on the walk of a crossing ahead, within `ZEBRA_BESIDE` of my
         // lane's footprint, not a kerb waiter (`at_kerb`: they let the vehicle go first, P4),

@@ -288,3 +288,69 @@ fn h8_7_a_car_stops_at_the_loaded_edge_and_drives_off_the_maps_end() {
         }
     }
 }
+
+/// [H8-8, fix pass 2] A pull-out from 3 m off its lane (steerable move 7.86 m) with people where
+/// the safety review's probes put them: standing on the axis 0.5 m and 1.5 m past the end of its
+/// way out, a walker from the right kerb 9 m ahead as it starts, one from the left kerb 12 m ahead
+/// 2 s after it starts. The lane's people test runs throughout: it never touches anybody (pass 1
+/// switched it off while the strip was clear and hit them at 1.3-4.3 m/s).
+fn pull_out_probe(people: &dyn Fn(f32, Option<f32>) -> Vec<Person>) -> (f32, bool) {
+    let net = one_lane();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![pulled_out(1, 100.0, 3.0)];
+    let mut started: Option<f32> = None;
+    let mut least = f32::INFINITY;
+    let mut moved = false;
+    let mut now = 0.0f32;
+    let mut st = None;
+    run(&net, &mut sim, &mut cars, 30.0, |t, sim| {
+        now = t;
+        sim.people = people(t, st);
+    }, |t, sim, cars| {
+        let c = &cars[0];
+        if started.is_none() && c.state.speed > 0.3 {
+            started = Some(t);
+        }
+        moved |= c.state.s > 101.0;
+        for p in &sim.people {
+            least = least.min(omsi_sim::collision::Obb::point(p.pos, 0.28).separation(&c.obb()) as f32);
+        }
+    });
+    let _ = (&mut st, now);
+    (least, moved)
+}
+
+#[test]
+fn h8_8_probes_people_past_the_way_out_are_braked_for() {
+    let end = 100.0 + omsi_traffic::plan::bypass_min_len(4.0, 3.0) as f64;
+    for past in [0.5, 1.5] {
+        let (least, _) = pull_out_probe(&|_, _| vec![person(0.0, end + past, 0.0, 0.0)]);
+        assert!(least > 0.0, "standing on the axis {past} m past the way out: touched, {least:.2}");
+    }
+    // a walker from the right kerb 9 m ahead, crossing as the car starts (the car starts at its
+    // `pull_out`, 2 s)
+    let (least, _) = pull_out_probe(&|t, _| {
+        let x = if t < 2.0 { 5.0 } else { (5.0 - 1.2 * (t - 2.0) as f64).max(-6.0) };
+        vec![person(x, 109.0, if t < 2.0 { 0.0 } else { -1.2 }, 0.0)]
+    });
+    assert!(least > 0.0, "walker from the right kerb: touched, {least:.2}");
+    // a walker from the left kerb 12 m ahead, crossing 2 s after the start
+    let (least, _) = pull_out_probe(&|t, _| {
+        let x = if t < 4.0 { -5.0 } else { (-5.0 + 1.2 * (t - 4.0) as f64).min(6.0) };
+        vec![person(x, 112.0, if t < 4.0 { 0.0 } else { 1.2 }, 0.0)]
+    });
+    assert!(least > 0.0, "walker from the left kerb: touched, {least:.2}");
+}
+
+/// [H8-8, fix pass 2] Jiangzhaikou #1913's shape: walkers on the pavement passing beside its parked
+/// body and one standing beside it on the far side of the pavement, off its way out, do not hold
+/// it: it leaves and reaches its lane, touching nobody.
+#[test]
+fn h8_8_walkers_beside_the_parked_body_off_its_way_out_do_not_hold_it() {
+    let (least, moved) = pull_out_probe(&|t, _| {
+        let t = t as f64;
+        vec![person(4.6, 97.0 + 1.2 * t, 0.0, 1.2), person(4.8, 104.0 - 1.2 * t, 0.0, -1.2), person(4.5, 100.0, 0.0, 0.0)]
+    });
+    assert!(moved, "held by walkers beside its parked body");
+    assert!(least > 0.0, "touched: {least:.2}");
+}

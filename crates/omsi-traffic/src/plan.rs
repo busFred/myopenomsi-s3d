@@ -195,9 +195,20 @@ pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, 
 /// when the body is at that metre, driving from rest at `PULL_OUT_ACCEL` (SUMO's insertion fails
 /// on a person on the footprint, `MSLane::checkForPedestrians`; on its way it brakes for persons
 /// on its lane).
-pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32) -> bool {
+pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32) -> bool {
     let Some(l) = net.lanes.get(lane) else { return true };
+    let (q, _) = l.at(s.min(l.length()));
+    !sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0).into_iter().any(|k| on_pull_out_strip(net, lane, s, lateral, front, rear, half_width, ramp_len, v, &sim.people[k]))
+}
+
+/// [round 8 H8-8, fix pass 2] Whether person `p` is on the strip (`pull_out_strip_clear`): where
+/// they are, or where they will be when the body is at that metre - the car driving on from `v`
+/// m/s at `PULL_OUT_ACCEL` up to the lane's limit (`arrival_time`; pass 1 timed it from rest even
+/// when moving).
+pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32, p: &crate::sim::Person) -> bool {
+    let Some(l) = net.lanes.get(lane) else { return false };
     let len = l.length();
+    let v_lim = l.speed_limit_kmh.max(1.0) / 3.6;
     let mut d = 0.0f32;
     while d <= ramp_len + 0.01 {
         let at = (s + d).min(len);
@@ -206,17 +217,42 @@ pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32
         let lat = lateral * (1.0 - omsi_sim::traffic::smooth01(d / ramp_len.max(0.1)));
         let c = q.truncate() + DVec2::new(hr.cos(), -hr.sin()) * lat as f64;
         let body = Obb::vehicle(c, h as f64, front as f64, rear as f64, half_width as f64);
-        for k in sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0) {
-            let p = &sim.people[k];
-            // (where they will be when the body is there, from rest at `PULL_OUT_ACCEL`)
-            let later = p.pos.truncate() + p.vel * (2.0 * d / omsi_sim::ai_motion::PULL_OUT_ACCEL).sqrt() as f64;
-            if [p.pos.truncate(), later].iter().any(|&x| Obb::point(x.extend(p.pos.z), PERSON_RADIUS as f64).separation(&body) < 0.0) {
-                return false;
-            }
+        let later = p.pos.truncate() + p.vel * arrival_time(d, v.max(0.0), omsi_sim::ai_motion::PULL_OUT_ACCEL, v_lim) as f64;
+        if [p.pos.truncate(), later].iter().any(|&x| Obb::point(x.extend(p.pos.z), PERSON_RADIUS as f64).separation(&body) < 0.0) {
+            return true;
         }
         d += 1.0;
     }
-    true
+    false
+}
+
+/// [round 8 H8-8, fix pass 2] The rest of a pull-out's way out (m): the steerable move from rest
+/// while it has not left (`bypass_min_len`), else what is left of its ramp.
+pub fn pull_out_ramp_left(me: &Vehicle) -> f32 {
+    let st = &me.state;
+    let (_, _, x0, len) = st.lateral_ramp;
+    if st.speed < STANDING_SPEED && me.pull_out > 0.0 {
+        bypass_min_len(me.length(), st.lateral)
+    } else {
+        (x0 + len - st.odometer).max(1.0)
+    }
+}
+
+/// [round 8 H8-8, fix pass 2] The one exemption the people test makes for a car pulling out of a
+/// parking space (`people_ahead` asks it for every person): somebody under or beside its parked
+/// body - level with it, from its rear to its front - who is not on the strip it sweeps onto its
+/// lane (`on_pull_out_strip`) is not in its way (the walkers passing over the pavement at its
+/// spot, Jiangzhaikou #1913). Everybody else is tested as by any car (pass 1 switched the test
+/// off while the strip was clear: probes hit people just past the strip at 3-4 m/s).
+pub fn pull_out_exempt(net: &Network, me: &Vehicle, p: &crate::sim::Person) -> bool {
+    if !me.pulling_out {
+        return false;
+    }
+    let st = &me.state;
+    let hr = (me.heading as f64).to_radians();
+    let along = (p.pos - me.pos).truncate().dot(DVec2::new(hr.sin(), hr.cos())) as f32;
+    let level = along >= -st.rear - PERSON_RADIUS && along <= st.front + PERSON_RADIUS;
+    level && !on_pull_out_strip(net, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, pull_out_ramp_left(me), st.speed, p)
 }
 
 /// [round 8 H8-1/H8-8, fix pass 1] The one pull-out rule, for the parked object the app takes
@@ -225,7 +261,7 @@ pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32
 /// (`pull_out_strip_clear`). SUMO re-inserts a parked vehicle only when `isInsertionSuccess`
 /// passes (`MSVehicleTransfer`); OMSI draws the body, so the car then drives from its offset.
 pub fn pull_out_clear(net: &Network, sim: &Simulation, followers: &[PullOutFollower], lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32) -> bool {
-    followers.iter().all(|f| f.gap >= secure_gap_behind(f)) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len)
+    followers.iter().all(|f| f.gap >= secure_gap_behind(f)) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len, 0.0)
 }
 
 /// [J7-3] SUMO LC2013's strategic look-ahead (`MSLCM_LC2013::LOOK_FORWARD`, s): a lane that
@@ -1235,18 +1271,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // 4. people ([round 8 H8-8, fix pass 1] a pull-out on its way from its offset onto its lane
-    // is held by people only when somebody is on the strip its body still sweeps
-    // (`pull_out_strip_clear` over the rest of its ramp), not by the walkers passing over the
-    // pavement under its parked body; where it stops for them is the people test's)
-    let strip_clear = me.pulling_out && {
-        let (_, _, x0, len) = st.lateral_ramp;
-        let left = if v < STANDING_SPEED && me.pull_out > 0.0 { bypass_min_len(me.length(), st.lateral) } else { (x0 + len - st.odometer).max(1.0) };
-        pull_out_strip_clear(net, sim, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, left)
-    };
-    if !strip_clear {
-        min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
-    }
+    // 4. people ([round 8 H8-8, fix pass 2] a pull-out too: `people_ahead` leaves out only the
+    // people under or beside its parked body off its way out, `pull_out_exempt`)
+    min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
