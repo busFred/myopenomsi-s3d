@@ -12,7 +12,7 @@
 //! traffic_cases converge <fixture>... [--all]
 //! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset] [--people]
 //! traffic_cases foes <fixture> <lane>...
-//! traffic_cases people <rec>... [--every 0.2] [--radius 200] [--json out.json]
+//! traffic_cases people <rec>... [--every 0.2] [--radius 200] [--until S] [--json out.json]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
 //! traffic_cases compare <dir> [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
@@ -6333,10 +6333,13 @@ impl PeopleAcc {
 fn people(args: &[String]) -> Res<()> {
     let mut recs: Vec<PathBuf> = Vec::new();
     let (mut every, mut radius, mut json_out) = (0.2f64, 200.0f64, None::<PathBuf>);
+    // (the recording's seconds counted: up to this many after its first frame)
+    let mut until = f64::INFINITY;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--every" => every = it.next().ok_or("--every needs a value")?.parse()?,
+            "--until" => until = it.next().ok_or("--until needs a value")?.parse()?,
             "--radius" => radius = it.next().ok_or("--radius needs a value")?.parse()?,
             "--json" => json_out = Some(PathBuf::from(it.next().ok_or("--json needs a path")?)),
             s if s.starts_with("--") => return Err(format!("unknown option {s}").into()),
@@ -6344,7 +6347,7 @@ fn people(args: &[String]) -> Res<()> {
         }
     }
     if recs.is_empty() || every <= 0.0 {
-        return Err("usage: traffic_cases people <rec>... [--every S] [--radius R] [--json out.json]".into());
+        return Err("usage: traffic_cases people <rec>... [--every S] [--radius R] [--until S] [--json out.json]".into());
     }
     let mut all = Vec::new();
     for path in &recs {
@@ -6360,12 +6363,20 @@ fn people(args: &[String]) -> Res<()> {
         drop(_sim);
         drop(header);
         let mut acc = PeopleAcc::new(every, radius);
+        let mut first: Option<f64> = None;
         while lines.next() {
             let (kind, _, _) = peek(&lines.buf);
             if !matches!(kind, "Frame" | "Keyframe" | "LanesAdded") {
                 continue;
             }
-            match omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?)? {
+            let rec = omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?)?;
+            if matches!(rec, Record::Frame(_) | Record::Keyframe { .. }) {
+                let t0 = *first.get_or_insert(rec.time());
+                if rec.time() - t0 > until {
+                    break;
+                }
+            }
+            match rec {
                 Record::LanesAdded { lanes, .. } => {
                     net.extend(lanes, 1.5);
                 }
