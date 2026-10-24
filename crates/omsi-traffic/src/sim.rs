@@ -1115,154 +1115,169 @@ impl Simulation {
         let mut standing_now: Vec<(usize, bool)> = Vec::new();
         // the line each vehicle has passed on green or yellow, written back with them
         let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
-        for (i, (v, p)) in vehicles.iter().zip(&perceptions).enumerate() {
-            let passed = p.junction.as_ref().and_then(|j| {
-                let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
-                let lets_in = self.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow));
-                if lets_in || v.passed_on_go == Some((ctl, li)) {
-                    Some((ctl, li))
-                } else {
-                    None
+        // (one vehicle's part of it reads only the perceptions, the vehicles and the simulation:
+        // built for every vehicle in parallel, filed below in vehicle order, as the serial loop did)
+        let parts: Vec<(Option<Option<(usize, usize)>>, Option<(bool, Claim)>)> = vehicles
+            .par_iter()
+            .zip(&perceptions)
+            .enumerate()
+            .map(|(i, (v, p))| {
+                let passed = p.junction.as_ref().and_then(|j| {
+                    let (ctl, li, _) = j.light.filter(|_| j.past_line)?;
+                    let lets_in = self.lights.get(ctl).is_some_and(|c| !matches!(TrafficLightController::aspect(c.state(li)), omsi_sim::traffic::Aspect::Red | omsi_sim::traffic::Aspect::RedYellow));
+                    if lets_in || v.passed_on_go == Some((ctl, li)) {
+                        Some((ctl, li))
+                    } else {
+                        None
+                    }
+                });
+                let passed_change = (passed != v.passed_on_go).then_some(passed);
+                let Some(j) = p.junction.as_ref() else { return (passed_change, None) };
+                let st = &v.state;
+                // a claim is filed from `claim_horizon` before the meeting place: the drivers who
+                // give way to this one see it coming in time to stop, not only once it is a
+                // braking distance from its own line
+                let horizon = claim_horizon(st.speed);
+                if !j.inside && j.conflict_start - st.front > horizon {
+                    return (passed_change, None);
                 }
-            });
-            if passed != v.passed_on_go {
+                // committed: too close to the next meeting place it has not entered to stop before
+                // it even braking hard, or past every one it has (in the last it is in). A driver
+                // who can still stop, if not comfortably, gives way as the rules say (two cars
+                // arriving together at an unmarked junction both took themselves for committed
+                // and met in the middle); one on the lead-in piece of a long object is inside but
+                // not yet committed; one standing in the box short of a later stretch it waits
+                // for (`plan`: the stop before the stretch waited for) is committed to the ones it
+                // is in, not to that one (`reservation`: a meeting place I am in). (at the line a
+                // driver stops hard if it must; one already inside does not slam on in the middle
+                // of the junction, it goes on unless it can stop gently)
+                let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+                let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
+                let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
+                // ([J7-4, fix pass 1] SUMO's waiting positions: committed when the first place it can
+                // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
+                // place's band - not only when it cannot stop before the meeting place itself: a car
+                // let go onto a crossing and refused there stood on it 50 s, viz case06 #15801)
+                let next_wait = plan::next_wait(net, self, v, j, brake);
+                // ([fix pass 2] committed - in the way of everybody - only when it cannot stop before its
+                // next meeting place, `plan::cannot_stop`; short of its next waiting position it is
+                // committed only to the meeting places it would block, foe by foe, `Claim::next_wait`:
+                // a crawler at 1.1 m/s could stop within 0.3 m and is no `willPass`, and standing 0.8 m
+                // short of a meeting place it went into a 12 m/s foe, x10 case01 #158/#1058)
+                let room = next - st.front - 0.6;
+                let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, room, brake);
+                let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
+                // the light at this junction's line, if the driver is held by one: any light on
+                // the way before the first meeting place with another way, wherever the object
+                // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
+                // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
+                let light_line = j.light_line;
+                let (light_red, until_go, red_at) = match p.signal {
+                    // (clearing the box: the light it passed holds it no more,
+                    // `JunctionView::clears_past`)
+                    Some(sig) if j.clears_past(&sig, st.front) => (false, None, f32::INFINITY),
+                    // (or, clearing the box, a later line of the way through: it holds the car as any,
+                    // `JunctionView::clears_past`, and the car standing there is held by it, not
+                    // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
+                    // committed to the cars waiting for it)
+                    // ([fix pass 2, 1b] and any light that holds the claimant before its first
+                    // meeting place, whatever the object's line: the light belongs to the claim -
+                    // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
+                    // `light_red false` for j783 and two cars stood refused for it 28 m apart)
+                    // ([J7-1] every red on the way through, with where its line lies, `red_at`: the
+                    // resolver holds the claimant before the meeting places past that line only; a red
+                    // past the first meeting place went unfiled and the foes took the car standing at
+                    // it for one coming, x10 case12 #19087, red at 31 m, meeting place at 41 m)
+                    Some(sig) if sig.dist < j.entry + j.way_len && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
+                        // not held by a light it goes through: the plan's own
+                        // call (too late to stop, the yellow it takes), or one
+                        // committed at amber onset and still rolling (`plan::light_call`; one
+                        // standing at its red waits for its green and files `light_red`)
+                        let call = plan::light_call(v, p, &sig);
+                        let through = call.go;
+                        if through {
+                            (false, None, f32::INFINITY)
+                        } else {
+                            // ([J7-1] its line along the way through, the claim's distances)
+                            (true, sig.until_go, sig.dist - j.entry)
+                        }
+                    }
+                    _ => (false, None, f32::INFINITY),
+                };
+                // standing at its red short of the first meeting place with
+                // another way, a car is committed to nothing: the merge of the lead-in with its
+                // own stub put its "first meeting place" behind its bumper, and the foes took
+                // the car waiting at its red for one already on its way across
+                let committed = committed && !(light_red && st.speed < 0.5 && (red_at + j.entry).min(light_line) - st.front > 0.5);
+                // standing, with hysteresis (`Claim::standing`):
+                // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
+                let was_standing = v.claim_standing;
+                let standing = st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0);
+                let claim = Claim {
+                    chain: j.chain.clone(),
+                    was_standing,
+                    light_red,
+                    until_go,
+                    red_at,
+                    lead: match p.leader.map(|l| l.what) {
+                        Some(Seen::Vehicle(o)) | Some(Seen::Body(o)) => Some(o),
+                        _ => None,
+                    },
+                    vehicle: i,
+                    junction: j.junction,
+                    movement: j.movement,
+                    s: -j.entry,
+                    speed: st.speed,
+                    accel: st.accel,
+                    v_max: limit.min(st.max_speed_kmh / 3.6),
+                    front: st.front,
+                    rear: st.rear,
+                    decel: v.params.comfort_brake,
+                    waiting: v.waiting,
+                    lead_gap: p.leader.map(|l| (l.gap, l.speed)),
+                    zip_behind: v.zip_behind,
+                    body_block: p.body_block,
+                    next_wait: next_wait - j.entry,
+                    tau: v.params.tau,
+                    min_gap: v.params.min_gap,
+                    committed,
+                    exit_room: j.exit_room,
+                    impatience: v.impatience,
+                    absolute: v.is_rail() || v.external.priority,
+                    held: v.is_held(),
+                    // (held by its lead, people, a zebra, a light, ... rather than by a junction's
+                    // answer or a full exit)
+                    blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                    // (people or a zebra in front of it, or a lead that stands too: nothing that
+                    // lets it go on a schedule, as a light or a lead moving off does)
+                    // in the box when its light turned: it clears it (rule F)
+                    clearing: j.clearing && !light_red,
+                    stuck: v.is_held()
+                        && match v.last.why {
+                            Why::People | Why::Zebra => true,
+                            Why::Lead => p.leader.is_some_and(|l| l.speed < STANDING_SPEED && l.gap < 12.0),
+                            _ => false,
+                        },
+                    lanes: perception::way_lanes(net, st, 150.0),
+                    light: j.light.map(|(c, l, _)| (c, l)),
+                    id: v.id,
+                    yields_now: None,
+                    // (where people, a zebra or a standing lead will stop the front)
+                    clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
+                    brake,
+                };
+                (passed_change, Some((standing, claim)))
+            })
+            .collect();
+        for (i, (passed_change, filed)) in parts.into_iter().enumerate() {
+            if let Some(passed) = passed_change {
                 passed_now.push((i, passed));
             }
-            let Some(j) = p.junction.as_ref() else { continue };
-            let st = &v.state;
-            // a claim is filed from `claim_horizon` before the meeting place: the drivers who
-            // give way to this one see it coming in time to stop, not only once it is a
-            // braking distance from its own line
-            let horizon = claim_horizon(st.speed);
-            if !j.inside && j.conflict_start - st.front > horizon {
-                continue;
+            if let Some((standing, claim)) = filed {
+                standing_now.push((i, standing));
+                claim_of[i] = Some(claims.len());
+                claims.push(claim);
             }
-            // committed: too close to the next meeting place it has not entered to stop before
-            // it even braking hard, or past every one it has (in the last it is in). A driver
-            // who can still stop, if not comfortably, gives way as the rules say (two cars
-            // arriving together at an unmarked junction both took themselves for committed
-            // and met in the middle); one on the lead-in piece of a long object is inside but
-            // not yet committed; one standing in the box short of a later stretch it waits
-            // for (`plan`: the stop before the stretch waited for) is committed to the ones it
-            // is in, not to that one (`reservation`: a meeting place I am in). (at the line a
-            // driver stops hard if it must; one already inside does not slam on in the middle
-            // of the junction, it goes on unless it can stop gently)
-            let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
-            let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
-            let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
-            // ([J7-4, fix pass 1] SUMO's waiting positions: committed when the first place it can
-            // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
-            // place's band - not only when it cannot stop before the meeting place itself: a car
-            // let go onto a crossing and refused there stood on it 50 s, viz case06 #15801)
-            let next_wait = plan::next_wait(net, self, v, j, brake);
-            // ([fix pass 2] committed - in the way of everybody - only when it cannot stop before its
-            // next meeting place, `plan::cannot_stop`; short of its next waiting position it is
-            // committed only to the meeting places it would block, foe by foe, `Claim::next_wait`:
-            // a crawler at 1.1 m/s could stop within 0.3 m and is no `willPass`, and standing 0.8 m
-            // short of a meeting place it went into a 12 m/s foe, x10 case01 #158/#1058)
-            let room = next - st.front - 0.6;
-            let committed = (next_ahead.is_infinite() && j.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, room, brake);
-            let limit = net.lanes.get(st.lane).map(|l| l.speed_limit_kmh / 3.6 * st.desire).unwrap_or(13.0);
-            // the light at this junction's line, if the driver is held by one: any light on
-            // the way before the first meeting place with another way, wherever the object
-            // begins (`JunctionView::light_line`: the old test, the light within 1 m of the
-            // object's entry, never saw a car standing at BeijingCity's lit stub as held by it)
-            let light_line = j.light_line;
-            let (light_red, until_go, red_at) = match p.signal {
-                // (clearing the box: the light it passed holds it no more,
-                // `JunctionView::clears_past`)
-                Some(sig) if j.clears_past(&sig, st.front) => (false, None, f32::INFINITY),
-                // (or, clearing the box, a later line of the way through: it holds the car as any,
-                // `JunctionView::clears_past`, and the car standing there is held by it, not
-                // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
-                // committed to the cars waiting for it)
-                // ([fix pass 2, 1b] and any light that holds the claimant before its first
-                // meeting place, whatever the object's line: the light belongs to the claim -
-                // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
-                // `light_red false` for j783 and two cars stood refused for it 28 m apart)
-                // ([J7-1] every red on the way through, with where its line lies, `red_at`: the
-                // resolver holds the claimant before the meeting places past that line only; a red
-                // past the first meeting place went unfiled and the foes took the car standing at
-                // it for one coming, x10 case12 #19087, red at 31 m, meeting place at 41 m)
-                Some(sig) if sig.dist < j.entry + j.way_len && !matches!(sig.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow | omsi_sim::traffic::Aspect::Dark) => {
-                    // not held by a light it goes through: the plan's own
-                    // call (too late to stop, the yellow it takes), or one
-                    // committed at amber onset and still rolling (`plan::light_call`; one
-                    // standing at its red waits for its green and files `light_red`)
-                    let call = plan::light_call(v, p, &sig);
-                    let through = call.go;
-                    if through {
-                        (false, None, f32::INFINITY)
-                    } else {
-                        // ([J7-1] its line along the way through, the claim's distances)
-                        (true, sig.until_go, sig.dist - j.entry)
-                    }
-                }
-                _ => (false, None, f32::INFINITY),
-            };
-            // standing at its red short of the first meeting place with
-            // another way, a car is committed to nothing: the merge of the lead-in with its
-            // own stub put its "first meeting place" behind its bumper, and the foes took
-            // the car waiting at its red for one already on its way across
-            let committed = committed && !(light_red && st.speed < 0.5 && (red_at + j.entry).min(light_line) - st.front > 0.5);
-            // standing, with hysteresis (`Claim::standing`):
-            // from under 0.3 m/s until over 1 m/s, remembered from one claim to the next
-            let was_standing = v.claim_standing;
-            standing_now.push((i, st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0)));
-            claim_of[i] = Some(claims.len());
-            claims.push(Claim {
-                chain: j.chain.clone(),
-                was_standing,
-                light_red,
-                until_go,
-                red_at,
-                lead: match p.leader.map(|l| l.what) {
-                    Some(Seen::Vehicle(o)) | Some(Seen::Body(o)) => Some(o),
-                    _ => None,
-                },
-                vehicle: i,
-                junction: j.junction,
-                movement: j.movement,
-                s: -j.entry,
-                speed: st.speed,
-                accel: st.accel,
-                v_max: limit.min(st.max_speed_kmh / 3.6),
-                front: st.front,
-                rear: st.rear,
-                decel: v.params.comfort_brake,
-                waiting: v.waiting,
-                lead_gap: p.leader.map(|l| (l.gap, l.speed)),
-                zip_behind: v.zip_behind,
-                body_block: p.body_block,
-                next_wait: next_wait - j.entry,
-                tau: v.params.tau,
-                min_gap: v.params.min_gap,
-                committed,
-                exit_room: j.exit_room,
-                impatience: v.impatience,
-                absolute: v.is_rail() || v.external.priority,
-                held: v.is_held(),
-                // (held by its lead, people, a zebra, a light, ... rather than by a junction's
-                // answer or a full exit)
-                blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
-                // (people or a zebra in front of it, or a lead that stands too: nothing that
-                // lets it go on a schedule, as a light or a lead moving off does)
-                // in the box when its light turned: it clears it (rule F)
-                clearing: j.clearing && !light_red,
-                stuck: v.is_held()
-                    && match v.last.why {
-                        Why::People | Why::Zebra => true,
-                        Why::Lead => p.leader.is_some_and(|l| l.speed < STANDING_SPEED && l.gap < 12.0),
-                        _ => false,
-                    },
-                lanes: perception::way_lanes(net, st, 150.0),
-                light: j.light.map(|(c, l, _)| (c, l)),
-                id: v.id,
-                yields_now: None,
-                // (where people, a zebra or a standing lead will stop the front)
-                clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
-                brake,
-            });
         }
         // the players' vehicles claim their way like anybody else (their grants are not
         // read: the player drives): the junction on the way ahead of the lane under the
