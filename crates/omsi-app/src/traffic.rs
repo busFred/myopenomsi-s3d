@@ -5237,12 +5237,43 @@ impl Traffic {
     }
 }
 
+/// The prefetch reach (m): how far round the player the tiles must be loaded so that the loaded
+/// tiles' edge still lies beyond the perceptual `horizon` when the next tile arrives - the horizon
+/// plus the distance covered during one tile load (`load_secs`) at `road_speed` (m/s). The edge
+/// is where the traffic network ends without the map ending; seen, it is a dead end on an open
+/// road (OMSI geometry: the edge is not a place; a SUMO network's border is where its roads end).
+pub fn prefetch_target(horizon: f64, road_speed: f64, load_secs: f64) -> f64 {
+    horizon + road_speed.max(0.0) * load_secs.max(0.0)
+}
+
+/// The horizon `prefetch_target` keeps the edge beyond: a body `height` high with its lamps dark
+/// (lit lamps have no horizon and no loaded area reaches that far), never within `NEAR_HIDE`
+/// (as `Viewer::beyond_horizon`: the far trip end acts beyond both).
+fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
+    Viewer { lamps_lit: false, ..viewer }.horizon(height).max(NEAR_HIDE)
+}
+
 impl Traffic {
+    /// `prefetch_target` for this frame's picture (`viewer`), `None` before the first frame:
+    /// the `edge_horizon` of the tallest random-traffic body (under lit lamps A4 keeps the cars
+    /// off the roads that end at the edge), and the road's speed at the player (`player`:
+    /// position, speed in m/s) - the faster of its street lane's speed limit and its own speed.
+    pub fn prefetch_reach(&self, player: Option<(DVec3, f64)>, load_secs: f64) -> Option<f64> {
+        let viewer = self.viewer?;
+        let height = self.types.iter().filter(|t| t.2 == LaneKind::Street).map(|t| body_height(&t.0)).fold(CAR_HEIGHT, f64::max);
+        let road_speed = player.map_or(0.0, |(pos, speed)| {
+            let limit = self.net.nearest_lane_near(pos, LaneKind::Street).map_or(0.0, |(l, _, _)| self.net.lanes[l].speed_limit_kmh as f64 / 3.6);
+            limit.max(speed.abs())
+        });
+        Some(prefetch_target(edge_horizon(viewer, height), road_speed, load_secs))
+    }
+
     /// [round 8 H8-7, fix pass 1] Mark the street lanes that end at the edge of the loaded tiles
     /// (`Lane::loaded_edge`): no lane on, and the road's way on - `LANE_LINK_TOL` past the end,
     /// where a lane going on would be linked - lies on a tile of the map whose lanes are not
-    /// loaded. (The "network's end" 873 m ahead at Jiangzhaikou, lanes 149-155 at y = -2455,
-    /// is the loaded tiles' edge: 7 of the map's 91 tiles are loaded at the start.)
+    /// loaded. The tiles reach at least `prefetch_reach` round the player, so the edge lies
+    /// beyond the perceptual horizon; a fixed `--radius` square keeps its edge where it is
+    /// (Jiangzhaikou with `--radius 2`: lanes 149-155 at y = -2455, 873 m ahead).
     pub fn mark_loaded_edges(&mut self, world: &World) {
         let ts = omsi_map::tile_size();
         for l in self.net.lanes.iter_mut() {
@@ -5937,6 +5968,29 @@ mod respawn_sight_tests {
         let mut braking = Vehicle::default();
         braking.state.braking = true;
         assert!(super::far_trip_ends(vec![(1u64, true, d(869.0), &braking)].into_iter()).is_empty(), "a braking car stays");
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    /// The prefetch reach: the horizon a 1.5 m car has on a 900-line, 60 degree picture (585 m)
+    /// plus the distance driven during one tile load at the road's speed; a lit picture keeps
+    /// the dark horizon (no area reaches a lamp's), a tiny one NEAR_HIDE, a bus twice the car's.
+    #[test]
+    fn the_reach_is_the_horizon_plus_one_load_at_the_road_speed() {
+        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }.with_screen(900, None);
+        let h = edge_horizon(v, CAR_HEIGHT);
+        assert!((h - 584.6).abs() < 0.5, "{h}");
+        assert_eq!(edge_horizon(v.with_lamps(true), CAR_HEIGHT), h, "lit lamps: the dark horizon");
+        assert!((edge_horizon(v, 3.0) - 2.0 * h).abs() < 1e-6);
+        assert_eq!(edge_horizon(v.with_screen(100, None), CAR_HEIGHT), NEAR_HIDE);
+        // 50 km/h and a 1.2 s load: 16.7 m further
+        assert!((prefetch_target(h, 50.0 / 3.6, 1.2) - (h + 16.666)).abs() < 0.01);
+        assert_eq!(prefetch_target(h, 0.0, 3.0), h, "standing: the horizon");
+        assert_eq!(prefetch_target(h, -5.0, 1.0), h, "no negative speed");
+        assert_eq!(prefetch_target(h, 10.0, 0.0), h, "no load measured yet");
     }
 }
 

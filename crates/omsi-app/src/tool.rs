@@ -44,7 +44,7 @@ pub fn settings() -> ToolSettings {
         detail_textures: s.detail_textures,
         vsync: s.vsync,
         enhanced: s.enhanced,
-        view_distance: crate::settings::view_distance().unwrap_or(1200.0).max(omsi_map::tile_size()),
+        view_distance: crate::settings::view_distance().unwrap_or(crate::settings::DEFAULT_VIEW_DISTANCE).max(omsi_map::tile_size()),
     }
 }
 
