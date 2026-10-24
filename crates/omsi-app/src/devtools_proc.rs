@@ -963,6 +963,9 @@ pub(crate) fn marks(
                     if last.why == omsi_traffic::Why::ExitFull {
                         flags.push("junction exit full".into());
                     }
+                    if last.why == omsi_traffic::Why::KeepClear {
+                        flags.push("keeping the box clear".into());
+                    }
                     if c.ai.stopped > 2.0 {
                         flags.push(format!("stopped {:.0} s", c.ai.stopped));
                     }

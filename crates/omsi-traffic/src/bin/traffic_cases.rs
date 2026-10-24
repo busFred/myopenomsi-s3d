@@ -1421,7 +1421,7 @@ fn snap_idx(snaps: &[Snap], t: f64) -> usize {
 
 fn decision_next(d: &omsi_traffic::Decision) -> Option<(u64, &'static str)> {
     match d.why {
-        Why::Junction | Why::ExitFull => d
+        Why::Junction | Why::ExitFull | Why::KeepClear => d
             .wait_for
             .map(|w| (w, "yields to"))
             .or(d.lead_id.map(|w| (w, "behind")))
@@ -1788,7 +1788,7 @@ fn terminal_reason(
                 why_name(d.why)
             ),
         ),
-        Why::Junction | Why::ExitFull => (
+        Why::Junction | Why::ExitFull | Why::KeepClear => (
             "junction-nofoe",
             format!(
                 "{} why={} hold={} with no foe named",
@@ -3836,7 +3836,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
             None => {}
         }
     }
-    if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull)) {
+    if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull | Why::KeepClear)) {
         let mut foes_n = 0;
         for &(j, m, ml, md) in &jms {
             let mv = &r.sim.junctions.nodes[j].movements[m];
@@ -4025,7 +4025,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 }
             }
         }
-        Why::Junction | Why::ExitFull => {
+        Why::Junction | Why::ExitFull | Why::KeepClear => {
             if d.hold == Some(Hold::Foe) && foe_in.is_empty() && foe_coming.is_empty() {
                 tags.push("junction hold (foe) with nobody in or coming to the conflict stretches".into());
             }
@@ -4074,7 +4074,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     } else if matches!(d.why, Why::People | Why::Zebra) && !near_people.is_empty() {
         let p = near_people[0].3;
         format!("person in front (state {}, decision {}, still {:.0} s, {:.1} m from front)", p.state, p.decision.as_deref().unwrap_or("-"), p.still, near_people[0].0)
-    } else if d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull) {
+    } else if d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull | Why::KeepClear) {
         if matches!(wait_rel, Some("BEHIND") | Some("BESIDE")) {
             format!("junction hold for a vehicle behind/beside ({} {})", d.wait_for.map(fmt_id).unwrap_or_default(), wait_rel.unwrap().to_lowercase())
         } else if d.hold == Some(Hold::ExitFull) {

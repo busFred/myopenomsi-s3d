@@ -1253,7 +1253,7 @@ impl Simulation {
                     held: v.is_held(),
                     // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                     // answer or a full exit)
-                    blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull),
+                    blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull | Why::KeepClear),
                     // (people or a zebra in front of it, or a lead that stands too: nothing that
                     // lets it go on a schedule, as a light or a lead moving off does)
                     // in the box when its light turned: it clears it (rule F)

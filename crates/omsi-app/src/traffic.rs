@@ -3577,9 +3577,10 @@ impl Traffic {
         if c.is_rail() || st.change.is_some() || c.ai.passing.is_some() || st.route.get(st.route_index) != Some(&st.lane) {
             return None;
         }
-        // queueing behind what holds its stop: a vehicle standing at a stop, or the exit full
-        let queued = c.ai.last.why == Why::ExitFull
-            || c.ai.last.lead_id.and_then(|id| self.links.by_id.get(&id).map(|&k| &self.cars[k])).is_some_and(|o| o.at_stop() || o.ai.last.why == Why::ExitFull);
+        // queueing behind what holds its stop: a vehicle standing at a stop, or the box ahead not
+        // clear (its exit full, or held at the line to keep the box clear)
+        let box_held = |w: Why| matches!(w, Why::ExitFull | Why::KeepClear);
+        let queued = box_held(c.ai.last.why) || c.ai.last.lead_id.and_then(|id| self.links.by_id.get(&id).map(|&k| &self.cars[k])).is_some_and(|o| o.at_stop() || box_held(o.ai.last.why));
         let stop = b.stops.front()?;
         let near = st.route_distance(&self.net, stop.ri, stop.s);
         let left = b.detour_wanted(st.speed, self.day_time, queued && near < 60.0)?;

@@ -19,6 +19,8 @@ pub enum Why {
     Lead,
     Light,
     Junction,
+    /// Refused by the junction for want of room on its exit lane (`Hold::ExitFull`, SUMO's
+    /// junction-blocking test at the link).
     ExitFull,
     People,
     /// A pedestrian at a crossing (round 4's zebra check; [round 7 A3] not produced any more:
@@ -29,6 +31,10 @@ pub enum Why {
     PullOut,
     LetOut,
     End,
+    /// Held at its line so as not to come to rest in the box (step 11 of `plan`, SUMO's
+    /// keep-clear rule): where it would stop lies between the line and the way's exit and is
+    /// no waiting place.
+    KeepClear,
 }
 
 impl Why {
@@ -46,6 +52,7 @@ impl Why {
             Why::PullOut => "pull_out",
             Why::LetOut => "let_out",
             Why::End => "end",
+            Why::KeepClear => "keep_clear",
         }
     }
 }
@@ -2263,7 +2270,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if rest > line + 0.5 && rest < exit {
                 let hold = pulled_back(&walk_bands(net, sim, j), me, line);
                 out.stop = Some(hold);
-                out.why = Why::ExitFull;
+                out.why = Why::KeepClear;
             }
         }
     }
