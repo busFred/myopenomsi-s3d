@@ -89,8 +89,9 @@ impl Block {
     }
 
     /// The axis-aligned bounds (min, max) of every point `near(p, margin)` holds for, a
-    /// little wider (`BOUNDS_SLACK`); None for a box with a coordinate that is not finite,
-    /// which `near` is never true of (its comparisons are with NaN or infinity).
+    /// little wider (`BOUNDS_SLACK`); None for a box with a coordinate that is not finite:
+    /// `near` is never true of one with a NaN or infinite centre or heading, and one with an
+    /// infinite half size (which no vehicle or parked box has) is dropped.
     pub fn bounds(&self, margin: f64) -> Option<(DVec2, DVec2)> {
         let (s, c) = (self.heading.sin().abs(), self.heading.cos().abs());
         let (hx, hy) = (self.half.x + margin, self.half.y + margin);
