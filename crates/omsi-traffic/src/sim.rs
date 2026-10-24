@@ -1532,6 +1532,22 @@ impl Simulation {
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
     }
 
+    /// [D7] A vehicle in the box at the end of its green (`Claim::in_box_at_turn`, clearing or
+    /// standing at a waiting place inside) whose way through still crosses the footpath `walk`
+    /// ahead of its rear: walkers do not step onto that crossing while it clears (SUMO: a
+    /// crossing's link is blocked by a vehicle on the junction that will pass it, `MSLink` for
+    /// crossings with `blockedAtDist`). For the pedestrians' kerb verdict (the app's); read after
+    /// `tick`, from this frame's claims.
+    pub fn clearing_across(&self, net: &Network, walk: usize) -> bool {
+        self.claims.iter().any(|(c, _)| {
+            c.in_box_at_turn
+                && c.chain.iter().any(|&(m, off)| {
+                    let lane = self.junctions.nodes[c.junction].movements[m].lane;
+                    net.walks.get(lane).is_some_and(|ws| ws.iter().any(|&(path, sa, _)| path == walk && c.s - c.rear <= off + sa))
+                })
+        })
+    }
+
     /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
     /// `yields_now` for the other while it has not left the meeting places of the two; the
     /// ease ends when it has, when either is gone or no longer claims the junction, when either
