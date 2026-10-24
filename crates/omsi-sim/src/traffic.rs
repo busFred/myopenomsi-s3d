@@ -124,6 +124,11 @@ pub struct Lane {
     pub loaded_edge: bool,
 }
 
+/// [round 9 A4 fix pass 2] How far along the road (m) `Network::ends_at_loaded_edge` looks for the
+/// edge of the loaded tiles: SUMO's `lcStrategicLookahead` default, how far a vehicle's best lanes
+/// look along its way (sumo.md; omsi-traffic's `LC_STRATEGIC_LOOKAHEAD`).
+pub const EDGE_LOOKAHEAD: f64 = 3000.0;
+
 /// Priority of a path without a `[rule] priority`.
 pub const DEFAULT_PRIORITY: f32 = 128.0;
 
@@ -644,6 +649,38 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 
 /// Grid cell size of `Network::grid` (m).
 pub const GRID_CELL: f64 = 50.0;
+
+impl Network {
+    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles: followed
+    /// along every way on, it reaches only lanes with `loaded_edge` and no way on ([fix pass 2]
+    /// at a fork, when every branch does: a road splitting into parallel lanes that all end at the
+    /// edge). The map's own end, a loop, or any branch leading elsewhere is not that edge.
+    pub fn ends_at_loaded_edge(&self, n: usize) -> bool {
+        // (each lane walked once: a lane met again gives its answer, one still being walked - a
+        // loop - is not the edge)
+        // ... within `EDGE_LOOKAHEAD`: farther on it is not taken for the edge
+        fn walk(net: &Network, l: usize, from: f64, memo: &mut std::collections::HashMap<usize, Option<bool>>) -> bool {
+            let Some(lane) = net.lanes.get(l) else { return false };
+            if lane.next.is_empty() {
+                return lane.loaded_edge;
+            }
+            if from > EDGE_LOOKAHEAD {
+                return false;
+            }
+            match memo.get(&l) {
+                Some(Some(r)) => return *r,
+                Some(None) => return false,
+                None => {}
+            }
+            memo.insert(l, None);
+            let to = from + lane.length() as f64;
+            let r = lane.next.iter().all(|&m| walk(net, m, to, memo));
+            memo.insert(l, Some(r));
+            r
+        }
+        walk(self, n, 0.0, &mut std::collections::HashMap::new())
+    }
+}
 
 impl Network {
     /// The sign of a lateral offset (positive to the right) towards the oncoming lane:
@@ -3238,7 +3275,9 @@ impl AiState {
     /// rules but not `no_cars`; `no_cars` - a car already on a lane whose only continuation is
     /// closed drives on through it, as before round 7, and is never taken off moving; only a
     /// lane with no way of its kind at all ends the network for it. A way that ends the
-    /// network just ahead (`Network::reach`) is taken like any other.
+    /// network just ahead (`Network::reach`) is taken like any other; [round 9 A4] one whose
+    /// road ends at the loaded tiles' edge (`Network::ends_at_loaded_edge`) only when no other
+    /// way of its tier is left.
     fn choose_after(
         &mut self,
         net: &Network,
@@ -3269,7 +3308,20 @@ impl AiState {
             }
         };
         let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
-        let choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        let mut choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        // [round 9 A4] not into the edge of the loaded tiles when another way of the same tier
+        // leads on: a random car has no trip, and the loaded-tile edge is not a place on the map,
+        // only where what is loaded ends - a car turning in there stood in a queue that reached
+        // back 400 m towards the player (r9 jzk). (OMSI geometry, not SUMO: SUMO's vehicles have
+        // routes to real destinations and never aim at the network's edge.) With no other way it
+        // drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
+        // as they load), so a branch opens again once its tile is loaded.
+        if choices.len() > 1 {
+            let open: Vec<usize> = choices.iter().copied().filter(|&n| !net.ends_at_loaded_edge(n)).collect();
+            if !open.is_empty() && open.len() < choices.len() {
+                choices = open;
+            }
+        }
         let weighted = best == 0 && self.traffic_pool.is_some();
         if best > 0 && !next.is_empty() {
             FORK_FALLBACKS[best.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

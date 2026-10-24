@@ -556,6 +556,11 @@ impl ApplicationHandler for App {
                 // (with a triple screen, all of its three panels are in sight)
                 let sight = self.camera.as_ref().zip(self.surface.as_ref())
                     .and_then(|(c, s)| self.sight_extent(c, (s.config.width, s.config.height)));
+                // ([round 9 A2 fix pass 1] a triple screen's centre panel's field of view, for the
+                // traffic's perceptual horizon)
+                let panel_fov = self.camera.as_ref().zip(self.surface.as_ref()).and_then(|(c, s)| {
+                    self.triple_rig((s.config.width, s.config.height)).map(|rig| rig.views(c, s.config.width, s.config.height)[1].camera.fov_deg)
+                });
                 if let (Some(t), Some(w), Some(r), Some(scene)) = (
                     self.traffic.as_mut(),
                     self.world.as_ref(),
@@ -573,6 +578,9 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .map(|s| s.config.width as f64 / s.config.height.max(1) as f64)
                         .unwrap_or(16.0 / 9.0);
+                    // ([round 9 A2] the picture's height, for the traffic's perceptual horizon, and
+                    // a triple screen's centre panel's field of view)
+                    let px_height = self.surface.as_ref().map(|s| s.config.height).unwrap_or(0);
                     let fog = self
                         .weather
                         .as_ref()
@@ -582,6 +590,7 @@ impl ApplicationHandler for App {
                         t,
                         self.camera.as_ref(),
                         aspect,
+                        (px_height, panel_fov),
                         sight,
                         fog,
                         &self.clock,
@@ -650,14 +659,9 @@ impl ApplicationHandler for App {
                     // the AI's lights (and a bus's saloon lamps, which its scripts switch with
                     // them): by the time of day, and by day in fog, rain, snow or under a
                     // closed cloud cover as drivers do
-                    let gloomy = self.weather.as_ref().map(|w| {
-                        let (kind, rate) = precip_of(w);
-                        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast")
-                    }).unwrap_or(false);
-                    // Omsi switches the AI's lights on below a light value of 0.75, before
-                    // the street lamps (0.6), and off after them in the morning
+                    // ([round 9 A2 fix pass 2] one rule with the offscreen harness: `ai_lights_on`)
                     let daylight = omsi_sim::Daylight::compute(&self.clock, self.envir.as_ref());
-                    t.night = daylight.brightness < 0.75 || gloomy;
+                    t.night = crate::traffic_link::ai_lights_on(&daylight, self.weather.as_ref());
                     t.daylight = Some(daylight);
                     let __t2 = Instant::now();
                     t.others = lan_outlines(&self.remotes);

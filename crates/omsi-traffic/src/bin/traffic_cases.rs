@@ -4225,11 +4225,17 @@ struct Extra {
     /// of the population's (`Replay::removals`, `RemoveRule::gated`: not the network's end
     /// nor the ground going): a free run, by the game's in-view rule
     /// (`removal::goes_in_view`, which the app asks too); replaying a game recording as
-    /// recorded, the game's own removals the eye saw (`Record::Remove`).
+    /// recorded, the game's own removals the eye saw (`Record::Remove`). ([round 9 A2] Not
+    /// those of a rule made beyond the perceptual horizon: `removed_far`.)
     removed_in_view: u64,
     /// Of them, their waiting times (`Vehicle::waiting`, the give-up clock) when they went,
     /// summed.
     removed_in_view_s: f64,
+    /// [round 9 A2] Vehicles taken off in frame by a rule made beyond the perceptual horizon
+    /// (`RemoveRule::beyond_horizon`: the far dead-end queues), whole map; not in
+    /// `removed_in_view`, which stays "removed in frame inside the horizon". Only a game
+    /// recording replayed as recorded has them (a free run has no picture).
+    removed_far: u64,
     /// [round 7 SHOULD 9] Vehicles the run's network end took off within the radius (a lane
     /// end in view), and of them, whole map, those taken off moving over 1 m/s.
     end_in_view: u64,
@@ -4522,7 +4528,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
             }
             for m in std::mem::take(&mut r.removals) {
-                if m.rule.is_some_and(|k| k.gated()) && m.seen && near(m.pos) {
+                if m.rule.is_some_and(|k| k.beyond_horizon()) && m.seen {
+                    ex.removed_far += 1;
+                    ex.events.push(format!("REMOVED-FAR {} t={:.1} #{} {:?} waiting {:.0} at ({:.0}, {:.0})", sc.name, m.time, m.id, m.rule, m.waiting, m.pos.x, m.pos.y));
+                } else if m.rule.is_some_and(|k| k.gated()) && m.seen && near(m.pos) {
                     ex.removed_in_view += 1;
                     ex.removed_in_view_s += m.waiting as f64;
                     ex.events.push(format!("REMOVED-IN-VIEW {} t={:.1} #{} {:?} waiting {:.0} at ({:.0}, {:.0})", sc.name, m.time, m.id, m.rule, m.waiting, m.pos.x, m.pos.y));
@@ -4902,6 +4911,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("far_red_before", e.far_red_before_s.to_string()),
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
+        ("removed_far", e.removed_far.to_string()),
     ]
 }
 
@@ -4928,6 +4938,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.eases += e.eases;
     t.removed_in_view += e.removed_in_view;
     t.removed_in_view_s += e.removed_in_view_s;
+    t.removed_far += e.removed_far;
     t.pedtouch_severe += e.pedtouch_severe;
     t.end_in_view += e.end_in_view;
     t.end_moving += e.end_moving;

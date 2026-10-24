@@ -289,6 +289,46 @@ fn h8_7_a_car_stops_at_the_loaded_edge_and_drives_off_the_maps_end() {
     }
 }
 
+/// [round 9 A2, fix pass 1 and 2] A queue of three that stopped at the loaded tiles' edge (no trip
+/// end set: it came while lit, or from inside the horizon): the front stands at the end
+/// (`Why::End`) braking, the two behind it queue. A car standing there brakes - its brake lamps
+/// glow - so none goes by `goes_far` (pass 2: lamps dark only); with the brake lamp out (the
+/// renderer's lamp shown dark) the front alone would go, never a follower, never inside the
+/// horizon.
+#[test]
+fn a2_a_car_standing_at_the_edge_stays_while_its_lamps_glow() {
+    use omsi_traffic::removal::goes_far;
+    let mut net = Network::default();
+    net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
+    net.lanes[0].loaded_edge = true;
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 150.0, 8.0), car(2, 0, 135.0, 8.0), car(3, 0, 120.0, 8.0)];
+    sim.update_positions(&net, &mut cars);
+    let going = |cars: &[Vehicle], beyond: bool| -> Vec<u64> {
+        cars.iter().filter(|v| goes_far(v.last.why.name() == "end" && v.state.speed < 0.3, beyond, v)).map(|v| v.id).collect()
+    };
+    let run = |sim: &mut Simulation, cars: &mut Vec<Vehicle>, secs: f32| {
+        let mut t = 0.0;
+        while t < secs {
+            sim.tick(&net, DT, cars);
+            assert!(sim.removed.is_empty(), "driven off the loaded edge");
+            t += DT;
+        }
+    };
+    run(&mut sim, &mut cars, 30.0);
+    assert!(cars[0].state.braking, "standing at the edge it brakes");
+    assert!(going(&cars, true).is_empty(), "a braking car stays");
+    let mut dark = cars.clone();
+    for v in &mut dark {
+        v.state.braking = false;
+    }
+    assert_eq!(going(&dark, true), vec![1], "the front only");
+    assert!(going(&dark, false).is_empty(), "inside the horizon");
+}
+
 /// [H8-8, fix pass 2] A pull-out from 3 m off its lane (steerable move 7.86 m) with people where
 /// the safety review's probes put them: standing on the axis 0.5 m and 1.5 m past the end of its
 /// way out, a walker from the right kerb 9 m ahead as it starts, one from the left kerb 12 m ahead
@@ -353,4 +393,112 @@ fn h8_8_walkers_beside_the_parked_body_off_its_way_out_do_not_hold_it() {
     });
     assert!(moved, "held by walkers beside its parked body");
     assert!(least > 0.0, "touched: {least:.2}");
+}
+
+/// [round 9 A4] A fork: one branch's road (two lanes, no other choice) ends at the loaded tiles'
+/// edge, the other leads on. No random car takes the edge branch while the other is there; once
+/// the tile loads (`loaded_edge` cleared) cars take it again; with the edge branch the only way
+/// on, they drive on into it as before.
+#[test]
+fn a4_random_cars_do_not_turn_towards_the_loaded_edge_when_another_way_leads_on() {
+    let build = |edge: bool, other: bool| {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 100.0), 1, 0)); // 0: approach
+        // 1: the branch to the edge, leaving straight and bending off
+        let mut b = LaneBuilder::polyline(vec![DVec3::new(0.0, 100.0, 0.0), DVec3::new(0.0, 110.0, 0.0), DVec3::new(30.0, 150.0, 0.0)], LaneKind::Street, 3.5);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 2, path: 0 });
+        net.lanes.push(b);
+        net.lanes.push(road((30.0, 150.0), (60.0, 190.0), 3, 0)); // 2: ends at the edge
+        if other {
+            net.lanes.push(road((0.0, 100.0), (0.0, 200.0), 4, 0)); // 3: straight on
+            net.lanes.push(road((0.0, 200.0), (0.0, 300.0), 5, 0)); // 4
+        }
+        net.lanes[2].loaded_edge = edge;
+        net.link(1.5);
+        net.compute_conflicts();
+        net.compute_reach();
+        net
+    };
+    let picks = |net: &Network| -> usize {
+        (1..=200u64).filter(|&seed| {
+            let mut st = AiState::new(0, 50.0, seed * 7919);
+            st.plan_next(net);
+            st.planned_next == Some(1)
+        }).count()
+    };
+    let net = build(true, true);
+    assert_eq!(net.lanes[0].next.len(), 2, "a fork");
+    assert!(net.ends_at_loaded_edge(1) && !net.ends_at_loaded_edge(3));
+    assert_eq!(picks(&net), 0, "a car turned towards the loaded edge");
+    let loaded = build(false, true);
+    assert!(!loaded.ends_at_loaded_edge(1));
+    let n = picks(&loaded);
+    assert!(n > 50 && n < 150, "the tile loaded: the branch is a way like any other ({n} of 200)");
+    assert_eq!(picks(&build(true, false)), 200, "the only way on is still taken");
+}
+
+/// [round 9 A2 fix pass 2] With the edge its trip's end (`External::edge_trip_end`, beyond the
+/// horizon, lamps dark), a car does not stop at the loaded tiles' edge: it drives off the lane's
+/// end still moving and never brakes (no brake lamp lights); without it, it stops as before.
+#[test]
+fn a2_pass2_beyond_the_horizon_a_car_drives_off_the_loaded_edge_without_braking() {
+    for trip_end in [true, false] {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
+        net.lanes[0].loaded_edge = true;
+        net.link(1.5);
+        net.compute_conflicts();
+        net.compute_reach();
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(1, 0, 60.0, 12.0)];
+        cars[0].external.edge_trip_end = trip_end;
+        sim.update_positions(&net, &mut cars);
+        let (mut gone_at, mut braked, mut t) = (None, false, 0.0);
+        while t < 40.0 && gone_at.is_none() {
+            let v = cars[0].state.speed;
+            sim.tick(&net, DT, &mut cars);
+            if !sim.removed.is_empty() {
+                gone_at = Some(v);
+                break;
+            }
+            braked |= cars[0].state.braking;
+            t += DT;
+        }
+        if trip_end {
+            let v = gone_at.expect("it drove off the edge");
+            assert!(v > 5.0 && !braked, "left at {v:.1} m/s, braked {braked}");
+        } else {
+            assert!(gone_at.is_none() && cars[0].state.speed < 0.3, "stops at the edge as before");
+        }
+    }
+}
+
+/// [round 9 A4 fix pass 2] A road splitting into two parallel lanes that both end at the loaded
+/// edge is the edge too; one whose other branch leads on is not.
+#[test]
+fn a4_pass2_a_fork_whose_every_branch_ends_at_the_edge_is_the_edge() {
+    let build = |both: bool| {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 100.0), 1, 0)); // 0
+        net.lanes.push(road((0.0, 100.0), (0.0, 200.0), 2, 0)); // 1: on, ends at the edge
+        let mut b = LaneBuilder::polyline(vec![DVec3::new(0.0, 100.0, 0.0), DVec3::new(0.0, 110.0, 0.0), DVec3::new(3.5, 200.0, 0.0)], LaneKind::Street, 3.5);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 3, path: 0 });
+        net.lanes.push(b); // 2: the parallel lane
+        net.lanes.push(road((3.5, 200.0), (3.5, 300.0), 4, 0)); // 3: leads on
+        net.lanes[1].loaded_edge = true;
+        if both {
+            net.lanes[3].loaded_edge = true;
+        } else {
+            net.lanes.push(road((3.5, 300.0), (3.5, 400.0), 5, 0));
+        }
+        net.link(1.5);
+        net
+    };
+    let both = build(true);
+    assert_eq!(both.lanes[0].next.len(), 2, "a fork");
+    assert!(both.ends_at_loaded_edge(0) && both.ends_at_loaded_edge(2));
+    let one = build(false);
+    assert!(!one.ends_at_loaded_edge(0) && one.ends_at_loaded_edge(1) && !one.ends_at_loaded_edge(2));
 }

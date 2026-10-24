@@ -295,7 +295,7 @@ pub(crate) fn run_offscreen(
                 .ok()
                 .as_ref(),
         );
-        t.night = daylight.brightness < 0.75;
+        t.night = crate::traffic_link::ai_lights_on(&daylight, Some(&weather));
         t.daylight = Some(daylight);
         t.populate(&world, &renderer, &mut scene, center);
     }
@@ -546,6 +546,7 @@ pub(crate) fn run_offscreen(
                 t,
                 Some(&view_cam),
                 w as f64 / h.max(1) as f64,
+                (h, (settings.triple.enabled && !settings.vr_requested()).then(|| settings.triple.views(&view_cam, w, h)[1].camera.fov_deg)),
                 triple_extent(&settings, &view_cam, w, h),
                 weather.fog.0 as f64,
                 &run_clock,

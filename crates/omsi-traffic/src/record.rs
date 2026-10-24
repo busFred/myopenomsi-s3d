@@ -294,6 +294,10 @@ pub enum Record {
         seen: bool,
         #[serde(default)]
         waiting: f32,
+        /// [round 9 A2] Its distance from the eye (m) when the population took it off (`None`:
+        /// an older recording, or not a population removal).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_eye: Option<f32>,
     },
     /// The game changed a vehicle's way outside the frame (a timetable bus given its next
     /// trip or let go, its route extended).
@@ -334,7 +338,15 @@ enum RecordRef<'a> {
     Frame(FrameRef<'a>),
     Keyframe { time: f64, vehicles: &'a [Vehicle] },
     Spawn { time: f64, vehicle: &'a Vehicle, type_name: &'a str },
-    Remove { time: f64, id: u64, rule: Option<RemoveRule>, seen: bool, waiting: f32 },
+    Remove {
+        time: f64,
+        id: u64,
+        rule: Option<RemoveRule>,
+        seen: bool,
+        waiting: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from_eye: Option<f32>,
+    },
     VehicleChanged { time: f64, vehicle: &'a Vehicle },
     LanesAdded { time: f64, first: usize, lanes: &'a [Lane] },
     LightsAdded { time: f64, first: usize, lights: &'a [TrafficLightController] },
@@ -419,7 +431,7 @@ pub struct Recorder {
     known: HashSet<u64>,
     /// [round 7 R7-1 fix 1] The rule (and seen, waiting) of each vehicle the game is taking
     /// off, named by `note_remove` before the frame that finds it gone.
-    remove_rules: HashMap<u64, (RemoveRule, bool, f32)>,
+    remove_rules: HashMap<u64, (RemoveRule, bool, f32, Option<f32>)>,
     ids: Vec<u64>,
     /// A fingerprint of the parked cars last written.
     parked_print: Option<u64>,
@@ -492,13 +504,19 @@ impl Recorder {
     /// [round 7 R7-1 fix 1] The game is taking vehicle `id` off by `rule` (`seen`: the eye
     /// saw it; `waiting`: its waiting time): written with its `Record::Remove`.
     pub fn note_remove(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
+        self.note_remove_from(id, rule, seen, waiting, None);
+    }
+
+    /// [round 9 A2] `note_remove` with its distance from the eye (m), for the population's
+    /// removals (the rule and the distance band of each, `Record::Remove::from_eye`).
+    pub fn note_remove_from(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32, from_eye: Option<f32>) {
         // (the ring of the last minute records too: every removal is named)
-        self.remove_rules.insert(id, (rule, seen, waiting));
+        self.remove_rules.insert(id, (rule, seen, waiting, from_eye));
     }
 
     /// `note_remove` unless a rule was named already (the general ways off the road).
-    pub fn note_remove_unnamed(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
-        self.remove_rules.entry(id).or_insert((rule, seen, waiting));
+    pub fn note_remove_unnamed(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32, from_eye: Option<f32>) {
+        self.remove_rules.entry(id).or_insert((rule, seen, waiting, from_eye));
     }
 
     pub fn is_recording(&self) -> bool {
@@ -535,11 +553,11 @@ impl Recorder {
                 let mut gone: Vec<u64> = self.known.difference(&now).copied().collect();
                 gone.sort_unstable();
                 for id in gone {
-                    let (rule, seen, waiting) = match self.remove_rules.remove(&id) {
-                        Some((r, s, w)) => (Some(r), s, w),
-                        None => (None, false, 0.0),
+                    let (rule, seen, waiting, from_eye) = match self.remove_rules.remove(&id) {
+                        Some((r, s, w, d)) => (Some(r), s, w, d),
+                        None => (None, false, 0.0, None),
                     };
-                    self.line(time, Kind::Other, &RecordRef::Remove { time, id, rule, seen, waiting });
+                    self.line(time, Kind::Other, &RecordRef::Remove { time, id, rule, seen, waiting, from_eye });
                 }
             }
             self.known = now;
@@ -914,5 +932,28 @@ mod tests {
             };
             assert_eq!(finite::to_string(&Record::Frame(owned)).unwrap(), before);
         }
+    }
+}
+
+#[cfg(test)]
+mod remove_line_tests {
+    use super::{Record, RecordRef};
+    use crate::removal::RemoveRule;
+
+    /// [round 9 A2 fix pass 3] A removal's line carries its rule, whether the eye saw it and its
+    /// distance from the eye; one with no distance is written as before, and an older line (no
+    /// `from_eye`) reads as None.
+    #[test]
+    fn a2_the_remove_line_carries_its_distance() {
+        let line = |from_eye| serde_json::to_string(&RecordRef::Remove { time: 56.0, id: 85, rule: Some(RemoveRule::FarDeadEnd), seen: true, waiting: 0.0, from_eye }).unwrap();
+        let far = line(Some(869.0));
+        assert!(far.contains("\"rule\":\"FarDeadEnd\"") && far.contains("\"from_eye\":869.0"), "{far}");
+        assert!(!line(None).contains("from_eye"));
+        match serde_json::from_str::<Record>(&far).unwrap() {
+            Record::Remove { rule, seen, from_eye, .. } => assert!(rule == Some(RemoveRule::FarDeadEnd) && seen && from_eye == Some(869.0)),
+            _ => panic!("not a removal"),
+        }
+        let old = r#"{"Remove":{"time":1.7,"id":111,"rule":"NetworkEnd","seen":false,"waiting":0.0}}"#;
+        assert!(matches!(serde_json::from_str::<Record>(old).unwrap(), Record::Remove { from_eye: None, .. }));
     }
 }

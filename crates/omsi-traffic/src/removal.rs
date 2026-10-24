@@ -39,6 +39,10 @@ pub enum RemoveRule {
     InViewAfterGrace,
     /// At a dead end or the loaded route's end, far off, long, or with a queue behind it.
     DeadEnd,
+    /// [round 9 A2, fix pass 1] At the loaded tiles' edge beyond the perceptual horizon, the
+    /// first in line: its trip ends there ([`goes_far`]), in frame, a dot nobody can tell from
+    /// nothing. Not counted as removed in view (`ab`'s `removed_far`).
+    FarDeadEnd,
     /// A timetable bus taken off as the last resort (no loop or room), or its last trip over.
     BusLastResort,
     /// It parked: the parked object stands in its place.
@@ -54,6 +58,12 @@ impl RemoveRule {
     /// like every other population rule.)
     pub fn gated(self) -> bool {
         !matches!(self, RemoveRule::NetworkEnd | RemoveRule::Parked)
+    }
+
+    /// [round 9 A2] Whether this removal is made beyond the perceptual horizon by its rule, so
+    /// it is not "removed in view" even in frame (`ab` counts it as `removed_far`).
+    pub fn beyond_horizon(self) -> bool {
+        matches!(self, RemoveRule::FarDeadEnd)
     }
 }
 
@@ -93,6 +103,27 @@ pub fn in_a_queue(d: &Decision) -> bool {
 /// sumo.md 5.3).
 pub fn goes_in_view(finished: bool, v: &Vehicle, from_eye: f64) -> bool {
     finished && v.waiting > GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(&v.last)
+}
+
+/// [round 9 A2, fix pass 1] Beyond the perceptual horizon (the app's `Viewer::horizon`) the
+/// edge of the loaded tiles is the trip's end, as the edge of a SUMO network is (a vehicle
+/// leaves the simulation where its route ends): a random car that stands there (`at_dead_end`,
+/// the crate stops it before the edge) as the first in line - no vehicle lead (`in_a_queue`) -
+/// goes at once, in frame too. The queue behind it drives up and each car goes as it arrives, one
+/// per arrival, so no row of cars vanishes at once. Inside the horizon this never fires: there
+/// the edge stays a dead end (round 8 H8-7) and `hidden()` and `goes_in_view` are the ways off.
+/// [fix pass 2] Only with its lamps dark: a car standing at the edge brakes (`AiState::braking`),
+/// and a brake lamp or an indicator glows a few pixels at any distance, so a car that stopped
+/// there stays (the round-8 stop); the trip's end is normally made moving, before any braking
+/// (`External::edge_trip_end`, `plan` rule 10b).
+pub fn goes_far(at_dead_end: bool, beyond_horizon: bool, v: &Vehicle) -> bool {
+    at_dead_end && beyond_horizon && lamps_dark(v) && !in_a_queue(&v.last)
+}
+
+/// [round 9 A2 fix pass 2] No lamp of the vehicle's own glows: not braking, no indicator (the
+/// headlights are the app's, by the light of the day: no horizon at all then).
+pub fn lamps_dark(v: &Vehicle) -> bool {
+    !v.state.braking && v.state.blinker == 0
 }
 
 #[cfg(test)]
@@ -153,5 +184,26 @@ mod tests {
         assert!(goes_in_view(true, &v, 100.0));
         assert!(!goes_in_view(true, &v, GAVE_UP_DIST - 1.0));
         assert!(!goes_in_view(false, &v, 100.0));
+    }
+
+    /// [round 9 A2, fix pass 1] r8-jzk t=520: #147 stood at the loaded tiles' edge 869 m from
+    /// the eye. Beyond the horizon, first in line: its trip ends, whatever its waiting time;
+    /// inside the horizon, behind a lead, or not at the edge it stays.
+    #[test]
+    fn a2_at_the_edge_beyond_the_horizon_the_trip_ends() {
+        let mut v = Vehicle::default();
+        assert!(goes_far(true, true, &v), "at once, no waiting time");
+        v.state.braking = true;
+        assert!(!goes_far(true, true, &v), "a braking car stays: its brake lamps glow");
+        v.state.braking = false;
+        v.state.blinker = 1;
+        assert!(!goes_far(true, true, &v), "an indicator glows");
+        v.state.blinker = 0;
+        assert!(!goes_far(true, false, &v), "inside the horizon");
+        assert!(!goes_far(false, true, &v), "not at the edge");
+        v.last = Decision { lead_id: Some(9), lead: Some(Lead { gap: 3.0, speed: 0.0, acc: 0.0 }), ..Default::default() };
+        assert!(!goes_far(true, true, &v), "behind a lead");
+        assert!(RemoveRule::FarDeadEnd.gated() && RemoveRule::FarDeadEnd.beyond_horizon());
+        assert!(!RemoveRule::InViewAfterGrace.beyond_horizon() && !RemoveRule::DeadEnd.beyond_horizon());
     }
 }

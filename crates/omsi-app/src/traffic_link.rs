@@ -71,6 +71,7 @@ pub(crate) fn traffic_inputs(
     t: &mut traffic::Traffic,
     cam: Option<&Camera>,
     aspect: f64,
+    screen: (u32, Option<f32>),
     extent: Option<(f64, f64)>,
     fog: f64,
     clock: &omsi_sim::SimClock,
@@ -81,6 +82,8 @@ pub(crate) fn traffic_inputs(
     if let Some(c) = cam {
         t.viewer = Some(
             traffic::Viewer::new(c, aspect, fog)
+                .with_screen(screen.0, screen.1)
+                .with_lamps(t.lamps_lit())
                 .with_extent(extent)
                 .with_culling(render.min_obj_size, render.max_obj_dist),
         );
@@ -107,4 +110,16 @@ pub(crate) fn lay_down_poles(
             log::info!("knocked over post {id} at ({:.1}, {:.1})", pos.x, pos.y);
         }
     }
+}
+
+/// Whether the AI vehicles have their lights on (`Traffic::night`): Omsi switches them on below a
+/// light value of 0.75, before the street lamps (0.6), and off after them in the morning; and by
+/// day in fog, rain, snow or under a closed cloud cover, as drivers do. ([round 9 A2 fix pass 2]
+/// one rule for the window and the offscreen harness, which had the light value alone.)
+pub(crate) fn ai_lights_on(daylight: &omsi_sim::Daylight, weather: Option<&omsi_content::weather::Weather>) -> bool {
+    let gloomy = weather.is_some_and(|w| {
+        let (kind, rate) = crate::weather_setup::precip_of(w);
+        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast")
+    });
+    daylight.brightness < 0.75 || gloomy
 }

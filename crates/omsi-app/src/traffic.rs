@@ -117,7 +117,7 @@ const QUEUE_BEHIND_STAND: f32 = 25.0;
 const QUEUE_BEHIND_DIST: f64 = 25.0;
 // ([round 7 R7-1 fix 1] IN_VIEW_GRACE, GAVE_UP_DIST, QUEUE_LEAD, `in_a_queue` and `lead_of`
 // are the crate's, `omsi_traffic::removal`: the free-run replay asks the same rule)
-use omsi_traffic::removal::{goes_in_view, lead_of, in_a_queue, RemoveRule};
+use omsi_traffic::removal::{goes_far, goes_in_view, lead_of, in_a_queue, RemoveRule};
 /// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
 /// eye): a margin over what is drawn.
 const OUT_OF_RANGE: f64 = 1.3;
@@ -178,12 +178,91 @@ mod spawn_queue_tests {
 
 // ([round 7 R7-1 fix 1] the queue tests moved with the rule to omsi_traffic::removal)
 
+/// [round 9 A1] How many of the cars `(position, timetable bus, on a lane of the kind filled)`
+/// count against a target: every random car on the kind's lanes ([round 7 B2] a car that gave
+/// up too: it stands on the road), within `near` (centre, radius) when given - near the centre
+/// it holds the budget, far off it does not.
+fn budget_count(cars: impl Iterator<Item = (DVec3, bool, bool)>, near: Option<(DVec3, f64)>) -> usize {
+    cars.filter(|&(p, scheduled, of_kind)| !scheduled && of_kind && near.is_none_or(|(c, r)| (p - c).length() < r)).count()
+}
+
+/// [round 9 A2 fix pass 1] A vehicle type's body height (m), the size its perceptual horizon
+/// is reckoned for: its `[boundingbox]`'s, else its model's, else `DEFAULT_BOX`'s (bus-sized).
+fn body_height(ty: &VehicleType) -> f64 {
+    match ty.def.bounding_box {
+        Some(bb) if bb[2] > 0.5 => bb[2] as f64,
+        _ => ty.model_box().map(|(lo, hi)| (hi.z - lo.z) as f64).filter(|h| *h > 0.5).unwrap_or(DEFAULT_BOX[2] as f64),
+    }
+}
+
+/// [round 9 A2 fix pass 1] The random cars `(id, standing at the loaded tiles' edge, beyond its
+/// horizon, its state)` whose trip ends at the edge now (`removal::goes_far`): only the one at
+/// the edge, first in line; the queue behind it drives up and each car goes as it arrives.
+fn far_trip_ends<'a>(cars: impl Iterator<Item = (u64, bool, bool, &'a omsi_traffic::Vehicle)>) -> std::collections::HashSet<u64> {
+    cars.filter(|(_, at_edge, beyond, v)| goes_far(*at_edge, *beyond, v)).map(|c| c.0).collect()
+}
+
+/// [round 9 A2 fix pass 3] What `edge_trip_end` decides on, for one random car this frame.
+#[derive(Debug, Clone, Copy)]
+struct EdgeFlag {
+    /// Metres from its front to where `plan` rule 10b would stop it at the loaded tiles' edge,
+    /// if its way ahead ends there (None: not heading for the edge).
+    d_end: Option<f32>,
+    /// Beyond its perceptual horizon (`Viewer::beyond_horizon`; never with the lamps lit).
+    beyond: bool,
+    blinker: i32,
+    braking: bool,
+    /// Its flag of the frame before.
+    prev: bool,
+    speed: f32,
+    /// Its driver's comfortable braking (`DriverParams::comfort_brake`, m/s²).
+    comfort_brake: f32,
+}
+
+/// [round 9 A2 fix pass 2, 3] Whether the loaded tiles' edge is the car's trip's end
+/// (`External::edge_trip_end`: it drives off the lane's end moving instead of stopping, so no
+/// brake lamp lights where a dot goes). Set while it heads for the edge beyond the horizon with
+/// no indicator, not braking - or already set (a brake for a lead or a light on the way lights
+/// its lamps there, not at the edge). [pass 3] Within its comfortable braking distance of the end
+/// it holds only while not braking: braking there it stops at the edge instead (lamps lit, it
+/// stays, round 8). And once set it holds, whatever the horizon (a zoom, a fast approach) or its
+/// lamps, while the car can no longer stop before the end even at `MAX_BRAKE`: cleared there it
+/// would drive off anyway, as an uncounted network end inside the horizon.
+fn edge_trip_end(e: EdgeFlag) -> bool {
+    let Some(d) = e.d_end else { return false };
+    let v2 = e.speed * e.speed;
+    if e.prev && d < v2 / (2.0 * omsi_sim::traffic::MAX_BRAKE) {
+        return true;
+    }
+    if !e.beyond || e.blinker != 0 {
+        return false;
+    }
+    if d < v2 / (2.0 * e.comfort_brake.max(0.1)) {
+        return !e.braking;
+    }
+    e.prev || !e.braking
+}
+
+/// [round 9 A2 fix pass 2] The rule a car the traffic took off at the network's end is recorded
+/// by: a timetable bus's last resort, a trip ended at the loaded tiles' edge (`edge_trip_end`:
+/// the far trip end, counted as `removed_far`), else the network's own end.
+fn network_end_rule(bus_last_resort: bool, on_edge_lane: bool, edge_trip_end: bool) -> RemoveRule {
+    if bus_last_resort {
+        RemoveRule::BusLastResort
+    } else if on_edge_lane && edge_trip_end {
+        RemoveRule::FarDeadEnd
+    } else {
+        RemoveRule::NetworkEnd
+    }
+}
+
 /// [round 7 R7-1 fix 1] The recorded rule of a population removal, by the reason it logs.
 fn removal_rule(why: &str) -> RemoveRule {
     match why {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        "at the loaded tiles' edge, beyond the horizon" => RemoveRule::FarDeadEnd,
         w if w.starts_with("at the loaded tiles' edge, in view") => RemoveRule::InViewAfterGrace,
         w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
@@ -392,10 +471,29 @@ pub struct Viewer {
     pub min_size: f64,
     pub max_dist: f64,
     pub fov: f64,
+    /// [round 9 A2] The picture's height in pixels (0: not known, see `Viewer::horizon`).
+    pub px_height: f64,
+    /// [round 9 A2 fix pass 1] The vertical field of view the horizon is reckoned with
+    /// (radians): the camera's, or a triple screen's centre panel's when narrower (0: `fov`).
+    pub horizon_fov: f64,
+    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (`Viewer::with_lamps`): no horizon.
+    pub lamps_lit: bool,
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
 const VISIBLE_RANGE: f64 = 900.0;
+
+/// [round 9 A2] Fewer pixel rows than this and a car is a dot the eye cannot tell from nothing
+/// (VISIBLE_RANGE's "two pixels").
+const DOT_PIXELS: f64 = 2.0;
+/// [round 9 A2] The height of a passenger car (m), the body VISIBLE_RANGE is documented for
+/// (a saloon's 1.4-1.5 m; VISIBLE_RANGE's two pixels at 900 m on 900 lines is a 1.5 m body at
+/// a 41 degree field of view): the horizon with the picture unknown scales from it.
+const CAR_HEIGHT: f64 = 1.5;
+/// [round 9 A2 fix pass 1] `Lighting::night` (0 day .. 1 night, the strength the coronas are
+/// drawn with) above which the vehicles' lamps count as lit (safety review r9-a: coronas keep a
+/// minimum of about three pixels at any distance, omsi-render corona.wgsl).
+const LAMPS_LIT_NIGHT: f32 = 0.05;
 
 /// Within this distance (m) of the camera a timetable bus has its driver at the wheel.
 const DRIVER_NEAR: f64 = 70.0;
@@ -439,7 +537,53 @@ impl Viewer {
             min_size: 0.0,
             max_dist: 0.0,
             fov: (cam.fov_deg as f64).to_radians(),
+            px_height: 0.0,
+            horizon_fov: 0.0,
+            lamps_lit: false,
         }
+    }
+
+    /// [round 9 A2] The picture's height in pixels (the window's, or the offscreen image's),
+    /// and [fix pass 1] a triple screen's centre panel's vertical field of view (degrees): the
+    /// horizon is reckoned with the narrower of it and the camera's (the panels show the rig's
+    /// field of view, not the camera's).
+    pub fn with_screen(mut self, px_height: u32, panel_fov_deg: Option<f32>) -> Viewer {
+        self.px_height = px_height as f64;
+        self.horizon_fov = panel_fov_deg.map_or(self.fov, |f| (f as f64).to_radians().min(self.fov));
+        self
+    }
+
+    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (dusk, night, gloom): a lamp is drawn
+    /// at a few pixels at any distance, so nothing is beyond the horizon.
+    pub fn with_lamps(mut self, lit: bool) -> Viewer {
+        self.lamps_lit = lit;
+        self
+    }
+
+    /// [round 9 A2] The perceptual horizon (m) of a body `height` (m) high: farther off it covers
+    /// fewer than `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit
+    /// of the image plane, the vertical field of view `horizon_fov`) and is a dot the player
+    /// cannot tell from nothing. One measure for both ways: beyond it a random car may be woken
+    /// in frame (`Traffic::may_appear_car`) and a car reaching the loaded tiles' edge ends its
+    /// trip there in frame (`omsi_traffic::removal::goes_far`). With the picture's height
+    /// unknown, the documented `VISIBLE_RANGE` scaled from a car's height. [fix pass 1] With the
+    /// lamps lit, none (infinite): a lamp keeps a few pixels at any distance.
+    pub fn horizon(&self, height: f64) -> f64 {
+        if self.lamps_lit {
+            return f64::INFINITY;
+        }
+        if self.px_height <= 0.0 {
+            return VISIBLE_RANGE * height / CAR_HEIGHT;
+        }
+        let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
+        height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
+    }
+
+    /// [round 9 A2] Is a body `height` (m) high, `dist` (m) from the eye, beyond its horizon -
+    /// and ([fix pass 1]) never within `NEAR_HIDE`, where only cover hides a car whatever the
+    /// picture (the mirrors, a turn of the head)?
+    pub fn beyond_horizon(&self, dist: f64, height: f64) -> bool {
+        dist >= NEAR_HIDE && dist > self.horizon(height)
     }
 
     /// A wider picture than the camera's own (a triple screen's side panels): the tangents
@@ -668,6 +812,13 @@ pub struct Traffic {
     light_prev: Vec<Vec<i32>>,
     /// `OMSI_DEBUG_POPULATION`: log where cars appear and vanish relative to the view.
     debug_population: bool,
+    /// [round 9 A2] Since the start: cars that appeared in frame beyond the perceptual
+    /// horizon, and cars taken off in frame there (`RemoveRule::FarDeadEnd`) (the population
+    /// log line).
+    appeared_far: usize,
+    removed_far: usize,
+    /// [round 9 A4] The lanes whose road ends at the loaded tiles' edge (`mark_loaded_edges`).
+    edge_bound: hashbrown::HashSet<usize>,
     /// Cars placed since the last look inside the view frustum (hidden behind something):
     /// (id, position). `OMSI_POPULATION_SHOTS` photographs them to check.
     pub framed_spawns: Vec<(u64, DVec3)>,
@@ -733,9 +884,6 @@ pub struct Traffic {
     pub keep_clear: Vec<omsi_sim::collision::Obb>,
     /// LAN play: this game draws the host's traffic instead of its own (`lan_world`).
     mirror: bool,
-    /// Count only the cars within this distance of this point when filling up (the
-    /// population around a LAN player, `populate_lan_centers`).
-    count_near: Option<(DVec3, f64)>,
     /// LAN play: where the other players are (host): the traffic is kept around them too.
     pub lan_centers: Vec<DVec3>,
     /// [ROLLBACK clockjump-traffic-1] The clock as of the last `note_clock` (NaN before the
@@ -1370,6 +1518,9 @@ impl Traffic {
             light_log,
             light_prev,
             debug_population: omsi_cfg::env::var_os("OMSI_DEBUG_POPULATION").is_some(),
+            appeared_far: 0,
+            removed_far: 0,
+            edge_bound: Default::default(),
             framed_spawns: Vec::new(),
             player: None,
             player_priority: false,
@@ -1393,7 +1544,6 @@ impl Traffic {
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
-            count_near: None,
             lan_centers: Vec::new(),
             clock_seen: f64::NAN,
             recorder: omsi_traffic::record::Recorder::new(),
@@ -1867,6 +2017,29 @@ impl Traffic {
         self.initial || self.hidden(world, p, 8.0)
     }
 
+    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit: the AI's lights are on (`night`) or
+    /// the coronas glow (`Daylight::night` over `LAMPS_LIT_NIGHT`).
+    pub fn lamps_lit(&self) -> bool {
+        self.night || self.daylight.as_ref().is_some_and(|d| d.night > LAMPS_LIT_NIGHT)
+    }
+
+    /// [round 9 A2] May a random car of body `height` (m) be woken at `p` unseen: as
+    /// `may_appear`, or beyond its perceptual horizon (`Viewer::horizon`), where it is a dot
+    /// nobody can tell from nothing - the line a car reaching the loaded tiles' edge ends its
+    /// trip beyond, too. (A timetable bus keeps `may_appear`; a new car keeps the round-6 rule,
+    /// `APPEAR_IN_VIEW_BEYOND`, which already lets it appear in plain view beyond 300 m.)
+    pub fn may_appear_car(&self, world: &World, p: DVec3, height: f64) -> bool {
+        self.may_appear(world, p) || self.viewer.is_some_and(|v| v.beyond_horizon((p - v.pos).length(), height))
+    }
+
+    /// [round 8 H8-7, fix pass 1] Car `c` stopped at the edge of the loaded tiles (`Lane::
+    /// loaded_edge`: the crate stops it there, `Why::End`).
+    fn at_loaded_edge(&self, c: &AiCar) -> bool {
+        c.ai.last.why == Why::End
+            && c.ai.stopped > AT_END_STAND
+            && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty())
+    }
+
     /// The world is still being built (the first populate, the first seconds): vehicles
     /// may be put anywhere.
     pub fn loading_phase(&self) -> bool {
@@ -1924,6 +2097,9 @@ impl Traffic {
                     min_size: 0.0,
                     max_dist: 0.0,
                     fov: 1.0,
+                    px_height: 0.0,
+                    horizon_fov: 0.0,
+                    lamps_lit: false,
                 });
             }
         }
@@ -1931,6 +2107,16 @@ impl Traffic {
         self.advance_dormant();
         // the cars somebody stands behind
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.last.lead_id).collect();
+        // [round 9 A2, fix pass 1] beyond the perceptual horizon the loaded tiles' edge is the
+        // trip's end: a random car that reaches it there, the first in line, goes at once
+        // (`removal::goes_far`); the queue behind it drains one car per arrival
+        let far_trip_end: std::collections::HashSet<u64> = match self.viewer {
+            Some(v) if !self.initial => far_trip_ends(self.cars.iter().filter(|c| !c.serves_stops()).map(|c| {
+                let beyond = v.beyond_horizon((c.vehicle.position - v.pos).length(), body_height(&c.vehicle.ty));
+                (c.id, self.at_loaded_edge(c), beyond, &c.ai)
+            })),
+            _ => Default::default(),
+        };
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1975,9 +2161,7 @@ impl Traffic {
                 && c.ai.state.route.last() == Some(&c.ai.state.lane)
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
             // [round 8 H8-7, fix pass 1] stopped at the edge of the loaded tiles
-            let at_loaded_edge = c.ai.last.why == Why::End
-                && c.ai.stopped > AT_END_STAND
-                && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
+            let at_loaded_edge = self.at_loaded_edge(c);
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
             let sleeps_instead = !c.serves_stops() && !c.ai.gone && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
@@ -1997,6 +2181,10 @@ impl Traffic {
                 first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
             } else if !random {
                 None
+            } else if far_trip_end.contains(&c.id) {
+                // [round 9 A2, fix pass 1] its trip ends at the edge beyond the horizon: once
+                // nobody sees it (as before) or now, in frame, a dot
+                first(&[(&|| hidden(), "at the loaded tiles' edge, out of sight"), (&|| true, "at the loaded tiles' edge, beyond the horizon")])
             } else if at_loaded_edge {
                 // [round 8 H8-7, fix pass 2] standing at the edge of the loaded tiles (`Lane::
                 // loaded_edge`, the crate stops it there): it goes once nobody sees it, or in view
@@ -2044,12 +2232,15 @@ impl Traffic {
                 let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
                 let seen = match rule {
                     RemoveRule::OutOfSight => false,
-                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded | RemoveRule::FarDeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
                     _ => frames(),
                 };
-                self.recorder.note_remove(c.id, rule, seen, c.ai.waiting);
+                self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
+                // ([round 9 A2] with its distance from the eye: the removals by distance band)
+                self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, Some(from_eye as f32));
             }
-            if remove && sleeps_instead {
+            // ([round 9 A2 fix pass 1] a trip ended at the edge does not drive on asleep)
+            if remove && sleeps_instead && reason != Some("at the loaded tiles' edge, beyond the horizon") {
                 let c = self.cars.swap_remove(i);
                 asleep += 1;
                 self.dormant.push(DormantCar {
@@ -2097,7 +2288,8 @@ impl Traffic {
             log::info!("traffic: {off_ground} vehicles taken away with the tiles under them");
         }
         if (asleep > 0 || !self.dormant.is_empty()) && self.debug_population {
-            log::info!("population t={:.1}: {asleep} cars went out of range and drive on unseen; {} on the map out of range, {} in range", self.time, self.dormant.len(), self.cars.len());
+            // ([round 9 A2] with the appearances and removals in frame beyond the horizon)
+            log::info!("population t={:.1}: {asleep} cars went out of range and drive on unseen; {} on the map out of range, {} in range; beyond the horizon ({:.0} m for a car) in frame since the start: {} appeared, {} removed", self.time, self.dormant.len(), self.cars.len(), self.viewer.map(|v| v.horizon(CAR_HEIGHT)).unwrap_or(VISIBLE_RANGE), self.appeared_far, self.removed_far);
         }
         if self.types.is_empty() || self.net.lanes.is_empty() {
             self.initial = false;
@@ -2140,12 +2332,6 @@ impl Traffic {
             (LaneKind::Street, street_target),
             (LaneKind::Air, if has_air { 3 } else { 0 }),
         ] {
-            // (a LAN host counts the cars round itself only: counted over the whole map,
-            // the traffic it keeps round the other players met its own target and the
-            // host drove through empty streets, #342)
-            if kind == LaneKind::Street && !self.lan_centers.is_empty() {
-                self.count_near = Some((center, self.spawn_radius));
-            }
             self.populate_kind(world, renderer, scene, center, kind, target);
         }
         self.populate_lan_centers(world, renderer, scene, center, street_target);
@@ -2407,6 +2593,10 @@ impl Traffic {
             // nor on a lane with a stop line (a car put down past the line went through
             // the junction on red), nor on a piece of a junction that meets other ways
             .filter(|(i, _)| self.may_put_on(*i))
+            // [round 9 A4] nor on a road that ends at the loaded tiles' edge before any choice of
+            // way (`Network::ends_at_loaded_edge`): a car put there has nowhere to go but the
+            // edge's queue (the flag follows the tiles, so the road opens again as they load)
+            .filter(|(i, _)| kind != LaneKind::Street || !self.edge_bound.contains(i))
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
@@ -2430,24 +2620,18 @@ impl Traffic {
         let cumulative: Vec<f32> = candidates.iter().map(|c| { acc += c.1; acc }).collect();
         let total_w = acc.max(1e-3);
         let mut attempts = 0;
-        let counted_near = self.count_near.take();
-        let unscheduled = self
-            .cars
-            .iter()
-            .filter(|c| {
-                // ([round 7 B2] a car that gave up counts too: it stands on the road)
-                !c.serves_stops()
-                    && counted_near
-                        .map(|(p, r)| (c.vehicle.position - p).length() < r)
-                        .unwrap_or(true)
-                    && self
-                        .net
-                        .lanes
-                        .get(c.ai.state.lane)
-                        .map(|l| l.kind == kind)
-                        .unwrap_or(false)
-            })
-            .count();
+        // [round 9 A1] the street target counts the cars within `spawn_radius` of the centre
+        // only, for every host: counted over the whole map, queues standing at far tile edges
+        // held the budget and nothing new appeared round the player (r8-jzk: the target met at
+        // ~440 with 91 cars 700-900 m off). A LAN host's other players are counted the same
+        // way round each of them (`populate_lan_centers`: counted over the whole map, the
+        // traffic round the others met the host's target and the host drove through empty
+        // streets, #342). Aircraft are few and far: counted over the whole map.
+        let counted_near = (kind == LaneKind::Street).then_some((center, self.spawn_radius));
+        let unscheduled = budget_count(
+            self.cars.iter().map(|c| (c.vehicle.position, c.serves_stops(), self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.kind == kind))),
+            counted_near,
+        );
         let mut count = unscheduled;
         // ([round 7 B2] no global jam guard: SUMO has none, a car is put in only where its
         // lane has room - the per-spot tests below, `behind_a_queue` above all; the guard
@@ -2631,10 +2815,12 @@ impl Traffic {
         if self.dormant.is_empty() {
             return;
         }
-        let active = self.cars.iter().filter(|c| !c.serves_stops()).count();
+        let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
+        // [round 9 A1] the cars round the players count, as for new cars (`populate_kind`):
+        // counted over the whole map, far queues held this budget too
+        let active = self.cars.iter().filter(|c| !c.serves_stops() && centers.iter().any(|o| (c.vehicle.position - *o).length() < self.spawn_radius)).count();
         let mut budget = (target as f32 * 1.25).ceil() as usize;
         budget = budget.saturating_sub(active);
-        let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
         let mut i = 0;
         while i < self.dormant.len() && budget > 0 {
             let (p, h, ty, lane, s, speed) = {
@@ -2653,8 +2839,10 @@ impl Traffic {
             // dormant car drives everywhere, and one woken there appeared inside a junction)
             let ok = near
                 && world.has_ground(p.x, p.y)
-                && self.may_appear(world, p)
+                && self.may_appear_car(world, p, body_height(&ty))
                 && self.may_put_on(lane)
+                // ([round 9 A4] nor where its road ends at the loaded tiles' edge: it sleeps on)
+                && !self.edge_bound.contains(&lane)
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)
@@ -2911,6 +3099,12 @@ impl Traffic {
         });
         if let Some(v) = speed {
             state.speed = v.min(state.speed.max(v * 0.5));
+        }
+        // [round 9 A2] counted: a car put down in frame beyond the perceptual horizon
+        if kind == LaneKind::Street && !self.initial {
+            let pos = vehicle.position;
+            let height = body_height(&vehicle.ty);
+            self.appeared_far += self.viewer.is_some_and(|v| v.frames(pos, 2.5) && v.beyond_horizon((pos - v.pos).length(), height)) as usize;
         }
         if self.debug_population && kind == LaneKind::Street {
             let v = self.viewer;
@@ -3616,8 +3810,27 @@ impl Traffic {
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
             let net = &self.net;
+            let viewer = self.viewer;
             let car = &mut self.cars[i];
             let mut ext = External { at_stop: car.at_stop(), standing_for: car.standing_for(day_time), priority: car.vehicle.var("TrafficPriority").unwrap_or(0.0) > 0.5, ..Default::default() };
+            // [round 9 A2 fix pass 2, 3] beyond the horizon with its lamps dark, a random car
+            // heading for the loaded tiles' edge ends its trip there moving
+            // (`External::edge_trip_end`, the rule `edge_trip_end`)
+            if !car.serves_stops() {
+                let st = &car.ai.state;
+                // (where its front meets the edge, as `plan` rule 10b stops it: the lane's end
+                // less half a metre)
+                let d_end = way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())).map(|&(l, d0)| d0 + net.lanes[l].length() - 0.5 - st.front);
+                ext.edge_trip_end = edge_trip_end(EdgeFlag {
+                    d_end,
+                    beyond: viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty))),
+                    blinker: st.blinker,
+                    braking: st.braking,
+                    prev: car.ai.external.edge_trip_end,
+                    speed: st.speed,
+                    comfort_brake: car.ai.params.comfort_brake,
+                });
+            }
             if let Some(service) = car.bus.as_mut() {
                 let wanted = stop_wishes.as_ref().map(|(alighting, waiting)| alighting.contains(&car.id) || service.stops.front().is_some_and(|s| waiting.contains(&s.id)));
                 // a stop on a through lane (random traffic runs there) with no bay: the bus
@@ -3892,8 +4105,18 @@ impl Traffic {
             {
                 let p = c.vehicle.position;
                 let r = (c.ai.state.length as f64 * 0.5).max(2.0);
-                let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else { RemoveRule::NetworkEnd };
-                self.recorder.note_remove(c.id, rule, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+                // ([round 9 A2 fix pass 2] driven off the loaded tiles' edge as its trip's end:
+                // the far trip end, not the network's)
+                let edge = self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
+                let rule = network_end_rule(respawn.contains(&i), edge, c.ai.external.edge_trip_end);
+                let seen = self.viewer.is_some_and(|v| v.frames(p, r));
+                self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
+                if rule == RemoveRule::FarDeadEnd && self.debug_population {
+                    // ([round 9 A2 fix pass 2] its lamps as it goes: none may glow)
+                    log::info!("population t={:.1}: car {} trip end at the loaded tiles' edge, {:.0} m from the eye, in frame {}, speed {:.1}, braking {}, blinker {}, lamps lit {}", self.time, c.id, self.viewer.map(|v| (p - v.pos).length()).unwrap_or(0.0), seen, c.ai.state.speed, c.ai.state.braking, c.ai.state.blinker, self.lamps_lit());
+                }
+                // ([round 9 A2 fix pass 1] with its distance from the eye, as every removal)
+                self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
             }
             if self.debug_population {
                 // [round 7 R7-1] every removal is logged with its rule: the traffic's own
@@ -4530,7 +4753,7 @@ impl Traffic {
         {
             let p = c.vehicle.position;
             let r = (c.ai.state.length as f64 * 0.5).max(2.0);
-            self.recorder.note_remove_unnamed(c.id, RemoveRule::Other, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+            self.recorder.note_remove_unnamed(c.id, RemoveRule::Other, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
         }
         if c.serves_stops() {
             self.riders_out.push(c.id);
@@ -4700,7 +4923,8 @@ impl Traffic {
             match self.cars[i].park {
                 Some(p) if p.done => {
                     let c = self.cars.swap_remove(i);
-                    self.recorder.note_remove(c.id, RemoveRule::Parked, false, c.ai.waiting);
+                    let from_eye = self.viewer.map(|v| (c.vehicle.position - v.pos).length() as f32);
+                    self.recorder.note_remove_from(c.id, RemoveRule::Parked, false, c.ai.waiting, from_eye);
                     if world.return_parked(renderer, scene, p.key) {
                         let st = &c.ai.state;
                         let spot = Parked { s: p.s, lateral: p.lat, half_width: c.ai.half_width, half_len: (st.front + st.rear) * 0.5 };
@@ -5028,6 +5252,26 @@ impl Traffic {
                 loaded_edge_at(probe, ts, &|k| world.has_tile(k), &self.lane_tiles)
             };
         }
+        // [round 9 A4 fix pass 2] the lanes whose every way on ends at an edge within
+        // EDGE_LOOKAHEAD (`Network::ends_at_loaded_edge`, gathered back from the edges once here
+        // rather than walked forward for every spawn place): no car is put down or woken there
+        let net = &self.net;
+        let mut bound: hashbrown::HashMap<usize, f64> = net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge && l.next.is_empty()).map(|(i, _)| (i, 0.0)).collect();
+        let mut work: Vec<usize> = bound.keys().copied().collect();
+        while let Some(m) = work.pop() {
+            for &p in net.prev.get(m).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if bound.contains_key(&p) {
+                    continue;
+                }
+                let lp = &net.lanes[p];
+                let far = lp.next.iter().map(|n| bound.get(n).map(|d| d + net.lanes[*n].length() as f64)).collect::<Option<Vec<f64>>>();
+                if let Some(d) = far.and_then(|v| v.into_iter().reduce(f64::max)).filter(|d| *d <= omsi_sim::traffic::EDGE_LOOKAHEAD) {
+                    bound.insert(p, d);
+                    work.push(p);
+                }
+            }
+        }
+        self.edge_bound = bound.into_keys().collect();
     }
 
     /// Take in what the tiles loaded since the last call brought: their lanes (linked into
@@ -5141,9 +5385,7 @@ impl Traffic {
             {
                 continue;
             }
-            self.count_near = Some((c, self.spawn_radius));
             self.populate_kind(world, renderer, scene, c, LaneKind::Street, target);
-            self.count_near = None;
             done.push(c);
         }
     }
@@ -5490,6 +5732,77 @@ fn road_scale(near_density: &[f32]) -> f32 {
 /// either side, `ahead` in front and `behind` behind it) - on the same level only: a bus
 /// under a bridge held up the traffic on the bridge above it (#753). 4 m, as for the other
 #[cfg(test)]
+mod budget_count_tests {
+    use super::budget_count;
+    use glam::DVec3;
+
+    /// [round 9 A1] r8-jzk: a queue at the loaded tiles' edge 870 m off held the street
+    /// target. Counted near the centre, the far cars do not count, a standing car near does
+    /// (round 7 B2), a timetable bus and a car on another kind of lane never do; with no
+    /// centre (the aircraft) every car of the kind counts.
+    #[test]
+    fn a1_far_cars_do_not_hold_the_budget() {
+        let c = DVec3::new(464.6, -1578.8, 0.0);
+        let cars = [
+            (c + DVec3::new(0.0, 120.0, 0.0), false, true),  // near, counts
+            (c + DVec3::new(0.0, -399.0, 0.0), false, true), // near, counts
+            (c + DVec3::new(10.0, -870.0, 0.0), false, true), // the far queue
+            (c + DVec3::new(0.0, 50.0, 0.0), true, true),    // a timetable bus
+            (c + DVec3::new(0.0, 60.0, 0.0), false, false),  // another kind
+        ];
+        assert_eq!(budget_count(cars.iter().copied(), Some((c, 400.0))), 2);
+        assert_eq!(budget_count(cars.iter().copied(), None), 3);
+    }
+}
+
+#[cfg(test)]
+mod edge_flag_tests {
+    use super::{edge_trip_end, network_end_rule, EdgeFlag, RemoveRule};
+
+    fn flag() -> EdgeFlag {
+        EdgeFlag { d_end: Some(300.0), beyond: true, blinker: 0, braking: false, prev: false, speed: 12.0, comfort_brake: 3.0 }
+    }
+
+    /// [round 9 A2 fix pass 3] The flag: set heading for the edge beyond the horizon, lamps dark;
+    /// not without the edge ahead (a tile loaded: the lane has a way on), inside the horizon, with
+    /// an indicator, or braking when not yet set; held through a brake on the way once set.
+    #[test]
+    fn a2_the_edge_flag_is_set_and_held() {
+        assert!(edge_trip_end(flag()));
+        assert!(!edge_trip_end(EdgeFlag { d_end: None, ..flag() }), "not heading for the edge (or its tile loaded)");
+        assert!(!edge_trip_end(EdgeFlag { beyond: false, ..flag() }), "inside the horizon");
+        assert!(!edge_trip_end(EdgeFlag { blinker: 1, ..flag() }), "an indicator");
+        assert!(!edge_trip_end(EdgeFlag { braking: true, ..flag() }), "braking, not yet set");
+        assert!(edge_trip_end(EdgeFlag { braking: true, prev: true, ..flag() }), "held through a brake on the way");
+        assert!(!edge_trip_end(EdgeFlag { d_end: None, prev: true, ..flag() }), "the tile loaded: cleared");
+    }
+
+    /// [pass 3, 1] Within its comfortable braking distance of the end (12 m/s at 3 m/s²: 24 m) a
+    /// braking car loses the flag and stops at the edge; [pass 3, 2] closer than it can stop at
+    /// MAX_BRAKE (9 m) a set flag holds whatever the horizon, the indicator or the brake.
+    #[test]
+    fn a2_the_flag_by_braking_distance() {
+        let near = EdgeFlag { d_end: Some(20.0), prev: true, ..flag() };
+        assert!(edge_trip_end(near), "within 24 m, not braking: held");
+        assert!(!edge_trip_end(EdgeFlag { braking: true, ..near }), "within 24 m, braking: stops at the edge");
+        assert!(!edge_trip_end(EdgeFlag { beyond: false, ..near }), "inside the horizon and able to stop: cleared, stops");
+        let late = EdgeFlag { d_end: Some(5.0), prev: true, ..flag() };
+        assert!(edge_trip_end(EdgeFlag { beyond: false, ..late }), "the horizon jumped, it cannot stop: held");
+        assert!(edge_trip_end(EdgeFlag { braking: true, blinker: 1, ..late }), "cannot stop: held");
+        assert!(!edge_trip_end(EdgeFlag { prev: false, beyond: false, ..late }), "never set: not set inside the horizon");
+    }
+
+    /// [pass 3, 3] The rule a network-end removal is recorded by.
+    #[test]
+    fn a2_the_far_trip_end_is_recorded_as_such() {
+        assert_eq!(network_end_rule(false, true, true), RemoveRule::FarDeadEnd);
+        assert_eq!(network_end_rule(false, true, false), RemoveRule::NetworkEnd, "off the edge unflagged");
+        assert_eq!(network_end_rule(false, false, true), RemoveRule::NetworkEnd, "the map's own end");
+        assert_eq!(network_end_rule(true, true, true), RemoveRule::BusLastResort);
+    }
+}
+
+#[cfg(test)]
 mod road_scale_tests {
     use super::road_scale;
 
@@ -5545,7 +5858,7 @@ mod respawn_sight_tests {
 
     /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
     fn viewer() -> Viewer {
-        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57 }
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }
     }
 
     /// [ROLLBACK r4d-B2] A bus is taken off the road by the rule it comes back by: never
@@ -5572,6 +5885,59 @@ mod respawn_sight_tests {
         assert!(v.hides_plainly(DVec3::new(0.0, 330.0, 0.0), 8.0));
         assert!(!v.hides_plainly(DVec3::new(0.0, 280.0, 0.0), 8.0));
     }
+
+    /// [round 9 A2] The perceptual horizon: a 1.5 m car covers two rows of a 900-line picture
+    /// with a 60 degree field of view at 585 m (r8-jzk's tile-edge queue at 869 m was 1.3 rows),
+    /// at 701 m on 1080 lines; a 3 m bus twice as far; with the picture's height unknown it is
+    /// VISIBLE_RANGE for a car. [fix pass 1] Never within NEAR_HIDE however small the picture;
+    /// none at all with the lamps lit; a triple screen's narrower centre panel pushes it out.
+    #[test]
+    fn a2_the_horizon_is_where_a_body_is_two_pixel_rows() {
+        use super::{VISIBLE_RANGE, CAR_HEIGHT, DOT_PIXELS};
+        let mut v = viewer();
+        v.fov = 60f64.to_radians();
+        assert_eq!(v.horizon(CAR_HEIGHT), VISIBLE_RANGE);
+        let v9 = v.with_screen(900, None);
+        assert!((v9.horizon(CAR_HEIGHT) - 584.6).abs() < 0.5, "{}", v9.horizon(CAR_HEIGHT));
+        let rows = |v: &Viewer, d: f64| CAR_HEIGHT / d * v.px_height / (2.0 * (v.fov * 0.5).tan());
+        assert!((rows(&v9, v9.horizon(CAR_HEIGHT)) - DOT_PIXELS).abs() < 1e-9);
+        assert!(rows(&v9, 869.0) < 1.4);
+        assert!(v9.beyond_horizon(600.0, CAR_HEIGHT) && !v9.beyond_horizon(570.0, CAR_HEIGHT));
+        assert!((v9.horizon(3.0) - 2.0 * v9.horizon(CAR_HEIGHT)).abs() < 1e-6, "a bus twice as far");
+        assert!(!v9.beyond_horizon(1000.0, 3.0));
+        assert!((v.with_screen(1080, None).horizon(CAR_HEIGHT) - 701.5).abs() < 0.5);
+        let tiny = v.with_screen(100, None);
+        assert!(tiny.horizon(CAR_HEIGHT) < 100.0 && !tiny.beyond_horizon(NEAR_HIDE - 1.0, CAR_HEIGHT) && tiny.beyond_horizon(NEAR_HIDE, CAR_HEIGHT));
+        let lit = v9.with_lamps(true);
+        assert!(lit.horizon(CAR_HEIGHT).is_infinite() && !lit.beyond_horizon(5000.0, CAR_HEIGHT));
+        let triple = v.with_screen(900, Some(29.0));
+        assert!(triple.horizon(CAR_HEIGHT) > 2.0 * v9.horizon(CAR_HEIGHT), "{}", triple.horizon(CAR_HEIGHT));
+        assert_eq!(v.with_screen(900, Some(90.0)).horizon(CAR_HEIGHT), v9.horizon(CAR_HEIGHT), "the narrower of the two");
+    }
+
+    /// [round 9 A2 fix pass 1] The set of trips ending at the edge: the head at the edge 869 m
+    /// off goes; a follower 500 m off (inside the horizon) stays, and so does the car behind
+    /// it 700 m off (beyond, but in a queue): only the car AT the edge goes.
+    #[test]
+    fn a2_only_the_car_at_the_edge_goes() {
+        use omsi_traffic::{Decision, Vehicle};
+        use omsi_sim::traffic::Lead;
+        let queued = |lead: u64| Vehicle { last: Decision { lead_id: Some(lead), lead: Some(Lead { gap: 2.5, speed: 0.0, acc: 0.0 }), ..Default::default() }, ..Default::default() };
+        let head = Vehicle::default();
+        let (f1, f2) = (queued(1), queued(2));
+        let mut v = viewer();
+        v.fov = 60f64.to_radians();
+        let v = v.with_screen(900, None);
+        let d = |m: f64| v.beyond_horizon(m, super::CAR_HEIGHT);
+        let cars = vec![(1u64, true, d(869.0), &head), (2, false, d(500.0), &f1), (3, false, d(700.0), &f2)];
+        let gone: Vec<u64> = super::far_trip_ends(cars.into_iter()).into_iter().collect();
+        assert_eq!(gone, vec![1]);
+        assert!(super::far_trip_ends(vec![(1u64, true, d(500.0), &head)].into_iter()).is_empty(), "inside the horizon");
+        // [fix pass 2] one that stopped there brakes: its brake lamps glow, it stays
+        let mut braking = Vehicle::default();
+        braking.state.braking = true;
+        assert!(super::far_trip_ends(vec![(1u64, true, d(869.0), &braking)].into_iter()).is_empty(), "a braking car stays");
+    }
 }
 
 #[cfg(test)]
@@ -5596,5 +5962,7 @@ mod loaded_edge_tests {
         assert_eq!(removal_rule("at the loaded tiles' edge, out of sight"), RemoveRule::DeadEnd);
         assert_eq!(removal_rule("at the loaded tiles' edge, in view after its grace"), RemoveRule::InViewAfterGrace);
         assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
+        // [round 9 A2, fix pass 1] the trip's end at the edge beyond the horizon
+        assert_eq!(removal_rule("at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
     }
 }
