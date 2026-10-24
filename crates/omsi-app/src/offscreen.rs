@@ -546,7 +546,7 @@ pub(crate) fn run_offscreen(
                 t,
                 Some(&view_cam),
                 w as f64 / h.max(1) as f64,
-                h,
+                (h, (settings.triple.enabled && !settings.vr_requested()).then(|| settings.triple.views(&view_cam, w, h)[1].camera.fov_deg)),
                 triple_extent(&settings, &view_cam, w, h),
                 weather.fog.0 as f64,
                 &run_clock,

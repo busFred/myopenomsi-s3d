@@ -556,6 +556,11 @@ impl ApplicationHandler for App {
                 // (with a triple screen, all of its three panels are in sight)
                 let sight = self.camera.as_ref().zip(self.surface.as_ref())
                     .and_then(|(c, s)| self.sight_extent(c, (s.config.width, s.config.height)));
+                // ([round 9 A2 fix pass 1] a triple screen's centre panel's field of view, for the
+                // traffic's perceptual horizon)
+                let panel_fov = self.camera.as_ref().zip(self.surface.as_ref()).and_then(|(c, s)| {
+                    self.triple_rig((s.config.width, s.config.height)).map(|rig| rig.views(c, s.config.width, s.config.height)[1].camera.fov_deg)
+                });
                 if let (Some(t), Some(w), Some(r), Some(scene)) = (
                     self.traffic.as_mut(),
                     self.world.as_ref(),
@@ -573,7 +578,8 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .map(|s| s.config.width as f64 / s.config.height.max(1) as f64)
                         .unwrap_or(16.0 / 9.0);
-                    // ([round 9 A2] the picture's height, for the traffic's perceptual horizon)
+                    // ([round 9 A2] the picture's height, for the traffic's perceptual horizon, and
+                    // a triple screen's centre panel's field of view)
                     let px_height = self.surface.as_ref().map(|s| s.config.height).unwrap_or(0);
                     let fog = self
                         .weather
@@ -584,7 +590,7 @@ impl ApplicationHandler for App {
                         t,
                         self.camera.as_ref(),
                         aspect,
-                        px_height,
+                        (px_height, panel_fov),
                         sight,
                         fog,
                         &self.clock,
