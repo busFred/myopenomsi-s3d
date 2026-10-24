@@ -906,6 +906,15 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     if o.speed < STANDING_SPEED && !their_inside {
         o.committed = false;
     }
+    // ([J4] and committed only up to the first place it can still wait at, `Claim::next_wait`: a
+    // stretch beyond that it can stop short of - SUMO's willPass is per link, from the vehicle's
+    // braking distance to that link. d24 08:37 #31323 waited for three oncoming left-turners
+    // on 6107 that its table gives way to: each was committed to its first meeting place 20 m
+    // before 6107 and was taken as committed to 6107 too)
+    let their_wait = claims[ok].next_wait - (claims[ok].s - o.s);
+    if o.committed && !their_inside && their_wait.is_finite() && their_wait <= foe.theirs.0 {
+        o.committed = false;
+    }
     // (clearing the box, it is committed to the others; not one standing outside this
     // meeting place stuck behind a standing lead or people: it is not coming for as
     // long as that holds, and when it moves off, the rules are the ordinary ones.
@@ -2536,6 +2545,30 @@ mod tests {
             let g = resolve(&js, &[x.clone(), y.clone()]);
             assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "refused last frame {refused}: {g:?}");
         }
+    }
+
+    /// [round 10 J4] A foe that cannot stop before its first meeting place (committed) but can wait
+    /// short of a later one (`Claim::next_wait`) is not committed to that later one: the table
+    /// decides there. (d24 08:37 #31323 waited for oncoming left-turners its table gives way to,
+    /// committed to their first meeting place 20 m before the one with it.) With its next waiting
+    /// place past my stretch, it still is.
+    #[test]
+    fn j4_a_foe_committed_to_its_first_meeting_place_is_not_committed_to_a_later_one_it_can_wait_short_of() {
+        let (_, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let m0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let s0 = js.nodes[0].movements[side].foes.iter().find(|f| f.movement == main).unwrap().mine.0;
+        // (me on the main road, standing 1 m out; the side road car rolling 6 m out at 5 m/s,
+        // committed to something before: the two would meet)
+        let me = claim(1, main, m0 - 1.0 - 2.0, 0.0);
+        let mut foe = claim(2, side, s0 - 6.0 - 2.0, 5.0);
+        foe.committed = true;
+        foe.next_wait = s0 - 4.0;
+        let g = resolve(&js, &[me.clone(), foe.clone()]);
+        assert!(grant_of(&g, 1).go, "it can wait short of our stretch, and gives way to me: {g:?}");
+        foe.next_wait = s0 + 3.0;
+        let g = resolve(&js, &[me, foe]);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "it cannot wait short of it: {g:?}");
     }
 
     /// [J7-2] The queue-entry case: the foe ahead stands at the join (in its stretch): the
