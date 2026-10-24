@@ -50,6 +50,35 @@ pub fn warm_up(world: &World, ty: &Arc<VehicleType>, hof: Option<Arc<omsi_vehicl
     }
 }
 
+/// The frame's cars by id, and the cars each one leads (the cars whose `last.lead_id` it is, in
+/// car order), built once before the per-car loop of `Traffic::tick`: the lookups there were
+/// a scan of every car per bus (and per car queued behind it); the answers are the same ones,
+/// found by the id (`lead_id` is set by `Simulation::tick`, not inside that loop).
+#[derive(Default)]
+struct CarLinks {
+    by_id: HashMap<u64, usize>,
+    followers: HashMap<u64, Vec<usize>>,
+}
+
+impl CarLinks {
+    fn of(cars: &[AiCar]) -> Self {
+        let mut links = CarLinks::default();
+        for (k, c) in cars.iter().enumerate() {
+            // (the first car of an id, as `iter().find` took it)
+            links.by_id.entry(c.id).or_insert(k);
+            if let Some(lead) = c.ai.last.lead_id {
+                links.followers.entry(lead).or_default().push(k);
+            }
+        }
+        links
+    }
+
+    /// The indices of the cars that have `id` for their lead, in car order.
+    fn following(&self, id: u64) -> &[usize] {
+        self.followers.get(&id).map_or(&[], |v| v.as_slice())
+    }
+}
+
 /// Frames between two lines of the traffic profile (OMSI_PROFILE): 30 s at the 30 Hz of the
 /// offscreen run.
 const TICK_PROFILE_FRAMES: u32 = 900;
@@ -669,6 +698,8 @@ pub struct Traffic {
     /// pre-plan loop, the recorder's frame, `Simulation::tick`; the sums and the frame count
     /// since the last line logged.
     pub tick_inner: [f64; 3],
+    /// The cars by id and by lead, as of the per-car loop of the running `tick`.
+    links: CarLinks,
     tick_inner_sum: ([f64; 3], u32),
     /// Seconds each of them has stood still.
     others_still: HashMap<u32, f32>,
@@ -1348,6 +1379,7 @@ impl Traffic {
             driver_pool: Vec::new(),
             tick_split: [0.0; 3],
             tick_inner: [0.0; 3],
+            links: CarLinks::default(),
             tick_inner_sum: ([0.0; 3], 0),
             others_still: HashMap::new(),
             removed_scheduled: Vec::new(),
@@ -3268,11 +3300,12 @@ impl Traffic {
         let stop_of = |c: &AiCar| c.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id);
         let lead_close = match (me.ai.last.lead_seen, me.ai.last.lead_id, me.ai.last.lead) {
             (Some(Seen::Player(_)), _, Some(l)) => l.gap < 9.0 && player.is_some_and(|p| p.4.abs() < omsi_traffic::driver::STANDING_SPEED),
-            (_, Some(id), Some(l)) => l.gap < 9.0 && self.cars.iter().find(|o| o.id == id).is_some_and(|o| o.standing() && o.at_stop() && stop_of(o) == Some(my_stop)),
+            (_, Some(id), Some(l)) => l.gap < 9.0 && self.links.by_id.get(&id).map(|&k| &self.cars[k]).is_some_and(|o| o.standing() && o.at_stop() && stop_of(o) == Some(my_stop)),
             _ => false,
         };
-        let follower_close = self.cars.iter().enumerate().any(|(j, o)| {
-            j != i && o.ai.last.lead_id == Some(me.id) && o.ai.last.lead.is_some_and(|l| l.gap < 40.0) && stop_of(o) == Some(my_stop)
+        let follower_close = self.links.following(me.id).iter().any(|&j| {
+            let o = &self.cars[j];
+            j != i && o.ai.last.lead.is_some_and(|l| l.gap < 40.0) && stop_of(o) == Some(my_stop)
         });
         (lead_close, follower_close)
     }
@@ -3284,8 +3317,9 @@ impl Traffic {
         let mut k = 0;
         while k < chain.len() && chain.len() <= 30 {
             let id = chain[k];
-            for o in &self.cars {
-                if o.standing() && o.ai.last.lead_id == Some(id) && !chain.contains(&o.id) {
+            for &j in self.links.following(id) {
+                let o = &self.cars[j];
+                if o.standing() && !chain.contains(&o.id) {
                     chain.push(o.id);
                 }
             }
@@ -3350,7 +3384,7 @@ impl Traffic {
         }
         // queueing behind what holds its stop: a vehicle standing at a stop, or the exit full
         let queued = c.ai.last.why == Why::ExitFull
-            || c.ai.last.lead_id.and_then(|id| self.cars.iter().find(|o| o.id == id)).is_some_and(|o| o.at_stop() || o.ai.last.why == Why::ExitFull);
+            || c.ai.last.lead_id.and_then(|id| self.links.by_id.get(&id).map(|&k| &self.cars[k])).is_some_and(|o| o.at_stop() || o.ai.last.why == Why::ExitFull);
         let stop = b.stops.front()?;
         let near = st.route_distance(&self.net, stop.ri, stop.s);
         let left = b.detour_wanted(st.speed, self.day_time, queued && near < 60.0)?;
@@ -3520,6 +3554,7 @@ impl Traffic {
         self.note_through_lanes();
         // [ROLLBACK r4d-B2] buses taken off the road this frame as the last resort
         let mut respawn: Vec<usize> = Vec::new();
+        self.links = CarLinks::of(&self.cars);
         let t_pre = std::time::Instant::now();
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
@@ -3533,7 +3568,7 @@ impl Traffic {
             let (fan_secs, fan_queued) = self.fan_queue(i, &fan);
             let queue_behind_secs = if self.cars[i].bus.is_some() {
                 let me = &self.cars[i];
-                let cars = self.cars.iter().filter(|o| o.ai.last.lead_id == Some(me.id) && o.standing()).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
+                let cars = self.links.following(me.id).iter().map(|&j| &self.cars[j]).filter(|o| o.standing()).map(|o| o.ai.stopped).fold(0.0f32, f32::max);
                 // the player's bus standing close behind it, heading the same way, counts too
                 let player_behind = player.filter(|p| p.4.abs() < omsi_traffic::driver::STANDING_SPEED).map_or(0.0, |p| {
                     let h = (me.ai.heading as f64).to_radians();
@@ -3553,7 +3588,7 @@ impl Traffic {
             // a through lane
             let (close_behind, covers_through) = if self.cars[i].bus.is_some() {
                 let me = &self.cars[i];
-                let cars = self.cars.iter().any(|o| o.ai.last.lead_id == Some(me.id) && o.ai.last.lead.is_some_and(|l| l.gap < crate::bus_service::PACE_FOLLOWER));
+                let cars = self.links.following(me.id).iter().any(|&j| self.cars[j].ai.last.lead.is_some_and(|l| l.gap < crate::bus_service::PACE_FOLLOWER));
                 let player_close = player.is_some_and(|p| {
                     let h = (me.ai.heading as f64).to_radians();
                     let fwd = DVec2::new(h.sin(), h.cos());
@@ -3695,8 +3730,12 @@ impl Traffic {
         let t_plan = std::time::Instant::now();
         // what the scripts are told, and the follow-camera triggers
         let mut frames: Vec<Option<AiFrame>> = Vec::with_capacity(self.cars.len());
+        let mut going = vec![false; self.cars.len()];
+        for &i in &remove {
+            going[i] = true;
+        }
         for (i, car) in self.cars.iter().enumerate() {
-            if remove.contains(&i) {
+            if going[i] {
                 frames.push(None);
                 continue;
             }
