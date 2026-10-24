@@ -159,7 +159,11 @@ pub struct JunctionView {
     /// The front is over that light's line (by more than half a metre), or the lit lane lies
     /// behind the car.
     pub past_line: bool,
-    /// Past its line (passed while the light let it in), the light no longer green, and unable
+    /// Past its line (passed while the light let it in) and the light no longer green: in the box
+    /// at the end of its green. A fresh green across its way waits for it (SUMO: a vehicle already
+    /// on the junction is never blocked by a link that just opened; `reservation::will_pass`).
+    pub in_box_at_turn: bool,
+    /// In the box at the end of its green (`in_box_at_turn`) and unable
     /// to stop before the first meeting place with another way or already at it: in the box
     /// when its light turned, it clears it. That light holds it no more (`clears_past`; a later line on the
     /// way, a left-turn waiting area's under another light of the controller, holds it as any)
@@ -1739,8 +1743,9 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // went in front of a car it had been refused for; review9)
         let to_line = light_line - me.state.front - 0.6;
         let cannot_stop = crate::plan::cannot_stop(me.state.speed, to_line, crate::plan::HARD_BRAKE);
-        let clearing = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go && (cannot_stop || light_line - me.state.front <= 0.5);
-        return Some(JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, clearing, way_len });
+        let in_box_at_turn = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go;
+        let clearing = in_box_at_turn && (cannot_stop || light_line - me.state.front <= 0.5);
+        return Some(JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, in_box_at_turn, clearing, way_len });
     }
     None
 }

@@ -1258,6 +1258,7 @@ impl Simulation {
                     // lets it go on a schedule, as a light or a lead moving off does)
                     // in the box when its light turned: it clears it (rule F)
                     clearing: j.clearing && !light_red,
+                    in_box_at_turn: j.in_box_at_turn && !light_red,
                     stuck: v.is_held()
                         && match v.last.why {
                             Why::People | Why::Zebra => true,
@@ -1473,6 +1474,7 @@ impl Simulation {
                 blocked,
                 stuck: false,
                 clearing: false,
+                in_box_at_turn: false,
                 lanes: way,
                 light,
                 id: PLAYER_ID_BASE + p.id as u64,

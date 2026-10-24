@@ -94,6 +94,12 @@ pub struct Claim {
     /// or clearing, between which the table decides (two clearing claimants both went:
     /// review9, a left turner in the box against an amber runner).
     pub clearing: bool,
+    /// Past its line, crossed while its light let it in, and that light no longer green
+    /// (`JunctionView::in_box_at_turn`): in the box at the end of its green, it clears first. A
+    /// foe whose light is never green with its own (the fresh green across its way) waits for it
+    /// and is no foe of its (`will_pass`; SUMO: a vehicle already on the junction is never blocked
+    /// by a link that just opened).
+    pub in_box_at_turn: bool,
     /// The vehicle's lanes from the one it is on: (lane, distance from its origin to the
     /// lane's start; the first is minus its place along it). Empty: not known (a player off
     /// the lanes). (For a car behind me in my own lane.)
@@ -905,8 +911,19 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     // past its line on amber, standing 8 m short of the merge with the bus as its
     // lead, was committed to the bus, which let it out first; each waited for the
     // other 46 s)
-    if o.clearing && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
+    // ([D7] in the box at the end of its green it clears first, standing at a waiting place inside
+    // or rolling: to a foe whose light is never green with its own - the fresh green across its
+    // way - it is committed, on the same terms as one clearing; SUMO: a vehicle already on the
+    // junction is never blocked by a link that just opened)
+    let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
+    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o))) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
         o.committed = true;
+    }
+    // ([D7] and the other way round: in the box at the end of my green, a foe on the fresh green
+    // across my way that is neither in the meeting place nor unable to stop short of it waits
+    // for me, it is no foe of mine)
+    if c.in_box_at_turn && fresh_green(c, o) && !their_inside && !o.committed {
+        return Pass::Not("clears_first");
     }
     let o = &*o;
     // clearing the box myself: only those in the meeting place, committed or
@@ -1334,7 +1351,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2904,6 +2921,32 @@ mod tests {
                 if !foe.committed {
                     assert_eq!(grant_of(&g, 2).wait_for, Some(1), "{foe_out} m out: the fresh green does not wait for the clearing car: {g:?}");
                 }
+            }
+        }
+
+        /// [round 10 D7] A car in the box at the end of its green clears first: standing at a
+        /// waiting place inside (it could stop, so it is not "clearing"), with its light now red,
+        /// against the main road's fresh green standing at its line or rolling up: the fresh green
+        /// waits for it, and it does not wait for the fresh green; with lights that may be green
+        /// together, the table decides as before.
+        #[test]
+        fn d7_a_car_in_the_box_at_the_end_of_its_green_goes_before_the_fresh_green() {
+            let (_, js) = four_way(192.0, 64.0);
+            let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+            let m0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+            let s0 = js.nodes[0].movements[side].foes.iter().find(|f| f.movement == main).unwrap().mine.0;
+            for (foe_out, foe_v) in [(1.0f32, 0.0f32), (15.0, 6.0), (30.0, 10.0)] {
+                let mut inbox = claim(1, side, s0 - 2.0 - 2.0, 0.0);
+                inbox.light = Some((0, 1));
+                inbox.in_box_at_turn = true;
+                let mut foe = claim(2, main, m0 - foe_out - 2.0, foe_v);
+                foe.light = Some((0, 0));
+                let g = resolve_with(&js, &[inbox.clone(), foe.clone()], &ex());
+                assert!(grant_of(&g, 1).go, "{foe_out} m out at {foe_v}: the car in the box waits: {g:?}");
+                assert_eq!(grant_of(&g, 2).wait_for, Some(1), "{foe_out} m out at {foe_v}: the fresh green goes: {g:?}");
+                // (lights not known to be exclusive: the table - the main road - decides)
+                let g = resolve_with(&js, &[inbox, foe], &Context::default());
+                assert!(!grant_of(&g, 1).go || grant_of(&g, 2).wait_for.is_none(), "{g:?}");
             }
         }
 
