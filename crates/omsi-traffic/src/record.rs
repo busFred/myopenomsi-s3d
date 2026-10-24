@@ -505,8 +505,8 @@ impl Recorder {
     }
 
     /// `note_remove` unless a rule was named already (the general ways off the road).
-    pub fn note_remove_unnamed(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
-        self.remove_rules.entry(id).or_insert((rule, seen, waiting, None));
+    pub fn note_remove_unnamed(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32, from_eye: Option<f32>) {
+        self.remove_rules.entry(id).or_insert((rule, seen, waiting, from_eye));
     }
 
     pub fn is_recording(&self) -> bool {

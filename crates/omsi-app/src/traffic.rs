@@ -3962,7 +3962,8 @@ impl Traffic {
                 let p = c.vehicle.position;
                 let r = (c.ai.state.length as f64 * 0.5).max(2.0);
                 let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else { RemoveRule::NetworkEnd };
-                self.recorder.note_remove(c.id, rule, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+                // ([round 9 A2 fix pass 1] with its distance from the eye, as every removal)
+                self.recorder.note_remove_from(c.id, rule, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
             }
             if self.debug_population {
                 // [round 7 R7-1] every removal is logged with its rule: the traffic's own
@@ -4599,7 +4600,7 @@ impl Traffic {
         {
             let p = c.vehicle.position;
             let r = (c.ai.state.length as f64 * 0.5).max(2.0);
-            self.recorder.note_remove_unnamed(c.id, RemoveRule::Other, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting);
+            self.recorder.note_remove_unnamed(c.id, RemoveRule::Other, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
         }
         if c.serves_stops() {
             self.riders_out.push(c.id);
@@ -4769,7 +4770,8 @@ impl Traffic {
             match self.cars[i].park {
                 Some(p) if p.done => {
                     let c = self.cars.swap_remove(i);
-                    self.recorder.note_remove(c.id, RemoveRule::Parked, false, c.ai.waiting);
+                    let from_eye = self.viewer.map(|v| (c.vehicle.position - v.pos).length() as f32);
+                    self.recorder.note_remove_from(c.id, RemoveRule::Parked, false, c.ai.waiting, from_eye);
                     if world.return_parked(renderer, scene, p.key) {
                         let st = &c.ai.state;
                         let spot = Parked { s: p.s, lateral: p.lat, half_width: c.ai.half_width, half_len: (st.front + st.rear) * 0.5 };
