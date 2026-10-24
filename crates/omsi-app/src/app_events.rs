@@ -573,6 +573,8 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .map(|s| s.config.width as f64 / s.config.height.max(1) as f64)
                         .unwrap_or(16.0 / 9.0);
+                    // ([round 9 A2] the picture's height, for the traffic's perceptual horizon)
+                    let px_height = self.surface.as_ref().map(|s| s.config.height).unwrap_or(0);
                     let fog = self
                         .weather
                         .as_ref()
@@ -582,6 +584,7 @@ impl ApplicationHandler for App {
                         t,
                         self.camera.as_ref(),
                         aspect,
+                        px_height,
                         sight,
                         fog,
                         &self.clock,

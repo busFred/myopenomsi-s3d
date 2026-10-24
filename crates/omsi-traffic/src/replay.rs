@@ -277,7 +277,7 @@ impl Replay {
 
     fn apply(&mut self, i: usize) {
         // (lent out while it is applied, and put back: the replay can start over)
-        let rec = std::mem::replace(&mut self.records[i], Record::Remove { time: 0.0, id: u64::MAX, rule: None, seen: false, waiting: 0.0 });
+        let rec = std::mem::replace(&mut self.records[i], Record::Remove { time: 0.0, id: u64::MAX, rule: None, seen: false, waiting: 0.0, from_eye: None });
         self.apply_record(&rec);
         self.records[i] = rec;
     }
@@ -322,7 +322,7 @@ impl Replay {
                     None => self.vehicles.push(v),
                 }
             }
-            Record::Remove { time, id, rule, seen, waiting } => {
+            Record::Remove { time, id, rule, seen, waiting, .. } => {
                 let id = *id;
                 if !self.free_run {
                     if let Some(v) = self.vehicles.iter().find(|v| v.id == id) {

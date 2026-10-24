@@ -546,6 +546,7 @@ pub(crate) fn run_offscreen(
                 t,
                 Some(&view_cam),
                 w as f64 / h.max(1) as f64,
+                h,
                 triple_extent(&settings, &view_cam, w, h),
                 weather.fog.0 as f64,
                 &run_clock,

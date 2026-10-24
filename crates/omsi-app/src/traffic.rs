@@ -84,7 +84,7 @@ const QUEUE_BEHIND_STAND: f32 = 25.0;
 const QUEUE_BEHIND_DIST: f64 = 25.0;
 // ([round 7 R7-1 fix 1] IN_VIEW_GRACE, GAVE_UP_DIST, QUEUE_LEAD, `in_a_queue` and `lead_of`
 // are the crate's, `omsi_traffic::removal`: the free-run replay asks the same rule)
-use omsi_traffic::removal::{goes_in_view, lead_of, in_a_queue, RemoveRule};
+use omsi_traffic::removal::{and_its_queue, goes_far, goes_in_view, lead_of, in_a_queue, RemoveRule};
 /// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
 /// eye): a margin over what is drawn.
 const OUT_OF_RANGE: f64 = 1.3;
@@ -159,6 +159,7 @@ fn removal_rule(why: &str) -> RemoveRule {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
+        w if w.ends_with("at the loaded tiles' edge, beyond the horizon") => RemoveRule::FarDeadEnd,
         w if w.starts_with("at the loaded tiles' edge, in view") => RemoveRule::InViewAfterGrace,
         w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
@@ -367,10 +368,20 @@ pub struct Viewer {
     pub min_size: f64,
     pub max_dist: f64,
     pub fov: f64,
+    /// [round 9 A2] The picture's height in pixels (0: not known, see `Viewer::horizon`).
+    pub px_height: f64,
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
 const VISIBLE_RANGE: f64 = 900.0;
+
+/// [round 9 A2] Fewer pixel rows than this and a car is a dot the eye cannot tell from nothing
+/// (VISIBLE_RANGE's "two pixels").
+const DOT_PIXELS: f64 = 2.0;
+/// [round 9 A2] The height of a passenger car (m), the size the perceptual horizon is reckoned
+/// for (a saloon's 1.4-1.5 m; VISIBLE_RANGE's two pixels at 900 m on 900 lines is a 1.5 m
+/// body at a 41 degree field of view).
+const CAR_HEIGHT: f64 = 1.5;
 
 /// Within this distance (m) of the camera a timetable bus has its driver at the wheel.
 const DRIVER_NEAR: f64 = 70.0;
@@ -414,7 +425,34 @@ impl Viewer {
             min_size: 0.0,
             max_dist: 0.0,
             fov: (cam.fov_deg as f64).to_radians(),
+            px_height: 0.0,
         }
+    }
+
+    /// [round 9 A2] The picture's height in pixels (the window's, or the offscreen image's).
+    pub fn with_screen(mut self, px_height: u32) -> Viewer {
+        self.px_height = px_height as f64;
+        self
+    }
+
+    /// [round 9 A2] The perceptual horizon (m): farther off, a car (`CAR_HEIGHT`) covers fewer
+    /// than `DOT_PIXELS` rows of this picture (its height in pixels over the vertical field of
+    /// view, `px_height / (2 tan(fov/2))` pixels per unit of the image plane) and is a dot the
+    /// player cannot tell from nothing. One horizon for both ways: beyond it a random car may
+    /// appear in frame (`Traffic::may_appear_car`) and a car at the loaded tiles' edge whose
+    /// waiting time has run may go in frame (`omsi_traffic::removal::goes_far`). With the
+    /// picture's height unknown, the documented `VISIBLE_RANGE`.
+    pub fn horizon(&self) -> f64 {
+        if self.px_height <= 0.0 {
+            return VISIBLE_RANGE;
+        }
+        CAR_HEIGHT * self.px_height / (DOT_PIXELS * 2.0 * (self.fov * 0.5).tan().max(1e-3))
+    }
+
+    /// [round 9 A2] Is a point `dist` (m) from the eye beyond the horizon (and never within
+    /// `NEVER_VANISH_WITHIN`, the mirrors' and a turn of the head's)?
+    pub fn beyond_horizon(&self, dist: f64) -> bool {
+        dist >= NEVER_VANISH_WITHIN && dist > self.horizon()
     }
 
     /// A wider picture than the camera's own (a triple screen's side panels): the tangents
@@ -643,6 +681,11 @@ pub struct Traffic {
     light_prev: Vec<Vec<i32>>,
     /// `OMSI_DEBUG_POPULATION`: log where cars appear and vanish relative to the view.
     debug_population: bool,
+    /// [round 9 A2] Since the start: cars that appeared in frame beyond the perceptual
+    /// horizon, and cars taken off in frame there (`RemoveRule::FarDeadEnd`) (the population
+    /// log line).
+    appeared_far: usize,
+    removed_far: usize,
     /// Cars placed since the last look inside the view frustum (hidden behind something):
     /// (id, position). `OMSI_POPULATION_SHOTS` photographs them to check.
     pub framed_spawns: Vec<(u64, DVec3)>,
@@ -1334,6 +1377,8 @@ impl Traffic {
             light_log,
             light_prev,
             debug_population: omsi_cfg::env::var_os("OMSI_DEBUG_POPULATION").is_some(),
+            appeared_far: 0,
+            removed_far: 0,
             framed_spawns: Vec::new(),
             player: None,
             player_priority: false,
@@ -1827,6 +1872,23 @@ impl Traffic {
         self.initial || self.hidden(world, p, 8.0)
     }
 
+    /// [round 9 A2] May a random car be put on the road at `p` unseen: as `may_appear`, or
+    /// beyond the perceptual horizon (`Viewer::horizon`, reckoned for a car's height), where it
+    /// is a dot nobody can tell from nothing - the line a car at the loaded tiles' edge may go
+    /// in frame beyond, too. (A timetable bus is twice a car's height, its own two-pixel line
+    /// twice as far, beyond what is drawn: it keeps `may_appear`.)
+    pub fn may_appear_car(&self, world: &World, p: DVec3) -> bool {
+        self.may_appear(world, p) || self.viewer.is_some_and(|v| v.beyond_horizon((p - v.pos).length()))
+    }
+
+    /// [round 8 H8-7, fix pass 1] Car `c` stopped at the edge of the loaded tiles (`Lane::
+    /// loaded_edge`: the crate stops it there, `Why::End`).
+    fn at_loaded_edge(&self, c: &AiCar) -> bool {
+        c.ai.last.why == Why::End
+            && c.ai.stopped > AT_END_STAND
+            && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty())
+    }
+
     /// The world is still being built (the first populate, the first seconds): vehicles
     /// may be put anywhere.
     pub fn loading_phase(&self) -> bool {
@@ -1884,6 +1946,7 @@ impl Traffic {
                     min_size: 0.0,
                     max_dist: 0.0,
                     fov: 1.0,
+                    px_height: 0.0,
                 });
             }
         }
@@ -1891,6 +1954,27 @@ impl Traffic {
         self.advance_dormant();
         // the cars somebody stands behind
         let queued: std::collections::HashSet<u64> = self.cars.iter().filter(|c| c.ai.stopped > 5.0).filter_map(|c| c.ai.last.lead_id).collect();
+        // [round 9 A2] the far dead-end queues: at the loaded tiles' edge beyond the perceptual
+        // horizon, the front whose waiting time passed SUMO's time-to-teleport and the queue
+        // standing behind it beyond the horizon (`removal::goes_far`, `and_its_queue`)
+        let far_dead_end = match self.viewer {
+            Some(v) if !self.initial => {
+                let mut heads = Vec::new();
+                let mut links = Vec::new();
+                for c in self.cars.iter().filter(|c| (!c.serves_stops() || c.released) && c.ai.stopped > AT_END_STAND) {
+                    if !v.beyond_horizon((c.vehicle.position - v.pos).length()) {
+                        continue;
+                    }
+                    if goes_far(self.at_loaded_edge(c), true, &c.ai) {
+                        heads.push(c.id);
+                    } else if let Some(lead) = lead_of(&c.ai.last).filter(|_| in_a_queue(&c.ai.last)) {
+                        links.push((c.id, lead));
+                    }
+                }
+                and_its_queue(&heads, &links)
+            }
+            _ => Default::default(),
+        };
         let mut i = 0;
         let mut off_ground = 0usize;
         let mut asleep = 0usize;
@@ -1935,9 +2019,7 @@ impl Traffic {
                 && c.ai.state.route.last() == Some(&c.ai.state.lane)
                 && c.ai.state.s > self.net.lanes[c.ai.state.lane].length() - 25.0;
             // [round 8 H8-7, fix pass 1] stopped at the edge of the loaded tiles
-            let at_loaded_edge = c.ai.last.why == Why::End
-                && c.ai.stopped > AT_END_STAND
-                && self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
+            let at_loaded_edge = self.at_loaded_edge(c);
             // a random car still on its way that goes out of range sleeps instead (see
             // `DormantCar`); only one whose trip is over leaves the map
             let sleeps_instead = !c.serves_stops() && !c.ai.gone && self.net.lanes.get(c.ai.state.lane).map(|l| l.kind == LaneKind::Street).unwrap_or(false);
@@ -1957,6 +2039,14 @@ impl Traffic {
                 first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
             } else if !random {
                 None
+            } else if far_dead_end.contains(&c.id) {
+                // [round 9 A2] SUMO's time-to-teleport beyond the horizon: the front once nobody
+                // sees it (as before) or now, in frame, a dot; the queue behind it with it
+                if at_loaded_edge {
+                    first(&[(&|| hidden(), "at the loaded tiles' edge, out of sight"), (&|| true, "at the loaded tiles' edge, beyond the horizon")])
+                } else {
+                    Some("in a queue at the loaded tiles' edge, beyond the horizon")
+                }
             } else if at_loaded_edge {
                 // [round 8 H8-7, fix pass 2] standing at the edge of the loaded tiles (`Lane::
                 // loaded_edge`, the crate stops it there): it goes once nobody sees it, or in view
@@ -2004,10 +2094,12 @@ impl Traffic {
                 let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
                 let seen = match rule {
                     RemoveRule::OutOfSight => false,
-                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded | RemoveRule::FarDeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
                     _ => frames(),
                 };
-                self.recorder.note_remove(c.id, rule, seen, c.ai.waiting);
+                self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
+                // ([round 9 A2] with its distance from the eye: the removals by distance band)
+                self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, Some(from_eye as f32));
             }
             if remove && sleeps_instead {
                 let c = self.cars.swap_remove(i);
@@ -2057,7 +2149,8 @@ impl Traffic {
             log::info!("traffic: {off_ground} vehicles taken away with the tiles under them");
         }
         if (asleep > 0 || !self.dormant.is_empty()) && self.debug_population {
-            log::info!("population t={:.1}: {asleep} cars went out of range and drive on unseen; {} on the map out of range, {} in range", self.time, self.dormant.len(), self.cars.len());
+            // ([round 9 A2] with the appearances and removals in frame beyond the horizon)
+            log::info!("population t={:.1}: {asleep} cars went out of range and drive on unseen; {} on the map out of range, {} in range; beyond the horizon ({:.0} m) in frame since the start: {} appeared, {} removed", self.time, self.dormant.len(), self.cars.len(), self.viewer.map(|v| v.horizon()).unwrap_or(VISIBLE_RANGE), self.appeared_far, self.removed_far);
         }
         if self.types.is_empty() || self.net.lanes.is_empty() {
             self.initial = false;
@@ -2419,7 +2512,7 @@ impl Traffic {
             // Ditan: 5 500 of 6 000 a pass; 70-100 cars about the player against a target of
             // 490; 200-260 with this, as measured headless with the player's view settings).
             // OMSI puts its cars down anywhere, at any distance.
-            if kind == LaneKind::Street && !self.initial && !self.may_appear(world, p) {
+            if kind == LaneKind::Street && !self.initial && !self.may_appear_car(world, p) {
                 let source = self.net.prev.get(lane).is_some_and(|q| q.is_empty());
                 let from_eye = self.viewer.map(|v| (p - v.pos).length()).unwrap_or(rel_len(p, center));
                 if !source && from_eye <= APPEAR_IN_VIEW_BEYOND {
@@ -2603,7 +2696,7 @@ impl Traffic {
             // dormant car drives everywhere, and one woken there appeared inside a junction)
             let ok = near
                 && world.has_ground(p.x, p.y)
-                && self.may_appear(world, p)
+                && self.may_appear_car(world, p)
                 && self.may_put_on(lane)
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
@@ -2861,6 +2954,11 @@ impl Traffic {
         });
         if let Some(v) = speed {
             state.speed = v.min(state.speed.max(v * 0.5));
+        }
+        // [round 9 A2] counted: a car put down in frame beyond the perceptual horizon
+        if kind == LaneKind::Street && !self.initial {
+            let pos = vehicle.position;
+            self.appeared_far += self.viewer.is_some_and(|v| v.frames(pos, 2.5) && v.beyond_horizon((pos - v.pos).length())) as usize;
         }
         if self.debug_population && kind == LaneKind::Street {
             let v = self.viewer;
@@ -5493,7 +5591,7 @@ mod respawn_sight_tests {
 
     /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
     fn viewer() -> Viewer {
-        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57 }
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0 }
     }
 
     /// [ROLLBACK r4d-B2] A bus is taken off the road by the rule it comes back by: never
@@ -5520,6 +5618,27 @@ mod respawn_sight_tests {
         assert!(v.hides_plainly(DVec3::new(0.0, 330.0, 0.0), 8.0));
         assert!(!v.hides_plainly(DVec3::new(0.0, 280.0, 0.0), 8.0));
     }
+
+    /// [round 9 A2] The perceptual horizon: a 1.5 m car covers two rows of a 900-line picture
+    /// with a 60 degree field of view at 585 m (r8-jzk's tile-edge queue at 869 m was 1.3 rows),
+    /// at 701 m on 1080 lines; with the picture's height unknown it is VISIBLE_RANGE; and never
+    /// within NEVER_VANISH_WITHIN, however small the picture.
+    #[test]
+    fn a2_the_horizon_is_where_a_car_is_two_pixel_rows() {
+        use super::{VISIBLE_RANGE, CAR_HEIGHT, DOT_PIXELS};
+        let mut v = viewer();
+        v.fov = 60f64.to_radians();
+        assert_eq!(v.horizon(), VISIBLE_RANGE);
+        let v9 = v.with_screen(900);
+        assert!((v9.horizon() - 584.6).abs() < 0.5, "{}", v9.horizon());
+        let rows = |v: &Viewer, d: f64| CAR_HEIGHT / d * v.px_height / (2.0 * (v.fov * 0.5).tan());
+        assert!((rows(&v9, v9.horizon()) - DOT_PIXELS).abs() < 1e-9);
+        assert!(rows(&v9, 869.0) < 1.4);
+        assert!(v9.beyond_horizon(600.0) && !v9.beyond_horizon(570.0));
+        assert!((v.with_screen(1080).horizon() - 701.5).abs() < 0.5);
+        let tiny = v.with_screen(100);
+        assert!(tiny.horizon() < 100.0 && !tiny.beyond_horizon(NEVER_VANISH_WITHIN - 1.0) && tiny.beyond_horizon(NEVER_VANISH_WITHIN));
+    }
 }
 
 #[cfg(test)]
@@ -5544,5 +5663,8 @@ mod loaded_edge_tests {
         assert_eq!(removal_rule("at the loaded tiles' edge, out of sight"), RemoveRule::DeadEnd);
         assert_eq!(removal_rule("at the loaded tiles' edge, in view after its grace"), RemoveRule::InViewAfterGrace);
         assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
+        // [round 9 A2] the far dead-end rule, the front and its queue
+        assert_eq!(removal_rule("at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
+        assert_eq!(removal_rule("in a queue at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
     }
 }

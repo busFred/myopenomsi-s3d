@@ -39,6 +39,11 @@ pub enum RemoveRule {
     InViewAfterGrace,
     /// At a dead end or the loaded route's end, far off, long, or with a queue behind it.
     DeadEnd,
+    /// [round 9 A2] At the loaded tiles' edge beyond the perceptual horizon, its waiting time
+    /// past SUMO's time-to-teleport, the front of its queue and the queue behind it
+    /// ([`goes_far`], [`and_its_queue`]): in frame, but a dot nobody can tell from nothing.
+    /// Not counted as removed in view (`ab`'s `removed_far`).
+    FarDeadEnd,
     /// A timetable bus taken off as the last resort (no loop or room), or its last trip over.
     BusLastResort,
     /// It parked: the parked object stands in its place.
@@ -54,6 +59,12 @@ impl RemoveRule {
     /// like every other population rule.)
     pub fn gated(self) -> bool {
         !matches!(self, RemoveRule::NetworkEnd | RemoveRule::Parked)
+    }
+
+    /// [round 9 A2] Whether this removal is made beyond the perceptual horizon by its rule, so
+    /// it is not "removed in view" even in frame (`ab` counts it as `removed_far`).
+    pub fn beyond_horizon(self) -> bool {
+        matches!(self, RemoveRule::FarDeadEnd)
     }
 }
 
@@ -93,6 +104,38 @@ pub fn in_a_queue(d: &Decision) -> bool {
 /// sumo.md 5.3).
 pub fn goes_in_view(finished: bool, v: &Vehicle, from_eye: f64) -> bool {
     finished && v.waiting > GIVE_UP_UNSEEN + IN_VIEW_GRACE && from_eye > GAVE_UP_DIST && !in_a_queue(&v.last)
+}
+
+/// [round 9 A2] SUMO's time-to-teleport for the front of a queue that cannot move on (sumo.md
+/// 5.3: waiting time above `--time-to-teleport` 300 s = `GIVE_UP_UNSEEN`, the vehicle first in
+/// line, teleported wherever it stands), for a car at a dead end that never clears while the
+/// player is far (the loaded tiles' edge: the way on loads only within 170-200 m) and beyond the
+/// perceptual horizon (the app's `Viewer::horizon`): it goes in frame. Inside the horizon this
+/// never fires: there the round-7 rule (`goes_in_view`) and `hidden()` stay the only ways.
+pub fn goes_far(at_dead_end: bool, beyond_horizon: bool, v: &Vehicle) -> bool {
+    at_dead_end && beyond_horizon && v.waiting > GIVE_UP_UNSEEN && !in_a_queue(&v.last)
+}
+
+/// [round 9 A2] The cars that go with the fronts `heads` ([`goes_far`]): every car linked by
+/// `links` (follower, lead) - each a car beyond the horizon, standing in a queue
+/// ([`in_a_queue`]) behind its lead - back from a front, link by link, so the chain is never
+/// cut in its middle. SUMO's clock runs only for the first in line and drains one car per
+/// 300 s; ours runs for every standing car, and a dead end at the loaded tiles' edge never
+/// clears while the player is far, so its queue, all of it beyond the horizon, goes with its
+/// front (one per 300 s could not keep up with the cars driving into it, and the far
+/// population would grow without bound, PLAN-r8-items Q9-3 b).
+pub fn and_its_queue(heads: &[u64], links: &[(u64, u64)]) -> std::collections::HashSet<u64> {
+    let mut gone: std::collections::HashSet<u64> = heads.iter().copied().collect();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for &(follower, lead) in links {
+            if gone.contains(&lead) && gone.insert(follower) {
+                grew = true;
+            }
+        }
+    }
+    gone
 }
 
 #[cfg(test)]
@@ -153,5 +196,41 @@ mod tests {
         assert!(goes_in_view(true, &v, 100.0));
         assert!(!goes_in_view(true, &v, GAVE_UP_DIST - 1.0));
         assert!(!goes_in_view(false, &v, 100.0));
+    }
+
+    /// [round 9 A2] r8-jzk t=520: #147 stood at the loaded tiles' edge 869 m from the eye for
+    /// 482 s. Beyond the horizon, past the 300 s, the front of its queue: it goes; before the
+    /// 300 s, inside the horizon, behind a lead, or not at the dead end it stays.
+    #[test]
+    fn a2_the_far_front_goes_after_the_time_to_teleport() {
+        let mut v = Vehicle { waiting: GIVE_UP_UNSEEN + 1.0, ..Default::default() };
+        assert!(goes_far(true, true, &v));
+        assert!(!goes_far(true, false, &v), "inside the horizon");
+        assert!(!goes_far(false, true, &v), "not at the dead end");
+        v.waiting = GIVE_UP_UNSEEN - 1.0;
+        assert!(!goes_far(true, true, &v), "before the time-to-teleport");
+        v.waiting = GIVE_UP_UNSEEN + 1.0;
+        v.last = Decision { lead_id: Some(9), lead: Some(Lead { gap: 3.0, speed: 0.0, acc: 0.0 }), ..Default::default() };
+        assert!(!goes_far(true, true, &v), "behind a lead");
+        assert!(RemoveRule::FarDeadEnd.gated() && RemoveRule::FarDeadEnd.beyond_horizon());
+        assert!(!RemoveRule::InViewAfterGrace.beyond_horizon() && !RemoveRule::DeadEnd.beyond_horizon());
+    }
+
+    /// [round 9 A2] The queue behind a far front goes with it, link by link, in any order of
+    /// the links; a car whose link is missing (inside the horizon, or moving) stays, and so
+    /// does every car behind it; another queue stays.
+    #[test]
+    fn a2_the_queue_goes_with_its_front_and_is_never_cut_in_its_middle() {
+        // 1 <- 2 <- 3 <- 4 (front 1), and 10 <- 11 (front 10 not going)
+        let links = [(4, 3), (3, 2), (2, 1), (11, 10)];
+        let mut gone: Vec<u64> = and_its_queue(&[1], &links).into_iter().collect();
+        gone.sort_unstable();
+        assert_eq!(gone, vec![1, 2, 3, 4]);
+        // 3 is inside the horizon: no link for it; 3 and 4 stay
+        let links = [(4, 3), (2, 1), (11, 10)];
+        let mut gone: Vec<u64> = and_its_queue(&[1], &links).into_iter().collect();
+        gone.sort_unstable();
+        assert_eq!(gone, vec![1, 2]);
+        assert!(and_its_queue(&[], &links).is_empty());
     }
 }

@@ -289,6 +289,46 @@ fn h8_7_a_car_stops_at_the_loaded_edge_and_drives_off_the_maps_end() {
     }
 }
 
+/// [round 9 A2] A queue of three at the loaded tiles' edge: the front stops at the end (`Why::End`),
+/// the two behind it queue (`in_a_queue`, lead within QUEUE_LEAD). The crate's waiting clock runs
+/// for the front at the end; before SUMO's time-to-teleport (300 s) nothing goes beyond the
+/// horizon, after it the front goes (`goes_far`) and the queue with it (`and_its_queue`), never a
+/// follower on its own. Inside the horizon nothing goes by this rule.
+#[test]
+fn a2_a_far_queue_at_the_loaded_edge_goes_with_its_front_after_300_s() {
+    use omsi_traffic::removal::{and_its_queue, goes_far, in_a_queue, lead_of};
+    let mut net = Network::default();
+    net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
+    net.lanes[0].loaded_edge = true;
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 0, 150.0, 8.0), car(2, 0, 135.0, 8.0), car(3, 0, 120.0, 8.0)];
+    sim.update_positions(&net, &mut cars);
+    let going = |cars: &[Vehicle], beyond: bool| {
+        let heads: Vec<u64> = cars.iter().filter(|v| goes_far(v.last.why.name() == "end", beyond, v)).map(|v| v.id).collect();
+        let links: Vec<(u64, u64)> = cars.iter().filter(|v| beyond && in_a_queue(&v.last)).filter_map(|v| lead_of(&v.last).map(|l| (v.id, l))).collect();
+        let mut g: Vec<u64> = and_its_queue(&heads, &links).into_iter().collect();
+        g.sort_unstable();
+        g
+    };
+    let mut t = 0.0;
+    while t < 320.0 {
+        sim.tick(&net, DT, &mut cars);
+        assert!(sim.removed.is_empty(), "driven off the loaded edge");
+        t += DT;
+        if (t - 200.0).abs() < DT * 0.5 {
+            assert!(going(&cars, true).is_empty(), "before the time-to-teleport: {:?}", going(&cars, true));
+        }
+    }
+    assert_eq!(cars[0].last.why.name(), "end");
+    assert!(cars[0].waiting > 300.0, "the front's waiting time {:.0}", cars[0].waiting);
+    assert!(cars[1..].iter().all(|v| in_a_queue(&v.last) && v.state.speed < 0.3), "the two behind queue");
+    assert_eq!(going(&cars, true), vec![1, 2, 3]);
+    assert!(going(&cars, false).is_empty(), "inside the horizon");
+}
+
 /// [H8-8, fix pass 2] A pull-out from 3 m off its lane (steerable move 7.86 m) with people where
 /// the safety review's probes put them: standing on the axis 0.5 m and 1.5 m past the end of its
 /// way out, a walker from the right kerb 9 m ahead as it starts, one from the left kerb 12 m ahead
