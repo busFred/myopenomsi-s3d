@@ -389,3 +389,46 @@ fn h8_8_walkers_beside_the_parked_body_off_its_way_out_do_not_hold_it() {
     assert!(moved, "held by walkers beside its parked body");
     assert!(least > 0.0, "touched: {least:.2}");
 }
+
+/// [round 9 A4] A fork: one branch's road (two lanes, no other choice) ends at the loaded tiles'
+/// edge, the other leads on. No random car takes the edge branch while the other is there; once
+/// the tile loads (`loaded_edge` cleared) cars take it again; with the edge branch the only way
+/// on, they drive on into it as before.
+#[test]
+fn a4_random_cars_do_not_turn_towards_the_loaded_edge_when_another_way_leads_on() {
+    let build = |edge: bool, other: bool| {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 100.0), 1, 0)); // 0: approach
+        // 1: the branch to the edge, leaving straight and bending off
+        let mut b = LaneBuilder::polyline(vec![DVec3::new(0.0, 100.0, 0.0), DVec3::new(0.0, 110.0, 0.0), DVec3::new(30.0, 150.0, 0.0)], LaneKind::Street, 3.5);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 2, path: 0 });
+        net.lanes.push(b);
+        net.lanes.push(road((30.0, 150.0), (60.0, 190.0), 3, 0)); // 2: ends at the edge
+        if other {
+            net.lanes.push(road((0.0, 100.0), (0.0, 200.0), 4, 0)); // 3: straight on
+            net.lanes.push(road((0.0, 200.0), (0.0, 300.0), 5, 0)); // 4
+        }
+        net.lanes[2].loaded_edge = edge;
+        net.link(1.5);
+        net.compute_conflicts();
+        net.compute_reach();
+        net
+    };
+    let picks = |net: &Network| -> usize {
+        (1..=200u64).filter(|&seed| {
+            let mut st = AiState::new(0, 50.0, seed * 7919);
+            st.plan_next(net);
+            st.planned_next == Some(1)
+        }).count()
+    };
+    let net = build(true, true);
+    assert_eq!(net.lanes[0].next.len(), 2, "a fork");
+    assert!(net.ends_at_loaded_edge(1) && !net.ends_at_loaded_edge(3));
+    assert_eq!(picks(&net), 0, "a car turned towards the loaded edge");
+    let loaded = build(false, true);
+    assert!(!loaded.ends_at_loaded_edge(1));
+    let n = picks(&loaded);
+    assert!(n > 50 && n < 150, "the tile loaded: the branch is a way like any other ({n} of 200)");
+    assert_eq!(picks(&build(true, false)), 200, "the only way on is still taken");
+}

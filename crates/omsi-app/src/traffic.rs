@@ -2492,6 +2492,10 @@ impl Traffic {
             // nor on a lane with a stop line (a car put down past the line went through
             // the junction on red), nor on a piece of a junction that meets other ways
             .filter(|(i, _)| self.may_put_on(*i))
+            // [round 9 A4] nor on a road that ends at the loaded tiles' edge before any choice of
+            // way (`Network::ends_at_loaded_edge`): a car put there has nowhere to go but the
+            // edge's queue (the flag follows the tiles, so the road opens again as they load)
+            .filter(|(i, _)| kind != LaneKind::Street || !self.net.ends_at_loaded_edge(*i))
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
@@ -2736,6 +2740,8 @@ impl Traffic {
                 && world.has_ground(p.x, p.y)
                 && self.may_appear_car(world, p, body_height(&ty))
                 && self.may_put_on(lane)
+                // ([round 9 A4] nor where its road ends at the loaded tiles' edge: it sleeps on)
+                && !self.net.ends_at_loaded_edge(lane)
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)

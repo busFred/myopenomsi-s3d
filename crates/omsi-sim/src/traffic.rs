@@ -646,6 +646,26 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
+    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles before any
+    /// choice of way: followed while each lane has exactly one way on, it reaches a lane with
+    /// `loaded_edge` and no way on. A fork, the map's own end or a loop is not that edge.
+    pub fn ends_at_loaded_edge(&self, n: usize) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut l = n;
+        loop {
+            let Some(lane) = self.lanes.get(l) else { return false };
+            if lane.next.is_empty() {
+                return lane.loaded_edge;
+            }
+            if lane.next.len() > 1 || !seen.insert(l) {
+                return false;
+            }
+            l = lane.next[0];
+        }
+    }
+}
+
+impl Network {
     /// The sign of a lateral offset (positive to the right) towards the oncoming lane:
     /// -1 on the right-hand side of the road, +1 on a left-hand-traffic map.
     pub fn oncoming_sign(&self) -> f32 {
@@ -3238,7 +3258,9 @@ impl AiState {
     /// rules but not `no_cars`; `no_cars` - a car already on a lane whose only continuation is
     /// closed drives on through it, as before round 7, and is never taken off moving; only a
     /// lane with no way of its kind at all ends the network for it. A way that ends the
-    /// network just ahead (`Network::reach`) is taken like any other.
+    /// network just ahead (`Network::reach`) is taken like any other; [round 9 A4] one whose
+    /// road ends at the loaded tiles' edge (`Network::ends_at_loaded_edge`) only when no other
+    /// way of its tier is left.
     fn choose_after(
         &mut self,
         net: &Network,
@@ -3269,7 +3291,20 @@ impl AiState {
             }
         };
         let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
-        let choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        let mut choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        // [round 9 A4] not into the edge of the loaded tiles when another way of the same tier
+        // leads on: a random car has no trip, and the loaded-tile edge is not a place on the map,
+        // only where what is loaded ends - a car turning in there stood in a queue that reached
+        // back 400 m towards the player (r9 jzk). (OMSI geometry, not SUMO: SUMO's vehicles have
+        // routes to real destinations and never aim at the network's edge.) With no other way it
+        // drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
+        // as they load), so a branch opens again once its tile is loaded.
+        if choices.len() > 1 {
+            let open: Vec<usize> = choices.iter().copied().filter(|&n| !net.ends_at_loaded_edge(n)).collect();
+            if !open.is_empty() && open.len() < choices.len() {
+                choices = open;
+            }
+        }
         let weighted = best == 0 && self.traffic_pool.is_some();
         if best > 0 && !next.is_empty() {
             FORK_FALLBACKS[best.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
