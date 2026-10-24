@@ -1492,7 +1492,7 @@ fn hold_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f3
 /// [round6 J2] A car comes to rest up to this far (m) short of its stop (the controller's 0.6 m
 /// `STOP_LINE_GAP` and a creep): `pulled_back` keeps that much more of the body out of a band
 /// (review-r6j: the rear stood 0.6 m inside a convergence it was stopped behind).
-const REST_SHORT: f32 = 1.0;
+pub(crate) const REST_SHORT: f32 = 1.0;
 
 /// `stop` (a distance from the origin, the front's) pulled back before every band of
 /// `bands` (from, to) the body would stand in, a band at a time.

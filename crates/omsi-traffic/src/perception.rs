@@ -1224,7 +1224,25 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let p = &sim.people[k];
             !p.at_kerb && !p.waiting_for_bus && (p.pos.z - me.pos.z).abs() <= 2.5 && z.blocked_by(net, p, me.half_width, lat)
         }) {
-            let stop = z.along - crate::plan::ZEBRA_STOP;
+            // ([P9-3] SUMO's waiting position: not with the body over an earlier crossing of the
+            // way - two walks a few metres apart, the zebra stop of the second lies over the
+            // first. Pulled back to the earlier one's zebra stop, as `plan::pulled_back` keeps a
+            // car off a band, while the front is short of it and the car can still stop there,
+            // `plan::cannot_stop`; viz case01 #78 stood over an empty walk)
+            let len = me.length();
+            let mut stop = z.along - crate::plan::ZEBRA_STOP;
+            for _ in 0..zebras.len() {
+                let earlier = zebras
+                    .iter()
+                    .map(|w| (w.along - crate::plan::ZEBRA_STOP, w.along + crate::plan::ZEBRA_PAST))
+                    .filter(|b| b.0 > st.front - 0.3 && b.0 < stop && b.1 > stop - len - crate::plan::REST_SHORT && !crate::plan::cannot_stop(v, b.0 - st.front, crate::plan::HARD_BRAKE))
+                    .map(|b| b.0)
+                    .fold(f32::INFINITY, f32::min);
+                if !earlier.is_finite() {
+                    break;
+                }
+                stop = earlier;
+            }
             holders.push(Holder { stop, along: z.along, axis: 0.0, swervable: false });
         }
     }
