@@ -1659,6 +1659,9 @@ struct Me {
     why: &'static str,
     /// The pace walked this frame.
     walk_pace: f64,
+    /// [P9-2] Walking up to a crossing with the verdict "go": where they step onto it and the
+    /// seconds until they do and until they are across (`Person::approach`).
+    approach: Option<(DVec2, f32, f32)>,
 }
 
 /// What a stroller sees this frame.
@@ -3205,9 +3208,13 @@ pub struct Person {
     /// a carriageway, past its first steps): the cars of the lanes still ahead stop for
     /// them as for somebody stepping in.
     on_crossing: bool,
-    /// The last decision at a kerb (`may_cross`): "go", or why they wait - for the traffic
+    /// The last decision at a kerb (`kerb_verdict`): "go", or why they wait - for the traffic
     /// recording, which shows why somebody froze.
     last_decision: Option<&'static str>,
+    /// [P9-2] Walking up to a crossing with the verdict "go" (`Me::approach`): where they step
+    /// onto it, the seconds until then and until they are across (SUMO's
+    /// `registerCrossingApproach`), for the cars on the junction.
+    approach: Option<(DVec2, f32, f32)>,
     /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
     /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
     step_out: Option<(DVec2, f32)>,
@@ -4048,12 +4055,11 @@ impl Humans {
             .count()
     }
 
-    /// People walking the footpaths of the traffic network: (lane, distance along it). The
-    /// traffic gives way to them at crossings and presses the pedestrian lights' buttons
-    /// for them.
-    /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
-    /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>)> {
+    /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
+    /// whether they wait at a stop (a bus pulls up right beside those), their standing
+    /// time, crossing and kerb flags, the stop they wait at, their id and their approach to a
+    /// crossing.
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
@@ -4064,7 +4070,7 @@ impl Humans {
                     State::Pax(x) if x.inside.is_none() => x.stop,
                     _ => None,
                 };
-                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at)
+                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at, p.id, p.approach)
             })
             .collect()
     }
@@ -4102,6 +4108,8 @@ impl Humans {
                         State::Pax(x) if x.inside.is_none() => x.stop,
                         _ => None,
                     },
+                    id: Some(p.id),
+                    approach: p.approach,
                 }
             })
             .collect()
@@ -4351,6 +4359,7 @@ impl Humans {
             still: 0.0,
             on_crossing: false,
             last_decision: None,
+            approach: None,
             step_out: None,
             car_wait: 0.0,
             detour: 0.0,
@@ -6822,7 +6831,7 @@ impl Humans {
     ) -> Want {
         let mut ped = self.ped.take();
         let p = &self.people[i];
-        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace };
+        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None };
         let at = Around { net, lights: traffic.map(|t| t as &dyn PedLights), cars, streams: &self.streams, time: self.time };
         let mut rng = self.rng;
         let w = stroll(ped.as_mut(), &at, &mut me, walk, &mut rng, &mut self.yields, dt);
@@ -6833,6 +6842,7 @@ impl Humans {
         p.last_decision = me.decision;
         p.why = me.why;
         p.walk_pace = me.walk_pace;
+        p.approach = me.approach;
         w
     }
 
@@ -9033,7 +9043,7 @@ mod ped_tests {
     }
 
     pub(super) fn me(id: u32, pos: DVec2, pace: f64) -> Me {
-        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace }
+        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace, approach: None }
     }
 
     /// One frame of the walk as the game moves them (the crowd left out): (velocity).

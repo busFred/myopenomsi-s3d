@@ -168,7 +168,7 @@ fn lights_people_parked_cars_and_new_lanes_replay_too() {
         let _ = cars;
         // somebody crosses the east exit for a while
         sim.people = if (3.0..12.0).contains(&t) {
-            vec![Person { pos: DVec3::new(60.0, -4.0 + (t as f64 - 3.0) * 0.9, 0.0), vel: DVec2::new(0.0, 0.9), on_crossing: true, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }]
+            vec![Person { pos: DVec3::new(60.0, -4.0 + (t as f64 - 3.0) * 0.9, 0.0), vel: DVec2::new(0.0, 0.9), on_crossing: true, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }]
         } else {
             Vec::new()
         };
@@ -247,7 +247,7 @@ fn the_recorder_costs_little_per_frame() {
     net.link(1.5);
     let mut sim = Simulation::new(&net, vec![TrafficLightController::new(vec![vec![(6, 15.0), (0, 15.0)]; 4], 30.0); 40]);
     let mut cars: Vec<Vehicle> = (0..300).map(|k| car(k as u64 + 1, (k % 30) * 2, 20.0 + (k / 30) as f32 * 40.0, 10.0)).collect();
-    sim.people = (0..200).map(|k| Person { pos: DVec3::new(k as f64 * 3.1, -5.0, 0.0), vel: DVec2::new(1.1, 0.0), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }).collect();
+    sim.people = (0..200).map(|k| Person { pos: DVec3::new(k as f64 * 3.1, -5.0, 0.0), vel: DVec2::new(1.1, 0.0), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }).collect();
     let mut people: Vec<PersonRecord> = sim.people.iter().map(|p| PersonRecord { state: Cow::Borrowed("WalkStreet"), leg: Some((3, 12.5, 40.0)), decision: Some(Cow::Borrowed("go")), ..PersonRecord::from_person(p) }).collect();
     sim.tick(&net, DT, &mut cars);
     let mut rec = Recorder::new();

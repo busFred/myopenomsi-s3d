@@ -60,7 +60,7 @@ fn two_lanes(drivable: (f32, f32), solid: bool) -> Network {
 /// Two same-direction 1.9 m lanes 3.6 m apart (BeijingCity's narrow lanes): 0 left at y=0, 1
 /// right at y=-3.6; the right lane's extent to the left lane's painted edge (3.6-0.95=2.65).
 fn walker(x: f64, y: f64, vx: f64, vy: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }
 }
 
 

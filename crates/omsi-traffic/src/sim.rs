@@ -69,6 +69,17 @@ pub struct Person {
     /// for a bus waits at: a timetable bus serving that stop pulls in beside them.
     #[serde(default)]
     pub waits_at: Option<i64>,
+    /// The person's id in the game (`humans::Person::id`), the same every frame they are on
+    /// foot: a vehicle's hold names whom it holds for (None: a recording from before it).
+    #[serde(default)]
+    pub id: Option<u32>,
+    /// [P9-2] Walking up to a crossing with the verdict to go: the point where they step onto
+    /// it, the seconds until they do and until they are across (SUMO's
+    /// `registerCrossingApproach`: arrival and leaving time on the crossing's link). A vehicle
+    /// on the junction brakes for one who reaches the crossing before it does
+    /// (`MSLink::getLeaderInfo`'s approaching persons).
+    #[serde(default)]
+    pub approach: Option<(DVec2, f32, f32)>,
 }
 
 /// A parked car beside a lane.

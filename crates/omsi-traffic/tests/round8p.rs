@@ -157,7 +157,7 @@ fn bus_past_waiter(serves: [Option<i64>; 2], waits_at: Option<i64>, off: f64) ->
     let net = finish(vec![lane(&[(0.0, 0.0), (300.0, 0.0)])]);
     let mut sim = Simulation::new(&net, vec![]);
     let mut vs = vec![bus(1, vec![0], 60.0, 8.0)];
-    sim.people = vec![Person { pos: DVec3::new(120.0, -off, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: true, at_kerb: false, waits_at }];
+    sim.people = vec![Person { pos: DVec3::new(120.0, -off, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: true, at_kerb: false, waits_at, id: None, approach: None }];
     let (mut held, mut min, mut t) = (false, f64::INFINITY, 0.0);
     sim.update_positions(&net, &mut vs);
     while t < 15.0 {
@@ -291,7 +291,7 @@ fn pass_person(trig: f32, dx: f64, y0: f64, vy: f64) -> (f64, bool) {
         let c = &vs[0];
         if !spawned && c.passing.is_some() && c.state.lateral.abs() >= trig {
             spawned = true;
-            sim.people = vec![Person { pos: DVec3::new(c.pos.x + c.state.front as f64 + dx, y0, 0.0), vel: DVec2::new(0.0, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }];
+            sim.people = vec![Person { pos: DVec3::new(c.pos.x + c.state.front as f64 + dx, y0, 0.0), vel: DVec2::new(0.0, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }];
         }
         if spawned {
             let pp = &mut sim.people[0];

@@ -371,7 +371,7 @@ fn a_car_waits_behind_a_parked_car_while_a_stream_comes_the_other_way() {
 fn a_car_stops_for_a_person_on_a_crossing_and_goes_on_when_they_are_gone() {
     let net = straight_road();
     let mut sim = Simulation::new(&net, vec![]);
-    sim.people.push(omsi_traffic::Person { pos: DVec3::new(150.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
+    sim.people.push(omsi_traffic::Person { pos: DVec3::new(150.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None });
     let mut cars = vec![car(1, 0, 60.0, 12.0)];
     let mut frames = 0;
     let mut stood_short = false;
@@ -659,7 +659,7 @@ fn a_bus_goes_past_a_person_waiting_at_the_kerb_spot() {
         let mut bus = Vehicle::new(1, VehicleClass::Bus, st, 1.25, 7);
         bus.fresh = 0.0;
         let mut cars = vec![bus];
-        sim.people.push(omsi_traffic::Person { pos: DVec3::new(111.0, -lateral, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.5, waiting_for_bus: false, at_kerb, waits_at: None });
+        sim.people.push(omsi_traffic::Person { pos: DVec3::new(111.0, -lateral, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.5, waiting_for_bus: false, at_kerb, waits_at: None, id: None, approach: None });
         let mut held = false;
         run(&net, &mut sim, &mut cars, 8.0, |_, sim, cars| {
             held |= matches!(cars[0].last.why, Why::People | Why::Zebra);

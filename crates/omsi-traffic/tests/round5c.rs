@@ -80,7 +80,7 @@ fn road_with_a_zebra(zebra: bool) -> Network {
 }
 
 fn person(x: f64, y: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }
 }
 
 // C1 ----------------------------------------------------------------------------------
