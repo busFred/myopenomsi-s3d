@@ -32,6 +32,24 @@ pub(crate) fn run_offscreen(
     crate::lights::set_corona_root(&args.root);
     let mut scene = renderer.new_scene();
     let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &settings, &renderer, &mut scene))?;
+    let world = std::sync::Arc::new(world);
+    // A run with traffic streams its tiles as the window does (`tiles::Streamer`: the view
+    // distance, or the traffic's prefetch reach when farther), so that the loaded tiles' edge
+    // lies where it lies in the game; the tiles within the view distance are loaded before the
+    // traffic starts, the loading screen's way, under the window's texture budget. A fixed
+    // `--radius` or `--all` keeps its tiles, and so does a run without traffic.
+    let mut streamer = (args.radius.is_none() && !args.all && (args.traffic > 0 || args.schedule)).then(|| {
+        let view = args.view_distance.or_else(settings::view_distance).unwrap_or(settings::DEFAULT_VIEW_DISTANCE).max(omsi_map::tile_size());
+        world.set_texture_budget(texture_budget(&settings));
+        let centers = start_centers(args, &camera, Some(&world));
+        let mut s = tiles::Streamer::new(world.clone(), &centers, view, view);
+        while s.initial_progress().is_some() {
+            s.update(&renderer, &mut scene, &centers, tiles::LOADING_BUDGET, None);
+            std::thread::yield_now();
+        }
+        log::info!("offscreen streaming: {} tiles loaded within {:.0} m", world.loaded_tiles().len(), view);
+        s
+    });
     // the map's own route arrows, with OMSI 2's route arrows
     world.show_help_arrows(&renderer, &mut scene, settings.nav_arrows);
     let lan_seed = lan_off.as_ref().map(lan::population_seed);
@@ -554,9 +572,32 @@ pub(crate) fn run_offscreen(
                 player.as_ref(),
                 &renderer.options,
             );
+            // the tiles round the eye and the bus, as the window streams them
+            if let Some(st) = streamer.as_mut() {
+                let motion = player.as_ref().map(|p| (p.vehicle.position, p.vehicle.physics.speed as f64));
+                if let Some(reach) = t.prefetch_reach(motion, st.load_secs) {
+                    st.reach_at_least(reach);
+                }
+                let mut centers = vec![view_cam.position];
+                centers.extend(player.as_ref().map(|p| p.vehicle.position));
+                world.update_texture_budget(&renderer, &mut scene, &centers, false);
+                if st.update(&renderer, &mut scene, &centers, tiles::FRAME_BUDGET, None) {
+                    world.update_texture_budget(&renderer, &mut scene, &centers, true);
+                    t.add_tiles(&world);
+                    if let Some(p) = player.as_mut() {
+                        p.vehicle.collision = settings.collision_objects.then(|| world.collision.lock().clone());
+                        p.vehicle.wheel_walls = settings.collision_objects;
+                    }
+                }
+            }
             if i % 60 == 0 {
-                // (following a car, the population goes with the camera)
-                let pc = if args.follow.is_some() { view_cam.position } else { center };
+                // (following a car, the population goes with the camera; with the tiles
+                // streaming round the bus, with the bus, as in the window)
+                let pc = match (&args.follow, &streamer, player.as_ref()) {
+                    (Some(_), _, _) => view_cam.position,
+                    (None, Some(_), Some(p)) => p.vehicle.position,
+                    _ => center,
+                };
                 t.populate(&world, &renderer, &mut scene, pc);
                 // (what the window does every frame: cars that parked become parked objects,
                 // released vehicles go back to the world)
