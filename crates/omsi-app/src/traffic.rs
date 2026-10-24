@@ -730,6 +730,8 @@ pub struct Traffic {
     /// log line).
     appeared_far: usize,
     removed_far: usize,
+    /// [round 9 A4] The lanes whose road ends at the loaded tiles' edge (`mark_loaded_edges`).
+    edge_bound: hashbrown::HashSet<usize>,
     /// Cars placed since the last look inside the view frustum (hidden behind something):
     /// (id, position). `OMSI_POPULATION_SHOTS` photographs them to check.
     pub framed_spawns: Vec<(u64, DVec3)>,
@@ -1423,6 +1425,7 @@ impl Traffic {
             debug_population: omsi_cfg::env::var_os("OMSI_DEBUG_POPULATION").is_some(),
             appeared_far: 0,
             removed_far: 0,
+            edge_bound: Default::default(),
             framed_spawns: Vec::new(),
             player: None,
             player_priority: false,
@@ -2495,7 +2498,7 @@ impl Traffic {
             // [round 9 A4] nor on a road that ends at the loaded tiles' edge before any choice of
             // way (`Network::ends_at_loaded_edge`): a car put there has nowhere to go but the
             // edge's queue (the flag follows the tiles, so the road opens again as they load)
-            .filter(|(i, _)| kind != LaneKind::Street || !self.net.ends_at_loaded_edge(*i))
+            .filter(|(i, _)| kind != LaneKind::Street || !self.edge_bound.contains(i))
             // as many cars on a lane as metres of it (times its density): counted per
             // lane, the many short lanes of a junction drew the cars into the town's
             // tangles and left the long roads between them empty
@@ -2741,7 +2744,7 @@ impl Traffic {
                 && self.may_appear_car(world, p, body_height(&ty))
                 && self.may_put_on(lane)
                 // ([round 9 A4] nor where its road ends at the loaded tiles' edge: it sleeps on)
-                && !self.net.ends_at_loaded_edge(lane)
+                && !self.edge_bound.contains(&lane)
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)
@@ -5119,6 +5122,26 @@ impl Traffic {
                 loaded_edge_at(probe, ts, &|k| world.has_tile(k), &self.lane_tiles)
             };
         }
+        // [round 9 A4 fix pass 2] the lanes whose every way on ends at an edge within
+        // EDGE_LOOKAHEAD (`Network::ends_at_loaded_edge`, gathered back from the edges once here
+        // rather than walked forward for every spawn place): no car is put down or woken there
+        let net = &self.net;
+        let mut bound: hashbrown::HashMap<usize, f64> = net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge && l.next.is_empty()).map(|(i, _)| (i, 0.0)).collect();
+        let mut work: Vec<usize> = bound.keys().copied().collect();
+        while let Some(m) = work.pop() {
+            for &p in net.prev.get(m).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if bound.contains_key(&p) {
+                    continue;
+                }
+                let lp = &net.lanes[p];
+                let far = lp.next.iter().map(|n| bound.get(n).map(|d| d + net.lanes[*n].length() as f64)).collect::<Option<Vec<f64>>>();
+                if let Some(d) = far.and_then(|v| v.into_iter().reduce(f64::max)).filter(|d| *d <= omsi_sim::traffic::EDGE_LOOKAHEAD) {
+                    bound.insert(p, d);
+                    work.push(p);
+                }
+            }
+        }
+        self.edge_bound = bound.into_keys().collect();
     }
 
     /// Take in what the tiles loaded since the last call brought: their lanes (linked into

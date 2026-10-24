@@ -124,6 +124,11 @@ pub struct Lane {
     pub loaded_edge: bool,
 }
 
+/// [round 9 A4 fix pass 2] How far along the road (m) `Network::ends_at_loaded_edge` looks for the
+/// edge of the loaded tiles: SUMO's `lcStrategicLookahead` default, how far a vehicle's best lanes
+/// look along its way (sumo.md; omsi-traffic's `LC_STRATEGIC_LOOKAHEAD`).
+pub const EDGE_LOOKAHEAD: f64 = 3000.0;
+
 /// Priority of a path without a `[rule] priority`.
 pub const DEFAULT_PRIORITY: f32 = 128.0;
 
@@ -646,22 +651,34 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
-    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles before any
-    /// choice of way: followed while each lane has exactly one way on, it reaches a lane with
-    /// `loaded_edge` and no way on. A fork, the map's own end or a loop is not that edge.
+    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles: followed
+    /// along every way on, it reaches only lanes with `loaded_edge` and no way on ([fix pass 2]
+    /// at a fork, when every branch does: a road splitting into parallel lanes that all end at the
+    /// edge). The map's own end, a loop, or any branch leading elsewhere is not that edge.
     pub fn ends_at_loaded_edge(&self, n: usize) -> bool {
-        let mut seen = std::collections::HashSet::new();
-        let mut l = n;
-        loop {
-            let Some(lane) = self.lanes.get(l) else { return false };
+        // (each lane walked once: a lane met again gives its answer, one still being walked - a
+        // loop - is not the edge)
+        // ... within `EDGE_LOOKAHEAD`: farther on it is not taken for the edge
+        fn walk(net: &Network, l: usize, from: f64, memo: &mut std::collections::HashMap<usize, Option<bool>>) -> bool {
+            let Some(lane) = net.lanes.get(l) else { return false };
             if lane.next.is_empty() {
                 return lane.loaded_edge;
             }
-            if lane.next.len() > 1 || !seen.insert(l) {
+            if from > EDGE_LOOKAHEAD {
                 return false;
             }
-            l = lane.next[0];
+            match memo.get(&l) {
+                Some(Some(r)) => return *r,
+                Some(None) => return false,
+                None => {}
+            }
+            memo.insert(l, None);
+            let to = from + lane.length() as f64;
+            let r = lane.next.iter().all(|&m| walk(net, m, to, memo));
+            memo.insert(l, Some(r));
+            r
         }
+        walk(self, n, 0.0, &mut std::collections::HashMap::new())
     }
 }
 

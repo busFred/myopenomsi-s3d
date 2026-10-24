@@ -474,3 +474,31 @@ fn a2_pass2_beyond_the_horizon_a_car_drives_off_the_loaded_edge_without_braking(
     }
 }
 
+/// [round 9 A4 fix pass 2] A road splitting into two parallel lanes that both end at the loaded
+/// edge is the edge too; one whose other branch leads on is not.
+#[test]
+fn a4_pass2_a_fork_whose_every_branch_ends_at_the_edge_is_the_edge() {
+    let build = |both: bool| {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 100.0), 1, 0)); // 0
+        net.lanes.push(road((0.0, 100.0), (0.0, 200.0), 2, 0)); // 1: on, ends at the edge
+        let mut b = LaneBuilder::polyline(vec![DVec3::new(0.0, 100.0, 0.0), DVec3::new(0.0, 110.0, 0.0), DVec3::new(3.5, 200.0, 0.0)], LaneKind::Street, 3.5);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 3, path: 0 });
+        net.lanes.push(b); // 2: the parallel lane
+        net.lanes.push(road((3.5, 200.0), (3.5, 300.0), 4, 0)); // 3: leads on
+        net.lanes[1].loaded_edge = true;
+        if both {
+            net.lanes[3].loaded_edge = true;
+        } else {
+            net.lanes.push(road((3.5, 300.0), (3.5, 400.0), 5, 0));
+        }
+        net.link(1.5);
+        net
+    };
+    let both = build(true);
+    assert_eq!(both.lanes[0].next.len(), 2, "a fork");
+    assert!(both.ends_at_loaded_edge(0) && both.ends_at_loaded_edge(2));
+    let one = build(false);
+    assert!(!one.ends_at_loaded_edge(0) && one.ends_at_loaded_edge(1) && !one.ends_at_loaded_edge(2));
+}
