@@ -72,8 +72,9 @@ pub struct Lane {
     pub offset: f32,
     /// Spline/object file the lane came from (debugging).
     pub name: String,
-    /// `[rule] trafficdensity`: how much of the road traffic uses this lane (0 = none), of
-    /// any random traffic group.
+    /// `[rule] trafficdensity`: the greatest share of the road traffic any random traffic
+    /// group has on this lane (0 = none): whether the lane carries random traffic at all.
+    /// What a vehicle may use is its own group's share (`Lane::density_for`, `Lane::closed_to`).
     pub density: f32,
     /// `[rule] trafficdensity <value> <group>` of the path, the last per group: the group
     /// is the random traffic group's place in the map's `unsched_vehgroups.txt`. A group
@@ -155,6 +156,27 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
     0.0
 }
 
+/// The least `[rule] trafficdensity` of a group at which a path is open to the group's random
+/// vehicles. The map editor offers the densities 0, 0.001, 0.1, 0.5, 1 and 3 (all twenty stock
+/// maps under `maps/` use only these): 0 is "none" and 0.001 "almost none", the editor's near
+/// closure (BeijingCity's bus lanes close the normal cars with 0, their feeder pieces with
+/// 0.001), 0.1 the lowest a mapper means as traffic. 0.01 lies between the two groups of
+/// classes, so a hand-edited value near either lands on its side. Below it a path is closed to the
+/// group as SUMO's `disallow` closes a lane to a vClass: no vehicle of the group is inserted on it
+/// or routed over it while an open way exists (SUMO's time-of-day variants, `rerouter`s and
+/// TraCI `allow`, need data the maps do not have: the painted hours of a bus lane are paint only).
+pub const OPEN_DENSITY_FLOOR: f32 = 0.01;
+
+/// Does a path of this density carry traffic of the group (`OPEN_DENSITY_FLOOR`)?
+pub fn density_is_open(density: f32) -> bool {
+    density >= OPEN_DENSITY_FLOOR
+}
+
+/// A vehicle's random traffic group for the access rule: the defaults of
+/// `unsched_vehgroups.txt` and its place in them (`AiState::traffic_pool`); None: a vehicle of no
+/// group, which counts as the first group.
+pub type PoolRef<'a> = Option<(&'a [i32], usize)>;
+
 impl Lane {
     /// The drivable extent (left, right) of the lane's axis in metres ([`Lane::drivable`]
     /// as stored, else the lane's half width either side).
@@ -196,6 +218,32 @@ impl Lane {
     /// [`pool_density`]).
     pub fn pool_density(&self, defaults: &[i32], pool: usize) -> f32 {
         pool_density(&self.group_density, defaults, pool)
+    }
+
+    /// How much of its own group's traffic the lane carries: the group's `pool_density`; a
+    /// vehicle of no group takes the first group's share where the path names groups, else the
+    /// lane's density (the greatest over groups would open a lane to whoever is asked for).
+    pub fn density_for(&self, pool: PoolRef) -> f32 {
+        match pool {
+            Some((defaults, p)) => self.pool_density(defaults, p),
+            None if self.group_density.is_empty() => self.density,
+            None => self.pool_density(&[1], 0),
+        }
+    }
+
+    /// The one access predicate of a street lane for a vehicle of `[ai_veh_type]` `veh_type` and
+    /// group `pool`, SUMO's `allow`/`disallow` by vClass: why the lane is closed to it, or None.
+    /// By the path's rules (`allows`) and, when `by_density`, by the group's own density
+    /// (`density_for`, `density_is_open`). The population (lane weight and vehicle type), the
+    /// way on at a fork, a lane change and the lane-end rule all ask this.
+    pub fn closed_to(&self, veh_type: i32, pool: PoolRef, by_density: bool) -> Option<Closed> {
+        if !self.allows(veh_type) {
+            return Some(Closed::Rules);
+        }
+        if by_density && !density_is_open(self.density_for(pool)) {
+            return Some(Closed::Density);
+        }
+        None
     }
 
     /// Closest point of the lane's polyline to `p`: (distance along the lane, distance to it).
@@ -3059,15 +3107,16 @@ pub enum Closed {
     Kind,
     /// `[rule] no_cars`, `bus`, `trucks` by the vehicle's `[ai_veh_type]`.
     Rules,
-    /// No random traffic of this vehicle's group drives here (`trafficdensity 0`).
+    /// No random traffic of this vehicle's group drives here (`trafficdensity` below
+    /// `OPEN_DENSITY_FLOOR`).
     Density,
 }
 
-/// [round 7 A1] Is `lane` open to a vehicle with the way `st`, driving on lanes of `kind`
-/// (street, rail, air), for driving along? One rule for the population, the way on at a
-/// fork, a lane change, a pass on the oncoming lane and the lane beside
-/// (`omsi_traffic::access`). A timetable vehicle on its route is open anywhere its route
-/// goes; this answers for the driver's own choices.
+/// Is `lane` open to a vehicle with the way `st`, driving on lanes of `kind` (street, rail,
+/// air), for driving along? One rule (`Lane::closed_to`, SUMO's `allow`/`disallow` by vClass)
+/// for the population, the way on at a fork, a lane change, a pass on the oncoming lane, the
+/// lane beside and the lane-end rule (`omsi_traffic::access`). A timetable vehicle on its route
+/// is open anywhere its route goes; this answers for the driver's own choices.
 pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> {
     if lane.kind != kind || kind == LaneKind::Sidewalk {
         return Err(Closed::Kind);
@@ -3077,23 +3126,11 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     if kind != LaneKind::Street {
         return Ok(());
     }
-    if !lane.allows(st.veh_type) {
-        return Err(Closed::Rules);
-    }
-    // a scheduled bus goes where its route goes; everybody else needs the lane to carry
-    // traffic of their group
-    if st.route.is_empty() {
-        // (a vehicle of no group is a normal car: where the path names its groups, the
-        // first group's share counts, not the most any group gets - `density` is the
-        // greatest over all groups, so that a lane stays open to whoever is asked for)
-        let density = match st.traffic_pool.as_ref() {
-            Some((pool, defaults)) => lane.pool_density(defaults, *pool),
-            None if lane.group_density.is_empty() => lane.density,
-            None => lane.pool_density(&[1], 0),
-        };
-        if density <= 0.0 {
-            return Err(Closed::Density);
-        }
+    // (a scheduled bus goes where its route goes; everybody else needs the lane to carry
+    // traffic of their group)
+    let pool = st.traffic_pool.as_ref().map(|(p, d)| (d.as_slice(), *p));
+    if let Some(why) = lane.closed_to(st.veh_type, pool, st.route.is_empty()) {
+        return Err(why);
     }
     // (no test on the path's width: a tenth of the stock maps' street paths are drawn a
     // metre wide where the lane is a full one - Spandau's ten-lane Altstädter Ring is
@@ -3113,8 +3150,8 @@ pub const SWEPT_WHEELBASE: f32 = 3.149 + 2.665;
 /// (Directive 97/27/EC, annex I 7.6), which caps the off-tracking.
 pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 
-/// [round 7 A1] Ways on chosen by a tier below "open to me and leading on"
-/// (`AiState::choose_after`), per tier: [open but every way on from it closed, closed by my
+/// Ways on chosen by a tier below "open to me and leading on" (`AiState::choose_after`: a
+/// car whose only way on is closed to it drives on, counted here), per tier: [open but every way on from it closed, closed by my
 /// group's density but driven by another group, driven by no group, closed by the rules but
 /// not `no_cars`, `no_cars`, none at all]. Per call (a plan is extended frame after frame).
 /// A diagnostic for `traffic_cases ab` (whole process).
@@ -3264,20 +3301,20 @@ impl AiState {
         self.planned_next.into_iter().chain(self.ahead.iter().copied())
     }
 
-    /// A random way on from the end of `lane`: one open to this vehicle by the access rule
-    /// (`open_to`: the path's rules, `[rule] no_cars`/`bus`/`trucks` by its type, and the
-    /// traffic density of its group - filtering them only at spawn still let cars turn into a
-    /// pedestrian street or a depot yard from next door); a car of a traffic pool takes them
-    /// by its pool's density. [round 7 A1] The ways on are ranked, the best tier taken (the
-    /// lower ones counted, `FORK_FALLBACKS`): open to me and leading on (a dead end too); open
-    /// to me but every way on from it closed (SUMO's bestLanes look-ahead, one step); closed
-    /// by my group's density but driven by another group; driven by no group; closed by the
-    /// rules but not `no_cars`; `no_cars` - a car already on a lane whose only continuation is
-    /// closed drives on through it, as before round 7, and is never taken off moving; only a
-    /// lane with no way of its kind at all ends the network for it. A way that ends the
-    /// network just ahead (`Network::reach`) is taken like any other; [round 9 A4] one whose
-    /// road ends at the loaded tiles' edge (`Network::ends_at_loaded_edge`) only when no other
-    /// way of its tier is left.
+    /// A random way on from the end of `lane`, never over a lane closed to this vehicle while an
+    /// open way exists (SUMO: a vehicle is not routed over a lane it may not use): open means
+    /// `open_to` - the path's rules (`[rule] no_cars`/`bus`/`trucks` by its type) and the density
+    /// of the vehicle's own group at or above `OPEN_DENSITY_FLOOR`, a car of a traffic pool by
+    /// its pool's density. The ways on are ranked and the best tier taken (the lower ones are
+    /// counted, `FORK_FALLBACKS`): open to me and leading on (a dead end too); open to me but
+    /// every way on from it closed (SUMO's bestLanes look-ahead, one step); closed by my
+    /// group's density but driven by another group; driven by no group; closed by the rules
+    /// but not `no_cars`; `no_cars`. A car whose only continuation is closed drives on through
+    /// it and is never taken off moving (a vehicle already on the network has to go somewhere);
+    /// only a lane with no way of its kind at all ends the network for it. A way that ends the
+    /// network just ahead (`Network::reach`) is taken like any other; one whose road ends at the
+    /// loaded tiles' edge (`Network::ends_at_loaded_edge`) only when no other way of its tier is
+    /// left (OMSI geometry: the edge is not a place on the map).
     fn choose_after(
         &mut self,
         net: &Network,
@@ -3300,7 +3337,7 @@ impl AiState {
             match closed(n) {
                 None if leads_on(n) => 0,
                 None => 1,
-                Some(Closed::Density) if net.lanes[n].density > 0.0 => 2,
+                Some(Closed::Density) if density_is_open(net.lanes[n].density) => 2,
                 Some(Closed::Density) => 3,
                 Some(Closed::Rules) if !net.lanes[n].no_cars => 4,
                 Some(Closed::Rules) => 5,

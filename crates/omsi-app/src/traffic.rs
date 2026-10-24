@@ -685,15 +685,91 @@ pub struct DormantCar {
 const MAP_POPULATION_FACTOR: f32 = 8.0;
 
 
-fn street_lane_weight(l: &omsi_sim::traffic::Lane) -> Option<f64> {
-    (l.kind == LaneKind::Street && !l.no_cars && l.density > 0.0 && l.length() >= 8.0)
-        .then(|| l.length() as f64 * l.density.clamp(0.05, 4.0) as f64)
+/// One random traffic group that has vehicle types on the street, for the lanes' spawn shares.
+struct SpawnGroup {
+    /// Its place in `unsched_vehgroups.txt` (None: the map has no such file).
+    uvg: Option<usize>,
+    /// The share of the street traffic it makes: its `unsched_trafficdens.txt` factor (1 without
+    /// the file), not the hour's curve - the lanes' weights are for the whole map and stay put
+    /// through the day, the hour scales the target (`Traffic::street_density`).
+    weight: f32,
+    /// Its vehicle types' `[ai_veh_type]` with the fraction of the group's weight each class has.
+    by_type: Vec<(i32, f32)>,
+}
+
+/// What each lane carries of each group, the lanes' weights for putting cars down
+/// (`SpawnShares::lane_weight`): the group's OWN density on the lane (SUMO: a vehicle is inserted
+/// only on a lane it may use, `Lane::closed_to`), not the greatest any group has there - a
+/// bus-only lane (normal cars 0, buses 1) took a car's share from the buses' 1.
+struct SpawnShares {
+    groups: Vec<SpawnGroup>,
+    total: f32,
+}
+
+/// The most a lane's density counts for as a spawn weight: the editor's densest class is 3, a
+/// hand-edited path above this counts as this.
+const MAX_SPAWN_DENSITY: f32 = 4.0;
+
+impl SpawnShares {
+    fn new(types: &[(Arc<VehicleType>, f32, LaneKind, usize)], groups: &[omsi_map::ailists::UnschedGroup], group_curves: bool, group_uvg: &[Option<usize>]) -> SpawnShares {
+        let mut out = Vec::new();
+        for (g, gr) in groups.iter().enumerate() {
+            let own: Vec<_> = types.iter().filter(|t| t.3 == g && t.2 == LaneKind::Street).collect();
+            let gw: f32 = own.iter().map(|t| t.1).sum();
+            if gw <= 0.0 {
+                continue;
+            }
+            let mut by_type: Vec<(i32, f32)> = Vec::new();
+            for t in own {
+                let vt = t.0.def.ai_veh_type;
+                match by_type.iter_mut().find(|e| e.0 == vt) {
+                    Some(e) => e.1 += t.1 / gw,
+                    None => by_type.push((vt, t.1 / gw)),
+                }
+            }
+            out.push(SpawnGroup { uvg: group_uvg.get(g).copied().flatten(), weight: if group_curves { gr.factor.max(0.0) } else { 1.0 }, by_type });
+        }
+        let total = out.iter().map(|g| g.weight).sum();
+        SpawnShares { groups: out, total }
+    }
+
+    /// How many cars a street lane takes per metre, 1 = the map's normal level: the groups'
+    /// shares of the traffic times what the lane carries of each group, for the vehicle types
+    /// the lane is open to. A `no_cars` lane none at all (no vehicle is put down on it).
+    fn lane_weight(&self, l: &omsi_sim::traffic::Lane, defaults: &[i32]) -> f32 {
+        if l.no_cars || self.total <= 0.0 {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        for g in &self.groups {
+            let pool = g.uvg.map(|u| (defaults, u));
+            let here = l.density_for(pool).min(MAX_SPAWN_DENSITY);
+            for &(vt, frac) in &g.by_type {
+                if l.closed_to(vt, pool, true).is_none() {
+                    sum += g.weight * frac * here;
+                }
+            }
+        }
+        sum / self.total
+    }
+
+    /// The weight of a street lane for the map's population (`fill_map`): its length times
+    /// `lane_weight`, None where none.
+    fn map_weight(&self, l: &omsi_sim::traffic::Lane, defaults: &[i32]) -> Option<f64> {
+        if l.kind != LaneKind::Street || l.length() < 8.0 {
+            return None;
+        }
+        let w = self.lane_weight(l, defaults);
+        (w > 0.0).then(|| l.length() as f64 * w as f64)
+    }
 }
 
 pub struct Traffic {
     pub net: Network,
     /// Sum of the spawn weights of every street lane, updated only as tiles add lanes.
     street_weight: f64,
+    /// What the lanes carry of each group, for the spawn weights.
+    shares: SpawnShares,
     /// Parked cars standing in or beside a lane: per lane, their boxes in the lane's frame
     /// (distance along it and signed lateral offset of the box's middle, + = right, and its
     /// half extents along and across the lane). A car in the lane's middle is an obstacle to
@@ -1423,17 +1499,17 @@ impl Traffic {
         let closed = net
             .lanes
             .iter()
-            .filter(|l| l.no_cars || l.density <= 0.0)
+            .filter(|l| l.no_cars || !omsi_sim::traffic::density_is_open(l.density))
             .count();
         let closed_junctions = net
             .lanes
             .iter()
-            .filter(|l| (l.no_cars || l.density <= 0.0) && l.source == 2)
+            .filter(|l| (l.no_cars || !omsi_sim::traffic::density_is_open(l.density)) && l.source == 2)
             .count();
         let quiet = net
             .lanes
             .iter()
-            .filter(|l| l.density < 1.0 && l.density > 0.0)
+            .filter(|l| l.density < 1.0 && omsi_sim::traffic::density_is_open(l.density))
             .count();
         let prio = net
             .lanes
@@ -1460,11 +1536,13 @@ impl Traffic {
         let light_log = omsi_cfg::env::var("OMSI_DEBUG_LIGHTS").ok();
         let light_prev = lights.iter().map(|c| vec![-100; c.lights.len()]).collect();
         let lanes = 0..net.lanes.len();
-        let street_weight = net.lanes.iter().filter_map(street_lane_weight).sum();
+        let shares = SpawnShares::new(&types, &groups, group_curves, &group_uvg);
+        let street_weight = net.lanes.iter().filter_map(|l| shares.map_weight(l, &uvg_defaults)).sum();
         let sim = omsi_traffic::Simulation::new(&net, lights);
         let mut t = Traffic {
             net,
             street_weight,
+            shares,
             parked,
             parked_waiting: Vec::new(),
             lane_tiles: lane_tiles.into_iter().collect(),
@@ -1819,17 +1897,16 @@ impl Traffic {
         (groups.iter().map(|&g| self.group_density(g)).sum::<f32>() / factors).clamp(0.0, 2.0)
     }
 
-    /// How much of group `g`'s traffic `lane` carries: the path's `[rule] trafficdensity`
-    /// for the group, else the group's default (see `uvg_defaults`).
-    fn lane_group_density(&self, lane: &omsi_sim::traffic::Lane, g: usize) -> f32 {
-        match self.group_uvg.get(g).copied().flatten() {
-            Some(u) => lane.pool_density(&self.uvg_defaults, u),
-            None => lane.density,
-        }
+    /// Group `g`'s place for the access rule (`Lane::closed_to`): the `unsched_vehgroups.txt`
+    /// defaults and its number there (None: the map has no such file).
+    fn pool_of(&self, g: usize) -> omsi_sim::traffic::PoolRef<'_> {
+        self.group_uvg.get(g).copied().flatten().map(|u| (self.uvg_defaults.as_slice(), u))
     }
 
     /// A random vehicle type for a lane of `kind`: on a street `lane`, of the groups that
-    /// lane carries, as much as it carries of each.
+    /// lane is open to (`Lane::closed_to`: the path's rules by the type's `[ai_veh_type]`, and
+    /// the group's own density at or above `OPEN_DENSITY_FLOOR`), as much as it carries of
+    /// each, times what the group makes now.
     fn pick_type(&mut self, kind: LaneKind, lane: Option<usize>) -> Option<Arc<VehicleType>> {
         // a vehicle's share: its weight within its group times what the group makes now
         let group_weight: Vec<f32> = (0..self.groups.len())
@@ -1841,50 +1918,35 @@ impl Traffic {
                     .sum::<f32>()
             })
             .collect();
-        let dens: Vec<f32> = (0..self.groups.len())
-            .map(|g| {
-                if kind == LaneKind::Street {
-                    let here = lane
-                        .and_then(|i| self.net.lanes.get(i))
-                        .map(|l| self.lane_group_density(l, g))
-                        .unwrap_or(1.0);
-                    self.group_density(g) * here
-                } else {
-                    1.0
-                }
-            })
-            .collect();
-        // (and only the vehicles the lane is open to: Grundorf's trucks where it says
-        // `trucks`, Omsi.exe 0x71d714)
-        let barred: Vec<*const VehicleType> = match lane.filter(|_| kind == LaneKind::Street).and_then(|i| self.net.lanes.get(i)) {
-            Some(l) => self.types.iter().filter(|t| !l.allows(t.0.def.ai_veh_type)).map(|t| Arc::as_ptr(&t.0)).collect(),
-            None => Vec::new(),
-        };
+        let street_lane = lane.filter(|_| kind == LaneKind::Street).and_then(|i| self.net.lanes.get(i));
         let weight = |t: &(Arc<VehicleType>, f32, LaneKind, usize)| -> f32 {
             let gw = group_weight.get(t.3).copied().unwrap_or(0.0);
-            if gw <= 0.0 || barred.contains(&Arc::as_ptr(&t.0)) {
-                0.0
-            } else {
-                t.1 / gw * dens.get(t.3).copied().unwrap_or(0.0)
+            if gw <= 0.0 {
+                return 0.0;
             }
+            let mut dens = if kind == LaneKind::Street { self.group_density(t.3) } else { 1.0 };
+            if let Some(l) = street_lane {
+                let pool = self.pool_of(t.3);
+                if l.closed_to(t.0.def.ai_veh_type, pool, true).is_some() {
+                    return 0.0;
+                }
+                dens *= l.density_for(pool);
+            }
+            t.1 / gw * dens
         };
-        let total: f32 = self.types.iter().filter(|t| t.2 == kind).map(weight).sum();
+        let weights: Vec<(Arc<VehicleType>, f32)> = self.types.iter().filter(|t| t.2 == kind).map(|t| (t.0.clone(), weight(t))).collect();
+        let total: f32 = weights.iter().map(|w| w.1).sum();
         if total <= 0.0 {
             return None;
         }
         let mut x = self.rand_f() as f32 * total;
-        for t in self.types.iter().filter(|t| t.2 == kind) {
-            let w = weight(t);
-            if x < w {
-                return Some(t.0.clone());
+        for (ty, w) in &weights {
+            if x < *w {
+                return Some(ty.clone());
             }
             x -= w;
         }
-        self.types
-            .iter()
-            .filter(|t| t.2 == kind)
-            .last()
-            .map(|t| t.0.clone())
+        weights.last().map(|w| w.0.clone())
     }
 
     /// Put parked cars onto the lanes they stand in or beside: (distance along the lane,
@@ -2308,8 +2370,8 @@ impl Traffic {
         // ... and so does how much road there is around: the same number of cars looks
         // empty on a six-lane Berlin junction and crowded on a village lane, so the count
         // asked for is per a neighbourhood of about 250 lanes; and as Omsi spawns on each
-        // path at a rate of its [rule] trafficdensity, paths of low density bring fewer cars
-        // and those of density 0 (or kept clear of cars) none
+        // path at a rate of its [rule] trafficdensity for the groups that drive, paths of low
+        // density bring fewer cars and those closed to every group (or kept clear of cars) none
         let near_density: Vec<f32> = self.net.lanes_starting_near(center, self.spawn_radius)
             .into_iter()
             .map(|i| &self.net.lanes[i])
@@ -2320,7 +2382,7 @@ impl Traffic {
                         .map(|p| (*p - center).length() < self.spawn_radius)
                         .unwrap_or(false)
             })
-            .map(|l| if l.no_cars { 0.0 } else { l.density.clamp(0.0, 4.0) })
+            .map(|l| self.shares.lane_weight(l, &self.uvg_defaults))
             .collect();
         let street_target = (self.target as f32 * density * road_scale(&near_density)).round() as usize;
         // the cars that come into range again, where they have got to
@@ -2586,10 +2648,10 @@ impl Traffic {
                     && l.length() > 8.0
                     && (l.start() - center).truncate().length() < radius
             })
-            // lanes the map keeps clear of cars, and those whose [rule] trafficdensity is
-            // zero, are not spawned on at all; a lower density makes a lane that much less
-            // likely to be picked
-            .filter(|(_, l)| !l.no_cars && l.density > 0.0)
+            // lanes the map keeps clear of cars, and (for the street) those no group that drives
+            // is let on (`SpawnShares::lane_weight`), are not spawned on at all; a lower
+            // density makes a lane that much less likely to be picked
+            .filter(|(_, l)| !l.no_cars && (kind != LaneKind::Street || self.shares.lane_weight(l, &self.uvg_defaults) > 0.0) && (kind == LaneKind::Street || l.density > 0.0))
             // nor on a lane with a stop line (a car put down past the line went through
             // the junction on red), nor on a piece of a junction that meets other ways
             .filter(|(i, _)| self.may_put_on(*i))
@@ -2610,7 +2672,8 @@ impl Traffic {
                 } else {
                     1.0
                 };
-                (i, l.length() * l.density.clamp(0.05, 4.0) * near)
+                let share = if kind == LaneKind::Street { self.shares.lane_weight(l, &self.uvg_defaults) } else { l.density.clamp(0.0, MAX_SPAWN_DENSITY) };
+                (i, l.length() * share * near)
             })
             .collect();
         if candidates.is_empty() {
@@ -2748,11 +2811,11 @@ impl Traffic {
                             .filter(same_kind)
                             .filter(|&n| {
                                 let nl = &self.net.lanes[n];
-                                let density = match pool.filter(|_| pooled) {
-                                    Some(p) => nl.pool_density(&self.uvg_defaults, p),
-                                    None => nl.density,
-                                };
-                                nl.allows(d.ty.def.ai_veh_type) && density > 0.0
+                                // (`pooled`: open to my group; else to any: the greatest density)
+                                match pool.filter(|_| pooled) {
+                                    Some(p) => nl.closed_to(d.ty.def.ai_veh_type, Some((self.uvg_defaults.as_slice(), p)), true).is_none(),
+                                    None => nl.allows(d.ty.def.ai_veh_type) && omsi_sim::traffic::density_is_open(nl.density),
+                                }
                             })
                             .collect()
                     };
@@ -2873,7 +2936,7 @@ impl Traffic {
         let mut near = 0f64;
         for i in nearby {
             let l = &self.net.lanes[i];
-            let Some(w) = street_lane_weight(l) else { continue };
+            let Some(w) = self.shares.map_weight(l, &self.uvg_defaults) else { continue };
             let d = centers.iter().map(|c| (l.start() - *c).truncate().length()).fold(f64::MAX, f64::min);
             if d < self.spawn_radius {
                 near += w;
@@ -2890,7 +2953,7 @@ impl Traffic {
         // The full outside list is only needed while replenishing the map population.
         let outside: Vec<(usize, f32)> = self.net.lanes.iter().enumerate()
             .filter_map(|(i, l)| {
-                let w = street_lane_weight(l)?;
+                let w = self.shares.map_weight(l, &self.uvg_defaults)?;
                 let d = centers.iter().map(|c| (l.start() - *c).truncate().length()).fold(f64::MAX, f64::min);
                 (d > far).then_some((i, w as f32))
             })
@@ -3836,7 +3899,7 @@ impl Traffic {
                 // a stop on a through lane (random traffic runs there) with no bay: the bus
                 // at it blocks the lane
                 let roadside = service.stops.front().is_some_and(|s| {
-                    s.bay.abs() < 0.3 && car.ai.state.route.get(s.ri).and_then(|&l| net.lanes.get(l)).is_some_and(|l| l.density > 0.0)
+                    s.bay.abs() < 0.3 && car.ai.state.route.get(s.ri).and_then(|&l| net.lanes.get(l)).is_some_and(|l| omsi_sim::traffic::density_is_open(l.density))
                 });
                 let v_nom = net.lanes.get(car.ai.state.lane).map_or(13.9, |l| (l.speed_limit_kmh * car.ai.params.speed_factor).min(car.ai.state.max_speed_kmh).max(10.0) / 3.6);
                 let ctx = crate::bus_service::Ctx {
@@ -5287,7 +5350,7 @@ impl Traffic {
             }
             added = self.net.extend(new, LANE_LINK_TOL);
             self.sim.network_grew(&self.net, added.start);
-            self.street_weight += self.net.lanes[added.clone()].iter().filter_map(street_lane_weight).sum::<f64>();
+            self.street_weight += self.net.lanes[added.clone()].iter().filter_map(|l| self.shares.map_weight(l, &self.uvg_defaults)).sum::<f64>();
             log::debug!(
                 "traffic: {} lanes added ({} in all)",
                 added.len(),
@@ -5964,5 +6027,44 @@ mod loaded_edge_tests {
         assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
         // [round 9 A2, fix pass 1] the trip's end at the edge beyond the horizon
         assert_eq!(removal_rule("at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
+    }
+}
+
+#[cfg(test)]
+mod density_semantics_tests {
+    use super::*;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind};
+
+    fn lane(density: f32, groups: &[(u16, f32)]) -> omsi_sim::traffic::Lane {
+        let mut l = LaneBuilder::polyline(vec![DVec3::ZERO, DVec3::new(50.0, 0.0, 0.0)], LaneKind::Street, 3.5);
+        l.density = density;
+        l.group_density = groups.to_vec();
+        l
+    }
+
+    /// B9-1: the spawn weight of a lane is its density for the groups that have types, not the
+    /// greatest any group has: BeijingCity's bus path (normal cars 0, buses 1) and its feeder
+    /// (0.001) weigh nothing for a fleet of normal cars; a lane of 0.1 a tenth; a lane of
+    /// no rules the full 1. Another group with types brings its own share.
+    #[test]
+    fn b9_1_the_spawn_weight_is_the_groups_own_density() {
+        let defaults = [1, 2, 1];
+        let normal = SpawnGroup { uvg: Some(0), weight: 1.0, by_type: vec![(0, 1.0)] };
+        let shares = SpawnShares { groups: vec![normal], total: 1.0 };
+        let w = |l: &omsi_sim::traffic::Lane| shares.lane_weight(l, &defaults);
+        assert_eq!(w(&lane(1.0, &[])), 1.0);
+        assert_eq!(w(&lane(1.0, &[(0, 0.0), (2, 1.0)])), 0.0, "the bus path");
+        assert_eq!(w(&lane(1.0, &[(0, 0.001), (2, 1.0)])), 0.0, "its feeder");
+        assert!((w(&lane(1.0, &[(0, 0.1)])) - 0.1).abs() < 1e-6);
+        assert_eq!(w(&lane(3.0, &[(0, 3.0)])), 3.0);
+        let mut no_cars = lane(1.0, &[]);
+        no_cars.no_cars = true;
+        assert_eq!(w(&no_cars), 0.0);
+        // two groups with types: the buses' group (uvg 2) has the bus path to itself
+        let both = SpawnShares { groups: vec![SpawnGroup { uvg: Some(0), weight: 3.0, by_type: vec![(0, 1.0)] }, SpawnGroup { uvg: Some(2), weight: 1.0, by_type: vec![(0, 1.0)] }], total: 4.0 };
+        assert!((both.lane_weight(&lane(1.0, &[(0, 0.0), (2, 1.0)]), &defaults) - 0.25).abs() < 1e-6);
+        // a type the lane's rules keep off (a bus type on a plain lane) takes no share
+        let buses = SpawnShares { groups: vec![SpawnGroup { uvg: Some(0), weight: 1.0, by_type: vec![(0, 0.5), (2, 0.5)] }], total: 1.0 };
+        assert!((buses.lane_weight(&lane(1.0, &[]), &defaults) - 0.5).abs() < 1e-6);
     }
 }

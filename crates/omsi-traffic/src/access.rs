@@ -1,8 +1,11 @@
 //! May this vehicle use that lane: one rule for the population, the way on at a fork, a
-//! lane change, a pass on the oncoming lane and the lane beside. The maps say it in
-//! several ways at once (BeijingCity keeps the normal cars off its bus lanes with a
-//! `trafficdensity 0` for their group alone and no `no_cars`; Grundorf uses `no_cars` and
-//! `bus`; cycle lanes are 1 m wide), and every stage used to ask a different subset.
+//! lane change, a pass on the oncoming lane, the lane beside and the lane-end rule
+//! (`omsi_sim::traffic::Lane::closed_to`, SUMO's `allow`/`disallow` by vClass). The maps say
+//! it in several ways at once (BeijingCity keeps the normal cars off its bus lanes with a
+//! `trafficdensity` of 0 for their group alone, and off their feeder pieces with 0.001, and
+//! no `no_cars`; Grundorf uses `no_cars` and `bus`; cycle lanes are 1 m wide); a density
+//! below `OPEN_DENSITY_FLOOR` closes a lane to the group. The bus lanes' painted hours are
+//! paint only: no map data gives a clock rule.
 
 use crate::sim::Vehicle;
 use omsi_sim::traffic::{Lane, LaneKind};
@@ -10,7 +13,7 @@ use omsi_sim::traffic::{Lane, LaneKind};
 pub use omsi_sim::traffic::Closed;
 
 /// Is `lane` open to `v` for driving along? (`omsi_sim::traffic::open_to`, the rule itself,
-/// which the way on at a fork in `AiState` asks too: [round 7 A1].)
+/// which the way on at a fork in `AiState` asks too.)
 pub fn open_to(lane: &Lane, v: &Vehicle) -> Result<(), Closed> {
     let kind = if v.is_rail() {
         LaneKind::Rail
