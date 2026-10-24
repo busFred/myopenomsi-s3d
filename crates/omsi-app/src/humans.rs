@@ -69,6 +69,18 @@ const OMSI_PAX_DOORS: usize = 8;
 /// radius people on the pavement came within 0.46 m, and two walking past each other or a
 /// group crossing the road merged into one another in the picture.
 const BODY_OUTSIDE: f64 = 0.28;
+
+/// A standing vehicle is in somebody's way when their next 0.9 m ends within this of its
+/// box (m): a body and 0.15 m (the crowd step's test of what holds a walker).
+const IN_WAY_REACH: f64 = BODY_OUTSIDE + 0.15;
+
+/// [ROLLBACK r4c-P5] Within this of a standing vehicle's box (m) nobody turns round more
+/// than once in PED_TURN_EVERY seconds.
+const TURN_BOX_REACH: f64 = 3.0;
+
+/// Vehicles' boxes further than this (m) from every walker on the ground are left out of
+/// the crowd step (it looks `CrowdParams::sense`, 4 m, round each walker).
+const CROWD_BLOCK_REACH: f64 = 25.0;
 /// [ROLLBACK pedhold-1] How far off their pavement (m) a stroller is still drawn back onto
 /// it by its corridor (`path_corridor_band`).
 const STROLL_BAND: f64 = 2.0;
@@ -6482,6 +6494,8 @@ impl Humans {
             }
             blocks.extend(bodies);
         }
+        // [r9 C1] the boxes by where they are, for the walkers' tests of the ones near them
+        let block_grid = crowd::BlockGrid::new(&blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
         // [ROLLBACK r4c-P4] how long each vehicle has stood; the yields to those that move again end
         // ([ROLLBACK r5-P5] a creep does not count as moving again: `stood_clock`)
         {
@@ -6546,10 +6560,11 @@ impl Humans {
                 }
             }
             let ahead = here + want / speed * 0.9;
-            let in_way = blocks.iter().any(|b| {
-                b.vel.length() < 0.5 && b.near(ahead, BODY_OUTSIDE + 0.15) && {
+            let in_way = block_grid.any_near(ahead, |k| {
+                let b = &blocks[k];
+                b.vel.length() < 0.5 && b.near(ahead, IN_WAY_REACH) && {
                     let (q, inside) = b.closest(ahead);
-                    inside || (ahead - q).length() < BODY_OUTSIDE + 0.15
+                    inside || (ahead - q).length() < IN_WAY_REACH
                 }
             });
             if !in_way {
@@ -6622,7 +6637,7 @@ impl Humans {
                 continue;
             }
             let here = self.people[i].position.truncate();
-            let near_box = blocks.iter().any(|b| b.vel.length() < 0.5 && b.near(here, 3.0));
+            let near_box = block_grid.any_near(here, |k| blocks[k].vel.length() < 0.5 && blocks[k].near(here, TURN_BOX_REACH));
             let p = &mut self.people[i];
             p.turned += dt;
             let v = wants[i].vel;
@@ -6666,7 +6681,10 @@ impl Humans {
             });
             who.push(i);
         }
-        let near_blocks: Vec<Block> = blocks.into_iter().filter(|b| walkers.iter().any(|w| b.near(w.pos, 25.0))).collect();
+        // [r9 C1] (by a grid of the walkers: the same blocks as testing each against all of them)
+        let places: Vec<DVec2> = walkers.iter().map(|w| w.pos).collect();
+        let near = crowd::near_any(&blocks, &places, CROWD_BLOCK_REACH);
+        let near_blocks: Vec<Block> = blocks.into_iter().zip(near).filter(|(_, n)| *n).map(|(b, _)| b).collect();
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
         let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();

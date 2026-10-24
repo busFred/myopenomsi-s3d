@@ -87,6 +87,141 @@ impl Block {
         let d = p - self.center;
         d.dot(r).abs() < self.half.x + margin && d.dot(f).abs() < self.half.y + margin
     }
+
+    /// The axis-aligned bounds (min, max) of every point `near(p, margin)` holds for, a
+    /// little wider (`BOUNDS_SLACK`); None for a box with a coordinate that is not finite:
+    /// `near` is never true of one with a NaN or infinite centre or heading, and one with an
+    /// infinite half size (which no vehicle or parked box has) is dropped.
+    pub fn bounds(&self, margin: f64) -> Option<(DVec2, DVec2)> {
+        let (s, c) = (self.heading.sin().abs(), self.heading.cos().abs());
+        let (hx, hy) = (self.half.x + margin, self.half.y + margin);
+        // the corners of the grown box along the world axes: r = (cos, -sin), f = (sin, cos)
+        let ext = DVec2::new(c * hx + s * hy, s * hx + c * hy) + DVec2::splat(BOUNDS_SLACK);
+        let (lo, hi) = (self.center - ext, self.center + ext);
+        (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+    }
+}
+
+/// [r9 C1] How much wider than exact `Block::bounds` are (m): the rounding of `near`'s dot
+/// products against the bounds' sums is far below a millimetre; a wider bound only adds
+/// candidates that `near` itself then turns down.
+const BOUNDS_SLACK: f64 = 1e-3;
+
+/// [r9 C1] A grid over the ground of the blocks that may lie near a point: each block is filed
+/// in every cell its `bounds(margin)` overlap, in the order of the slice it was built from,
+/// so the list of the cell of `p` holds every block `near(p, m)` is true of for any
+/// `m <= margin`, in that order. A per-walker test of the blocks in its cell then visits the
+/// same blocks in the same order as a test of all of them (the sums of the crowd's forces
+/// come out bit for bit the same), without testing the hundreds far away.
+pub struct BlockGrid {
+    cell: f64,
+    cells: HashMap<(i32, i32), Vec<u32>>,
+    /// Blocks over more than `GRID_WIDE_CELLS` cells a side, tested for every point.
+    wide: Vec<u32>,
+}
+
+/// [r9 C1] Side of a `BlockGrid` cell (m): about a car's length, so that with the crowd's
+/// 4 m look-ahead (`CrowdParams::sense`) a car is filed in two or three cells a side.
+pub const BLOCK_CELL: f64 = 8.0;
+
+/// [r9 C1] A block whose bounds span more cells a side than this goes in `BlockGrid::wide`
+/// (no vehicle or parked box does; it keeps a malformed one from being filed in millions).
+const GRID_WIDE_CELLS: i64 = 64;
+
+/// [r9 C1] Which of `blocks` lie within `margin` of any of `points` (`Block::near`), one flag
+/// per block: the points by a grid of cells of side `margin`, each block tested against the
+/// points of the cells its `bounds(margin)` overlap only (the same answer as testing every
+/// point, which took blocks x walkers tests a frame: 400 x 3700 on a busy street).
+pub fn near_any(blocks: &[Block], points: &[DVec2], margin: f64) -> Vec<bool> {
+    let mut cells: HashMap<(i32, i32), Vec<DVec2>> = HashMap::new();
+    for &p in points {
+        cells.entry(grid_cell(p, margin)).or_default().push(p);
+    }
+    blocks
+        .iter()
+        .map(|b| {
+            let Some((lo, hi)) = b.bounds(margin) else { return false };
+            let ((x0, y0), (x1, y1)) = (grid_cell(lo, margin), grid_cell(hi, margin));
+            if (x1 as i64 - x0 as i64) > GRID_WIDE_CELLS || (y1 as i64 - y0 as i64) > GRID_WIDE_CELLS {
+                return points.iter().any(|&p| b.near(p, margin));
+            }
+            (y0..=y1).any(|y| (x0..=x1).any(|x| cells.get(&(x, y)).is_some_and(|l| l.iter().any(|&p| b.near(p, margin)))))
+        })
+        .collect()
+}
+
+/// The cell of a grid of side `cell` that `p` lies in.
+pub fn grid_cell(p: DVec2, cell: f64) -> (i32, i32) {
+    ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32)
+}
+
+impl BlockGrid {
+    pub fn new(blocks: &[Block], margin: f64, cell: f64) -> BlockGrid {
+        let mut g = BlockGrid { cell, cells: HashMap::new(), wide: Vec::new() };
+        for (i, b) in blocks.iter().enumerate() {
+            let Some((lo, hi)) = b.bounds(margin) else { continue };
+            let ((x0, y0), (x1, y1)) = (grid_cell(lo, cell), grid_cell(hi, cell));
+            if (x1 as i64 - x0 as i64) > GRID_WIDE_CELLS || (y1 as i64 - y0 as i64) > GRID_WIDE_CELLS {
+                g.wide.push(i as u32);
+                continue;
+            }
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    g.cells.entry((x, y)).or_default().push(i as u32);
+                }
+            }
+        }
+        g
+    }
+
+    /// Calls `f` with the index of every block that may lie within the grid's margin of
+    /// `p` (all those that do, and some that do not), in ascending order.
+    pub fn for_each_near(&self, p: DVec2, mut f: impl FnMut(usize)) {
+        let list: &[u32] = self.cells.get(&grid_cell(p, self.cell)).map(|v| v.as_slice()).unwrap_or(&[]);
+        if self.wide.is_empty() {
+            for &i in list {
+                f(i as usize);
+            }
+            return;
+        }
+        // (merged with the wide ones, still in ascending order)
+        let (mut a, mut b) = (list.iter().peekable(), self.wide.iter().peekable());
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (Some(&&x), Some(&&y)) if x < y => a.next(),
+                (Some(_), Some(_)) => b.next(),
+                (Some(_), None) => a.next(),
+                (None, Some(_)) => b.next(),
+                (None, None) => break,
+            };
+            f(*next.unwrap() as usize);
+        }
+    }
+
+    /// The lowest index above `after` of a block that may lie within the grid's margin of
+    /// `p` (with `after` None, the lowest).
+    pub fn next_near(&self, p: DVec2, after: Option<usize>) -> Option<usize> {
+        let first = |list: &[u32]| {
+            let from = after.map(|a| list.partition_point(|&i| i as usize <= a)).unwrap_or(0);
+            list.get(from).map(|&i| i as usize)
+        };
+        let list: &[u32] = self.cells.get(&grid_cell(p, self.cell)).map(|v| v.as_slice()).unwrap_or(&[]);
+        match (first(list), first(&self.wide)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Whether any block that may lie near `p` passes `test` (stops at the first).
+    pub fn any_near(&self, p: DVec2, mut test: impl FnMut(usize) -> bool) -> bool {
+        let mut found = false;
+        self.for_each_near(p, |i| {
+            if !found && test(i) {
+                found = true;
+            }
+        });
+        found
+    }
 }
 
 fn sign(v: f64) -> f64 {
@@ -127,6 +262,10 @@ impl CrowdParams {
 }
 
 const CELL: f64 = 2.0;
+
+/// How near a vehicle's box a walker's body may come before the contact pass pushes it out
+/// (m beyond its radius).
+const CONTACT_REACH: f64 = 0.1;
 
 fn cell_of(space: u64, p: DVec2) -> (u64, i32, i32) {
     (space, (p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32)
@@ -174,6 +313,10 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
         grid.entry(cell_of(w.space, w.pos)).or_default().push(i);
     }
     let reach = (params.sense / CELL).ceil() as i32;
+    // [r9 C1] the blocks by where they are: within `sense` of a walker for the avoidance, within
+    // a body's radius and CONTACT_REACH for the contacts
+    let widest = walkers.iter().map(|w| w.radius).fold(0.0f64, f64::max);
+    let block_grid = BlockGrid::new(blocks, params.sense.max(widest + CONTACT_REACH), BLOCK_CELL);
     let mut new_vel = vec![DVec2::ZERO; walkers.len()];
     for (i, me) in walkers.iter().enumerate() {
         if me.fixed {
@@ -207,16 +350,17 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
         // (a ghost goes through vehicles too - the last way out of a jam - unless they are
         // solid to it)
         if me.space == 0 && (!me.ghost || me.solid) {
-            for b in blocks {
+            block_grid.for_each_near(me.pos, |k| {
+                let b = &blocks[k];
                 if !b.near(me.pos, params.sense) {
-                    continue;
+                    return;
                 }
                 let (q, inside) = b.closest(me.pos);
                 if inside {
-                    continue;
+                    return;
                 }
                 avoid += ttc_force(params, me.pos, me.vel, q, b.vel, me.radius + 0.05);
-            }
+            });
         }
         // Straight at somebody the force only brakes, and two people stop nose to nose:
         // a walker then steps to the right, as people do.
@@ -288,8 +432,13 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
             if w.fixed || w.ghost || w.space != 0 {
                 continue;
             }
-            for b in blocks {
-                if !b.near(w.pos, w.radius + 0.1) {
+            // (every block in turn, as they lie: a push out of one moves the walker, and the
+            // next block is looked for in the cell of where the walker is now)
+            let mut after = None;
+            while let Some(k) = block_grid.next_near(w.pos, after) {
+                after = Some(k);
+                let b = &blocks[k];
+                if !b.near(w.pos, w.radius + CONTACT_REACH) {
                     continue;
                 }
                 let (q, inside) = b.closest(w.pos);
@@ -770,5 +919,111 @@ mod tests {
         assert!((h1 - 9.0).abs() < 1e-6 || (h1 - 351.0).abs() < 1e-6, "{h1}");
         assert!((angle_diff(350.0, 10.0) - 20.0).abs() < 1e-9);
         assert!((heading_of(DVec2::new(1.0, 0.0)) - 90.0).abs() < 1e-9);
+    }
+
+    /// A deterministic scatter of vehicle boxes, points round them, one box far too big for
+    /// the grid and one that is not finite.
+    fn scatter() -> (Vec<Block>, Vec<DVec2>) {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut r = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut blocks = Vec::new();
+        for _ in 0..300 {
+            let center = DVec2::new(r() * 400.0 - 200.0, r() * 400.0 - 200.0);
+            let half = DVec2::new(0.8 + r() * 0.6, 2.0 + r() * 4.0);
+            blocks.push(Block { center, half, heading: r() * 7.0 - 0.5, vel: DVec2::ZERO });
+        }
+        blocks.insert(17, Block { center: DVec2::ZERO, half: DVec2::new(900.0, 2.0), heading: 0.3, vel: DVec2::ZERO });
+        blocks.insert(40, Block { center: DVec2::new(f64::NAN, 0.0), half: DVec2::ONE, heading: 0.0, vel: DVec2::ZERO });
+        let mut points = Vec::new();
+        for k in 0..3000 {
+            let b = &blocks[k % blocks.len()];
+            let c = if b.center.is_finite() { b.center } else { DVec2::ZERO };
+            points.push(c + DVec2::new(r() * 16.0 - 8.0, r() * 16.0 - 8.0));
+        }
+        (blocks, points)
+    }
+
+    #[test]
+    fn block_grid_lists_every_near_block_in_order() {
+        let (blocks, points) = scatter();
+        let margin = 4.0;
+        let g = BlockGrid::new(&blocks, margin, BLOCK_CELL);
+        assert_eq!(g.wide, vec![17]);
+        let mut seen_near = 0;
+        for &p in &points {
+            let mut cand = Vec::new();
+            g.for_each_near(p, |i| cand.push(i));
+            assert!(cand.windows(2).all(|w| w[0] < w[1]), "ascending: {cand:?}");
+            // the same list one by one
+            let mut chain = Vec::new();
+            let mut after = None;
+            while let Some(k) = g.next_near(p, after) {
+                chain.push(k);
+                after = Some(k);
+            }
+            assert_eq!(chain, cand);
+            for m in [0.1, 0.43, 3.0, 4.0] {
+                for (i, b) in blocks.iter().enumerate() {
+                    if b.near(p, m) {
+                        seen_near += 1;
+                        assert!(cand.contains(&i), "block {i} near {p} by {m} is not listed");
+                    }
+                }
+            }
+            assert!(!cand.contains(&40));
+        }
+        assert!(seen_near > 1000, "{seen_near}");
+    }
+
+    #[test]
+    fn near_any_is_testing_every_point() {
+        let (blocks, points) = scatter();
+        for margin in [4.0, 25.0] {
+            let fast = near_any(&blocks, &points[..200], margin);
+            let slow: Vec<bool> = blocks.iter().map(|b| points[..200].iter().any(|&p| b.near(p, margin))).collect();
+            assert_eq!(fast, slow);
+            assert!(slow.iter().any(|n| *n) && slow.iter().any(|n| !*n));
+        }
+    }
+
+    #[test]
+    fn contacts_look_for_boxes_where_the_walker_is_pushed_to() {
+        // pushed out of a big box across grid cells, the walker meets boxes its first cell
+        // does not list; the result is that of testing every box in turn (the walkers stand
+        // still, so only the contact pass moves them: two passes over the boxes in order)
+        let big = Block { center: DVec2::ZERO, half: DVec2::new(12.0, 12.0), heading: 0.0, vel: DVec2::ZERO };
+        let mut blocks = vec![big];
+        for k in 0..12 {
+            let a = k as f64 * 0.52;
+            blocks.push(Block { center: DVec2::new(a.cos(), a.sin()) * (13.4 + (k % 3) as f64 * 0.3), half: DVec2::new(1.0, 1.0), heading: a, vel: DVec2::ZERO });
+        }
+        let r = 0.28;
+        for k in 0..400 {
+            let start = DVec2::new((k % 20) as f64 * 1.2 - 11.5, (k / 20) as f64 * 1.2 - 11.5);
+            let mut w = [Walker::new(start, r, 0)];
+            step(&mut w, &blocks, &CrowdParams::default(), 1e-3);
+            let mut want = start;
+            for _ in 0..2 {
+                for b in &blocks {
+                    if !b.near(want, r + CONTACT_REACH) {
+                        continue;
+                    }
+                    let (q, inside) = b.closest(want);
+                    let d = want - q;
+                    let dist = d.length();
+                    if inside {
+                        want = q + if dist > 1e-6 { -d / dist } else { DVec2::X } * r;
+                    } else if dist < r {
+                        want = q + if dist > 1e-6 { d / dist } else { DVec2::X } * r;
+                    }
+                }
+            }
+            assert_eq!(w[0].pos, want, "from {start}");
+        }
     }
 }
