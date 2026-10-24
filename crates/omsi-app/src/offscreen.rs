@@ -295,7 +295,7 @@ pub(crate) fn run_offscreen(
                 .ok()
                 .as_ref(),
         );
-        t.night = daylight.brightness < 0.75;
+        t.night = crate::traffic_link::ai_lights_on(&daylight, Some(&weather));
         t.daylight = Some(daylight);
         t.populate(&world, &renderer, &mut scene, center);
     }

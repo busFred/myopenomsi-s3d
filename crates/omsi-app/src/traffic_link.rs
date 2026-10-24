@@ -111,3 +111,15 @@ pub(crate) fn lay_down_poles(
         }
     }
 }
+
+/// Whether the AI vehicles have their lights on (`Traffic::night`): Omsi switches them on below a
+/// light value of 0.75, before the street lamps (0.6), and off after them in the morning; and by
+/// day in fog, rain, snow or under a closed cloud cover, as drivers do. ([round 9 A2 fix pass 2]
+/// one rule for the window and the offscreen harness, which had the light value alone.)
+pub(crate) fn ai_lights_on(daylight: &omsi_sim::Daylight, weather: Option<&omsi_content::weather::Weather>) -> bool {
+    let gloomy = weather.is_some_and(|w| {
+        let (kind, rate) = crate::weather_setup::precip_of(w);
+        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast")
+    });
+    daylight.brightness < 0.75 || gloomy
+}

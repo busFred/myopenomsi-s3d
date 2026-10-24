@@ -177,6 +177,12 @@ pub struct External {
     /// frame.
     #[serde(default)]
     pub signal: Option<i32>,
+    /// [round 9 A2 fix pass 2] A random car beyond the player's perceptual horizon with its lamps
+    /// dark, heading for the edge of the loaded tiles: the edge is its trip's end and it drives
+    /// off the lane's end without stopping (`plan` rule 10b), so no brake lamp lights where a dot
+    /// goes. Set by the app every frame.
+    #[serde(default)]
+    pub edge_trip_end: bool,
 }
 
 impl External {

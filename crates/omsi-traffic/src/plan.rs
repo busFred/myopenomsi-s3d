@@ -2240,7 +2240,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //      road goes on into a tile that is not loaded; the car stops before the lane's end, as a
     //      bus at its loaded route's end, and the game takes it off once nobody sees it (a
     //      dead-end removal) or lets it on when the tile comes
-    if let Some(&(el, d0)) = p.way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())) {
+    //      [round 9 A2 fix pass 2] unless the edge is its trip's end (`External::edge_trip_end`,
+    //      the app's: beyond the horizon, lamps dark): then it drives off the lane's end as at the
+    //      network's end, still moving, and no brake lamp lights
+    if let Some(&(el, d0)) = p.way.iter().filter(|_| !me.external.edge_trip_end).find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())) {
         let end = d0 + net.lanes[el].length() - 0.5;
         min_stop(&mut out.stop, &mut out.why, Some(end.max(st.front - 0.3)), Why::End);
     }

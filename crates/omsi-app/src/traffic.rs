@@ -3705,8 +3705,23 @@ impl Traffic {
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
             let net = &self.net;
+            let viewer = self.viewer;
             let car = &mut self.cars[i];
             let mut ext = External { at_stop: car.at_stop(), standing_for: car.standing_for(day_time), priority: car.vehicle.var("TrafficPriority").unwrap_or(0.0) > 0.5, ..Default::default() };
+            // [round 9 A2 fix pass 2] beyond the horizon with its lamps dark, a random car heading
+            // for the loaded tiles' edge ends its trip there moving (`External::edge_trip_end`):
+            // standing there it would brake, and its brake lamps glow a few pixels at any
+            // distance by day too. Not one already braking or indicating (it stops as before);
+            // once set it holds while the car stays beyond the horizon (a brake for a lead on
+            // the way lights its lamps there, not at the edge)
+            if !car.serves_stops() {
+                let st = &car.ai.state;
+                let heading = std::iter::once(st.lane).chain(st.upcoming()).any(|l| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty()));
+                ext.edge_trip_end = heading
+                    && viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty)))
+                    && st.blinker == 0
+                    && (car.ai.external.edge_trip_end || !st.braking);
+            }
             if let Some(service) = car.bus.as_mut() {
                 let wanted = stop_wishes.as_ref().map(|(alighting, waiting)| alighting.contains(&car.id) || service.stops.front().is_some_and(|s| waiting.contains(&s.id)));
                 // a stop on a through lane (random traffic runs there) with no bay: the bus
@@ -3961,9 +3976,14 @@ impl Traffic {
             {
                 let p = c.vehicle.position;
                 let r = (c.ai.state.length as f64 * 0.5).max(2.0);
-                let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else { RemoveRule::NetworkEnd };
+                // ([round 9 A2 fix pass 2] driven off the loaded tiles' edge as its trip's end:
+                // the far trip end, not the network's)
+                let edge = self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
+                let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else if edge && c.ai.external.edge_trip_end { RemoveRule::FarDeadEnd } else { RemoveRule::NetworkEnd };
+                let seen = self.viewer.is_some_and(|v| v.frames(p, r));
+                self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
                 // ([round 9 A2 fix pass 1] with its distance from the eye, as every removal)
-                self.recorder.note_remove_from(c.id, rule, self.viewer.is_some_and(|v| v.frames(p, r)), c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
+                self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
             }
             if self.debug_population {
                 // [round 7 R7-1] every removal is logged with its rule: the traffic's own
@@ -5713,6 +5733,10 @@ mod respawn_sight_tests {
         let gone: Vec<u64> = super::far_trip_ends(cars.into_iter()).into_iter().collect();
         assert_eq!(gone, vec![1]);
         assert!(super::far_trip_ends(vec![(1u64, true, d(500.0), &head)].into_iter()).is_empty(), "inside the horizon");
+        // [fix pass 2] one that stopped there brakes: its brake lamps glow, it stays
+        let mut braking = Vehicle::default();
+        braking.state.braking = true;
+        assert!(super::far_trip_ends(vec![(1u64, true, d(869.0), &braking)].into_iter()).is_empty(), "a braking car stays");
     }
 }
 

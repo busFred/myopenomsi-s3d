@@ -659,14 +659,9 @@ impl ApplicationHandler for App {
                     // the AI's lights (and a bus's saloon lamps, which its scripts switch with
                     // them): by the time of day, and by day in fog, rain, snow or under a
                     // closed cloud cover as drivers do
-                    let gloomy = self.weather.as_ref().map(|w| {
-                        let (kind, rate) = precip_of(w);
-                        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast")
-                    }).unwrap_or(false);
-                    // Omsi switches the AI's lights on below a light value of 0.75, before
-                    // the street lamps (0.6), and off after them in the morning
+                    // ([round 9 A2 fix pass 2] one rule with the offscreen harness: `ai_lights_on`)
                     let daylight = omsi_sim::Daylight::compute(&self.clock, self.envir.as_ref());
-                    t.night = daylight.brightness < 0.75 || gloomy;
+                    t.night = crate::traffic_link::ai_lights_on(&daylight, self.weather.as_ref());
                     t.daylight = Some(daylight);
                     let __t2 = Instant::now();
                     t.others = lan_outlines(&self.remotes);

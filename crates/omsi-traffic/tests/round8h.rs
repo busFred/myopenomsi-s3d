@@ -289,12 +289,14 @@ fn h8_7_a_car_stops_at_the_loaded_edge_and_drives_off_the_maps_end() {
     }
 }
 
-/// [round 9 A2, fix pass 1] A queue of three at the loaded tiles' edge: the front stops at the end
-/// (`Why::End`), the two behind it queue (`in_a_queue`). Beyond the horizon the front's trip ends
-/// at once (`goes_far`), never a follower; once it has gone the next drives up and goes as it
-/// arrives - one per arrival, no row at once. Inside the horizon nobody goes by this rule.
+/// [round 9 A2, fix pass 1 and 2] A queue of three that stopped at the loaded tiles' edge (no trip
+/// end set: it came while lit, or from inside the horizon): the front stands at the end
+/// (`Why::End`) braking, the two behind it queue. A car standing there brakes - its brake lamps
+/// glow - so none goes by `goes_far` (pass 2: lamps dark only); with the brake lamp out (the
+/// renderer's lamp shown dark) the front alone would go, never a follower, never inside the
+/// horizon.
 #[test]
-fn a2_beyond_the_horizon_the_loaded_edge_is_the_trips_end_one_car_per_arrival() {
+fn a2_a_car_standing_at_the_edge_stays_while_its_lamps_glow() {
     use omsi_traffic::removal::goes_far;
     let mut net = Network::default();
     net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
@@ -317,11 +319,14 @@ fn a2_beyond_the_horizon_the_loaded_edge_is_the_trips_end_one_car_per_arrival() 
         }
     };
     run(&mut sim, &mut cars, 30.0);
-    assert_eq!(going(&cars, true), vec![1], "the front only");
-    assert!(going(&cars, false).is_empty(), "inside the horizon");
-    cars.remove(0);
-    run(&mut sim, &mut cars, 30.0);
-    assert_eq!(going(&cars, true), vec![2], "the next as it arrives");
+    assert!(cars[0].state.braking, "standing at the edge it brakes");
+    assert!(going(&cars, true).is_empty(), "a braking car stays");
+    let mut dark = cars.clone();
+    for v in &mut dark {
+        v.state.braking = false;
+    }
+    assert_eq!(going(&dark, true), vec![1], "the front only");
+    assert!(going(&dark, false).is_empty(), "inside the horizon");
 }
 
 /// [H8-8, fix pass 2] A pull-out from 3 m off its lane (steerable move 7.86 m) with people where
@@ -432,3 +437,40 @@ fn a4_random_cars_do_not_turn_towards_the_loaded_edge_when_another_way_leads_on(
     assert!(n > 50 && n < 150, "the tile loaded: the branch is a way like any other ({n} of 200)");
     assert_eq!(picks(&build(true, false)), 200, "the only way on is still taken");
 }
+
+/// [round 9 A2 fix pass 2] With the edge its trip's end (`External::edge_trip_end`, beyond the
+/// horizon, lamps dark), a car does not stop at the loaded tiles' edge: it drives off the lane's
+/// end still moving and never brakes (no brake lamp lights); without it, it stops as before.
+#[test]
+fn a2_pass2_beyond_the_horizon_a_car_drives_off_the_loaded_edge_without_braking() {
+    for trip_end in [true, false] {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (0.0, 200.0), 1, 0));
+        net.lanes[0].loaded_edge = true;
+        net.link(1.5);
+        net.compute_conflicts();
+        net.compute_reach();
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(1, 0, 60.0, 12.0)];
+        cars[0].external.edge_trip_end = trip_end;
+        sim.update_positions(&net, &mut cars);
+        let (mut gone_at, mut braked, mut t) = (None, false, 0.0);
+        while t < 40.0 && gone_at.is_none() {
+            let v = cars[0].state.speed;
+            sim.tick(&net, DT, &mut cars);
+            if !sim.removed.is_empty() {
+                gone_at = Some(v);
+                break;
+            }
+            braked |= cars[0].state.braking;
+            t += DT;
+        }
+        if trip_end {
+            let v = gone_at.expect("it drove off the edge");
+            assert!(v > 5.0 && !braked, "left at {v:.1} m/s, braked {braked}");
+        } else {
+            assert!(gone_at.is_none() && cars[0].state.speed < 0.3, "stops at the edge as before");
+        }
+    }
+}
+

@@ -112,8 +112,18 @@ pub fn goes_in_view(finished: bool, v: &Vehicle, from_eye: f64) -> bool {
 /// goes at once, in frame too. The queue behind it drives up and each car goes as it arrives, one
 /// per arrival, so no row of cars vanishes at once. Inside the horizon this never fires: there
 /// the edge stays a dead end (round 8 H8-7) and `hidden()` and `goes_in_view` are the ways off.
+/// [fix pass 2] Only with its lamps dark: a car standing at the edge brakes (`AiState::braking`),
+/// and a brake lamp or an indicator glows a few pixels at any distance, so a car that stopped
+/// there stays (the round-8 stop); the trip's end is normally made moving, before any braking
+/// (`External::edge_trip_end`, `plan` rule 10b).
 pub fn goes_far(at_dead_end: bool, beyond_horizon: bool, v: &Vehicle) -> bool {
-    at_dead_end && beyond_horizon && !in_a_queue(&v.last)
+    at_dead_end && beyond_horizon && lamps_dark(v) && !in_a_queue(&v.last)
+}
+
+/// [round 9 A2 fix pass 2] No lamp of the vehicle's own glows: not braking, no indicator (the
+/// headlights are the app's, by the light of the day: no horizon at all then).
+pub fn lamps_dark(v: &Vehicle) -> bool {
+    !v.state.braking && v.state.blinker == 0
 }
 
 #[cfg(test)]
@@ -183,6 +193,12 @@ mod tests {
     fn a2_at_the_edge_beyond_the_horizon_the_trip_ends() {
         let mut v = Vehicle::default();
         assert!(goes_far(true, true, &v), "at once, no waiting time");
+        v.state.braking = true;
+        assert!(!goes_far(true, true, &v), "a braking car stays: its brake lamps glow");
+        v.state.braking = false;
+        v.state.blinker = 1;
+        assert!(!goes_far(true, true, &v), "an indicator glows");
+        v.state.blinker = 0;
         assert!(!goes_far(true, false, &v), "inside the horizon");
         assert!(!goes_far(false, true, &v), "not at the edge");
         v.last = Decision { lead_id: Some(9), lead: Some(Lead { gap: 3.0, speed: 0.0, acc: 0.0 }), ..Default::default() };
