@@ -2473,19 +2473,17 @@ impl Traffic {
         }
     }
 
-    /// Now and then a car parked at the kerb near the player drives off: the parked object
-    /// goes (its space stays empty) and the AI car of the same folder takes its place, in
-    /// the parking position, indicating, and pulls out into its lane once the road behind
-    /// it is clear. Called with every population pass (about every two seconds).
-    /// [round 8 H8-1/H8-8, fix pass 2] The parked object that signals to pull out
-    /// (`pending_pull_out`): once its signalling time has run, the frame the one pull-out rule
-    /// passes (`plan::pull_out_clear`: every vehicle driving up the lane, the players too, beyond
-    /// its own secure gap; nobody on the strip its body sweeps from its offset onto the lane) and
-    /// its lane point is clear (`spawn_clear`), it leaves the kerb: the AI car is made where it
-    /// was parked, `pulling_out`, and drives out over the shortest move it can steer from rest.
-    /// Until then it stays a parked object (SUMO: a parked vehicle enters only when
-    /// `isInsertionSuccess` passes, MSVehicleTransfer.cpp ~135-149); no AI car waits at the offset.
-    /// (The scenery object shows no indicator: the time runs, the lamps do not blink.)
+    /// The parked object that signals to pull out (`pending_pull_out`): once its signalling
+    /// time has run and the one pull-out rule passes (`plan::pull_out_clear`: every vehicle
+    /// driving up the lane, the players too, beyond its own secure gap; nobody on the strip its
+    /// body sweeps from its offset onto the lane) and its lane point is clear (`spawn_clear`),
+    /// it leaves the kerb: the parked object goes (its space stays empty), the AI car of the
+    /// same folder is made where it was parked, `pulling_out`, and drives out over the shortest
+    /// move it can steer from rest. Until then it stays a parked object (SUMO: a parked vehicle
+    /// enters only when `isInsertionSuccess` passes, MSVehicleTransfer.cpp ~135-149); no AI car
+    /// waits at the offset. The parked object is scenery and shows no indicator, a limit of the
+    /// scenery objects: the signalling is only the time that runs before the rule is asked, and
+    /// the lamp lights (left indicator) from the frame the AI car replaces the object.
     fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
         let Some(pp) = self.pending_pull_out.clone() else { return };
         let parked = world.parked_objects.lock().get(&pp.key).map(|p| p.pos);
@@ -2535,6 +2533,9 @@ impl Traffic {
         }
     }
 
+    /// Now and then (`PULL_OUT_CHANCE` per call, called with every population pass, about every
+    /// two seconds) a car parked at the kerb 25-180 m from the player is chosen to drive off: it
+    /// becomes `pending_pull_out` (`advance_pull_out`).
     pub fn pull_out_parked(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
         if self.pending_pull_out.is_some() {
             self.advance_pull_out(world, renderer, scene, center);
