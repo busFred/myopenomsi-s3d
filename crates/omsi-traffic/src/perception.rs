@@ -1341,15 +1341,13 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let stepping_in = p.vel.dot(my_right) * off < -0.01 && (off.abs() as f32) < half + STEP_NEAR;
         let t = if stepping_in { (dist / v.max(1.0)).clamp(2.0, STEP_LOOK) } else { (dist / v.max(1.0)).min(2.0) };
         let later = p.pos.truncate() + p.vel * t as f64;
-        // (where somebody waiting for a bus is, not where their shuffle would take them; [P2,
-        // A9-2] and, for the strip, anybody off a crossing who is not walking towards my axis at
-        // `STEP_SPEED` or more: SUMO's nextBlocking takes a person where they are, and who walks
-        // a pavement keeps to it (`humans` P1c); somebody shuffling towards the lane under
-        // walking pace is no step (the 08:37 bus #30339 held ~40 s by two walkers at 0.45 m/s
-        // whose projected step reached its strip); one walking out into the road is followed
-        // as before, and the body test below looks where a step of `STEP_SPEED` takes anybody)
-        let toward_axis = -(p.vel.dot(my_right) as f32) * (off as f32).signum();
-        let now_only = at_kerb_of_stop || my_waiter || (!on_crossing && toward_axis < STEP_SPEED);
+        // (where somebody waiting for a bus is, not where their shuffle would take them; anybody
+        // else also where their step takes them. [P2, A9-2] Taking the people off a crossing
+        // where they are, or with their step only above walking pace (`STEP_SPEED`), failed the
+        // replay gate: the fixtures' recorded walkers cross lanes off any crossing (viz4: 21 ->
+        // 53 and -> 28 severe contacts); with walkers kept to their paths, `humans` P1c, it is
+        // for fixtures recorded after it)
+        let now_only = at_kerb_of_stop || my_waiter;
         let positions: &[DVec2] = if now_only { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
         let stepped: [DVec2; 2] = [p.pos.truncate(), later];
         // ([fix pass 1, 2; pass 2, 3] anybody whose body is over mine - beside it or behind

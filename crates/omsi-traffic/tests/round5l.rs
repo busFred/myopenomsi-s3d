@@ -416,10 +416,10 @@ fn walkers_beside(x0: f64) -> Vec<Person> {
     (0..4).map(|k| walker(x0 + k as f64 * 0.7, -1.3 - 0.07 * k as f64, 0.0, 0.1)).collect()
 }
 
-/// Four walkers beside the 1.9 m lane (outside its footprint) whose bodies reach 0.1-0.25 m over
-/// the sedan's flank: 1.0-1.15 m right of the axis, shuffling at 0.1 m/s towards the lane.
+/// Four walkers standing beside the 1.9 m lane (outside its footprint) whose bodies reach
+/// 0.1-0.25 m over the sedan's flank: 1.0-1.15 m right of the axis.
 fn walkers_at_flank(x0: f64) -> Vec<Person> {
-    (0..4).map(|k| walker(x0 + k as f64 * 0.7, -1.0 - 0.05 * k as f64, 0.0, 0.1)).collect()
+    (0..4).map(|k| walker(x0 + k as f64 * 0.7, -1.0 - 0.05 * k as f64, 0.0, 0.0)).collect()
 }
 
 /// Sedan 1 at `s` with `speed` rolls on for `secs` with `people` there: (the least lateral
@@ -446,13 +446,13 @@ fn past_people(net: &Network, me: Vehicle, people: Vec<Person>, others: Vec<Vehi
 
 #[test]
 fn l3_a_car_shifts_half_a_metre_to_pass_walkers_on_the_kerbless_pavement_strip() {
-    // round5 case01 #2827: the walkers 0.05-0.25 m off its flank beside the lane hold nothing
-    // ([P2] SUMO's nextBlocking: their bodies are clear of its width): it drives past them
-    // without standing or shifting
+    // round5 case01 #2827: the walkers 0.05-0.25 m off its flank beside the lane, their shuffle
+    // towards it bringing them over it (their step is followed); the car eases half a metre
+    // towards the middle and drives past them without standing
     let net = jianandong();
     let (lat, least, got_past, stood, me) = past_people(&net, sedan(1, 0, 190.0, 4.0), walkers_beside(205.0), vec![], 15.0, 215.0);
-    assert!(got_past && !stood, "held by walkers clear of its flank: x {:.1} why {:?}", me.pos.x, me.last.why);
-    assert!(lat > -0.1, "shifted {lat:.2} m for walkers clear of its flank");
+    assert!(got_past && !stood, "held by the walkers beside it: x {:.1} why {:?}", me.pos.x, me.last.why);
+    assert!(lat < -0.4 && lat > -0.6, "shifted {lat:.2} m (left is negative)");
     assert!(least > 0.0, "brushed a walker: {least:.2} m");
     // walkers whose bodies reach over its flank, beside the lane: the car eases half a metre
     // towards the middle (0.83 m of room left to the keep-off from the oncoming lane) and
