@@ -444,9 +444,6 @@ pub const MUTUAL_HOLD: f32 = 6.0;
 /// flickering every 0.4 s between a body and none restarted the clock each time (x10 case03,
 /// the dice rolled once in 54 min).
 pub const MUTUAL_GAP: f32 = 1.0;
-/// [round 8 H8-6] A deadlock ring has at least this many members (`Simulation::break_rings`):
-/// two holding each other are a pair, `negotiate`'s.
-pub const RING_MIN: usize = 3;
 /// `MUTUAL_HOLD` is scaled per driver by a factor in this range (the lower id's, seeded by
 /// its id) so that unrelated pairs do not tick in lockstep.
 pub const MUTUAL_JITTER: (f32, f32) = (0.5, 1.5);
@@ -1723,80 +1720,6 @@ impl Simulation {
             vehicles[b].mutual = None;
             vehicles[a].mutual_gap = 0.0;
             vehicles[b].mutual_gap = 0.0;
-        }
-        self.break_rings(vehicles, claim_of);
-    }
-
-    /// [round 8 H8-6] A deadlock ring: three or more standing vehicles, each held by the next -
-    /// the one it eased off for (`ease_for`), else the one its junction refusal waits for
-    /// (`Decision::wait_for`), else its lead or the body across its way - back to the first, none
-    /// held by a red light (that ring opens at the green). Pairs are `negotiate`'s. Nothing in
-    /// the ring will move by itself: the resolver's second pass orders standing contenders of
-    /// one junction, but an ease pins its car whatever the others do, and two pairs' eases chained
-    /// through a queue's lead made a ring (viz5 case02: #10482 eased for #8753, which stood behind
-    /// #8511, eased for #10482; 15 s). Broken as SUMO lets impatience break it (sumo.md 1.5: the
-    /// impatience I = waiting / 180 s grows with the waiting time, and the most impatient driver
-    /// accepts the gap first; 5.3: the waiting time is the teleport's clock): of the members held
-    /// by the junction, the one that has waited longest (`Vehicle::waiting`, then the lower id)
-    /// goes - its own ease ends, and the member it waits for eases off for it (its claim no
-    /// longer stands in its way; `eased_claims` ends that ease once it has gone through). It
-    /// still goes only where its other foes and the bodies let it.
-    fn break_rings(&self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>]) {
-        let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
-        let held = |v: &Vehicle| v.state.speed < STANDING_SPEED && v.last.why != Why::Light;
-        // (each vehicle's one link, and whether it is the junction's: an ease or a refusal)
-        let next: Vec<Option<(usize, bool)>> = vehicles
-            .iter()
-            .map(|v| {
-                if !held(v) {
-                    return None;
-                }
-                let junction = v.ease_for.map(|e| e.0).or(v.last.wait_for);
-                let link = junction.or(v.last.lead_id).or(v.last.body_block)?;
-                by_id.get(&link).filter(|&&o| held(&vehicles[o])).map(|&o| (o, junction.is_some()))
-            })
-            .collect();
-        // (the cycles of that graph: one link each, so each start walks to a cycle or an end)
-        let mut state = vec![0u8; vehicles.len()];
-        let mut rings: Vec<Vec<usize>> = Vec::new();
-        for start in 0..vehicles.len() {
-            let mut path: Vec<usize> = Vec::new();
-            let mut at = start;
-            while state[at] == 0 {
-                state[at] = 1;
-                path.push(at);
-                match next[at] {
-                    Some((o, _)) => at = o,
-                    None => break,
-                }
-            }
-            if state[at] == 1 {
-                if let Some(p) = path.iter().position(|&k| k == at) {
-                    if path.len() - p >= RING_MIN {
-                        rings.push(path[p..].to_vec());
-                    }
-                }
-            }
-            for &k in &path {
-                state[k] = 2;
-            }
-        }
-        for ring in rings {
-            let pick = ring
-                .iter()
-                .filter_map(|&m| {
-                    let (w, junction) = next[m]?;
-                    let (km, kw) = (claim_of[m]?, claim_of[w]?);
-                    let j = self.claims.get(km)?.0.junction;
-                    (junction && self.claims.get(kw)?.0.junction == j).then_some((m, w, j))
-                })
-                .max_by(|a, b| vehicles[a.0].waiting.total_cmp(&vehicles[b.0].waiting).then(vehicles[b.0].id.cmp(&vehicles[a.0].id)));
-            let Some((m, w, j)) = pick else { continue };
-            let mid = vehicles[m].id;
-            vehicles[m].ease_for = None;
-            vehicles[w].ease_for = Some((mid, j, 0.0));
-            vehicles[w].mutual = None;
-            vehicles[w].mutual_gap = 0.0;
         }
     }
 
