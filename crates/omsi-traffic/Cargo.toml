@@ -15,5 +15,7 @@ serde.workspace = true
 # (exact floats: a replay reads back the very numbers the game had)
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 flate2.workspace = true
+# (perception of every vehicle in parallel: a pure read of the network, the simulation and the vehicles)
+rayon.workspace = true
 # (traffic_cases: the replay's warnings on stderr)
 env_logger.workspace = true
