@@ -861,3 +861,26 @@ pub fn write_file(path: &Path, header: &Header, records: &[&Record]) -> io::Resu
     }
     out.finish()?.flush()
 }
+
+#[cfg(test)]
+mod remove_line_tests {
+    use super::{Record, RecordRef};
+    use crate::removal::RemoveRule;
+
+    /// [round 9 A2 fix pass 3] A removal's line carries its rule, whether the eye saw it and its
+    /// distance from the eye; one with no distance is written as before, and an older line (no
+    /// `from_eye`) reads as None.
+    #[test]
+    fn a2_the_remove_line_carries_its_distance() {
+        let line = |from_eye| serde_json::to_string(&RecordRef::Remove { time: 56.0, id: 85, rule: Some(RemoveRule::FarDeadEnd), seen: true, waiting: 0.0, from_eye }).unwrap();
+        let far = line(Some(869.0));
+        assert!(far.contains("\"rule\":\"FarDeadEnd\"") && far.contains("\"from_eye\":869.0"), "{far}");
+        assert!(!line(None).contains("from_eye"));
+        match serde_json::from_str::<Record>(&far).unwrap() {
+            Record::Remove { rule, seen, from_eye, .. } => assert!(rule == Some(RemoveRule::FarDeadEnd) && seen && from_eye == Some(869.0)),
+            _ => panic!("not a removal"),
+        }
+        let old = r#"{"Remove":{"time":1.7,"id":111,"rule":"NetworkEnd","seen":false,"waiting":0.0}}"#;
+        assert!(matches!(serde_json::from_str::<Record>(old).unwrap(), Record::Remove { from_eye: None, .. }));
+    }
+}
