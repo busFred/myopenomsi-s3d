@@ -682,8 +682,8 @@ pub struct Simulation {
     pub day_time: f64,
     pub time_scale: f64,
     pub players: Vec<PlayerView>,
-    /// [Q8-1 fix pass 2-3] Each player's time standing held by nothing (`player_waiting`): the
-    /// player's `Vehicle::unheld_for`.
+    /// Each player's time standing held by nothing (`player_waiting`, from minus its start
+    /// reaction): the player's `Vehicle::unheld_for`.
     pub player_wait: HashMap<u32, f32>,
     /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
     /// speed last frame, the estimate).
@@ -1038,12 +1038,15 @@ impl Simulation {
         }
     }
 
-    /// [Q8-1 fix pass 2-3] The players' time standing held by nothing (`player_wait`), as an AI
-    /// head's `Vehicle::unheld_for`: it runs while the player's vehicle stands and is set back to 0
-    /// when it moves or a red holds it - its claim's `light_red` last frame, the light of a lane it
-    /// stands on, the first lit lane its lanes lead into (the next lit stub along its way: through
-    /// lanes with one way on, every way on at a fork), or the red its follower waits at
-    /// (`Why::Light`).
+    /// The players' time standing held by nothing (`player_wait`), as an AI head's
+    /// `Vehicle::unheld_for`: it runs while the player's vehicle stands and is set back when it
+    /// moves or a red holds it - its claim's `light_red` last frame, the light of a lane it stands
+    /// on, the first lit lane its lanes lead into (the next lit stub along its way: through lanes
+    /// with one way on, every way on at a fork), or the red its follower waits at (`Why::Light`).
+    /// Set back to minus the start reaction of the player's preset (`PLAYER_PRESET`, 0.8 s): an AI
+    /// head let go starts within its reaction, so the player standing that long after its green
+    /// is not yet standing for good either. (SUMO's `startupDelay` is 0; the reaction is OMSI's
+    /// per-driver start delay, `AiState::drive`.)
     fn player_waiting(&mut self, net: &Network, vehicles: &[Vehicle], dt: f32) {
         let is_red = |l: usize| -> Option<bool> {
             let (ctl, li) = net.lanes.get(l)?.traffic_light?;
@@ -1088,7 +1091,7 @@ impl Simulation {
         for (id, moving) in ids {
             let w = self.player_wait.entry(id).or_insert(0.0);
             if moving || red.contains(&id) {
-                *w = 0.0;
+                *w = -DriverParams::preset(PLAYER_PRESET).reaction;
             } else {
                 *w += dt;
             }

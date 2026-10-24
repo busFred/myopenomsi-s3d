@@ -162,3 +162,38 @@ fn j92_a_left_turner_waits_inside_on_green_not_at_its_line() {
     let (Some(a), Some(b)) = (through_at, cross_in_at) else { panic!("turner through {through_at:?}, cross street in {cross_in_at:?}") };
     assert!(a < b, "the cross street went first: turner through at {a:.1} s, cross street over the turn at {b:.1} s");
 }
+
+/// [round 10 Q9-1] The player's time standing held by nothing starts, after its red, from minus
+/// the start reaction of its preset (0.8 s), as an AI head let go starts within its reaction: a
+/// bus that stands 4 s after its green is not yet standing for good (`QUEUE_OBSTACLE_STAND`).
+#[test]
+fn q91_the_players_standing_clock_after_its_red_starts_after_the_start_reaction() {
+    let lane = |y: f64, x0: f64, x1: f64| {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, y, 0.0), DVec3::new(x1, y, 0.0)], LaneKind::Street, 3.5);
+        l.source = 1;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(lane(-3.5, 0.0, 200.0));
+    net.lanes.push(lane(-3.5, 200.0, 400.0));
+    net.lanes[1].traffic_light = Some((0, 0));
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    // (red 10 s, then green)
+    let ctl = TrafficLightController::new(vec![vec![(0, 10.0), (6, 100.0)]], 110.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    sim.players.push(omsi_traffic::PlayerView { id: 0, pos: DVec3::new(193.0, -3.5, 0.0), heading: 90.0, half_len: 6.0, half_width: 1.25, speed: 0.0, still: 60.0, blinker: 0, signalling: 0.0, priority: false });
+    let mut cars: Vec<Vehicle> = Vec::new();
+    let mut at = |secs: f32, sim: &mut Simulation| {
+        run(&net, sim, &mut cars, secs, |_, _, _| {});
+        sim.player_wait.get(&0).copied().unwrap_or(0.0)
+    };
+    let w_red = at(9.0, &mut sim);
+    assert!(w_red < 0.0, "held by its red: {w_red}");
+    // (green from 10 s: 4 s later the clock has run 4 s less the reaction)
+    let w4 = at(5.0, &mut sim);
+    assert!(w4 < omsi_traffic::plan::QUEUE_OBSTACLE_STAND && w4 > 2.0, "4 s after the green: {w4}");
+    let w6 = at(2.0, &mut sim);
+    assert!(w6 >= omsi_traffic::plan::QUEUE_OBSTACLE_STAND, "6 s after the green: {w6}");
+}
