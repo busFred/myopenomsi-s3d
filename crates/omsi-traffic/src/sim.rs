@@ -13,6 +13,7 @@ use glam::{DVec2, DVec3};
 use hashbrown::HashMap;
 use omsi_sim::collision::Obb;
 use omsi_sim::traffic::{AiState, LaneKind, Lead, Network, TrafficLightController};
+use rayon::prelude::*;
 
 /// A player's (or another LAN player's) vehicle as the traffic sees it.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1098,8 +1099,13 @@ impl Simulation {
         self.update_lights(net, vehicles, dt);
         self.player_waiting(net, vehicles, dt);
 
-        // perception: read-only over everything
-        let perceptions: Vec<Perception> = (0..vehicles.len()).map(|i| perception::perceive(net, self, vehicles, i)).collect();
+        // perception: read-only over everything, so every vehicle's in parallel (an indexed
+        // collect keeps the vehicle order: the same Vec the serial map built)
+        let perceptions: Vec<Perception> = {
+            let sim: &Simulation = self;
+            let vs: &[Vehicle] = vehicles;
+            (0..vs.len()).into_par_iter().map(|i| perception::perceive(net, sim, vs, i)).collect()
+        };
 
         // claims and grants at the junctions
         let mut claims: Vec<Claim> = Vec::new();
