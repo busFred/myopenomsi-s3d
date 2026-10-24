@@ -169,6 +169,60 @@ fn far_trip_ends<'a>(cars: impl Iterator<Item = (u64, bool, bool, &'a omsi_traff
     cars.filter(|(_, at_edge, beyond, v)| goes_far(*at_edge, *beyond, v)).map(|c| c.0).collect()
 }
 
+/// [round 9 A2 fix pass 3] What `edge_trip_end` decides on, for one random car this frame.
+#[derive(Debug, Clone, Copy)]
+struct EdgeFlag {
+    /// Metres from its front to where `plan` rule 10b would stop it at the loaded tiles' edge,
+    /// if its way ahead ends there (None: not heading for the edge).
+    d_end: Option<f32>,
+    /// Beyond its perceptual horizon (`Viewer::beyond_horizon`; never with the lamps lit).
+    beyond: bool,
+    blinker: i32,
+    braking: bool,
+    /// Its flag of the frame before.
+    prev: bool,
+    speed: f32,
+    /// Its driver's comfortable braking (`DriverParams::comfort_brake`, m/s²).
+    comfort_brake: f32,
+}
+
+/// [round 9 A2 fix pass 2, 3] Whether the loaded tiles' edge is the car's trip's end
+/// (`External::edge_trip_end`: it drives off the lane's end moving instead of stopping, so no
+/// brake lamp lights where a dot goes). Set while it heads for the edge beyond the horizon with
+/// no indicator, not braking - or already set (a brake for a lead or a light on the way lights
+/// its lamps there, not at the edge). [pass 3] Within its comfortable braking distance of the end
+/// it holds only while not braking: braking there it stops at the edge instead (lamps lit, it
+/// stays, round 8). And once set it holds, whatever the horizon (a zoom, a fast approach) or its
+/// lamps, while the car can no longer stop before the end even at `MAX_BRAKE`: cleared there it
+/// would drive off anyway, as an uncounted network end inside the horizon.
+fn edge_trip_end(e: EdgeFlag) -> bool {
+    let Some(d) = e.d_end else { return false };
+    let v2 = e.speed * e.speed;
+    if e.prev && d < v2 / (2.0 * omsi_sim::traffic::MAX_BRAKE) {
+        return true;
+    }
+    if !e.beyond || e.blinker != 0 {
+        return false;
+    }
+    if d < v2 / (2.0 * e.comfort_brake.max(0.1)) {
+        return !e.braking;
+    }
+    e.prev || !e.braking
+}
+
+/// [round 9 A2 fix pass 2] The rule a car the traffic took off at the network's end is recorded
+/// by: a timetable bus's last resort, a trip ended at the loaded tiles' edge (`edge_trip_end`:
+/// the far trip end, counted as `removed_far`), else the network's own end.
+fn network_end_rule(bus_last_resort: bool, on_edge_lane: bool, edge_trip_end: bool) -> RemoveRule {
+    if bus_last_resort {
+        RemoveRule::BusLastResort
+    } else if on_edge_lane && edge_trip_end {
+        RemoveRule::FarDeadEnd
+    } else {
+        RemoveRule::NetworkEnd
+    }
+}
+
 /// [round 7 R7-1 fix 1] The recorded rule of a population removal, by the reason it logs.
 fn removal_rule(why: &str) -> RemoveRule {
     match why {
@@ -3711,19 +3765,23 @@ impl Traffic {
             let viewer = self.viewer;
             let car = &mut self.cars[i];
             let mut ext = External { at_stop: car.at_stop(), standing_for: car.standing_for(day_time), priority: car.vehicle.var("TrafficPriority").unwrap_or(0.0) > 0.5, ..Default::default() };
-            // [round 9 A2 fix pass 2] beyond the horizon with its lamps dark, a random car heading
-            // for the loaded tiles' edge ends its trip there moving (`External::edge_trip_end`):
-            // standing there it would brake, and its brake lamps glow a few pixels at any
-            // distance by day too. Not one already braking or indicating (it stops as before);
-            // once set it holds while the car stays beyond the horizon (a brake for a lead on
-            // the way lights its lamps there, not at the edge)
+            // [round 9 A2 fix pass 2, 3] beyond the horizon with its lamps dark, a random car
+            // heading for the loaded tiles' edge ends its trip there moving
+            // (`External::edge_trip_end`, the rule `edge_trip_end`)
             if !car.serves_stops() {
                 let st = &car.ai.state;
-                let heading = std::iter::once(st.lane).chain(st.upcoming()).any(|l| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty()));
-                ext.edge_trip_end = heading
-                    && viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty)))
-                    && st.blinker == 0
-                    && (car.ai.external.edge_trip_end || !st.braking);
+                // (where its front meets the edge, as `plan` rule 10b stops it: the lane's end
+                // less half a metre)
+                let d_end = way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())).map(|&(l, d0)| d0 + net.lanes[l].length() - 0.5 - st.front);
+                ext.edge_trip_end = edge_trip_end(EdgeFlag {
+                    d_end,
+                    beyond: viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty))),
+                    blinker: st.blinker,
+                    braking: st.braking,
+                    prev: car.ai.external.edge_trip_end,
+                    speed: st.speed,
+                    comfort_brake: car.ai.params.comfort_brake,
+                });
             }
             if let Some(service) = car.bus.as_mut() {
                 let wanted = stop_wishes.as_ref().map(|(alighting, waiting)| alighting.contains(&car.id) || service.stops.front().is_some_and(|s| waiting.contains(&s.id)));
@@ -3982,7 +4040,7 @@ impl Traffic {
                 // ([round 9 A2 fix pass 2] driven off the loaded tiles' edge as its trip's end:
                 // the far trip end, not the network's)
                 let edge = self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.loaded_edge && l.next.is_empty());
-                let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else if edge && c.ai.external.edge_trip_end { RemoveRule::FarDeadEnd } else { RemoveRule::NetworkEnd };
+                let rule = network_end_rule(respawn.contains(&i), edge, c.ai.external.edge_trip_end);
                 let seen = self.viewer.is_some_and(|v| v.frames(p, r));
                 self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
                 if rule == RemoveRule::FarDeadEnd && self.debug_population {
@@ -5626,6 +5684,53 @@ mod budget_count_tests {
         ];
         assert_eq!(budget_count(cars.iter().copied(), Some((c, 400.0))), 2);
         assert_eq!(budget_count(cars.iter().copied(), None), 3);
+    }
+}
+
+#[cfg(test)]
+mod edge_flag_tests {
+    use super::{edge_trip_end, network_end_rule, EdgeFlag, RemoveRule};
+
+    fn flag() -> EdgeFlag {
+        EdgeFlag { d_end: Some(300.0), beyond: true, blinker: 0, braking: false, prev: false, speed: 12.0, comfort_brake: 3.0 }
+    }
+
+    /// [round 9 A2 fix pass 3] The flag: set heading for the edge beyond the horizon, lamps dark;
+    /// not without the edge ahead (a tile loaded: the lane has a way on), inside the horizon, with
+    /// an indicator, or braking when not yet set; held through a brake on the way once set.
+    #[test]
+    fn a2_the_edge_flag_is_set_and_held() {
+        assert!(edge_trip_end(flag()));
+        assert!(!edge_trip_end(EdgeFlag { d_end: None, ..flag() }), "not heading for the edge (or its tile loaded)");
+        assert!(!edge_trip_end(EdgeFlag { beyond: false, ..flag() }), "inside the horizon");
+        assert!(!edge_trip_end(EdgeFlag { blinker: 1, ..flag() }), "an indicator");
+        assert!(!edge_trip_end(EdgeFlag { braking: true, ..flag() }), "braking, not yet set");
+        assert!(edge_trip_end(EdgeFlag { braking: true, prev: true, ..flag() }), "held through a brake on the way");
+        assert!(!edge_trip_end(EdgeFlag { d_end: None, prev: true, ..flag() }), "the tile loaded: cleared");
+    }
+
+    /// [pass 3, 1] Within its comfortable braking distance of the end (12 m/s at 3 m/s²: 24 m) a
+    /// braking car loses the flag and stops at the edge; [pass 3, 2] closer than it can stop at
+    /// MAX_BRAKE (9 m) a set flag holds whatever the horizon, the indicator or the brake.
+    #[test]
+    fn a2_the_flag_by_braking_distance() {
+        let near = EdgeFlag { d_end: Some(20.0), prev: true, ..flag() };
+        assert!(edge_trip_end(near), "within 24 m, not braking: held");
+        assert!(!edge_trip_end(EdgeFlag { braking: true, ..near }), "within 24 m, braking: stops at the edge");
+        assert!(!edge_trip_end(EdgeFlag { beyond: false, ..near }), "inside the horizon and able to stop: cleared, stops");
+        let late = EdgeFlag { d_end: Some(5.0), prev: true, ..flag() };
+        assert!(edge_trip_end(EdgeFlag { beyond: false, ..late }), "the horizon jumped, it cannot stop: held");
+        assert!(edge_trip_end(EdgeFlag { braking: true, blinker: 1, ..late }), "cannot stop: held");
+        assert!(!edge_trip_end(EdgeFlag { prev: false, beyond: false, ..late }), "never set: not set inside the horizon");
+    }
+
+    /// [pass 3, 3] The rule a network-end removal is recorded by.
+    #[test]
+    fn a2_the_far_trip_end_is_recorded_as_such() {
+        assert_eq!(network_end_rule(false, true, true), RemoveRule::FarDeadEnd);
+        assert_eq!(network_end_rule(false, true, false), RemoveRule::NetworkEnd, "off the edge unflagged");
+        assert_eq!(network_end_rule(false, false, true), RemoveRule::NetworkEnd, "the map's own end");
+        assert_eq!(network_end_rule(true, true, true), RemoveRule::BusLastResort);
     }
 }
 
