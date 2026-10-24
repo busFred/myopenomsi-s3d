@@ -1107,6 +1107,14 @@ const JM_CROSSING_GAP: f32 = 10.0;
 /// the vehicle only while they have waited less than this (s); one standing longer holds it
 /// only from inside the band.
 const CROSSING_STANDING_WAIT: f32 = 2.0;
+/// [P9-2] SUMO's `jmTimegapMinor` default (1 s, `MSLink::myLookaheadTime`): an approaching
+/// person's window on the crossing and mine conflict within this of each other
+/// (`MSLink::blockedAtTime`).
+const JM_TIMEGAP_MINOR: f32 = 1.0;
+/// [P9-2] SUMO's `jmStoplineCrossingGap` default (1 m, `MSPModel::SAFETY_GAP`): a vehicle on the
+/// junction braking for an approaching person stops this far before the crossing
+/// (`MSLink::getLeaderInfo`, `distToPeds`).
+const JM_STOPLINE_CROSSING_GAP: f32 = 1.0;
 
 impl ZebraCut {
     /// [P8-5] SUMO's `blockedAtDist` for somebody on this crossing's walk: they hold a vehicle
@@ -1167,7 +1175,10 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
 
 /// The people in the strip ahead: where to stop for them, and the shift inside the drawn
 /// road that lets the car past the ones beside its lane instead, with where to stop once
-/// shifted (for whom the shift does not clear). `parked_swerve`: a swerve round a parked car
+/// shifted (for whom the shift does not clear). The strip is the car's own footprint and a
+/// body's radius for anybody off a crossing, where they are now ([P2], SUMO's
+/// `MSLane::nextBlocking`), wider and with their step for a crossing's users; persons walking
+/// up to a crossing my way cuts are SUMO's approaching persons ([P9-2]). `parked_swerve`: a swerve round a parked car
 /// already asked for (a shift the other way is not added to it).
 ///
 /// The way is the car's bent way (`AiState::way_points` lays its lateral curve on): a person
@@ -1204,14 +1215,12 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // crossing geometry; past it the strip and body tests below decide) - anybody on its
     // walk who is in my band (crossing flag or not) or, with the crossing flag, walks
     // towards it from within `JM_CROSSING_GAP` holds me short of the crossing, whatever
-    // their pace (position, direction and waiting time, no pace, as blockedAtDist). Not
-    // implemented: SUMO's `myApproachingPersons` (MSLink.cpp, a vehicle already on the
-    // junction braking for a person who will reach the crossing first), nor its "stopped
-    // less than 2 s ago still walks" for somebody whose step is zero (the person's walking
-    // direction is not kept here) (viz4 case04 #18965 moved off at a crossing
-    // while a walker 3.5 m off its axis came at 1.7 m/s; the strip test saw them in its
-    // 2 s step only once they were 0.4 m from its flank). Kerb waiters (on the walking area,
-    // not the crossing) and bus waiters are no crossing users.
+    // their pace (position, direction and waiting time, no pace, as blockedAtDist) (viz4
+    // case04 #18965 moved off at a crossing while a walker 3.5 m off its axis came at 1.7 m/s).
+    // Not implemented: SUMO's "stopped less than 2 s ago still walks" for somebody whose step
+    // is zero (the person's walking direction is not kept here). Kerb waiters (on the walking
+    // area, not the crossing) and bus waiters are no crossing users; somebody walking up to the
+    // crossing with the verdict to go is an approaching person ([P9-2], below).
     let sideways = me.passing.is_some() || st.change.is_some_and(|c| c.bypass);
     let on_walks = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + (JM_CROSSING_GAP + me.half_width) as f64) };
     for z in zebras.iter().filter(|z| z.along - crate::plan::ZEBRA_STOP > st.front) {
@@ -1221,6 +1230,46 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             !p.at_kerb && !p.waiting_for_bus && (p.pos.z - me.pos.z).abs() <= 2.5 && z.blocked_by(net, p, me.half_width, lat)
         }) {
             let stop = z.along - crate::plan::ZEBRA_STOP;
+            holders.push(Holder { stop, along: z.along, axis: 0.0, swervable: false });
+        }
+    }
+    // [P9-2] SUMO's approaching persons (`MSLink::myApproachingPersons`, registered by
+    // `MSPModel_Striping::registerCrossingApproach` with their arrival and leaving time): a
+    // person walking up to a crossing my way cuts with the verdict to go (`Person::approach`,
+    // their step-on point on the crossing within its walk's width along my lane and
+    // `JM_CROSSING_GAP` across it) holds me (1) short of the zebra stop while their window on the
+    // crossing overlaps mine - my front reaching the cut to my rear leaving it - within
+    // `JM_TIMEGAP_MINOR` and I can still brake for the stop at my comfortable deceleration
+    // (`MSLink::blockedAtTime`'s persons); (2) past the zebra stop, short of the cut, when I
+    // reach the cut later than they step on (`getLeaderInfo`: "breaking for approaching
+    // person", the time to the crossing at max(v, 1 m/s)), `JM_STOPLINE_CROSSING_GAP` before it
+    let approaching = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + JM_CROSSING_GAP as f64).into_iter().filter(|&k| sim.people[k].approach.is_some()).collect::<Vec<_>>() };
+    for z in zebras.iter().filter(|z| z.along > st.front) {
+        let Some(walk) = net.lanes.get(z.walk) else { continue };
+        let lane_fwd = DVec2::new(-z.right.y, z.right.x);
+        let v_max = st.max_speed_kmh / 3.6;
+        let comes = approaching.iter().filter_map(|&k| sim.people[k].approach).filter(|&(at, _, _)| {
+            let rel = at - z.at;
+            (rel.dot(lane_fwd).abs() as f32) <= walk.width * 0.5 + crate::plan::PERSON_RADIUS && (rel.dot(z.right).abs() as f32) <= JM_CROSSING_GAP
+        });
+        let zebra_stop = z.along - crate::plan::ZEBRA_STOP;
+        let mut stop = None;
+        for (_, arrive, leave) in comes {
+            if zebra_stop > st.front {
+                let my_arrive = arrival_time(z.along - st.front, v, st.accel, v_max);
+                let my_leave = arrival_time(z.along + st.rear, v, st.accel, v_max);
+                let overlap = !(my_arrive > leave + JM_TIMEGAP_MINOR || my_leave + JM_TIMEGAP_MINOR < arrive);
+                let can_brake = zebra_stop - st.front > v * v / (2.0 * me.params.comfort_brake.max(0.1));
+                if overlap && can_brake {
+                    stop = Some(zebra_stop);
+                    break;
+                }
+            } else if (z.along - st.front) / v.max(1.0) > arrive {
+                stop = Some(z.along - JM_STOPLINE_CROSSING_GAP);
+                break;
+            }
+        }
+        if let Some(stop) = stop {
             holders.push(Holder { stop, along: z.along, axis: 0.0, swervable: false });
         }
     }
@@ -1250,8 +1299,8 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let ahead_of_front = rel.truncate().dot(DVec2::new(hd.sin(), hd.cos())) as f32 - st.front;
         // ([P8 pass 3, C1] only somebody on a walk my body covers: one on the next walk - a
         // crowd stepping onto a short walk a turn crosses 3 m on - goes through the ordinary
-        // strip and body tests below like anybody; w2-jzk #1902 re-accelerated into them.
-        // SUMO's approaching-persons rule, myApproachingPersons, is not implemented: round 9)
+        // strip and body tests below like anybody; w2-jzk #1902 re-accelerated into them; those
+        // still walking up to it are approaching persons, [P9-2] above)
         let on_covered_walk = covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
         if on_covered_walk && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
             if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {

@@ -99,3 +99,95 @@ fn d7_a_vehicle_that_cannot_stop_short_of_the_crossing_is_passing_it() {
     // a point off the lane's footprint is no cut of its way
     assert!(passing(0.0, 8.0, &[BESIDE]).is_empty());
 }
+
+// P9-2 ---------------------------------------------------------------------------------
+
+const DT: f32 = 1.0 / 30.0;
+
+fn lane(pts: &[(f64, f64)], kind: LaneKind) -> omsi_sim::traffic::Lane {
+    LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), kind, 3.5)
+}
+
+/// An eastbound road (lane 0, x -300..-15, a spline lane) into crossing object 9's piece (lane 1,
+/// x -15..45) and on (lane 2), with the object's zebra at x = 23 (lane 3, y -8..8).
+fn road_with_a_zebra() -> Network {
+    let road = |pts: &[(f64, f64)], id: i64| {
+        let mut l = lane(pts, LaneKind::Street);
+        l.source = 1;
+        l.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id, path: 0 });
+        l
+    };
+    let piece = |pts: &[(f64, f64)], path: u16, kind: LaneKind| {
+        let mut l = lane(pts, kind);
+        l.source = 2;
+        l.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 9, path });
+        l.priority = 128.0;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1));
+    net.lanes.push(piece(&[(-15.0, 0.0), (45.0, 0.0)], 0, LaneKind::Street));
+    net.lanes.push(road(&[(45.0, 0.0), (400.0, 0.0)], 2));
+    net.lanes.push(piece(&[(23.0, -8.0), (23.0, 8.0)], 3, LaneKind::Sidewalk));
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    net
+}
+
+fn car_at(front_x: f64, speed: f32) -> omsi_traffic::Vehicle {
+    // (on the object's piece, lane 1, which starts at x = -15)
+    let mut st = omsi_sim::traffic::AiState::new(1, (front_x - 2.0 + 15.0) as f32, 1);
+    st.speed = speed;
+    st.front = 2.0;
+    st.rear = 2.0;
+    st.length = 4.0;
+    st.max_speed_kmh = 100.0;
+    let mut v = omsi_traffic::Vehicle::new(1, omsi_traffic::VehicleClass::Car, st, 0.9, 7919);
+    v.fresh = 0.0;
+    v
+}
+
+/// The car with its front at `front_x` coming east at `speed` past somebody standing at the
+/// zebra's south kerb who will step onto it in `arrive` s (and be across in `arrive + 12` s):
+/// the furthest its front got in `secs`, and whether it stood for people.
+fn past_an_approaching_person(front_x: f64, speed: f32, arrive: Option<f32>, secs: f32) -> (f64, bool) {
+    let net = road_with_a_zebra();
+    let mut sim = Simulation::new(&net, Vec::new());
+    let mut cars = vec![car_at(front_x, speed)];
+    let (mut far, mut stood) = (f64::MIN, false);
+    let mut t = 0.0f32;
+    while t < secs {
+        let approach = arrive.map(|a| (DVec2::new(23.0, -8.0), (a - t).max(0.0), a + 12.0 - t));
+        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, -8.6, 0.0), vel: DVec2::new(0.0, 0.0), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(3), approach }];
+        sim.tick(&net, DT, &mut cars);
+        far = far.max(cars[0].pos.x + 2.0);
+        stood |= cars[0].last.why == omsi_traffic::Why::People && cars[0].state.speed < 0.1;
+        t += DT;
+    }
+    (far, stood)
+}
+
+#[test]
+fn p92_a_car_is_held_short_of_the_zebra_for_a_person_about_to_step_onto_it() {
+    // SUMO's approaching persons (MSLink::blockedAtTime): the person steps on in 1 s, the car 20 m
+    // short at 8 m/s would be on the crossing in their window and can still brake: held at the
+    // zebra stop (2.5 m before the cut at x = 23)
+    let (far, stood) = past_an_approaching_person(0.0, 8.0, Some(1.0), 6.0);
+    assert!(stood && far < 23.0 - 2.0, "front reached {far:.2}, stood {stood}");
+    // nobody approaching: it drives on over the zebra
+    let (far, _) = past_an_approaching_person(0.0, 8.0, None, 6.0);
+    assert!(far > 30.0, "front reached {far:.2}");
+    // stepping on only in 20 s, long after the car has gone over it: not held
+    let (far, _) = past_an_approaching_person(0.0, 8.0, Some(20.0), 6.0);
+    assert!(far > 30.0, "front reached {far:.2}");
+}
+
+#[test]
+fn p92_a_car_past_the_zebra_stop_brakes_for_a_person_who_steps_on_first() {
+    // MSLink::getLeaderInfo's "breaking for approaching person": already past the zebra stop,
+    // 2 m short of the cut at 2 m/s (1 s to it), the person steps on in 0.2 s: it stops 1 m
+    // before the crossing (jmStoplineCrossingGap)
+    let (far, stood) = past_an_approaching_person(21.0, 2.0, Some(0.2), 4.0);
+    assert!(stood && far < 22.6, "front reached {far:.2}, stood {stood}");
+}
