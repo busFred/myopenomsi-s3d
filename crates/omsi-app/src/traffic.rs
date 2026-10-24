@@ -3985,6 +3985,10 @@ impl Traffic {
                 let rule = if respawn.contains(&i) { RemoveRule::BusLastResort } else if edge && c.ai.external.edge_trip_end { RemoveRule::FarDeadEnd } else { RemoveRule::NetworkEnd };
                 let seen = self.viewer.is_some_and(|v| v.frames(p, r));
                 self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
+                if rule == RemoveRule::FarDeadEnd && self.debug_population {
+                    // ([round 9 A2 fix pass 2] its lamps as it goes: none may glow)
+                    log::info!("population t={:.1}: car {} trip end at the loaded tiles' edge, {:.0} m from the eye, in frame {}, speed {:.1}, braking {}, blinker {}, lamps lit {}", self.time, c.id, self.viewer.map(|v| (p - v.pos).length()).unwrap_or(0.0), seen, c.ai.state.speed, c.ai.state.braking, c.ai.state.blinker, self.lamps_lit());
+                }
                 // ([round 9 A2 fix pass 1] with its distance from the eye, as every removal)
                 self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, self.viewer.map(|v| (p - v.pos).length() as f32));
             }
