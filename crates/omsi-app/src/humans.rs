@@ -1739,7 +1739,7 @@ const PED_CLEAR_MARGIN: f32 = 2.0;
 /// lights of the carriageway lanes they cross and of the lanes leading into those (the
 /// soonest; 0 with one showing green now); None where none of them carries a light - the
 /// program gives no clearance.
-fn cars_go_in(ped: &mut PedNet, net: &Network, traffic: &dyn PedLights, paths: &[usize]) -> Option<f32> {
+fn cars_go_in(ped: &PedNet, net: &Network, traffic: &dyn PedLights, paths: &[usize]) -> Option<f32> {
     let crossed: Vec<usize> = paths.iter().flat_map(|&p| ped.crossed_lanes(net, p).to_vec()).collect();
     let mut soonest: Option<f32> = None;
     for &s in &crossed {
@@ -1811,19 +1811,53 @@ trait PedLights {
 
 impl PedLights for Traffic {
     fn light_state(&self, c: usize, li: usize) -> Option<(i32, f32)> {
-        Traffic::light_state(self, c, li)
+        LightsOf::of(self).light_state(c, li)
     }
     fn light_until_go(&self, c: usize, li: usize) -> Option<f32> {
-        Traffic::light_until_go(self, c, li)
+        LightsOf::of(self).light_until_go(c, li)
     }
     fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
-        Traffic::crossing_light(self, lane)
+        LightsOf::of(self).crossing_light(lane)
+    }
+    fn crossing_piece(&self, lane: usize) -> bool {
+        LightsOf::of(self).crossing_piece(lane)
+    }
+    fn vehicle_passing(&self, cuts: &[DVec2]) -> bool {
+        LightsOf::of(self).vehicle_passing(cuts)
+    }
+}
+
+/// [r9 C2] The traffic's lights and crossings as the people on foot read them, without the
+/// rest of `Traffic` (its vehicles cannot be shared between the threads of the people's
+/// read phase): what `Traffic::light_state`, `light_until_go` and `crossing_light` read.
+#[derive(Clone, Copy)]
+struct LightsOf<'a> {
+    sim: &'a omsi_traffic::Simulation,
+    net: &'a Network,
+}
+
+impl<'a> LightsOf<'a> {
+    fn of(t: &'a Traffic) -> LightsOf<'a> {
+        LightsOf { sim: &t.sim, net: &t.net }
+    }
+}
+
+impl PedLights for LightsOf<'_> {
+    fn light_state(&self, c: usize, li: usize) -> Option<(i32, f32)> {
+        let ctl = self.sim.lights.get(c)?;
+        Some((ctl.state(li), ctl.remaining(li)))
+    }
+    fn light_until_go(&self, c: usize, li: usize) -> Option<f32> {
+        self.sim.lights.get(c)?.time_until_go(li)
+    }
+    fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
+        self.sim.crossing_light(self.net, lane)
     }
     fn crossing_piece(&self, lane: usize) -> bool {
         self.sim.junctions.crossing_of(lane).is_some()
     }
     fn vehicle_passing(&self, cuts: &[DVec2]) -> bool {
-        !self.sim.vehicles_passing_crossing(&self.net, cuts).is_empty()
+        !self.sim.vehicles_passing_crossing(self.net, cuts).is_empty()
     }
 }
 
@@ -1861,6 +1895,201 @@ struct Me {
     approach: Option<(DVec2, f32, f32)>,
 }
 
+/// Whether the player, with eyes `eye` (none: about `center`), could see somebody standing at `p`.
+fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
+    match eye {
+        None => (p - center).length() < 150.0,
+        Some(e) => {
+            let d = p + DVec3::Z * 0.9 - e.pos;
+            let dist = d.length();
+            if dist > 230.0 {
+                return false;
+            }
+            dist < 3.0 || d.dot(e.fwd) / dist > e.cos_half
+        }
+    }
+}
+
+/// Is `p` further than `r` from `center` and from every one of `others`?
+fn far_from(center: DVec3, others: &[DVec3], p: DVec3, r: f64) -> bool {
+    (p - center).length() > r && others.iter().all(|c| (p - *c).length() > r)
+}
+
+/// [r9 C2] The yields to standing vehicles (`Yields`) as a kerb decision sees them: the
+/// book itself, in the serial apply phase, or not at all in the parallel read phase, where
+/// a decision that would look a vehicle up in it is marked and made again in the apply
+/// phase, in index order, against the book as the people before it left it (the one
+/// write one pedestrian's decision makes that another's reads in the same frame).
+enum YieldBook<'a> {
+    Book(&'a mut Yields),
+    Deferred { asked: bool },
+}
+
+impl YieldBook<'_> {
+    /// The book, or None (and the decision marked to be made again) in the read phase.
+    fn open(&mut self) -> Option<&mut Yields> {
+        match self {
+            YieldBook::Book(b) => Some(b),
+            YieldBook::Deferred { asked } => {
+                *asked = true;
+                None
+            }
+        }
+    }
+
+    fn asked(&self) -> bool {
+        matches!(self, YieldBook::Deferred { asked: true })
+    }
+}
+
+/// [r9 C2] Pedestrians decided by one job of the read phase at least: a decision takes about
+/// 1.2 us (1.9 ms a frame for 1600 walkers, the round-9 offscreen profile of the jzk scene),
+/// and a rayon job much under 100 us costs more to hand out than it saves (PERF-r8; the AI
+/// bodies' jobs are 50 us at least, AI_JOB_SECS in traffic.rs): about 150 us a job.
+const DECIDE_JOB: usize = 128;
+
+/// [r9 C2] A pedestrian's decision of the frame (task 8, `WalkStreet`) and what it changes of
+/// them, made from the frame's state alone: by many threads at once in the read phase,
+/// taken over in index order in the apply phase (`Humans::take_decision`).
+struct Decision {
+    want: Want,
+    /// They go (`remove`).
+    gone: bool,
+    /// Their new state (None: as it was).
+    state: Option<State>,
+    step_out: Option<(DVec2, f32)>,
+    t_state: f32,
+    on_crossing: bool,
+    last_decision: Option<&'static str>,
+    why: &'static str,
+    walk_pace: f64,
+    walk_rng: u64,
+    /// [P9-2] `Person::approach`.
+    approach: Option<(DVec2, f32, f32)>,
+}
+
+impl Decision {
+    fn of(p: &Person) -> Decision {
+        Decision {
+            want: Want::stand(None, Activity::Stand),
+            gone: false,
+            state: None,
+            step_out: p.step_out,
+            t_state: p.t_state,
+            on_crossing: p.on_crossing,
+            last_decision: p.last_decision,
+            why: p.why,
+            walk_pace: p.walk_pace,
+            walk_rng: p.walk_rng,
+            approach: p.approach,
+        }
+    }
+}
+
+/// [r9 C2] What the pedestrians' decisions read of the people's world, shared by the
+/// threads of the read phase (nothing of it changes during the phase).
+struct DecideCtx<'a> {
+    ped: Option<&'a PedNet>,
+    streams: &'a Streams,
+    eye: Option<Eye>,
+    center: DVec3,
+    lan_centers: &'a [DVec3],
+    time: f64,
+}
+
+impl DecideCtx<'_> {
+    /// What pedestrian `p` wants this frame (task 8, `WalkStreet`).
+    #[allow(clippy::too_many_arguments)]
+    fn decide(&self, p: &Person, dt: f32, world: &World, net: Option<&Network>, lights: Option<&LightsOf>, cars: &[SeenCar], yields: &mut YieldBook) -> Decision {
+        let mut d = Decision::of(p);
+        let pos2 = p.position.truncate();
+        // somebody walking on towards ground that is not loaded goes
+        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
+            d.gone = true;
+            return d;
+        }
+        match &p.state {
+            State::Strolling(walk) => {
+                let seen = seen_from(self.eye, self.center, p.position);
+                // (a stroller goes only once well out of everybody's range and out of sight)
+                let far = far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS * 2.0);
+                let Some(net) = net else {
+                    d.gone = true;
+                    return d;
+                };
+                if far && !seen {
+                    d.gone = true;
+                    return d;
+                }
+                // [ROLLBACK stepout-70] off a bus: first straight away from its side
+                if let Some((tgt, left)) = p.step_out {
+                    let to = tgt - pos2;
+                    if to.length() < 0.25 || left <= 0.0 {
+                        d.step_out = None;
+                    } else {
+                        d.step_out = Some((tgt, left - dt));
+                        d.want = Want { vel: to.normalize() * p.pace, face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+                        return d;
+                    }
+                }
+                let mut walk = walk.clone();
+                d.want = self.walk_want(p, &mut d, &mut walk, net, lights, cars, dt, yields);
+                d.state = Some(State::Strolling(walk));
+                d
+            }
+            State::Standing => {
+                // somebody who got off with no pavement known beside the stop (or off a stop)
+                // looks for one about once a second - those at a stop whose pavement was not
+                // found, or not loaded yet, stood there for good - and walks on along it
+                let t = p.t_state;
+                if let (Some(net), true) = (net, t % 1.0 < dt || t == 0.0) {
+                    let at = p.position;
+                    let found = self.ped.and_then(|pn| pn.nearest(net, at, STANDING_REACH));
+                    // [ROLLBACK reach-93] a pavement across the street does not count (they
+                    // walked into the bus to reach it); with none within reach they are gone
+                    let found = found.filter(|&(lane, s, _)| {
+                        let (q, _) = net.lanes[lane].at(s);
+                        !crosses_street(net, at.truncate(), q.truncate())
+                    });
+                    if let Some((lane, s, _)) = found {
+                        let leg = Leg { lane, a: s, b: s };
+                        d.state = Some(State::Strolling(PedWalk::new(vec![leg], true, 0.0)));
+                        d.t_state = 0.0;
+                        return d;
+                    }
+                    if self.ped.is_some() {
+                        d.gone = true;
+                        return d;
+                    }
+                }
+                // [ROLLBACK respawn-61] as in OMSI 2, somebody who finds no pavement is respawned
+                // (taken away; the spawner puts a pedestrian where one belongs): at once when out
+                // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
+                let gone = !seen_from(self.eye, self.center, p.position) && far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS);
+                if gone || t >= STANDING_GIVE_UP {
+                    d.gone = true;
+                }
+                d
+            }
+            _ => d,
+        }
+    }
+
+    /// Where a walk along the pavement takes somebody next.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_want(&self, p: &Person, d: &mut Decision, walk: &mut PedWalk, net: &Network, lights: Option<&LightsOf>, cars: &[SeenCar], dt: f32, yields: &mut YieldBook) -> Want {
+        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None };
+        let at = Around { net, lights: lights.map(|t| t as &dyn PedLights), cars, streams: self.streams, time: self.time };
+        let w = stroll(self.ped, &at, &mut me, walk, &mut d.walk_rng, yields, dt);
+        d.on_crossing = me.on_crossing;
+        d.last_decision = me.decision;
+        d.why = me.why;
+        d.walk_pace = me.walk_pace;
+        d.approach = me.approach;
+        w
+    }
+}
+
 /// What a stroller sees this frame.
 struct Around<'a> {
     net: &'a Network,
@@ -1869,6 +2098,16 @@ struct Around<'a> {
     /// [ROLLBACK r4c-P4] The people on the carriageway of each crossing (by its key).
     streams: &'a Streams,
     time: f64,
+}
+
+/// [r9 C2] The seed of person `id`'s walk numbers from the world's `seed`: SplitMix64's
+/// finaliser (Steele, Lea and Flood, "Fast splittable pseudorandom number generators",
+/// OOPSLA 2014) of the two, never 0 (`xorshift` stays at 0 for ever).
+fn walk_seed_of(seed: u64, id: u32) -> u64 {
+    let mut z = seed ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) | 1
 }
 
 fn xorshift(x: &mut u64) -> u64 {
@@ -1883,7 +2122,7 @@ fn xorshift(x: &mut u64) -> u64 {
 /// A piece of a crossing proper: it cuts a carriageway, carries a light, or is one of the
 /// pieces of a crossing object's pedestrian crossing (BeijingCity lays its crossings in 1 m
 /// pieces, most of which cut no lane).
-fn core_piece(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> bool {
+fn core_piece(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> bool {
     net.lanes[lane].traffic_light.is_some() || lights.map(|t| t.crossing_piece(lane)).unwrap_or(false) || !ped.crossings(net, lane).is_empty()
 }
 
@@ -1953,7 +2192,7 @@ fn lognormal(median: f64, sigma: f64, z: f64) -> f64 {
 /// change their "kerb" was the drop point in the road (a bus and 26 cars held 66 s by one
 /// man, X10 case09; BeijingCity case04; 22 drop-ins in 93 s at X10 j530, case12). A kerb
 /// piece that cuts no lane stays a candidate (the pavements of junction objects).
-fn stroll_candidate(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, l: usize) -> bool {
+fn stroll_candidate(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, l: usize) -> bool {
     ped.ends.contains_key(&l)
         && net.lanes[l].length() > 4.0
         && !net.lanes[l].no_unsched // [ROLLBACK unsched-93]
@@ -1963,7 +2202,7 @@ fn stroll_candidate(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLigh
 /// [ROLLBACK r4c-P1] The crossing starting with `walk.legs[start]`: the pieces on from it that
 /// cut a carriageway or carry a light, with short pieces between them (a median); a stroll
 /// is planned on straight across where its legs run out. None when no such piece follows.
-fn crossing_span(ped: &mut PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &mut PedWalk, start: usize) -> Option<Cross> {
+fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &mut PedWalk, start: usize) -> Option<Cross> {
     const SHORT: f32 = 6.0;
     if start >= walk.legs.len() {
         return None;
@@ -2046,6 +2285,9 @@ const LIT_FAR_MERGE: f64 = 0.3;
 /// The pavement paths as a walking network: path ends closer than a metre are one
 /// junction, whatever their heading (the road network joins lane ends only when they
 /// continue in the same direction, which leaves every pavement corner open).
+/// Where a pavement lane crosses carriageways (points) and which carriageway lanes it crosses.
+type LaneCuts = (Vec<DVec2>, Vec<usize>);
+
 struct PedNet {
     /// Per pavement lane: its start and end junction.
     ends: HashMap<usize, (usize, usize)>,
@@ -2055,10 +2297,11 @@ struct PedNet {
     /// it, which `out` does not list there: the way on from a dead end there (`next_leg`) and
     /// onward across (`straight_on`), against their way, decided at the kerb like any crossing.
     against: Vec<Vec<usize>>,
-    /// Where each pavement lane crosses a carriageway (lazily), and the carriageway lanes
-    /// it crosses.
-    crossings: HashMap<usize, Vec<DVec2>>,
-    crossed: HashMap<usize, Vec<usize>>,
+    /// Where each pavement lane crosses a carriageway, and the carriageway lanes it
+    /// crosses, by lane (worked out the first time they are asked for). [r9 C2] Each lane's
+    /// is set once, by whichever thread of the people's read phase asks first; the answer
+    /// is a function of the network alone, so who asks first does not matter.
+    cuts: Vec<std::sync::OnceLock<LaneCuts>>,
     /// Pavement lanes by 50 m cell.
     grid: HashMap<(i32, i32), Vec<usize>>,
     /// The junctions and a 1.5 m grid of them, for joining the paths of tiles loaded later.
@@ -2075,8 +2318,7 @@ impl PedNet {
             ends: HashMap::new(),
             out: Vec::new(),
             against: Vec::new(),
-            crossings: HashMap::new(),
-            crossed: HashMap::new(),
+            cuts: Vec::new(),
             grid: HashMap::new(),
             nodes: Vec::new(),
             cells: HashMap::new(),
@@ -2102,6 +2344,12 @@ impl PedNet {
         let before = self.ends.len();
         let walkable = |l: &omsi_sim::traffic::Lane| l.kind == LaneKind::Sidewalk && l.points.len() >= 2 && l.length() >= 0.3;
         let lit: Vec<usize> = (from..net.lanes.len()).filter(|&i| walkable(&net.lanes[i]) && net.lanes[i].traffic_light.is_some()).collect();
+        // a new carriageway may cross pavement paths that are in already (what is worked out
+        // in this call is of the whole network as it is now, which this call does not change)
+        if from > 0 && (from..net.lanes.len()).any(|i| net.lanes[i].kind == LaneKind::Street) {
+            self.cuts.clear();
+        }
+        self.cuts.resize_with(net.lanes.len(), std::sync::OnceLock::new);
         let mut nodes: HashMap<usize, (usize, usize)> = HashMap::new();
         for &i in &lit {
             let l = &net.lanes[i];
@@ -2112,10 +2360,6 @@ impl PedNet {
         }
         for i in from..net.lanes.len() {
             let l = &net.lanes[i];
-            if l.kind == LaneKind::Street && from > 0 {
-                // a new carriageway may cross pavement paths that are in already
-                self.crossings.clear();
-            }
             if !walkable(l) {
                 continue;
             }
@@ -2321,7 +2565,7 @@ impl PedNet {
     /// [ROLLBACK r4c-P1] The leg on from the end of `leg` that turns least (within `max_turn`
     /// degrees) among the lanes `ok` accepts, one-way crossing pieces ending there included
     /// (against their way, [P1b]); not back along `leg`'s lane or its twin.
-    fn straight_on(&mut self, net: &Network, leg: &Leg, max_turn: f64, mut ok: impl FnMut(&mut PedNet, usize) -> bool) -> Option<Leg> {
+    fn straight_on(&self, net: &Network, leg: &Leg, max_turn: f64, mut ok: impl FnMut(&PedNet, usize) -> bool) -> Option<Leg> {
         let node = self.end_node(net, leg)?;
         let (_, h_in) = leg.at(net, leg.len());
         let back = self.ends.get(&leg.lane).copied();
@@ -2353,58 +2597,73 @@ impl PedNet {
         best.map(|b| b.1)
     }
 
-    /// Where pavement lane `lane` crosses a carriageway.
-    fn crossings(&mut self, net: &Network, lane: usize) -> &[DVec2] {
-        if !self.crossings.contains_key(&lane) {
-            let l = &net.lanes[lane];
-            let mut cand: Vec<usize> = Vec::new();
-            for p in &l.points {
-                if let Some(list) = net
-                    .grid
-                    .get(&((p.x / 50.0).floor() as i32, (p.y / 50.0).floor() as i32))
-                {
-                    for &i in list {
-                        if net.lanes[i].kind == LaneKind::Street && !cand.contains(&i) {
-                            cand.push(i);
-                        }
+    /// Where pavement lane `lane` crosses a carriageway, and the carriageway lanes it crosses.
+    fn cuts_of(net: &Network, lane: usize) -> LaneCuts {
+        let l = &net.lanes[lane];
+        let mut cand: Vec<usize> = Vec::new();
+        for p in &l.points {
+            if let Some(list) = net
+                .grid
+                .get(&((p.x / 50.0).floor() as i32, (p.y / 50.0).floor() as i32))
+            {
+                for &i in list {
+                    if net.lanes[i].kind == LaneKind::Street && !cand.contains(&i) {
+                        cand.push(i);
                     }
                 }
             }
-            let mut out = Vec::new();
-            let mut crossed = Vec::new();
-            for i in cand {
-                let o = &net.lanes[i];
-                for w in l.points.windows(2) {
-                    for v in o.points.windows(2) {
-                        if (w[0].z - v[0].z).abs() > 3.0 {
-                            continue;
-                        }
-                        if let Some(x) = seg_cross(
-                            w[0].truncate(),
-                            w[1].truncate(),
-                            v[0].truncate(),
-                            v[1].truncate(),
-                        ) {
-                            if !crossed.contains(&i) {
-                                crossed.push(i);
-                            }
-                            if !out.iter().any(|q: &DVec2| (*q - x).length() < 1.5) {
-                                out.push(x);
-                            }
-                        }
-                    }
-                }
-            }
-            self.crossings.insert(lane, out);
-            self.crossed.insert(lane, crossed);
         }
-        &self.crossings[&lane]
+        let mut out = Vec::new();
+        let mut crossed = Vec::new();
+        for i in cand {
+            let o = &net.lanes[i];
+            for w in l.points.windows(2) {
+                for v in o.points.windows(2) {
+                    if (w[0].z - v[0].z).abs() > 3.0 {
+                        continue;
+                    }
+                    if let Some(x) = seg_cross(
+                        w[0].truncate(),
+                        w[1].truncate(),
+                        v[0].truncate(),
+                        v[1].truncate(),
+                    ) {
+                        if !crossed.contains(&i) {
+                            crossed.push(i);
+                        }
+                        if !out.iter().any(|q: &DVec2| (*q - x).length() < 1.5) {
+                            out.push(x);
+                        }
+                    }
+                }
+            }
+        }
+        (out, crossed)
+    }
+
+    /// `cuts_of`, kept: a lane the network gained since the last `extend` (not kept, as
+    /// none of its pavements is in yet) is worked out afresh.
+    fn lane_cuts(&self, net: &Network, lane: usize) -> std::borrow::Cow<'_, LaneCuts> {
+        match self.cuts.get(lane) {
+            Some(c) => std::borrow::Cow::Borrowed(c.get_or_init(|| PedNet::cuts_of(net, lane))),
+            None => std::borrow::Cow::Owned(PedNet::cuts_of(net, lane)),
+        }
+    }
+
+    /// Where pavement lane `lane` crosses a carriageway.
+    fn crossings(&self, net: &Network, lane: usize) -> std::borrow::Cow<'_, [DVec2]> {
+        match self.lane_cuts(net, lane) {
+            std::borrow::Cow::Borrowed(c) => std::borrow::Cow::Borrowed(&c.0[..]),
+            std::borrow::Cow::Owned(c) => std::borrow::Cow::Owned(c.0),
+        }
     }
 
     /// The carriageway lanes a pavement lane crosses.
-    fn crossed_lanes(&mut self, net: &Network, lane: usize) -> &[usize] {
-        self.crossings(net, lane);
-        &self.crossed[&lane]
+    fn crossed_lanes(&self, net: &Network, lane: usize) -> std::borrow::Cow<'_, [usize]> {
+        match self.lane_cuts(net, lane) {
+            std::borrow::Cow::Borrowed(c) => std::borrow::Cow::Borrowed(&c.1[..]),
+            std::borrow::Cow::Owned(c) => std::borrow::Cow::Owned(c.1),
+        }
     }
 }
 
@@ -2414,14 +2673,14 @@ impl PedNet {
 /// while the pedestrians still have theirs, are turning traffic that gives way. Without
 /// such a light, the pedestrian green `green_left` and two seconds.
 fn pedestrian_window(
-    mut ped: Option<&mut PedNet>,
+    ped: Option<&PedNet>,
     net: &Network,
     traffic: &dyn PedLights,
     paths: &[usize],
     green_left: f32,
 ) -> f32 {
     let mut window = f32::MAX;
-    let crossed: Vec<usize> = match ped.as_deref_mut() {
+    let crossed: Vec<usize> = match ped {
         Some(ped) => paths.iter().flat_map(|&p| ped.crossed_lanes(net, p).to_vec()).collect(),
         None => Vec::new(),
     };
@@ -2482,7 +2741,7 @@ fn plan_next_leg(ped: Option<&PedNet>, net: &Network, walk: &mut PedWalk, rng: &
 /// One frame of a walk along the pavement network: where `me` goes, and what they decide at
 /// the kerbs.
 #[allow(clippy::too_many_arguments)]
-fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rng: &mut u64, yields: &mut Yields, dt: f32) -> Want {
+fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rng: &mut u64, yields: &mut YieldBook, dt: f32) -> Want {
     let net = at.net;
     let pos2 = me.pos;
     me.walk_pace = me.pace;
@@ -2505,7 +2764,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                     let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
                     let walked = c.walked(walk);
                     let rest = (c.total - walked).max(0.0) * if c.total > 0.1 { c.span / c.total } else { 1.0 };
-                    let clearance = ped.as_deref_mut().and_then(|p| cars_go_in(p, net, lights, &paths)).map(|g| (g, rest / hurried(me.id, me.pace) as f32));
+                    let clearance = ped.and_then(|p| cars_go_in(p, net, lights, &paths)).map(|g| (g, rest / hurried(me.id, me.pace) as f32));
                     match change_turns_back(walked, c.lead, &pieces, clearance) {
                         Clear::Back(i) => {
                             walk.turn_back_to(net, c.from + i);
@@ -2533,9 +2792,9 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
     let to_end = leg.len() - walk.s;
     if walk.held == 0.0 && walk.kerb_go.is_none_or(|g| g.0 != walk.leg) && !walk.cross.is_some_and(|c| c.on(walk.leg)) && to_end > KERB_AT && to_end <= kerb_look(me.pace) {
         if walk.leg + 1 >= walk.legs.len() && walk.roam {
-            plan_next_leg(ped.as_deref(), net, walk, rng);
+            plan_next_leg(ped, net, walk, rng);
         }
-        if let (Some(&next), Some(p)) = (walk.legs.get(walk.leg + 1), ped.as_deref_mut()) {
+        if let (Some(&next), Some(p)) = (walk.legs.get(walk.leg + 1), ped) {
             if next.from_end(net) && !core_piece(p, net, at.lights, leg.lane) {
                 if let Some(c) = crossing_span(p, net, at.lights, walk, walk.leg + 1) {
                     match kerb_verdict(p, at, walk, &c, me, yields, to_end) {
@@ -2588,26 +2847,26 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                         me.on_crossing = false;
                         return Want::stand(None, Activity::Stand);
                     }
-                    plan_next_leg(ped.as_deref(), net, walk, rng);
+                    plan_next_leg(ped, net, walk, rng);
                 }
                 let next = walk.legs[walk.leg + 1];
                 // (on a crossing piece, not at a kerb: at the end of a crossing's last piece
                 // every crosser is here - `walk.cross` was just taken - and the span from this
                 // piece steps them off it without a kerb decision; once also somebody put
                 // down on a crossing, which no longer happens since r5-P1/P6b)
-                let mid = !walk.kerb_hold && ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
+                let mid = !walk.kerb_hold && ped.map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
                 // [ROLLBACK r5-P2] (back at the near end after turning round on a crossing with
                 // no pavement leg to stand on: decided as at a kerb - the light and the cars
                 // looked at - not "go" without a verdict, which looped on red: case04/09/12)
                 let at_kerb = (next.from_end(net) || walk.kerb_hold) && !mid;
-                let span = match ped.as_deref_mut() {
+                let span = match ped {
                     Some(p) => crossing_span(p, net, at.lights, walk, if mid { walk.leg } else { walk.leg + 1 }),
                     None => None,
                 };
                 match span {
                     Some(c) if at_kerb => {
                         // (a "go" taken on the way to this kerb stands, `kerb_look`)
-                        let verdict = match ped.as_deref_mut() {
+                        let verdict = match ped {
                             _ if walk.kerb_go.is_some_and(|g| g.0 == walk.leg) => Ok(()),
                             Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0)),
                             None => Ok(()),
@@ -2618,7 +2877,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                                 if walk.held > 0.0 && debug_pax() {
                                     log::info!("t={:.1} pax #{} crosses path {} after waiting {:.0} s", at.time, me.id, next.lane, walk.held);
                                 }
-                                let from_pavement = !ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
+                                let from_pavement = !ped.map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
                                 walk.cross = Some(Cross { kerb: from_pavement.then_some(leg), ..c });
                                 walk.step_on();
                             }
@@ -2641,7 +2900,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
                                     return Want::stand(None, Activity::Stand);
                                 }
                                 me.on_crossing = false;
-                                return wait_at_kerb(ped.as_deref_mut(), at, me, walk, &leg, &next);
+                                return wait_at_kerb(ped, at, me, walk, &leg, &next);
                             }
                         }
                     }
@@ -2663,7 +2922,7 @@ fn stroll(mut ped: Option<&mut PedNet>, at: &Around, me: &mut Me, walk: &mut Ped
     let (p, h) = leg.at(net, (walk.s + 1.3).min(len));
     let lane = &net.lanes[leg.lane];
     let width = (lane.width as f64).max(1.0);
-    let crosses = ped.as_ref().map(|p| p.crossings.get(&leg.lane).map(|x| !x.is_empty()).unwrap_or(false)).unwrap_or(false);
+    let crosses = ped.map(|p| !p.crossings(net, leg.lane).is_empty()).unwrap_or(false);
     // [ROLLBACK r4c-P1] on the crossing from the first steps off the kerb to the far kerb, on
     // every piece of it (the cars of the lanes ahead stop for them)
     me.on_crossing = match walk.cross {
@@ -2897,7 +3156,7 @@ fn kerb_look(pace: f64) -> f32 {
 
 /// Waiting at the kerb before `next`: facing the way across, spread along it and a step back,
 /// [ROLLBACK r4c-P3] off the carriageway (see `kerb_spot`).
-fn wait_at_kerb(mut ped: Option<&mut PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
+fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
     let net = at.net;
     let (_, h) = next.at(net, 0.3);
     let id = me.id;
@@ -2912,7 +3171,7 @@ fn wait_at_kerb(mut ped: Option<&mut PedNet>, at: &Around, me: &Me, walk: &mut P
                 let l = walk.legs[k];
                 // [ROLLBACK r4c-L2] (never back onto a crossing just walked: at an island between
                 // two lights the spot was backed across the first street)
-                if ped.as_deref_mut().map(|p| core_piece(p, net, at.lights, l.lane)).unwrap_or(false) {
+                if ped.map(|p| core_piece(p, net, at.lights, l.lane)).unwrap_or(false) {
                     break;
                 }
                 if let Some(after) = way.last() {
@@ -2930,7 +3189,7 @@ fn wait_at_kerb(mut ped: Option<&mut PedNet>, at: &Around, me: &Me, walk: &mut P
                 let lane_len = net.lanes[l.lane].length();
                 l.a = if l.b >= l.a { 0.0 } else { lane_len };
             }
-            let q = kerb_spot(ped.as_deref(), net, &way, next, spread, back);
+            let q = kerb_spot(ped, net, &way, next, spread, back);
             // ([P1a] somebody refused nearer the kerb than their spot, off every lane's waiter
             // reach, waits where they are: no step back)
             let (kerb, _) = next.at(net, 0.0);
@@ -3166,7 +3425,7 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
 /// the clearance until a light of the carriageway turns green - must do; without a light no
 /// car may be about to pass the crossing. Somebody who has waited very long takes any green
 /// (never a red).
-fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut Yields, approach: f32) -> Result<(), &'static str> {
+fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut YieldBook, approach: f32) -> Result<(), &'static str> {
     let net = at.net;
     let next = walk.legs[c.from];
     let pace = me.pace;
@@ -3228,7 +3487,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
                 // counted: people stepped onto a 28 s crossing 1-4 s before the red)
                 let arrival = t_cross;
                 let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
-                let window = pedestrian_window(Some(&mut *ped), net, t, &paths, left);
+                let window = pedestrian_window(Some(ped), net, t, &paths, left);
                 // (a few go anyway, so that a crowd does not freeze all at once; the change
                 // then turns them back or sends them on, P1)
                 if !makes_it(left, window, arrival) && !(left > 2.0 && late_stepper(me.id, c.key)) {
@@ -3271,6 +3530,10 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             })
         });
         let in_front = in_front.unwrap_or(false);
+        // [r9 C2] (in the read phase: made again in the apply phase, with the book)
+        let Some(yields) = yields.open() else {
+            return Err(YIELDS);
+        };
         match yields.get(&car.id).copied() {
             // (all the yields to one vehicle, resets and renewals too, within PED_YIELD_CAP of
             // the first)
@@ -3345,7 +3608,7 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
 /// [ROLLBACK r4c-L1] Where the pieces `legs` of a crossing cut a carriageway: the pieces' own
 /// cuts and those of the steps between them (a walk leaves every other 1 m piece out, and
 /// the piece over the lane may be one of those).
-fn span_cuts(ped: &mut PedNet, net: &Network, legs: &[Leg]) -> Vec<DVec2> {
+fn span_cuts(ped: &PedNet, net: &Network, legs: &[Leg]) -> Vec<DVec2> {
     let mut out: Vec<DVec2> = Vec::new();
     let mut add = |x: DVec2, out: &mut Vec<DVec2>| {
         if !out.iter().any(|q| (*q - x).length() < 1.5) {
@@ -3565,6 +3828,11 @@ pub struct Person {
     puppet: Option<Puppet>,
     /// LAN play: one of the host's people, drawn where the host says (`mirror_set`).
     remote: bool,
+    /// [r9 C2] The person's own random numbers for their walk (which way on at a junction),
+    /// seeded from the world's seed and their id (`walk_seed_of`): drawn from one sequence
+    /// shared by everybody, a decision depended on everybody's before it in the frame, and
+    /// the decisions could not be made side by side.
+    walk_rng: u64,
 }
 
 impl Person {
@@ -3659,6 +3927,9 @@ pub struct Humans {
     types: Vec<Arc<HumanType>>,
     pub people: Vec<Person>,
     rng: u64,
+    /// [r9 C2] The seed of everybody's own walk numbers (`Person::walk_rng`): the starting
+    /// value of `rng` (the LAN room's seed in a LAN session).
+    walk_seed: u64,
     next_id: u32,
     /// Seconds since the start.
     time: f64,
@@ -3943,6 +4214,7 @@ impl Humans {
     /// the host and clients; subsequent movement remains simulation-local.
     pub fn set_lan_seed(&mut self, seed: u64) {
         self.rng = (seed ^ 0xA5A5_5A5A_1F2E_3D4C) as u64 | 1;
+        self.walk_seed = self.rng;
     }
 
     pub fn new(root: &Path) -> Humans {
@@ -4007,6 +4279,7 @@ impl Humans {
             types,
             people: Vec::new(),
             rng: 0x1234_5678_9ABC_DEF1,
+            walk_seed: 0x1234_5678_9ABC_DEF1,
             next_id: 1,
             time: 0.0,
             cabins: HashMap::new(),
@@ -4286,17 +4559,7 @@ impl Humans {
 
     /// Whether the player could see somebody standing at `p`.
     fn seen(&self, p: DVec3) -> bool {
-        match self.eye {
-            None => (p - self.center).length() < 150.0,
-            Some(e) => {
-                let d = p + DVec3::Z * 0.9 - e.pos;
-                let dist = d.length();
-                if dist > 230.0 {
-                    return false;
-                }
-                dist < 3.0 || d.dot(e.fwd) / dist > e.cos_half
-            }
-        }
+        seen_from(self.eye, self.center, p)
     }
 
     /// The people of OMSI's pool there are now (everybody but avatars and other players'
@@ -4694,6 +4957,7 @@ impl Humans {
             ankles: [Vec3::ZERO; 2],
             puppet: None,
             remote: false,
+            walk_rng: walk_seed_of(self.walk_seed, id),
         });
         Some(self.people.len() - 1)
     }
@@ -6873,15 +7137,50 @@ impl Humans {
             }
             self.streams = streams;
         }
+        // [r9 C2] what everybody on foot wants: decided side by side from the frame's state
+        // (the read phase), then taken over in index order (the apply phase); a decision that
+        // needs the yields to standing vehicles, which the decisions before it in the frame
+        // may change, is made again in the apply phase, in its turn, with the book
+        for p in self.people.iter_mut() {
+            p.t_state += dt;
+        }
+        let decided: Vec<Option<Decision>> = {
+            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+            let people = &self.people;
+            let cars = &cars;
+            let lights = traffic.map(LightsOf::of);
+            let lights = lights.as_ref();
+            (0..people.len())
+                .into_par_iter()
+                .with_min_len(DECIDE_JOB)
+                .map(|i| {
+                    // (None: not on foot, or to be made again in the apply phase)
+                    let p = &people[i];
+                    if p.puppet.is_some() || matches!(p.state, State::Pax(_)) || p.remote {
+                        return None;
+                    }
+                    let mut book = YieldBook::Deferred { asked: false };
+                    let d = ctx.decide(p, dt, world, net, lights, cars, &mut book);
+                    (!book.asked()).then_some(d)
+                })
+                .collect()
+        };
         let mut wants: Vec<Want> = Vec::with_capacity(self.people.len());
-        for i in 0..self.people.len() {
-            self.people[i].t_state += dt;
-            let w = if self.people[i].puppet.is_some() || matches!(self.people[i].state, State::Pax(_)) {
+        for (i, d) in decided.into_iter().enumerate() {
+            let p = &self.people[i];
+            let w = if p.puppet.is_some() || matches!(p.state, State::Pax(_)) {
                 Want::stand(None, Activity::Stand)
-            } else if self.people[i].remote {
+            } else if p.remote {
                 self.mirror_want(i, &buses)
             } else {
-                self.decide(i, dt, world, net, traffic, &cars, &mut remove)
+                let d = match d {
+                    Some(d) => d,
+                    None => {
+                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+                        ctx.decide(&self.people[i], dt, world, net, traffic.map(LightsOf::of).as_ref(), &cars, &mut YieldBook::Book(&mut self.yields))
+                    }
+                };
+                self.take_decision(i, d, &mut remove)
             };
             wants.push(w);
         }
@@ -7016,118 +7315,24 @@ impl Humans {
         taken_ticket
     }
 
-    /// What pedestrian `i` wants this frame (task 8, `WalkStreet`).
-    #[allow(clippy::too_many_arguments)]
-    fn decide(
-        &mut self,
-        i: usize,
-        dt: f32,
-        world: &World,
-        net: Option<&Network>,
-        traffic: Option<&Traffic>,
-        cars: &[SeenCar],
-        remove: &mut Vec<usize>,
-    ) -> Want {
-        let state = self.people[i].state.clone();
-        let pos2 = self.people[i].position.truncate();
-        // somebody walking on towards ground that is not loaded goes
-        if self.people[i].place == Place::Ground && self.people[i].vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
-            remove.push(i);
-            return Want::stand(None, Activity::Stand);
-        }
-        match state {
-            State::Strolling(mut walk) => {
-                let seen = self.seen(self.people[i].position);
-                // (a stroller goes only once well out of everybody's range and out of sight)
-                let far = self.far_from_players(self.people[i].position, STROLL_RADIUS * 2.0);
-                let Some(net) = net else {
-                    remove.push(i);
-                    return Want::stand(None, Activity::Stand);
-                };
-                if far && !seen {
-                    remove.push(i);
-                    return Want::stand(None, Activity::Stand);
-                }
-                // [ROLLBACK stepout-70] off a bus: first straight away from its side
-                if let Some((tgt, left)) = self.people[i].step_out {
-                    let pos2 = self.people[i].position.truncate();
-                    let d = tgt - pos2;
-                    if d.length() < 0.25 || left <= 0.0 {
-                        self.people[i].step_out = None;
-                    } else {
-                        self.people[i].step_out = Some((tgt, left - dt));
-                        self.people[i].state = State::Strolling(walk);
-                        let pace = self.people[i].pace;
-                        return Want { vel: d.normalize() * pace, face: None, give: 1.0, corridor: None, idle: Activity::Stand };
-                    }
-                }
-                let w = self.walk_want(i, &mut walk, net, traffic, cars, dt);
-                self.people[i].state = State::Strolling(walk);
-                w
-            }
-            State::Standing => {
-                // somebody who got off with no pavement known beside the stop (or off a stop)
-                // looks for one about once a second - those at a stop whose pavement was not
-                // found, or not loaded yet, stood there for good - and walks on along it
-                let t = self.people[i].t_state;
-                if let (Some(net), true) = (net, t % 1.0 < dt || t == 0.0) {
-                    let at = self.people[i].position;
-                    let found = self.ped.as_ref().and_then(|pn| pn.nearest(net, at, STANDING_REACH));
-                    // [ROLLBACK reach-93] a pavement across the street does not count (they
-                    // walked into the bus to reach it); with none within reach they are gone
-                    let found = found.filter(|&(lane, s, _)| {
-                        let (q, _) = net.lanes[lane].at(s);
-                        !crosses_street(net, at.truncate(), q.truncate())
-                    });
-                    if let Some((lane, s, _)) = found {
-                        let leg = Leg { lane, a: s, b: s };
-                        self.people[i].state = State::Strolling(PedWalk::new(vec![leg], true, 0.0));
-                        self.people[i].t_state = 0.0;
-                        return Want::stand(None, Activity::Stand);
-                    }
-                    if self.ped.is_some() {
-                        remove.push(i);
-                        return Want::stand(None, Activity::Stand);
-                    }
-                }
-                // [ROLLBACK respawn-61] as in OMSI 2, somebody who finds no pavement is respawned
-                // (taken away; the spawner puts a pedestrian where one belongs): at once when out
-                // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
-                let gone = !self.seen(self.people[i].position) && self.far_from_players(self.people[i].position, STROLL_RADIUS);
-                if gone || t >= STANDING_GIVE_UP {
-                    remove.push(i);
-                }
-                Want::stand(None, Activity::Stand)
-            }
-            _ => Want::stand(None, Activity::Stand),
-        }
-    }
-
-    /// Where a walk along the pavement takes somebody next.
-    fn walk_want(
-        &mut self,
-        i: usize,
-        walk: &mut PedWalk,
-        net: &Network,
-        traffic: Option<&Traffic>,
-        cars: &[SeenCar],
-        dt: f32,
-    ) -> Want {
-        let mut ped = self.ped.take();
-        let p = &self.people[i];
-        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None };
-        let at = Around { net, lights: traffic.map(|t| t as &dyn PedLights), cars, streams: &self.streams, time: self.time };
-        let mut rng = self.rng;
-        let w = stroll(ped.as_mut(), &at, &mut me, walk, &mut rng, &mut self.yields, dt);
-        self.rng = rng;
-        self.ped = ped;
+    /// [r9 C2] Takes over pedestrian `i`'s decision of the frame (see `Decision`).
+    fn take_decision(&mut self, i: usize, d: Decision, remove: &mut Vec<usize>) -> Want {
         let p = &mut self.people[i];
-        p.on_crossing = me.on_crossing;
-        p.last_decision = me.decision;
-        p.why = me.why;
-        p.walk_pace = me.walk_pace;
-        p.approach = me.approach;
-        w
+        if let Some(state) = d.state {
+            p.state = state;
+        }
+        p.step_out = d.step_out;
+        p.t_state = d.t_state;
+        p.on_crossing = d.on_crossing;
+        p.last_decision = d.last_decision;
+        p.why = d.why;
+        p.walk_pace = d.walk_pace;
+        p.walk_rng = d.walk_rng;
+        p.approach = d.approach;
+        if d.gone {
+            remove.push(i);
+        }
+        d.want
     }
 
     /// Take over where the crowd moved person `i`.
@@ -8085,11 +8290,6 @@ pub struct LanPerson {
 }
 
 impl Humans {
-    /// Is `p` further than `r` from us and from every other LAN player?
-    fn far_from_players(&self, p: DVec3, r: f64) -> bool {
-        (p - self.center).length() > r && self.lan_centers.iter().all(|c| (p - *c).length() > r)
-    }
-
     /// The stops and pavements around the other players of a LAN session (host).
     fn populate_lan_centers(
         &mut self,
@@ -8594,7 +8794,7 @@ mod tests {
             LaneKind::Street,
         ));
         net.link(1.5);
-        let mut ped = PedNet::build(&net);
+        let ped = PedNet::build(&net);
         let x = ped.crossings(&net, 0).to_vec();
         assert_eq!(x.len(), 1);
         assert!((x[0] - DVec2::new(0.0, 4.0)).length() < 1e-6);
@@ -9344,8 +9544,15 @@ mod ped_tests {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn frame_with(net: &Network, ped: &mut PedNet, lights: Option<&dyn PedLights>, cars: &[SeenCar], streams: &Streams, yields: &mut Yields, t: f64, me: &mut Me, walk: &mut PedWalk, dt: f32) -> DVec2 {
         let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ me.id as u64;
+        frame_book(net, ped, lights, cars, streams, &mut YieldBook::Book(yields), &mut rng, t, me, walk, dt)
+    }
+
+    /// `frame_with` with the yields as a phase of the frame sees them (`YieldBook`) and the
+    /// person's own random numbers.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn frame_book(net: &Network, ped: &PedNet, lights: Option<&dyn PedLights>, cars: &[SeenCar], streams: &Streams, yields: &mut YieldBook, rng: &mut u64, t: f64, me: &mut Me, walk: &mut PedWalk, dt: f32) -> DVec2 {
         let at = Around { net, lights, cars, streams, time: t };
-        let w = stroll(Some(ped), &at, me, walk, &mut rng, yields, dt);
+        let w = stroll(Some(ped), &at, me, walk, rng, yields, dt);
         me.pos += w.vel * dt as f64;
         if let Some(leg) = walk.legs.get(walk.leg) {
             walk.s = leg.project(net, me.pos.extend(0.0), walk.s).max(walk.s - 0.3);
@@ -10495,6 +10702,70 @@ mod ped_tests {
         let at = |t: f32| seen.iter().find(|(s, _)| *s >= t).unwrap().1;
         assert_eq!(at(5.0), Some(YIELDS));
         assert_eq!(at(6.5), Some("go"));
+    }
+
+    #[test]
+    fn c2_decisions_side_by_side_are_the_ones_made_one_after_the_other() {
+        // [r9 C2] nine people walking up to an unlit crossing a car has stood at for 10 s,
+        // one of a stream ahead of them: decided all from the frame's state with the yields
+        // deferred, then taken over in order (those that asked for the yields decided again
+        // with the book), they walk, decide and leave the yields exactly as decided one
+        // after the other
+        let (net, ped) = crossing(false);
+        let mut streams: Streams = HashMap::new();
+        streams.insert(3, vec![(50, DVec2::new(0.0, -4.5), DVec2::new(0.0, 1.2))]);
+        let start = |k: usize| {
+            let mut walk = across();
+            let a = 19.5 - 1.6 * k as f32;
+            walk.legs[0] = Leg { lane: 2, a, b: 20.0 };
+            let id = 1 + k as u32;
+            (me(id, DVec2::new(-20.0 + a as f64, -5.5), 1.0 + 0.05 * k as f64), walk, walk_seed_of(7, id))
+        };
+        let mut serial: Vec<(Me, PedWalk, u64)> = (0..9).map(start).collect();
+        let mut phased = serial.clone();
+        let (mut ys, mut yp): (Yields, Yields) = (HashMap::new(), HashMap::new());
+        let (mut deferred, mut yielded) = (0, 0);
+        for f in 0..400 {
+            let t = f as f64 * 0.05;
+            let car = [car_before(10.0 + t as f32)];
+            for (m, w, r) in serial.iter_mut() {
+                frame_book(&net, &ped, None, &car, &streams, &mut YieldBook::Book(&mut ys), r, t, m, w, 0.05);
+            }
+            let read: Vec<Option<(Me, PedWalk, u64)>> = phased
+                .iter()
+                .map(|(m, w, r)| {
+                    let (mut m, mut w, mut r) = (m.clone(), w.clone(), *r);
+                    let mut book = YieldBook::Deferred { asked: false };
+                    frame_book(&net, &ped, None, &car, &streams, &mut book, &mut r, t, &mut m, &mut w, 0.05);
+                    (!book.asked()).then_some((m, w, r))
+                })
+                .collect();
+            for (k, d) in read.into_iter().enumerate() {
+                match d {
+                    Some(d) => phased[k] = d,
+                    None => {
+                        deferred += 1;
+                        let (m, w, r) = &mut phased[k];
+                        frame_book(&net, &ped, None, &car, &streams, &mut YieldBook::Book(&mut yp), r, t, m, w, 0.05);
+                    }
+                }
+                yielded += (phased[k].0.decision == Some(YIELDS)) as usize;
+            }
+            assert_eq!(format!("{serial:?}"), format!("{phased:?}"), "frame {f}");
+            assert_eq!(ys, yp, "frame {f}");
+        }
+        assert!(deferred > 0 && yielded > 0 && !ys.is_empty(), "{deferred} {yielded} {ys:?}");
+        assert!(serial.iter().any(|(m, ..)| m.pos.y > 5.0), "somebody got across: {serial:?}");
+    }
+
+    #[test]
+    fn c2_everybody_walks_with_numbers_of_their_own() {
+        // [r9 C2] distinct, never 0, the same for the same seed and id
+        let seeds: HashSet<u64> = (0..10_000u32).map(|id| walk_seed_of(0x1234_5678_9ABC_DEF1, id)).collect();
+        assert_eq!(seeds.len(), 10_000);
+        assert!(!seeds.contains(&0));
+        assert_eq!(walk_seed_of(5, 9), walk_seed_of(5, 9));
+        assert_ne!(walk_seed_of(5, 9), walk_seed_of(6, 9));
     }
 
     #[test]
