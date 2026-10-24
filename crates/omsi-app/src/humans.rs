@@ -1843,6 +1843,10 @@ struct PedNet {
     ends: HashMap<usize, (usize, usize)>,
     /// Per junction: (lane, walked forwards) leaving it.
     out: Vec<Vec<(usize, bool)>>,
+    /// [P1b] Per junction: the one-way crossing pieces (`keeps_way` in `extend`) that end at
+    /// it, which `out` does not list there: the way on from a dead end there (`next_leg`) and
+    /// onward across (`straight_on`), against their way, decided at the kerb like any crossing.
+    against: Vec<Vec<usize>>,
     /// Where each pavement lane crosses a carriageway (lazily), and the carriageway lanes
     /// it crosses.
     crossings: HashMap<usize, Vec<DVec2>>,
@@ -1862,6 +1866,7 @@ impl PedNet {
         let mut p = PedNet {
             ends: HashMap::new(),
             out: Vec::new(),
+            against: Vec::new(),
             crossings: HashMap::new(),
             crossed: HashMap::new(),
             grid: HashMap::new(),
@@ -1914,15 +1919,18 @@ impl PedNet {
                 continue;
             }
             self.ends.insert(i, (a, b));
-            // [ROLLBACK pedoneway-1] a one-way pavement path with a light, or one that
-            // crosses a carriageway, is walked its way only: the lit stub at the kerb is then
-            // the only way onto its crossing, and nobody steps onto the unlit pieces from
-            // the far kerb or from the side and crosses on red (every path was walkable
-            // both ways; the ordinary pavements still are)
+            // a one-way pavement path with a light, or one that crosses a carriageway, is
+            // walked its way only (the lit stub at the kerb is then the way onto its crossing:
+            // nobody steps onto the unlit pieces from the side), except as the way on from a
+            // dead end at its far end (`against`, [P1b]), where the crossing is decided at the
+            // kerb under the light that governs its pieces (`crossing_span`); the ordinary
+            // pavements are walked both ways
             let keeps_way = l.one_way && (l.traffic_light.is_some() || !self.crossings(net, i).is_empty());
             self.out[a].push((i, true));
             if !keeps_way {
                 self.out[b].push((i, false));
+            } else {
+                self.against[b].push(i);
             }
             let mut seen: Vec<(i32, i32)> = Vec::new();
             for p in &l.points {
@@ -1960,6 +1968,7 @@ impl PedNet {
         }
         self.nodes.push(p);
         self.out.push(Vec::new());
+        self.against.push(Vec::new());
         self.cells
             .entry((cx, cy))
             .or_default()
@@ -2027,7 +2036,8 @@ impl PedNet {
         }
     }
 
-    /// A leg leaving junction `node`, not back along `came` (unless it is a dead end).
+    /// A leg leaving junction `node`, not back along `came`. At a dead end: on over a one-way
+    /// crossing piece ending there against its way ([P1b]), else back along `came`.
     fn next_leg(&self, net: &Network, node: usize, came: usize, pick: u64) -> Option<Leg> {
         let back = self.ends.get(&came).copied();
         let twin = |l: usize| -> bool {
@@ -2069,7 +2079,14 @@ impl PedNet {
             .filter(|o| angle_between(heading_in, leaving(o)) <= 110.0)
             .collect();
         let list = if onward.is_empty() { list } else { onward };
-        let (lane, fwd) = if list.is_empty() {
+        // [P1b] a dead end where one-way crossing pieces end: on across them against their way,
+        // decided at the kerb like any crossing (turned round there, walkers stepped onto the
+        // lane edge and went back over the crossing they had just walked: 15 of 26 at
+        // BeijingCity's one-way chain 6132-6142, 08:39 case04); the one most nearly ahead
+        let against: Vec<(usize, bool)> = self.against.get(node).map(|v| v.iter().filter(|&&l| !twin(l)).map(|&l| (l, false)).collect()).unwrap_or_default();
+        let (lane, fwd) = if list.is_empty() && !against.is_empty() {
+            *against.iter().min_by(|a, b| angle_between(heading_in, leaving(a)).total_cmp(&angle_between(heading_in, leaving(b)))).unwrap()
+        } else if list.is_empty() {
             // a dead end: turn round
             let (a, _) = back?;
             (came, a == node)
@@ -2094,12 +2111,16 @@ impl PedNet {
 
 
     /// [ROLLBACK r4c-P1] The leg on from the end of `leg` that turns least (within `max_turn`
-    /// degrees) among the lanes `ok` accepts; not back along `leg`'s lane or its twin.
+    /// degrees) among the lanes `ok` accepts, one-way crossing pieces ending there included
+    /// (against their way, [P1b]); not back along `leg`'s lane or its twin.
     fn straight_on(&mut self, net: &Network, leg: &Leg, max_turn: f64, mut ok: impl FnMut(&mut PedNet, usize) -> bool) -> Option<Leg> {
         let node = self.end_node(net, leg)?;
         let (_, h_in) = leg.at(net, leg.len());
         let back = self.ends.get(&leg.lane).copied();
-        let list: Vec<(usize, bool)> = self.out.get(node)?.clone();
+        // ([P1b] and the one-way crossing pieces ending here, against their way: walked onto from
+        // a dead end, the crossing goes on over them)
+        let mut list: Vec<(usize, bool)> = self.out.get(node)?.clone();
+        list.extend(self.against.get(node).into_iter().flatten().map(|&l| (l, false)));
         let mut best: Option<(f64, Leg)> = None;
         for (l, fwd) in list {
             if l == leg.lane {
@@ -10426,6 +10447,38 @@ mod ped_tests {
         assert!((at - DVec2::new(0.0, -3.5)).length() < 0.1, "steps on at {at:?}");
         assert!(y < -3.5 - KERB_BACK_MAX as f64, "seen from {y:.2}");
         assert!(arrive > 0.5 && arrive < 2.5 && leave > arrive + 4.0, "{arrive:.2} {leave:.2}");
+    }
+
+    #[test]
+    fn p1b_a_dead_end_at_a_one_way_crossing_is_crossed_against_its_way_not_turned_at() {
+        // the far pavement's walker arrives where only the one-way chain's last piece ends: on
+        // across it against its way under the crossing's light, not back the way they came
+        // (BeijingCity's chain 6132-6142: 15 of 26 walked back, 08:39 case04)
+        let (mut net, _) = kerb_at_the_edge();
+        net.lanes[3].one_way = true;
+        net.lanes[4].one_way = false;
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = PedWalk::new(vec![Leg { lane: 4, a: 10.0, b: 0.0 }], true, 0.0);
+        let mut m = me(3, DVec2::new(0.0, 13.5), 1.35);
+        let mut turned = false;
+        for k in 0..400 {
+            let v = frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if m.pos.y < 6.0 && v.y > 0.3 {
+                turned = true;
+            }
+        }
+        assert!(!turned, "turned round at the dead end");
+        assert!(m.pos.y < -6.0, "across against the piece's way: {:?}", m.pos);
+        // red: they wait at that kerb, as at any
+        let lights = FakeLights::new(RED, 60.0);
+        let mut walk = PedWalk::new(vec![Leg { lane: 4, a: 10.0, b: 0.0 }], true, 0.0);
+        let mut m = me(3, DVec2::new(0.0, 13.5), 1.35);
+        for k in 0..400 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert_eq!(m.decision, Some("red light"));
+        assert!(m.pos.y > 3.5, "{:?}", m.pos);
     }
 
     #[test]
