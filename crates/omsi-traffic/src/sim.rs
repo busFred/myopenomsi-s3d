@@ -366,6 +366,11 @@ pub struct Vehicle {
     /// vehicle, so a keyframe carries it.
     #[serde(default)]
     pub zip_behind: Option<u64>,
+    /// Its junction claim was refused last frame (`Claim::refused_last`: the resolver decides
+    /// such claimants first, so that a foe sees their answer of this frame); kept with the
+    /// vehicle, so a keyframe carries it.
+    #[serde(default)]
+    pub refused_last: bool,
     /// A lane change under way: (its progress when it last moved on, seconds since while
     /// standing). Frozen for `FROZEN_CHANGE` it is settled where the body is
     /// (`AiState::settle_change`).
@@ -574,6 +579,7 @@ impl Vehicle {
             lane_end_stop: None,
             unheld_for: 0.0,
             zip_behind: None,
+            refused_last: false,
             mutual: None,
             mutual_gap: 0.0,
             ease_for: None,
@@ -1242,6 +1248,7 @@ impl Simulation {
                     waiting: v.waiting,
                     lead_gap: p.leader.map(|l| (l.gap, l.speed)),
                     zip_behind: v.zip_behind,
+                    refused_last: v.refused_last,
                     body_block: p.body_block,
                     next_wait: next_wait - j.entry,
                     tau: v.params.tau,
@@ -1462,6 +1469,7 @@ impl Simulation {
                 waiting: 0.0,
                 lead_gap: None,
                 zip_behind: None,
+                refused_last: false,
                 body_block: None,
                 next_wait: f32::NEG_INFINITY,
                 tau: DriverParams::preset(PLAYER_PRESET).tau,
@@ -1512,13 +1520,16 @@ impl Simulation {
         let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // [J7-2, fix pass 2] the zipper order kept with the vehicles while engaged
+        // (and whether its claim was refused: the resolver decides those first next frame)
         for v in vehicles.iter_mut() {
             v.zip_behind = None;
+            v.refused_last = false;
         }
         for (c, g) in claims.iter().zip(&grants) {
             let foe_id = g.zipper.and_then(|z| claims.iter().find(|o| o.vehicle == z.foe)).map(|o| o.id);
-            if let Some(v) = vehicles.get_mut(c.vehicle) {
+            if let Some(v) = vehicles.get_mut(c.vehicle).filter(|_| claim_player(c.vehicle).is_none()) {
                 v.zip_behind = foe_id;
+                v.refused_last = !g.go;
             }
         }
 

@@ -71,7 +71,7 @@ fn cross_with_a_zebra() -> Network {
 
 fn claim_on(sim: &Simulation, lane: usize, s: f32, in_box_at_turn: bool) -> Claim {
     let (j, m) = sim.junctions.of_lane[&lane];
-    Claim { chain: vec![(m, 0.0)], vehicle: 0, junction: j, movement: m, s, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, red_at: f32::INFINITY, lead: None, was_standing: true, blocked: false, stuck: false, clearing: false, in_box_at_turn, lanes: Vec::new(), light: Some((0, 0)), id: 1, yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6 }
+    Claim { chain: vec![(m, 0.0)], vehicle: 0, junction: j, movement: m, s, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, red_at: f32::INFINITY, lead: None, was_standing: true, blocked: false, stuck: false, clearing: false, in_box_at_turn, lanes: Vec::new(), light: Some((0, 0)), id: 1, yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6 }
 }
 
 /// [round 10 D7] `Simulation::clearing_across`: a vehicle in the box at the end of its green whose

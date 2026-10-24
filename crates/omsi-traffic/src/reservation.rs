@@ -42,6 +42,11 @@ pub struct Claim {
     /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame
     /// (`Vehicle::zip_behind`): the pair's order, fixed once, is kept while both are engaged.
     pub zip_behind: Option<u64>,
+    /// Its claim was refused last frame (`Vehicle::refused_last`). The resolver decides such a
+    /// claimant, standing, before the others (`decide_in`), so that its foes read its answer of
+    /// this frame: standing outside the meeting place and refused, it will not pass (SUMO's
+    /// `willPass`, `will_pass`).
+    pub refused_last: bool,
     /// [J7-2, fix pass 2] The vehicle whose body across its way holds it this frame
     /// (`Perception::body_block`): at a zipper that one is ahead of it whatever the arrival
     /// rule says.
@@ -887,7 +892,7 @@ enum Pass {
 /// leader at a merge either. `their_inside`: its front is in the stretch; `me_in`: mine is (at a
 /// crossing); `zip_pair`: the two ways merge and cross nowhere else.
 #[allow(clippy::too_many_arguments)]
-fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, c: &Claim, o: &mut Claim, ok: usize, foe: &crate::junction::Foe, me_in: bool, zip_pair: bool) -> Pass {
+fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, decided: &[Option<Grant>], c: &Claim, o: &mut Claim, ok: usize, foe: &crate::junction::Foe, me_in: bool, zip_pair: bool) -> Pass {
     // a foe that has left the meeting place
     if o.s - o.rear > foe.theirs.1 {
         return Pass::Left;
@@ -1002,6 +1007,17 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     if !their_inside && !o.committed && !c.blocked && held_off(claims, claim_of, plain, ok, c.vehicle) {
         return Pass::Not("held_off");
     }
+    // [J8-1] SUMO's `willPass` (MSLink::blockedByFoe drops a foe whose request is not to pass: its
+    // planned speed at the link is 0): a foe standing outside the meeting place, not committed to
+    // it, that this pass has refused already (decided before me: the claimants standing refused
+    // last frame are decided first) stays where it stands this frame - it is not coming. One not
+    // decided yet counts (its answer may be a go); a player's claim always counts (its grant is
+    // not read); and one blocked by what lets it go on a schedule (a lead moving off) counts: its
+    // refusal may be its block's (a blocked claimant drops nobody), and the time test decides, as
+    // for the second pass's standing order (review9: a foe 1 m out behind a lead moving off)
+    if !their_inside && !o.committed && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go) {
+        return Pass::Not("refused");
+    }
     // ([J7-1] one held by something that lets it go on a schedule, a light or a lead
     // moving off, is no longer dropped by round 5's `START_DELAY`, 1.5 s added to its
     // start from rest: the time test reckons with its window from rest, as SUMO's
@@ -1034,13 +1050,18 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
 fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Grant]>, standing: Option<&[Standing]>, mut trace: Option<&mut Vec<FoeTrace>>) -> Vec<Grant> {
     let mut out: Vec<Option<Grant>> = vec![None; claims.len()];
     // (the contenders first, in their order: each sees whether the ones before it go)
+    // ([J8-1] then the claimants standing refused last frame, in vehicle order: their answer of
+    // this pass is known to the foes decided after them, `will_pass`; a foe not decided yet counts
+    // as coming, so two that drop each other never both go)
     let mut order: Vec<usize> = (0..claims.len()).collect();
-    if let Some(st) = standing {
-        order.sort_by_key(|&k| match st[k] {
-            Standing::Rank(r) => r,
+    let refused_standing = |k: usize| claims[k].refused_last && claims[k].standing();
+    order.sort_by_key(|&k| {
+        let rank = match standing.map(|st| st[k]) {
+            Some(Standing::Rank(r)) => r,
             _ => usize::MAX,
-        });
-    }
+        };
+        (rank, !refused_standing(k))
+    });
     // a claim stands for the whole way through: the piece it names and the pieces that
     // one continues into, each as far along as its start lies (claim, piece, shift)
     // (by junction and piece, in claim order: each foe looks up its own; scanning them all for
@@ -1143,7 +1164,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 if go_anyway && !zip_pair {
                     continue;
                 }
-                let pass = will_pass(ctx, claims, &claim_of, plain, c, &mut shifted, ok, foe, me_in, zip_pair);
+                let pass = will_pass(ctx, claims, &claim_of, plain, &out, c, &mut shifted, ok, foe, me_in, zip_pair);
                 let o = &shifted;
                 // [J7-1] (the account of this foe for `resolve_traced`)
                 let mut note = |skip: &'static str, times: Option<FoeTimes>| {
@@ -1351,7 +1372,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -1554,7 +1575,9 @@ mod tests {
         let g = resolve(&js, &claims);
         let going: Vec<usize> = g.iter().filter(|g| g.go).map(|g| g.vehicle).collect();
         assert_eq!(going, vec![10], "exactly one goes, the lowest index of the ring: {:?}", g);
-        assert!(g.iter().filter(|g| !g.go).all(|g| g.wait_for == Some(10)), "the others wait for it: {:?}", g);
+        // (the others wait within the ring: for it, or - [J8-1] the one it gives way to having
+        // been decided before it - for that one, which waits for it)
+        assert!(g.iter().filter(|g| !g.go).all(|g| g.wait_for.is_some_and(|w| (10..13).contains(&w))), "the others wait in the ring: {:?}", g);
     }
 
     #[test]
@@ -2468,6 +2491,50 @@ mod tests {
             let a = zip_claim(&js, 1, 0, len + 6.0, 0.0);
             let b = zip_claim(&js, 2, 1, len + 3.0, 5.0);
             assert!(capped_by(&resolve(&js, &[a, b]), 1, 2));
+        }
+    }
+
+    /// [round 10 J8-1] SUMO's `willPass`: a foe standing short of the meeting place that this
+    /// frame refuses (it gives way to a moving stream that does not cross me) is not coming, and I
+    /// do not wait for it although it has the right of way over me; the order makes it safe: the
+    /// claimants standing refused last frame are decided first, an undecided foe counts. Granted
+    /// last frame (not decided first), it still counts. Two that would drop each other: exactly
+    /// one goes.
+    #[test]
+    fn j81_a_foe_standing_refused_this_frame_short_of_the_meeting_place_does_not_hold_me() {
+        // X eastbound at y = 5 (low), Y northbound at x = 0 (middle), Z eastbound at y = -5 (high):
+        // Y crosses both, X and Z cross nothing of each other; X yields to Y, Y to Z
+        let mut net = Network::default();
+        net.lanes.push(piece((-10.0, 5.0), (10.0, 5.0), 0, 64.0));
+        net.lanes.push(piece((0.0, -10.0), (0.0, 10.0), 1, 128.0));
+        net.lanes.push(piece((-10.0, -5.0), (10.0, -5.0), 2, 192.0));
+        net.link(1.5);
+        net.compute_conflicts();
+        let js = Junctions::compile(&net);
+        let m = |l: usize| js.nodes[0].movement_of(l).unwrap();
+        let start = |a: usize, b: usize| js.nodes[0].movements[m(a)].foes.iter().find(|f| f.movement == m(b)).unwrap().mine.0;
+        // (X rolling up at 5 m/s, 12 m out: not one of the second pass's standing contenders)
+        let mut x = claim(1, m(0), start(0, 1) - 12.0 - 2.0, 5.0);
+        let mut y = claim(2, m(1), start(1, 2) - 1.0 - 2.0, 0.0);
+        y.refused_last = true;
+        // (Z rolling at 8 m/s, 10 m out: Y waits for it)
+        let z = claim(3, m(2), start(2, 1) - 10.0 - 2.0, 8.0);
+        let g = resolve(&js, &[x.clone(), y.clone(), z.clone()]);
+        assert_eq!(grant_of(&g, 2).wait_for, Some(3), "Y waits for Z: {g:?}");
+        assert!(grant_of(&g, 1).go, "X waits for Y, which stands refused: {g:?}");
+        // (whichever order the claims come in)
+        let g = resolve(&js, &[z.clone(), y.clone(), x.clone()]);
+        assert!(grant_of(&g, 1).go && grant_of(&g, 2).wait_for == Some(3), "{g:?}");
+        // (the control: Y granted last frame is not decided first - it counts, X waits)
+        y.refused_last = false;
+        let g = resolve(&js, &[x.clone(), y.clone(), z.clone()]);
+        assert!(!grant_of(&g, 1).go || !grant_of(&g, 2).go, "{g:?}");
+        // (no Z: Y goes, and X waits for it, refused last frame or not)
+        for refused in [false, true] {
+            y.refused_last = refused;
+            x.refused_last = refused;
+            let g = resolve(&js, &[x.clone(), y.clone()]);
+            assert!(grant_of(&g, 2).go && grant_of(&g, 1).wait_for == Some(2), "refused last frame {refused}: {g:?}");
         }
     }
 
