@@ -234,6 +234,43 @@ fn p84_a_car_queued_behind_does_not_keep_it_out_for_good() {
     assert!(go >= 0.0 && go < 3.0, "held by the car queued behind it: goes at {go:.1}");
 }
 
+/// [round 8 fix, re-entry] A bus standing 3.48 m out in its bay, part-way along the bay's way
+/// IN (the ramp laid is still 0 -> 4.1 m over 30 m, 22.6 m of it driven) when its bay is sent
+/// back to 0 - the service's way out comes a frame later - with a car passing it in the lane at
+/// 4.4 m/s, its front 7.7 m past the bus's rear (inside its secure gap: the bus is held). Held,
+/// the bus stays where it stands: moving the start of the way-in ramp put it on the lane's
+/// axis, 3.48 m sideways onto the car (viz2 case10 #31063/#34056, t=1418.2, 2.14 m deep).
+#[test]
+fn reentry_hold_on_a_stale_way_in_keeps_the_bus_where_it_stands() {
+    let net = finish(vec![lane(&[(0.0, 0.0), (400.0, 0.0)])]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut b = bus(1, vec![0], 200.0, 0.0);
+    let odo = b.state.odometer;
+    b.state.lateral_ramp = (0.0, 4.1, odo - 22.6, 30.0);
+    b.state.lateral = 4.1 * omsi_sim::traffic::smooth01(22.6 / 30.0);
+    b.state.lateral_target = 0.0;
+    b.external.bay = Some(0.0);
+    let lat0 = b.state.lateral;
+    let c = car(2, vec![0], 200.0 - 6.0 + 7.7 - 2.25, 4.4);
+    let mut vs = vec![b, c];
+    sim.update_positions(&net, &mut vs);
+    let (mut min, mut jump, mut held, mut t) = (f64::INFINITY, 0.0f32, false, 0.0);
+    while t < 6.0 {
+        sim.tick(&net, DT, &mut vs);
+        sim.update_positions(&net, &mut vs);
+        held |= vs[0].last.why == Why::PullOut;
+        if vs[0].state.speed < 0.1 {
+            jump = jump.max((vs[0].state.lateral - lat0).abs());
+        }
+        min = min.min(vs[0].obb().separation(&vs[1].obb()));
+        t += DT;
+    }
+    eprintln!("held {held}, standing offset moved {jump:.2} m, min sep {min:.2}");
+    assert!(held, "the bus was not held for the car beside it");
+    assert!(jump < 0.05, "the held bus moved {jump:.2} m sideways where it stood");
+    assert!(min > 0.0, "the bus and the car went into each other: {min:.2} m");
+}
+
 /// A pass round a parked car (as `pass_round_parked`); once the car is `trig` m out, a
 /// person appears `dx` ahead of its front at y0 and walks across at vy: the least distance
 /// between them and whether the car was held for them.

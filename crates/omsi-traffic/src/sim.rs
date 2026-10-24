@@ -1681,8 +1681,14 @@ impl Simulation {
         // the body would first feel it once let go - its start kept a heading chord ahead of
         // the standing body, so the body is not drawn turned into the lane while it waits
         // (x10 case08 #10940 stood turned 17 degrees, heading 168 -> 152, for 3 s)
+        // ([round 8 fix, re-entry] laid as the way back from where the body is, `plan::way_back`:
+        // moving the start of whatever ramp is laid put the body at that ramp's start - the
+        // bay's way in still laid, the lane's axis: viz2 case10 bus #31063 jumped 3.48 m
+        // sideways onto #34056 passing at 4.4 m/s, t=1418.2)
         if plan.reentry_held {
-            v.state.lateral_ramp.2 = v.state.odometer + omsi_sim::traffic::HEADING_CHORD;
+            let (_, to, _, len) = plan::way_back(v);
+            v.state.lateral_curve.clear();
+            v.state.lateral_ramp = (v.state.lateral, to, v.state.odometer + omsi_sim::traffic::HEADING_CHORD, len);
         }
         // a lane change begins only when nobody started one into the same stretch this
         // frame (the perception was taken before anybody moved)

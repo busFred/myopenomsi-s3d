@@ -249,10 +249,10 @@ pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front
 }
 
 /// [round 8 H8-8, fix pass 2] The rest of a pull-out's way out (m): the steerable move from rest
-/// while it has not left (`bypass_min_len`), else what is left of its ramp.
+/// while it has not left (`bypass_min_len`), else what is left of its way back (`way_back`).
 pub fn pull_out_ramp_left(me: &Vehicle) -> f32 {
     let st = &me.state;
-    let (_, _, x0, len) = st.lateral_ramp;
+    let (_, _, x0, len) = way_back(me);
     if st.speed < STANDING_SPEED && me.pull_out > 0.0 {
         bypass_min_len(me.length(), st.lateral)
     } else {
@@ -1203,15 +1203,33 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
 /// (`bypass_sweep_clear`).
 const REENTRY_STEP: f32 = 0.5;
 
+/// [round 8 fix, re-entry] The way back into the lane of a vehicle out of it, as a sideways
+/// ramp (`AiState::lateral_ramp`: from, to, start odometer, length): the ramp laid if it ends at
+/// the offset the vehicle is asked for (a bay, the bus service sends 0 as it leaves one; else
+/// its target), else the S-curve the motion lays for a new target (`AiState` step,
+/// `s_curve_len`) from where the body is now. The ramp laid can still be the way IN for a frame:
+/// the bay's target turns back before the service's way out is laid, and read as the way back
+/// it swept the bay outward and, its start moved on by the hold, put the body on the lane's
+/// axis (viz2 case10 bus #31063 at t=1418.2, 3.48 m sideways onto #34056 passing at 4.4 m/s).
+pub fn way_back(me: &Vehicle) -> (f32, f32, f32, f32) {
+    let st = &me.state;
+    let to = me.external.bay.unwrap_or(st.lateral_target);
+    let laid = st.lateral_ramp;
+    if (laid.1 - to).abs() <= 1e-3 {
+        laid
+    } else {
+        (st.lateral, to, st.odometer, omsi_sim::traffic::s_curve_len(to - st.lateral))
+    }
+}
+
 /// [P8-4] A vehicle out of its lane on its way back in: its body clear of the lane's axis (a
 /// car passing in the lane gets by it), no pass or change of its own, the offset it is asked
 /// for (a bay, the bus service sends 0 as it leaves one; else its target) nearer the lane
-/// than where it is, and the way's sideways ramp not run out yet (`AiState::lateral_ramp`:
-/// the bus service's `depart`, a parked car's pull-out).
+/// than where it is, and its way back (`way_back`: the ramp the bus service's `depart` or a
+/// parked car's pull-out laid, else one from where it is) not run out yet.
 fn reentering(me: &Vehicle) -> bool {
     let st = &me.state;
-    let (_, _, x0, len) = st.lateral_ramp;
-    let to = me.external.bay.unwrap_or(st.lateral_target);
+    let (_, to, x0, len) = way_back(me);
     // (not a settled lane change's offset easing in place, `Simulation::sidestep`: it moves
     // sideways standing, not back into the traffic)
     !st.settled_offset && me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
@@ -1227,8 +1245,21 @@ fn reentering(me: &Vehicle) -> bool {
 /// timetable bus #10940 swung out of its bay across the lane beside, into #11059 coming at
 /// 8.9 m/s 14 m away, 0.58 m deep.)
 fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle) -> bool {
+    // ([round 8 fix, re-entry] the poses on the way back, `way_back`: a ramp laid that ends
+    // elsewhere is not where the body will move)
+    let back = way_back(me);
+    let on_way_back;
+    let me = if back == me.state.lateral_ramp {
+        me
+    } else {
+        let mut w = me.clone();
+        w.state.lateral_curve.clear();
+        w.state.lateral_ramp = back;
+        on_way_back = w;
+        &on_way_back
+    };
     let st = &me.state;
-    let (_, _, x0, len) = st.lateral_ramp;
+    let (_, _, x0, len) = back;
     let left = (x0 + len - st.odometer).max(0.0);
     let n = (left / REENTRY_STEP).ceil() as usize;
     // ([pass 2, A1] the poses it has not reached yet: where it stands now is no move into
