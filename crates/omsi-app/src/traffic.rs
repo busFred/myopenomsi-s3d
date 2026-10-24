@@ -145,6 +145,14 @@ mod spawn_queue_tests {
 
 // ([round 7 R7-1 fix 1] the queue tests moved with the rule to omsi_traffic::removal)
 
+/// [round 9 A1] How many of the cars `(position, timetable bus, on a lane of the kind filled)`
+/// count against a target: every random car on the kind's lanes ([round 7 B2] a car that gave
+/// up too: it stands on the road), within `near` (centre, radius) when given - near the centre
+/// it holds the budget, far off it does not.
+fn budget_count(cars: impl Iterator<Item = (DVec3, bool, bool)>, near: Option<(DVec3, f64)>) -> usize {
+    cars.filter(|&(p, scheduled, of_kind)| !scheduled && of_kind && near.is_none_or(|(c, r)| (p - c).length() < r)).count()
+}
+
 /// [round 7 R7-1 fix 1] The recorded rule of a population removal, by the reason it logs.
 fn removal_rule(why: &str) -> RemoveRule {
     match why {
@@ -692,9 +700,6 @@ pub struct Traffic {
     pub keep_clear: Vec<omsi_sim::collision::Obb>,
     /// LAN play: this game draws the host's traffic instead of its own (`lan_world`).
     mirror: bool,
-    /// Count only the cars within this distance of this point when filling up (the
-    /// population around a LAN player, `populate_lan_centers`).
-    count_near: Option<(DVec3, f64)>,
     /// LAN play: where the other players are (host): the traffic is kept around them too.
     pub lan_centers: Vec<DVec3>,
     /// [ROLLBACK clockjump-traffic-1] The clock as of the last `note_clock` (NaN before the
@@ -1349,7 +1354,6 @@ impl Traffic {
             twinned: Default::default(),
             keep_clear: Vec::new(),
             mirror: false,
-            count_near: None,
             lan_centers: Vec::new(),
             clock_seen: f64::NAN,
             recorder: omsi_traffic::record::Recorder::new(),
@@ -2096,12 +2100,6 @@ impl Traffic {
             (LaneKind::Street, street_target),
             (LaneKind::Air, if has_air { 3 } else { 0 }),
         ] {
-            // (a LAN host counts the cars round itself only: counted over the whole map,
-            // the traffic it keeps round the other players met its own target and the
-            // host drove through empty streets, #342)
-            if kind == LaneKind::Street && !self.lan_centers.is_empty() {
-                self.count_near = Some((center, self.spawn_radius));
-            }
             self.populate_kind(world, renderer, scene, center, kind, target);
         }
         self.populate_lan_centers(world, renderer, scene, center, street_target);
@@ -2386,24 +2384,18 @@ impl Traffic {
         let cumulative: Vec<f32> = candidates.iter().map(|c| { acc += c.1; acc }).collect();
         let total_w = acc.max(1e-3);
         let mut attempts = 0;
-        let counted_near = self.count_near.take();
-        let unscheduled = self
-            .cars
-            .iter()
-            .filter(|c| {
-                // ([round 7 B2] a car that gave up counts too: it stands on the road)
-                !c.serves_stops()
-                    && counted_near
-                        .map(|(p, r)| (c.vehicle.position - p).length() < r)
-                        .unwrap_or(true)
-                    && self
-                        .net
-                        .lanes
-                        .get(c.ai.state.lane)
-                        .map(|l| l.kind == kind)
-                        .unwrap_or(false)
-            })
-            .count();
+        // [round 9 A1] the street target counts the cars within `spawn_radius` of the centre
+        // only, for every host: counted over the whole map, queues standing at far tile edges
+        // held the budget and nothing new appeared round the player (r8-jzk: the target met at
+        // ~440 with 91 cars 700-900 m off). A LAN host's other players are counted the same
+        // way round each of them (`populate_lan_centers`: counted over the whole map, the
+        // traffic round the others met the host's target and the host drove through empty
+        // streets, #342). Aircraft are few and far: counted over the whole map.
+        let counted_near = (kind == LaneKind::Street).then_some((center, self.spawn_radius));
+        let unscheduled = budget_count(
+            self.cars.iter().map(|c| (c.vehicle.position, c.serves_stops(), self.net.lanes.get(c.ai.state.lane).is_some_and(|l| l.kind == kind))),
+            counted_near,
+        );
         let mut count = unscheduled;
         // ([round 7 B2] no global jam guard: SUMO has none, a car is put in only where its
         // lane has room - the per-spot tests below, `behind_a_queue` above all; the guard
@@ -2587,10 +2579,12 @@ impl Traffic {
         if self.dormant.is_empty() {
             return;
         }
-        let active = self.cars.iter().filter(|c| !c.serves_stops()).count();
+        let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
+        // [round 9 A1] the cars round the players count, as for new cars (`populate_kind`):
+        // counted over the whole map, far queues held this budget too
+        let active = self.cars.iter().filter(|c| !c.serves_stops() && centers.iter().any(|o| (c.vehicle.position - *o).length() < self.spawn_radius)).count();
         let mut budget = (target as f32 * 1.25).ceil() as usize;
         budget = budget.saturating_sub(active);
-        let centers: Vec<DVec3> = std::iter::once(center).chain(self.lan_centers.iter().copied()).collect();
         let mut i = 0;
         while i < self.dormant.len() && budget > 0 {
             let (p, h, ty, lane, s, speed) = {
@@ -5073,9 +5067,7 @@ impl Traffic {
             {
                 continue;
             }
-            self.count_near = Some((c, self.spawn_radius));
             self.populate_kind(world, renderer, scene, c, LaneKind::Street, target);
-            self.count_near = None;
             done.push(c);
         }
     }
@@ -5421,6 +5413,30 @@ fn road_scale(near_density: &[f32]) -> f32 {
 /// Whether the point `p` of a car's way lies in the player's box round `centre` (`wide` to
 /// either side, `ahead` in front and `behind` behind it) - on the same level only: a bus
 /// under a bridge held up the traffic on the bridge above it (#753). 4 m, as for the other
+#[cfg(test)]
+mod budget_count_tests {
+    use super::budget_count;
+    use glam::DVec3;
+
+    /// [round 9 A1] r8-jzk: a queue at the loaded tiles' edge 870 m off held the street
+    /// target. Counted near the centre, the far cars do not count, a standing car near does
+    /// (round 7 B2), a timetable bus and a car on another kind of lane never do; with no
+    /// centre (the aircraft) every car of the kind counts.
+    #[test]
+    fn a1_far_cars_do_not_hold_the_budget() {
+        let c = DVec3::new(464.6, -1578.8, 0.0);
+        let cars = [
+            (c + DVec3::new(0.0, 120.0, 0.0), false, true),  // near, counts
+            (c + DVec3::new(0.0, -399.0, 0.0), false, true), // near, counts
+            (c + DVec3::new(10.0, -870.0, 0.0), false, true), // the far queue
+            (c + DVec3::new(0.0, 50.0, 0.0), true, true),    // a timetable bus
+            (c + DVec3::new(0.0, 60.0, 0.0), false, false),  // another kind
+        ];
+        assert_eq!(budget_count(cars.iter().copied(), Some((c, 400.0))), 2);
+        assert_eq!(budget_count(cars.iter().copied(), None), 3);
+    }
+}
+
 #[cfg(test)]
 mod road_scale_tests {
     use super::road_scale;
