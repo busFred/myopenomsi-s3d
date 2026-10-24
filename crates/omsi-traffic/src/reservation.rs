@@ -852,6 +852,159 @@ fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     }
 }
 
+/// What [`will_pass`] makes of a foe: not coming (why, `FoeTrace::skip`), or its window at the
+/// stretch (in, out; s from now) as the resolver reckons it, and whether it is held at a red that
+/// my green holds back (`red_foe`).
+enum Pass {
+    /// It has left the meeting place.
+    Left,
+    Not(&'static str),
+    /// Its window, whether it is held at a red my green holds back, and whether its front is in
+    /// the stretch.
+    Window { their_in: f32, their_out: f32, at_red: bool, their_inside: bool },
+}
+
+/// The one foe-eligibility test of the resolver (SUMO's `MSLink::blockedByFoe`, whose first
+/// line drops a foe that will not pass, `willPass`, and whose times are the foe's planned
+/// arrival and leave): whether the foe `o` (its claim `ok`, shifted onto the piece of the meeting
+/// place `foe`) can come into my, `c`'s, stretch before I am through, and when. Both the time
+/// test and the zipper read its answer (`decide_in`): a foe that will not pass is nobody's
+/// leader at a merge either. `their_inside`: its front is in the stretch; `me_in`: mine is (at a
+/// crossing); `zip_pair`: the two ways merge and cross nowhere else.
+#[allow(clippy::too_many_arguments)]
+fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, c: &Claim, o: &mut Claim, ok: usize, foe: &crate::junction::Foe, me_in: bool, zip_pair: bool) -> Pass {
+    // a foe that has left the meeting place
+    if o.s - o.rear > foe.theirs.1 {
+        return Pass::Left;
+    }
+    let their_inside = o.s + o.front >= foe.theirs.0;
+    // "committed" is to the foe's first meeting place: one
+    // standing outside this one is not on its way into it whatever comes, it
+    // comes as its window from standing says (a car standing in a queue on a
+    // lead-in whose first meeting place, with its own stub or another way, lay
+    // behind its bumper held the claimant ahead of it until it "left")
+    if o.speed < STANDING_SPEED && !their_inside {
+        o.committed = false;
+    }
+    // (clearing the box, it is committed to the others; not one standing outside this
+    // meeting place stuck behind a standing lead or people: it is not coming for as
+    // long as that holds, and when it moves off, the rules are the ordinary ones.
+    // Round 4b: a car clearing the box 11 s refused for one clearing too, stuck
+    // behind a third that waited for the first, made a ring of three, viz2 case08.
+    // Nor one standing outside it that waits for me, through its lead or the
+    // junction's answer, `held_by`: it is not coming before I go. X10 case03: a car
+    // past its line on amber, standing 8 m short of the merge with the bus as its
+    // lead, was committed to the bus, which let it out first; each waited for the
+    // other 46 s)
+    if o.clearing && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
+        o.committed = true;
+    }
+    let o = &*o;
+    // clearing the box myself: only those in the meeting place, committed or
+    // clearing, can still hold me
+    if c.clearing && !their_inside && !o.committed {
+        return Pass::Not("clearing");
+    }
+    // lights before the table: held at a red that is never green with mine, it
+    // comes at its green (`red_foe`)
+    // ([J7-1] its red holds it only short of its line, `red_at`)
+    let at_red = !their_inside && o.red_at <= foe.theirs.0 && red_foe(ctx, c, o);
+    if at_red && o.until_go.is_none() {
+        return Pass::Not("red");
+    }
+    if me_in && !their_inside {
+        return Pass::Not("me_in");
+    }
+    // behind me (in my own lane, merging in behind me, or on a piece both our ways
+    // take): it comes after me at any speed, `behind_me`
+    if behind_me(c, o, &claims[ok], foe, their_inside, zip_pair) {
+        return Pass::Not("behind");
+    }
+    let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
+    // my own follower comes after me whatever the table says; one already in the
+    // meeting place or committed to it is never dropped
+    // (the follower only while it stands: a lead is one frame's perception and
+    // flickers between two cars side by side into a merge; one rolling at 3 m/s
+    // 2 m from the meeting place was dropped on it, and the two touched)
+    // (rolling, it is dropped when it rolls up to a queue that waits for me: its
+    // lead chain reaches me through a standing vehicle, `held_by_standing`; x10
+    // case05: a bus at the head of the queue it had just left waited 8.6 s for
+    // three cars rolling up behind it, each a competitor from its own speed until
+    // it had come to a full stop)
+    if !their_inside && !o.committed && ((o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
+        return Pass::Not("waits_for_me");
+    }
+    // a foe standing at its red light is not coming before its light goes:
+    // the left-turner on its arrow turns in front of the oncoming queue
+    // (creeping up to its line under 1 m/s after a stand counts as
+    // standing there, `Claim::was_standing`)
+    if at_red {
+        let t = o.until_go.unwrap_or(f32::INFINITY);
+        let standing = o.standing();
+        // (standing: from rest at its green; rolling: not before its green, nor
+        // before its own window says)
+        let shift = if standing { t } else { (t - their_in).max(0.0) };
+        their_in += shift;
+        their_out += shift;
+    } else if o.light_red && !their_inside && o.red_at <= foe.theirs.0 {
+        // (held at a red line short of this meeting place, rolling or standing, it does
+        // not come before its green - SUMO's foe arrival is the foe's planned one, and
+        // it plans to stop at its red; [J7-1] round 4 shifted only one standing there,
+        // and a head waited for a foe braking to its red 53 m off, x10 case12 #18746;
+        // standing: from rest at its green; rolling: not before its green, nor before
+        // its own window says)
+        match o.until_go {
+            Some(t) => {
+                let shift = if o.standing() { t } else { (t - their_in).max(0.0) };
+                their_in += shift;
+                their_out += shift;
+            }
+            None => {
+                return Pass::Not("red");
+            }
+        }
+    }
+    // a foe standing outside the meeting place, held there by people, a zebra or
+    // a lead that stands too, or standing refused for one so held, is not coming
+    // for as long as that holds, however near the meeting place it stands: it is
+    // not waited for whatever my clear time (round 5's drop by `START_DELAY` kept a
+    // taxi 44.9 s for a garage car held by 60 people 22.9 m before the merge, viz3
+    // case14: the foe stood nearer the meeting place than the claimant could clear
+    // it). When it moves off it is a competitor again; if I am in the box by then,
+    // committed, it waits for me. (Not when I am held so myself: my window is no
+    // more real than its, and two such would let each other go.)
+    if !their_inside && !o.committed && !c.blocked && held_off(claims, claim_of, plain, ok, c.vehicle) {
+        return Pass::Not("held_off");
+    }
+    // ([J7-1] one held by something that lets it go on a schedule, a light or a lead
+    // moving off, is no longer dropped by round 5's `START_DELAY`, 1.5 s added to its
+    // start from rest: the time test reckons with its window from rest, as SUMO's
+    // `blockedByFoe` does with a foe's arrival)
+    // standing in a merge's meeting place behind me (its front further from the
+    // merge's end than my rear) with me as its lead (through standing links,
+    // `held_by_standing`): it stopped behind me and waits for me, it is not in my
+    // way (a foe let through rolling up to my queue by `held_by_standing` stopped
+    // 2.2 m behind my rear with me as its lead, and held me 30 s as "standing in
+    // the meeting place", viz case14 #46608/#50444). Level with me or ahead, it
+    // holds me as before (`competitor_filter_my_follower_in_the_same_lane_is_no_foe`)
+    let behind_me = foe.kind == FoeKind::Merge && foe.theirs.1 - (o.s + o.front) > foe.mine.1 - (c.s - c.rear);
+    if their_inside && o.speed < STANDING_SPEED && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
+        return Pass::Not("stopped_behind_me");
+    }
+    // standing in the meeting place, held by its own lead or standing for good: it is
+    // not leaving on the schedule its acceleration would give it
+    // (its plan holds it there - a lead, its stop: OMSI's reason, SUMO's foe would carry
+    // its planned leave time, which no claim knows; [J7-1] at its red, past this place,
+    // it leaves at its green - until_go and its window from rest - not never)
+    if their_inside && o.speed < STANDING_SPEED && o.held {
+        their_out = match o.until_go.filter(|_| o.light_red && o.red_at > foe.theirs.0) {
+            Some(t) => t + window(o, foe.theirs.1, foe.theirs.1).1,
+            None => f32::INFINITY,
+        };
+    }
+    Pass::Window { their_in, their_out, at_red, their_inside }
+}
+
 fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Grant]>, standing: Option<&[Standing]>, mut trace: Option<&mut Vec<FoeTrace>>) -> Vec<Grant> {
     let mut out: Vec<Option<Grant>> = vec![None; claims.len()];
     // (the contenders first, in their order: each sees whether the ones before it go)
@@ -949,39 +1102,6 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 let mut shifted = claims[ok].clone();
                 shifted.s -= shift;
                 shifted.red_at -= shift;
-                // a foe that has left the meeting place
-                if shifted.s - shifted.rear > foe.theirs.1 {
-                    continue;
-                }
-                let their_inside = shifted.s + shifted.front >= foe.theirs.0;
-                // "committed" is to the foe's first meeting place: one
-                // standing outside this one is not on its way into it whatever comes, it
-                // comes as its window from standing says (a car standing in a queue on a
-                // lead-in whose first meeting place, with its own stub or another way, lay
-                // behind its bumper held the claimant ahead of it until it "left")
-                if shifted.speed < STANDING_SPEED && !their_inside {
-                    shifted.committed = false;
-                }
-                // (clearing the box, it is committed to the others; not one standing outside this
-                // meeting place stuck behind a standing lead or people: it is not coming for as
-                // long as that holds, and when it moves off, the rules are the ordinary ones.
-                // Round 4b: a car clearing the box 11 s refused for one clearing too, stuck
-                // behind a third that waited for the first, made a ring of three, viz2 case08.
-                // Nor one standing outside it that waits for me, through its lead or the
-                // junction's answer, `held_by`: it is not coming before I go. X10 case03: a car
-                // past its line on amber, standing 8 m short of the merge with the bus as its
-                // lead, was committed to the bus, which let it out first; each waited for the
-                // other 46 s)
-                if shifted.clearing && !(shifted.stuck && !their_inside) && !(shifted.speed < STANDING_SPEED && !their_inside && held_by(claims, &claim_of, plain, ok, c.vehicle)) {
-                    shifted.committed = true;
-                }
-                let o = &shifted;
-                // [J7-1] (the account of this foe for `resolve_traced`)
-                let mut note = |skip: &'static str, times: Option<FoeTimes>| {
-                    if let Some(t) = trace.as_deref_mut() {
-                        t.push(FoeTrace { claimant: c.vehicle, foe: o.vehicle, movement: foe.movement, times, skip });
-                    }
-                };
                 // ([round6 J1] a claimant refused for one standing in the meeting place stops at
                 // the stretch, as every refused one does, `plan::refused_stop` [J7-4], not at the
                 // line: case11's #54242 stood at its line refused for the layover bus #40523 with
@@ -997,116 +1117,22 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 if go_anyway && !zip_pair {
                     continue;
                 }
-                // clearing the box myself: only those in the meeting place, committed or
-                // clearing, can still hold me
-                if c.clearing && !their_inside && !o.committed {
-                    note("clearing", None);
-                    continue;
-                }
-                // lights before the table: held at a red that is never green with mine, it
-                // comes at its green (`red_foe`)
-                // ([J7-1] its red holds it only short of its line, `red_at`)
-                let at_red = !their_inside && o.red_at <= foe.theirs.0 && red_foe(ctx, c, o);
-                if at_red && o.until_go.is_none() {
-                    note("red", None);
-                    continue;
-                }
-                if me_in && !their_inside {
-                    note("me_in", None);
-                    continue;
-                }
-                // behind me (in my own lane, merging in behind me, or on a piece both our ways
-                // take): it comes after me at any speed, `behind_me`
-                if behind_me(c, o, &claims[ok], foe, their_inside, zip_pair) {
-                    note("behind", None);
-                    continue;
-                }
-                let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
-                // my own follower comes after me whatever the table says; one already in the
-                // meeting place or committed to it is never dropped
-                // (the follower only while it stands: a lead is one frame's perception and
-                // flickers between two cars side by side into a merge; one rolling at 3 m/s
-                // 2 m from the meeting place was dropped on it, and the two touched)
-                // (rolling, it is dropped when it rolls up to a queue that waits for me: its
-                // lead chain reaches me through a standing vehicle, `held_by_standing`; x10
-                // case05: a bus at the head of the queue it had just left waited 8.6 s for
-                // three cars rolling up behind it, each a competitor from its own speed until
-                // it had come to a full stop)
-                if !their_inside && !o.committed && ((o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, &claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
-                    note("waits_for_me", None);
-                    continue;
-                }
-                // a foe standing at its red light is not coming before its light goes:
-                // the left-turner on its arrow turns in front of the oncoming queue
-                // (creeping up to its line under 1 m/s after a stand counts as
-                // standing there, `Claim::was_standing`)
-                if at_red {
-                    let t = o.until_go.unwrap_or(f32::INFINITY);
-                    let standing = o.standing();
-                    // (standing: from rest at its green; rolling: not before its green, nor
-                    // before its own window says)
-                    let shift = if standing { t } else { (t - their_in).max(0.0) };
-                    their_in += shift;
-                    their_out += shift;
-                } else if o.light_red && !their_inside && o.red_at <= foe.theirs.0 {
-                    // (held at a red line short of this meeting place, rolling or standing, it does
-                    // not come before its green - SUMO's foe arrival is the foe's planned one, and
-                    // it plans to stop at its red; [J7-1] round 4 shifted only one standing there,
-                    // and a head waited for a foe braking to its red 53 m off, x10 case12 #18746;
-                    // standing: from rest at its green; rolling: not before its green, nor before
-                    // its own window says)
-                    match o.until_go {
-                        Some(t) => {
-                            let shift = if o.standing() { t } else { (t - their_in).max(0.0) };
-                            their_in += shift;
-                            their_out += shift;
-                        }
-                        None => {
-                            note("red", None);
-                            continue;
-                        }
+                let pass = will_pass(ctx, claims, &claim_of, plain, c, &mut shifted, ok, foe, me_in, zip_pair);
+                let o = &shifted;
+                // [J7-1] (the account of this foe for `resolve_traced`)
+                let mut note = |skip: &'static str, times: Option<FoeTimes>| {
+                    if let Some(t) = trace.as_deref_mut() {
+                        t.push(FoeTrace { claimant: c.vehicle, foe: o.vehicle, movement: foe.movement, times, skip });
                     }
-                }
-                // a foe standing outside the meeting place, held there by people, a zebra or
-                // a lead that stands too, or standing refused for one so held, is not coming
-                // for as long as that holds, however near the meeting place it stands: it is
-                // not waited for whatever my clear time (round 5's drop by `START_DELAY` kept a
-                // taxi 44.9 s for a garage car held by 60 people 22.9 m before the merge, viz3
-                // case14: the foe stood nearer the meeting place than the claimant could clear
-                // it). When it moves off it is a competitor again; if I am in the box by then,
-                // committed, it waits for me. (Not when I am held so myself: my window is no
-                // more real than its, and two such would let each other go.)
-                if !their_inside && !o.committed && !c.blocked && held_off(claims, &claim_of, plain, ok, c.vehicle) {
-                    note("held_off", None);
-                    continue;
-                }
-                // ([J7-1] one held by something that lets it go on a schedule, a light or a lead
-                // moving off, is no longer dropped by round 5's `START_DELAY`, 1.5 s added to its
-                // start from rest: the time test reckons with its window from rest, as SUMO's
-                // `blockedByFoe` does with a foe's arrival)
-                // standing in a merge's meeting place behind me (its front further from the
-                // merge's end than my rear) with me as its lead (through standing links,
-                // `held_by_standing`): it stopped behind me and waits for me, it is not in my
-                // way (a foe let through rolling up to my queue by `held_by_standing` stopped
-                // 2.2 m behind my rear with me as its lead, and held me 30 s as "standing in
-                // the meeting place", viz case14 #46608/#50444). Level with me or ahead, it
-                // holds me as before (`competitor_filter_my_follower_in_the_same_lane_is_no_foe`)
-                let behind_me = foe.kind == FoeKind::Merge && foe.theirs.1 - (o.s + o.front) > foe.mine.1 - (c.s - c.rear);
-                if their_inside && o.speed < STANDING_SPEED && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, &claim_of, ok, c.vehicle)) {
-                    note("stopped_behind_me", None);
-                    continue;
-                }
-                // standing in the meeting place, held by its own lead or standing for good: it is
-                // not leaving on the schedule its acceleration would give it
-                // (its plan holds it there - a lead, its stop: OMSI's reason, SUMO's foe would carry
-                // its planned leave time, which no claim knows; [J7-1] at its red, past this place,
-                // it leaves at its green - until_go and its window from rest - not never)
-                if their_inside && o.speed < STANDING_SPEED && o.held {
-                    their_out = match o.until_go.filter(|_| o.light_red && o.red_at > foe.theirs.0) {
-                        Some(t) => t + window(o, foe.theirs.1, foe.theirs.1).1,
-                        None => f32::INFINITY,
-                    };
-                }
+                };
+                let (their_in, their_out, at_red, their_inside) = match pass {
+                    Pass::Left => continue,
+                    Pass::Not(skip) => {
+                        note(skip, None);
+                        continue;
+                    }
+                    Pass::Window { their_in, their_out, at_red, their_inside } => (their_in, their_out, at_red, their_inside),
+                };
                 // [J7-1] SUMO's time test (`blockedByFoe`, `foe_times`): follower, leader or a
                 // conflict, `JM_TIMEGAP_MINOR` either way, the foe's arrival as my impatience
                 // sees it. (One held by its lead, people or a light outside the meeting place is
