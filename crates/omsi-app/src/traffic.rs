@@ -698,7 +698,8 @@ pub struct Traffic {
     /// pre-plan loop, the recorder's frame, `Simulation::tick`; the sums and the frame count
     /// since the last line logged.
     pub tick_inner: [f64; 3],
-    /// The cars by id and by lead, as of the per-car loop of the running `tick`.
+    /// The cars by id and by lead: valid for one frame only, built before the per-car loop of
+    /// `tick` and cleared right after it (the indices go stale once cars are removed).
     links: CarLinks,
     tick_inner_sum: ([f64; 3], u32),
     /// Seconds each of them has stood still.
@@ -3697,6 +3698,7 @@ impl Traffic {
             }
             car.ai.external = ext;
         }
+        self.links = CarLinks::default();
         // the drivers
         let placeholder = || AiVehicle::new(0, VehicleClass::Car, AiState::new(0, 0.0, 0), 0.0, 0);
         // (what the bus services and the parking plans set on the ways themselves, for the

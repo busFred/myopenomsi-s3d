@@ -23,6 +23,7 @@ use flate2::Compression;
 use glam::{DVec2, DVec3};
 use hashbrown::{HashMap, HashSet};
 use omsi_sim::traffic::{AiState, Crossing, Lane, Network, TrafficLightController};
+#[cfg(test)]
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
