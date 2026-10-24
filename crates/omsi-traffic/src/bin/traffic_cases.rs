@@ -4261,6 +4261,10 @@ struct Extra {
     /// [J7-2] Vehicle-seconds within the radius with a zipper speed (`Grant::zipper`: the foe
     /// ahead at a merge caps the speed, or the queue-entry stop behind it).
     zipper_capped_s: f64,
+    /// Vehicle-seconds within the radius standing under a zipper cap (not the queue-entry stop)
+    /// whose foe ahead stands at its own red (`Claim::light_red`): a partner held at red is not
+    /// coming (`reservation::will_pass`, `zipper_cap`), so this is 0 when the rule holds.
+    capped_by_red_s: f64,
     /// [round 7 R7-1] With `--pedtouch`: frames a moving vehicle's body is severely over a
     /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
     /// player's passengers out not counted).
@@ -4491,6 +4495,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.follower_go_s += g.follower_go as f64 * fdt;
                     ex.leader_go_s += g.leader_go as f64 * fdt;
                     ex.zipper_capped_s += g.zipper.is_some() as u8 as f64 * fdt;
+                    let partner_at_red = g.zipper.filter(|z| !z.stop).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe)).is_some_and(|(o, _)| o.light_red && o.speed < 0.3);
+                    if partner_at_red && c.speed < 0.3 {
+                        ex.capped_by_red_s += fdt;
+                    }
                 }
             }
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
@@ -4911,6 +4919,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("far_red_before", e.far_red_before_s.to_string()),
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
+        ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
         ("removed_far", e.removed_far.to_string()),
     ]
 }
@@ -4954,6 +4963,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.follower_go_s += e.follower_go_s;
     t.leader_go_s += e.leader_go_s;
     t.zipper_capped_s += e.zipper_capped_s;
+    t.capped_by_red_s += e.capped_by_red_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
