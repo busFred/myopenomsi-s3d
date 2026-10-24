@@ -1270,15 +1270,17 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // 6.1). Every other waiter - at another stop, for a bus going by - is held for by the
         // car rule (viz5 case02: timetable buses drove through waiters away from their stop).
         let my_waiter = p.waiting_for_bus && me.serves_stops() && p.waits_at.is_some() && me.external.serves.contains(&p.waits_at);
+        // ([P2, A9-2] anybody else on foot - on a pavement, at a kerb, beside the lane: SUMO's
+        // `MSLane::nextBlocking` holds a vehicle for a person only where their body overlaps its
+        // own width, no margin; the 0.3 m strip round my footprint held a bus for walkers 0.24-
+        // 1.04 m off its flank with the free lane beside it, 08:37 #30339 ~40 s)
         let half = if on_crossing {
             me.half_width + 1.5
-        } else if my_waiter {
-            me.half_width + crate::plan::PERSON_RADIUS
         } else if at_kerb_of_stop {
             // (its footprint and 0.3 m clear of it)
             me.half_width + KERB_CLEAR
         } else {
-            me.half_width + 0.3
+            me.half_width + crate::plan::PERSON_RADIUS
         };
         // (one about to step into my lane - moving toward it from within STEP_NEAR of my
         // strip - is followed for the time I need to reach them, 2 s at least; anyone else
@@ -1290,8 +1292,17 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let stepping_in = p.vel.dot(my_right) * off < -0.01 && (off.abs() as f32) < half + STEP_NEAR;
         let t = if stepping_in { (dist / v.max(1.0)).clamp(2.0, STEP_LOOK) } else { (dist / v.max(1.0)).min(2.0) };
         let later = p.pos.truncate() + p.vel * t as f64;
-        // (where somebody waiting for a bus is, not where their shuffle would take them)
-        let positions: &[DVec2] = if at_kerb_of_stop || my_waiter { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
+        // (where somebody waiting for a bus is, not where their shuffle would take them; [P2,
+        // A9-2] and, for the strip, anybody off a crossing who is not walking towards my axis at
+        // `STEP_SPEED` or more: SUMO's nextBlocking takes a person where they are, and who walks
+        // a pavement keeps to it (`humans` P1c); somebody shuffling towards the lane under
+        // walking pace is no step (the 08:37 bus #30339 held ~40 s by two walkers at 0.45 m/s
+        // whose projected step reached its strip); one walking out into the road is followed
+        // as before, and the body test below looks where a step of `STEP_SPEED` takes anybody)
+        let toward_axis = -(p.vel.dot(my_right) as f32) * (off as f32).signum();
+        let now_only = at_kerb_of_stop || my_waiter || (!on_crossing && toward_axis < STEP_SPEED);
+        let positions: &[DVec2] = if now_only { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
+        let stepped: [DVec2; 2] = [p.pos.truncate(), later];
         // ([fix pass 1, 2; pass 2, 3] anybody whose body is over mine - beside it or behind
         // the front plane, now or where their step takes them - holds the car where it stands
         // until they are clear of it (SUMO: vehicles brake for persons on their lane): the
@@ -1307,7 +1318,8 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             // 3.7 m/s with the crossing under it and stood 78 s with a walker's projected step
             // inside its body)
             let stepping = (on_crossing || p.vel.length() >= STEP_SPEED as f64) && !covering;
-            let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
+            let body_pos: &[DVec2] = if at_kerb_of_stop || my_waiter { &stepped[..1] } else { &stepped };
+            let at: &[DVec2] = if stepping { body_pos } else { &body_pos[..1] };
             let inside = |pos: DVec2| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0;
             // ([pass 2, R1] out on a pass or bypass, somebody only their step brings over my
             // body, whose line my rear passes at my present speed before they reach my flank,
@@ -1377,23 +1389,25 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let now_way = (p.pos.truncate() - q).dot(right) as f32;
             let now_axis = now_way + lat;
             let later_axis = (later - q).dot(right) as f32 + lat;
-            // (where their body is now, off my way: the shift below is for somebody outside my
-            // footprint, which a projected shuffle must not decide)
+            // (where their body is now, off my way: the level-with-my-body exemptions below are
+            // for somebody outside my footprint, which a projected shuffle must not decide)
             let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
-            // [round 5 L3] one beside the lane - outside its footprint now and after their
-            // step, their body outside mine (C2 holds one inside it), inside the drawn road -
-            // on the car's own lane: a shift inside the drawn road may clear them (a bus pulls
-            // in beside its people; one on a crossing, or stepping into the lane, holds the car)
+            // [round 5 L3] one beside the lane - their centre outside its footprint now and after
+            // their step (one taken where they are, [P2], now), inside the drawn road - on the
+            // car's own lane: a shift inside the drawn road may clear them (a bus pulls in beside
+            // its people; one on a crossing, inside the lane, or stepping into it holds the car).
+            // ([P2] with the strip the car's own width, the people a shift is for are those whose
+            // body reaches over its flank from beside the lane: their body need not be outside
+            // mine, as when the strip was 0.3 m wider than my footprint)
             let strip = if now_axis < 0.0 { drivable_left } else { drivable_right };
             let swervable = |along: f32| {
                 !me.serves_stops()
                     && !on_crossing
-                    && outside
                     && along <= lane_left
                     && now_axis.abs() > lane_half
-                    && later_axis.abs() > lane_half
+                    && (now_only || later_axis.abs() > lane_half)
                     && now_axis.abs() < strip
-                    && now_axis.signum() == later_axis.signum()
+                    && (now_only || now_axis.signum() == later_axis.signum())
             };
             for &pos in positions {
                 let r = pos - q;
@@ -1412,10 +1426,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 if along < -span_back || along > span_ahead {
                     continue;
                 }
-                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
-                // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
-                // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
-                // with a stream on the crossing they let the vehicle go first (P4)
+                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross whose body is outside my
+                // footprint holds nobody, nor counts for the shift past the people beside the
+                // lane: with a stream on the crossing they let the vehicle go first (P4)
                 if p.at_kerb && !on_crossing && across >= me.half_width + crate::plan::PERSON_RADIUS {
                     continue;
                 }
@@ -1492,7 +1505,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         if on_axis.iter().any(|h| h.axis.signum() != side) {
             return None;
         }
-        let half = me.half_width + 0.3;
+        let half = me.half_width + crate::plan::PERSON_RADIUS;
         let need = on_axis.iter().map(|h| half - h.axis.abs()).fold(0.0f32, f32::max).clamp(PEOPLE_SWERVE_MIN, PEOPLE_SWERVE_MAX);
         let room = if side > 0.0 { drivable_left } else { drivable_right };
         if room - me.half_width - need < SWERVE_EDGE_KEEP {
@@ -1507,7 +1520,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // (with the shift, whoever it clears holds nothing: level with the body or creeping, by
     // the shift as planned; ahead of a moving car by the way as it is bent already, or by the
     // curve's share while the curve is not laid yet)
-    let half = me.half_width + 0.3;
+    let half = me.half_width + crate::plan::PERSON_RADIUS;
     let nearest = |stops: &mut dyn Iterator<Item = f32>| {
         let s = stops.fold(f32::INFINITY, f32::min);
         s.is_finite().then_some(s)
@@ -1528,7 +1541,7 @@ fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {
     let v = st.speed;
     let reach = people_reach(v);
     let radius = (st.front + reach + 6.0) as f64;
-    let half = (me.half_width + 0.3) as f64;
+    let half = (me.half_width + crate::plan::PERSON_RADIUS) as f64;
     let mut far = 0.0f32;
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
