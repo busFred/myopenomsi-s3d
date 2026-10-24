@@ -50,6 +50,10 @@ pub fn warm_up(world: &World, ty: &Arc<VehicleType>, hof: Option<Arc<omsi_vehicl
     }
 }
 
+/// Frames between two lines of the traffic profile (OMSI_PROFILE): 30 s at the 30 Hz of the
+/// offscreen run.
+const TICK_PROFILE_FRAMES: u32 = 900;
+
 /// The chance per population pass (about every 2 s) that a car near the player parks in a
 /// free space (`Traffic::park_in`; the value since the first release, by eye).
 const PARK_IN_CHANCE: f64 = 0.04;
@@ -661,6 +665,11 @@ pub struct Traffic {
     /// Where the last `tick` spent its time (s, OMSI_PROFILE): who is on which lane and the
     /// light programs, every car's plan, the bodies and scripts on the workers.
     pub tick_split: [f64; 3],
+    /// Where the planning part of the last `tick` went (s, OMSI_PROFILE): the per-car
+    /// pre-plan loop, the recorder's frame, `Simulation::tick`; the sums and the frame count
+    /// since the last line logged.
+    pub tick_inner: [f64; 3],
+    tick_inner_sum: ([f64; 3], u32),
     /// Seconds each of them has stood still.
     others_still: HashMap<u32, f32>,
     /// Timetable buses taken off the road because the tile under them was unloaded (their
@@ -1338,6 +1347,8 @@ impl Traffic {
             drivers: HashMap::new(),
             driver_pool: Vec::new(),
             tick_split: [0.0; 3],
+            tick_inner: [0.0; 3],
+            tick_inner_sum: ([0.0; 3], 0),
             others_still: HashMap::new(),
             removed_scheduled: Vec::new(),
             dead_ended: Vec::new(),
@@ -3509,6 +3520,7 @@ impl Traffic {
         self.note_through_lanes();
         // [ROLLBACK r4d-B2] buses taken off the road this frame as the last resort
         let mut respawn: Vec<usize> = Vec::new();
+        let t_pre = std::time::Instant::now();
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
@@ -3663,9 +3675,12 @@ impl Traffic {
                 r.set_person(p);
             }
         }
+        let t_rec = std::time::Instant::now();
         let cars = &self.cars;
         self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &|i| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default());
+        let t_sim = std::time::Instant::now();
         self.sim.tick(&self.net, dt, &mut drivers);
+        self.tick_inner = [(t_rec - t_pre).as_secs_f64(), (t_sim - t_rec).as_secs_f64(), t_sim.elapsed().as_secs_f64()];
         for (c, v) in self.cars.iter_mut().zip(drivers) {
             c.ai = v;
         }
@@ -3787,6 +3802,18 @@ impl Traffic {
             });
         }
         self.tick_split = [(t_plan - t_start).as_secs_f64(), (t_par - t_plan).as_secs_f64(), t_par.elapsed().as_secs_f64()];
+        if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            let (sum, n) = &mut self.tick_inner_sum;
+            for (s, v) in sum.iter_mut().zip(self.tick_inner) {
+                *s += v;
+            }
+            *n += 1;
+            if *n >= TICK_PROFILE_FRAMES {
+                let ms = |x: f64| x * 1000.0 / *n as f64;
+                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]));
+                self.tick_inner_sum = ([0.0; 3], 0);
+            }
+        }
         if debug {
             // a car pulled round harder than a driver would: what way was it given?
             for (c, fr) in self.cars.iter().zip(&frames) {
