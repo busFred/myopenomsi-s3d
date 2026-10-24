@@ -101,15 +101,12 @@ const PRIORITY_WARN_GAP: f32 = 60.0;
 const AT_END_STAND: f32 = 0.5;
 /// ... a timetable bus let go there after this long (s).
 const AT_END_STAND_BUS: f32 = 20.0;
-/// Standing this long (s) beyond `FAR_OFF_DIST` (m) from the eye, too far for the
-/// renderer to draw it plainly: a bus stood with its passengers at the far end of a
-/// straight road for good (r4d). For a timetable bus at its loaded route's end (`at_edge`)
-/// and the dead-end rule only ([round 8 H8-7 fix pass 2] not for a car at the loaded tiles'
-/// edge, which goes by the round-7 in-view rule).
+/// Standing this long (s) beyond the perceptual horizon (`Viewer::beyond_horizon`) takes a
+/// timetable bus at its loaded route's end (`at_edge`) and a car at a dead end (a bus stood
+/// with its passengers at the far end of a straight road for good). Inside the horizon in
+/// frame neither rule removes it: it is plainly seen (a car at a dead end then goes by the
+/// in-view rule, `goes_in_view`).
 const FAR_OFF_STAND: f32 = 8.0;
-const FAR_OFF_DIST: f64 = 180.0;
-/// Standing this long (s) at a dead end or the loaded route's end goes in any case.
-const STOOD_LONG: f32 = 150.0;
 /// At a dead end with a queue behind it, in view too after this long (s), beyond
 /// `QUEUE_BEHIND_DIST` (m): a fire engine at the end of a dead-end street held fourteen cars
 /// for two and a half minutes.
@@ -262,7 +259,8 @@ fn removal_rule(why: &str) -> RemoveRule {
         "its ground unloaded" => RemoveRule::GroundUnloaded,
         "out of range" => RemoveRule::OutOfRange,
         "finished, in view after its grace" => RemoveRule::InViewAfterGrace,
-        "at the loaded tiles' edge, beyond the horizon" => RemoveRule::FarDeadEnd,
+        "at the loaded tiles' edge, beyond the horizon" | "at a dead end, beyond the horizon" => RemoveRule::FarDeadEnd,
+        "at the loaded route's end, beyond the horizon" => RemoveRule::FarRouteEnd,
         w if w.starts_with("at the loaded tiles' edge, in view") => RemoveRule::InViewAfterGrace,
         w if w.starts_with("at the loaded tiles' edge") => RemoveRule::DeadEnd,
         w if w.ends_with("out of sight") => RemoveRule::OutOfSight,
@@ -2231,41 +2229,42 @@ impl Traffic {
             // (the rules are asked in order, lazily: `hidden` casts rays)
             let first = |rules: &[(&dyn Fn() -> bool, &'static str)]| rules.iter().find(|r| r.0()).map(|r| r.1);
             let hidden = || self.hidden(world, p, r);
-            // [round 8 H8-7] the ground going is no reason of its own to vanish in view: it
-            // waits behind `hidden()` like every other removal (the tiles go at 170-200 m, and
-            // 129 cars went within 200 m of the eye in 300 s at Jiangzhaikou, in frame); one in
-            // sight stays until it is not, or another rule below takes it
+            // beyond the perceptual horizon of its body (`Viewer::beyond_horizon`, with the lamps
+            // dark: the one measure round 9's appearing and trip ends use)
+            let beyond = || self.viewer.is_some_and(|v| v.beyond_horizon(from_eye, body_height(&c.vehicle.ty)));
+            // the ground going is no reason of its own to vanish in view: it waits behind
+            // `hidden()` like every other removal (the tiles go at 170-200 m); one in sight stays
+            // until it is not, or another rule below takes it
             let reason: Option<&'static str> = if unloaded && hidden() {
                 Some("its ground unloaded")
             } else if at_edge {
-                // (its trip comes back with the tiles; kept until nobody saw it, a bus stood
-                // with its passengers at the far end of a straight road for good)
-                first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at the loaded route's end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at the loaded route's end, long")])
+                // (its trip comes back with the tiles) a timetable bus waits at the loaded
+                // route's end until nobody sees it, or - a dot nobody tells from nothing - beyond
+                // the perceptual horizon (`Viewer::beyond_horizon`: lamps lit, none) after
+                // FAR_OFF_STAND; inside the horizon in frame it stays, whatever its standing time
+                // (the bus a player parked beside is not made to vanish)
+                first(&[(&|| hidden(), "at the loaded route's end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && beyond(), "at the loaded route's end, beyond the horizon")])
             } else if !random {
                 None
             } else if far_trip_end.contains(&c.id) {
-                // [round 9 A2, fix pass 1] its trip ends at the edge beyond the horizon: once
-                // nobody sees it (as before) or now, in frame, a dot
+                // its trip ends at the edge beyond the horizon (`far_trip_ends`): once nobody sees
+                // it or now, in frame, a dot
                 first(&[(&|| hidden(), "at the loaded tiles' edge, out of sight"), (&|| true, "at the loaded tiles' edge, beyond the horizon")])
             } else if at_loaded_edge {
-                // [round 8 H8-7, fix pass 2] standing at the edge of the loaded tiles (`Lane::
-                // loaded_edge`, the crate stops it there): it goes once nobody sees it, or in view
-                // by the round-7 rule every other car has (`goes_in_view`: given up, its grace
-                // run, beyond GAVE_UP_DIST, the front of its queue) - nothing else; a dead-end
-                // removal, gated and counted (it drove off the loaded network in view as "the
-                // network's end": 607 in frame at 873 m, Jiangzhaikou). The bus route end's
-                // FAR_OFF/STOOD_LONG are a timetable bus's alone.
+                // standing at the edge of the loaded tiles (`Lane::loaded_edge`, the crate stops it
+                // there): it goes once nobody sees it, or in view by the rule every other car
+                // has (`goes_in_view`: given up, its grace run, beyond GAVE_UP_DIST, the front of
+                // its queue) - nothing else, so that it does not drive off the loaded network in
+                // view as "the network's end"
                 first(&[
                     (&|| hidden(), "at the loaded tiles' edge, out of sight"),
                     (&|| goes_in_view(c.ai.gone, &c.ai, from_eye), "at the loaded tiles' edge, in view after its grace"),
                 ])
-            } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && from_eye > FAR_OFF_DIST, "at a dead end, far off"), (&|| c.ai.stopped > STOOD_LONG, "at a dead end, long"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
-                // (and in view too once others wait behind it: a fire engine at the end of a
-                // dead-end street held a queue of fourteen cars for two and a half minutes)
-                // (taken at once it vanished in plain view 300 m ahead; but a car kept
-                // until nobody could see it stood for good at the end of a long straight
-                // road in view, and the queue behind it - timetable buses with their
-                // passengers among them - never moved again)
+            } else if let Some(why) = at_end.then(|| first(&[(&|| hidden(), "at a dead end, out of sight"), (&|| c.ai.stopped > FAR_OFF_STAND && beyond(), "at a dead end, beyond the horizon"), (&|| c.ai.stopped > QUEUE_BEHIND_STAND && queued.contains(&c.id) && from_eye > QUEUE_BEHIND_DIST, "at a dead end, a queue behind it")])).flatten() {
+                // a car given up at a dead end goes once nobody sees it, beyond the horizon after
+                // FAR_OFF_STAND, or in view once others wait behind it (QUEUE_BEHIND_STAND: a
+                // queue behind a car that cannot move on never clears); else by the in-view rule
+                // below
                 Some(why)
             } else if finished || dist > far {
                 // in plain view a car stays until the renderer leaves it out anyway, and
@@ -2294,10 +2293,10 @@ impl Traffic {
                 let frames = || self.viewer.is_some_and(|v| v.frames(p, r));
                 let seen = match rule {
                     RemoveRule::OutOfSight => false,
-                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded | RemoveRule::FarDeadEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
+                    RemoveRule::InViewAfterGrace | RemoveRule::DeadEnd | RemoveRule::GroundUnloaded | RemoveRule::FarDeadEnd | RemoveRule::FarRouteEnd => frames() && !self.viewer.is_some_and(|v| self.occluded(world, &v, p, r)),
                     _ => frames(),
                 };
-                self.removed_far += (rule == RemoveRule::FarDeadEnd && seen) as usize;
+                self.removed_far += (rule.beyond_horizon() && seen) as usize;
                 // ([round 9 A2] with its distance from the eye: the removals by distance band)
                 self.recorder.note_remove_from(c.id, rule, seen, c.ai.waiting, Some(from_eye as f32));
             }
@@ -6027,6 +6026,17 @@ mod loaded_edge_tests {
         assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
         // [round 9 A2, fix pass 1] the trip's end at the edge beyond the horizon
         assert_eq!(removal_rule("at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
+    }
+
+    /// D2: the removal rules of the bus route end and the dead end beyond the horizon are
+    /// recorded by their own rules, counted as `removed_far` and not as removed in view.
+    #[test]
+    fn d2_the_far_route_end_and_dead_end_are_horizon_rules() {
+        assert_eq!(removal_rule("at the loaded route's end, beyond the horizon"), RemoveRule::FarRouteEnd);
+        assert_eq!(removal_rule("at a dead end, beyond the horizon"), RemoveRule::FarDeadEnd);
+        assert!(RemoveRule::FarRouteEnd.beyond_horizon() && RemoveRule::FarDeadEnd.beyond_horizon());
+        assert_eq!(removal_rule("at the loaded route's end, out of sight"), RemoveRule::OutOfSight);
+        assert!(!RemoveRule::DeadEnd.beyond_horizon());
     }
 }
 
