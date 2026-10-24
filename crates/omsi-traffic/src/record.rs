@@ -327,6 +327,9 @@ impl Record {
 /// exactly as `Record` does.
 #[derive(Serialize)]
 enum RecordRef<'a> {
+    /// (only the test: a frame is written from an owned `Frame`, `Msg::Frame`; this is what
+    /// it must serialise to, byte for byte)
+    #[cfg(test)]
     Frame(FrameRef<'a>),
     Keyframe { time: f64, vehicles: &'a [Vehicle] },
     Spawn { time: f64, vehicle: &'a Vehicle, type_name: &'a str },
@@ -338,6 +341,7 @@ enum RecordRef<'a> {
     Note { time: f64, text: &'a str },
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct FrameRef<'a> {
     time: f64,
@@ -354,8 +358,10 @@ struct FrameRef<'a> {
 }
 
 /// The light programs' clocks as `Frame::light_clocks` has them.
+#[cfg(test)]
 struct LightClocks<'a>(&'a [TrafficLightController]);
 
+#[cfg(test)]
 impl Serialize for LightClocks<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.0.len()))?;
@@ -390,6 +396,9 @@ enum Kind {
 
 enum Msg {
     Line { time: f64, kind: Kind, text: String },
+    /// A frame's inputs, owned, written as a line by the recorder's thread (the people are
+    /// most of a frame's text: serialising them was the game thread's, now it is this one's).
+    Frame { time: f64, frame: Box<Frame> },
     StartFull { file: std::fs::File, header: String },
     StopFull,
     Dump { path: PathBuf, header: String },
@@ -552,21 +561,23 @@ impl Recorder {
             people_fallback = sim.people.iter().map(PersonRecord::from_person).collect();
             &people_fallback
         };
-        let frame = FrameRef {
+        // (copied, not written: the recorder's thread serialises it, `Record::Frame` as
+        // `RecordRef::Frame` would have)
+        let frame = Frame {
             time,
             dt,
             day_time: sim.day_time,
             time_scale: sim.time_scale,
-            players: &sim.players,
-            people,
+            players: sim.players.clone(),
+            people: people.to_vec(),
             // ([round 7 E3] not with the people's legs: the replay rebuilds the list from them)
-            walkers: if people.iter().any(|p| p.leg.is_some()) { &[] } else { &sim.walkers },
-            externals: &self.externals,
-            steer,
-            light_clocks: LightClocks(&sim.lights),
-            order: order_changed.then_some(self.order.as_slice()),
+            walkers: if people.iter().any(|p| p.leg.is_some()) { Vec::new() } else { sim.walkers.clone() },
+            externals: self.externals.clone(),
+            steer: steer.to_vec(),
+            light_clocks: sim.lights.iter().map(|c| (c.time, c.held, c.request.clone())).collect(),
+            order: order_changed.then(|| self.order.clone()),
         };
-        self.line(time, Kind::Other, &RecordRef::Frame(frame));
+        self.send(Msg::Frame { time, frame: Box::new(frame) });
     }
 
     /// Every vehicle as it is now.
@@ -762,6 +773,22 @@ fn compress(bytes: &[u8]) -> Vec<u8> {
 
 type FileOut = ZlibEncoder<io::BufWriter<std::fs::File>>;
 
+/// A line of text to the file being recorded (if any) and to the ring.
+fn write_line(file: &mut Option<FileOut>, ring: &mut Ring, time: f64, kind: Kind, text: &str) {
+    if let Some(f) = file.as_mut() {
+        // (a keyframe flushes what came before: a recording of a game that
+        // crashed reads up to its last keyframe)
+        let ok = if kind == Kind::Keyframe { f.flush().is_ok() } else { true } && f.write_all(text.as_bytes()).is_ok() && f.write_all(b"\n").is_ok();
+        if !ok {
+            log::warn!("traffic recording: the file cannot be written any more, the recording stops");
+            *file = None;
+        }
+    }
+    if kind != Kind::FileOnly {
+        ring.push(time, kind, text);
+    }
+}
+
 fn writer_thread(rx: mpsc::Receiver<Msg>) {
     let mut file: Option<FileOut> = None;
     let mut ring = Ring::default();
@@ -774,20 +801,11 @@ fn writer_thread(rx: mpsc::Receiver<Msg>) {
     };
     for m in rx {
         match m {
-            Msg::Line { time, kind, text } => {
-                if let Some(f) = file.as_mut() {
-                    // (a keyframe flushes what came before: a recording of a game that
-                    // crashed reads up to its last keyframe)
-                    let ok = if kind == Kind::Keyframe { f.flush().is_ok() } else { true } && f.write_all(text.as_bytes()).is_ok() && f.write_all(b"\n").is_ok();
-                    if !ok {
-                        log::warn!("traffic recording: the file cannot be written any more, the recording stops");
-                        file = None;
-                    }
-                }
-                if kind != Kind::FileOnly {
-                    ring.push(time, kind, &text);
-                }
-            }
+            Msg::Frame { time, frame } => match finite::to_string(&Record::Frame(*frame)) {
+                Ok(text) => write_line(&mut file, &mut ring, time, Kind::Other, &text),
+                Err(e) => log::warn!("traffic recording: a record could not be written: {e}"),
+            },
+            Msg::Line { time, kind, text } => write_line(&mut file, &mut ring, time, kind, &text),
             Msg::StartFull { file: f, header } => {
                 finish(file.take());
                 let mut f = ZlibEncoder::new(io::BufWriter::new(f), Compression::default());
@@ -842,4 +860,58 @@ pub fn write_file(path: &Path, header: &Header, records: &[&Record]) -> io::Resu
         out.write_all(b"\n")?;
     }
     out.finish()?.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame written from its owned copy on the recorder's thread is the line the game
+    /// thread used to write from the borrowed parts, byte for byte.
+    #[test]
+    fn an_owned_frame_serialises_as_the_borrowed_one_did() {
+        let mut light = TrafficLightController::new(vec![vec![(1, 5.0), (3, 7.5)], vec![(3, 5.0)]], 12.5);
+        light.time = 3.25;
+        light.held = true;
+        light.request = vec![true, false];
+        let lights = vec![light];
+        let players = vec![PlayerView { id: 0, pos: DVec3::new(1.5, -2.25, 0.1), heading: 33.3, half_len: 6.0, half_width: 1.2, speed: -0.7, still: 0.0, blinker: 2, signalling: 1.5, priority: true }];
+        let mut walker = PersonRecord::from_person(&Person { pos: DVec3::new(10.1, 20.2, 0.0), vel: DVec2::new(0.3, -0.1), on_crossing: true, still: 0.4, waiting_for_bus: false, at_kerb: true, waits_at: Some(7) });
+        walker.leg = Some((3, 1.25, 8.5));
+        walker.decision = Some(Cow::Borrowed("red light"));
+        let people = vec![walker, PersonRecord::from_person(&Person { pos: DVec3::new(-5.0, 6.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: true, at_kerb: false, waits_at: None })];
+        let externals = vec![(7u64, External { priority: true, ..Default::default() })];
+        let steer = vec![(9u64, Steer { signal: 1, signal_time: 0.5, lateral_target: -1.5, lateral_ramp: (0.1, 0.2, 0.3, 0.4) })];
+        let order = vec![3u64, 1, 2];
+        for (order, walkers) in [(None, vec![(2usize, 0.5f32)]), (Some(order.clone()), Vec::new())] {
+            let borrowed = FrameRef {
+                time: 12.125,
+                dt: 0.033333335,
+                day_time: 30000.5,
+                time_scale: 1.0,
+                players: &players,
+                people: &people,
+                walkers: &walkers,
+                externals: &externals,
+                steer: &steer,
+                light_clocks: LightClocks(&lights),
+                order: order.as_deref(),
+            };
+            let before = finite::to_string(&RecordRef::Frame(borrowed)).unwrap();
+            let owned = Frame {
+                time: 12.125,
+                dt: 0.033333335,
+                day_time: 30000.5,
+                time_scale: 1.0,
+                players: players.clone(),
+                people: people.clone(),
+                walkers: walkers.clone(),
+                externals: externals.clone(),
+                steer: steer.clone(),
+                light_clocks: lights.iter().map(|c| (c.time, c.held, c.request.clone())).collect(),
+                order,
+            };
+            assert_eq!(finite::to_string(&Record::Frame(owned)).unwrap(), before);
+        }
+    }
 }
