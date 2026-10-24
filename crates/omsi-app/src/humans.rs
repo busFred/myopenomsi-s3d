@@ -1909,11 +1909,29 @@ const PED_GAP_MEDIAN: f64 = 6.0;
 const PED_GAP_MIN: f64 = 0.8;
 const PED_GAP_SIGMA: f64 = 1.0;
 
+/// [P3] The target density of strollers on a pavement (persons/m^2) at the map's passenger
+/// curve 1: the boundary of walkway levels of service B and C in the user's bands (Fruin 1971,
+/// "Pedestrian Planning and Design"; HCM walkway LOS: free flow under 0.3, busy 0.3-0.7,
+/// congested 0.7-1.3, jammed over 1.3), the default "LOS B-C".
+const PED_DENSITY_TARGET: f32 = 0.3;
+/// [P3] Nobody is put down on a pavement past this density (persons/m^2): the top of LOS D in
+/// those bands (bus waiters at stops and people queueing are counted apart).
+const PED_DENSITY_CAP: f32 = 0.7;
+/// [P3] The narrowest a path counts as for its area (m): one body abreast (2 x BODY_OUTSIDE).
+const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
+
+/// [P3] The target density of strollers on a pavement and the most they are put down to
+/// (persons/m^2), at the hour's passenger curve `curve` (the map's `[trafficdensity_passenger]`
+/// times the passengers setting): the target scales with the curve, both stop at LOS D's top.
+fn stroll_density(curve: f32) -> (f32, f32) {
+    ((PED_DENSITY_TARGET * curve.max(0.0)).min(PED_DENSITY_CAP), PED_DENSITY_CAP)
+}
+
 /// [ROLLBACK r5-P6b] The median gap (m) for `target` strollers on `pavement_m` metres of pavement
 /// in the circle: half the pavement per person wanted, within PED_GAP_MIN..PED_GAP_MEDIAN, so
-/// that the count the setting asks for is reached while the gaps keep their skew. At the top
-/// of the `pedestrians` slider the median sits on the 0.8 m floor and the law is off by
-/// design: the slider is the density, and only the group draw shapes the gaps there.
+/// that the count wanted is reached while the gaps keep their skew. Where the target density
+/// ([P3] `stroll_density`) asks for more than one person per 1.6 m of path, the median sits on
+/// the 0.8 m floor and only the group draw shapes the gaps.
 fn gap_median(pavement_m: f32, target: usize) -> f64 {
     (pavement_m as f64 / (2.0 * target.max(1) as f64)).clamp(PED_GAP_MIN, PED_GAP_MEDIAN)
 }
@@ -3814,8 +3832,9 @@ pub struct Humans {
     duty: Option<(Arc<DutyTrip>, usize, bool)>,
     /// Buses whose validator somebody used since the app last looked (`take_stamped`).
     stamped: Vec<BusId>,
-    /// How many people to keep strolling the pavements about the player (the `pedestrians`
-    /// setting), scaled by `density` and by how much pavement is around, within the pool.
+    /// The most people to keep strolling the pavements about the player (the `pedestrians`
+    /// setting, an upper bound since [P3]: the pavements' area at the hour's target density
+    /// decides, `stroll_density`), within the pool.
     pub pedestrians: usize,
     /// Omsi.exe's people (`[AIMaxCountRandom]`'s second line, the `ai_max_humans` setting):
     /// it makes that many at the start (0x709274) and draws everybody waiting at a stop,
@@ -5207,10 +5226,10 @@ impl Humans {
     ) {
         let center = self.center;
         let radius = STROLL_RADIUS * 0.9;
-        // strollers: as many as the `pedestrians` setting asks for, times the hour's
-        // passenger curve, scaled down (never up) where there is little pavement around,
-        // and never past the people pool (`ai_max_humans`; OMSI lets at most half of its
-        // pool walk, 0x62463c, which the setting's default of 100 for a pool of 200 keeps).
+        // [P3] strollers: as many as the pavements' areas hold at the hour's target density
+        // (`stroll_density`, walkway level of service), never more than the `pedestrians`
+        // setting asks for (an upper bound) nor past the people pool (`ai_max_humans`; OMSI lets
+        // at most half of its pool walk, 0x62463c); put down on the paths below their target.
         // [ROLLBACK strollers-2] The pavements are those that pass within the radius (found
         // by the pavement grid), not those that start within it: a long pavement spline
         // along a boulevard that began 250 m back was no candidate at all, and only the
@@ -5257,10 +5276,20 @@ impl Humans {
             })
             .collect();
         let metres: f32 = candidates.iter().map(|c| c.1).sum();
-        // (700 m of pavement in the circle - a street with a pavement on each side - is the
-        // full measure)
-        let pavement = (metres / 700.0).clamp(0.3, 1.0);
-        let target = (self.pedestrians as f32 * self.density.clamp(0.0, 3.0) * pavement).round() as usize;
+        // [P3] each path's area inside the circle (its metres there times its width, a body
+        // abreast at least) and the strollers on it now (by the leg they walk)
+        let area = |l: usize, m: f32| m * net.lanes[l].width.max(PED_PATH_MIN_WIDTH);
+        let mut on_path: HashMap<usize, usize> = HashMap::new();
+        for q in &self.people {
+            if let State::Strolling(w) = &q.state {
+                if let Some(leg) = w.legs.get(w.leg) {
+                    *on_path.entry(leg.lane).or_default() += 1;
+                }
+            }
+        }
+        let (rho, cap) = stroll_density(self.density);
+        let wanted: f32 = candidates.iter().map(|(l, m, _)| area(*l, *m) * rho).sum();
+        let target = (wanted.round() as usize).min(self.pedestrians);
         // (never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
         let target = target.min((self.max_people + strolling).saturating_sub(self.pool_used()));
@@ -5276,6 +5305,7 @@ impl Humans {
             // weighted by the metres inside, and by lying ahead of the player: somebody put
             // down beside or behind a moving bus never gets in front of it, and the street
             // ahead looked empty until the bus stopped
+            // ([P3] by what each path lacks of its target: one at it or over gets nobody)
             let weights: Vec<f32> = candidates
                 .iter()
                 .map(|(l, m, ks)| {
@@ -5283,14 +5313,15 @@ impl Humans {
                     let lead = ahead
                         .map(|a| ((mid - center).truncate().normalize_or_zero().extend(0.0)).dot(a).max(0.0) as f32)
                         .unwrap_or(0.0);
-                    m * (1.0 + 2.0 * lead)
+                    let lacks = (area(*l, *m) * rho - on_path.get(l).copied().unwrap_or(0) as f32).max(0.0);
+                    lacks * (1.0 + 2.0 * lead)
                 })
                 .collect();
             let total: f32 = weights.iter().sum();
             // (12 a second at most, the members of a group counted)
-            let cap = (target - have).min(12);
+            let per_second = (target - have).min(12);
             for _ in 0..((target - have) * 3).min(36) {
-                if placed >= cap {
+                if placed >= per_second || total <= 0.0 {
                     break;
                 }
                 let mut x = self.rand_f() as f32 * total;
@@ -5302,8 +5333,10 @@ impl Humans {
                     }
                     x -= *w;
                 }
-                let (lane, _, ks) = &candidates[ci];
+                let (lane, path_m, ks) = &candidates[ci];
                 let lane = *lane;
+                // ([P3] never past LOS D on the path, the group counted as it is put down)
+                let path_cap = (area(lane, *path_m) * cap).floor() as usize;
                 let l = &net.lanes[lane];
                 let k = ks[(self.rand() as usize) % ks.len()];
                 let seg = if k + 1 < l.points.len() { l.dist[k + 1] - l.dist[k] } else { 0.0 };
@@ -5345,7 +5378,7 @@ impl Humans {
                 let mut at_s = s;
                 let mut leader_pace: Option<f64> = None;
                 for k in 0..members {
-                    if placed >= cap {
+                    if placed >= per_second || on_path.get(&lane).copied().unwrap_or(0) >= path_cap {
                         break;
                     }
                     if k > 0 {
@@ -5376,6 +5409,7 @@ impl Humans {
                     ) {
                         self.people[i].activity = Activity::Walk;
                         placed += 1;
+                        *on_path.entry(lane).or_default() += 1;
                         match leader_pace {
                             None => leader_pace = Some(self.people[i].pace),
                             Some(lp) => {
@@ -5393,8 +5427,8 @@ impl Humans {
         }
         if debug_pax() && (have < target || placed > 0) {
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked, curve {:.2}, pavement {:.2} of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
-                self.time, self.pedestrians, self.density, pavement, metres, candidates.len()
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2 on {:.0} m2 of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
+                self.time, self.pedestrians, self.density, candidates.iter().map(|(l, m, _)| area(*l, *m)).sum::<f32>(), metres, candidates.len()
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -10168,6 +10202,20 @@ mod ped_tests {
         assert_eq!(gap_median(700.0, 50), PED_GAP_MEDIAN);
         assert!((gap_median(2000.0, 500) - 2.0).abs() < 1e-9);
         assert_eq!(gap_median(100.0, 0), PED_GAP_MEDIAN);
+    }
+
+    #[test]
+    fn p3_the_target_density_follows_the_curve_on_the_walkway_bands_and_stops_at_los_d() {
+        // the map's curve 1 is LOS B-C's boundary (0.3 p/m^2), half of it free flow, the
+        // morning peak's 2 busy (0.6), nothing past the top of LOS D (0.7) whatever the curve
+        assert_eq!(stroll_density(1.0), (0.3, 0.7));
+        assert!((stroll_density(0.5).0 - 0.15).abs() < 1e-6);
+        assert!((stroll_density(2.0).0 - 0.6).abs() < 1e-6);
+        assert_eq!(stroll_density(3.0).0, PED_DENSITY_CAP);
+        assert_eq!(stroll_density(-1.0).0, 0.0);
+        // a 2.5 m pavement 100 m long at curve 1: 75 people; a 1 m path counts its width
+        assert!((100.0 * 2.5 * stroll_density(1.0).0 - 75.0).abs() < 1e-3);
+        assert!(PED_PATH_MIN_WIDTH < 1.0);
     }
 
     #[test]

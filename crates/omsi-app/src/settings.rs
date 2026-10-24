@@ -191,9 +191,10 @@ pub struct Settings {
     /// How many people wait and ride, against the map's own numbers (OMSI's `AIPassFactor`,
     /// 1 = 100 %).
     pub pax_density: f32,
-    /// How many people stroll the pavements about the player (`pedestrians` in the file; the
-    /// older `ped_density`, a per cent, is read as that many: 100 % = 100), scaled by the
-    /// map's passenger curve for the hour and the pavement about, within the people pool.
+    /// The most people strolling the pavements about the player (`pedestrians` in the file; the
+    /// older `ped_density`, a per cent, is read as that many: 100 % = 100), within the people
+    /// pool: how many there are follows the pavements' area at the hour's target density
+    /// (`humans::stroll_density`, the map's passenger curve on a walkway level of service).
     pub pedestrians: u32,
     /// [ROLLBACK seatpick-69] How much passengers want to sit: 0 the original's random place.
     pub pax_sit: f32,
