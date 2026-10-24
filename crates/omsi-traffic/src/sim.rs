@@ -799,6 +799,66 @@ impl Simulation {
         out
     }
 
+    /// [D7, P1f] The vehicles that will pass a pedestrian crossing and cannot stop short of it:
+    /// `cuts` are the places where the crossing's walk cuts the carriageway lanes (on a lane's
+    /// axis); returns (vehicle id, metres from its front to the nearest cut it will pass,
+    /// negative once the front is past it).
+    ///
+    /// SUMO (`MSPModel_Striping::addCrossingVehs` on a prioritised crossing): every vehicle on
+    /// a foe link of the crossing - approaching it or already on the junction - whose length
+    /// and `brakeGap(speed, maxDecel)` reach over the crossing is an obstacle the pedestrian
+    /// does not step in front of; one that can still brake is not (it brakes for them, the
+    /// crossing being theirs). Here the junctions' claims of the last frame (`claims`: the way
+    /// through as chain pieces, the origin `s` along it, front, rear, speed and comfortable
+    /// deceleration) are the vehicles on or approaching a junction: a claimant moving at
+    /// `STANDING_SPEED` or more whose way through runs over a cut (the cut within half the
+    /// piece's width of its axis) that its rear has not passed, and whose front plus
+    /// `speed^2 / (2 decel)` reaches it. A standing claimant is not listed (its body over the
+    /// crossing is the kerb's own rule); a vehicle with no claim (on a road away from any
+    /// junction) neither. Read-only; area J may replace the internals (one willPass for the
+    /// resolver and the people), the contract stays.
+    pub fn vehicles_passing_crossing(&self, net: &Network, cuts: &[DVec2]) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        if cuts.is_empty() {
+            return out;
+        }
+        // (where `q` lies along lane `l`, if within half its width of its axis)
+        let along = |l: usize, q: DVec2| -> Option<f32> {
+            let lane = net.lanes.get(l)?;
+            let mut best: Option<(f32, f64)> = None;
+            for k in 0..lane.points.len().saturating_sub(1) {
+                let (a, b) = (lane.points[k].truncate(), lane.points[k + 1].truncate());
+                let ab = b - a;
+                let t = ((q - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
+                let d = (a + ab * t - q).length();
+                if best.is_none_or(|b| d < b.1) {
+                    best = Some((lane.dist[k] + (lane.dist[k + 1] - lane.dist[k]) * t as f32, d));
+                }
+            }
+            best.filter(|b| b.1 <= (lane.width as f64) * 0.5).map(|b| b.0)
+        };
+        for (claim, _) in &self.claims {
+            if claim.speed < STANDING_SPEED {
+                continue;
+            }
+            let Some(node) = self.junctions.nodes.get(claim.junction) else { continue };
+            let front = claim.s + claim.front;
+            let reach = front + claim.speed * claim.speed / (2.0 * claim.decel.max(0.1));
+            let nearest = claim
+                .chain
+                .iter()
+                .filter_map(|&(m, off)| node.movements.get(m).map(|mv| (mv.lane, off)))
+                .flat_map(|(l, off)| cuts.iter().filter_map(move |&q| along(l, q).map(|a| off + a)))
+                .filter(|&at| claim.s - claim.rear < at && reach >= at)
+                .map(|at| at - front)
+                .fold(f32::INFINITY, f32::min);
+            if nearest.is_finite() && !out.iter().any(|o| o.0 == claim.id) {
+                out.push((claim.id, nearest));
+            }
+        }
+        out
+    }
+
     /// Indices of the people within `r` metres of `p` (by grid cell: a few more).
     pub fn people_near(&self, p: DVec3, r: f64) -> Vec<usize> {
         let (cx, cy) = cell(p);

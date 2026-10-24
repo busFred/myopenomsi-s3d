@@ -1804,6 +1804,9 @@ trait PedLights {
     fn crossing_light(&self, lane: usize) -> Option<(usize, usize)>;
     /// Whether footpath lane `lane` is a piece of a crossing object's pedestrian crossing.
     fn crossing_piece(&self, lane: usize) -> bool;
+    /// [D7] Whether a vehicle will pass a crossing whose walk cuts the carriageway at `cuts`
+    /// and cannot stop short of it (`Simulation::vehicles_passing_crossing`).
+    fn vehicle_passing(&self, cuts: &[DVec2]) -> bool;
 }
 
 impl PedLights for Traffic {
@@ -1818,6 +1821,9 @@ impl PedLights for Traffic {
     }
     fn crossing_piece(&self, lane: usize) -> bool {
         self.sim.junctions.crossing_of(lane).is_some()
+    }
+    fn vehicle_passing(&self, cuts: &[DVec2]) -> bool {
+        !self.sim.vehicles_passing_crossing(&self.net, cuts).is_empty()
     }
 }
 
@@ -2827,6 +2833,8 @@ fn replan_frozen(decision: Option<&str>, still: f32, wants: f64) -> bool {
 }
 
 const BACK_TO_KERB: &str = "a vehicle in the way: back to the kerb";
+/// [D7] A vehicle on the junction will pass the crossing and cannot stop (`kerb_verdict`).
+const PASSES: &str = "a vehicle clears the junction over the crossing";
 /// A vehicle's box over the way at the kerb ([ROLLBACK r4c-P5]) or over a cut of the
 /// crossing near the kerb ([ROLLBACK r5-P6]).
 const STANDS_ON: &str = "a vehicle stands on the crossing";
@@ -3182,6 +3190,11 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
                     && (near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)) || covers_path(&car.body, from.truncate(), way, 1.5))
             })
     };
+    // [D7] nor while a vehicle on the junction, or coming to it, will pass the crossing and can
+    // no longer stop short of it (SUMO addCrossingVehs: on a prioritised crossing a vehicle whose
+    // brake gap reaches over it is an obstacle the pedestrian does not step in front of; the
+    // vehicles clearing the box at the end of their green are such)
+    let passes = || at.lights.is_some_and(|t| t.vehicle_passing(&cuts));
     if let (Some((ctl, li)), Some(t)) = (c.light, at.lights) {
         if let Some((state, left)) = t.light_state(ctl, li) {
             if !omsi_sim::traffic::TrafficLightController::allows_go(state) {
@@ -3206,6 +3219,9 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
             }
             if occupied() {
                 return Err(STANDS_ON);
+            }
+            if passes() {
+                return Err(PASSES);
             }
             return Ok(());
         }
@@ -3264,6 +3280,9 @@ fn kerb_verdict(ped: &mut PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &M
     }
     if occupied() {
         return Err(STANDS_ON);
+    }
+    if passes() {
+        return Err(PASSES);
     }
     // [ROLLBACK r4c-P5] a vehicle moving across the first 1.5 m of the way holds them; one
     // standing there is `occupied`'s (above: up to PED_OCCUPIED_CAP of its standing, then
@@ -9198,6 +9217,8 @@ mod ped_tests {
         pub second: Cell<i32>,
         /// Seconds until a car light goes green while the pedestrians' light is not.
         pub car_go: Cell<f32>,
+        /// [D7] A vehicle on the junction will pass the crossing and cannot stop.
+        pub passing: Cell<bool>,
     }
 
     pub(super) const GREEN: i32 = 6;
@@ -9205,7 +9226,7 @@ mod ped_tests {
 
     impl FakeLights {
         pub fn new(state: i32, left: f32) -> FakeLights {
-            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false, second: Cell::new(state), car_go: Cell::new(20.0) }
+            FakeLights { state: Cell::new(state), left: Cell::new(left), pieces: Vec::new(), unlit: false, second: Cell::new(state), car_go: Cell::new(20.0), passing: Cell::new(false) }
         }
     }
 
@@ -9221,6 +9242,9 @@ mod ped_tests {
         }
         fn crossing_piece(&self, lane: usize) -> bool {
             self.pieces.contains(&lane)
+        }
+        fn vehicle_passing(&self, cuts: &[DVec2]) -> bool {
+            self.passing.get() && !cuts.is_empty()
         }
     }
 
@@ -9485,6 +9509,9 @@ mod ped_tests {
         }
         fn crossing_piece(&self, lane: usize) -> bool {
             self.junctions.crossing_of(lane).is_some()
+        }
+        fn vehicle_passing(&self, _cuts: &[DVec2]) -> bool {
+            false
         }
     }
 
@@ -10671,6 +10698,41 @@ mod ped_tests {
             let track = walk_past(DVec2::new(-5.0, 0.0), &[body], &[Some(0)], &[car(yielding, stood)], 400);
             assert!(track[399].x < 5.0 - 2.3, "yielding {yielding} stood {stood}: {:?}", track[399]);
         }
+    }
+
+    #[test]
+    fn d7_nobody_steps_onto_a_crossing_a_vehicle_will_pass_and_cannot_stop_for() {
+        // the user's rule (D7): a walker does not step out while a vehicle clears the junction
+        // over the crossing (SUMO addCrossingVehs); green and time to cross, they wait for it,
+        // then go
+        let (net, mut ped) = crossing(true);
+        let lights = FakeLights::new(GREEN, 60.0);
+        lights.passing.set(true);
+        let mut walk = across();
+        let mut m = me(2, DVec2::new(-10.0, -5.5), 1.3);
+        for k in 0..200 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert_eq!(m.decision, Some(PASSES));
+        assert!(m.pos.y < -5.0 && !m.on_crossing, "{:?}", m.pos);
+        lights.passing.set(false);
+        for k in 200..400 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert!(m.pos.y > -3.0, "across once it has passed: {:?}", m.pos);
+        // unlit: the same
+        let (net, mut ped, pieces) = metre_pieces();
+        let mut lights = FakeLights::new(GREEN, 60.0);
+        lights.pieces = pieces.clone();
+        lights.unlit = true;
+        lights.passing.set(true);
+        let mut walk = PedWalk::new(vec![Leg { lane: 2, a: 10.0, b: 20.0 }], true, 0.0);
+        let mut m = me(2, DVec2::new(-10.0, -5.5), 1.3);
+        for k in 0..300 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert_eq!(m.decision, Some(PASSES));
+        assert!(m.pos.y < -5.0, "{:?}", m.pos);
     }
 
     #[test]
