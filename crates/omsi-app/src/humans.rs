@@ -3462,8 +3462,27 @@ fn waiter_reach(l: &omsi_sim::traffic::Lane) -> f64 {
 
 /// [round 6 B3] `q`, moved straight away from the axes of the street lanes it is closer to
 /// than `waiter_reach` (at its height); `q` itself when nothing is that close, or when
-/// clearing them would take it more than `WAITER_PUSH_MAX` or into another lane.
+/// clearing them would take it more than `WAITER_PUSH_MAX` or into another lane. [P2-B2] Where
+/// that leaves it inside a lane's footprint (an island stop between two lanes narrower than two
+/// waiter reaches: BeijingCity's stop between lanes 410 and 411, 3.1 m apart, whose waiters
+/// stood 0.95 m off 411's axis and held its cars 290-295 s), it is cleared of the lanes'
+/// footprints and a body instead (`footprint_reach`): the cars of the lane pass them.
 pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
+    let p = clear_of_lanes_by(net, q, &waiter_reach);
+    if p != q || !within_lanes(net, q, &footprint_reach) {
+        return p;
+    }
+    clear_of_lanes_by(net, q, &footprint_reach)
+}
+
+/// [P2-B2] A street lane's footprint and a body (m from its axis): half its width,
+/// `LANE_MIN_WIDTH` at least, and `WAITER_BODY`.
+fn footprint_reach(l: &omsi_sim::traffic::Lane) -> f64 {
+    (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY
+}
+
+/// `clear_of_lanes` by the lanes' `reach`.
+fn clear_of_lanes_by(net: &Network, q: DVec3, reach_of: &dyn Fn(&omsi_sim::traffic::Lane) -> f64) -> DVec3 {
     // (the lane's polyline point nearest to `p`, and how far: as `Lane::nearest_point`)
     let nearest = |l: &omsi_sim::traffic::Lane, p: DVec3| -> Option<(DVec3, f64)> {
         let mut best: Option<(DVec3, f64)> = None;
@@ -3489,7 +3508,7 @@ pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
                     if l.kind != LaneKind::Street {
                         continue;
                     }
-                    let reach = waiter_reach(l);
+                    let reach = reach_of(l);
                     if let Some((c, d)) = nearest(l, p) {
                         if d < reach - 1e-3 && out.is_none_or(|o| reach - d > o.2 - o.1) {
                             out = Some((c, d, reach));
@@ -11431,6 +11450,25 @@ mod ped_tests {
         // the lane too close for a body beside the car: no room
         let tight = |q: DVec2| q.y > -1.2 + 1.25 + 0.28;
         assert_eq!(along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.0)), &tight), Along::NoRoom);
+    }
+
+    #[test]
+    fn p2b2_waiters_on_an_island_stop_between_two_lanes_stand_off_both_footprints() {
+        // BeijingCity d24: the stop between lanes 411 and 410, 3.1 m apart: two waiter reaches
+        // (1.88 m each) do not fit, so the places stayed 0.95 m off 411's axis and its cars stood
+        // for them 290-295 s; cleared of the footprints and a body (1.53 m) they fit
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.36));
+        net.lanes.push(lane(vec![p(-50.0, -3.1), p(50.0, -3.1)], LaneKind::Street, 2.3));
+        net.build_grid();
+        let q = clear_of_lanes(&net, p(0.0, -0.95));
+        assert!(q.y < -1.53 + 1e-6 && q.y > -3.1 + 1.53 - 1e-6, "{q:?}");
+        // a kerb stop with room: the waiter reach as before
+        let mut wide = Network::default();
+        wide.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.36));
+        wide.build_grid();
+        let q = clear_of_lanes(&wide, p(0.0, -0.95));
+        assert!((q.y + waiter_reach(&wide.lanes[0]) + 0.01).abs() < 1e-6, "{q:?}");
     }
 
     #[test]
