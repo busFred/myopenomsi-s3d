@@ -454,12 +454,12 @@ pub fn arc_point(start: DVec3, heading_deg: f64, s: f64, radius: f64) -> (DVec2,
 }
 
 /// The whole network.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Network {
     pub lanes: Vec<Lane>,
     /// Lanes by map identity (both directions of a two-way path share a key).
     pub by_key: HashMap<LaneKey, Vec<usize>>,
-    /// Per lane: lanes of the same crossing object whose geometry crosses or merges into it.
+    /// Per lane: the lanes it has a meeting place with (`crossings` without the places).
     pub conflicts: Vec<Vec<usize>>,
     /// Per lane: the lanes that lead into it (the reverse of `next`), for walking a
     /// one-way path backwards.
@@ -470,8 +470,11 @@ pub struct Network {
     /// Lanes by the cell containing their start. Population only needs lane starts near
     /// a viewer; the geometry grid above can contain the same long lane in many cells.
     pub start_grid: HashMap<(i32, i32), Vec<usize>>,
-    /// Per street lane: where the other street and rail lanes of its junction object cross
-    /// it or run into its end (`conflicts` with the places).
+    /// Per street or rail lane: where another lane meets it - the street and rail lanes of its
+    /// junction object that cross it or run into its end (`conflicts_from`), lane joins and the
+    /// lanes converging before them (`compile_joins`), swept paths (`compile_swept`) and the lanes
+    /// crossing it or running beside it outside any one object (`compile_lane_crossings`,
+    /// `compile_outside_converging`).
     pub crossings: Vec<Vec<Crossing>>,
     /// Per street lane: the footpaths of its junction object that cross it (zebra and
     /// signalled crossings): (footpath lane, distance along the street lane, along the path).
@@ -534,8 +537,9 @@ pub struct Approach {
 /// The road an approach comes off (`Approach::spline`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplineClass {
-    /// Lanes abreast in its direction.
+    /// Lanes of the road in its direction (`Network::road_class`).
     pub lanes: u32,
+    /// The mean `[rule] trafficdensity` and speed limit of those lanes.
     pub density: f32,
     pub speed_kmh: f32,
 }
@@ -562,6 +566,10 @@ pub struct Crossing {
     /// run together, not a joint.
     #[serde(default)]
     pub side: bool,
+    /// A crossing of two vehicle lanes that no one crossing object compiles
+    /// (`Network::compile_lane_crossings`): `Junctions::extend` puts the two into one junction.
+    #[serde(default)]
+    pub outside: bool,
 }
 
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
@@ -662,7 +670,7 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
-    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles within the
+    /// Does the road from lane `n` on end at the edge of the loaded tiles within the
     /// player's sight: followed along every way on (within `EDGE_LOOKAHEAD`), it reaches only
     /// lanes with `loaded_edge` and `edge_in_sight` and no way on (at a fork, when every branch
     /// does: a road splitting into parallel lanes that all end at the edge). The map's own end, a
@@ -864,14 +872,19 @@ impl Network {
 
     /// Geometric conflicts between the lanes of each crossing object (paths that intersect
     /// or end at the same point, with where they meet), and the footpaths crossing its
-    /// street lanes. AI cars sort out who goes first from these (`Network::must_yield`).
+    /// street lanes; the lane joins, swept paths, and lane crossings and merges outside the
+    /// objects.
+    /// AI cars sort out who goes first from these (`Network::must_yield`).
     pub fn compute_conflicts(&mut self) {
         self.conflicts = vec![Vec::new(); self.lanes.len()];
         self.crossings = vec![Vec::new(); self.lanes.len()];
         self.walks = vec![Vec::new(); self.lanes.len()];
         let (n, walks) = self.conflicts_from(0);
         let joins = self.compile_joins() + self.compile_swept();
-        log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {walks} footpath crossings");
+        let t = std::time::Instant::now();
+        let outside = self.compile_lane_crossings(0);
+        let beside = self.compile_outside_converging(0);
+        log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {outside} lane crossings and {beside} merges outside the objects ({:.1} ms), {walks} footpath crossings", t.elapsed().as_secs_f64() * 1e3);
     }
 
     /// `conflicts`, `crossings` and `walks` of the junction objects whose lanes start at
@@ -921,8 +934,8 @@ impl Network {
                         let (la, lb) = (a.length(), b.length());
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false });
-                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false });
+                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false, outside: false });
+                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false, outside: false });
                         n += 1;
                         continue;
                     }
@@ -932,8 +945,8 @@ impl Network {
                         let (bb, ba) = if merge { (meeting_extent(b, sb, a).0, 0.5) } else { meeting_extent(b, sb, a) };
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false });
-                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false });
+                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false, outside: false });
+                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false, outside: false });
                         n += 1;
                     } else if self.add_converging(i, j) {
                         n += 1;
@@ -961,7 +974,8 @@ impl Network {
     /// merging into the other's lane yields, a turning movement yields to the one going
     /// straight on, the minor road yields to the major one; only then right before left (the
     /// German "rechts vor links" the stock maps rely on wherever they set no priorities,
-    /// mirrored on a left-hand-traffic map).
+    /// mirrored on a left-hand-traffic map). Oncoming and "from the right" read the headings
+    /// the two have as they come to the meeting place (`Approach::entry_heading`).
     pub fn must_yield(&self, a: usize, b: usize) -> bool {
         let (la, lb) = (&self.lanes[a], &self.lanes[b]);
         if la.kind == LaneKind::Rail {
@@ -973,7 +987,13 @@ impl Network {
         if (la.priority - lb.priority).abs() > 0.5 {
             return la.priority < lb.priority;
         }
-        let rel = wrap_deg(lb.start_heading() - la.start_heading());
+        // (the two ways as they come to the meeting place, `approach_to`'s heading `APPROACH_WINDOW`
+        // back from it: a long spline lane crossing mid-way has turned since its start - viz case01
+        // 28/3131 started 44 degrees off its heading there, and the oncoming test fired on a right
+        // angle; an object's piece reads the lane leading into it, as it starts)
+        let (at_a, _) = self.meeting_on(a, b);
+        let (at_b, _) = self.meeting_on(b, a);
+        let rel = wrap_deg(self.approach_to(b, at_b).entry_heading - self.approach_to(a, at_a).entry_heading);
         // (the turn across the oncoming traffic: left, or right when driving on the left)
         let across = if self.left_hand { 2 } else { 1 };
         // oncoming: the turn across the other's way waits for it, before any fallback (the
@@ -1023,10 +1043,10 @@ impl Network {
             // the road from the first spline lane of the approach only (a yard, the road
             // class): the pieces of a crossing object carry their author's spawn weights (0,
             // 0.001, 0.1, 1.0), no road class (a piece of 0.001 behind a main road's lit stub
-            // made it a "yard", review9). (A lane closed to cars - the app's reverse twins and
+            // is no yard). (A lane closed to cars - the app's reverse twins and
             // timetable connectors - is no road.)
             if lane.source == 1 && !lane.no_cars && ap.spline.is_none() {
-                ap.spline = Some(SplineClass { lanes: self.lanes_abreast(l), density: lane.density, speed_kmh: lane.speed_limit_kmh });
+                ap.spline = Some(self.road_class(l));
             }
         };
         note(&mut ap, a);
@@ -1056,23 +1076,52 @@ impl Network {
         ap
     }
 
-    /// Lanes of the road side by side in `l`'s direction (the `left`/`right` chains).
-    pub fn lanes_abreast(&self, l: usize) -> u32 {
-        let mut n = 1;
-        for side in [true, false] {
-            let mut cur = l;
-            for _ in 0..8 {
-                let next = if side { self.lanes[cur].left } else { self.lanes[cur].right };
-                match next {
-                    Some(x) if x != l && x < self.lanes.len() => {
-                        n += 1;
-                        cur = x;
+    /// The class of the road spline lane `l` belongs to, in its direction: its street lanes
+    /// whose heading lies within a right angle of `l`'s, their number and the mean of their
+    /// `[rule] trafficdensity` and speed limits, as SUMO ranks a node's incoming edges by the
+    /// edge's priority, speed and lane number (sumo.md 1.3, `rightOfWay` default) - the road's,
+    /// not one lane's: a lane past a median or a bus bay has no linked neighbour, and the map
+    /// gives single lanes their own spawn weight (viz case01 AndingR_noside: 723743/9 counted as a
+    /// one-lane road, 191/6 of density 3 beside lanes of 1 as a major road, and one crossing of
+    /// two roads had two right-of-way orders). A spline's paths are numbered from 0 without gaps
+    /// (the spline file's `[path]` list); a lane of no spline is a road of its own `left`/`right`
+    /// chain with its own density and limit.
+    pub fn road_class(&self, l: usize) -> SplineClass {
+        let lane = &self.lanes[l];
+        let Some(k) = lane.key.filter(|_| lane.source == 1) else {
+            let mut n = 1;
+            for side in [true, false] {
+                let mut cur = l;
+                for _ in 0..self.lanes.len() {
+                    let next = if side { self.lanes[cur].left } else { self.lanes[cur].right };
+                    match next {
+                        Some(x) if x != l && x < self.lanes.len() => {
+                            n += 1;
+                            cur = x;
+                        }
+                        _ => break,
                     }
-                    _ => break,
+                }
+            }
+            return SplineClass { lanes: n, density: lane.density, speed_kmh: lane.speed_limit_kmh };
+        };
+        let h = lane.start_heading();
+        let (mut n, mut density, mut speed) = (0u32, 0.0f32, 0.0f32);
+        for path in 0..=u16::MAX {
+            let Some(list) = self.by_key.get(&LaneKey { path, ..k }) else { break };
+            for &x in list {
+                let o = &self.lanes[x];
+                if o.kind == LaneKind::Street && wrap_deg(o.start_heading() - h).abs() < 90.0 {
+                    n += 1;
+                    density += o.density;
+                    speed += o.speed_limit_kmh;
                 }
             }
         }
-        n
+        if n == 0 {
+            return SplineClass { lanes: 1, density: lane.density, speed_kmh: lane.speed_limit_kmh };
+        }
+        SplineClass { lanes: n, density: density / n as f32, speed_kmh: speed / n as f32 }
     }
 
     /// The right of way between two paths of equal `[rule] priority` before right before
@@ -1087,9 +1136,10 @@ impl Network {
     ///    approach) yields to one going on straight (not between oncoming ways: there the
     ///    left turn waits, step 4);
     /// 3. the minor road yields to the major one, read from the spline lane each approach
-    ///    comes off within the window (none for one of them: no road class): 2+ lanes abreast
-    ///    against 1, else `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO` times
-    ///    lower, else a speed limit `CLASS_SPEED_RATIO` times lower.
+    ///    comes off within the window (none for one of them: no road class): 2+ lanes in its
+    ///    direction against 1, else a mean `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO`
+    ///    times lower, else a mean speed limit `CLASS_SPEED_RATIO` times lower - of the road's
+    ///    lanes in that direction (`road_class`).
     pub fn right_of_way(&self, a: usize, b: usize) -> Option<bool> {
         let (at_a, merge) = self.meeting_on(a, b);
         let (at_b, _) = self.meeting_on(b, a);
@@ -1304,13 +1354,17 @@ impl Network {
     /// (`must_yield`; neither yields: a zipper). Not between pieces of one way
     /// (`one_way_pieces`, nor one leading into the other within three links), nor two
     /// branches forking from one point (starts within half a metre), nor two lanes of one path
-    /// or that have a meeting place already. True when one was added.
+    /// (one key: both directions of a two-way path) or of one spline (a road's lanes side by
+    /// side), nor two that have a meeting place already; lanes of no one object only where
+    /// their centre lines come within `CONVERGE_DIST` (the edges' overlap is a test for pieces
+    /// of one object). True when one was added.
     pub fn add_converging(&mut self, i: usize, j: usize) -> bool {
         let (Some(a), Some(b)) = (self.lanes.get(i), self.lanes.get(j)) else { return false };
         if i == j || a.points.len() < 2 || b.points.len() < 2 || a.kind != LaneKind::Street || b.kind != LaneKind::Street {
             return false;
         }
-        if a.key.map(|k| k.path) == b.key.map(|k| k.path) || self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
+        let spline = |l: &Lane| l.key.filter(|_| l.source == 1).map(|k| (k.tile, k.id));
+        if (a.key.is_some() && a.key == b.key) || (spline(a).is_some() && spline(a) == spline(b)) || self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
             return false;
         }
         if (a.start() - b.start()).truncate().length() <= 0.5 || self.one_way_pieces(i, j) || self.links_within(i, j, 3) || self.links_within(j, i, 3) {
@@ -1322,7 +1376,14 @@ impl Network {
         if ba.0 > bb.2 + MEET_DIST || bb.0 > ba.2 + MEET_DIST || ba.1 > bb.3 + MEET_DIST || bb.1 > ba.3 + MEET_DIST {
             return false;
         }
-        let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { return false };
+        let Some(((a0, a1), (b0, b1), least)) = converging_stretch(a, b) else { return false };
+        // (the edges' overlap only between pieces of one object, drawn as one junction; lanes of
+        // different roads by their centre lines: two splines' lanes side by side 2.2-2.6 m apart
+        // with 3 m widths are a road's lanes, `CONVERGE_DIST`)
+        let object = |l: &Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
+        if least >= CONVERGE_DIST && !(object(a).is_some() && object(a) == object(b)) {
+            return false;
+        }
         // (side by side the same way: two lanes of opposite directions close together are a
         // narrow road, not two ways running into one)
         if wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > CONVERGE_HEADING {
@@ -1332,8 +1393,8 @@ impl Network {
         let (aa, ba) = ((la - a1).min(0.5), (lb - b1).min(0.5));
         self.conflicts[i].push(j);
         self.conflicts[j].push(i);
-        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true });
-        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true });
+        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true, outside: false });
+        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true, outside: false });
         true
     }
 
@@ -1352,10 +1413,142 @@ impl Network {
         false
     }
 
-    /// [round 7 A2-full] The meeting place of every lane join, as SUMO makes every join a
-    /// junction node with a response matrix or a zipper (`NBNode`, `NBRequest`): in OMSI a
-    /// junction table came only from crossing objects, so two spline lanes joining outside one
-    /// had none and a first-come rule in perception decided there (deleted). Here: two street
+    /// The crossings of two vehicle lanes (street, or a street and a track) that no one crossing
+    /// object compiles: SUMO makes every crossing of two connections a foe in its node's request
+    /// matrix, whether or not the map draws a node (sumo.md 1.3); OMSI maps may draw two roads
+    /// across each other with splines alone, or a spline across a piece of an object, and the
+    /// crossing is then the junction. Two lanes whose polylines cross at an inner point
+    /// (`polyline_crossing`) at one level: their centre lines less than `MEET_DIST` apart in height
+    /// at the crossing point, where two bodies on them can touch, the distance `meeting_extent`
+    /// measures (farther apart one passes over the other: BeijingCity's and X10's underpasses lie
+    /// 3.1-3.7 m below the deck's lanes, and no fixture network has a crossing between 0.5 and 4 m), not two lanes of one crossing object (`conflicts_from` compiles those)
+    /// nor of one spline, not two tracks (as inside an object: the railway's signals keep them
+    /// apart), not pieces of one way (`one_way_pieces`), and with no meeting place yet. Only the
+    /// pairs with a lane from index `first` on (a grown network looks at its new lanes,
+    /// `outside_pairs`). Each pair once, lower index first: (a, b, distance along a, distance
+    /// along b).
+    pub fn lane_crossings(&self, first: usize) -> Vec<(usize, usize, f32, f32)> {
+        let mut out = Vec::new();
+        for (j, i) in self.outside_pairs(first, 0.0) {
+            let (a, b) = (&self.lanes[i], &self.lanes[j]);
+            if a.kind == LaneKind::Rail && b.kind == LaneKind::Rail {
+                continue;
+            }
+            let Some((sa, sb)) = polyline_crossing(a, b) else { continue };
+            if (a.at(sa).0.z - b.at(sb).0.z).abs() >= MEET_DIST || self.one_way_pieces(i, j) {
+                continue;
+            }
+            out.push((j, i, sb, sa));
+        }
+        out
+    }
+
+    /// The candidate pairs of vehicle lanes (street or rail) for a meeting place outside any one
+    /// crossing object: not two lanes of one object nor of one spline nor of one path, with no
+    /// meeting place yet, their bounding boxes within `reach` metres of each other, and one of
+    /// them from index `first` on (found through `grid`). Each pair once, (lower, higher index),
+    /// sorted.
+    fn outside_pairs(&self, first: usize, reach: f64) -> Vec<(usize, usize)> {
+        let vehicle = |l: &Lane| matches!(l.kind, LaneKind::Street | LaneKind::Rail) && l.points.len() >= 2;
+        let object = |l: &Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
+        let spline = |l: &Lane| l.key.filter(|_| l.source == 1).map(|k| (k.tile, k.id));
+        let bbox = |l: &Lane| l.points.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)));
+        let mut out = Vec::new();
+        for i in first..self.lanes.len() {
+            let a = &self.lanes[i];
+            if !vehicle(a) {
+                continue;
+            }
+            let ba = bbox(a);
+            let mut near: Vec<usize> = Vec::new();
+            for c in Self::lane_cells(a) {
+                if let Some(list) = self.grid.get(&c) {
+                    near.extend(list.iter().copied().filter(|&j| j < i));
+                }
+            }
+            near.sort_unstable();
+            near.dedup();
+            for j in near {
+                let b = &self.lanes[j];
+                if !vehicle(b) || (object(a).is_some() && object(a) == object(b)) || (spline(a).is_some() && spline(a) == spline(b)) || (a.key.is_some() && a.key == b.key) {
+                    continue;
+                }
+                let bb = bbox(b);
+                if ba.0 > bb.2 + reach || bb.0 > ba.2 + reach || ba.1 > bb.3 + reach || bb.1 > ba.3 + reach {
+                    continue;
+                }
+                if self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
+                    continue;
+                }
+                out.push((j, i));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Compile a crossing meeting place for each of `lane_crossings(first)`, as `conflicts_from`
+    /// compiles one inside an object: over the stretch either side of the point where the two
+    /// centre lines stay within `MEET_DIST` (`meeting_extent`: the two bodies' half widths).
+    /// Marked `outside`: `Junctions::extend` puts the two lanes into one junction table, where the
+    /// right of way is `must_yield`'s as for every compiled foe. Returns how many were added.
+    pub fn compile_lane_crossings(&mut self, first: usize) -> usize {
+        let len = self.lanes.len();
+        self.conflicts.resize(len, Vec::new());
+        self.crossings.resize(len, Vec::new());
+        let found = self.lane_crossings(first);
+        for &(i, j, sa, sb) in &found {
+            let (a, b) = (&self.lanes[i], &self.lanes[j]);
+            let (ab, aa) = meeting_extent(a, sa, b);
+            let (bb, ba) = meeting_extent(b, sb, a);
+            self.conflicts[i].push(j);
+            self.conflicts[j].push(i);
+            self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: false, before: ab, after: aa, other_before: bb, other_after: ba, side: false, outside: true });
+            self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: false, before: bb, after: ba, other_before: ab, other_after: aa, side: false, outside: true });
+        }
+        found.len()
+    }
+
+    /// The merges without an object: two street lanes of no one crossing object that run side
+    /// by side closer than a car is wide without crossing or running into one another get the
+    /// side-merge meeting place of `add_converging`, as lanes of one object do (SUMO: two ways
+    /// whose shapes overlap meet at a node, a zipper where nothing else orders them; OMSI maps
+    /// draw such overlaps with splines alone - X10's parallel ramp splines 0.5-1.8 m apart, a
+    /// spline under the first metres of an object's piece). Not two lanes leaving one lane, or
+    /// one leaving a lane the other's way leaves within three links (a fork: one lane before the
+    /// split keeps them in queue order, as `same_root` inside an object), nor at different
+    /// levels (centre lines `MEET_DIST` or more apart in height mid-stretch: the bodies cannot touch),
+    /// nor neighbours (`left`/`right`: lanes of one road). Only pairs with a
+    /// lane from index `first` on (`outside_pairs`). Returns how many were added.
+    pub fn compile_outside_converging(&mut self, first: usize) -> usize {
+        let len = self.lanes.len();
+        self.conflicts.resize(len, Vec::new());
+        self.crossings.resize(len, Vec::new());
+        let mut n = 0;
+        for (j, i) in self.outside_pairs(first, MEET_DIST) {
+            let (a, b) = (&self.lanes[i], &self.lanes[j]);
+            if a.kind != LaneKind::Street || b.kind != LaneKind::Street || a.left == Some(j) || a.right == Some(j) || b.left == Some(i) || b.right == Some(i) {
+                continue;
+            }
+            let prev = |l: usize| self.prev.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+            let fork = prev(i).iter().any(|p| prev(j).contains(p)) || prev(i).iter().any(|&p| self.links_within(p, j, 3)) || prev(j).iter().any(|&p| self.links_within(p, i, 3));
+            if fork {
+                continue;
+            }
+            let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { continue };
+            if (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs() >= MEET_DIST {
+                continue;
+            }
+            if self.add_converging(i, j) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The meeting place of every lane join, as SUMO makes every join a junction node with a
+    /// response matrix or a zipper (`NBNode`, `NBRequest`), because in OMSI only crossing objects
+    /// come with a table: two street
     /// lanes that run into one lane (both in its `prev`) and have none yet - spline lanes outside any crossing
     /// object, a spline lane joining an object's way out, two pieces of one object that start
     /// within 3 m of each other (which `conflicts_from` leaves out) - a merge at their ends, as
@@ -1384,14 +1577,13 @@ impl Network {
                     let bb = meeting_extent(b, sb, a).0;
                     self.conflicts[i].push(j);
                     self.conflicts[j].push(i);
-                    self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: true, before: ab, after: 0.5, other_before: bb, other_after: 0.5, side: false });
-                    self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: true, before: bb, after: 0.5, other_before: ab, other_after: 0.5, side: false });
+                    self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: true, before: ab, after: 0.5, other_before: bb, other_after: 0.5, side: false, outside: false });
+                    self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: true, before: bb, after: 0.5, other_before: ab, other_after: 0.5, side: false, outside: false });
                     n += 1;
                 }
             }
         }
-        // [round 7 A2-full fix] lanes converging side by side before the join, without a
-        // shared next lane (viz case06: 4115 runs beside 3745 and reaches 3747 through 4126):
+        // lanes converging side by side before the join, without a shared next lane (viz case06: 4115 runs beside 3745 and reaches 3747 through 4126):
         // the lanes up to two links back from each side of a join, converging closer than a
         // car is wide, get the side-merge meeting place of `add_converging`
         for (i, j) in self.join_approaches() {
@@ -1402,13 +1594,16 @@ impl Network {
         n
     }
 
-    /// [fix pass 2, 2] The swept-path meeting places of the crossing objects: a piece of an
+    /// The swept-path meeting places of the crossing objects: a piece of an
     /// object and every lane of the object or leading into it whose last body length
     /// (`SWEPT_BUS_LENGTH`) before its end lies in the piece's swept path - the two lanes' half
     /// widths (their vehicles' room) and the off-tracking of a long vehicle in the piece's
     /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R, R no less than `SWEPT_MIN_RADIUS`) - when nothing else is compiled
     /// between the two: a meeting place over the two stretches, so a vehicle standing there
-    /// counts as inside it and a refused vehicle stops before it. SUMO: any conflict between
+    /// counts as inside it and a refused vehicle stops before it - in the junction table where
+    /// both lanes are movements of the object (a piece, or a spline lane grouped into it by a
+    /// join); a lane leading in that is no movement of it keeps the place in the network only
+    /// (`Junctions::extend`; `traffic_cases crossings` counts them). SUMO: any conflict between
     /// connection shapes is a foe (sumo.md 1.3); OMSI: a stop line can sit inside a tight
     /// turn's sweep (x10 case03: bus #587 turning right on 2577 swept #3221 standing at
     /// 2605's end, no meeting place between them). Returns how many were added.
@@ -1485,8 +1680,8 @@ impl Network {
                     let (ph, bh) = (((p1 - p0) * 0.5).max(0.5), ((b1 - b0) * 0.5).max(0.5));
                     self.conflicts[pi].push(bi);
                     self.conflicts[bi].push(pi);
-                    self.crossings[pi].push(Crossing { other: bi, at: pa, other_at: ba, merge: false, before: ph, after: ph, other_before: bh, other_after: bh, side: false });
-                    self.crossings[bi].push(Crossing { other: pi, at: ba, other_at: pa, merge: false, before: bh, after: bh, other_before: ph, other_after: ph, side: false });
+                    self.crossings[pi].push(Crossing { other: bi, at: pa, other_at: ba, merge: false, before: ph, after: ph, other_before: bh, other_after: bh, side: false, outside: false });
+                    self.crossings[bi].push(Crossing { other: pi, at: ba, other_at: pa, merge: false, before: bh, after: bh, other_before: ph, other_after: ph, side: false, outside: false });
                     n += 1;
                 }
             }
@@ -1494,7 +1689,7 @@ impl Network {
         n
     }
 
-    /// [fix pass 2, 1a; pass 3, 8] Lanes `i` and `j` are pieces of ONE crossing object that
+    /// Lanes `i` and `j` are pieces of ONE crossing object that
     /// leave one lane together (a lane forking into twin pieces of the object that rejoin, viz3
     /// case03: 1106/1110 leave 1100 and rejoin into 1477/1481): pieces of ONE way, as SUMO
     /// makes the connections of one lane that re-merge one internal edge - no meeting place
@@ -1510,7 +1705,7 @@ impl Network {
         pi.is_some_and(|a| pj.is_some_and(|b| a.iter().any(|r| b.contains(r))))
     }
 
-    /// [round 7 A2-full fix] The pairs of street lanes that may converge before a lane join
+    /// The pairs of street lanes that may converge before a lane join
     /// without sharing a next lane: for every two lanes running into one lane, the lanes up to
     /// two links back from each (themselves included), one from each side, of different paths.
     pub fn join_approaches(&self) -> Vec<(usize, usize)> {
@@ -1549,33 +1744,6 @@ impl Network {
         pairs
     }
 
-    /// The converging lanes of every crossing object (`add_converging`) on a network whose
-    /// meeting places were derived before them (a recording's header): the pairs with no
-    /// meeting place yet, and the lane joins (`compile_joins`). Returns how many were added.
-    pub fn compile_converging(&mut self) -> usize {
-        self.conflicts.resize(self.lanes.len(), Vec::new());
-        self.crossings.resize(self.lanes.len(), Vec::new());
-        let mut by_object: std::collections::BTreeMap<((i32, i32), i64), Vec<usize>> = std::collections::BTreeMap::new();
-        for (i, l) in self.lanes.iter().enumerate() {
-            if l.source != 2 || l.kind != LaneKind::Street {
-                continue;
-            }
-            if let Some(k) = l.key {
-                by_object.entry((k.tile, k.id)).or_default().push(i);
-            }
-        }
-        let mut n = 0;
-        for lanes in by_object.values() {
-            for (x, &i) in lanes.iter().enumerate() {
-                for &j in &lanes[x + 1..] {
-                    if self.add_converging(i, j) {
-                        n += 1;
-                    }
-                }
-            }
-        }
-        n + self.compile_joins() + self.compile_swept()
-    }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
     /// does. (The 1.5 m linking distance also links a lane to a short piece that starts a
@@ -2189,11 +2357,16 @@ impl Network {
                 self.prev[to].push(from);
             }
         }
-        // meeting places and footpath crossings inside the new junction objects, and how far
-        // every lane now leads (a dead end may go on into the new tiles)
+        // meeting places and footpath crossings inside the new junction objects, the joins,
+        // swept paths, and lane crossings and merges outside the objects with a new lane, and how far every
+        // lane now leads (a dead end may go on into the new tiles)
         self.conflicts_from(first);
         self.compile_joins();
         self.compile_swept();
+        let t = std::time::Instant::now();
+        let outside = self.compile_lane_crossings(first);
+        let beside = self.compile_outside_converging(first);
+        log::debug!("network grew by {} lanes: {outside} lane crossings and {beside} merges outside the objects ({:.2} ms)", end - first, t.elapsed().as_secs_f64() * 1e3);
         self.update_reach_from(first);
         self.clip_drivable(first);
         first..end
@@ -2565,8 +2738,8 @@ mod stub_links_tests {
         }
         for (i, j) in [(0, 1), (3, 5)] {
             let (li, lj) = (net.lanes[i].length(), net.lanes[j].length());
-            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false });
-            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false });
+            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false, outside: false });
+            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false, outside: false });
             net.conflicts[i].push(j);
             net.conflicts[j].push(i);
         }
@@ -4568,9 +4741,15 @@ mod tests {
                 net.lanes[l].source = 1;
                 net.lanes[l].key = Some(LaneKey { tile: (0, 0), id: 100 + l as i64, path: 0 });
             }
+            // (two lanes of the main road: its spline's second path, beside the first)
             if main.1 {
-                net.lanes[2].right = Some(4);
-                net.lanes[4].left = Some(2);
+                net.lanes[4].key = Some(LaneKey { tile: (0, 0), id: 102, path: 1 });
+                net.by_key.clear();
+                for (i, l) in net.lanes.iter().enumerate() {
+                    if let Some(k) = l.key {
+                        net.by_key.entry(k).or_default().push(i);
+                    }
+                }
             }
             net
         };

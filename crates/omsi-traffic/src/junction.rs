@@ -2,7 +2,11 @@
 //!
 //! In an OMSI map a junction is a crossing scenery object: all the street and rail
 //! `[path]`s of one object are the ways through it (the *movements*), and the network
-//! already knows where any two of them meet (`Network::crossings`). This module turns
+//! already knows where any two of them meet (`Network::crossings`). Lanes that meet outside
+//! any one object - a join of spline lanes, or two lanes drawn across each other with no object
+//! (`Network::compile_lane_crossings`) - are movements of the object one of them belongs to, or
+//! of a junction of their own (`JOIN_TILE`), as SUMO has a node wherever two connections meet.
+//! This module turns
 //! that into a table: for every movement, the list of foe movements with the stretch of
 //! each lane where the two are in each other's way, and who gives way to whom under the
 //! map's rules. At run time a driver looks its movement up and reads the table; no
@@ -144,7 +148,8 @@ pub struct Junctions {
 }
 
 impl Junctions {
-    /// Compile every crossing object of the network.
+    /// Compile every crossing object of the network, and the places where lanes meet outside
+    /// any one object (`extend`).
     pub fn compile(net: &Network) -> Junctions {
         let mut j = Junctions::default();
         j.extend(net, 0);
@@ -153,11 +158,14 @@ impl Junctions {
 
     /// Compile the junctions again with the lanes added from index `first` (lanes come in
     /// whole objects when a tile loads): every crossing object with all its lanes (an object
-    /// extended with reverse twins is compiled whole), and [round 7 A2-full] every lane join
-    /// (`Network::compile_joins`) whose two lanes are not of one object: a spline lane joining
-    /// an object's way goes into that object as one of its movements, and joins of spline
-    /// lanes alone make a junction of their own (`JOIN_TILE`), so that every join has a
-    /// meeting place in one junction table (`foe_between`). Junctions keep their index (a new
+    /// extended with reverse twins is compiled whole), and every lane join
+    /// (`Network::compile_joins`) or lane crossing outside the objects
+    /// (`Network::compile_lane_crossings`, `Crossing::outside`) whose two lanes are not of one
+    /// object: a spline lane joining or crossing an object's way goes into that object as one
+    /// of its movements, and spline lanes alone make a junction of their own (`JOIN_TILE`), so
+    /// that every such meeting place is in one junction table (`foe_between`). The swept path
+    /// of an object's piece over a lane leading into it (`Network::compile_swept`) groups
+    /// nothing: that lane stays an approach, where the queue stands. Junctions keep their index (a new
     /// one comes at the end), so what a vehicle remembers of one (`ease_for`)
     /// stays right.
     pub fn extend(&mut self, net: &Network, first: usize) {
@@ -199,12 +207,19 @@ impl Junctions {
         for a in 0..net.lanes.len().min(net.crossings.len()) {
             for c in &net.crossings[a] {
                 let b = c.other;
-                // (a merge between lanes of no one object: a lane join, or lanes converging side
-                // by side before one, `Network::compile_joins`)
-                if !c.merge || b <= a || b >= net.lanes.len() {
+                // (a meeting place between lanes of no one object: a lane join, or lanes
+                // converging side by side before one, `Network::compile_joins`, or anywhere,
+                // `Network::compile_outside_converging`; or two lanes crossing outside any one
+                // object, `Network::compile_lane_crossings`. The swept
+                // path of an object's piece over a lane leading into it, `compile_swept`, leaves
+                // that lane an approach: its queue stands there.)
+                if b <= a || b >= net.lanes.len() {
                     continue;
                 }
                 if object(a).is_some() && object(a) == object(b) {
+                    continue;
+                }
+                if !c.merge && !c.outside {
                     continue;
                 }
                 let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
@@ -443,8 +458,8 @@ impl Junctions {
     }
 
     /// Two movements merging into one another that no rule of the table separates (neither
-    /// gives way to the other): SUMO's zipper node. ([J7-2] `reservation`'s zipper speed takes
-    /// every merge that crosses nothing, the table ordering the pair where it says who yields.)
+    /// gives way to the other): SUMO's zipper node. (`reservation`'s zipper speed takes every
+    /// merge that crosses nothing, the table ordering the pair where it says who yields.)
     pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
         foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
     }
@@ -618,7 +633,7 @@ impl Junctions {
         Some((&self.nodes[j], &self.nodes[j].movements[m]))
     }
 
-    /// [round 7 A2] The meeting place of lanes `a` and `b`, two pieces of one junction: the
+    /// The meeting place of lanes `a` and `b`, two pieces of one junction: the
     /// foe of `a`'s movement that is `b`'s (None outside a junction or with no meeting place).
     pub fn foe_between(&self, a: usize, b: usize) -> Option<&Foe> {
         let (&(ja, ma), &(jb, mb)) = (self.of_lane.get(&a)?, self.of_lane.get(&b)?);
@@ -717,5 +732,162 @@ mod tests {
         let east = &j.movements[j.movement_of(first).unwrap()];
         let north = &j.movements[j.movement_of(first + 1).unwrap()];
         assert_ne!(east.foes[0].yields, north.foes[0].yields);
+    }
+
+    /// Two spline roads drawn across each other with no crossing object (viz case01: AndingR_noside
+    /// 191/3-4 across 723743/3): the crossing is the junction, as in SUMO every crossing of two
+    /// connections is a foe of its node. The pair gets a crossing meeting place in one junction
+    /// table, with the map's priority where the paths carry one and right before left between
+    /// equals; a road passing over the other on a bridge gets none.
+    #[test]
+    fn two_roads_crossing_with_no_object_meet_in_one_junction() {
+        let build = |main: Option<f32>, dz: f64| {
+            let mut net = Network::default();
+            let mut ew = road((-60.0, 0.0), (60.0, 0.0), 1); // 0: west to east
+            let mut sn = road((0.0, -60.0), (0.0, 60.0), 2); // 1: south to north
+            if let Some(p) = main {
+                ew.priority = p;
+                sn.priority = 64.0;
+            }
+            for q in &mut sn.points {
+                q.z = dz;
+            }
+            net.lanes.push(ew);
+            net.lanes.push(sn);
+            net.link(1.5);
+            net.compute_conflicts();
+            net
+        };
+        // equal priorities: right before left - the eastbound car has the northbound one coming
+        // from its right and gives way
+        let net = build(None, 0.0);
+        let c = net.crossings[0].iter().find(|c| c.other == 1).expect("a meeting place on 0");
+        assert!(c.outside && net.crossings[0].len() == 1 && net.crossings[1].len() == 1);
+        assert!(!c.merge && (c.at - 60.0).abs() < 0.1 && (c.other_at - 60.0).abs() < 0.1);
+        assert!(c.before > 0.5 && c.after > 0.5, "the stretch where the two bodies touch");
+        let js = Junctions::compile(&net);
+        assert_eq!(js.nodes.len(), 1);
+        let j = &js.nodes[0];
+        assert_eq!(j.key.0, (JOIN_TILE, JOIN_TILE));
+        let (ew, sn) = (&j.movements[j.movement_of(0).unwrap()], &j.movements[j.movement_of(1).unwrap()]);
+        assert_eq!((ew.foes.len(), sn.foes.len()), (1, 1));
+        assert_eq!((ew.foes[0].kind, sn.foes[0].kind), (FoeKind::Cross, FoeKind::Cross));
+        assert!(ew.foes[0].yields && !sn.foes[0].yields, "right before left");
+        assert!(ew.foes[0].mine.0 < 60.0 && ew.foes[0].mine.1 > 60.0);
+        // the map's priority on the paths decides first
+        let js = Junctions::compile(&build(Some(192.0), 0.0));
+        let j = &js.nodes[0];
+        assert!(!j.movements[j.movement_of(0).unwrap()].foes[0].yields, "the main road goes first");
+        assert!(j.movements[j.movement_of(1).unwrap()].foes[0].yields);
+        // within reach of the bodies still a crossing; a deck 3.1 m above (BeijingCity's
+        // underpass of spline 295367 under 3841) is a bridge
+        assert_eq!(build(None, 0.5).crossings[0].len(), 1);
+        assert!(build(None, omsi_sim::traffic::MEET_DIST).crossings[0].is_empty());
+        let bridge = build(None, 3.1);
+        assert!(bridge.crossings[0].is_empty());
+        assert!(Junctions::compile(&bridge).nodes.is_empty());
+    }
+
+    /// Two three-lane spline roads crossing with no object, one lane of the east-west road past a
+    /// bus bay's gap and so linked to no neighbour (viz case01 AndingR_noside 723743/9), another
+    /// of three times its neighbours' density (191/6): every lane of one road meets every lane of
+    /// the other with the same right of way - the road's lanes count for the road class
+    /// (`Network::road_class`), as SUMO ranks edges, not lanes - here right before left.
+    #[test]
+    fn every_lane_of_two_crossing_roads_has_one_right_of_way() {
+        let mut net = Network::default();
+        let lane = |from: (f64, f64), to: (f64, f64), id: i64, path: u16| {
+            let mut l = road(from, to, id);
+            l.key = Some(LaneKey { tile: (0, 0), id, path });
+            l
+        };
+        for (path, y) in [(0u16, 0.0), (1, 3.0), (2, 12.0)] {
+            net.lanes.push(lane((-60.0, y), (60.0, y), 1, path));
+        }
+        for (path, x) in [(0u16, 0.0), (1, -3.0), (2, -6.0)] {
+            net.lanes.push(lane((x, 60.0), (x, -60.0), 2, path));
+        }
+        net.lanes[1].density = 3.0;
+        net.link(1.5);
+        net.compute_conflicts();
+        assert_eq!((net.road_class(0).lanes, net.road_class(2).lanes, net.road_class(3).lanes), (3, 3, 3));
+        assert_eq!(net.road_class(0).density, net.road_class(1).density);
+        let js = Junctions::compile(&net);
+        let j = &js.nodes[0];
+        let yields: Vec<bool> = (0..3).flat_map(|ew| (3..6).map(move |sn| (ew, sn))).map(|(ew, sn)| j.movements[j.movement_of(ew).unwrap()].foes.iter().find(|f| j.movements[f.movement].lane == sn).expect("a foe").yields).collect();
+        assert_eq!(yields.len(), 9);
+        // the southbound road comes from the eastbound one's left: the eastbound goes first
+        assert!(yields.iter().all(|&y| !y), "{yields:?}");
+    }
+
+    /// A long spline lane that starts heading against the other road and bends to cross it at a
+    /// right angle (viz case01 28/3131, 44 degrees off at the crossing): the right of way reads the
+    /// headings as the two come to the meeting place, so the pair is right before left - exactly
+    /// one yields - not two oncoming ways that both go on.
+    #[test]
+    fn a_bent_lane_crossing_at_a_right_angle_is_right_before_left() {
+        let mut net = Network::default();
+        net.lanes.push(road((-60.0, 0.0), (60.0, 0.0), 1)); // 0: eastbound
+        let mut b = road((100.0, -40.0), (30.0, -40.0), 2); // 1: westbound, then north across 0 at x = 0
+        b.points = vec![DVec3::new(100.0, -40.0, 0.0), DVec3::new(30.0, -40.0, 0.0), DVec3::new(0.0, -25.0, 0.0), DVec3::new(0.0, 60.0, 0.0)];
+        let mut b = omsi_sim::traffic::LaneBuilder::polyline(b.points.clone(), LaneKind::Street, 3.0);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 2, path: 0 });
+        net.lanes.push(b);
+        net.link(1.5);
+        net.compute_conflicts();
+        assert!(net.crossings[0].iter().any(|c| c.other == 1));
+        // the northbound comes from the south, the eastbound's right: the eastbound yields
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0));
+    }
+
+    /// Two spline roads drawn over each other with no object and no link between them (X10's
+    /// parallel ramp splines under a metre apart): a side merge in one junction table, a zipper
+    /// between equals. Two splines' lanes side by side as a road's lanes (2.4 m apart, 3 m wide)
+    /// and two lanes forking from one lane get none.
+    #[test]
+    fn two_roads_over_each_other_with_no_object_merge_but_a_road_s_lanes_and_a_fork_do_not() {
+        let build = |gap: f64, fork: bool| {
+            let mut net = Network::default();
+            net.lanes.push(road((0.0, 0.0), (100.0, 0.0), 1)); // 0
+            // 1: from 5 m on, or from 0's start (2 leads into both: a fork)
+            net.lanes.push(road((if fork { 0.0 } else { 5.0 }, gap), (100.0, gap), 2));
+            net.lanes.push(road((-50.0, 0.0), (0.0, 0.0), 3)); // 2: leads into 0
+            net.link(1.5);
+            net.compute_conflicts();
+            net
+        };
+        let net = build(0.8, false);
+        let c = net.crossings[0].iter().find(|c| c.other == 1).expect("a side merge");
+        assert!(c.merge && c.side && !c.outside);
+        let js = Junctions::compile(&net);
+        assert_eq!(js.nodes.len(), 1);
+        let j = &js.nodes[0];
+        let m0 = j.movement_of(0).unwrap();
+        let f = j.movements[m0].foes.iter().find(|f| j.movements[f.movement].lane == 1).expect("a foe");
+        assert_eq!(f.kind, FoeKind::Merge);
+        assert!(js.is_zipper(0, m0, f));
+        assert!(build(2.4, false).crossings[0].is_empty(), "a road's lanes");
+        assert!(build(0.8, true).crossings[0].iter().all(|c| c.other != 1), "a fork");
+    }
+
+    /// A spline road drawn across a piece of a crossing object it does not lead into: the pair
+    /// meets in the object's table (the spline lane one of its movements, as a spline lane joining
+    /// an object's way is), and a tile loaded later finds its crossings with the lanes already
+    /// there.
+    #[test]
+    fn a_road_across_an_object_piece_meets_it_in_the_object_table_also_when_loaded_later() {
+        let mut net = four_way();
+        let first = net.lanes.len();
+        // a road along x = 5, crossing the main piece 1 (y = 0) between -10 and 10, outside the
+        // side piece 4 (x = 0)
+        net.extend(vec![road((5.0, -40.0), (5.0, 40.0), 9)], 1.5);
+        assert!(net.crossings[first].len() == 1 && net.crossings[first][0].other == 1 && net.crossings[first][0].outside);
+        let js = Junctions::compile(&net);
+        assert_eq!(js.nodes.len(), 1);
+        let j = &js.nodes[0];
+        let (main, cut) = (&j.movements[j.movement_of(1).unwrap()], &j.movements[j.movement_of(first).unwrap()]);
+        assert!(main.foes.iter().any(|f| f.movement == j.movement_of(first).unwrap() && f.kind == FoeKind::Cross && !f.yields), "the priority-192 main road goes first");
+        assert!(cut.foes.iter().any(|f| f.movement == j.movement_of(1).unwrap() && f.kind == FoeKind::Cross && f.yields));
     }
 }

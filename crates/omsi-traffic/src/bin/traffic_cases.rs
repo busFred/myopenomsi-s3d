@@ -97,6 +97,8 @@ fn main() {
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("joins") if args.len() >= 3 => joins(&args[2..]),
+        Some("crossings") if args.len() >= 3 => crossings(&args[2..]),
+        Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -5198,6 +5200,215 @@ fn grown(fixture: &Path, lit: bool) -> Res<(Replay, usize)> {
     }
     r.records = records;
     Ok((r, header_lanes))
+}
+
+/// `crossings <fixture>... [--list]`: the vehicle lanes that cross outside any one crossing object
+/// and got a meeting place (`Network::compile_lane_crossings`), per fixture's grown network: how
+/// many, by the lanes' sources (spline or object piece, a track), whether both are movements of one
+/// junction with the crossing in its foe table, and the cost of the detection (the whole network
+/// once, and per tile batch as the network grew).
+fn crossings(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let mut r = Replay::load(Path::new(f))?;
+        let outside = |net: &omsi_sim::traffic::Network| -> Vec<(usize, usize)> { (0..net.crossings.len()).flat_map(|a| net.crossings[a].iter().filter(move |c| c.outside && c.other > a).map(move |c| (a, c.other))).collect() };
+        let header_found = outside(&r.net).len();
+        let records = std::mem::take(&mut r.records);
+        let (mut batches, mut batch_ms, mut batch_max) = (0usize, 0.0f64, 0.0f64);
+        for rec in &records {
+            if let Record::LanesAdded { lanes, .. } = rec {
+                let added = r.net.extend(lanes.clone(), 1.5);
+                r.sim.network_grew(&r.net, added.start);
+                // (the detection again over the batch: every pair it compiled is skipped at once now)
+                let t = std::time::Instant::now();
+                let again = r.net.lane_crossings(added.start);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                assert!(again.is_empty());
+                batches += 1;
+                batch_ms += ms;
+                batch_max = batch_max.max(ms);
+            }
+        }
+        let t = std::time::Instant::now();
+        let _ = r.net.lane_crossings(0);
+        let whole_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (net, js) = (&r.net, &r.sim.junctions);
+        let mut cats: BTreeMap<String, usize> = BTreeMap::new();
+        let mut in_table = 0usize;
+        let found = outside(net);
+        for &(a, b) in &found {
+            let (la, lb) = (&net.lanes[a], &net.lanes[b]);
+            let src = |l: &omsi_sim::traffic::Lane| match (l.kind, l.source) {
+                (LaneKind::Rail, _) => "track",
+                (_, 2) => "piece",
+                (_, 1) => "spline",
+                _ => "other",
+            };
+            let mut pair = [src(la), src(lb)];
+            pair.sort_unstable();
+            let cat = format!("{}x{}", pair[0], pair[1]);
+            *cats.entry(cat.clone()).or_insert(0) += 1;
+            let foe = match (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                (Some(&(ja, ma)), Some(&(jb, mb))) if ja == jb => js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb && x.kind == omsi_traffic::FoeKind::Cross).map(|x| (ja, x.yields)),
+                _ => None,
+            };
+            if foe.is_some() {
+                in_table += 1;
+            }
+            if list {
+                let c = net.crossings[a].iter().find(|c| c.other == b).copied();
+                let (p, at, oat) = c.map(|c| (la.at(c.at).0, c.at, c.other_at)).unwrap_or((la.start(), 0.0, 0.0));
+                let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
+                let table = match foe {
+                    Some((j, y)) => format!("junction {j}, {a} {}", if y { "yields" } else { "goes first" }),
+                    None => "NOT IN ONE TABLE".into(),
+                };
+                println!("  {cat} {a} ({}) s {at:.1} x {b} ({}) s {oat:.1} at ({:.1}, {:.1}, {:.1}): {table}", name(la), name(lb), p.x, p.y, p.z);
+            }
+        }
+        // (the other non-merge meeting places between lanes of no one object - the swept paths
+        // over a lane leading in - and how many of them no junction table carries)
+        let (mut swept, mut swept_untabled) = (0usize, 0usize);
+        for a in 0..net.crossings.len() {
+            for c in net.crossings[a].iter().filter(|c| !c.merge && !c.outside && c.other > a) {
+                let obj = |l: usize| net.lanes[l].key.filter(|_| net.lanes[l].source == 2).map(|k| (k.tile, k.id));
+                if obj(a).is_some() && obj(a) == obj(c.other) {
+                    continue;
+                }
+                swept += 1;
+                let one = matches!((js.of_lane.get(&a), js.of_lane.get(&c.other)), (Some(x), Some(y)) if x.0 == y.0);
+                if !one {
+                    swept_untabled += 1;
+                    if list {
+                        let (p, b) = if obj(a).is_some() { (a, c.other) } else { (c.other, a) };
+                        let lb = &net.lanes[b];
+                        let pc = net.crossings[p].iter().find(|x| x.other == b).copied().unwrap_or(*c);
+                        let leads = net.lanes[b].next.iter().map(|&n| format!("{n}{}", if js.of_lane.contains_key(&n) { "(in)" } else { "" })).collect::<Vec<_>>().join(",");
+                        println!("  swept, no table: piece {p} s {:.1}-{:.1} x lane {b} (source {}, len {:.1}, light {:?}, next {leads}) s {:.1}-{:.1} at ({:.1}, {:.1})", pc.at - pc.before, pc.at + pc.after, lb.source, lb.length(), lb.traffic_light, pc.other_at - pc.other_before, pc.other_at + pc.other_after, lb.end().x, lb.end().y);
+                    }
+                }
+            }
+        }
+        println!("  other crossings between lanes of no one object (swept paths): {swept}, in no junction table {swept_untabled}");
+        // (the side merges between lanes of no one object: before a join, `compile_joins`, or
+        // anywhere, `compile_outside_converging`)
+        let side = (0..net.crossings.len()).map(|a| net.crossings[a].iter().filter(|c| c.side && c.other > a && !(net.lanes[a].source == 2 && net.lanes[c.other].source == 2 && net.lanes[a].key.map(|k| (k.tile, k.id)) == net.lanes[c.other].key.map(|k| (k.tile, k.id)))).count()).sum::<usize>();
+        println!("  side merges between lanes of no one object: {side}");
+        // (one right-of-way order per pair of roads at a crossing outside the objects: the lanes of
+        // one spline heading one way - the quarter of their start heading - against another
+        // spline's; an object's pieces are movements of their own, a turn yields where the straight
+        // way beside it does not)
+        let road = |l: usize| net.lanes[l].key.filter(|_| net.lanes[l].source == 1).map(|k| (k.tile, k.id, net.lanes[l].source, (net.lanes[l].start_heading().rem_euclid(360.0) / 90.0) as i32));
+        let mut orders: BTreeMap<(Option<((i32, i32), i64, u32, i32)>, Option<((i32, i32), i64, u32, i32)>), (usize, usize)> = BTreeMap::new();
+        for &(a, b) in &found {
+            if road(a).is_none() || road(b).is_none() {
+                continue;
+            }
+            if let (Some(&(ja, ma)), Some(&(jb, mb))) = (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                if ja == jb {
+                    if let Some(f) = js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb) {
+                        let e = orders.entry((road(a), road(b))).or_insert((0, 0));
+                        if f.yields { e.0 += 1 } else { e.1 += 1 }
+                    }
+                }
+            }
+        }
+        let mixed = orders.values().filter(|&&(y, g)| y > 0 && g > 0).count();
+        if list {
+            for (k, v) in orders.iter().filter(|(_, &(y, g))| y > 0 && g > 0) {
+                println!("  two orders: {k:?} yields {} goes first {}", v.0, v.1);
+            }
+        }
+        println!("  pairs of spline roads crossing outside the objects: {}, with two right-of-way orders between their lanes: {mixed}", orders.len());
+        let cats: Vec<String> = cats.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        println!(
+            "{}: {} lane crossings outside the objects ({header_found} on the recorded header), {in_table} in a junction's foe table; {}; detection {whole_ms:.1} ms over {} lanes, per tile batch {:.2} ms mean / {batch_max:.2} ms max over {batches}",
+            f,
+            found.len(),
+            cats.join(", "),
+            net.lanes.len(),
+            if batches > 0 { batch_ms / batches as f64 } else { 0.0 }
+        );
+    }
+    Ok(())
+}
+
+/// `converge_outside <fixture>... [--list]`: street lanes of no one crossing object (or of two
+/// different ones) that run side by side closer than a car is wide (`converging_stretch`, the
+/// same way within `CONVERGE_HEADING`) with no meeting place between them and no link within three
+/// lanes - the merges without an object that neither `compile_joins` (a shared lane after them, or
+/// two links back from one) nor an object's `add_converging` compiles. Lanes of one spline, and
+/// neighbours (`left`/`right`), are a road's lanes, not a merge.
+fn converge_outside(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let (r, _) = grown(Path::new(f), true)?;
+        let net = &r.net;
+        let street = |l: &omsi_sim::traffic::Lane| l.kind == LaneKind::Street && l.points.len() >= 2;
+        let object = |l: &omsi_sim::traffic::Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
+        let spline = |l: &omsi_sim::traffic::Lane| l.key.filter(|_| l.source == 1).map(|k| (k.tile, k.id));
+        let within = |from: usize, to: usize| {
+            let mut at = vec![from];
+            for _ in 0..3 {
+                at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+                if at.contains(&to) {
+                    return true;
+                }
+            }
+            false
+        };
+        let (mut close, mut edges) = (0usize, 0usize);
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for i in 0..net.lanes.len() {
+            let a = &net.lanes[i];
+            if !street(a) {
+                continue;
+            }
+            let mut near: Vec<usize> = omsi_sim::traffic::Network::lane_cells(a).iter().flat_map(|c| net.grid.get(c).cloned().unwrap_or_default()).filter(|&j| j < i).collect();
+            near.sort_unstable();
+            near.dedup();
+            for j in near {
+                let b = &net.lanes[j];
+                if !street(b) || (object(a).is_some() && object(a) == object(b)) || (spline(a).is_some() && spline(a) == spline(b)) {
+                    continue;
+                }
+                if a.left == Some(j) || a.right == Some(j) || b.left == Some(i) || b.right == Some(i) || a.key.is_some() && a.key == b.key {
+                    continue;
+                }
+                if net.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) || within(i, j) || within(j, i) || (a.start() - b.start()).truncate().length() <= 0.5 {
+                    continue;
+                }
+                let Some(((a0, a1), (b0, b1), least)) = omsi_sim::traffic::converging_stretch(a, b) else { continue };
+                if omsi_sim::traffic::wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > omsi_sim::traffic::CONVERGE_HEADING {
+                    continue;
+                }
+                let lvl = (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs();
+                if lvl >= omsi_sim::traffic::MEET_DIST {
+                    continue;
+                }
+                let tight = least < omsi_sim::traffic::CONVERGE_DIST;
+                // (what the pair is: a fork - the two leave one lane, or a lane of one leads
+                // into a lane the other leaves -, a lane ending on the other with no way on, or
+                // two ways coming together that never join)
+                let pv = |l: usize| net.prev.get(l).cloned().unwrap_or_default();
+                let fork = pv(i).iter().any(|p| pv(j).contains(p)) || pv(i).iter().any(|&p| within(p, j)) || pv(j).iter().any(|&p| within(p, i));
+                let kind = if fork { "fork" } else if a.next.is_empty() || b.next.is_empty() { "dead-end" } else { "other" };
+                *kinds.entry(kind).or_insert(0usize) += 1;
+                if tight {
+                    close += 1;
+                } else {
+                    edges += 1;
+                }
+                if list {
+                    let p = a.at((a0 + a1) * 0.5).0;
+                    let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
+                    println!("  {kind} {} {i} ({}) {a0:.1}-{a1:.1} of {:.1} | {j} ({}) {b0:.1}-{b1:.1} of {:.1}; least {least:.2} m, widths {:.1}/{:.1}, at ({:.1}, {:.1}); next {:?} / {:?}", if tight { "close" } else { "edges" }, name(a), a.length(), name(b), b.length(), a.width, b.width, p.x, p.y, a.next, b.next);
+                }
+            }
+        }
+        println!("{f}: side by side outside one object with no meeting place: {close} with centre lines under CONVERGE_DIST, {edges} by the edges only; {kinds:?}");
+    }
+    Ok(())
 }
 
 /// `stubs <fixture>... [--all]`: the links and meeting places the lit stubs drop from each
