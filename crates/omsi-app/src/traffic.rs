@@ -2209,8 +2209,8 @@ impl Traffic {
             // car that reaches the end is taken off by the traffic itself as Omsi.exe does
             // (`AiState::drive` finds no way on: once 0x71dc9c finds no next segment
             // (0x612e10) its segment stays -1 and 0x6fe3fc deletes it the same frame,
-            // 0x703bb0); one held short of it goes as below, out of sight or far off, after
-            // a long while, or in view once others queue behind it
+            // 0x703bb0); one held short of it goes as below: out of sight, beyond the perceptual
+            // horizon after FAR_OFF_STAND, or in view once others queue behind it
             let at_end = finished
                 && c.ai.stopped > if c.serves_stops() { AT_END_STAND_BUS } else { AT_END_STAND }
                 && c.ai.state.route.is_empty()

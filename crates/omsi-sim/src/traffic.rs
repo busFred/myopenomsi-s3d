@@ -157,14 +157,18 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
 }
 
 /// The least `[rule] trafficdensity` of a group at which a path is open to the group's random
-/// vehicles. The map editor offers the densities 0, 0.001, 0.1, 0.5, 1 and 3 (all twenty stock
-/// maps under `maps/` use only these): 0 is "none" and 0.001 "almost none", the editor's near
-/// closure (BeijingCity's bus lanes close the normal cars with 0, their feeder pieces with
-/// 0.001), 0.1 the lowest a mapper means as traffic. 0.01 lies between the two groups of
-/// classes, so a hand-edited value near either lands on its side. Below it a path is closed to the
-/// group as SUMO's `disallow` closes a lane to a vClass: no vehicle of the group is inserted on it
-/// or routed over it while an open way exists (SUMO's time-of-day variants, `rerouter`s and
-/// TraCI `allow`, need data the maps do not have: the painted hours of a bus lane are paint only).
+/// vehicles: the one floor of the code (a yard way out, `YARD_DENSITY` before, is the same
+/// cut). Source: the map editor offers the densities 0, 0.001, 0.1, 0.5, 1 and 3 and the 20 stock
+/// maps under `maps/` use only these (counted in every `.map`): 0 is "none" and 0.001 "almost
+/// none" - BeijingCity closes its bus paths to the normal cars with 0 and their feeder pieces
+/// with 0.001 - and 0.1 the lowest meant as traffic; 0.01 lies between the two groups of classes.
+/// Reach, on the fixtures' networks: BeijingCity 13.0 km of street (383 lanes) lie at 0.001 for
+/// the normal cars, X10 Berlin 70.9 km (2476 lanes, 58 % of its street length): newly closed to
+/// them (no spawn, no routing while another way exists; they enter only through forks that have
+/// no open way, counted in `FORK_FALLBACKS`). Below the floor a path is closed to the group as
+/// SUMO's `disallow` closes a lane to a vClass: no vehicle of the group is inserted on it or
+/// routed over it while an open way exists (SUMO's time-of-day variants, `rerouter`s and TraCI
+/// `allow`, need data the maps do not have: the painted hours of a bus lane are paint only).
 pub const OPEN_DENSITY_FLOOR: f32 = 0.01;
 
 /// Does a path of this density carry traffic of the group (`OPEN_DENSITY_FLOOR`)?
@@ -572,10 +576,9 @@ pub const REACH_MAX: f32 = 600.0;
 /// A way on that ends within this distance is a dead end to a driver who has a choice (m).
 pub const DEAD_END: f32 = 500.0;
 
-/// Right of way between paths of equal `[rule] priority` (`Network::right_of_way`): a path
-/// whose approach carries at most this `[rule] trafficdensity` is a way out of a yard, a car
-/// park, a garage or a bus bay.
-pub const YARD_DENSITY: f32 = 0.01;
+/// Right of way between paths of equal `[rule] priority` (`Network::right_of_way`): a path whose
+/// approach carries a `[rule] trafficdensity` above 0 but below `OPEN_DENSITY_FLOOR` (the map
+/// editor's "almost none", 0.001) is a way out of a yard, a car park, a garage or a bus bay.
 /// ... more heading change than this (degrees) over the approach is a turn.
 pub const TURN_DEG: f32 = 30.0;
 /// ... at a merge, a way bending this much more than the other (degrees) merges into it.
@@ -1151,7 +1154,7 @@ impl Network {
     /// left: Some(true) when `a` yields to `b`, Some(false) when `b` yields to `a`, None when
     /// none of these says. In order:
     /// 1. a way out of a yard, a car park, a garage or a bus bay (the spline lane it comes off
-    ///    within `SPLINE_WINDOW` carries `[rule] trafficdensity` <= `YARD_DENSITY`: the stock and
+    ///    within `SPLINE_WINDOW` carries a `[rule] trafficdensity` above 0 and below `OPEN_DENSITY_FLOOR`: the stock and
     ///    BeijingCity paths off the street say so) yields to
     ///    the street; at a merge, a way coming in at an angle to the way out (`MERGE_DEG` more
     ///    than the other, which comes within `TURN_DEG` of it) yields to the other;
@@ -1175,7 +1178,7 @@ impl Network {
         };
         // 1. yards (from the spline the approach comes off within the window: none, no yard;
         // a density of 0 says no random traffic, not a yard); merging into the other's lane
-        let yard = |p: &Approach| p.spline.is_some_and(|c| c.density > 0.0 && c.density <= YARD_DENSITY);
+        let yard = |p: &Approach| p.spline.is_some_and(|c| c.density > 0.0 && !density_is_open(c.density));
         if let Some(y) = decided(yard(&pa), yard(&pb)) {
             return Some(y);
         }
@@ -3186,11 +3189,12 @@ pub const SWEPT_WHEELBASE: f32 = 3.149 + 2.665;
 /// (Directive 97/27/EC, annex I 7.6), which caps the off-tracking.
 pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 
-/// Ways on chosen by a tier below "open to me and leading on" (`AiState::choose_after`: a
-/// car whose only way on is closed to it drives on, counted here), per tier: [open but every way on from it closed, closed by my
-/// group's density but driven by another group, driven by no group, closed by the rules but
-/// not `no_cars`, `no_cars`, none at all]. Per call (a plan is extended frame after frame).
-/// A diagnostic for `traffic_cases ab` (whole process).
+/// Ways on chosen by a tier below "open to me and leading on" (`AiState::choose_after`: a car
+/// whose only way on is closed to it drives on, counted here), per tier: [open but every way on
+/// from it closed, closed by my group's density but driven by another group, driven by no group,
+/// closed by the rules but not `no_cars`, `no_cars`, none at all]. Per call: plan extensions,
+/// not cars (a plan is extended frame after frame). A diagnostic for `traffic_cases ab` (whole
+/// process).
 pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
