@@ -556,11 +556,6 @@ pub struct Crossing {
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
 /// buses.
 pub const MEET_DIST: f64 = 2.6;
-/// Two lanes crossing with their centre lines this far apart in height (m) or less cross at one
-/// level (`Network::compile_lane_crossings`); farther, one passes over the other on a bridge. The
-/// same-level band the traffic uses for vehicles and people (2.5 m: less than a deck's clearance
-/// of 4.5 m, more than a road's camber and slope across a junction).
-pub const LEVEL_CROSSING_DZ: f64 = 2.5;
 /// A meeting place reaches at most this far either side of the crossing point (m).
 const MEET_MAX: f32 = 14.0;
 
@@ -872,7 +867,7 @@ impl Network {
         self.crossings = vec![Vec::new(); self.lanes.len()];
         self.walks = vec![Vec::new(); self.lanes.len()];
         let (n, walks) = self.conflicts_from(0);
-        let joins = self.compile_joins() + self.compile_swept() + self.compile_lane_crossings(0);
+        let joins = self.compile_joins() + self.compile_swept();
         log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {walks} footpath crossings");
     }
 
@@ -1355,83 +1350,6 @@ impl Network {
         false
     }
 
-    /// The meeting place of two street lanes of no crossing object that cross (splines drawn
-    /// across each other): SUMO makes every crossing of two
-    /// connections a foe in its junction's request matrix (sumo.md 1.3); OMSI maps may draw a
-    /// crossing of two roads with splines alone, and the crossing is then the junction. Two lanes
-    /// whose polylines cross at an inner point at the same level (`LEVEL_CROSSING_DZ`: a deck above
-    /// is a bridge) and have no meeting place yet, not pieces of one way (`one_way_pieces`): a
-    /// crossing over `meeting_extent`,
-    /// as `conflicts_from` compiles one. Only pairs with a lane from index `first` on (a grown
-    /// network looks at its new lanes). Returns how many were added.
-    pub fn compile_lane_crossings(&mut self, first: usize) -> usize {
-        let len = self.lanes.len();
-        self.conflicts.resize(len, Vec::new());
-        self.crossings.resize(len, Vec::new());
-        let street = |l: &Lane| l.kind == LaneKind::Street && l.points.len() >= 2;
-        let object = |l: &Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
-        let bbox = |l: &Lane| l.points.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)));
-        let cell = |v: f64| (v / GRID_CELL).floor() as i64;
-        let mut cells: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        let mut boxes: Vec<(f64, f64, f64, f64)> = vec![(0.0, 0.0, 0.0, 0.0); len];
-        for (i, l) in self.lanes.iter().enumerate() {
-            if !street(l) {
-                continue;
-            }
-            let b = bbox(l);
-            boxes[i] = b;
-            for cx in cell(b.0)..=cell(b.2) {
-                for cy in cell(b.1)..=cell(b.3) {
-                    cells.entry((cx, cy)).or_default().push(i);
-                }
-            }
-        }
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        for list in cells.values() {
-            for (x, &i) in list.iter().enumerate() {
-                for &j in &list[x + 1..] {
-                    if i.max(j) < first {
-                        continue;
-                    }
-                    let (a, b) = (boxes[i], boxes[j]);
-                    if a.0 > b.2 || b.0 > a.2 || a.1 > b.3 || b.1 > a.3 {
-                        continue;
-                    }
-                    pairs.push((i.min(j), i.max(j)));
-                }
-            }
-        }
-        pairs.sort_unstable();
-        pairs.dedup();
-        let mut n = 0;
-        for (i, j) in pairs {
-            let (a, b) = (&self.lanes[i], &self.lanes[j]);
-            // (two lanes of no crossing object: an object's own crossings are `conflicts_from`'s,
-            // and a lane leading into an object meets its pieces in their swept path, `compile_swept`)
-            if object(a).is_some() || object(b).is_some() {
-                continue;
-            }
-            if a.key.is_some() && a.key == b.key {
-                continue;
-            }
-            if self.crossings[i].iter().any(|c| c.other == j) || self.one_way_pieces(i, j) {
-                continue;
-            }
-            let Some((sa, sb)) = polyline_crossing(a, b) else { continue };
-            if (a.at(sa).0.z - b.at(sb).0.z).abs() > LEVEL_CROSSING_DZ {
-                continue;
-            }
-            let (ab, aa) = meeting_extent(a, sa, b);
-            let (bb, ba) = meeting_extent(b, sb, a);
-            self.conflicts[i].push(j);
-            self.conflicts[j].push(i);
-            self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: false, before: ab, after: aa, other_before: bb, other_after: ba, side: false });
-            self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: false, before: bb, after: ba, other_before: ab, other_after: aa, side: false });
-            n += 1;
-        }
-        n
-    }
-
     /// [round 7 A2-full] The meeting place of every lane join, as SUMO makes every join a
     /// junction node with a response matrix or a zipper (`NBNode`, `NBRequest`): in OMSI a
     /// junction table came only from crossing objects, so two spline lanes joining outside one
@@ -1654,7 +1572,7 @@ impl Network {
                 }
             }
         }
-        n + self.compile_joins() + self.compile_swept() + self.compile_lane_crossings(0)
+        n + self.compile_joins() + self.compile_swept()
     }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
@@ -2274,7 +2192,6 @@ impl Network {
         self.conflicts_from(first);
         self.compile_joins();
         self.compile_swept();
-        self.compile_lane_crossings(first);
         self.update_reach_from(first);
         self.clip_drivable(first);
         first..end
