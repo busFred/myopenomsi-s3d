@@ -962,7 +962,8 @@ impl Network {
     /// merging into the other's lane yields, a turning movement yields to the one going
     /// straight on, the minor road yields to the major one; only then right before left (the
     /// German "rechts vor links" the stock maps rely on wherever they set no priorities,
-    /// mirrored on a left-hand-traffic map).
+    /// mirrored on a left-hand-traffic map). Oncoming and "from the right" read the headings
+    /// the two have as they come to the meeting place (`Approach::entry_heading`).
     pub fn must_yield(&self, a: usize, b: usize) -> bool {
         let (la, lb) = (&self.lanes[a], &self.lanes[b]);
         if la.kind == LaneKind::Rail {
@@ -974,7 +975,13 @@ impl Network {
         if (la.priority - lb.priority).abs() > 0.5 {
             return la.priority < lb.priority;
         }
-        let rel = wrap_deg(lb.start_heading() - la.start_heading());
+        // (the two ways as they come to the meeting place, `approach_to`'s heading `APPROACH_WINDOW`
+        // back from it: a long spline lane crossing mid-way has turned since its start - viz case01
+        // 28/3131 started 44 degrees off its heading there, and the oncoming test fired on a right
+        // angle; an object's piece reads the lane leading into it, as it starts)
+        let (at_a, _) = self.meeting_on(a, b);
+        let (at_b, _) = self.meeting_on(b, a);
+        let rel = wrap_deg(self.approach_to(b, at_b).entry_heading - self.approach_to(a, at_a).entry_heading);
         // (the turn across the oncoming traffic: left, or right when driving on the left)
         let across = if self.left_hand { 2 } else { 1 };
         // oncoming: the turn across the other's way waits for it, before any fallback (the

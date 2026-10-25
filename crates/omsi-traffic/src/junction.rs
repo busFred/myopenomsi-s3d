@@ -820,6 +820,27 @@ mod tests {
         assert!(yields.iter().all(|&y| !y), "{yields:?}");
     }
 
+    /// A long spline lane that starts heading against the other road and bends to cross it at a
+    /// right angle (viz case01 28/3131, 44 degrees off at the crossing): the right of way reads the
+    /// headings as the two come to the meeting place, so the pair is right before left - exactly
+    /// one yields - not two oncoming ways that both go on.
+    #[test]
+    fn a_bent_lane_crossing_at_a_right_angle_is_right_before_left() {
+        let mut net = Network::default();
+        net.lanes.push(road((-60.0, 0.0), (60.0, 0.0), 1)); // 0: eastbound
+        let mut b = road((100.0, -40.0), (30.0, -40.0), 2); // 1: westbound, then north across 0 at x = 0
+        b.points = vec![DVec3::new(100.0, -40.0, 0.0), DVec3::new(30.0, -40.0, 0.0), DVec3::new(0.0, -25.0, 0.0), DVec3::new(0.0, 60.0, 0.0)];
+        let mut b = omsi_sim::traffic::LaneBuilder::polyline(b.points.clone(), LaneKind::Street, 3.0);
+        b.source = 1;
+        b.key = Some(LaneKey { tile: (0, 0), id: 2, path: 0 });
+        net.lanes.push(b);
+        net.link(1.5);
+        net.compute_conflicts();
+        assert!(net.crossings[0].iter().any(|c| c.other == 1));
+        // the northbound comes from the south, the eastbound's right: the eastbound yields
+        assert!(net.must_yield(0, 1) && !net.must_yield(1, 0));
+    }
+
     /// Two spline roads drawn over each other with no object and no link between them (X10's
     /// parallel ramp splines under a metre apart): a side merge in one junction table, a zipper
     /// between equals. Two splines' lanes side by side as a road's lanes (2.4 m apart, 3 m wide)
