@@ -196,6 +196,26 @@ fn p92_a_car_is_held_short_of_the_zebra_for_a_person_about_to_step_onto_it() {
 }
 
 #[test]
+fn p92_a_far_kerb_approacher_on_a_wide_crossing_is_seen() {
+    // SUMO registers approaching persons on the crossing's link whatever its width: one stepping
+    // on 12 m across from my lane's cut (beyond jmCrossingGap), 16 m of crossing ahead of them,
+    // still holds the car while their window overlaps its own
+    let net = road_with_a_zebra();
+    let mut sim = Simulation::new(&net, Vec::new());
+    let mut cars = vec![car_at(0.0, 8.0)];
+    let (mut far, mut t) = (f64::MIN, 0.0f32);
+    while t < 6.0 {
+        // (the crossing runs y -8..8; they step on at its far end, y = 12 being 12 m off my cut)
+        let approach = Some((DVec2::new(23.0, 12.0), (1.0 - t).max(0.0), 1.0 + 16.0 / 1.3 - t));
+        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, 12.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(4), approach }];
+        sim.tick(&net, DT, &mut cars);
+        far = far.max(cars[0].pos.x + 2.0);
+        t += DT;
+    }
+    assert!(far < 23.0 - 2.0, "front reached {far:.2}");
+}
+
+#[test]
 fn p92_a_car_past_the_zebra_stop_brakes_for_a_person_who_steps_on_first() {
     // MSLink::getLeaderInfo's "breaking for approaching person": already past the zebra stop,
     // 2 m short of the cut at 2 m/s (1 s to it), the person steps on in 0.2 s: it stops 1 m
