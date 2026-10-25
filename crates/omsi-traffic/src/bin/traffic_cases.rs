@@ -5279,6 +5279,13 @@ fn crossings(args: &[String]) -> Res<()> {
                 let one = matches!((js.of_lane.get(&a), js.of_lane.get(&c.other)), (Some(x), Some(y)) if x.0 == y.0);
                 if !one {
                     swept_untabled += 1;
+                    if list {
+                        let (p, b) = if obj(a).is_some() { (a, c.other) } else { (c.other, a) };
+                        let lb = &net.lanes[b];
+                        let pc = net.crossings[p].iter().find(|x| x.other == b).copied().unwrap_or(*c);
+                        let leads = net.lanes[b].next.iter().map(|&n| format!("{n}{}", if js.of_lane.contains_key(&n) { "(in)" } else { "" })).collect::<Vec<_>>().join(",");
+                        println!("  swept, no table: piece {p} s {:.1}-{:.1} x lane {b} (source {}, len {:.1}, light {:?}, next {leads}) s {:.1}-{:.1} at ({:.1}, {:.1})", pc.at - pc.before, pc.at + pc.after, lb.source, lb.length(), lb.traffic_light, pc.other_at - pc.other_before, pc.other_at + pc.other_after, lb.end().x, lb.end().y);
+                    }
                 }
             }
         }
