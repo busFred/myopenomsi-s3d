@@ -420,7 +420,7 @@ fn a_car_keeps_the_junction_clear_while_the_exit_is_blocked() {
             if c.state.lane != 0 {
                 entered_early = true;
             }
-            if c.state.speed < 0.3 && c.last.why == Why::ExitFull {
+            if c.state.speed < 0.3 && matches!(c.last.why, Why::ExitFull | Why::KeepClear) {
                 held_for_exit = true;
             }
         }

@@ -400,3 +400,25 @@ fn c1_a_car_over_one_walk_is_held_by_people_on_the_next_and_clears_past_its_own(
     run(&net, &mut sim, &mut cars, 6.0, |_, _, _| {});
     assert!(front_x(&cars[0]) > 30.0, "did not clear forward past its own walk: front at {:.1}", front_x(&cars[0]));
 }
+
+/// [round 10 P9-3] A car coming up to two walks 3.3 m apart with somebody on the second stops at
+/// the first one's zebra stop, not at the second one's (which would put its body over the first
+/// walk: SUMO's waiting position is before the crossing, viz case01 #78 stood over an empty walk).
+#[test]
+fn p93_a_car_held_for_the_second_of_two_close_walks_waits_before_the_first() {
+    let net = road_with_two_walks();
+    let mut sim = Simulation::new(&net, vec![]);
+    // (somebody standing on walk B in the lane; the car 60 m off at 8 m/s)
+    sim.people = vec![Person { on_crossing: true, ..person(13.3, -0.3) }];
+    let mut cars = vec![car(1, 0, 285.0 - 60.0, 8.0)];
+    let mut least = f64::INFINITY;
+    run(&net, &mut sim, &mut cars, 15.0, |_, sim, cars| {
+        least = least.min(omsi_sim::collision::Obb::point(sim.people[0].pos, 0.28).separation(&cars[0].obb()));
+    });
+    let c = &cars[0];
+    let (front, rear) = (front_x(c), front_x(c) - 4.0);
+    assert!(c.state.speed < 0.3 && c.last.why == Why::People, "not held: {:?} at {:.1}", c.last.why, c.state.speed);
+    // (walk A at x 10, its band from its zebra stop 7.5 to 12; the body wholly short of it)
+    assert!(front <= 10.0 - omsi_traffic::plan::ZEBRA_STOP + 0.05 && rear < 10.0, "stood with its body over walk A: front {front:.1}");
+    assert!(least > 0.0, "touched the person: {least:.2}");
+}

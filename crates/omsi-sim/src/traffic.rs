@@ -3170,8 +3170,14 @@ pub struct AiState {
     /// From the vehicle's origin (the lane position `s`) to its front and rear bumper (m).
     pub front: f32,
     pub rear: f32,
-    /// Standing still and held there (by a car ahead, a light, a stop): moving off again
-    /// starts after `reaction`; `start_timer` counts it down.
+    /// Standing still and held there: the car ahead or the stop point (a light, a junction,
+    /// people, ...) asks it not to move; a cap (`accel_cap`) never holds it. The start reaction
+    /// (`reaction`, OMSI's per-driver start delay; SUMO's `startupDelay` is 0) applies once per
+    /// standstill held: set when the hold begins, it runs while the hold is off and pauses while a
+    /// hold comes back, so the car moves off once `reaction` s of free frames have passed since
+    /// the first clearing. A car standing under a cap alone is not held and moves off at the cap
+    /// the frame the cap allows it, without the reaction (SUMO's start). `start_timer` counts it
+    /// down.
     pub held: bool,
     pub start_timer: f32,
     /// Acceleration of the last step (m/s²).
@@ -4145,32 +4151,35 @@ impl AiState {
         if net.lanes.get(self.lane).is_none() {
             return false;
         }
-        let mut acc = self.desired_accel(net, lead, stop);
-        if let Some(cap) = self.accel_cap {
-            acc = acc.min(cap);
-        }
-        // standing: a driver who is held there moves off only after a moment when the way
-        // clears (the wave that runs down a queue at a green light)
+        // what the car ahead and the stop point ask (the explicit reasons to stand), then the
+        // plan's cap on top (`accel_cap`: a zipper's arrival, edging out, making room - a bound on
+        // the start, never a reason to stand)
+        let free = self.desired_accel(net, lead, stop);
+        let mut acc = self.accel_cap.map_or(free, |cap| free.min(cap));
+        // standing: held only while the car ahead or the stop point asks it not to move (`free`
+        // <= 0). When that clears, the driver moves off after `reaction` (OMSI's per-driver start
+        // delay, the wave down a queue at a green light; SUMO's `startupDelay` is 0), counted from
+        // the first frame the hold has cleared: a hold that comes back before it has run out pauses
+        // it (the hold is still on), it does not wind it back - a junction that is free and not
+        // free by turns as the cars on a ring come and go lets the car go when the reaction has
+        // run in its free frames
         if self.speed < 0.05 {
-            if acc <= 0.05 {
-                // (a hold of a frame or two - a junction that is free and not free by turns
-                // as the cars on the ring come and go - winds the reaction back only a
-                // little: set back whole every frame, it never ran out, and the car stood at
-                // an empty roundabout for minutes, "about to go")
-                self.start_timer = if self.held { (self.start_timer + 3.0 * dt).min(self.reaction) } else { self.reaction };
+            if free <= 0.0 {
+                if !self.held {
+                    self.start_timer = self.reaction;
+                }
                 self.held = true;
                 acc = acc.min(0.0);
             } else if self.held {
-                // [ROLLBACK queuestart-100] the cars of a queue do not wait for the one ahead to
-                // be gone: once it rolls, the reaction runs out three times as fast (the wave
-                // down the queue at a green light), but for the slow drivers (the longest
-                // reactions, about one in five) who keep waiting as before
+                // (the cars of a queue do not wait for the one ahead to be gone: once it rolls,
+                // the reaction runs out three times as fast, the wave down the queue at a green
+                // light, but for the slow drivers - the longest reactions, about one in five)
                 let rolling = lead.map(|l| l.speed > 0.5).unwrap_or(false);
                 let quick = rolling && self.reaction < 1.05;
                 let k = if quick { 3.0 } else { 1.0 };
                 self.start_timer -= k * dt;
                 if self.start_timer > 0.0 {
-                    acc = 0.0;
+                    acc = acc.min(0.0);
                 } else {
                     self.held = false;
                 }
@@ -4183,7 +4192,7 @@ impl AiState {
         self.speed = v1;
         self.acc = if dt > 0.0 { (v1 - v0) / dt } else { 0.0 };
         // brake lights: braking, or holding the car on the brake
-        self.braking = acc < -0.6 || (v1 < 0.3 && self.held);
+        self.braking = acc < -0.6 || (v1 < 0.3 && (self.held || acc <= 0.0));
         let ds = (v0 + v1) * 0.5 * dt;
         self.s += ds;
         self.odometer += ds;
@@ -4349,6 +4358,41 @@ mod tests {
         }
         let v = entered.expect("reached the bend");
         assert!(v < 7.5, "entered the bend at {v} m/s");
+    }
+
+    /// [round 10 J1e] A standing car is held only by an explicit reason - the car ahead or the
+    /// stop point - never by a cap: under a tiny cap with nothing ahead it moves off at once at
+    /// that cap; held by a stop that clears, it waits its reaction; a hold that comes back for a
+    /// frame while the reaction runs pauses it, it does not wind it back.
+    #[test]
+    fn a_standing_car_is_held_by_its_stop_or_lead_never_by_a_cap() {
+        let net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 200.0, 0.0)], LaneKind::Street, 3.0)], ..Default::default() };
+        let dt = 0.1;
+        // (a cap far below the start acceleration: it rolls, at the cap)
+        let mut car = AiState::new(0, 10.0, 3);
+        car.reaction = 0.8;
+        car.accel_cap = Some(0.02);
+        assert!(car.drive(&net, dt, None, None));
+        assert!(!car.held && (car.acc - 0.02).abs() < 1e-4, "held {} acc {}", car.held, car.acc);
+        // (a stop at its front holds it; once it clears it goes after its reaction, 0.8 s)
+        let mut car = AiState::new(0, 10.0, 3);
+        car.reaction = 0.8;
+        let at = car.front + 0.2;
+        for _ in 0..10 {
+            car.drive(&net, dt, None, Some(at));
+        }
+        assert!(car.held && car.speed < 0.05);
+        let mut moved_at = None;
+        for k in 0..30 {
+            // (the stop comes back for one frame at 0.3 s: a pause, not a rewind)
+            let stop = (k == 3).then_some(car.front + 0.2);
+            car.drive(&net, dt, None, stop);
+            if car.speed > 0.0 && moved_at.is_none() {
+                moved_at = Some(k);
+            }
+        }
+        // (the reaction runs out in its eighth free frame: frame 8, with the held frame 3 between)
+        assert_eq!(moved_at, Some(8), "moved off at frame {moved_at:?}");
     }
 
     /// A pull-out started a few metres before the car's lane ends (a road of short spline

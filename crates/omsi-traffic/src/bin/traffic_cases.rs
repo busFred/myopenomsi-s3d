@@ -76,6 +76,15 @@ const PERSON_RADIUS: f64 = 0.28;
 /// How far ahead (m) `heads` looks for the junction pieces of a head's way: past the claim's
 /// furthest reach (`Simulation::tick`'s horizon, at most 220 m) and a way through of its own.
 const HEADS_WAY: f32 = 400.0;
+/// `ab`'s `pedtouch_nospawn`: a person this young (s since they came into the replay, matched from
+/// frame to frame by position) is left out - the same 3 s as `ovl_nospawn`'s vehicle spawns.
+const FRESH_PERSON: f64 = 3.0;
+/// A person this far (m) from where anybody stood last frame came into the replay this frame
+/// (people walk under 2.5 m/s: 0.08 m a 30 Hz frame; the recording's keyframes jump nobody further).
+const PERSON_MATCH: f64 = 0.5;
+/// `ab`'s `capped_by_red`: a start capped to this or less (m/s^2) is "capped to nothing" - the
+/// round 10 drive analysis's measure of J9-1 (report2/junctions.md), the old held threshold.
+const CAPPED_START: f32 = 0.05;
 /// An eased-off car standing longer than this (s) counts in `ab`'s `ease_stand` (and, with the
 /// follow its grant offers, `ease_pinned`): round 6's count of the ease pin (review-r6 case03/06).
 const EASE_PIN_AFTER: f64 = 3.0;
@@ -1423,7 +1432,7 @@ fn snap_idx(snaps: &[Snap], t: f64) -> usize {
 
 fn decision_next(d: &omsi_traffic::Decision) -> Option<(u64, &'static str)> {
     match d.why {
-        Why::Junction | Why::ExitFull => d
+        Why::Junction | Why::ExitFull | Why::KeepClear => d
             .wait_for
             .map(|w| (w, "yields to"))
             .or(d.lead_id.map(|w| (w, "behind")))
@@ -1790,7 +1799,7 @@ fn terminal_reason(
                 why_name(d.why)
             ),
         ),
-        Why::Junction | Why::ExitFull => (
+        Why::Junction | Why::ExitFull | Why::KeepClear => (
             "junction-nofoe",
             format!(
                 "{} why={} hold={} with no foe named",
@@ -3838,7 +3847,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
             None => {}
         }
     }
-    if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull)) {
+    if !jms.is_empty() && (d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull | Why::KeepClear)) {
         let mut foes_n = 0;
         for &(j, m, ml, md) in &jms {
             let mv = &r.sim.junctions.nodes[j].movements[m];
@@ -4027,7 +4036,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
                 }
             }
         }
-        Why::Junction | Why::ExitFull => {
+        Why::Junction | Why::ExitFull | Why::KeepClear => {
             if d.hold == Some(Hold::Foe) && foe_in.is_empty() && foe_coming.is_empty() {
                 tags.push("junction hold (foe) with nobody in or coming to the conflict stretches".into());
             }
@@ -4076,7 +4085,7 @@ fn head_sample(r: &Replay, i: usize, t: f64, day: f64, ppos: Option<DVec3>, stan
     } else if matches!(d.why, Why::People | Why::Zebra) && !near_people.is_empty() {
         let p = near_people[0].3;
         format!("person in front (state {}, decision {}, still {:.0} s, {:.1} m from front)", p.state, p.decision.as_deref().unwrap_or("-"), p.still, near_people[0].0)
-    } else if d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull) {
+    } else if d.hold.is_some() || matches!(d.why, Why::Junction | Why::ExitFull | Why::KeepClear) {
         if matches!(wait_rel, Some("BEHIND") | Some("BESIDE")) {
             format!("junction hold for a vehicle behind/beside ({} {})", d.wait_for.map(fmt_id).unwrap_or_default(), wait_rel.unwrap().to_lowercase())
         } else if d.hold == Some(Hold::ExitFull) {
@@ -4263,10 +4272,20 @@ struct Extra {
     /// [J7-2] Vehicle-seconds within the radius with a zipper speed (`Grant::zipper`: the foe
     /// ahead at a merge caps the speed, or the queue-entry stop behind it).
     zipper_capped_s: f64,
+    /// Vehicle-seconds within the radius standing with its start capped to `CAPPED_START` or less
+    /// by a zipper foe (not the queue-entry stop) that stands short of the merge at its own red
+    /// (`Claim::light_red`): a partner held at red whose green comes after my arrival is not
+    /// ahead (`reservation::zipper_cap`), so this is 0 when the rule holds.
+    capped_by_red_s: f64,
     /// [round 7 R7-1] With `--pedtouch`: frames a moving vehicle's body is severely over a
     /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
     /// player's passengers out not counted).
     pedtouch_severe: u64,
+    /// Of `pedtouch_severe`, the frames with a person that came into the replay more than
+    /// `FRESH_PERSON` s before (recorded people do not react to the free run's vehicles: one the
+    /// recording puts down where the free run has a car is the replay's, as `ovl_nospawn` leaves
+    /// out vehicles touching within 3 s of coming on the road).
+    pedtouch_nospawn: u64,
     events: Vec<String>,
 }
 
@@ -4430,6 +4449,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
     let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
     let mut on_cut_ids: HashSet<u64> = HashSet::new();
+    // (`--pedtouch`: last frame's people, each with when it came into the replay)
+    let mut prev_people: Vec<(glam::DVec3, f64)> = Vec::new();
+    // (pairs already listed as `CAPRED` events)
+    let mut capped_seen: HashSet<(u64, u64)> = HashSet::new();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4493,6 +4516,19 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.follower_go_s += g.follower_go as f64 * fdt;
                     ex.leader_go_s += g.leader_go as f64 * fdt;
                     ex.zipper_capped_s += g.zipper.is_some() as u8 as f64 * fdt;
+                    // (J9-1's symptom, round 10 analysis: the start capped to nothing, 0.05 m/s^2 or
+                    // less, by a partner short of the merge standing at its red - not one standing
+                    // in the merged way ahead, a lead to follow)
+                    let partner = g.zipper.filter(|z| !z.stop && !z.inside).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe)).filter(|(o, _)| o.light_red && o.speed < 0.3);
+                    let tiny = r.vehicles.get(c.vehicle).and_then(|v| v.state.accel_cap).is_some_and(|cap| cap <= CAPPED_START);
+                    if let (Some((o, _)), true) = (partner, c.speed < 0.3 && tiny) {
+                        ex.capped_by_red_s += fdt;
+                        let (me_id, foe_id) = (r.vehicles[c.vehicle].id, o.id);
+                        if capped_seen.insert((me_id, foe_id)) {
+                            let z = g.zipper.unwrap();
+                            ex.events.push(format!("CAPRED {} t={now:.1} #{me_id} capped by #{foe_id} at its red (until_go {:?}, red_at {:.1}, s {:.1}): gap {:.1} arrive {:.3} hold {:?} zip_behind {:?} body_block {:?}", sc.name, o.until_go, o.red_at, o.s, z.gap, z.arrive, z.hold, c.zip_behind, c.body_block));
+                        }
+                    }
                 }
             }
             let ids: HashSet<u64> = r.vehicles.iter().map(|v| v.id).collect();
@@ -4586,6 +4622,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
             }
         }
+        // (`--pedtouch`: when each person came into the replay, matched to last frame's by position)
+        let person_since: Vec<f64> = if pedtouch {
+            let since: Vec<f64> = r.sim.people.iter().map(|p| prev_people.iter().filter(|(q, _)| (p.pos - *q).length() < PERSON_MATCH).map(|&(_, t0)| t0).fold(r.sim.time, f64::min)).collect();
+            prev_people = r.sim.people.iter().zip(&since).map(|(p, &t0)| (p.pos, t0)).collect();
+            since
+        } else {
+            Vec::new()
+        };
         // ---- every frame: the odometers and the stop lines
         for v in &r.vehicles {
             let st = &v.state;
@@ -4603,7 +4647,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             // person's disc, 0.28 m, every frame, on stderr)
             if pedtouch && st.speed >= 0.3 {
                 let b = v.obb();
-                for p in &r.sim.people {
+                for (pk, p) in r.sim.people.iter().enumerate() {
                     if (p.pos - v.pos).truncate().length() > 15.0 || (p.pos.z - v.pos.z).abs() > 2.5 {
                         continue;
                     }
@@ -4616,7 +4660,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         let severe = -sep > 0.28 || (st.speed > 1.0 && -sep > 0.05);
                         let note = if v.last.why == Why::LetOut { " artefact: passengers placed by the recording beside the run's car" } else { "" };
                         ex.pedtouch_severe += (severe && note.is_empty()) as u64;
-                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
+                        let fresh = person_since.get(pk).is_some_and(|&t0| r.sim.time - t0 < FRESH_PERSON);
+                        ex.pedtouch_nospawn += (severe && note.is_empty() && !fresh) as u64;
+                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{} age {:.1}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note, person_since.get(pk).map(|&t0| r.sim.time - t0).unwrap_or(f64::NAN));
                     }
                 }
             }
@@ -4873,6 +4919,13 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
         close(&mut sc, run);
     }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
+    // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
+    // as loaded at the end of the run: how many such places the map has here)
+    {
+        let outside = |l: usize| r.net.lanes.get(l).is_some_and(|x| x.source != 2);
+        let n = r.net.crossings.iter().enumerate().map(|(i, cs)| cs.iter().filter(|c| !c.merge && c.other > i && outside(i) && outside(c.other)).count()).sum::<usize>();
+        eprintln!("LANECROSS {} {n} crossings of lanes outside crossing objects", sc.name);
+    }
     sc.divergence = r.divergence.iter().map(|d| d.1 as f64).fold(0.0, f64::max);
     for &(t, d, id) in r.divergence.iter().filter(|d| d.1 > 0.0005) {
         sc.drift_events.push(format!("{} t={t:.1} {d:.3} m (vehicle #{id})", sc.name));
@@ -4913,6 +4966,8 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("far_red_before", e.far_red_before_s.to_string()),
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
+        ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
+        ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
         ("removed_far", e.removed_far.to_string()),
     ]
 }
@@ -4942,6 +4997,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.removed_in_view_s += e.removed_in_view_s;
     t.removed_far += e.removed_far;
     t.pedtouch_severe += e.pedtouch_severe;
+    t.pedtouch_nospawn += e.pedtouch_nospawn;
     t.end_in_view += e.end_in_view;
     t.end_moving += e.end_moving;
     t.wait60 += e.wait60;
@@ -4956,6 +5012,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.follower_go_s += e.follower_go_s;
     t.leader_go_s += e.leader_go_s;
     t.zipper_capped_s += e.zipper_capped_s;
+    t.capped_by_red_s += e.capped_by_red_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -5085,8 +5142,14 @@ fn ab(args: &[String]) -> Res<()> {
         total.red_cross,
         total.extra.removed_in_view,
         total.extra.removed_in_view_s,
-        if pedtouch { total.extra.pedtouch_severe.to_string() } else { "not run (--pedtouch)".into() }
+        if pedtouch { total.extra.pedtouch_nospawn.to_string() } else { "not run (--pedtouch)".into() }
     );
+    if pedtouch {
+        // (the GATE's severe leaves out people who came into the replay less than `FRESH_PERSON`
+        // ago: recorded people do not react to the free run's vehicles and appear where the game
+        // spawned them, as `ovl_nospawn` leaves out vehicles fresh on the road)
+        println!("(pedtouch_severe in GATE: people in the replay {FRESH_PERSON} s or longer; with the fresh ones {})", total.extra.pedtouch_severe);
+    }
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures

@@ -385,7 +385,7 @@ impl VehicleState {
             "zebra" => VehicleState::Zebra,
             "yield" => VehicleState::Yield,
             "light" => VehicleState::Light,
-            "exit" => VehicleState::Exit,
+            "exit" | "keep_clear" => VehicleState::Exit,
             _ => VehicleState::Other,
         }
     }

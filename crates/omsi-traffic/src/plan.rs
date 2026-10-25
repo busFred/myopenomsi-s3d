@@ -19,16 +19,22 @@ pub enum Why {
     Lead,
     Light,
     Junction,
+    /// Refused by the junction for want of room on its exit lane (`Hold::ExitFull`, SUMO's
+    /// junction-blocking test at the link).
     ExitFull,
     People,
-    /// A pedestrian at a crossing (round 4's zebra check; [round 7 A3] not produced any more:
-    /// `People` holds for them. Kept for the recordings that name it.)
+    /// A pedestrian at a crossing: not produced (`People` holds for them); kept for the
+    /// recordings that name it.
     Zebra,
     Service,
     Merge,
     PullOut,
     LetOut,
     End,
+    /// Held at its line so as not to come to rest in the box (step 11 of `plan`, SUMO's
+    /// keep-clear rule): where it would stop lies between the line and the way's exit and is
+    /// no waiting place.
+    KeepClear,
 }
 
 impl Why {
@@ -46,6 +52,7 @@ impl Why {
             Why::PullOut => "pull_out",
             Why::LetOut => "let_out",
             Why::End => "end",
+            Why::KeepClear => "keep_clear",
         }
     }
 }
@@ -81,27 +88,27 @@ pub struct Plan {
     /// The decision at the light ahead taken at its amber onset (`light_call`): (light,
     /// through, the gap from the front to its line).
     pub light_decision: Option<((usize, usize), bool, f32)>,
-    /// [J7-3] SUMO LC2013's cooperation (`informFollower`): the follower in the lane I must
+    /// SUMO LC2013's cooperation (`informFollower`): the follower in the lane I must
     /// change into is asked to make room - (its index, the gap from its front to my rear, my
     /// speed, the gap my acceptance needs from it; `Vehicle::help_for`).
     pub help: Option<(usize, f32, f32, f32)>,
-    /// [J7-3] What the lane change of the driver's own it starts is for (`ChangeWhy`).
+    /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
-    /// [Q8-4] The last-resort stop before a lane's end placed this frame (the odometer where the
+    /// The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
-    /// [Q8-1] Backing up out of a packed queue (`queue_escape`): [fix pass 1] (the odometer where it
+    /// Backing up out of a packed queue (`queue_escape`): (the odometer where it
     /// is to stand, stopping: a committed stop - the strip behind no longer clear or the queue
     /// moving).
     pub reverse: Option<(f32, bool)>,
-    /// [Q8-3] SUMO LC2013's keep-right accumulation this frame (per second, `keep_right_rate`):
+    /// SUMO LC2013's keep-right accumulation this frame (per second, `keep_right_rate`):
     /// `Vehicle::keep_right` grows by it; None where no lane beside on the keep side is one the
     /// driver may change onto (the wish is left as it is).
     pub keep_right_rate: Option<f32>,
-    /// [round 8 H8-1] A car leaving a parking space is held where it is parked because its
+    /// A car leaving a parking space is held where it is parked because its
     /// lane has no room behind it: its `pull_out` clock waits.
     pub pull_out_held: bool,
-    /// [P8 pass 1, S1] Held standing out of its lane on the way back in (`reentry_clear`):
+    /// Held standing out of its lane on the way back in (`reentry_clear`):
     /// the ramp back is not begun while held (`Simulation` keeps its start ahead of the body).
     pub reentry_held: bool,
 }
@@ -123,7 +130,7 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
 }
 
 /// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
-/// (the follower need not brake hard). (`informFollower` asks for it, [J7-3].)
+/// (the follower need not brake hard). (`informFollower` asks for it, .)
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
     accepted_gap(me, nb.behind_min_gap, vb, v)
 }
@@ -134,7 +141,7 @@ fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
 /// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`).
 fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
-    // ([fix pass 2] the follower's own standing gap, not a fixed 2 m: the helper opens exactly
+    // (the follower's own standing gap, not a fixed 2 m: the helper opens exactly
     // this gap, `informFollower`, one function on both sides; a follower resting at its 1.57 m
     // standing gap behind the changer was never accepted, and both stood)
     min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
@@ -148,7 +155,7 @@ fn gap_parts(me: &Vehicle, nb: &NeighbourView) -> (bool, bool) {
     (ok_behind, ok_ahead)
 }
 
-/// [round 8 H8-1/H8-8, fix pass 1] A vehicle behind a car about to pull out of a parking space,
+/// A vehicle behind a car about to pull out of a parking space,
 /// on the lane it pulls out onto (or a lane leading into it): the gap from its front to the
 /// pull-out's rear along the lane (m), its speed and its own driver.
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +214,7 @@ pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, 
     out
 }
 
-/// [round 8 H8-8, fix pass 1] Nobody is on the strip a pull-out's body sweeps from its parking
+/// Nobody is on the strip a pull-out's body sweeps from its parking
 /// offset onto its lane: the body at lane `lane`, `s` + d, `lateral` eased to 0 over `ramp_len`
 /// m as `AiState::lateral_ramp` does, for d from where it stands to the ramp's end (a walker
 /// passing through the parked body holds it until through - leaving them out, the car drove off
@@ -223,7 +230,7 @@ pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32
     !sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0).into_iter().any(|k| on_pull_out_strip(net, lane, s, lateral, front, rear, half_width, ramp_len, v, &sim.people[k]))
 }
 
-/// [round 8 H8-8, fix pass 2] Whether person `p` is on the strip (`pull_out_strip_clear`): where
+/// Whether person `p` is on the strip (`pull_out_strip_clear`): where
 /// they are, or where they will be when the body is at that metre - the car driving on from `v`
 /// m/s at `PULL_OUT_ACCEL` up to the lane's limit (`arrival_time`; pass 1 timed it from rest even
 /// when moving).
@@ -248,7 +255,7 @@ pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front
     false
 }
 
-/// [round 8 H8-8, fix pass 2] The rest of a pull-out's way out (m): the steerable move from rest
+/// The rest of a pull-out's way out (m): the steerable move from rest
 /// while it has not left (`bypass_min_len`), else what is left of its way back (`way_back`).
 pub fn pull_out_ramp_left(me: &Vehicle) -> f32 {
     let st = &me.state;
@@ -260,7 +267,7 @@ pub fn pull_out_ramp_left(me: &Vehicle) -> f32 {
     }
 }
 
-/// [round 8 H8-8, fix pass 2] The one exemption the people test makes for a car pulling out of a
+/// The one exemption the people test makes for a car pulling out of a
 /// parking space (`people_ahead` asks it for every person): somebody under or beside its parked
 /// body - level with it, from its rear to its front - who is not on the strip it sweeps onto its
 /// lane (`on_pull_out_strip`) is not in its way (the walkers passing over the pavement at its
@@ -277,7 +284,7 @@ pub fn pull_out_exempt(net: &Network, me: &Vehicle, p: &crate::sim::Person) -> b
     level && !on_pull_out_strip(net, st.lane, st.s, st.lateral, st.front, st.rear, me.half_width, pull_out_ramp_left(me), st.speed, p)
 }
 
-/// [round 8 H8-1/H8-8, fix pass 1] The one pull-out rule, for the parked object the app takes
+/// The one pull-out rule, for the parked object the app takes
 /// off the kerb, for a recorded pull-out standing at its offset and ([merge P8/H8], P8-4) for any
 /// vehicle standing out of its lane on its way back in, a bus leaving its bay: every moving
 /// follower has its secure gap (`secure_gap_behind`), a standing one only room for its body, and nobody is on the strip its body sweeps
@@ -289,20 +296,20 @@ pub fn pull_out_clear(net: &Network, sim: &Simulation, followers: &[PullOutFollo
     followers.iter().all(|f| if f.speed < STANDING_SPEED { f.gap >= 0.0 } else { f.gap >= secure_gap_behind(f) }) && pull_out_strip_clear(net, sim, lane, s, lateral, front, rear, half_width, ramp_len, 0.0)
 }
 
-/// [J7-3] SUMO LC2013's strategic look-ahead (`MSLCM_LC2013::LOOK_FORWARD`, s): a lane that
+/// SUMO LC2013's strategic look-ahead (`MSLCM_LC2013::LOOK_FORWARD`, s): a lane that
 /// ends for the driver raises its wish to leave it from this many seconds of its speed out.
 pub const LC_LOOK_FORWARD: f32 = 10.0;
-/// [J7-3, fix pass 1] SUMO LC2013's `LOOK_AHEAD_SPEED_MEMORY`: the look-ahead speed falls by this
+/// SUMO LC2013's `LOOK_AHEAD_SPEED_MEMORY`: the look-ahead speed falls by this
 /// factor per second (`Vehicle::look_ahead_speed`).
 pub const LOOK_AHEAD_SPEED_MEMORY: f32 = 0.9;
-/// [J7-3] ... times this towards the overtaking side (SUMO's `lcLookaheadLeft` default; the
+/// ... times this towards the overtaking side (SUMO's `lcLookaheadLeft` default; the
 /// side mirrors on a left-hand-traffic map).
 pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
-/// [J7-3] SUMO LC2013's `HELP_DECEL_FACTOR`: a follower asked to make room for a lane change
+/// SUMO LC2013's `HELP_DECEL_FACTOR`: a follower asked to make room for a lane change
 /// brakes no harder than its comfortable brake times this.
 pub const HELP_DECEL_FACTOR: f32 = 1.0;
 
-/// [J7-3, fix pass 1] The road a lane change started at `v` m/s takes (m): the signalling before
+/// The road a lane change started at `v` m/s takes (m): the signalling before
 /// it moves (`SIGNAL_BEFORE_CHANGE`, speeding up at `a` meanwhile) and the move
 /// (`change_length`).
 pub fn change_space(v: f32, a: f32) -> f32 {
@@ -310,14 +317,14 @@ pub fn change_space(v: f32, a: f32) -> f32 {
     v * w + 0.5 * a.max(0.0) * w * w + omsi_sim::traffic::change_length(v)
 }
 
-/// [J7-3] SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
+/// SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
 /// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side) plus two of the
 /// vehicle's lengths with its standing gap.
 pub fn lane_end_look(v: f32, overtaking_side: bool, me: &Vehicle) -> f32 {
     v * LC_LOOK_FORWARD * if overtaking_side { LC_LOOKAHEAD_LEFT } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
 }
 
-/// [J7-3] May the driver change onto `nb` because its own lane ends for it (`Perception::
+/// May the driver change onto `nb` because its own lane ends for it (`Perception::
 /// lane_end`): the path's rules allow it there and no solid line holds either lane; on a
 /// junction object's piece only onto a piece of the same object beside it that it meets in no
 /// crossing (two lanes of one carriageway running side by side: SUMO changes lanes on an edge,
@@ -337,7 +344,7 @@ fn may_change_for_lane_end(net: &Network, sim: &Simulation, me: &Vehicle, nb: &N
     }
 }
 
-/// [J7-3] Somebody on the lane `nb` over the move a change would take (from beside my rear to
+/// Somebody on the lane `nb` over the move a change would take (from beside my rear to
 /// the move's length past my front): no change into people.
 fn people_on_move(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView) -> bool {
     let st = &me.state;
@@ -352,7 +359,7 @@ fn people_on_move(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourV
     })
 }
 
-/// [J7-3] The lane `lane` beside me runs on `need` m past my front (along its first ways on;
+/// The lane `lane` beside me runs on `need` m past my front (along its first ways on;
 /// `NeighbourView::runs_on` is the network's reach from the lane's start, capped).
 fn runs_past(net: &Network, me: &Vehicle, lane: usize, need: f32) -> bool {
     let st = &me.state;
@@ -369,7 +376,7 @@ fn runs_past(net: &Network, me: &Vehicle, lane: usize, need: f32) -> bool {
     d >= need
 }
 
-/// [J7-3] SUMO LC2013's strategic wish to leave a lane that ends for the driver (sumo.md 3.2),
+/// SUMO LC2013's strategic wish to leave a lane that ends for the driver (sumo.md 3.2),
 /// towards `nb`: 0 far off, rising with the nearness of the end over the strategic distance
 /// (`lane_end_look`) to `lc_strategic` two vehicle lengths before it - towards the lane the
 /// merge joins (`LaneEnd::toward`), or for a closed lane or the way's end one that runs on past
@@ -403,7 +410,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
-    // [J7-3] the lane ends for me: the strategic wish to leave it, whatever else holds
+    // the lane ends for me: the strategic wish to leave it, whatever else holds
     let end = lane_end_desire(net, sim, me, p, nb);
     // (nor a move that does not fit before the end: SUMO's `LCA_INSUFFICIENT_SPACE`; the car
     // slows to its last-resort stop, which leaves the room to move over from standing)
@@ -437,9 +444,9 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
             wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
         }
     }
-    // [Q8-3] keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
+    // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
     // (`Vehicle::keep_right`, `keep_right_rate`) past its threshold, unless SUMO's strategic stays
-    // hold (`stays_on_best`, over the lanes open to me: [fix pass 1] no `open_on` window); a speed-
+    // hold (`stays_on_best`, over the lanes open to me: no `open_on` window); a speed-
     // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (round 5's gates -
     // lead over 60 m, the lane beside free 70 m, not near a junction, running on 200 m - are gone:
     // how long the driver could keep its speed there is the accumulator's rate)
@@ -449,7 +456,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     (desire, end_ok(gap_accepted(me, nb)), why)
 }
 
-/// [J7-3] The motivation that won a lane change of the driver's own (`change_desire`; counted per
+/// The motivation that won a lane change of the driver's own (`change_desire`; counted per
 /// start, `Simulation::changes_by_why`, `traffic_cases ab`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeWhy {
@@ -467,7 +474,7 @@ const TURN_LANE_KEEP: f32 = 150.0;
 /// onto.
 const CHANGE_RUNS_ON: f32 = 40.0;
 
-/// [round 7 D5] May the driver change onto `nb` of its own accord (a change for a reason of
+/// May the driver change onto `nb` of its own accord (a change for a reason of
 /// its own, a bypass; `change_desire` and `could_bypass` ask the same): the path's rules
 /// allow it there; no solid line (`[rule] overtaking_prohib`) on either lane, not on a
 /// junction object's piece; a turn lane is never left within `TURN_LANE_KEEP` of its
@@ -488,28 +495,28 @@ fn may_change_to(net: &Network, me: &Vehicle, nb: &NeighbourView) -> bool {
 /// lane, which runs into 3474's, closed to it).
 pub const KEEP_SIDE_OPEN_AHEAD: f32 = 60.0;
 
-/// [Q8-3] SUMO LC2013's `KEEP_RIGHT_TIME` (s): "the number of seconds after which a vehicle
+/// SUMO LC2013's `KEEP_RIGHT_TIME` (s): "the number of seconds after which a vehicle
 /// should move to the right lane" - with the lane beside free for its whole acceptance time
 /// the wish reaches its threshold in this long.
 pub const KEEP_RIGHT_TIME: f32 = 5.0;
-/// [Q8-3] The accumulated keep-right wish (`Vehicle::keep_right`) asks for the change once it
+/// The accumulated keep-right wish (`Vehicle::keep_right`) asks for the change once it
 /// reaches this: SUMO's `myKeepRightProbability * lcKeepRight < -myChangeProbThresholdRight`
 /// with the default `lcKeepRight` 1, the accumulator counted in units of the threshold.
 pub const KEEP_RIGHT_THRESHOLD: f32 = 1.0;
-/// [Q8-3] SUMO LC2013's legacy acceptance time (`lcKeepRightAcceptanceTime` -1, its default):
+/// SUMO LC2013's legacy acceptance time (`lcKeepRightAcceptanceTime` -1, its default):
 /// `7 * roadSpeedFactor * max(1, v)` seconds.
 pub const KEEP_RIGHT_ACCEPTANCE: f32 = 7.0;
-/// [Q8-3] SUMO LC2013 accumulates the keep-right wish only while the current lane is not faster
+/// SUMO LC2013 accumulates the keep-right wish only while the current lane is not faster
 /// than the lane beside by more than this (m/s: `thisLaneVSafe - 5 / 3.6 > neighLaneVSafe`).
 pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
-/// [Q8-3] SUMO LC2013's `TURN_LANE_DIST` (m): "the distance at which a lane leading elsewhere is
+/// SUMO LC2013's `TURN_LANE_DIST` (m): "the distance at which a lane leading elsewhere is
 /// considered to be a turn-lane that must be avoided" - a driver on the lane that runs on does not
 /// leave it for a keep-right onto one that runs on less than this (`stays_on_best`).
 pub const TURN_LANE_DIST: f32 = 200.0;
-/// [Q8-3] SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so
+/// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so
 /// the distance a lane beside runs on (`neighDist`), are looked along.
 pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
-/// [Q8-3] SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
+/// SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
 /// allowed (`avoidOvertakeRight` is false), above it the time on the lane beside is bounded by
 /// catching up with my own leader.
 pub const CONGESTED_SPEED: f32 = 60.0 / 3.6;
@@ -523,7 +530,7 @@ fn keep_side(sim: &Simulation) -> i32 {
     }
 }
 
-/// [Q8-3] SUMO LC2013's strategic stays that come before its keep-right layer, for the lane beside
+/// SUMO LC2013's strategic stays that come before its keep-right layer, for the lane beside
 /// `nb` when my own lane runs on further (SUMO: `bestLaneOffset == 0`): VARIANT_21 `stayOnBest`,
 /// the lane beside runs on less than `TURN_LANE_DIST`; and "could not change back and forth in
 /// time", twice its run is under the strategic distance (`lane_end_look`).
@@ -535,7 +542,7 @@ fn stays_on_best(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
     theirs < short && open_run(net, me, st.lane, st.s, short) > theirs
 }
 
-/// [Q8-3] How far (m, at most `cap`) a car at `s` on `lane` can drive on along it and the lanes it
+/// How far (m, at most `cap`) a car at `s` on `lane` can drive on along it and the lanes it
 /// runs into while they are open to it (`access::is_open`; a junction object's piece is the
 /// junction's): SUMO's best-lane length (`neighDist`, `currentDist`) for a car with no route -
 /// at a fork the way on that runs furthest. (`NeighbourView::runs_on` is the network's reach,
@@ -569,11 +576,11 @@ fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
     walk(net, me, lane, -s.min(l.length()), cap, &mut budget).min(cap)
 }
 
-/// [Q8-3] `open_run` looks at no more than this many lanes (the network's own reach is counted
+/// `open_run` looks at no more than this many lanes (the network's own reach is counted
 /// over the same chains, `Network::compute_reach`).
 const OPEN_RUN_LANES: usize = 64;
 
-/// [Q8-3] SUMO's Krauss `maximumSafeFollowSpeed` (on insertion: no reaction step): the highest
+/// SUMO's Krauss `maximumSafeFollowSpeed` (on insertion: no reaction step): the highest
 /// speed from which the driver, braking at `b` after `tau`, stays behind a lead `gap` m ahead at
 /// `vl` m/s braking as hard; a stop `gap` m ahead with `vl` 0 (`maximumSafeStopSpeed`).
 fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
@@ -582,7 +589,7 @@ fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
     -b * tau + ((b * tau).powi(2) + 2.0 * b * room).sqrt()
 }
 
-/// [Q8-3] SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
+/// SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
 /// side, `nb` (`MSLCM_LC2013::_wantsChange`, "honor the obligation to keep right"): 0 while my
 /// lane is faster than that one by `KEEP_RIGHT_FASTER` (the anticipated safe speeds behind each
 /// lane's leader, `anticipateFollowSpeed`); else the share of the acceptance time
@@ -595,7 +602,7 @@ pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Pe
     let dp = &me.params;
     let (b, tau) = (dp.comfort_brake, dp.tau);
     let v_max = p.v_want.max(0.1);
-    // ([fix pass 1] SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
+    // (SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
     // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
     let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
     let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
@@ -621,7 +628,7 @@ pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Pe
         full_gap = full_gap.min(g - secure).max(0.0);
         seconds = seconds.min(full_gap / (v_max - vl));
     }
-    // ([fix pass 1] SUMO compares my desired speed with the leader's maximum on its lane,
+    // (SUMO compares my desired speed with the leader's maximum on its lane,
     // `getVehicleMaxSpeed`, not its speed now: a player's vehicle or a parked car is taken at my
     // lane's limit)
     let leader_max = |l: &crate::perception::Headway| match l.what {
@@ -973,12 +980,12 @@ fn behind_an_obstacle(net: &Network, sim: &Simulation, vehicles: &[Vehicle], lea
     queue_head(net, sim, vehicles, lead).is_some()
 }
 
-/// [Q8-1 fix pass 1] What heads the queue the standing `lead` is the tail of (`QUEUE_LOOK`
+/// What heads the queue the standing `lead` is the tail of (`QUEUE_LOOK`
 /// vehicles on at most, linked by their leads; the one definition of `behind_an_obstacle` and the
 /// escape, `queue_escape`): `AtStop`, a bus held at its stop; `ForGood`, a vehicle at the end of
 /// its way, or one standing `QUEUE_OBSTACLE_STAND` held by nothing - an AI vehicle not indicating,
-/// a player's vehicle not indicating and not held by its red (its claim's `light_red`), [fix pass
-/// 3] the standing counted as continuous time held by nothing; None, a
+/// a player's vehicle not indicating and not held by its red (its claim's `light_red`), the
+/// standing counted as continuous time held by nothing; None, a
 /// queue that is the road (a red light, a junction, people: their heads are held by them) or
 /// anything moving or manoeuvring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,10 +995,10 @@ enum QueueHead {
 }
 
 /// A lead nearer than this (m) holds the car (`Plan::held`: the start reaction applies when it
-/// clears); [Q8-1 follow-up] the same test holds a player's vehicle for `queue_head`.
+/// clears); the same test holds a player's vehicle for `queue_head`.
 pub const HELD_LEAD_GAP: f32 = 12.0;
 
-/// [Q8-1 follow-up] Is player `id`'s vehicle blocked by a vehicle ahead - an AI vehicle on a lane it
+/// Is player `id`'s vehicle blocked by a vehicle ahead - an AI vehicle on a lane it
 /// stands on, or on a lane that one runs into, whose rear is within `HELD_LEAD_GAP` of its front -
 /// as an AI head is held by a lead near (`Plan::held`)?
 fn player_blocked(net: &Network, sim: &Simulation, vehicles: &[Vehicle], id: u32) -> bool {
@@ -1022,7 +1029,7 @@ fn queue_head(net: &Network, sim: &Simulation, vehicles: &[Vehicle], lead: &crat
     if lead.speed.abs() >= STANDING_SPEED {
         return None;
     }
-    // ([fix pass 3] standing for good counts the time standing held by nothing, continuous
+    // (standing for good counts the time standing held by nothing, continuous
     // (`Vehicle::unheld_for`, `Simulation::player_wait`): a head held by its red, people or the
     // junction is not standing for good on the frame it is let go - SUMO's waiting time runs on
     // under people and junction holds)
@@ -1060,19 +1067,19 @@ fn queue_head(net: &Network, sim: &Simulation, vehicles: &[Vehicle], lead: &crat
     None
 }
 
-/// [Q8-1] A car stood this long (s) behind a queue whose head is an obstacle backs up to the room
+/// A car stood this long (s) behind a queue whose head is an obstacle backs up to the room
 /// a bypass needs (`queue_escape`): as long as anything standing takes to be an obstacle whatever
 /// holds it (`perception::HELD_OBSTACLE_STAND`, the cleanup's one definition).
 pub const QUEUE_ESCAPE_STAND: f32 = crate::perception::HELD_OBSTACLE_STAND;
 
-/// [Q8-1 fix pass 1] A vehicle's brake gap at `v` (m): SUMO's `MSCFModel::brakeGap` - the
+/// A vehicle's brake gap at `v` (m): SUMO's `MSCFModel::brakeGap` - the
 /// reaction distance `v * tau` and the stop `v^2 / 2b` at its comfortable brake.
 fn brake_gap(v: f32, tau: f32, b: f32) -> f32 {
     let v = v.abs();
     v * tau + v * v / (2.0 * b.max(0.1))
 }
 
-/// [Q8-1 fix pass 1] How far behind me (m) a vehicle can come from before it would stand: the
+/// How far behind me (m) a vehicle can come from before it would stand: the
 /// brake gap at my lane's limit of the road preset that brakes longest (the lorry's: tau 1.8 s,
 /// 1.5 m/s², `DriverParams::preset`).
 fn rear_look(net: &Network, me: &Vehicle) -> f32 {
@@ -1081,9 +1088,9 @@ fn rear_look(net: &Network, me: &Vehicle) -> f32 {
     brake_gap(limit, lorry.tau, lorry.comfort_brake)
 }
 
-/// [Q8-1] Is the strip behind me clear for backing up `back` m and keeping my standing gap
+/// Is the strip behind me clear for backing up `back` m and keeping my standing gap
 /// there: my body moved back along my way over every half metre of `back` + `min_gap` touches no
-/// vehicle, player's vehicle, parked car or person by `SQUEEZE_CLEARANCE`; [fix pass 1] a vehicle
+/// vehicle, player's vehicle, parked car or person by `SQUEEZE_CLEARANCE`; a vehicle
 /// on the move is swept along its way from where it is to where it would stand (its SUMO brake
 /// gap, `brake_gap`), and looked for as far back as one can come from (`rear_look`).
 fn rear_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, back: f32) -> bool {
@@ -1147,7 +1154,7 @@ fn rear_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicl
     }
 }
 
-/// [Q8-1 fix pass 1] Where a car backed up to `s` on its own lane would wait: SUMO's waiting
+/// Where a car backed up to `s` on its own lane would wait: SUMO's waiting
 /// positions (J7-4's `legal_before`), its body on no band of its lane - a pedestrian crossing's
 /// zebra band (`ZEBRA_STOP` before the cut to `ZEBRA_PAST` past it), and on a lane that is a
 /// junction's movement, its meeting places (from a metre before) and convergences.
@@ -1163,12 +1170,12 @@ fn rest_clear_of_bands(net: &Network, sim: &Simulation, me: &Vehicle, s: f32) ->
     !bands.iter().any(|b| b.0 < to && b.1 > from)
 }
 
-/// [Q8-1] The packed-queue escape: a car that has stood `QUEUE_ESCAPE_STAND` behind a queue whose
+/// The packed-queue escape: a car that has stood `QUEUE_ESCAPE_STAND` behind a queue whose
 /// head stands for good (`queue_head`: `ForGood`, the same head the round-6 keep-back and bypass
 /// read), held by nothing but its lead, with a lane beside it may bypass into (`could_bypass`) but
 /// nearer its lead than the room the bypass needs (`bypass_room`), backs up to that room when the
 /// strip behind holds the move and its standing gap (`rear_clear`; so the rearmost goes first and
-/// the queue dissolves from the back), then pulls out with the round-6 bypass. [fix pass 1] Only
+/// the queue dissolves from the back), then pulls out with the round-6 bypass. Only
 /// on a lane of a road (not a junction object's piece), its body staying on its own lane, and
 /// to a place where it may wait (`rest_clear_of_bands`). The metres to back up. (SUMO has no
 /// reversing: its vehicles are points on a lane that change lanes from any gap; an OMSI car's
@@ -1199,11 +1206,11 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     rear_clear(net, sim, vehicles, me, back).then_some(back)
 }
 
-/// [P8-4] The pull-back into the lane is sampled at this spacing (m), as the bypass's sweep
+/// The pull-back into the lane is sampled at this spacing (m), as the bypass's sweep
 /// (`bypass_sweep_clear`).
 const REENTRY_STEP: f32 = 0.5;
 
-/// [round 8 fix, re-entry] The way back into the lane of a vehicle out of it, as a sideways
+/// The way back into the lane of a vehicle out of it, as a sideways
 /// ramp (`AiState::lateral_ramp`: from, to, start odometer, length): the ramp laid if it ends at
 /// the offset the vehicle is asked for (a bay, the bus service sends 0 as it leaves one; else
 /// its target), else the S-curve the motion lays for a new target (`AiState` step,
@@ -1222,7 +1229,7 @@ pub fn way_back(me: &Vehicle) -> (f32, f32, f32, f32) {
     }
 }
 
-/// [P8-4] A vehicle out of its lane on its way back in: its body clear of the lane's axis (a
+/// A vehicle out of its lane on its way back in: its body clear of the lane's axis (a
 /// car passing in the lane gets by it), no pass or change of its own, the offset it is asked
 /// for (a bay, the bus service sends 0 as it leaves one; else its target) nearer the lane
 /// than where it is, and its way back (`way_back`: the ramp the bus service's `depart` or a
@@ -1235,7 +1242,7 @@ fn reentering(me: &Vehicle) -> bool {
     !st.settled_offset && me.passing.is_none() && st.change.is_none() && st.lateral.abs() > me.half_width && to.abs() < st.lateral.abs() && x0 + len > st.odometer
 }
 
-/// [P8-4] Is the way back into the lane clear of bodies standing on it? My body on the bent way
+/// Is the way back into the lane clear of bodies standing on it? My body on the bent way
 /// over what is left of the ramp (`shifted_body`, the way carries the ramp), turned along it as
 /// the bypass's sweep, against every other vehicle's and player's box where it is now; a
 /// vehicle going my way with its rear ahead of my front is a lead, not a threat. [merge P8/H8]
@@ -1245,7 +1252,7 @@ fn reentering(me: &Vehicle) -> bool {
 /// timetable bus #10940 swung out of its bay across the lane beside, into #11059 coming at
 /// 8.9 m/s 14 m away, 0.58 m deep.)
 fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle) -> bool {
-    // ([round 8 fix, re-entry] the poses on the way back, `way_back`: a ramp laid that ends
+    // (the poses on the way back, `way_back`: a ramp laid that ends
     // elsewhere is not where the body will move)
     let back = way_back(me);
     let on_way_back;
@@ -1262,7 +1269,7 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     let (_, _, x0, len) = back;
     let left = (x0 + len - st.odometer).max(0.0);
     let n = (left / REENTRY_STEP).ceil() as usize;
-    // ([pass 2, A1] the poses it has not reached yet: where it stands now is no move into
+    // (the poses it has not reached yet: where it stands now is no move into
     // anybody's way - a car queued behind it stands there already)
     let poses: Vec<Obb> = (1..=n.max(1)).map(|k| shifted_body(net, me, (k as f32 * REENTRY_STEP).min(left), 0.0)).collect();
     let hr = (me.heading as f64).to_radians();
@@ -1305,7 +1312,7 @@ fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me:
     body_sweep_clear(net, sim, vehicles, me, &[], &[], side, out_len, level)
 }
 
-/// [P8 pass 1, S2] The parked cars within `reach` metres of my origin as boxes, on any lane
+/// The parked cars within `reach` metres of my origin as boxes, on any lane
 /// (one parked at the far kerb of the oncoming lane is in a pass's path), as `squeeze_clear`
 /// lays them.
 fn parked_boxes(net: &Network, sim: &Simulation, me: &Vehicle, reach: f32) -> Vec<Obb> {
@@ -1372,24 +1379,24 @@ pub struct LightCall {
     pub decision: Option<((usize, usize), bool, f32)>,
 }
 
-/// [round 7 D2] The braking (m/s²) a driver reckons with when asking whether it can still
+/// The braking (m/s²) a driver reckons with when asking whether it can still
 /// stop before a line or a meeting place: hard, short of an emergency stop (`MAX_BRAKE`).
 /// One figure for the light (`light_call`), the claim's committed and clearing tests and the
 /// player's red (before: 0.8 of `MAX_BRAKE` at the light, 0.7 at the junction).
 pub const HARD_BRAKE: f32 = omsi_sim::traffic::MAX_BRAKE * 0.8;
 
-/// [round 7 D2] Too late to stop within `room` metres at `v` m/s braking `brake` (m/s²;
+/// Too late to stop within `room` metres at `v` m/s braking `brake` (m/s²;
 /// `HARD_BRAKE` but inside a junction); under 1 m/s a car can always stop.
 pub fn cannot_stop(v: f32, room: f32, brake: f32) -> bool {
     v > 1.0 && room < v * v / (2.0 * brake)
 }
 
-/// [fix pass 3, 1] The braking (m/s²) a driver always accepts to stop at an amber line,
+/// The braking (m/s²) a driver always accepts to stop at an amber line,
 /// SUMO's `--tls.yellow.min-decel` (3 m/s², sumo.md §7: "the deceleration needed is compared
 /// against" it).
 pub const YELLOW_MIN_DECEL: f32 = 3.0;
 
-/// [fix pass 2, 4; pass 3, 1] Can the driver stop within `gap` (m) at `v` (m/s) on amber -
+/// Can the driver stop within `gap` (m) at `v` (m/s) on amber -
 /// SUMO's yellow: the vehicle stops when v²/2gap is within its decel or `YELLOW_MIN_DECEL`,
 /// whichever is more? Standing it can. (Its comfortable brake alone, 2 m/s², committed a car
 /// 56 m out at 14.86 m/s, needing 1.95, that crossed 1.8 s into red: viz case17 #60501.)
@@ -1397,9 +1404,9 @@ pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
     v <= STANDING_SPEED || (gap > 0.0 && v * v / (2.0 * gap) <= dp.comfort_brake.max(YELLOW_MIN_DECEL))
 }
 
-/// [round 7 fix pass 1] The driver's call at the light, SUMO's yellow and red rule: through
+/// The driver's call at the light, SUMO's yellow and red rule: through
 /// on green; on amber the driver asks every frame whether it can stop with comfortable
-/// braking (`stops_comfortably`) - if not it goes, if so it stops ([J8-2] SUMO re-tests it every
+/// braking (`stops_comfortably`) - if not it goes, if so it stops (SUMO re-tests it every
 /// step; the last amber answer is kept as `Vehicle::light_decision`); on red only a
 /// car that cannot stop at all (`cannot_stop`, `HARD_BRAKE`) or one committed at amber onset
 /// and still rolling crosses. Nothing is decided on green, no decision is extended past
@@ -1407,7 +1414,7 @@ pub fn stops_comfortably(v: f32, gap: f32, dp: &DriverParams) -> bool {
 /// (round 6 J3: one standing short of its line set off over it on red, viz case07 #18558).
 /// (This replaces round 4's amber mark: taken on green 3 m out, extended 6 m on yellow,
 /// carried over frames and retired by `stale_amber` and a 2 s stand; x10 case03 #3145
-/// crossed its line on red on it.) [P8 map data] "Cannot stop" is reckoned to the line
+/// crossed its line on red on it.) "Cannot stop" is reckoned to the line
 /// itself, as SUMO's red: the half metre past the line it allowed (round 4's `possible -
 /// 0.5`, carried into round 7's D2) had no source and let a stop lie over the line.
 pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
@@ -1424,11 +1431,11 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
         Aspect::Green | Aspect::GreenYellow | Aspect::Dark => LightCall { go: true, decision: None },
         Aspect::Yellow => {
             // (and never from a standstill or a queue: at rest nothing is "too late to stop";
-            // [fix pass 2, 4] nor into a box whose exit is not free - SUMO's no-block check,
+            // nor into a box whose exit is not free - SUMO's no-block check,
             // sumo.md: viz5 case05 #16535 took its amber with people 2.8 m past the line and
             // stood 85.8 s inside - unless it cannot stop at all)
             let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
-            // ([J8-2] SUMO's yellow rule, re-tested every step (`MSVehicle::planMoveInternal`:
+            // (SUMO's yellow rule, re-tested every step (`MSVehicle::planMoveInternal`:
             // `yellow && canBrake`, canBrake = the brake gap at the vehicle's decel - here its
             // comfortable brake or `--tls.yellow.min-decel` 3 m/s², whichever is more - within the
             // distance to the line): a car that slowed for anything and can then stop, stops; the
@@ -1482,10 +1489,10 @@ fn hold_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f3
     bands
 }
 
-/// [round6 J2] A car comes to rest up to this far (m) short of its stop (the controller's 0.6 m
+/// A car comes to rest up to this far (m) short of its stop (the controller's 0.6 m
 /// `STOP_LINE_GAP` and a creep): `pulled_back` keeps that much more of the body out of a band
 /// (review-r6j: the rear stood 0.6 m inside a convergence it was stopped behind).
-const REST_SHORT: f32 = 1.0;
+pub(crate) const REST_SHORT: f32 = 1.0;
 
 /// `stop` (a distance from the origin, the front's) pulled back before every band of
 /// `bands` (from, to) the body would stand in, a band at a time.
@@ -1524,11 +1531,11 @@ fn converge_bands(sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32, usize)> 
     j.chain.iter().flat_map(|&(m, off)| node.movements[m].converge.iter().zip(&node.movements[m].converge_with).map(move |(&(a, b), &with)| (j.entry + off + a - 1.0, j.entry + off + b, with))).collect()
 }
 
-/// [round6 J3] Under this speed (m/s) an eased-off car stands, and is pinned where it is
+/// Under this speed (m/s) an eased-off car stands, and is pinned where it is
 /// (`Claim::standing`'s 0.3 m/s).
 const EASE_STANDING: f32 = 0.3;
 
-/// [J7-4] Where a car its grant refuses stops (a distance from its origin), one rule: refused
+/// Where a car its grant refuses stops (a distance from its origin), one rule: refused
 /// for a foe, just before the first stretch it waits for (`Grant::at`), pulled back before every
 /// other meeting place, pedestrian crossing or convergence its body would stand in
 /// (`hold_point`) - SUMO's waiting position before the conflict on the internal lane - then off
@@ -1548,7 +1555,7 @@ fn refused_stop(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView,
     let line_stop = !j.inside && (gently || v < 0.5);
     let bands = wait_bands(net, sim, j);
     let first = if line_stop { at_line } else { j.conflict_start - 1.0 };
-    // ([fix pass 2] inside and past that metre already: the first band still ahead of the front -
+    // (inside and past that metre already: the first band still ahead of the front -
     // a car held for a full exit with the first meeting place behind it was stopped where it
     // was and rolled onto the walk ahead, viz case11 #38790/#38867)
     let first = if first < st.front - 0.3 { bands.iter().map(|b| b.0).filter(|&a| a > st.front - 0.3).fold(f32::INFINITY, f32::min).min(j.conflict_end) } else { first };
@@ -1560,13 +1567,13 @@ fn refused_stop(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView,
     // target where the body lies on no band; none left (the body is over a band it cannot leave
     // before the target - the resolver lets such a car go, `Claim::next_wait`, unless the foe is
     // in the meeting place already): the hold point as before
-    // ([fix pass 2] the line too only where the body there lies on no band: a car held for a
+    // (the line too only where the body there lies on no band: a car held for a
     // full exit stood at its line over a walk, viz case11 #38790/#38867)
     let len = me.length();
     let line = (line_stop && at_line <= target && !bands.iter().any(|b| b.0 < at_line && b.1 > at_line - len - REST_SHORT)).then_some(at_line);
     match legal_before(&bands, me, target) {
         Some(p) => line.map_or(p, |l| p.max(l)),
-        // ([fix pass 2] held for anything but a foe - a full exit -, past its last place to wait:
+        // (held for anything but a foe - a full exit -, past its last place to wait:
         // on to the next one, `next_wait`, as the claim's commitment says; the lead still stops
         // it behind a queue)
         None if g.hold != Some(Hold::Foe) => line.unwrap_or_else(|| next_wait(net, sim, me, j, if j.inside { st.decel * 1.5 } else { HARD_BRAKE })),
@@ -1574,19 +1581,19 @@ fn refused_stop(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView,
     }
 }
 
-/// [J7-4, fix pass 1] The bands a waiting car's body may not lie on (SUMO waits at link ends and
+/// The bands a waiting car's body may not lie on (SUMO waits at link ends and
 /// internal junctions, never on a crossing link): the crossings with other ways (`Cross`, `Block`
 /// meeting places, from a metre before), the pedestrian crossings and the convergences - not the
-/// merges, where the zipper puts the two one behind the other ([J7-2]; a queue stands in a side
+/// merges, where the zipper puts the two one behind the other (; a queue stands in a side
 /// merge as in a lane, viz4 case02's twin chains).
-fn wait_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
+pub(crate) fn wait_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
     let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| f.kind != crate::junction::FoeKind::Merge).map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
     bands.extend(walk_bands(net, sim, j));
     bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
     bands
 }
 
-/// [J7-4, fix pass 1] SUMO's waiting positions: the last place at or before `limit` (the front's
+/// SUMO's waiting positions: the last place at or before `limit` (the front's
 /// distance from the origin, no further back than where the front is) where the body lies on no
 /// band of the way through (`wait_bands`). None: no such place ahead of the front.
 pub fn legal_before(bands: &[(f32, f32)], me: &Vehicle, limit: f32) -> Option<f32> {
@@ -1605,13 +1612,13 @@ pub fn legal_before(bands: &[(f32, f32)], me: &Vehicle, limit: f32) -> Option<f3
     None
 }
 
-/// [J7-4, fix pass 1] SUMO's waiting positions: the first place the car can come to rest at
+/// SUMO's waiting positions: the first place the car can come to rest at
 /// with its body on no band of the way through (`wait_bands`), braking at `brake` (the claim's,
 /// `Simulation::tick`) - a distance from the origin. Until there it cannot wait: it is committed
 /// to every meeting place short of it (`Claim::next_wait`, SUMO's `willPass`).
 pub fn next_wait(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, brake: f32) -> f32 {
     let st = &me.state;
-    // ([fix pass 2] from its stopping place at any speed - its go took it there: a car standing
+    // (from its stopping place at any speed - its go took it there: a car standing
     // with its body on a band cannot wait there, viz case04 #9059 stood 435 frames on a walk; the
     // resolver still holds it for a foe in or arriving at the meeting place, `Claim::next_wait`)
     let len = me.length();
@@ -1639,7 +1646,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.lead = Some(l.lead());
         out.lead_seen = Some(l.what);
         out.body_block = p.body_block;
-        // [round5 C3] a queue over a pedestrian crossing: behind a lead standing past a cut of
+        // a queue over a pedestrian crossing: behind a lead standing past a cut of
         // my way, where closing up to it would put my body in the zebra band, I stop at the
         // zebra stop instead, as `hold_point` keeps a refused car off it (x10 case15 #35611
         // followed its lead onto the crossing and stood there, the stream through the 2.2 m
@@ -1706,7 +1713,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // [J7-2] the zipper speed (SUMO's `getZipperSpeed`) for the foe ahead at a merge that crosses
+    // the zipper speed (SUMO's `getZipperSpeed`) for the foe ahead at a merge that crosses
     // nothing: whatever the grant otherwise says, a cap on the acceleration - the gentler of
     // following that foe where it stands along the merged way (the model's own answer for it as a
     // lead) and arriving `tau` after its rear, no harder than the blended brake - or, the foe
@@ -1725,14 +1732,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
             }
         }
-        // [fix pass 2] the position bound: short of the stretch until the foe's rear has been past
+        // the position bound: short of the stretch until the foe's rear has been past
         // its start `tau`, the car waits at the start (`ZipCap::hold`), at a waiting position
         if let (Some(d), Some(j)) = (z.hold, p.junction.as_ref()) {
             if let Some(at) = legal_before(&wait_bands(net, sim, j), me, st.front + d) {
                 min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3)), Why::Junction);
             }
         }
-        // [J7-4, fix pass 1] SUMO's waiting positions: where following the foe ahead brings the car
+        // SUMO's waiting positions: where following the foe ahead brings the car
         // to rest - behind it at the join, or, the foe in the stretch, behind where it comes to
         // rest itself while it is coming to rest (`QUEUE_COMING`, `QUEUE_BRAKE`) - it rests at the
         // last place short of that with its body on no band, never on a crossing (viz case17
@@ -1746,10 +1753,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // [J7-3] asked to make room for a car whose lane ends beside me (SUMO's cooperative
+    // asked to make room for a car whose lane ends beside me (SUMO's cooperative
     // follower, `informFollower`): its rear my lead, braking no harder than my comfortable
     // brake times `HELP_DECEL_FACTOR` (`Vehicle::help_for`)
-    // ([fix pass 1] it keeps its own standing gap behind the place the changer's acceptance
+    // (it keeps its own standing gap behind the place the changer's acceptance
     // needs it to be: its lead is the changer's rear less that gap - following the rear itself it
     // came to rest at its standing gap, which the acceptance at rest never takes, and both stood)
     if let Some((_, gap, v_r, need)) = me.help_for.filter(|h| h.3 <= 0.0) {
@@ -1767,7 +1774,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // (eased off in a mutual hold: it stays where it stands until the other is through)
-    // [round6 J3] pinned there only while it stands and its grant offers no follow; with one
+    // pinned there only while it stands and its grant offers no follow; with one
     // (the other rolls on into a merge of the two ahead) it rolls in behind it, the follow
     // branch above; rolling with none, it stops gently (case03: #5424 stood pinned 13 s with
     // the follow behind #8417 ready 9 of them; case06 #13911 10 s on the zebra)
@@ -1782,19 +1789,19 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // 4. people ([round 8 H8-8, fix pass 2] a pull-out too: `people_ahead` leaves out only the
+    // 4. people (a pull-out too: `people_ahead` leaves out only the
     // people under or beside its parked body off its way out, `pull_out_exempt`)
     min_stop(&mut out.stop, &mut out.why, p.people_stop, Why::People);
 
     // 5. the app's own holds
     min_stop(&mut out.stop, &mut out.why, me.external.stop_at, Why::Service);
-    // [round 8 H8-1] a car leaving a parking space starts only when its lane has room behind
+    // a car leaving a parking space starts only when its lane has room behind
     // it: the follower there not within the gap a lane change needs from it (`gap_needed_behind`:
     // its standing gap, the time gap and the braking distance of the speed it closes in at) -
     // SUMO's parked vehicle re-enters by insertion, which checks the follower's secure gap on the
     // lane it enters (`MSLane::isInsertionSuccess`, `getSecureGap`). Until then it stays parked
     // and its clock waits (x10 case08: #11387 pulled out with bus #11125 coming up at 12 m/s)
-    // [P8-4, merge P8/H8] standing out of the lane and about to move back in - a parked car
+    // standing out of the lane and about to move back in - a parked car
     // pulling out, a bus leaving its bay (`reentering`) - is the same case: one rule,
     // `pull_out_clear` (every follower up its lane, the players too, beyond its own secure gap, a
     // standing one reaching only its own body; nobody on the strip its body sweeps), over what is
@@ -1832,7 +1839,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // [Q8-1] backing up out of a packed queue (`queue_escape`): [fix pass 1] to the place fixed when
+    // backing up out of a packed queue (`queue_escape`): to the place fixed when
     // it began, the speed braking to it (`AiState::reverse_step`); every frame the strip behind is
     // swept again (`rear_clear`) and the queue looked at: any change and the car stops, a committed
     // stop over its brake distance from where it is, kept to the end
@@ -1854,7 +1861,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // [Q8-3] SUMO LC2013's keep-right wish accumulates every step the driver is not changing
+    // SUMO LC2013's keep-right wish accumulates every step the driver is not changing
     // lanes (`wantsChange` runs each step), towards a lane beside on the keep side it may change
     // onto
     if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
@@ -1870,7 +1877,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if free_to_change {
         let near_junction = p.junction.as_ref().map(|j| !j.inside && j.line < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView, ChangeWhy)> = None;
-        // [J7-3] the strongest lane-end wish whose gap is not there
+        // the strongest lane-end wish whose gap is not there
         let mut blocked_end: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok, why) = change_desire(net, sim, me, p, &nb, near_junction);
@@ -1891,7 +1898,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             };
             out.change_why = Some(why);
         } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
-            // [J7-3] SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
+            // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
             // when only it is in the way (room ahead there), is asked to make room
             // the gap my acceptance needs from it (`gap_needed_behind`); one level with me or ahead
             // (no gap behind my rear) is not asked to brake: it must be overtaken - I slow so it
@@ -1904,7 +1911,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 // stay behind it)
                 drop_back = Some(((2.0 + (v - va).max(0.0) * 1.5) - g, va));
             } else if let (false, Some(f), Some((gap, vb))) = (ok_behind, nb.behind_id, nb.behind) {
-                // ([fix pass 3] SUMO's `neededGap`/`decelGap` test before the `helpDecel` branch:
+                // (SUMO's `neededGap`/`decelGap` test before the `helpDecel` branch:
                 // asked to brake only if it can still open the gap from where it is - braking at
                 // its comfortable brake (times `HELP_DECEL_FACTOR`) to rest while I go on to my
                 // last stop before the lane's end, the gap at rest is then its standing gap;
@@ -1944,7 +1951,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // has to, within its comfortable stopping distance (SUMO's vehicle stops at a dead
             // lane's end as late as its model lets it: braking earlier, it slowed beside the
             // follower that braked to make room, and the gap never opened)
-            // ([Q8-4] once placed it is kept - a latch, `Vehicle::lane_end_stop` - until the change
+            // (once placed it is kept - a latch, `Vehicle::lane_end_stop` - until the change
             // starts or the car stands: placed and dropped by the brake test frame by frame, it
             // flicked on and off in the last metre, an 8 m/s² brake-light flicker)
             if let Some(e) = p.lane_end.filter(|e| e.kind != LaneEndKind::Merge) {
@@ -2167,7 +2174,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // has closed up (no 3 s stop of its own); a pass waits for 3 s stopped
         let early = squeeze && player && v < SQUEEZE_START_SPEED;
         let ready = (me.stopped >= 3.0 || early || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
-        // [P8-2] a pass on the oncoming lane starts only when its path is swept as the
+        // a pass on the oncoming lane starts only when its path is swept as the
         // bypass's is (`bypass_sweep_clear`): the body turned along its S-curve (the out
         // length it will drive) out and level with what it passes, clear of every vehicle's
         // and player's body by `SQUEEZE_CLEARANCE` - not on the oncoming lane's gap alone.
@@ -2176,7 +2183,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // squeeze's linear corridor (`squeeze_clear`: from a queue gap behind a parked car its
         // straight ramp cut the car passed and the pass never came - adversarial b1c).
         let pass_out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
-        // ([pass 1, S2] and the parked cars along the way and the people near it, as the
+        // (and the parked cars along the way and the people near it, as the
         // squeeze's corridor has them)
         let pass_swept = || {
             if squeeze {
@@ -2198,7 +2205,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
 
     // 9. where the car sits in its lane: a bay, a swerve round a parked car, or the middle
     if me.passing.is_none() && st.change.is_none() {
-        // ([round 7 A7] a timetable bus has a bay only at or into its stop: between stops it
+        // (a timetable bus has a bay only at or into its stop: between stops it
         // swerves round a parked car as everybody does - not towards the middle past the
         // people at the kerb, whom it serves: the round-5 L3 shift took bus 267 0.5 m out
         // beside the waiters of its next stop, Anwai 300 s run)
@@ -2208,26 +2215,26 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             out.lateral = Some(p.parked_swerve.unwrap_or(0.0));
         } else {
             out.lateral = Some(p.kerb_swerve.unwrap_or(0.0));
-            // [round 5 L3] easing past people beside the lane: gently, as a car edging out
+            // easing past people beside the lane: gently, as a car edging out
             if p.people_swerve && v < 3.0 && out.accel_cap.is_none() {
                 out.accel_cap = Some(omsi_sim::ai_motion::PULL_OUT_ACCEL);
             }
         }
     }
 
-    // 10. the end of a fixed route: stop at its end. [ROLLBACK r4d-B1] Not where the road
+    // 10. the end of a fixed route: stop at its end. Not where the road
     //     itself ends (a street lane that runs into nothing, no stop of the bus's own on it):
     //     there the bus keeps its speed and is taken off as it reaches the end (`AiState::
     //     drive` finds no way on), as a plain car at a dead end; the timetable puts it back
     //     where its track goes on. Held 0.5 m before the end, two buses on the Anwai bridge
     //     (BeijingCity) stood for up to half an hour with fifty cars behind them.
-    //     [round 6 B2] Nor where its trip is over at the end of its track on a lane with a way
+    // Nor where its trip is over at the end of its track on a lane with a way
     //     on (`External::trip_over`): T11's bus stood 11.7 min at Why::End on lane 10871 with
     //     its next trip never handed over (review-r6-cases case08).
     if !st.route.is_empty() && st.route_index + 1 >= st.route.len() && st.planned_next.is_none() {
         let end = lane.length() - st.s - 0.5;
         let dead_end = lane.next.is_empty() && lane.kind == omsi_sim::traffic::LaneKind::Street;
-        // ([fix pass 3, 10] nor where the stop it is asked for lies beyond the end of its
+        // (nor where the stop it is asked for lies beyond the end of its
         // route: the route's next part is not loaded yet, it waits at the end - a bus whose
         // stop lay 76 m past its route's end drove off it, x10 case11 #18542)
         let stop_beyond = me.external.stop_at.is_none_or(|sa| sa > end + st.front + 0.5);
@@ -2236,11 +2243,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // 10b. [round 8 H8-7, fix pass 1] the edge of the loaded tiles (`Lane::loaded_edge`): the
+    // 10b. the edge of the loaded tiles (`Lane::loaded_edge`): the
     //      road goes on into a tile that is not loaded; the car stops before the lane's end, as a
     //      bus at its loaded route's end, and the game takes it off once nobody sees it (a
     //      dead-end removal) or lets it on when the tile comes
-    //      [round 9 A2 fix pass 2] unless the edge is its trip's end (`External::edge_trip_end`,
+    // unless the edge is its trip's end (`External::edge_trip_end`,
     //      the app's: beyond the horizon, lamps dark): then it drives off the lane's end as at the
     //      network's end, still moving, and no brake lamp lights
     if let Some(&(el, d0)) = p.way.iter().filter(|_| !me.external.edge_trip_end).find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())) {
@@ -2248,22 +2255,37 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         min_stop(&mut out.stop, &mut out.why, Some(end.max(st.front - 0.3)), Why::End);
     }
 
-    // 11. [fix pass 3, 2] keep the box clear, on every aspect (SUMO's no-block heuristic,
-    //     sumo.md §2): a car short of its junction's lit line does not cross it while where it
-    //     would come to rest - its stop (people, a refusal) or behind a lead standing or coming
-    //     to rest - lies between the line and the way's exit from the box; it holds at the line,
-    //     pulled back before a crossing there (viz5 case05 #16535 crossed on green into a box
-    //     its people stop lay in and stood 2.8 m in, over the crossing)
+    // 11. keep the box clear, on every aspect (SUMO's keep-clear rule, sumo.md 1.6: a vehicle does
+    //     not drive onto a junction where it would get stuck): a car short of its junction's lit
+    //     line does not cross it while where it would come to rest lies between the line and the
+    //     way's exit and is no waiting place - behind a lead standing or coming to rest there (one
+    //     car to a waiting place), or its own stop (a refusal, people) with its body on a band (a
+    //     crossing meeting place, a walk, a convergence: `wait_bands`), where it would block a
+    //     foe's way or a crossing. Its own stop at a waiting place inside (the body on no band:
+    //     `refused_stop`'s waiting place, or the zebra stop short of a walk) is a legal place:
+    //     SUMO's vehicle enters on green and waits at the internal junction (sumo.md 1.2), or
+    //     before the crossing on its internal lane (sumo.md 4.3), and at the end of its green it
+    //     clears first (`reservation::will_pass`). Held, it waits at the line,
+    //     pulled back before a walk there (viz5 case05 #16535 crossed on green into a box its
+    //     people stop lay in and stood 2.8 m in, over the crossing). A way through that crosses
+    //     nothing - no crossing meeting place, walk or convergence, only merges, which the zipper
+    //     orders - has nothing to keep clear: SUMO applies no keep-clear at such geometry-like
+    //     nodes (sumo.md 1.6), and its queue stands in it as in a lane (viz5 case10: cars
+    //     held at the line of a merge-only join behind a queue standing in it).
     if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
         let line = sig.dist;
-        if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 {
+        let bands = if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 { wait_bands(net, sim, j) } else { Vec::new() };
+        if !bands.is_empty() {
             let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
-            let rest = [out.stop, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
+            let len = me.length();
+            let waiting_place = |r: f32| !bands.iter().any(|b| b.0 < r && b.1 > r - len - REST_SHORT);
+            let own = out.stop.filter(|&r| !(matches!(out.why, Why::Junction | Why::People) && waiting_place(r)));
+            let rest = [own, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
             let exit = j.entry + j.way_len;
             if rest > line + 0.5 && rest < exit {
                 let hold = pulled_back(&walk_bands(net, sim, j), me, line);
                 out.stop = Some(hold);
-                out.why = Why::ExitFull;
+                out.why = Why::KeepClear;
             }
         }
     }
