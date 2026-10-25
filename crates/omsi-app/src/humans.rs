@@ -3475,6 +3475,10 @@ pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
     clear_of_lanes_by(net, q, &footprint_reach)
 }
 
+/// [P2-B2] How far beyond a body a waiter steps out of a standing vehicle's box (m): a hand's
+/// breadth.
+const WAITER_STEP_OUT: f64 = 0.05;
+
 /// [P2-B2] A street lane's footprint and a body (m from its axis): half its width,
 /// `LANE_MIN_WIDTH` at least, and `WAITER_BODY`.
 fn footprint_reach(l: &omsi_sim::traffic::Lane) -> f64 {
@@ -7348,6 +7352,37 @@ impl Humans {
         }
         // [r9 C1] the boxes by where they are, for the walkers' tests of the ones near them
         let block_grid = crowd::BlockGrid::new(&blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
+        // [P2-B2] somebody waiting at a stop whose place a standing vehicle's body now covers (a
+        // bus pulled into a bay over another stop's waiting places: Wuluju #208 stood 280 s with
+        // seven waiters of stop 2296499 0.1 m inside its flank) steps out of it, to a body clear of
+        // its side: a waiter never stands inside a vehicle (SUMO's waiting persons are on the
+        // platform), and the vehicle can then leave
+        for p in self.people.iter_mut() {
+            let State::Pax(x) = &mut p.state else { continue };
+            if x.inside.is_some() || x.task != pax::Task::WaitingForBus || p.place != Place::Ground {
+                continue;
+            }
+            let here = p.position.truncate();
+            let mut out = None;
+            block_grid.for_each_near(here, |k| {
+                let b = &blocks[k];
+                if out.is_some() || block_car[k].is_none() || b.vel.length() >= 0.5 {
+                    return;
+                }
+                let (q, inside) = b.closest(here);
+                if inside || (here - q).length() < BODY_OUTSIDE {
+                    let n = if inside { (q - here).normalize_or_zero() } else { (here - q).normalize_or_zero() };
+                    out = Some(q + n * (BODY_OUTSIDE + WAITER_STEP_OUT));
+                }
+            });
+            if let Some(to) = out {
+                let d = to - here;
+                x.pos.x += d.x;
+                x.pos.y += d.y;
+                p.position.x = to.x;
+                p.position.y = to.y;
+            }
+        }
         // [ROLLBACK r4c-P4] how long each vehicle has stood; the yields to those that move again end
         // ([ROLLBACK r5-P5] a creep does not count as moving again: `stood_clock`)
         {
