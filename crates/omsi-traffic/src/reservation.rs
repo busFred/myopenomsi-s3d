@@ -869,6 +869,35 @@ fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     }
 }
 
+/// Does the refused claim `ok` (its grant `g`) come to rest short of `before` (a distance along
+/// its own way through, the chain's)? It stops at the last place short of the stretch it waits for
+/// (`Grant::at`) where its body lies on none of its crossing meeting places, from a metre before
+/// each (`plan::refused_stop`'s waiting place, with the bands the resolver knows: a walk or a
+/// convergence moves it further back still, so this errs towards "it comes"); no `at`: held at its
+/// line or where it stands. SUMO's willPass per link: a car that waits past a link still asks for it.
+fn rests_short(js: &Junctions, claims: &[Claim], ok: usize, g: &Grant, before: f32) -> bool {
+    let Some(at) = g.at else { return true };
+    let o = &claims[ok];
+    let len = o.front + o.rear;
+    let bands: Vec<(f32, f32)> = js.foes_along(o.junction, &o.chain).iter().filter(|f| f.kind != FoeKind::Merge).map(|f| (f.mine.0 - 1.0, f.mine.1)).collect();
+    // (the front's place at rest, pulled back a band at a time, as `plan::legal_before`)
+    let mut p = at - 1.0;
+    for _ in 0..64 {
+        if p <= before {
+            return true;
+        }
+        match bands.iter().filter(|b| b.0 < p && b.1 > p - len - REST_SHORT_OF_STOP).map(|b| b.0).fold(f32::INFINITY, f32::min) {
+            x if x.is_finite() => p = x,
+            _ => break,
+        }
+    }
+    p <= before
+}
+
+/// The metre a car comes to rest short of its stop (`plan::REST_SHORT`): its body must lie on no
+/// band that far back too.
+const REST_SHORT_OF_STOP: f32 = 1.0;
+
 /// What [`will_pass`] makes of a foe: not coming (why, `FoeTrace::skip`), or its window at the
 /// stretch (in, out; s from now) as the resolver reckons it, and whether it is held at a red that
 /// my green holds back (`red_foe`).
@@ -889,7 +918,7 @@ enum Pass {
 /// leader at a merge either. `their_inside`: its front is in the stretch; `me_in`: mine is (at a
 /// crossing); `zip_pair`: the two ways merge and cross nowhere else.
 #[allow(clippy::too_many_arguments)]
-fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, decided: &[Option<Grant>], c: &Claim, o: &mut Claim, ok: usize, foe: &crate::junction::Foe, me_in: bool, zip_pair: bool) -> Pass {
+fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, decided: &[Option<Grant>], c: &Claim, o: &mut Claim, ok: usize, foe: &crate::junction::Foe, me_in: bool, zip_pair: bool) -> Pass {
     // (its rear past the stretch: gone)
     if o.s - o.rear > foe.theirs.1 {
         return Pass::Left;
@@ -915,14 +944,14 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     // place stuck (people, a standing lead: it is not coming while that holds), nor while it
     // stands outside it waiting for me through its lead or the junction's answer (`held_by`:
     // it is not coming before I go) - both made rings of mutual waits
-    // (refused this pass, standing outside this meeting place, for a stretch that begins at or
-    // short of this one: it comes to rest short of it - a refused car stops before the first
-    // stretch it waits for, `Grant::at`; none, held at its line or where it stands - `refused`
+    // (refused this pass, standing outside this meeting place, coming to rest short of it -
+    // `rests_short`: a refused car stops at its last waiting place short of the stretch it waits
+    // for, `Grant::at`; none, held at its line or where it stands - `refused`
     // below; and in the box at the end of its green it is no car clearing the box: viz3 case21
     // #59961 on its fresh green waited 45 s for #59951, itself refused for a queue 32 m on. One
     // refused for a stretch past this one still drives through this one to wait there, so it
     // counts, as SUMO's car allowed to wait at its internal junction still asks for the entry link)
-    let stops_short = |g: &Grant| g.at.map_or(true, |a| a - (claims[ok].s - o.s) <= foe.theirs.0);
+    let stops_short = |g: &Grant| rests_short(js, claims, ok, g, foe.theirs.0 + (claims[ok].s - o.s));
     let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go && stops_short(&g));
     let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
     if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
@@ -1149,7 +1178,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 if go_anyway && !zip_pair {
                     continue;
                 }
-                let pass = will_pass(ctx, claims, &claim_of, plain, &out, c, &mut shifted, ok, foe, me_in, zip_pair);
+                let pass = will_pass(ctx, js, claims, &claim_of, plain, &out, c, &mut shifted, ok, foe, me_in, zip_pair);
                 let o = &shifted;
                 // (the account of this foe for `resolve_traced`)
                 let mut note = |skip: &'static str, times: Option<FoeTimes>| {
@@ -1273,7 +1302,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                                 // (one before me that stays refused comes to rest short of the
                                 // stretch it waits for, `Grant::at`: past this place, it still
                                 // drives through this one to wait there, and counts)
-                                let stops_short = theirs > mine || out[ok].is_some_and(|g| g.at.map_or(true, |a| a - (claims[ok].s - o.s) <= foe.theirs.0));
+                                let stops_short = theirs > mine || out[ok].is_some_and(|g| rests_short(js, claims, ok, &g, foe.theirs.0 + (claims[ok].s - o.s)));
                                 if me_inside || (!ahead_goes && !on_schedule && stops_short) {
                                     continue;
                                 }
@@ -2640,6 +2669,24 @@ mod tests {
         assert_eq!(grant_of(&g, 2).wait_for, Some(3), "Y waits for Z: {g:?}");
         assert!(grant_of(&g, 2).at.is_some_and(|a| a > start(1, 0)), "Y's stretch lies past the Y-X one: {g:?}");
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "X let into the place Y drives through: {g:?}");
+        // (Z's way 4 m past X's: no place between the two where Y's body lies on neither - it comes
+        // to rest short of X's, `rests_short`, and X goes)
+        let mut net = Network::default();
+        net.lanes.push(piece((-20.0, -5.0), (20.0, -5.0), 0, 64.0));
+        net.lanes.push(piece((0.0, -10.0), (0.0, 16.0), 1, 128.0));
+        net.lanes.push(piece((-60.0, -1.0), (20.0, -1.0), 2, 192.0));
+        net.link(1.5);
+        net.compute_conflicts();
+        let js = Junctions::compile(&net);
+        let m = |l: usize| js.nodes[0].movement_of(l).unwrap();
+        let start = |a: usize, b: usize| js.nodes[0].movements[m(a)].foes.iter().find(|f| f.movement == m(b)).unwrap().mine.0;
+        let x = claim(1, m(0), start(0, 1) - 1.0 - 2.0, 0.0);
+        let mut y = claim(2, m(1), start(1, 0) - 1.0 - 2.0, 0.0);
+        y.refused_last = true;
+        let z = claim(3, m(2), start(2, 1) - 40.0 - 2.0, 8.0);
+        let g = resolve(&js, &[x, y, z]);
+        assert_eq!(grant_of(&g, 2).wait_for, Some(3), "Y waits for Z: {g:?}");
+        assert!(grant_of(&g, 1).go, "Y rests short of X's place: {g:?}");
     }
 
     /// The queue-entry case: the foe ahead stands at the join (in its stretch): the
