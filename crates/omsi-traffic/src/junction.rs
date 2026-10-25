@@ -786,6 +786,38 @@ mod tests {
         assert!(Junctions::compile(&bridge).nodes.is_empty());
     }
 
+    /// Two three-lane spline roads crossing with no object, one lane of the east-west road past a
+    /// bus bay's gap and so linked to no neighbour (viz case01 AndingR_noside 723743/9), another
+    /// of three times its neighbours' density (191/6): every lane of one road meets every lane of
+    /// the other with the same right of way - the road's lanes count for the road class
+    /// (`Network::road_class`), as SUMO ranks edges, not lanes - here right before left.
+    #[test]
+    fn every_lane_of_two_crossing_roads_has_one_right_of_way() {
+        let mut net = Network::default();
+        let lane = |from: (f64, f64), to: (f64, f64), id: i64, path: u16| {
+            let mut l = road(from, to, id);
+            l.key = Some(LaneKey { tile: (0, 0), id, path });
+            l
+        };
+        for (path, y) in [(0u16, 0.0), (1, 3.0), (2, 12.0)] {
+            net.lanes.push(lane((-60.0, y), (60.0, y), 1, path));
+        }
+        for (path, x) in [(0u16, 0.0), (1, -3.0), (2, -6.0)] {
+            net.lanes.push(lane((x, 60.0), (x, -60.0), 2, path));
+        }
+        net.lanes[1].density = 3.0;
+        net.link(1.5);
+        net.compute_conflicts();
+        assert_eq!((net.road_class(0).lanes, net.road_class(2).lanes, net.road_class(3).lanes), (3, 3, 3));
+        assert_eq!(net.road_class(0).density, net.road_class(1).density);
+        let js = Junctions::compile(&net);
+        let j = &js.nodes[0];
+        let yields: Vec<bool> = (0..3).flat_map(|ew| (3..6).map(move |sn| (ew, sn))).map(|(ew, sn)| j.movements[j.movement_of(ew).unwrap()].foes.iter().find(|f| j.movements[f.movement].lane == sn).expect("a foe").yields).collect();
+        assert_eq!(yields.len(), 9);
+        // the southbound road comes from the eastbound one's left: the eastbound goes first
+        assert!(yields.iter().all(|&y| !y), "{yields:?}");
+    }
+
     /// Two spline roads drawn over each other with no object and no link between them (X10's
     /// parallel ramp splines under a metre apart): a side merge in one junction table, a zipper
     /// between equals. Two splines' lanes side by side as a road's lanes (2.4 m apart, 3 m wide)

@@ -526,8 +526,9 @@ pub struct Approach {
 /// The road an approach comes off (`Approach::spline`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplineClass {
-    /// Lanes abreast in its direction.
+    /// Lanes of the road in its direction (`Network::road_class`).
     pub lanes: u32,
+    /// The mean `[rule] trafficdensity` and speed limit of those lanes.
     pub density: f32,
     pub speed_kmh: f32,
 }
@@ -1032,7 +1033,7 @@ impl Network {
             // is no yard). (A lane closed to cars - the app's reverse twins and
             // timetable connectors - is no road.)
             if lane.source == 1 && !lane.no_cars && ap.spline.is_none() {
-                ap.spline = Some(SplineClass { lanes: self.lanes_abreast(l), density: lane.density, speed_kmh: lane.speed_limit_kmh });
+                ap.spline = Some(self.road_class(l));
             }
         };
         note(&mut ap, a);
@@ -1062,23 +1063,52 @@ impl Network {
         ap
     }
 
-    /// Lanes of the road side by side in `l`'s direction (the `left`/`right` chains).
-    pub fn lanes_abreast(&self, l: usize) -> u32 {
-        let mut n = 1;
-        for side in [true, false] {
-            let mut cur = l;
-            for _ in 0..8 {
-                let next = if side { self.lanes[cur].left } else { self.lanes[cur].right };
-                match next {
-                    Some(x) if x != l && x < self.lanes.len() => {
-                        n += 1;
-                        cur = x;
+    /// The class of the road spline lane `l` belongs to, in its direction: its street lanes
+    /// whose heading lies within a right angle of `l`'s, their number and the mean of their
+    /// `[rule] trafficdensity` and speed limits, as SUMO ranks a node's incoming edges by the
+    /// edge's priority, speed and lane number (sumo.md 1.3, `rightOfWay` default) - the road's,
+    /// not one lane's: a lane past a median or a bus bay has no linked neighbour, and the map
+    /// gives single lanes their own spawn weight (viz case01 AndingR_noside: 723743/9 counted as a
+    /// one-lane road, 191/6 of density 3 beside lanes of 1 as a major road, and one crossing of
+    /// two roads had two right-of-way orders). A spline's paths are numbered from 0 without gaps
+    /// (the spline file's `[path]` list); a lane of no spline is a road of its own `left`/`right`
+    /// chain with its own density and limit.
+    pub fn road_class(&self, l: usize) -> SplineClass {
+        let lane = &self.lanes[l];
+        let Some(k) = lane.key.filter(|_| lane.source == 1) else {
+            let mut n = 1;
+            for side in [true, false] {
+                let mut cur = l;
+                for _ in 0..self.lanes.len() {
+                    let next = if side { self.lanes[cur].left } else { self.lanes[cur].right };
+                    match next {
+                        Some(x) if x != l && x < self.lanes.len() => {
+                            n += 1;
+                            cur = x;
+                        }
+                        _ => break,
                     }
-                    _ => break,
+                }
+            }
+            return SplineClass { lanes: n, density: lane.density, speed_kmh: lane.speed_limit_kmh };
+        };
+        let h = lane.start_heading();
+        let (mut n, mut density, mut speed) = (0u32, 0.0f32, 0.0f32);
+        for path in 0..=u16::MAX {
+            let Some(list) = self.by_key.get(&LaneKey { path, ..k }) else { break };
+            for &x in list {
+                let o = &self.lanes[x];
+                if o.kind == LaneKind::Street && wrap_deg(o.start_heading() - h).abs() < 90.0 {
+                    n += 1;
+                    density += o.density;
+                    speed += o.speed_limit_kmh;
                 }
             }
         }
-        n
+        if n == 0 {
+            return SplineClass { lanes: 1, density: lane.density, speed_kmh: lane.speed_limit_kmh };
+        }
+        SplineClass { lanes: n, density: density / n as f32, speed_kmh: speed / n as f32 }
     }
 
     /// The right of way between two paths of equal `[rule] priority` before right before
@@ -1093,9 +1123,10 @@ impl Network {
     ///    approach) yields to one going on straight (not between oncoming ways: there the
     ///    left turn waits, step 4);
     /// 3. the minor road yields to the major one, read from the spline lane each approach
-    ///    comes off within the window (none for one of them: no road class): 2+ lanes abreast
-    ///    against 1, else `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO` times
-    ///    lower, else a speed limit `CLASS_SPEED_RATIO` times lower.
+    ///    comes off within the window (none for one of them: no road class): 2+ lanes in its
+    ///    direction against 1, else a mean `[rule] trafficdensity` more than `CLASS_DENSITY_RATIO`
+    ///    times lower, else a mean speed limit `CLASS_SPEED_RATIO` times lower - of the road's
+    ///    lanes in that direction (`road_class`).
     pub fn right_of_way(&self, a: usize, b: usize) -> Option<bool> {
         let (at_a, merge) = self.meeting_on(a, b);
         let (at_b, _) = self.meeting_on(b, a);
@@ -4722,9 +4753,15 @@ mod tests {
                 net.lanes[l].source = 1;
                 net.lanes[l].key = Some(LaneKey { tile: (0, 0), id: 100 + l as i64, path: 0 });
             }
+            // (two lanes of the main road: its spline's second path, beside the first)
             if main.1 {
-                net.lanes[2].right = Some(4);
-                net.lanes[4].left = Some(2);
+                net.lanes[4].key = Some(LaneKey { tile: (0, 0), id: 102, path: 1 });
+                net.by_key.clear();
+                for (i, l) in net.lanes.iter().enumerate() {
+                    if let Some(k) = l.key {
+                        net.by_key.entry(k).or_default().push(i);
+                    }
+                }
             }
             net
         };
