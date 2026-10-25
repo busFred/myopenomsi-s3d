@@ -199,12 +199,19 @@ impl Junctions {
         for a in 0..net.lanes.len().min(net.crossings.len()) {
             for c in &net.crossings[a] {
                 let b = c.other;
-                // (a merge between lanes of no one object: a lane join, or lanes converging side
-                // by side before one, `Network::compile_joins`)
-                if !c.merge || b <= a || b >= net.lanes.len() {
+                // (a meeting place between lanes of no one object: a lane join, lanes converging
+                // side by side before one, `Network::compile_joins`, or two lanes crossing outside
+                // a crossing object, `Network::compile_lane_crossings`)
+                if b <= a || b >= net.lanes.len() {
                     continue;
                 }
                 if object(a).is_some() && object(a) == object(b) {
+                    continue;
+                }
+                // (a crossing, not a merge, only between two lanes of no object: an object's
+                // piece and a lane leading into it meet in its swept path, `compile_swept`, and
+                // the lane leading in stays an approach)
+                if !c.merge && (object(a).is_some() || object(b).is_some()) {
                     continue;
                 }
                 let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
