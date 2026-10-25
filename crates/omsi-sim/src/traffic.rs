@@ -664,9 +664,9 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
-    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles: followed
-    /// along every way on, it reaches only lanes with `loaded_edge` and no way on ([fix pass 2]
-    /// at a fork, when every branch does: a road splitting into parallel lanes that all end at the
+    /// Does the road from lane `n` on end at the edge of the loaded tiles: followed
+    /// along every way on, it reaches only lanes with `loaded_edge` and no way on (at a fork,
+    /// when every branch does: a road splitting into parallel lanes that all end at the
     /// edge). The map's own end, a loop, or any branch leading elsewhere is not that edge.
     pub fn ends_at_loaded_edge(&self, n: usize) -> bool {
         // (each lane walked once: a lane met again gives its answer, one still being walked - a
@@ -1029,7 +1029,7 @@ impl Network {
             // the road from the first spline lane of the approach only (a yard, the road
             // class): the pieces of a crossing object carry their author's spawn weights (0,
             // 0.001, 0.1, 1.0), no road class (a piece of 0.001 behind a main road's lit stub
-            // made it a "yard", review9). (A lane closed to cars - the app's reverse twins and
+            // is no yard). (A lane closed to cars - the app's reverse twins and
             // timetable connectors - is no road.)
             if lane.source == 1 && !lane.no_cars && ap.spline.is_none() {
                 ap.spline = Some(SplineClass { lanes: self.lanes_abreast(l), density: lane.density, speed_kmh: lane.speed_limit_kmh });
@@ -1499,10 +1499,9 @@ impl Network {
         n
     }
 
-    /// [round 7 A2-full] The meeting place of every lane join, as SUMO makes every join a
-    /// junction node with a response matrix or a zipper (`NBNode`, `NBRequest`): in OMSI a
-    /// junction table came only from crossing objects, so two spline lanes joining outside one
-    /// had none and a first-come rule in perception decided there (deleted). Here: two street
+    /// The meeting place of every lane join, as SUMO makes every join a junction node with a
+    /// response matrix or a zipper (`NBNode`, `NBRequest`), because in OMSI only crossing objects
+    /// come with a table: two street
     /// lanes that run into one lane (both in its `prev`) and have none yet - spline lanes outside any crossing
     /// object, a spline lane joining an object's way out, two pieces of one object that start
     /// within 3 m of each other (which `conflicts_from` leaves out) - a merge at their ends, as
@@ -1537,8 +1536,7 @@ impl Network {
                 }
             }
         }
-        // [round 7 A2-full fix] lanes converging side by side before the join, without a
-        // shared next lane (viz case06: 4115 runs beside 3745 and reaches 3747 through 4126):
+        // lanes converging side by side before the join, without a shared next lane (viz case06: 4115 runs beside 3745 and reaches 3747 through 4126):
         // the lanes up to two links back from each side of a join, converging closer than a
         // car is wide, get the side-merge meeting place of `add_converging`
         for (i, j) in self.join_approaches() {
@@ -1549,13 +1547,16 @@ impl Network {
         n
     }
 
-    /// [fix pass 2, 2] The swept-path meeting places of the crossing objects: a piece of an
+    /// The swept-path meeting places of the crossing objects: a piece of an
     /// object and every lane of the object or leading into it whose last body length
     /// (`SWEPT_BUS_LENGTH`) before its end lies in the piece's swept path - the two lanes' half
     /// widths (their vehicles' room) and the off-tracking of a long vehicle in the piece's
     /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R, R no less than `SWEPT_MIN_RADIUS`) - when nothing else is compiled
     /// between the two: a meeting place over the two stretches, so a vehicle standing there
-    /// counts as inside it and a refused vehicle stops before it. SUMO: any conflict between
+    /// counts as inside it and a refused vehicle stops before it - in the junction table where
+    /// both lanes are movements of the object (a piece, or a spline lane grouped into it by a
+    /// join); a lane leading in that is no movement of it keeps the place in the network only
+    /// (`Junctions::extend`; `traffic_cases crossings` counts them). SUMO: any conflict between
     /// connection shapes is a foe (sumo.md 1.3); OMSI: a stop line can sit inside a tight
     /// turn's sweep (x10 case03: bus #587 turning right on 2577 swept #3221 standing at
     /// 2605's end, no meeting place between them). Returns how many were added.
@@ -1641,7 +1642,7 @@ impl Network {
         n
     }
 
-    /// [fix pass 2, 1a; pass 3, 8] Lanes `i` and `j` are pieces of ONE crossing object that
+    /// Lanes `i` and `j` are pieces of ONE crossing object that
     /// leave one lane together (a lane forking into twin pieces of the object that rejoin, viz3
     /// case03: 1106/1110 leave 1100 and rejoin into 1477/1481): pieces of ONE way, as SUMO
     /// makes the connections of one lane that re-merge one internal edge - no meeting place
@@ -1657,7 +1658,7 @@ impl Network {
         pi.is_some_and(|a| pj.is_some_and(|b| a.iter().any(|r| b.contains(r))))
     }
 
-    /// [round 7 A2-full fix] The pairs of street lanes that may converge before a lane join
+    /// The pairs of street lanes that may converge before a lane join
     /// without sharing a next lane: for every two lanes running into one lane, the lanes up to
     /// two links back from each (themselves included), one from each side, of different paths.
     pub fn join_approaches(&self) -> Vec<(usize, usize)> {

@@ -458,8 +458,8 @@ impl Junctions {
     }
 
     /// Two movements merging into one another that no rule of the table separates (neither
-    /// gives way to the other): SUMO's zipper node. ([J7-2] `reservation`'s zipper speed takes
-    /// every merge that crosses nothing, the table ordering the pair where it says who yields.)
+    /// gives way to the other): SUMO's zipper node. (`reservation`'s zipper speed takes every
+    /// merge that crosses nothing, the table ordering the pair where it says who yields.)
     pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
         foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
     }
@@ -633,7 +633,7 @@ impl Junctions {
         Some((&self.nodes[j], &self.nodes[j].movements[m]))
     }
 
-    /// [round 7 A2] The meeting place of lanes `a` and `b`, two pieces of one junction: the
+    /// The meeting place of lanes `a` and `b`, two pieces of one junction: the
     /// foe of `a`'s movement that is `b`'s (None outside a junction or with no meeting place).
     pub fn foe_between(&self, a: usize, b: usize) -> Option<&Foe> {
         let (&(ja, ma), &(jb, mb)) = (self.of_lane.get(&a)?, self.of_lane.get(&b)?);
