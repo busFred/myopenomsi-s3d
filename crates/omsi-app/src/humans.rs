@@ -1579,10 +1579,12 @@ struct PedWalk {
     kerb_hold: bool,
     /// [ROLLBACK r4c-P3] Where they wait at this kerb: (leg, next lane, spot).
     spot: Option<(usize, usize, DVec2)>,
-    /// The kerb verdict "go" taken on the way to the kerb at the end of leg `.0` (`KERB_LOOK`
-    /// short of it): they walk on and step onto the crossing without stopping, and the cars
-    /// see them coming (`Person::approach`, SUMO's `registerCrossingApproach`). `.1` the
-    /// crossing's span (m, kerb to kerb).
+    /// The kerb verdict "go" of this frame, taken on the way to the kerb at the end of leg `.0`
+    /// (within `kerb_look` of it, again every frame as SUMO's pedestrian asks the crossing's
+    /// link every step): while it holds they walk on, and the cars see them coming
+    /// (`Person::approach`, SUMO's `registerCrossingApproach`). `.1` the crossing's span (m, kerb
+    /// to kerb). Dropped when a later verdict refuses them; at the kerb the verdict is taken
+    /// once more before they step on.
     kerb_go: Option<(usize, f32)>,
 }
 
@@ -2787,10 +2789,11 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     // short of it (SUMO: a pedestrian waits at the crossing's start, on the walking area, never
     // on the carriageway; OMSI's crossings start at the lane's edge, so the start of the
     // crossing is where the verdict must already stand): refused, they stop at their kerb
-    // spot without stepping to the lane edge first; allowed, they walk on onto it (taken at
-    // the leg's end, the verdict sent every refused group to the edge and back, 08:39 case04)
+    // spot without stepping to the lane edge first; allowed, they walk on onto it, the verdict
+    // taken again every frame of the way (taken at the leg's end only, it sent every refused
+    // group to the edge and back, 08:39 case04)
     let to_end = leg.len() - walk.s;
-    if walk.held == 0.0 && walk.kerb_go.is_none_or(|g| g.0 != walk.leg) && !walk.cross.is_some_and(|c| c.on(walk.leg)) && to_end > KERB_AT && to_end <= kerb_look(me.pace) {
+    if walk.held == 0.0 && !walk.cross.is_some_and(|c| c.on(walk.leg)) && to_end > KERB_AT && to_end <= kerb_look(me.pace) {
         if walk.leg + 1 >= walk.legs.len() && walk.roam {
             plan_next_leg(ped, net, walk, rng);
         }
@@ -2803,10 +2806,12 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                             me.decision = Some("go");
                         }
                         Err(why) => {
+                            walk.kerb_go = None;
                             walk.held += dt;
                             me.why = why;
                             me.decision = Some(why);
                             me.on_crossing = false;
+                            me.approach = None;
                             return wait_at_kerb(Some(p), at, me, walk, &leg, &next);
                         }
                     }
@@ -2865,9 +2870,9 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                 };
                 match span {
                     Some(c) if at_kerb => {
-                        // (a "go" taken on the way to this kerb stands, `kerb_look`)
+                        // (asked once more at the kerb: what changed since the last verdict on the
+                        // way - a red, a vehicle that will pass - holds them here)
                         let verdict = match ped {
-                            _ if walk.kerb_go.is_some_and(|g| g.0 == walk.leg) => Ok(()),
                             Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0)),
                             None => Ok(()),
                         };
@@ -10894,6 +10899,31 @@ mod ped_tests {
             assert!(!in_waiter_reach(&net, m.pos.extend(0.0)), "#{id} waits at {:?}", m.pos);
             assert!(nearest < -3.5 - 0.3, "#{id} came to {nearest:.2}, the lane edge is -3.5");
         }
+    }
+
+    #[test]
+    fn p1a_the_verdict_is_asked_again_on_the_way_and_a_red_holds_them_short_of_the_kerb() {
+        // green when they come within kerb_look, red a moment later: the "go" of the first
+        // frames is no latch; they stop at their spot and wait, never stepping on at red
+        let (net, mut ped) = kerb_at_the_edge();
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = PedWalk::new(vec![Leg { lane: 2, a: 4.0, b: 16.5 }], true, 0.0);
+        let mut m = me(7, DVec2::new(0.0, -16.0), 1.35);
+        let mut went_red = false;
+        let mut on_at_red = false;
+        for k in 0..400 {
+            if !went_red && m.approach.is_some() {
+                lights.state.set(RED);
+                lights.left.set(40.0);
+                went_red = true;
+            }
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            on_at_red |= went_red && m.pos.y > -3.5;
+        }
+        assert!(went_red, "never seen coming");
+        assert!(!on_at_red, "stepped on at red: {:?}", m.pos);
+        assert_eq!(m.decision, Some("red light"));
+        assert!(m.approach.is_none());
     }
 
     #[test]
