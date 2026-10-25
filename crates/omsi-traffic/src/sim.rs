@@ -1653,6 +1653,13 @@ impl Simulation {
             if ca.junction != cb.junction || ca.light_red || cb.light_red || ca.vehicle != a || cb.vehicle != b {
                 continue;
             }
+            // (a mutual refusal counts only once the resolver has seen both standing: refused while
+            // one still crawled to its stop, the pair is decided again next frame as two standing,
+            // where the rules for two in each other's way apply - x10 case06 #10810/#10932 eased on
+            // the frame the crawler stopped)
+            if refused && !(ca.standing() && cb.standing()) {
+                continue;
+            }
             let j = ca.junction;
             let meet = self.junctions.foes_along_pieces(j, &ca.chain).iter().any(|(_, f)| cb.chain.iter().any(|&(m, _)| m == f.movement));
             if !meet {
