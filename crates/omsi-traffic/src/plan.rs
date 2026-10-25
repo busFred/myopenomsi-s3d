@@ -1677,6 +1677,24 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     }
                 }
             }
+            // ... and the same for every band of the junction ahead (a crossing meeting place, a
+            // walk, a convergence: `wait_bands`): closing up to a lead coming to rest past the
+            // band's start would leave my body on it - in the cross traffic's way or on the
+            // crossing, which I could not leave. SUMO's keep-clear: a vehicle does not drive onto
+            // a junction or crossing link where it would come to rest (sumo.md 1.6). It waits at
+            // the last place short of it with its body on no band (`legal_before`), if it can
+            // still stop there (`cannot_stop` at `HARD_BRAKE`)
+            if let Some(j) = p.junction.as_ref() {
+                let bands = wait_bands(net, sim, j);
+                let len = me.length();
+                if bands.iter().any(|b| b.0 > st.front - 0.3 && b.0 < my_front && b.1 > my_front - len - REST_SHORT) {
+                    if let Some(at) = legal_before(&bands, me, my_front) {
+                        if at > st.front - 0.3 && !cannot_stop(v, at - st.front, HARD_BRAKE) {
+                            min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
+                        }
+                    }
+                }
+            }
         }
     }
 
