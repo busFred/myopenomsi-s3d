@@ -97,6 +97,7 @@ fn main() {
         Some("stubs") if args.len() >= 3 => stubs(&args[2..]),
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("joins") if args.len() >= 3 => joins(&args[2..]),
+        Some("crossings") if args.len() >= 3 => crossings(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -5198,6 +5199,100 @@ fn grown(fixture: &Path, lit: bool) -> Res<(Replay, usize)> {
     }
     r.records = records;
     Ok((r, header_lanes))
+}
+
+/// `crossings <fixture>... [--list]`: the vehicle lanes that cross outside any one crossing object
+/// and got a meeting place (`Network::compile_lane_crossings`), per fixture's grown network: how
+/// many, by the lanes' sources (spline or object piece, a track), whether both are movements of one
+/// junction with the crossing in its foe table, and the cost of the detection (the whole network
+/// once, and per tile batch as the network grew).
+fn crossings(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let mut r = Replay::load(Path::new(f))?;
+        let outside = |net: &omsi_sim::traffic::Network| -> Vec<(usize, usize)> { (0..net.crossings.len()).flat_map(|a| net.crossings[a].iter().filter(move |c| c.outside && c.other > a).map(move |c| (a, c.other))).collect() };
+        let header_found = outside(&r.net).len();
+        let records = std::mem::take(&mut r.records);
+        let (mut batches, mut batch_ms, mut batch_max) = (0usize, 0.0f64, 0.0f64);
+        for rec in &records {
+            if let Record::LanesAdded { lanes, .. } = rec {
+                let added = r.net.extend(lanes.clone(), 1.5);
+                r.sim.network_grew(&r.net, added.start);
+                // (the detection again over the batch: every pair it compiled is skipped at once now)
+                let t = std::time::Instant::now();
+                let again = r.net.lane_crossings(added.start);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                assert!(again.is_empty());
+                batches += 1;
+                batch_ms += ms;
+                batch_max = batch_max.max(ms);
+            }
+        }
+        let t = std::time::Instant::now();
+        let _ = r.net.lane_crossings(0);
+        let whole_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (net, js) = (&r.net, &r.sim.junctions);
+        let mut cats: BTreeMap<String, usize> = BTreeMap::new();
+        let mut in_table = 0usize;
+        let found = outside(net);
+        for &(a, b) in &found {
+            let (la, lb) = (&net.lanes[a], &net.lanes[b]);
+            let src = |l: &omsi_sim::traffic::Lane| match (l.kind, l.source) {
+                (LaneKind::Rail, _) => "track",
+                (_, 2) => "piece",
+                (_, 1) => "spline",
+                _ => "other",
+            };
+            let mut pair = [src(la), src(lb)];
+            pair.sort_unstable();
+            let cat = format!("{}x{}", pair[0], pair[1]);
+            *cats.entry(cat.clone()).or_insert(0) += 1;
+            let foe = match (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                (Some(&(ja, ma)), Some(&(jb, mb))) if ja == jb => js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb && x.kind == omsi_traffic::FoeKind::Cross).map(|x| (ja, x.yields)),
+                _ => None,
+            };
+            if foe.is_some() {
+                in_table += 1;
+            }
+            if list {
+                let c = net.crossings[a].iter().find(|c| c.other == b).copied();
+                let (p, at, oat) = c.map(|c| (la.at(c.at).0, c.at, c.other_at)).unwrap_or((la.start(), 0.0, 0.0));
+                let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
+                let table = match foe {
+                    Some((j, y)) => format!("junction {j}, {a} {}", if y { "yields" } else { "goes first" }),
+                    None => "NOT IN ONE TABLE".into(),
+                };
+                println!("  {cat} {a} ({}) s {at:.1} x {b} ({}) s {oat:.1} at ({:.1}, {:.1}, {:.1}): {table}", name(la), name(lb), p.x, p.y, p.z);
+            }
+        }
+        // (the other non-merge meeting places between lanes of no one object - the swept paths
+        // over a lane leading in - and how many of them no junction table carries)
+        let (mut swept, mut swept_untabled) = (0usize, 0usize);
+        for a in 0..net.crossings.len() {
+            for c in net.crossings[a].iter().filter(|c| !c.merge && !c.outside && c.other > a) {
+                let obj = |l: usize| net.lanes[l].key.filter(|_| net.lanes[l].source == 2).map(|k| (k.tile, k.id));
+                if obj(a).is_some() && obj(a) == obj(c.other) {
+                    continue;
+                }
+                swept += 1;
+                let one = matches!((js.of_lane.get(&a), js.of_lane.get(&c.other)), (Some(x), Some(y)) if x.0 == y.0);
+                if !one {
+                    swept_untabled += 1;
+                }
+            }
+        }
+        println!("  other crossings between lanes of no one object (swept paths): {swept}, in no junction table {swept_untabled}");
+        let cats: Vec<String> = cats.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        println!(
+            "{}: {} lane crossings outside the objects ({header_found} on the recorded header), {in_table} in a junction's foe table; {}; detection {whole_ms:.1} ms over {} lanes, per tile batch {:.2} ms mean / {batch_max:.2} ms max over {batches}",
+            f,
+            found.len(),
+            cats.join(", "),
+            net.lanes.len(),
+            if batches > 0 { batch_ms / batches as f64 } else { 0.0 }
+        );
+    }
+    Ok(())
 }
 
 /// `stubs <fixture>... [--all]`: the links and meeting places the lit stubs drop from each
