@@ -1224,7 +1224,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let p = &sim.people[k];
             !p.at_kerb && !p.waiting_for_bus && (p.pos.z - me.pos.z).abs() <= 2.5 && z.blocked_by(net, p, me.half_width, lat)
         }) {
-            // ([P9-3] SUMO's waiting position: not with the body over an earlier crossing of the
+            // (SUMO's waiting position: not with the body over an earlier crossing of the
             // way - two walks a few metres apart, the zebra stop of the second lies over the
             // first. Pulled back to the earlier one's zebra stop, as `plan::pulled_back` keeps a
             // car off a band, while the front is short of it and the car can still stop there,

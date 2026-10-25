@@ -1546,7 +1546,7 @@ impl Simulation {
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
     }
 
-    /// [D7] A vehicle in the box at the end of its green (`Claim::in_box_at_turn`, clearing or
+    /// A vehicle in the box at the end of its green (`Claim::in_box_at_turn`, clearing or
     /// standing at a waiting place inside) whose way through still crosses the footpath `walk`
     /// ahead of its rear: walkers do not step onto that crossing while it clears (SUMO: a
     /// crossing's link is blocked by a vehicle on the junction that will pass it, `MSLink` for
