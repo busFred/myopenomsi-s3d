@@ -78,6 +78,16 @@ const IN_WAY_REACH: f64 = BODY_OUTSIDE + 0.15;
 /// than once in PED_TURN_EVERY seconds.
 const TURN_BOX_REACH: f64 = 3.0;
 
+/// The points of the way ahead (m) at which a standing box is a box to be got round
+/// (`around_box`, `along_box_off`): a box further off than the last holds none of them.
+const BOX_LOOK: [f64; 3] = [0.9, 1.8, 3.0];
+
+/// The margin of the walkers' grid of the boxes (m): every box the box rule (`past_boxes`)
+/// or the turn rule may test lies within it.
+fn box_grid_margin() -> f64 {
+    IN_WAY_REACH.max(TURN_BOX_REACH).max(BOX_LOOK[BOX_LOOK.len() - 1])
+}
+
 /// Vehicles' boxes further than this (m) from every walker on the ground are left out of
 /// the crowd step (it looks `CrowdParams::sense`, 4 m, round each walker).
 const CROWD_BLOCK_REACH: f64 = 25.0;
@@ -92,7 +102,7 @@ fn around_box(b: &Block, here: DVec2, dir: DVec2) -> Option<[DVec2; 2]> {
     const MARGIN: f64 = 0.8;
     let (s, c) = (b.heading.sin(), b.heading.cos());
     let (r, f) = (DVec2::new(c, -s), DVec2::new(s, c));
-    if [0.9, 1.8, 3.0].iter().all(|t| !b.closest(here + dir * *t).1) {
+    if BOX_LOOK.iter().all(|t| !b.closest(here + dir * *t).1) {
         return None;
     }
     let d = here - b.center;
@@ -142,7 +152,7 @@ fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DV
     if f.dot(dir).abs() < 0.7 {
         return Along::Across;
     }
-    if [0.9, 1.8, 3.0].iter().all(|t| !b.closest(here + dir * *t).1) && !b.near(here + dir * 0.9, BODY_OUTSIDE + 0.15) {
+    if BOX_LOOK.iter().all(|t| !b.closest(here + dir * *t).1) && !b.near(here + dir * 0.9, BODY_OUTSIDE + 0.15) {
         return Along::Across;
     }
     // (in the box's own axes: the way along it, and across)
@@ -250,7 +260,8 @@ enum BoxOutcome {
     Stuck,
 }
 
-/// A walker at `here` wanting `want` past the standing boxes (`blocks`, by `grid`; `block_car`
+/// A walker at `here` wanting `want` past the standing boxes (`blocks`, by `grid`, of margin
+/// `box_grid_margin`; `block_car`
 /// the vehicle among `cars` each is the body of): on the way round a big one already, on to its
 /// next corner; a big one along the way, beside it inside the path (`along_box`), across it,
 /// round its end (`around_box`, on a pavement only where both corners lie in the path);
@@ -318,10 +329,20 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     // one that lies along the way (a bus standing half on the pavement):
     // along its free side within the path's width; round its end it was across the
     // way, and the people paced to and fro in front of its nose (the bus held by them)
-    let big = |b: &&Block| b.vel.length() < 0.5 && b.half.max_element() >= 2.0;
+    // (the big standing boxes within the grid's margin of `here`, in the order of `blocks`:
+    // `along_box_off` and `around_box` find a way past a box only if it holds one of the points
+    // of `BOX_LOOK` ahead (within the grid's margin), so the boxes further off,
+    // which every waiting walker tested every frame, could never answer)
+    let mut near_big: Vec<&Block> = Vec::new();
+    grid.for_each_near(here, |k| {
+        let b = &blocks[k];
+        if b.vel.length() < 0.5 && b.half.max_element() >= 2.0 {
+            near_big.push(b);
+        }
+    });
     let mut no_room = false;
     let mut route = None;
-    for b in blocks.iter().filter(big) {
+    for &b in &near_big {
         match along_box_off(b, here, dir, want.corridor, if on_pavement { off_lanes } else { &|_| true }) {
             Along::Route(wp) => {
                 route = Some(wp);
@@ -332,7 +353,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
         }
     }
     if route.is_none() && !no_room {
-        route = blocks.iter().filter(big).find_map(|b| around_box(b, here, dir));
+        route = near_big.iter().find_map(|b| around_box(b, here, dir));
         // (on a pavement only round it inside the path: never out over the kerb into a
         // street lane, SUMO's stripes of the own lane)
         if on_pavement {
@@ -7469,7 +7490,7 @@ impl Humans {
             blocks.extend(bodies);
         }
         // the boxes by where they are, for the walkers' tests of the ones near them
-        let block_grid = crowd::BlockGrid::new(&blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
+        let block_grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
         // somebody waiting at a stop whose place a standing vehicle's body now covers (a
         // bus pulled into a bay over another stop's waiting places, waiters 0.1 m inside
         // its flank) steps out of it, to a body clear of
@@ -11592,7 +11613,7 @@ mod ped_tests {
     /// the walker's positions, moved by what `past_boxes` leaves them and held to the corridor
     /// as the crowd step holds them (widened by ALONG_FIT on a way past a box).
     fn walk_past(from: DVec2, blocks: &[Block], block_car: &[Option<usize>], cars: &[SeenCar], frames: usize) -> Vec<DVec2> {
-        let grid = crowd::BlockGrid::new(blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
+        let grid = crowd::BlockGrid::new(blocks, box_grid_margin(), crowd::BLOCK_CELL);
         let (mut bw, mut detour, mut pos) = (BoxWait::default(), 0.0f32, from);
         let corridor = Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 0.75));
         let mut out = Vec::new();
