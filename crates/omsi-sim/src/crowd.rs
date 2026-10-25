@@ -39,11 +39,15 @@ pub struct Walker {
     /// Keeps to within `.2` of the segment `.0`-`.1` (an aisle): avoidance may move a walker
     /// sideways, never into the seats.
     pub corridor: Option<(DVec2, DVec2, f64)>,
+    /// The box (by its centre) this walker squeezes through, jammed behind it (SUMO's jammed
+    /// pedestrian ignores the obstacle it is jammed at, `MSPModel_Striping` PState::walk): no
+    /// force from it; every other box, moving vehicles among them, stays solid.
+    pub through: Option<DVec2>,
 }
 
 impl Walker {
     pub fn new(pos: DVec2, radius: f64, space: u64) -> Walker {
-        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, solid: false, corridor: None }
+        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, solid: false, corridor: None, through: None }
     }
 }
 
@@ -352,7 +356,7 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
         if me.space == 0 && (!me.ghost || me.solid) {
             block_grid.for_each_near(me.pos, |k| {
                 let b = &blocks[k];
-                if !b.near(me.pos, params.sense) {
+                if !b.near(me.pos, params.sense) || me.through == Some(b.center) {
                     return;
                 }
                 let (q, inside) = b.closest(me.pos);
@@ -785,7 +789,30 @@ mod tests {
     use super::*;
 
     fn walker(x: f64, y: f64, want: DVec2) -> Walker {
-        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, solid: false, corridor: None }
+        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, solid: false, corridor: None, through: None }
+    }
+
+    #[test]
+    fn a_jammed_walker_ignores_only_the_box_it_squeezes_through() {
+        // [P1e] SUMO's jam ignores the blocking obstacle only: the parked box `through` gives no
+        // force, a car moving at the walker is avoided as ever
+        let parked = Block { center: DVec2::new(0.0, 2.0), half: DVec2::new(0.95, 2.3), heading: 0.0, vel: DVec2::ZERO };
+        let run = |through: Option<DVec2>, blocks: &[Block]| {
+            let mut w = vec![Walker { ghost: true, solid: true, through, ..walker(0.0, -1.0, DVec2::new(0.0, 0.35)) }];
+            let p = CrowdParams::default();
+            for _ in 0..30 {
+                step(&mut w, blocks, &p, 1.0 / 30.0);
+            }
+            w[0].vel
+        };
+        let free = run(Some(parked.center), &[parked]);
+        assert!((free - DVec2::new(0.0, 0.35)).length() < 0.02, "pushed by the box it passes: {free:?}");
+        let held = run(None, &[parked]);
+        assert!(held.y < 0.3, "not held by the box: {held:?}");
+        // a car coming across at 5 m/s just ahead: avoided though jammed
+        let car = Block { center: DVec2::new(-3.0, -0.3), half: DVec2::new(0.9, 2.2), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::new(5.0, 0.0) };
+        let dodge = run(Some(parked.center), &[parked, car]);
+        assert!((dodge - free).length() > 0.05, "the moving car gave no force: {dodge:?}");
     }
 
     #[test]

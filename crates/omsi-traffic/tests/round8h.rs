@@ -183,7 +183,7 @@ fn h8_4_a_refused_car_inside_a_long_object_stops_before_the_zebra_short_of_the_c
 
 
 fn person(x: f64, y: f64, vx: f64, vy: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: if vx == 0.0 && vy == 0.0 { 10.0 } else { 0.0 }, waiting_for_bus: false, at_kerb: false, waits_at: None }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: if vx == 0.0 && vy == 0.0 { 10.0 } else { 0.0 }, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }
 }
 
 /// [H8-8, fix pass 1] The one pull-out rule (`plan::pull_out_clear`, which the game asks before

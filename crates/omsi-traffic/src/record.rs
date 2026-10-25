@@ -193,6 +193,12 @@ pub struct PersonRecord {
     /// The stop they wait at (`Person::waits_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waits_at: Option<i64>,
+    /// Their id in the game (`Person::id`; None in a recording from before it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
+    /// [P9-2] Walking up to a crossing to step onto it (`Person::approach`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<(DVec2, f32, f32)>,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -207,12 +213,12 @@ fn is_false(v: &bool) -> bool {
 impl PersonRecord {
     /// The person as the frame sees them.
     pub fn person(&self) -> Person {
-        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb, waits_at: self.waits_at }
+        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb, waits_at: self.waits_at, id: self.id, approach: self.approach }
     }
 
     /// A record of somebody the game told nothing more about.
     pub fn from_person(p: &Person) -> PersonRecord {
-        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at }
+        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at, id: p.id, approach: p.approach }
     }
 
     /// Take the frame's own values over (the extras stay).
@@ -224,6 +230,8 @@ impl PersonRecord {
         self.waiting_for_bus = p.waiting_for_bus;
         self.at_kerb = p.at_kerb;
         self.waits_at = p.waits_at;
+        self.id = p.id;
+        self.approach = p.approach;
     }
 }
 
@@ -914,10 +922,10 @@ mod tests {
         light.request = vec![true, false];
         let lights = vec![light];
         let players = vec![PlayerView { id: 0, pos: DVec3::new(1.5, -2.25, 0.1), heading: 33.3, half_len: 6.0, half_width: 1.2, speed: -0.7, still: 0.0, blinker: 2, signalling: 1.5, priority: true }];
-        let mut walker = PersonRecord::from_person(&Person { pos: DVec3::new(10.1, 20.2, 0.0), vel: DVec2::new(0.3, -0.1), on_crossing: true, still: 0.4, waiting_for_bus: false, at_kerb: true, waits_at: Some(7) });
+        let mut walker = PersonRecord::from_person(&Person { pos: DVec3::new(10.1, 20.2, 0.0), vel: DVec2::new(0.3, -0.1), on_crossing: true, still: 0.4, waiting_for_bus: false, at_kerb: true, waits_at: Some(7), id: None, approach: None });
         walker.leg = Some((3, 1.25, 8.5));
         walker.decision = Some(Cow::Borrowed("red light"));
-        let people = vec![walker, PersonRecord::from_person(&Person { pos: DVec3::new(-5.0, 6.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: true, at_kerb: false, waits_at: None })];
+        let people = vec![walker, PersonRecord::from_person(&Person { pos: DVec3::new(-5.0, 6.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: true, at_kerb: false, waits_at: None, id: None, approach: None })];
         let externals = vec![(7u64, External { priority: true, ..Default::default() })];
         let steer = vec![(9u64, Steer { signal: 1, signal_time: 0.5, lateral_target: -1.5, lateral_ramp: (0.1, 0.2, 0.3, 0.4) })];
         let order = vec![3u64, 1, 2];

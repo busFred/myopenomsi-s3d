@@ -12,6 +12,7 @@
 //! traffic_cases converge <fixture>... [--all]
 //! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset] [--people]
 //! traffic_cases foes <fixture> <lane>...
+//! traffic_cases people <rec>... [--every 0.2] [--radius 200] [--until S] [--json out.json]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
 //! traffic_cases compare <dir> [--fps 5] [--all-people] [--out <dir>] [--only 01,08]
@@ -38,6 +39,10 @@
 //!
 //! `info` and `cut` stream the recording once (a session recording does not fit in
 //! memory parsed); `trace` and `diagnose` replay a cut fixture headless.
+//!
+//! `people` streams recordings once and measures the pedestrians within `--radius` of the player:
+//! person-seconds of strollers inside a street lane's footprint, on-crossing true-false-true flips,
+//! cars held by people for a minute or more (keyframes), Fruin pavement density bands, stroller counts.
 //!
 //! `ab` scores free runs (or with `--reset`, reset-at-keyframe replays) of fixtures, one row
 //! each; the footer names the rules each recording's header gives. `stubs` lists what the
@@ -123,9 +128,10 @@ fn main() {
         ),
         Some("compare") if args.len() >= 3 => compare(Path::new(&args[2]), &args[3..]),
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
+        Some("people") if args.len() >= 3 => people(&args[2..]),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|mask|diagnose|heads|ab|stubs|converge|viewer|viewer2|compare|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|mask|diagnose|heads|ab|stubs|converge|people|viewer|viewer2|compare|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -348,8 +354,18 @@ fn info(path: &Path) -> Res<()> {
     let mut notes: Vec<String> = Vec::new();
     let mut scales: BTreeMap<String, u64> = BTreeMap::new();
     let mut offset = f64::NAN;
+    // (whether the people carry their game id: the first frame with anybody on foot tells;
+    // `PersonRecord::id` and `approach` are optional fields, so no version bump marks them)
+    let mut person_ids: Option<(bool, bool)> = None;
     while lines.next() {
         let (kind, time, day) = peek(&lines.buf);
+        if kind == "Frame" && person_ids.is_none() {
+            if let Ok(Record::Frame(f)) = omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?) {
+                if !f.people.is_empty() {
+                    person_ids = Some((f.people.iter().any(|p| p.id.is_some()), f.people.iter().any(|p| p.approach.is_some())));
+                }
+            }
+        }
         let e = counts.entry(kind.to_string()).or_default();
         e.0 += 1;
         e.1 += lines.buf.len() as u64 + 1;
@@ -432,6 +448,10 @@ fn info(path: &Path) -> Res<()> {
             "zlib stream: CUT SHORT ({})",
             lines.error.unwrap_or_default()
         ),
+    }
+    match person_ids {
+        Some((ids, approach)) => println!("people: ids present {} (approach seen in the first frame: {})", if ids { "yes" } else { "no" }, if approach { "yes" } else { "no" }),
+        None => println!("people: nobody on foot in any frame"),
     }
     Ok(())
 }
@@ -6044,6 +6064,695 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
             let back = js.nodes[j].movements[f.movement].foes.iter().find(|g| g.movement == m).map(|g| g.yields);
             println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" });
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// people
+
+/// Window (s) in which an `on_crossing` true -> false -> true counts as a flip.
+const FLIP_WINDOW: f64 = 5.0;
+/// Two keyframes' vehicle runs under these speeds count as standing (`people` hold metric).
+const HOLD_SPEED: f32 = 0.3;
+/// Matching distance (m) of the id-less person tracker.
+const TRACK_MATCH: f64 = 0.5;
+/// The narrowest a path counts as for its area (m): one body abreast (2 x PERSON_RADIUS), the
+/// spawner's `humans::PED_PATH_MIN_WIDTH`.
+const PATH_MIN_WIDTH: f64 = 2.0 * PERSON_RADIUS;
+/// `density_max` is taken over paths of at least this area (m^2): at the 0.3 persons/m^2 target
+/// it holds three people, and below it one group's count swings the density (a 1.4 m kerb stub
+/// with a crowd waiting at it read 20 persons/m^2); `density_max_any` keeps every path.
+const DENSITY_MIN_AREA: f64 = 10.0;
+/// Histogram bin (persons/m^2) and range of the pavement density percentile.
+const DENSITY_BIN: f64 = 0.01;
+const DENSITY_BINS: usize = 600;
+
+/// [P9-6] Of the parked cars beside the lanes (a `Parked` record), how many there are and how many
+/// lie over a footpath's walking line: their box overlaps a body (PERSON_RADIUS) on a Sidewalk
+/// lane's axis (the app's `covers_footpath`, the slots the pull-out rule takes out), the lanes
+/// sampled every 0.25 m.
+fn parked_on_footpath(net: &Network, parked: &HashMap<usize, Vec<omsi_traffic::Parked>>) -> (usize, usize) {
+    let (mut all, mut on) = (0usize, 0usize);
+    for (&l, list) in parked {
+        let Some(lane) = net.lanes.get(l) else { continue };
+        for pc in list {
+            all += 1;
+            let (q, h) = lane.at(pc.s);
+            let hr = (h as f64).to_radians();
+            let right = glam::DVec2::new(hr.cos(), -hr.sin());
+            let c = q.truncate() + right * pc.lateral as f64;
+            let b = omsi_sim::collision::Obb::vehicle(c, h as f64, pc.half_len as f64, pc.half_len as f64, pc.half_width as f64);
+            let reach = (pc.half_len.max(pc.half_width) as f64) + 2.0;
+            let cell = ((c.x / 50.0).floor() as i32, (c.y / 50.0).floor() as i32);
+            let mut hit = false;
+            'cells: for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for &f in net.grid.get(&(cell.0 + dx, cell.1 + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let fl = &net.lanes[f];
+                        if fl.kind != LaneKind::Sidewalk {
+                            continue;
+                        }
+                        let mut s = 0.0f32;
+                        while s <= fl.length() {
+                            let (p, _) = fl.at(s);
+                            if (p.truncate() - c).length() <= reach && omsi_sim::collision::Obb::point(p, PERSON_RADIUS).separation(&b) < 0.0 {
+                                hit = true;
+                                break 'cells;
+                            }
+                            s += 0.25;
+                        }
+                    }
+                }
+            }
+            on += hit as usize;
+        }
+    }
+    (all, on)
+}
+
+/// What `people` knows about one person from frame to frame.
+#[derive(Clone)]
+struct PTrack {
+    /// A key that is the same person's from frame to frame (the id, or a tracker count).
+    key: u64,
+    on: bool,
+    /// When `on_crossing` last went true -> false (NaN: not since the track began), where, and the decision then.
+    tf: f64,
+    tf_pos: DVec3,
+    tf_dec: Option<String>,
+}
+
+/// One flip: a person on a crossing, off it, on it again within [`FLIP_WINDOW`].
+struct Flip {
+    key: u64,
+    has_id: bool,
+    t_off: f64,
+    t_on: f64,
+    pos: DVec3,
+    dec_off: Option<String>,
+    dec_on: Option<String>,
+    at_kerb: bool,
+}
+
+/// The id-less person tracker: the previous frame's people on a 1 m grid, matched greedily
+/// by distance within [`TRACK_MATCH`], same state.
+#[derive(Default)]
+struct PTracker {
+    prev: Vec<(DVec3, u8, PTrack)>,
+    grid: HashMap<(i32, i32), Vec<u32>>,
+    next_key: u64,
+}
+
+impl PTracker {
+    /// The tracks of `cur` (position, state index), matched against the previous frame's;
+    /// the previous frame is then replaced by this one.
+    fn step(&mut self, cur: &[(DVec3, u8, bool)]) -> Vec<PTrack> {
+        for v in self.grid.values_mut() {
+            v.clear();
+        }
+        for (i, (p, _, _)) in self.prev.iter().enumerate() {
+            self.grid.entry((p.x.floor() as i32, p.y.floor() as i32)).or_default().push(i as u32);
+        }
+        let mut pairs: Vec<(f64, u32, u32)> = Vec::new();
+        for (j, (p, st, _)) in cur.iter().enumerate() {
+            let (cx, cy) = (p.x.floor() as i32, p.y.floor() as i32);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let Some(l) = self.grid.get(&(cx + dx, cy + dy)) else { continue };
+                    for &i in l {
+                        let (q, qs, _) = &self.prev[i as usize];
+                        if qs != st {
+                            continue;
+                        }
+                        let d = ((q.x - p.x).powi(2) + (q.y - p.y).powi(2)).sqrt();
+                        if d < TRACK_MATCH {
+                            pairs.push((d, j as u32, i));
+                        }
+                    }
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut taken_prev = vec![false; self.prev.len()];
+        let mut out: Vec<Option<PTrack>> = vec![None; cur.len()];
+        for (_, j, i) in pairs {
+            if out[j as usize].is_none() && !taken_prev[i as usize] {
+                taken_prev[i as usize] = true;
+                out[j as usize] = Some(self.prev[i as usize].2.clone());
+            }
+        }
+        let tracks: Vec<PTrack> = out
+            .into_iter()
+            .zip(cur)
+            .map(|(t, (_, _, on))| {
+                t.unwrap_or_else(|| {
+                    self.next_key += 1;
+                    PTrack { key: self.next_key, on: *on, tf: f64::NAN, tf_pos: DVec3::ZERO, tf_dec: None }
+                })
+            })
+            .collect();
+        self.prev = cur.iter().zip(&tracks).map(|((p, s, _), t)| (*p, *s, t.clone())).collect();
+        tracks
+    }
+}
+
+/// A person's footprint test against a street lane: (distance to the centre line in the
+/// plane, height difference), or None when the nearest point is beyond the lane's ends.
+fn lane_foot(l: &omsi_sim::traffic::Lane, p: DVec3) -> Option<(f64, f64)> {
+    let n = l.points.len();
+    if n < 2 {
+        return None;
+    }
+    let mut best: Option<(f64, usize, f64, f64)> = None;
+    for k in 0..n - 1 {
+        let (a, b) = (l.points[k], l.points[k + 1]);
+        let (abx, aby) = (b.x - a.x, b.y - a.y);
+        let tu = ((p.x - a.x) * abx + (p.y - a.y) * aby) / (abx * abx + aby * aby).max(1e-9);
+        let t = tu.clamp(0.0, 1.0);
+        let d = ((a.x + abx * t - p.x).powi(2) + (a.y + aby * t - p.y).powi(2)).sqrt();
+        if best.map(|b| d < b.0).unwrap_or(true) {
+            best = Some((d, k, tu, a.z + (b.z - a.z) * t));
+        }
+    }
+    let (d, k, tu, z) = best?;
+    if (k == 0 && tu < 0.0) || (k == n - 2 && tu > 1.0) {
+        return None;
+    }
+    Some((d, (p.z - z).abs()))
+}
+
+/// A run of keyframes in which one vehicle stands held by people.
+struct HoldRun {
+    id: u64,
+    first: f64,
+    last: f64,
+    lane: usize,
+    pos: DVec3,
+    zebra_seen: bool,
+}
+
+/// Accumulates one recording's pedestrian gate metrics.
+struct PeopleAcc {
+    every: f64,
+    radius: f64,
+    ppos: Option<DVec3>,
+    next_t: f64,
+    first_t: f64,
+    last_t: f64,
+    samples: usize,
+    // 1. street footprint
+    street_ps: f64,
+    street_lane: HashMap<usize, (f64, DVec3)>,
+    foot_lane: HashMap<usize, f64>,
+    bbox: Vec<[f64; 4]>,
+    // 2. flips
+    id_tracks: HashMap<u32, PTrack>,
+    tracker: PTracker,
+    states: Vec<String>,
+    flips: Vec<Flip>,
+    flipped: HashSet<u64>,
+    // 3. holds (strict People runs, People-or-Zebra runs), keyframe times
+    runs: Vec<HoldRun>,
+    runs_any: Vec<HoldRun>,
+    open: HashMap<u64, HoldRun>,
+    open_any: HashMap<u64, HoldRun>,
+    kf_times: Vec<f64>,
+    // 4. density
+    band_area_s: [f64; 4],
+    hist: Vec<f64>,
+    dens_max: (f64, usize, f64, f64, usize),
+    dens_max_any: (f64, usize, f64, f64, usize),
+    /// Whether any person carried an id (flip tracking exact) / the game's on-foot counts.
+    ids_seen: bool,
+    /// [P9-6] Parked cars of the last `Parked` record and those whose box lies over a footpath.
+    parked: (usize, usize),
+    area_cache: Option<(DVec3, usize, f64)>,
+    pave_sum: f64,
+    // 5. counts
+    stroll_sum: f64,
+    stroll_max: usize,
+    all_sum: f64,
+    all_max: usize,
+}
+
+impl PeopleAcc {
+    fn new(every: f64, radius: f64) -> PeopleAcc {
+        PeopleAcc {
+            every,
+            radius,
+            ppos: None,
+            next_t: f64::NEG_INFINITY,
+            first_t: f64::NAN,
+            last_t: f64::NAN,
+            samples: 0,
+            street_ps: 0.0,
+            street_lane: HashMap::new(),
+            foot_lane: HashMap::new(),
+            bbox: Vec::new(),
+            id_tracks: HashMap::new(),
+            tracker: PTracker::default(),
+            states: Vec::new(),
+            flips: Vec::new(),
+            flipped: HashSet::new(),
+            runs: Vec::new(),
+            runs_any: Vec::new(),
+            open: HashMap::new(),
+            open_any: HashMap::new(),
+            kf_times: Vec::new(),
+            band_area_s: [0.0; 4],
+            hist: vec![0.0; DENSITY_BINS + 1],
+            dens_max: (0.0, 0, 0.0, 0.0, 0),
+            dens_max_any: (0.0, 0, 0.0, 0.0, 0),
+            ids_seen: false,
+            parked: (0, 0),
+            area_cache: None,
+            pave_sum: 0.0,
+            stroll_sum: 0.0,
+            stroll_max: 0,
+            all_sum: 0.0,
+            all_max: 0,
+        }
+    }
+
+    fn near(&self, p: DVec3) -> bool {
+        self.ppos.map(|c| (p.x - c.x).powi(2) + (p.y - c.y).powi(2) <= self.radius * self.radius).unwrap_or(false)
+    }
+
+    /// Footprint boxes of the street lanes added since the last call.
+    fn grow_boxes(&mut self, net: &Network) {
+        for l in &net.lanes[self.bbox.len()..] {
+            let hw = (l.width as f64).max(LANE_MIN_WIDTH) / 2.0 + 0.1;
+            let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            if l.kind == LaneKind::Street {
+                for p in &l.points {
+                    b = [b[0].min(p.x - hw), b[1].min(p.y - hw), b[2].max(p.x + hw), b[3].max(p.y + hw)];
+                }
+            }
+            self.bbox.push(b);
+        }
+    }
+
+    /// Total area of the pavements with a point within the radius of the player.
+    fn pavement_area(&mut self, net: &Network) -> f64 {
+        let c = self.ppos.unwrap_or_default();
+        if let Some((cc, n, a)) = self.area_cache {
+            if n == net.lanes.len() && (cc - c).truncate().length() < 5.0 {
+                return a;
+            }
+        }
+        let g = omsi_sim::traffic::GRID_CELL;
+        let (x0, x1) = (((c.x - self.radius) / g).floor() as i32, ((c.x + self.radius) / g).floor() as i32);
+        let (y0, y1) = (((c.y - self.radius) / g).floor() as i32, ((c.y + self.radius) / g).floor() as i32);
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut area = 0.0;
+        for cx in x0..=x1 {
+            for cy in y0..=y1 {
+                for &i in net.grid.get(&(cx, cy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    let l = &net.lanes[i];
+                    if l.kind != LaneKind::Sidewalk || !seen.insert(i) {
+                        continue;
+                    }
+                    if l.points.iter().any(|p| self.near(*p)) {
+                        area += l.length() as f64 * (l.width as f64).max(PATH_MIN_WIDTH);
+                    }
+                }
+            }
+        }
+        self.area_cache = Some((c, net.lanes.len(), area));
+        area
+    }
+
+    fn frame(&mut self, net: &Network, f: &omsi_traffic::record::Frame) {
+        if !self.ids_seen && f.people.iter().any(|p| p.id.is_some()) {
+            self.ids_seen = true;
+        }
+        let t = f.time;
+        if self.first_t.is_nan() {
+            self.first_t = t;
+        }
+        self.last_t = t;
+        if let Some(p) = f.players.first() {
+            self.ppos = Some(p.pos);
+        }
+        // 2. flips, every frame
+        let mut tracks: Vec<PTrack> = Vec::with_capacity(f.people.len());
+        let mut idless: Vec<(DVec3, u8, bool)> = Vec::new();
+        let mut idless_at: Vec<usize> = Vec::new();
+        for (i, p) in f.people.iter().enumerate() {
+            if p.id.is_some() {
+                tracks.push(PTrack { key: 0, on: false, tf: f64::NAN, tf_pos: DVec3::ZERO, tf_dec: None });
+            } else {
+                let s = match self.states.iter().position(|s| *s == p.state) {
+                    Some(k) => k,
+                    None => {
+                        self.states.push(p.state.to_string());
+                        self.states.len() - 1
+                    }
+                };
+                idless.push((p.pos, s as u8, p.on_crossing));
+                idless_at.push(i);
+                tracks.push(PTrack { key: 0, on: false, tf: f64::NAN, tf_pos: DVec3::ZERO, tf_dec: None });
+            }
+        }
+        if !idless.is_empty() || !self.tracker.prev.is_empty() {
+            let matched = self.tracker.step(&idless);
+            for (k, tr) in matched.into_iter().enumerate() {
+                tracks[idless_at[k]] = tr;
+            }
+        }
+        for (i, p) in f.people.iter().enumerate() {
+            let has_id = p.id.is_some();
+            let tr: &mut PTrack = match p.id {
+                Some(id) => self.id_tracks.entry(id).or_insert_with(|| PTrack { key: id as u64, on: p.on_crossing, tf: f64::NAN, tf_pos: DVec3::ZERO, tf_dec: None }),
+                None => &mut tracks[i],
+            };
+            if tr.on && !p.on_crossing {
+                tr.tf = t;
+                tr.tf_pos = p.pos;
+                tr.tf_dec = p.decision.as_ref().map(|d| d.to_string());
+            } else if !tr.on && p.on_crossing && tr.tf.is_finite() && t - tr.tf <= FLIP_WINDOW {
+                let key = tr.key;
+                let ev = Flip { key, has_id, t_off: tr.tf, t_on: t, pos: p.pos, dec_off: tr.tf_dec.take(), dec_on: p.decision.as_ref().map(|d| d.to_string()), at_kerb: p.at_kerb };
+                tr.tf = f64::NAN;
+                tr.on = true;
+                let near = self.near(p.pos);
+                if near {
+                    self.flipped.insert(key | if has_id { 0 } else { 1 << 40 });
+                    self.flips.push(ev);
+                }
+                continue;
+            }
+            tr.on = p.on_crossing;
+        }
+        // the id-less tracker keeps its tracks' state for the next frame
+        if !idless.is_empty() {
+            for (k, &i) in idless_at.iter().enumerate() {
+                self.tracker.prev[k].2 = tracks[i].clone();
+            }
+        }
+        // sampled frames
+        if t + 1e-9 < self.next_t {
+            return;
+        }
+        while self.next_t <= t + 1e-9 {
+            self.next_t = if self.next_t.is_finite() { self.next_t + self.every } else { t + self.every };
+        }
+        if self.ppos.is_none() {
+            return;
+        }
+        self.sample(net, f);
+    }
+
+    fn sample(&mut self, net: &Network, f: &omsi_traffic::record::Frame) {
+        let w = self.every;
+        self.samples += 1;
+        self.grow_boxes(net);
+        let (mut n_all, mut n_stroll) = (0usize, 0usize);
+        let mut per_lane: HashMap<usize, usize> = HashMap::new();
+        for p in &f.people {
+            if !self.near(p.pos) {
+                continue;
+            }
+            n_all += 1;
+            if p.state != "WalkStreet" {
+                continue;
+            }
+            n_stroll += 1;
+            if let Some((lane, _, _)) = p.leg {
+                if net.lanes.get(lane).map(|l| l.kind == LaneKind::Sidewalk).unwrap_or(false) {
+                    *per_lane.entry(lane).or_default() += 1;
+                }
+            }
+            if p.on_crossing {
+                continue;
+            }
+            // 1. street footprint
+            let c = Network::grid_cell(p.pos);
+            let mut best: Option<(f64, usize)> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for &i in net.grid.get(&(c.0 + dx, c.1 + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let Some(b) = self.bbox.get(i) else { continue };
+                        if p.pos.x < b[0] || p.pos.x > b[2] || p.pos.y < b[1] || p.pos.y > b[3] {
+                            continue;
+                        }
+                        let l = &net.lanes[i];
+                        if let Some((d, dz)) = lane_foot(l, p.pos) {
+                            if d < (l.width as f64).max(LANE_MIN_WIDTH) / 2.0 && dz < 2.5 && best.map(|b| d < b.0).unwrap_or(true) {
+                                best = Some((d, i));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((_, i)) = best {
+                self.street_ps += w;
+                let e = self.street_lane.entry(i).or_insert((0.0, p.pos));
+                e.0 += w;
+                if let Some((fl, _, _)) = p.leg {
+                    *self.foot_lane.entry(fl).or_default() += w;
+                }
+            }
+        }
+        self.stroll_sum += n_stroll as f64;
+        self.stroll_max = self.stroll_max.max(n_stroll);
+        self.all_sum += n_all as f64;
+        self.all_max = self.all_max.max(n_all);
+        // 4. density
+        for (&lane, &n) in &per_lane {
+            let l = &net.lanes[lane];
+            let area = l.length() as f64 * (l.width as f64).max(PATH_MIN_WIDTH);
+            if area <= 0.0 {
+                continue;
+            }
+            let d = n as f64 / area;
+            let band = if d < 0.3 {
+                0
+            } else if d < 0.7 {
+                1
+            } else if d <= 1.3 {
+                2
+            } else {
+                3
+            };
+            self.band_area_s[band] += area * w;
+            self.hist[((d / DENSITY_BIN) as usize).min(DENSITY_BINS)] += area * w;
+            if d > self.dens_max_any.0 {
+                self.dens_max_any = (d, lane, l.length() as f64, l.width as f64, n);
+            }
+            if area >= DENSITY_MIN_AREA && d > self.dens_max.0 {
+                self.dens_max = (d, lane, l.length() as f64, l.width as f64, n);
+            }
+        }
+        let area = self.pavement_area(net);
+        if area > 0.0 {
+            self.pave_sum += n_stroll as f64 / area;
+        }
+    }
+
+    fn keyframe(&mut self, time: f64, vehicles: &[Vehicle]) {
+        self.kf_times.push(time);
+        let mut alive: HashSet<u64> = HashSet::new();
+        for v in vehicles {
+            let held = v.state.speed < HOLD_SPEED;
+            let (people, zebra) = (v.last.why == Why::People, v.last.why == Why::Zebra);
+            for (any, open, done) in [(false, &mut self.open, &mut self.runs), (true, &mut self.open_any, &mut self.runs_any)] {
+                let on = held && (people || (any && zebra));
+                match (on, open.get_mut(&v.id)) {
+                    (true, Some(r)) => {
+                        r.last = time;
+                        r.zebra_seen |= zebra;
+                    }
+                    (true, None) => {
+                        open.insert(v.id, HoldRun { id: v.id, first: time, last: time, lane: v.state.lane, pos: v.pos, zebra_seen: zebra });
+                    }
+                    (false, Some(_)) => done.push(open.remove(&v.id).unwrap()),
+                    (false, None) => {}
+                }
+            }
+            alive.insert(v.id);
+        }
+        // (a vehicle missing from a keyframe ends its run)
+        for (open, done) in [(&mut self.open, &mut self.runs), (&mut self.open_any, &mut self.runs_any)] {
+            let gone: Vec<u64> = open.keys().filter(|k| !alive.contains(*k)).copied().collect();
+            for k in gone {
+                done.push(open.remove(&k).unwrap());
+            }
+        }
+    }
+
+    /// The report: (text block, JSON object).
+    fn finish(mut self, name: &str) -> (String, Value) {
+        for (open, done) in [(&mut self.open, &mut self.runs), (&mut self.open_any, &mut self.runs_any)] {
+            done.extend(open.drain().map(|(_, r)| r));
+        }
+        let mut gaps: Vec<f64> = self.kf_times.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0.0).collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let kf_dt = gaps.get(gaps.len() / 2).copied().unwrap_or(5.0);
+        let dur = |r: &HoldRun| r.last - r.first + kf_dt;
+        let mut out = String::new();
+        let mut js = serde_json::Map::new();
+        js.insert("file".into(), json!(name));
+        js.insert("t_first".into(), json!(r1(self.first_t)));
+        js.insert("t_last".into(), json!(r1(self.last_t)));
+        macro_rules! kv {
+            ($k:expr, $v:expr, $j:expr) => {{
+                let _ = writeln!(out, "{:<24} {}", $k, $v);
+                js.insert($k.into(), $j);
+            }};
+        }
+        let _ = writeln!(out, "== {name}  sim time {:.1} .. {:.1} s ({:.0} s), {} sampled frames every {} s, radius {} m", self.first_t, self.last_t, self.last_t - self.first_t, self.samples, self.every, self.radius);
+        // 5
+        let n = self.samples.max(1) as f64;
+        kv!("strollers_mean", format!("{:.1}", self.stroll_sum / n), json!(r2(self.stroll_sum / n)));
+        kv!("strollers_max", self.stroll_max, json!(self.stroll_max));
+        kv!("people_mean", format!("{:.1}", self.all_sum / n), json!(r2(self.all_sum / n)));
+        kv!("people_max", self.all_max, json!(self.all_max));
+        // 1
+        kv!("street_ps", format!("{:.1} (strollers, state WalkStreet, with the game's on_crossing false, centre within max(width, 2.5)/2 of a street lane's axis)", self.street_ps), json!(r1(self.street_ps)));
+        let mut top: Vec<_> = self.street_lane.iter().collect();
+        top.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then(a.0.cmp(b.0)));
+        let mut jt = Vec::new();
+        for (k, (lane, (ps, pos))) in top.iter().take(8).enumerate() {
+            let _ = writeln!(out, "  street_top_{:<2}          lane {lane} {:.1} ps at ({:.1}, {:.1}, {:.1})", k + 1, ps, pos.x, pos.y, pos.z);
+            jt.push(json!({"lane": lane, "ps": r1(*ps), "pos": [r1(pos.x), r1(pos.y), r1(pos.z)]}));
+        }
+        js.insert("street_top".into(), json!(jt));
+        let mut top: Vec<_> = self.foot_lane.iter().collect();
+        top.sort_by(|a, b| b.1.total_cmp(a.1).then(a.0.cmp(b.0)));
+        let mut jt = Vec::new();
+        for (k, (lane, ps)) in top.iter().take(8).enumerate() {
+            let _ = writeln!(out, "  footpath_top_{:<2}        lane {lane} {:.1} ps", k + 1, ps);
+            jt.push(json!({"lane": lane, "ps": r1(**ps)}));
+        }
+        js.insert("footpath_top".into(), json!(jt));
+        // 2
+        kv!("flip_tft", format!("{} ({})", self.flipped.len(), if self.ids_seen { "by person id: exact" } else { "no ids: nearest-neighbour tracking, swaps inflate it" }), json!(self.flipped.len()));
+        let mut jt = Vec::new();
+        for (k, f) in self.flips.iter().take(10).enumerate() {
+            let who = if f.has_id { format!("id {}", f.key) } else { format!("track {}", f.key) };
+            let _ = writeln!(out, "  flip_{:<2}                {who} off {:.1} on {:.1} at ({:.1}, {:.1}) at_kerb {} decision_off {:?} decision_on {:?}", k + 1, f.t_off, f.t_on, f.pos.x, f.pos.y, f.at_kerb, f.dec_off, f.dec_on);
+            jt.push(json!({"who": who, "t_off": r1(f.t_off), "t_on": r1(f.t_on), "pos": [r1(f.pos.x), r1(f.pos.y)], "at_kerb": f.at_kerb, "decision_off": f.dec_off, "decision_on": f.dec_on}));
+        }
+        js.insert("flips".into(), json!(jt));
+        // 3
+        let ge60 = |runs: &[HoldRun]| runs.iter().filter(|r| dur(r) >= 60.0).map(|r| r.id).collect::<HashSet<_>>().len();
+        kv!("people_hold_ge60", ge60(&self.runs), json!(ge60(&self.runs)));
+        kv!("people_hold_ge60_any", ge60(&self.runs_any), json!(ge60(&self.runs_any)));
+        match self.runs.iter().max_by(|a, b| dur(a).total_cmp(&dur(b))) {
+            Some(r) => {
+                let _ = writeln!(out, "{:<24} {:.0} s vehicle {} from {:.0} lane {} at ({:.1}, {:.1})", "people_hold_max", dur(r), fmt_id(r.id), r.first, r.lane, r.pos.x, r.pos.y);
+                js.insert("people_hold_max".into(), json!({"s": r1(dur(r)), "id": r.id, "start": r1(r.first), "lane": r.lane, "pos": [r1(r.pos.x), r1(r.pos.y)]}));
+            }
+            None => kv!("people_hold_max", "0 s", json!(null)),
+        }
+        let mut long: Vec<&HoldRun> = self.runs_any.iter().filter(|r| dur(r) >= 30.0).collect();
+        long.sort_by(|a, b| dur(b).total_cmp(&dur(a)));
+        let mut jt = Vec::new();
+        for r in &long {
+            let _ = writeln!(out, "  hold_ge30                vehicle {} start {:.0} for {:.0} s lane {}{}", fmt_id(r.id), r.first, dur(r), r.lane, if r.zebra_seen { " (zebra)" } else { "" });
+            jt.push(json!({"id": r.id, "start": r1(r.first), "s": r1(dur(r)), "lane": r.lane, "zebra": r.zebra_seen}));
+        }
+        js.insert("hold_ge30".into(), json!(jt));
+        kv!("keyframe_interval", format!("{kf_dt:.1} s ({} keyframes)", self.kf_times.len()), json!(kf_dt));
+        // 4
+        let tot: f64 = self.band_area_s.iter().sum::<f64>().max(1e-9);
+        let names = ["A-B <0.3", "C-D 0.3-0.7", "E 0.7-1.3", "F >1.3"];
+        let shares: Vec<f64> = self.band_area_s.iter().map(|a| a / tot * 100.0).collect();
+        let line = names.iter().zip(&shares).map(|(n, s)| format!("{n} {s:.1}%")).collect::<Vec<_>>().join("  ");
+        kv!("density_shares", line, json!(names.iter().zip(&shares).map(|(n, s)| json!({"band": n, "pct": r2(*s)})).collect::<Vec<_>>()));
+        let mut acc = 0.0;
+        let mut p99 = 0.0;
+        for (i, h) in self.hist.iter().enumerate() {
+            acc += h;
+            if acc >= 0.99 * tot {
+                p99 = (i as f64 + 1.0) * DENSITY_BIN;
+                break;
+            }
+        }
+        kv!("density_p99", format!("{p99:.2} per m2 (area-time weighted, occupied pavements)"), json!(r2(p99)));
+        let m = self.dens_max;
+        kv!("density_max", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {} (paths of {DENSITY_MIN_AREA} m2 or more)", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
+        let m = self.dens_max_any;
+        kv!("density_max_any", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {}", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
+        kv!("parked_on_footpath", format!("{} of {} parked cars beside lanes (the P9-6 pull-out rule's slots)", self.parked.1, self.parked.0), json!({"on_footpath": self.parked.1, "parked": self.parked.0}));
+        kv!("pavement_density_mean", format!("{:.5} per m2", self.pave_sum / n), json!((self.pave_sum / n * 1e5).round() / 1e5));
+        (out, Value::Object(js))
+    }
+}
+
+/// `people <rec>... [--every S] [--radius R] [--json out.json]`: streams each recording once
+/// and prints the pedestrian gate metrics of the people within `--radius` of the first player
+/// (frames sampled every `--every` s of sim time; flips are counted on every frame).
+fn people(args: &[String]) -> Res<()> {
+    let mut recs: Vec<PathBuf> = Vec::new();
+    let (mut every, mut radius, mut json_out) = (0.2f64, 200.0f64, None::<PathBuf>);
+    // (the recording's seconds counted: up to this many after its first frame)
+    let mut until = f64::INFINITY;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--every" => every = it.next().ok_or("--every needs a value")?.parse()?,
+            "--until" => until = it.next().ok_or("--until needs a value")?.parse()?,
+            "--radius" => radius = it.next().ok_or("--radius needs a value")?.parse()?,
+            "--json" => json_out = Some(PathBuf::from(it.next().ok_or("--json needs a path")?)),
+            s if s.starts_with("--") => return Err(format!("unknown option {s}").into()),
+            s => recs.push(PathBuf::from(s)),
+        }
+    }
+    if recs.is_empty() || every <= 0.0 {
+        return Err("usage: traffic_cases people <rec>... [--every S] [--radius R] [--until S] [--json out.json]".into());
+    }
+    let mut all = Vec::new();
+    for path in &recs {
+        let started = std::time::Instant::now();
+        let mut lines = Lines::open(path)?;
+        if !lines.next() {
+            return Err(format!("{}: empty recording", path.display()).into());
+        }
+        let header: Header = omsi_traffic::finite::from_str(std::str::from_utf8(&lines.buf)?)?;
+        // (the network as the replay builds it: the header's lanes, then every LanesAdded
+        // through `Network::extend`, so lane indices are the recording's)
+        let (mut net, _sim) = omsi_traffic::replay::recorded(&header);
+        drop(_sim);
+        drop(header);
+        let mut acc = PeopleAcc::new(every, radius);
+        let mut first: Option<f64> = None;
+        while lines.next() {
+            let (kind, _, _) = peek(&lines.buf);
+            if !matches!(kind, "Frame" | "Keyframe" | "LanesAdded" | "Parked") {
+                continue;
+            }
+            let rec = omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?)?;
+            if matches!(rec, Record::Frame(_) | Record::Keyframe { .. }) {
+                let t0 = *first.get_or_insert(rec.time());
+                if rec.time() - t0 > until {
+                    break;
+                }
+            }
+            match rec {
+                Record::LanesAdded { lanes, .. } => {
+                    net.extend(lanes, 1.5);
+                }
+                Record::Keyframe { time, vehicles } => acc.keyframe(time, &vehicles),
+                Record::Frame(f) => acc.frame(&net, &f),
+                Record::Parked { parked, .. } => acc.parked = parked_on_footpath(&net, &parked),
+                _ => {}
+            }
+        }
+        if lines.clean != Some(true) && until.is_infinite() {
+            eprintln!("{}: zlib stream cut short ({})", path.display(), lines.error.clone().unwrap_or_default());
+        }
+        let name = path.display().to_string();
+        let (text, mut js) = acc.finish(&name);
+        js["wall_s"] = json!(r1(started.elapsed().as_secs_f64()));
+        print!("{text}");
+        eprintln!("({:.1} s wall)", started.elapsed().as_secs_f64());
+        all.push(js);
+    }
+    if let Some(p) = json_out {
+        std::fs::write(p, serde_json::to_string_pretty(&all)?)?;
     }
     Ok(())
 }

@@ -376,7 +376,7 @@ fn l2_inside_a_junction_the_squeeze_keeps_clear_of_the_foe_stretch() {
 }
 
 fn walker(x: f64, y: f64, vx: f64, vy: f64) -> Person {
-    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None }
+    Person { pos: DVec3::new(x, y, 0.0), vel: glam::DVec2::new(vx, vy), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }
 }
 
 /// JiananDong_1.sli as the Wuluju stop has it (round5 case01): a 1.9 m eastbound lane at
