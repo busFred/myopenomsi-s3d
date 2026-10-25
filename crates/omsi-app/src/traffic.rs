@@ -2906,6 +2906,9 @@ impl Traffic {
                 && self.may_put_on(lane)
                 // ([round 9 A4] nor where its road ends at the loaded tiles' edge: it sleeps on)
                 && !self.edge_bound.contains(&lane)
+                // (nor on a lane closed to its group, `Lane::closed_to`: a dormant car drives on
+                // over any lane when none is open to it, and sleeps on past such a piece)
+                && self.types.iter().find(|t| Arc::ptr_eq(&t.0, &ty)).is_none_or(|t| self.net.lanes[lane].closed_to(ty.def.ai_veh_type, self.pool_of(t.3), true).is_none())
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)
