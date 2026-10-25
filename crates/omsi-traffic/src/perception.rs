@@ -1005,7 +1005,6 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 /// people standing at the kerb.
 const KERB_CLEAR: f32 = 0.3;
 
-
 /// How far ahead (s) the step of a person about to enter my lane is followed, at most: the
 /// time I need to reach them, at least 2 s (`dist / v` alone is 0.15 s at
 /// 13 m/s, and a stepper beside the bumper would never be braked for); 4 s covers my reach of 45 m at
