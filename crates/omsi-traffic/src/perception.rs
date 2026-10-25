@@ -1749,7 +1749,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let me = &vehicles[i];
     let st = &me.state;
     let lane = net.lanes.get(nb)?;
-    let allowed = crate::access::is_open(lane, me);
+    let allowed = crate::access::is_open_at(net, nb, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
     let mut behind: Option<(f32, f32)> = None;
@@ -1818,8 +1818,8 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
 /// [J7-3] Why my lane ends for me (`LaneEnd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneEndKind {
-    /// The way runs into a lane closed to me that stays closed (or ends) to the look-ahead's
-    /// reach: a dead lane for me.
+    /// The way runs into a closure: a lane closed to me whose closed run is as long as a body of
+    /// my group (a shorter run is a marker, `Network::closed_marker`).
     Closed,
     /// The way ends (no lane on).
     DeadEnd,
@@ -1875,20 +1875,13 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
         }
         let lane = &net.lanes[l];
         // (a junction piece has no rules of its own: the way through is the junction's)
-        // A closed lane ends my lane only if my way does not open again within the look-ahead
-        // (SUMO: a lane is dead for a vehicle when the route cannot go on from it; where the way
-        // on from a closed piece leads to lanes open to me the piece is a stretch to cross, not
-        // an end). BeijingCity's 1-4 m stop-line pieces carry density 0 for the normal cars so
-        // that nothing is put down at the line, and lead on into the junction: they are no end;
-        // a long closed lane that stays closed to the look-ahead's reach is.
-        if k > 0 && lane.source != 2 && !crate::access::is_open(lane, me) {
-            let opens_again = way[k + 1..]
-                .iter()
-                .take_while(|&&(_, d)| d - st.front <= look)
-                .any(|&(m, _)| net.lanes[m].source == 2 || crate::access::is_open(&net.lanes[m], me));
-            if !opens_again {
-                return Some(LaneEnd { dist: d0 - st.front, kind: LaneEndKind::Closed, toward: None });
-            }
+        // A closed lane ends my lane for me if its closed run is a closure; a run shorter than
+        // the longest body of my group is a marker (BeijingCity's 1-4 m stop-line pieces carry
+        // density 0 for the normal cars so that nothing is put down at the line, and lead on
+        // into the junction): it is crossed, not stopped short of, `Network::closed_marker`
+        // (SUMO: a lane is dead for a vehicle only where its route cannot go on).
+        if k > 0 && lane.source != 2 && !crate::access::is_open_at(net, l, me) {
+            return Some(LaneEnd { dist: d0 - st.front, kind: LaneEndKind::Closed, toward: None });
         }
         if let Some(&(j, m)) = sim.junctions.of_lane.get(&l) {
             let node = &sim.junctions.nodes[j];

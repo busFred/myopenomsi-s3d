@@ -1631,6 +1631,7 @@ impl Traffic {
             pending_pull_out: None,
         };
         t.sort_parked(parked_cars, lanes);
+        t.set_group_bodies();
         t.mark_loaded_edges(world);
         if let Ok(path) = omsi_cfg::env::var("OMSI_TRAFFIC_RECORD") {
             if let Err(e) = t.start_recording(Path::new(&path)) {
@@ -4591,6 +4592,22 @@ impl Traffic {
     /// sections, trailers, the cars of a unit) reaches standing straight: each car placed as
     /// `consist_bodies` places it, the farthest corner back. (One straight box: the rear
     /// section of an articulated bus swinging inwards in a bend is not modelled.)
+    /// `Network::group_body`: per `unsched_vehgroups.txt` group the longest whole consist of its
+    /// street vehicle types (the length `create_car` gives them), the yardstick of a closed run.
+    fn set_group_bodies(&mut self) {
+        let mut body = vec![0.0f32; self.uvg_defaults.len()];
+        let types: Vec<(Arc<VehicleType>, usize)> = self.types.iter().filter(|t| t.2 == LaneKind::Street).map(|t| (t.0.clone(), t.3)).collect();
+        for (ty, g) in types {
+            let Some(u) = self.group_uvg.get(g).copied().flatten() else { continue };
+            let (front, rear, _) = extents(&ty, 4.5);
+            let len = front + rear.max(self.consist_rear(&ty));
+            if let Some(b) = body.get_mut(u) {
+                *b = b.max(len);
+            }
+        }
+        self.net.group_body = body;
+    }
+
     fn consist_rear(&mut self, ty: &Arc<VehicleType>) -> f32 {
         let (pos, heading) = (DVec3::ZERO, 0.0f64);
         let mut back_most = 0.0f64;

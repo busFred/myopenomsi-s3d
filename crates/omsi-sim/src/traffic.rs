@@ -177,6 +177,38 @@ pub fn density_is_open(density: f32) -> bool {
 /// group, which counts as the first group.
 pub type PoolRef<'a> = Option<(&'a [i32], usize)>;
 
+impl Network {
+    /// Is `lane`, closed by density to the vehicle `st`, a marker and not a closure? The closed
+    /// run it starts - this lane and the lanes after it while each is the only way on and also
+    /// closed by density to the vehicle (a junction object's piece is no run: the way through is
+    /// the junction's) - is shorter than the longest body of the vehicle's group (its own length
+    /// where the group's is not known). Such a run cannot hold a vehicle of the group: it is a
+    /// marker the map's makers put at a stop line or a spawn point (BeijingCity's 1-4 m
+    /// stop-line pieces carry density 0 for the normal cars, the lanes before and after them
+    /// do not), not a lane the group is kept off. SUMO: a lane is dead for a vehicle only where
+    /// its route cannot go on; a vehicle never stops short of a piece it fits nowhere on.
+    pub fn closed_marker(&self, lane: usize, st: &AiState) -> bool {
+        let body = st.traffic_pool.as_ref().and_then(|(p, _)| self.group_body.get(*p)).copied().unwrap_or(0.0).max(st.length);
+        let pool = st.traffic_pool.as_ref().map(|(p, d)| (d.as_slice(), *p));
+        let mut len = 0.0;
+        let mut cur = lane;
+        for _ in 0..16 {
+            let l = &self.lanes[cur];
+            len += l.length();
+            if len >= body {
+                return false;
+            }
+            let [n] = l.next[..] else { return true };
+            let nl = &self.lanes[n];
+            if nl.source == 2 || nl.closed_to(st.veh_type, pool, true) != Some(Closed::Density) {
+                return true;
+            }
+            cur = n;
+        }
+        false
+    }
+}
+
 impl Lane {
     /// The drivable extent (left, right) of the lane's axis in metres ([`Lane::drivable`]
     /// as stored, else the lane's half width either side).
@@ -519,6 +551,10 @@ pub struct Network {
     /// The map drives on the left (`global.cfg` `[lht]`): priority to the left, the
     /// oncoming lane on the right, turning right across the oncoming traffic.
     pub left_hand: bool,
+    /// Per `unsched_vehgroups.txt` group: the length (m) of its longest vehicle (the game sets
+    /// it from the vehicle types it loads); the yardstick of a closed run
+    /// (`Network::closed_marker`). Empty (a replay): the vehicle's own length.
+    pub group_body: Vec<f32>,
 }
 
 /// Lit stubs: an approach lane is not linked past its short lit stub into the lane after
@@ -3326,7 +3362,11 @@ impl AiState {
         // among the choices (the others are: a street goes on where it has a way on)
         let next: Vec<usize> = l.next.iter().copied().filter(|&n| !avoid(n)).collect();
         let kind = l.kind;
-        let closed = |n: usize| open_to(&net.lanes[n], self, kind).err();
+        // (a closed marker is no closed lane for the way on, `Network::closed_marker`)
+        let closed = |n: usize| match open_to(&net.lanes[n], self, kind).err() {
+            Some(Closed::Density) if net.lanes[n].source != 2 && net.closed_marker(n, self) => None,
+            c => c,
+        };
         // (SUMO's bestLanes, one step: a lane whose ways on are all closed to me is no way on
         // for me - a car entered X10's 20754 and 20737, whose only continuation is no_cars)
         let leads_on = |n: usize| {

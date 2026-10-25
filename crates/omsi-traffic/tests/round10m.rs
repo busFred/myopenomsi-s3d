@@ -90,7 +90,7 @@ fn the_fork_never_routes_a_group_over_a_near_closure_when_a_way_is_open() {
     assert!(ways(&fork(0.001)).iter().all(|w| w.is_some()));
 }
 
-/// M9-1 (#31323): a 4 m stop-line piece of density 0 for the normal cars, the only way on from its
+/// M9-1 (#31323): a 3 m stop-line piece (shorter than the 4 m body) of density 0 for the normal cars, the only way on from its
 /// lane and leading on into open road, is no lane end: the car does not set out to move over (and
 /// stand 16 m short of the piece where the lane beside is full), it drives on over the piece and the open lane after it. The other lane has its own
 /// open piece.
@@ -99,10 +99,10 @@ fn a_closed_stop_line_piece_that_leads_on_is_no_lane_end() {
     let mut net = Network::default();
     net.lanes.push(road((0.0, 0.0), (600.0, 0.0), 1, 0, 0.0));
     net.lanes.push(road((0.0, -3.5), (600.0, -3.5), 1, 1, 3.5));
-    net.lanes.push(road((600.0, 0.0), (604.0, 0.0), 2, 0, 0.0));
-    net.lanes.push(road((600.0, -3.5), (604.0, -3.5), 2, 1, 3.5));
-    net.lanes.push(road((604.0, 0.0), (1500.0, 0.0), 3, 0, 0.0));
-    net.lanes.push(road((604.0, -3.5), (1500.0, -3.5), 3, 1, 3.5));
+    net.lanes.push(road((600.0, 0.0), (603.0, 0.0), 2, 0, 0.0));
+    net.lanes.push(road((600.0, -3.5), (603.0, -3.5), 2, 1, 3.5));
+    net.lanes.push(road((603.0, 0.0), (1500.0, 0.0), 3, 0, 0.0));
+    net.lanes.push(road((603.0, -3.5), (1500.0, -3.5), 3, 1, 3.5));
     net.lanes[3].group_density = vec![(0, 0.0), (5, 1.0)];
     net.link(1.5);
     net.compute_conflicts();
@@ -122,4 +122,31 @@ fn a_closed_stop_line_piece_that_leads_on_is_no_lane_end() {
     assert!(!stood, "stood");
     assert!(!moved_over, "left its lane for the closed piece at its end");
     assert!(reached, "never drove over the piece: lane {} s {:.0}", cars[0].state.lane, cars[0].state.s);
+}
+
+/// M9-1: the same piece one body long (a 30 m closed run) is a closure: the car moves over before it,
+/// as the J7-3 lane drop; and the group's longest body (`Network::group_body`) decides: a 12 m
+/// run is a marker for a group with an 18 m bus, a closure for one whose longest body is 4 m.
+#[test]
+fn a_closed_run_as_long_as_a_body_is_a_closure_and_the_groups_longest_body_decides() {
+    let build = |piece_len: f64| {
+        let mut net = Network::default();
+        net.lanes.push(road((0.0, 0.0), (600.0, 0.0), 1, 0, 0.0));
+        net.lanes.push(road((600.0, 0.0), (600.0 + piece_len, 0.0), 2, 0, 0.0));
+        net.lanes.push(road((600.0 + piece_len, 0.0), (1500.0, 0.0), 3, 0, 0.0));
+        net.lanes[1].group_density = vec![(0, 0.0), (5, 1.0)];
+        net.link(1.5);
+        net
+    };
+    let pool = Some((0usize, std::sync::Arc::new(vec![1, 1, 1, 1, 1, 1])));
+    let mut st = AiState::new(0, 100.0, 1);
+    st.length = 4.0;
+    st.traffic_pool = pool;
+    let mut net = build(12.0);
+    net.group_body = vec![18.0; 6];
+    assert!(net.closed_marker(1, &st), "12 m < an 18 m bus: a marker");
+    net.group_body = vec![4.0; 6];
+    assert!(!net.closed_marker(1, &st), "12 m >= 4 m: a closure");
+    let net = build(3.0);
+    assert!(net.closed_marker(1, &st), "3 m < 4 m: a marker");
 }

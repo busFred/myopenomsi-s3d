@@ -25,6 +25,19 @@ pub fn open_to(lane: &Lane, v: &Vehicle) -> Result<(), Closed> {
     omsi_sim::traffic::open_to(lane, &v.state, kind)
 }
 
+/// Is lane `idx` of `net` open to `v` for driving along: `is_open`, or closed by density only as
+/// a marker (`Network::closed_marker`: a run too short to hold a vehicle of its group)? What
+/// every stage that looks along a way asks (the lane-end rule, the open run, a lane change's
+/// target).
+pub fn is_open_at(net: &omsi_sim::traffic::Network, idx: usize, v: &Vehicle) -> bool {
+    let l = &net.lanes[idx];
+    match open_to(l, v) {
+        Ok(()) => true,
+        Err(Closed::Density) => l.source != 2 && net.closed_marker(idx, &v.state),
+        Err(_) => false,
+    }
+}
+
 /// Open, as a plain yes or no.
 pub fn is_open(lane: &Lane, v: &Vehicle) -> bool {
     open_to(lane, v).is_ok()

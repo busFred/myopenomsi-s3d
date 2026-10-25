@@ -1834,7 +1834,7 @@ impl Simulation {
         // a change of the driver's own whose target lane (moving on along its plan) is closed
         // to it: given up while the body is less than half over (viz5 case04 #5644 went on from
         // 3470's rule-less bus lane piece into 3474's)
-        let closed = v.state.change.is_some_and(|c| v.state.route.is_empty() && net.lanes.get(c.to).is_some_and(|l| l.source != 2 && !crate::access::is_open(l, v)));
+        let closed = v.state.change.is_some_and(|c| v.state.route.is_empty() && net.lanes.get(c.to).is_some_and(|l| l.source != 2 && !crate::access::is_open_at(net, c.to, v)));
         if closed && v.state.change_offsets(net).is_some_and(|(k, _, _)| k < 0.5) {
             v.state.settle_change(net, false);
             v.change_still = (0.0, 0.0);
