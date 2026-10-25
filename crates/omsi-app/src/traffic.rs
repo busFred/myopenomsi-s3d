@@ -118,43 +118,6 @@ const QUEUE_BEHIND_DIST: f64 = 25.0;
 // ([round 7 R7-1 fix 1] IN_VIEW_GRACE, GAVE_UP_DIST, QUEUE_LEAD, `in_a_queue` and `lead_of`
 // are the crate's, `omsi_traffic::removal`: the free-run replay asks the same rule)
 use omsi_traffic::removal::{goes_far, goes_in_view, lead_of, in_a_queue, RemoveRule};
-
-/// [P9-6] Whether the parked box `b` lies over a footpath's walking line: a body (`FOOT_BODY`) on
-/// the axis of a pavement lane near it overlaps the box (the lanes' points sampled every
-/// `FOOTPATH_STEP`). A box only over the path's edge leaves its walkers room beside it (they pass
-/// it inside the path, `humans::along_box`); one on its line stands among them.
-fn covers_footpath(net: &Network, b: &omsi_sim::collision::Obb) -> bool {
-    let reach = b.half.length() + 2.0 * FOOTPATH_STEP as f64;
-    let (cx, cy) = ((b.center.x / 50.0).floor() as i32, (b.center.y / 50.0).floor() as i32);
-    let mut seen: Vec<usize> = Vec::new();
-    for dx in -1..=1 {
-        for dy in -1..=1 {
-            for &l in net.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
-                let lane = &net.lanes[l];
-                if lane.kind != LaneKind::Sidewalk || seen.contains(&l) {
-                    continue;
-                }
-                seen.push(l);
-                let (mut s, len) = (0.0f32, lane.length());
-                while s <= len {
-                    let (q, _) = lane.at(s);
-                    if (q.truncate() - b.center).length() <= reach && omsi_sim::collision::Obb::point(q, FOOT_BODY).separation(b) < 0.0 {
-                        return true;
-                    }
-                    s += FOOTPATH_STEP;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// [P9-6] The spacing (m) of the points of a footpath tested against a parked box: under half a
-/// body, so no stretch of the path between two of them is missed.
-const FOOTPATH_STEP: f32 = 0.25;
-/// [P9-6] A walker's body radius (m, `humans::BODY_OUTSIDE`).
-const FOOT_BODY: f64 = 0.28;
-
 /// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
 /// eye): a margin over what is drawn.
 const OUT_OF_RANGE: f64 = 1.3;
@@ -2572,16 +2535,6 @@ impl Traffic {
             }
             if !(0.8..4.5).contains(&lat) || dh.abs() > 30.0 {
                 why.push(format!("{lat:+.1} m beside lane {l}, {dh:+.0} deg to it"));
-                continue;
-            }
-            // [P9-6] not out of a slot laid on a footpath: its box over the walkers' path, a car
-            // pulling out of it stands on the pavement among them and is held there by them
-            // (Jiangzhaikou's tile [1,-6] 3433: slots at 3.1 m on the path at 2.8 m, #2551 held
-            // 170 s; OMSI geometry: such a slot is pavement; SUMO's parking areas lie beside the
-            // sidewalk, never on it)
-            let on_path = world.parked_boxes.lock().iter().filter(|b| b.id == key).any(|b| covers_footpath(&self.net, b));
-            if on_path {
-                why.push("its slot is on a footpath".into());
                 continue;
             }
             // nobody close by on the road
@@ -5992,23 +5945,5 @@ mod loaded_edge_tests {
         assert!(RemoveRule::DeadEnd.gated() && RemoveRule::InViewAfterGrace.gated());
         // [round 9 A2, fix pass 1] the trip's end at the edge beyond the horizon
         assert_eq!(removal_rule("at the loaded tiles' edge, beyond the horizon"), RemoveRule::FarDeadEnd);
-    }
-}
-
-#[cfg(test)]
-mod p96_tests {
-    use super::*;
-
-    #[test]
-    fn p96_a_parked_box_over_a_footpath_is_found_one_beside_it_is_not() {
-        // Jiangzhaikou 3433: a 1 m footpath 2.8 m right of its street lane, slots at 3.1 m
-        let mut net = Network::default();
-        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -50.0, 0.0), DVec3::new(0.0, 50.0, 0.0)], LaneKind::Street, 3.0));
-        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(2.8, -50.0, 0.0), DVec3::new(2.8, 50.0, 0.0)], LaneKind::Sidewalk, 1.0));
-        net.link(1.5);
-        let slot = |x: f64| omsi_sim::collision::Obb::vehicle(DVec2::new(x, 0.0), 0.0, 2.3, 2.3, 0.92);
-        assert!(covers_footpath(&net, &slot(3.1)));
-        // (one parked in the lane's own kerb strip, 1.2 m short of the path's edge)
-        assert!(!covers_footpath(&net, &slot(1.0)));
     }
 }
