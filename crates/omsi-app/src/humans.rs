@@ -4445,6 +4445,9 @@ pub struct Humans {
     /// Where the time of this tick went (stage, ms since the one before), for the slow
     /// ticks OMSI_PROFILE reports.
     tick_stages: Vec<(&'static str, f64)>,
+    /// With OMSI_PROFILE: the stages' sums over the frames since the last profile line, the
+    /// frames and the people summed over them.
+    stage_sums: (Vec<(&'static str, f64)>, usize, usize),
     /// Speed, heading and floor acceleration of each bus last frame (for the riders' balance).
     bus_motion: HashMap<BusId, (f64, f64, DVec2)>,
     /// `types` has been cut down to the map's `humans.txt`.
@@ -4686,6 +4689,7 @@ impl Humans {
             inside_seen: HashSet::new(),
             moved_places: HashMap::new(),
             tick_stages: Vec::new(),
+            stage_sums: (Vec::new(), 0, 0),
             bus_motion: HashMap::new(),
             map_humans_done: false,
             last_sync: 0.0,
@@ -7248,6 +7252,27 @@ impl Humans {
                 self.tick_stages.iter().filter(|s| s.1 >= 1.0).map(|(n, t)| format!("{n} {t:.1}")).collect::<Vec<_>>().join(", ")
             );
         }
+        // (and with OMSI_PROFILE, every 900 frames: each stage's mean, and per person)
+        if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            let sums = &mut self.stage_sums;
+            for (n, t) in &self.tick_stages {
+                match sums.0.iter_mut().find(|s| s.0 == *n) {
+                    Some(s) => s.1 += t,
+                    None => sums.0.push((n, *t)),
+                }
+            }
+            sums.1 += 1;
+            sums.2 += self.people.len();
+            if sums.1 >= 900 {
+                let (f, people) = (sums.1 as f64, sums.2 as f64 / sums.1 as f64);
+                log::info!(
+                    "humans profile over {} frames, {people:.0} people: {}",
+                    sums.1,
+                    sums.0.iter().map(|(n, t)| format!("{n} {:.2} ms ({:.2} us/person)", t / f, t / f * 1000.0 / people.max(1.0))).collect::<Vec<_>>().join(", ")
+                );
+                *sums = (Vec::new(), 0, 0);
+            }
+        }
         if omsi_cfg::env::var_os("OMSI_CHECK_WALLS").is_some() {
             self.check_walls();
         }
@@ -7529,6 +7554,7 @@ impl Humans {
             }
             self.streams = streams;
         }
+        stage!("ped.prep");
         // what everybody on foot wants: decided side by side from the frame's state
         // (the read phase), then taken over in index order (the apply phase); a decision that
         // needs the yields to standing vehicles, which the decisions before it in the frame
@@ -7557,6 +7583,7 @@ impl Humans {
                 })
                 .collect()
         };
+        stage!("ped.decide");
         let mut wants: Vec<Want> = Vec::with_capacity(self.people.len());
         for (i, d) in decided.into_iter().enumerate() {
             let p = &self.people[i];
@@ -7576,6 +7603,7 @@ impl Humans {
             };
             wants.push(w);
         }
+        stage!("ped.take");
         // a standing vehicle in the way: wait, then go round it - on a pavement only inside the
         // path () - or, jammed, squeeze past it () (`past_boxes`)
         for i in 0..self.people.len() {
@@ -7607,6 +7635,7 @@ impl Humans {
                 p.detour = p.detour.max(4.0);
             }
         }
+        stage!("ped.boxes");
         // nobody stands frozen with "go" on a crossing: released from the path's
         // corridor for a moment, the crowd takes them round what holds them (not on a
         // pavement: there they keep to the path, and the jam rule lets them on)
@@ -7642,6 +7671,7 @@ impl Humans {
             }
             p.want_dir = dir;
         }
+        stage!("ped.turns");
         // the crowd of the pavements (passengers outside stand in it as they are)
         let mut walkers: Vec<Walker> = Vec::with_capacity(self.people.len());
         let mut who: Vec<usize> = Vec::with_capacity(self.people.len());
@@ -7686,8 +7716,10 @@ impl Humans {
         let near = crowd::near_any(&blocks, &places, CROWD_BLOCK_REACH);
         let near_idx: Vec<usize> = near.iter().enumerate().filter(|(_, n)| **n).map(|(k, _)| k).collect();
         let near_blocks: Vec<Block> = near_idx.iter().map(|&k| blocks[k]).collect();
+        stage!("ped.walkers");
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
+        stage!("ped.crowd");
         // (the gate's counts: jammed strollers, and anybody inside a moving vehicle's box)
         {
             let moving: Vec<(Block, Option<u64>)> = near_blocks.iter().zip(&near_idx).filter(|(b, _)| b.vel.length() >= 0.5).map(|(b, &k)| (*b, block_car[k].map(|c| cars[c].id))).collect();
@@ -7724,6 +7756,7 @@ impl Humans {
                 }
             }
         }
+        stage!("ped.count");
         let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
         let mut moved = vec![false; self.people.len()];
         for (k, w) in ground {
@@ -7744,6 +7777,7 @@ impl Humans {
                 self.carry(i, dt, &buses, &bus_ix, wants[i].face);
             }
         }
+        stage!("ped.apply");
         self.animate(dt, world, &buses, &bus_ix);
         remove.sort_unstable();
         remove.dedup();
@@ -7756,7 +7790,7 @@ impl Humans {
             self.retire(&p);
         }
         self.give_ticket = false;
-        stage!("pedestrians");
+        stage!("ped.animate");
         taken_ticket
     }
 
