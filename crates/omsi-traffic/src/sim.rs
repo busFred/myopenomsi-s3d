@@ -815,8 +815,13 @@ impl Simulation {
     /// piece's width of its axis) that its rear has not passed, and whose front plus
     /// `speed^2 / (2 decel)` reaches it. A standing claimant is not listed (its body over the
     /// crossing is the kerb's own rule); a vehicle with no claim (on a road away from any
-    /// junction) neither. Read-only; area J may replace the internals (one willPass for the
-    /// resolver and the people), the contract stays.
+    /// junction) neither. Only the claims of the junctions whose lanes the cuts lie on are read.
+    /// The deceleration: SUMO's `maxDecel` is the vType's `decel` (4.5 m/s^2 for a passenger
+    /// car, below its `emergencyDecel` 9), the driver's ordinary hard braking; ours in that role
+    /// is the driver's `comfort_brake` (`Claim::decel`); `MAX_BRAKE` (8 m/s^2) is our emergency
+    /// stop and would let a walker step out in front of a car that must brake that hard.
+    /// Read-only; area J may replace the internals (one willPass for the resolver and the
+    /// people), the contract stays.
     pub fn vehicles_passing_crossing(&self, net: &Network, cuts: &[DVec2]) -> Vec<(u64, f32)> {
         let mut out: Vec<(u64, f32)> = Vec::new();
         if cuts.is_empty() {
@@ -837,8 +842,20 @@ impl Simulation {
             }
             best.filter(|b| b.1 <= (lane.width as f64) * 0.5).map(|b| b.0)
         };
+        // (the junctions whose lanes the cuts lie on)
+        let mut at_cuts: Vec<usize> = Vec::new();
+        for &q in cuts {
+            let cell = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
+            for &l in net.grid.get(&cell).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if let Some(&(j, _)) = self.junctions.of_lane.get(&l) {
+                    if !at_cuts.contains(&j) && along(l, q).is_some() {
+                        at_cuts.push(j);
+                    }
+                }
+            }
+        }
         for (claim, _) in &self.claims {
-            if claim.speed < STANDING_SPEED {
+            if claim.speed < STANDING_SPEED || !at_cuts.contains(&claim.junction) {
                 continue;
             }
             let Some(node) = self.junctions.nodes.get(claim.junction) else { continue };

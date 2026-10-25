@@ -7,11 +7,19 @@ use omsi_traffic::{Claim, Grant, Impatience, Junction, Junctions, Movement, Simu
 /// A junction of one movement (lane 0, along x from 0 to 20 m, 3 m wide) whose crossing cuts
 /// it 12 m in, and a claim on it with its origin `s` along the movement, front/rear 2 m.
 fn sim_with(s: f32, speed: f32) -> (Network, Simulation) {
+    sim_on(0, s, speed)
+}
+
+/// `sim_with` with the claim on movement `m`: 0 the lane the crossing cuts, 1 another arm of
+/// the junction (lane 1, along y at x = 30, which the crossing does not cut).
+fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
     let mut net = Network::default();
     net.lanes.push(LaneBuilder::polyline(vec![DVec3::ZERO, DVec3::new(20.0, 0.0, 0.0)], LaneKind::Street, 3.0));
+    net.lanes.push(LaneBuilder::polyline(vec![DVec3::new(30.0, -20.0, 0.0), DVec3::new(30.0, 20.0, 0.0)], LaneKind::Street, 3.0));
+    net.build_grid();
     let mut sim = Simulation::new(&net, Vec::new());
-    let movement = Movement {
-        lane: 0,
+    let arm = |lane: usize| Movement {
+        lane,
         kind: LaneKind::Street,
         entries: Vec::new(),
         exits: Vec::new(),
@@ -24,8 +32,9 @@ fn sim_with(s: f32, speed: f32) -> (Network, Simulation) {
         converge_with: Vec::new(),
     };
     let mut js = Junctions::default();
-    js.nodes.push(Junction { key: ((0, 0), 1), movements: vec![movement], crossings: Vec::new() });
+    js.nodes.push(Junction { key: ((0, 0), 1), movements: vec![arm(0), arm(1)], crossings: Vec::new() });
     js.of_lane.insert(0, (0, 0));
+    js.of_lane.insert(1, (0, 1));
     sim.junctions = js;
     let claim = Claim {
         yields_now: None,
@@ -33,7 +42,7 @@ fn sim_with(s: f32, speed: f32) -> (Network, Simulation) {
         brake: 5.6,
         vehicle: 0,
         junction: 0,
-        movement: 0,
+        movement: m,
         s,
         speed,
         accel: 0.0,
@@ -56,7 +65,7 @@ fn sim_with(s: f32, speed: f32) -> (Network, Simulation) {
         held: false,
         light_red: false,
         until_go: None,
-        chain: vec![(0, 0.0)],
+        chain: vec![(m, 0.0)],
         lead: None,
         was_standing: false,
         blocked: false,
@@ -98,6 +107,9 @@ fn d7_a_vehicle_that_cannot_stop_short_of_the_crossing_is_passing_it() {
     assert!(over.len() == 1 && over[0].1 < 0.0, "{over:?}");
     // a point off the lane's footprint is no cut of its way
     assert!(passing(0.0, 8.0, &[BESIDE]).is_empty());
+    // a vehicle on another arm of the junction, at speed: its way does not run over the cut
+    let (net, sim) = sim_on(1, 0.0, 12.0);
+    assert!(sim.vehicles_passing_crossing(&net, &[CUT]).is_empty());
 }
 
 // P9-2 ---------------------------------------------------------------------------------
