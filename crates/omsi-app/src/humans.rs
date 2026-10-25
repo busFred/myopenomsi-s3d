@@ -1970,6 +1970,14 @@ fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
     }
 }
 
+/// Whether a stroller at `p` goes: out of sight (`seen_from`) and out of everybody's stroll
+/// radius (`center` and the other players' `others`), where strollers are put down and counted:
+/// past it they are nobody's. (Out to twice the radius they kept wandering, never counted
+/// against a target and never seen, and the people climbed for as long as the player stood.)
+fn stroller_goes(eye: Option<Eye>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
+    !seen_from(eye, center, p) && far_from(center, others, p, STROLL_RADIUS)
+}
+
 /// Is `p` further than `r` from `center` and from every one of `others`?
 fn far_from(center: DVec3, others: &[DVec3], p: DVec3, r: f64) -> bool {
     (p - center).length() > r && others.iter().all(|c| (p - *c).length() > r)
@@ -2070,14 +2078,11 @@ impl DecideCtx<'_> {
         }
         match &p.state {
             State::Strolling(walk) => {
-                let seen = seen_from(self.eye, self.center, p.position);
-                // (a stroller goes only once well out of everybody's range and out of sight)
-                let far = far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS * 2.0);
                 let Some(net) = net else {
                     d.gone = true;
                     return d;
                 };
-                if far && !seen {
+                if stroller_goes(self.eye, self.center, self.lan_centers, p.position) {
                     d.gone = true;
                     return d;
                 }
@@ -6147,9 +6152,17 @@ impl Humans {
             let all_m2: f32 = candidates.iter().map(|(l, m, _)| area(*l, *m)).sum();
             let seen_m2: f32 = targets.iter().filter(|t| !t.source).map(|t| area(t.lane, t.metres)).sum();
             let sources: f32 = targets.iter().filter(|t| t.source).map(|t| t.want).sum();
+            // (the strollers past the radius: in sight, standing still, waiting behind a standing
+            // box with no way past (the jam clock running), looking for a path, past twice it)
+            let past: Vec<&Person> = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_) | State::Standing) && (p.position - center).length() >= STROLL_RADIUS).collect();
+            let past_seen = past.iter().filter(|p| self.seen(p.position)).count();
+            let past_still = past.iter().filter(|p| p.vel.length() < 0.1).count();
+            let past_box = past.iter().filter(|p| p.vel.length() < 0.1 && p.boxes.jam > 0.0).count();
+            let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
+            let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
-                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count()
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
+                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len()
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -11190,6 +11203,19 @@ mod ped_tests {
         // a source point outside the circle: none
         let t = stroll_targets(&ped, &net, &all, &in_reach, &|q: DVec3| q.x > -25.0, rho);
         assert!(t.iter().all(|x| !x.source), "{t:?}");
+    }
+
+    #[test]
+    fn p3c_a_stroller_goes_out_of_sight_past_the_stroll_radius() {
+        // looking north from the origin: behind the player past the radius, gone; in sight past
+        // it, kept; within it, kept; near another player, kept
+        let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
+        let behind = DVec3::new(0.0, -(STROLL_RADIUS + 5.0), 0.0);
+        assert!(stroller_goes(Some(e), DVec3::ZERO, &[], behind));
+        assert!(stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0)), "short of twice the radius");
+        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0)), "in sight");
+        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0)), "within the radius");
+        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind), "near another player");
     }
 
     #[test]
