@@ -240,3 +240,89 @@ fn h85_a_merge_only_join_is_no_box_to_keep_clear() {
         }
     }
 }
+
+/// Three ways through one point (object 9): X eastbound at y = 5 (low priority), Y northbound at
+/// x = 0 (middle), Z eastbound at y = -5 (high): Y crosses both, X and Z nothing of each other.
+fn three_ways() -> Network {
+    let mut net = Network::default();
+    let mut x = piece(&[(-10.0, 5.0), (10.0, 5.0)], 0, LaneKind::Street);
+    x.priority = 64.0;
+    let mut z = piece(&[(-10.0, -5.0), (10.0, -5.0)], 2, LaneKind::Street);
+    z.priority = 192.0;
+    net.lanes.push(x);
+    net.lanes.push(piece(&[(0.0, -10.0), (0.0, 10.0)], 1, LaneKind::Street));
+    net.lanes.push(z);
+    net.link(1.5);
+    net.compute_conflicts();
+    net
+}
+
+/// [round 10 pass 1, 8464ed00] A car in the box at the end of its green that stands refused for a
+/// third vehicle is not committed for the fresh green across its way: Y (in the box, light 1)
+/// stands refused for Z rolling on its way; X on the fresh green (light 0, never green with 1),
+/// which the table makes give way to Y, goes. With Y not refused (no Z), X waits for it.
+#[test]
+fn pass1_a_car_in_the_box_refused_for_a_third_does_not_hold_the_fresh_green() {
+    use omsi_traffic::reservation::{resolve_with, Context};
+    let net = three_ways();
+    let sim = Simulation::new(&net, vec![]);
+    let js = &sim.junctions;
+    let start = |a: usize, b: usize| {
+        let (_, ma) = js.of_lane[&a];
+        let (_, mb) = js.of_lane[&b];
+        js.nodes[0].movements[ma].foes.iter().find(|f| f.movement == mb).unwrap().mine.0
+    };
+    let mut ctx = Context::default();
+    ctx.exclusive.insert((0, 0, 1), true);
+    let mut x = claim_on(&sim, 0, start(0, 1) - 1.0 - 2.0, false);
+    x.vehicle = 1;
+    x.id = 1;
+    x.light = Some((0, 0));
+    let mut y = claim_on(&sim, 1, start(1, 2) - 1.0 - 2.0, true);
+    y.vehicle = 2;
+    y.id = 2;
+    y.light = Some((0, 1));
+    y.refused_last = true;
+    let mut z = claim_on(&sim, 2, start(2, 1) - 8.0 - 2.0, false);
+    z.vehicle = 3;
+    z.id = 3;
+    z.speed = 8.0;
+    z.was_standing = false;
+    z.light = None;
+    let grant = |g: &[Grant], v: usize| *g.iter().find(|g| g.vehicle == v).unwrap();
+    let g = resolve_with(js, &[x.clone(), y.clone(), z], &ctx);
+    assert_eq!(grant(&g, 2).wait_for, Some(3), "Y waits for Z: {g:?}");
+    assert!(grant(&g, 1).go, "X waits for Y, which stands refused in the box: {g:?}");
+    let g = resolve_with(js, &[x, y], &ctx);
+    assert_eq!(grant(&g, 1).wait_for, Some(2), "Y clears the box first: {g:?}");
+}
+
+/// [round 10 pass 1, dbc48899] The ease of a mutual refusal starts only once the resolver has seen
+/// both claims standing: two vehicles standing after `act`, refused for each other, one of whose
+/// claims was filed while it still crawled, are not eased that frame; filed standing, they are.
+#[test]
+fn pass1_a_mutual_refusal_eases_only_once_both_claims_stand() {
+    let net = cross_with_a_zebra();
+    for crawl in [true, false] {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut a = car(1, 0, 3.0, 0.0);
+        let mut b = car(2, 1, 3.0, 0.0);
+        a.last.wait_for = Some(2);
+        b.last.wait_for = Some(1);
+        let mut ca = claim_on(&sim, 0, 3.0, false);
+        ca.vehicle = 0;
+        ca.id = 1;
+        ca.light = None;
+        ca.was_standing = false;
+        ca.speed = if crawl { 0.5 } else { 0.0 };
+        let mut cb = claim_on(&sim, 1, 3.0, false);
+        cb.vehicle = 1;
+        cb.id = 2;
+        cb.light = None;
+        sim.claims = vec![(ca, Grant::refused(0, Some(1), omsi_traffic::Hold::Foe)), (cb, Grant::refused(1, Some(0), omsi_traffic::Hold::Foe))];
+        let mut vs = vec![a, b];
+        sim.negotiate(&mut vs, &[Some(0), Some(1)], DT);
+        let eased = vs.iter().any(|v| v.ease_for.is_some());
+        assert_eq!(eased, !crawl, "claim filed crawling {crawl}: eased {eased}");
+    }
+}
