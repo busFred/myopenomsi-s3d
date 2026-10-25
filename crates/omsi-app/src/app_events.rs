@@ -3203,6 +3203,9 @@ impl ApplicationHandler for App {
                         s.resize(r, size.width, size.height);
                     }
                 }
+                if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+                    self.window_profile();
+                }
                 if finish {
                     self.finish_session();
                 }
@@ -3300,6 +3303,57 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// OMSI_PROFILE: every 30 s of wall time one line with the fps, the stage times (ms per
+    /// frame) and the sizes of the structures a long run could grow, over that window, to
+    /// find which stage and which structure decays a long drive.
+    fn window_profile(&mut self) {
+        const WINDOW_SECS: f64 = 30.0;
+        let Some((t0, f0, p0)) = self.window_mark.as_ref() else {
+            self.window_mark = Some((Instant::now(), self.total_frames, self.profile.clone()));
+            return;
+        };
+        let secs = t0.elapsed().as_secs_f64();
+        if secs < WINDOW_SECS {
+            return;
+        }
+        let frames = self.total_frames.saturating_sub(*f0).max(1) as f64;
+        let stages: Vec<String> = self
+            .profile
+            .iter()
+            .filter_map(|(k, v)| {
+                let ms = (v - p0.get(k).copied().unwrap_or(0.0)) / frames * 1000.0;
+                (ms >= 0.2).then(|| format!("{k} {ms:.1}"))
+            })
+            .collect();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = |key: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .and_then(|l| l.split_whitespace().next())
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or(0.0)
+                / 1024.0
+        };
+        // (the machine's own load, to tell a stage that grows from one that waits for other
+        // processes)
+        let load = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|l| l.split_whitespace().next().map(str::to_owned))
+            .unwrap_or_default();
+        let people = self.humans.as_ref().map_or(0, |h| h.people.len());
+        let traffic = self.traffic.as_ref().map(|t| t.sizes()).unwrap_or_default();
+        log::info!(
+            "profile window: t {:.0} s, {:.1} fps over {secs:.1} s; ms per frame: {}; machine load {load}; people {people}; {traffic}; RSS {:.0} MB (peak {:.0} MB)",
+            self.started.elapsed().as_secs_f64(),
+            frames / secs,
+            stages.join(", "),
+            kb("VmRSS:"),
+            kb("VmHWM:")
+        );
+        self.window_mark = Some((Instant::now(), self.total_frames, self.profile.clone()));
+    }
+
     /// The window's size in pixels, while the mirror panels can be worked (in the cab, no menu).
     pub(crate) fn mirror_hud_size(&self) -> Option<(f32, f32)> {
         if !self.in_cab || self.game_menu.is_some() || !self.mirror_hud.editing() {
