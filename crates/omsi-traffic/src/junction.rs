@@ -208,8 +208,9 @@ impl Junctions {
             for c in &net.crossings[a] {
                 let b = c.other;
                 // (a meeting place between lanes of no one object: a lane join, or lanes
-                // converging side by side before one, `Network::compile_joins`; or two lanes
-                // crossing outside any one object, `Network::compile_lane_crossings`. The swept
+                // converging side by side before one, `Network::compile_joins`, or anywhere,
+                // `Network::compile_outside_converging`; or two lanes crossing outside any one
+                // object, `Network::compile_lane_crossings`. The swept
                 // path of an object's piece over a lane leading into it, `compile_swept`, leaves
                 // that lane an approach: its queue stands there.)
                 if b <= a || b >= net.lanes.len() {
@@ -783,6 +784,36 @@ mod tests {
         let bridge = build(None, 6.0);
         assert!(bridge.crossings[0].is_empty());
         assert!(Junctions::compile(&bridge).nodes.is_empty());
+    }
+
+    /// Two spline roads drawn over each other with no object and no link between them (X10's
+    /// parallel ramp splines under a metre apart): a side merge in one junction table, a zipper
+    /// between equals. Two splines' lanes side by side as a road's lanes (2.4 m apart, 3 m wide)
+    /// and two lanes forking from one lane get none.
+    #[test]
+    fn two_roads_over_each_other_with_no_object_merge_but_a_road_s_lanes_and_a_fork_do_not() {
+        let build = |gap: f64, fork: bool| {
+            let mut net = Network::default();
+            net.lanes.push(road((0.0, 0.0), (100.0, 0.0), 1)); // 0
+            // 1: from 5 m on, or from 0's start (2 leads into both: a fork)
+            net.lanes.push(road((if fork { 0.0 } else { 5.0 }, gap), (100.0, gap), 2));
+            net.lanes.push(road((-50.0, 0.0), (0.0, 0.0), 3)); // 2: leads into 0
+            net.link(1.5);
+            net.compute_conflicts();
+            net
+        };
+        let net = build(0.8, false);
+        let c = net.crossings[0].iter().find(|c| c.other == 1).expect("a side merge");
+        assert!(c.merge && c.side && !c.outside);
+        let js = Junctions::compile(&net);
+        assert_eq!(js.nodes.len(), 1);
+        let j = &js.nodes[0];
+        let m0 = j.movement_of(0).unwrap();
+        let f = j.movements[m0].foes.iter().find(|f| j.movements[f.movement].lane == 1).expect("a foe");
+        assert_eq!(f.kind, FoeKind::Merge);
+        assert!(js.is_zipper(0, m0, f));
+        assert!(build(2.4, false).crossings[0].is_empty(), "a road's lanes");
+        assert!(build(0.8, true).crossings[0].iter().all(|c| c.other != 1), "a fork");
     }
 
     /// A spline road drawn across a piece of a crossing object it does not lead into: the pair

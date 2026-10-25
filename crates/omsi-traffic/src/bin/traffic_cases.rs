@@ -98,6 +98,7 @@ fn main() {
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("joins") if args.len() >= 3 => joins(&args[2..]),
         Some("crossings") if args.len() >= 3 => crossings(&args[2..]),
+        Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -5282,6 +5283,10 @@ fn crossings(args: &[String]) -> Res<()> {
             }
         }
         println!("  other crossings between lanes of no one object (swept paths): {swept}, in no junction table {swept_untabled}");
+        // (the side merges between lanes of no one object: before a join, `compile_joins`, or
+        // anywhere, `compile_outside_converging`)
+        let side = (0..net.crossings.len()).map(|a| net.crossings[a].iter().filter(|c| c.side && c.other > a && !(net.lanes[a].source == 2 && net.lanes[c.other].source == 2 && net.lanes[a].key.map(|k| (k.tile, k.id)) == net.lanes[c.other].key.map(|k| (k.tile, k.id)))).count()).sum::<usize>();
+        println!("  side merges between lanes of no one object: {side}");
         let cats: Vec<String> = cats.iter().map(|(k, v)| format!("{k} {v}")).collect();
         println!(
             "{}: {} lane crossings outside the objects ({header_found} on the recorded header), {in_table} in a junction's foe table; {}; detection {whole_ms:.1} ms over {} lanes, per tile batch {:.2} ms mean / {batch_max:.2} ms max over {batches}",
@@ -5291,6 +5296,84 @@ fn crossings(args: &[String]) -> Res<()> {
             net.lanes.len(),
             if batches > 0 { batch_ms / batches as f64 } else { 0.0 }
         );
+    }
+    Ok(())
+}
+
+/// `converge_outside <fixture>... [--list]`: street lanes of no one crossing object (or of two
+/// different ones) that run side by side closer than a car is wide (`converging_stretch`, the
+/// same way within `CONVERGE_HEADING`) with no meeting place between them and no link within three
+/// lanes - the merges without an object that neither `compile_joins` (a shared lane after them, or
+/// two links back from one) nor an object's `add_converging` compiles. Lanes of one spline, and
+/// neighbours (`left`/`right`), are a road's lanes, not a merge.
+fn converge_outside(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let (r, _) = grown(Path::new(f), true)?;
+        let net = &r.net;
+        let street = |l: &omsi_sim::traffic::Lane| l.kind == LaneKind::Street && l.points.len() >= 2;
+        let object = |l: &omsi_sim::traffic::Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
+        let spline = |l: &omsi_sim::traffic::Lane| l.key.filter(|_| l.source == 1).map(|k| (k.tile, k.id));
+        let within = |from: usize, to: usize| {
+            let mut at = vec![from];
+            for _ in 0..3 {
+                at = at.iter().flat_map(|&l| net.lanes[l].next.iter().copied()).collect();
+                if at.contains(&to) {
+                    return true;
+                }
+            }
+            false
+        };
+        let (mut close, mut edges) = (0usize, 0usize);
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for i in 0..net.lanes.len() {
+            let a = &net.lanes[i];
+            if !street(a) {
+                continue;
+            }
+            let mut near: Vec<usize> = omsi_sim::traffic::Network::lane_cells(a).iter().flat_map(|c| net.grid.get(c).cloned().unwrap_or_default()).filter(|&j| j < i).collect();
+            near.sort_unstable();
+            near.dedup();
+            for j in near {
+                let b = &net.lanes[j];
+                if !street(b) || (object(a).is_some() && object(a) == object(b)) || (spline(a).is_some() && spline(a) == spline(b)) {
+                    continue;
+                }
+                if a.left == Some(j) || a.right == Some(j) || b.left == Some(i) || b.right == Some(i) || a.key.is_some() && a.key == b.key {
+                    continue;
+                }
+                if net.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) || within(i, j) || within(j, i) || (a.start() - b.start()).truncate().length() <= 0.5 {
+                    continue;
+                }
+                let Some(((a0, a1), (b0, b1), least)) = omsi_sim::traffic::converging_stretch(a, b) else { continue };
+                if omsi_sim::traffic::wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > omsi_sim::traffic::CONVERGE_HEADING {
+                    continue;
+                }
+                let lvl = (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs();
+                if lvl > omsi_sim::traffic::LEVEL_DZ {
+                    continue;
+                }
+                let tight = least < omsi_sim::traffic::CONVERGE_DIST;
+                // (what the pair is: a fork - the two leave one lane, or a lane of one leads
+                // into a lane the other leaves -, a lane ending on the other with no way on, or
+                // two ways coming together that never join)
+                let pv = |l: usize| net.prev.get(l).cloned().unwrap_or_default();
+                let fork = pv(i).iter().any(|p| pv(j).contains(p)) || pv(i).iter().any(|&p| within(p, j)) || pv(j).iter().any(|&p| within(p, i));
+                let kind = if fork { "fork" } else if a.next.is_empty() || b.next.is_empty() { "dead-end" } else { "other" };
+                *kinds.entry(kind).or_insert(0usize) += 1;
+                if tight {
+                    close += 1;
+                } else {
+                    edges += 1;
+                }
+                if list {
+                    let p = a.at((a0 + a1) * 0.5).0;
+                    let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
+                    println!("  {kind} {} {i} ({}) {a0:.1}-{a1:.1} of {:.1} | {j} ({}) {b0:.1}-{b1:.1} of {:.1}; least {least:.2} m, widths {:.1}/{:.1}, at ({:.1}, {:.1}); next {:?} / {:?}", if tight { "close" } else { "edges" }, name(a), a.length(), name(b), b.length(), a.width, b.width, p.x, p.y, a.next, b.next);
+                }
+            }
+        }
+        println!("{f}: side by side outside one object with no meeting place: {close} with centre lines under CONVERGE_DIST, {edges} by the edges only; {kinds:?}");
     }
     Ok(())
 }
