@@ -130,6 +130,13 @@ enum Along {
 // with no corridor any side is taken. The turn cap (P5) makes pacers stand (vel 0) up to 5 s
 // instead of turning, still inside a bus's strip if they were there.
 fn along_box(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Along {
+    along_box_off(b, here, dir, corridor, &|_| true)
+}
+
+/// `along_box`, the way beside the box only where `off_lanes` holds for it ([P1i]: off every
+/// street lane's footprint and a body), as close beside the box as a body passes (`PASS_BY`)
+/// when the usual `CLEAR` would not fit.
+fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DVec2, f64)>, off_lanes: &dyn Fn(DVec2) -> bool) -> Along {
     const CLEAR: f64 = 0.5;
     let f = DVec2::new(b.heading.sin(), b.heading.cos());
     if f.dot(dir).abs() < 0.7 {
@@ -156,10 +163,19 @@ fn along_box(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DVec2,
     };
     let mut sides = [c_n - e_n - CLEAR, c_n + e_n + CLEAR];
     sides.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
-    let Some(x) = sides.into_iter().find(|x| fits(*x)) else { return Along::NoRoom };
+    let near_sides = [c_n - e_n - PASS_BY, c_n + e_n + PASS_BY];
+    let ok = |x: f64| fits(x) && off_lanes(here + n * x);
+    let Some(x) = sides.into_iter().chain(near_sides).find(|x| ok(*x)) else { return Along::NoRoom };
     let near = (c_d - e_d).max(0.3);
     Along::Route([here + n * x + fd * near, here + n * x + fd * (c_d + e_d + 0.8)])
 }
+
+/// [P1i] How far beside a box's flank (m) a walker passes it where the usual half metre would
+/// take them into a street lane: a body and a hand's breadth (BODY_OUTSIDE + 0.05).
+const PASS_BY: f64 = BODY_OUTSIDE + 0.05;
+/// [P1i] How far off the line of the way past a box (m) the crowd may push a pavement walker: a
+/// hand's breadth.
+const ROUTE_DEV: f64 = 0.05;
 
 /// How far off the path's corridor (m) a way past a standing box may lie (`along_box`, and
 /// [P1c] the corridor a pavement walker keeps on it).
@@ -220,6 +236,8 @@ struct BoxWait {
     /// [ROLLBACK around-86] Going round a standing bus or lorry: the two corners of its box to
     /// walk through (the near end, the far side of it), the one on its way and the seconds left.
     around: Option<([DVec2; 2], usize, f32)>,
+    /// [P1i] The way round is held to its line (`ROUTE_DEV`), not the path's corridor.
+    line: bool,
 }
 
 /// What `past_boxes` leaves to its caller.
@@ -241,7 +259,7 @@ enum BoxOutcome {
 /// they wait behind the box in the path (SUMO's sidewalk stripes: posLat never leaves the own
 /// lane), on a crossing they stand `PED_GO_FROZEN` and are planned again (`Stuck`).
 #[allow(clippy::too_many_arguments)]
-fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool, on_pavement: bool, want: &mut Want, blocks: &[Block], grid: &crowd::BlockGrid, block_car: &[Option<usize>], cars: &[SeenCar], dt: f32) -> BoxOutcome {
+fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool, on_pavement: bool, want: &mut Want, blocks: &[Block], grid: &crowd::BlockGrid, block_car: &[Option<usize>], cars: &[SeenCar], off_lanes: &dyn Fn(DVec2) -> bool, dt: f32) -> BoxOutcome {
     let wv = want.vel;
     let speed = wv.length();
     if speed < 0.2 {
@@ -304,7 +322,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     let mut no_room = false;
     let mut route = None;
     for b in blocks.iter().filter(big) {
-        match along_box(b, here, dir, want.corridor) {
+        match along_box_off(b, here, dir, want.corridor, if on_pavement { off_lanes } else { &|_| true }) {
             Along::Route(wp) => {
                 route = Some(wp);
                 break;
@@ -323,6 +341,10 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     }
     if let Some(wp) = route {
         bw.around = Some((wp, 0, 12.0));
+        // ([P1i] on a pavement the way past holds them on its line: pushed off the box by the
+        // crowd's avoidance up to the path's edge, they stood in the street lane beside, Wuluju
+        // lanes 1026/1328/1344, cars held 120-160 s)
+        bw.line = on_pavement;
         *detour = detour.max(0.3);
         want.vel = (wp[0] - here).normalize_or_zero() * speed;
         bw.car_wait = 0.0;
@@ -4303,6 +4325,8 @@ pub struct Humans {
     /// [P1e] Counted for the gate (`summary`): person-seconds of strollers jammed, and of
     /// people on foot inside the box of a vehicle moving at 0.5 m/s or more (none should be).
     jam_stats: (f64, f64),
+    /// The (person, vehicle) pairs already logged inside a moving vehicle's box.
+    inside_seen: HashSet<(u32, u64)>,
     /// Where the time of this tick went (stage, ms since the one before), for the slow
     /// ticks OMSI_PROFILE reports.
     tick_stages: Vec<(&'static str, f64)>,
@@ -4544,6 +4568,7 @@ impl Humans {
             message: None,
             tick_stats: (0, 0.0, 0.0),
             jam_stats: (0.0, 0.0),
+            inside_seen: HashSet::new(),
             tick_stages: Vec::new(),
             bus_motion: HashMap::new(),
             map_humans_done: false,
@@ -7384,7 +7409,9 @@ impl Humans {
                 continue;
             }
             let (here, on_crossing, on_pavement) = (p.position.truncate(), p.on_crossing, pavement_walker(p));
-            if past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, &mut wants[i], &blocks, &block_grid, &block_car, &cars, dt) == BoxOutcome::Stuck {
+            let z = p.position.z;
+            let off_lanes = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY));
+            if past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, &mut wants[i], &blocks, &block_grid, &block_car, &cars, &off_lanes, dt) == BoxOutcome::Stuck {
                 // ([ROLLBACK r4c-P6] on a crossing just off the kerb: back to it)
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
                     if let Some(c) = walk.cross.filter(|c| c.on(walk.leg) && !c.back) {
@@ -7460,6 +7487,7 @@ impl Humans {
                 // ([P1c] on a pavement the path holds them even on the way past a box: widened
                 // by what `along_box` lets a route lie off it)
                 corridor: match (p.detour > 0.0, pavement_walker(p)) {
+                    _ if p.boxes.line && p.boxes.around.is_some() => p.boxes.around.map(|(wp, _, _)| (wp[0], wp[1], ROUTE_DEV)),
                     (false, _) => w.corridor,
                     (true, true) => w.corridor.map(|(a, b, dev)| (a, b, dev + ALONG_FIT)),
                     (true, false) => None,
@@ -7470,20 +7498,40 @@ impl Humans {
         // [r9 C1] (by a grid of the walkers: the same blocks as testing each against all of them)
         let places: Vec<DVec2> = walkers.iter().map(|w| w.pos).collect();
         let near = crowd::near_any(&blocks, &places, CROWD_BLOCK_REACH);
-        let near_blocks: Vec<Block> = blocks.into_iter().zip(near).filter(|(_, n)| *n).map(|(b, _)| b).collect();
+        let near_idx: Vec<usize> = near.iter().enumerate().filter(|(_, n)| **n).map(|(k, _)| k).collect();
+        let near_blocks: Vec<Block> = near_idx.iter().map(|&k| blocks[k]).collect();
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
         // ([P1e] the gate's counts: jammed strollers, and anybody inside a moving vehicle's box)
         {
-            let moving: Vec<Block> = near_blocks.iter().copied().filter(|b| b.vel.length() >= 0.5).collect();
-            let grid = crowd::BlockGrid::new(&moving, 0.0, crowd::BLOCK_CELL);
+            let moving: Vec<(Block, Option<u64>)> = near_blocks.iter().zip(&near_idx).filter(|(b, _)| b.vel.length() >= 0.5).map(|(b, &k)| (*b, block_car[k].map(|c| cars[c].id))).collect();
+            let boxes: Vec<Block> = moving.iter().map(|m| m.0).collect();
+            let grid = crowd::BlockGrid::new(&boxes, 0.0, crowd::BLOCK_CELL);
             for (k, w) in g.iter().enumerate() {
                 let p = &self.people[who[k]];
                 if p.boxes.jammed {
                     self.jam_stats.0 += dt as f64;
                 }
-                if grid.any_near(w.pos, |b| moving[b].closest(w.pos).1) {
+                let mut hit = None;
+                grid.for_each_near(w.pos, |b| {
+                    if hit.is_none() && boxes[b].closest(w.pos).1 {
+                        hit = Some(b);
+                    }
+                });
+                if let Some(b) = hit {
                     self.jam_stats.1 += dt as f64;
+                    // (each person and vehicle once, for the diagnosis of the count)
+                    let car = moving[b].1;
+                    if self.inside_seen.len() < 20000 && self.inside_seen.insert((p.id, car.unwrap_or(u64::MAX))) {
+                        let leg = match &p.state {
+                            State::Strolling(walk) => walk.legs.get(walk.leg).map(|l| l.lane),
+                            _ => None,
+                        };
+                        log::info!(
+                            "t={:.1} inside a moving vehicle: person {} ({}) at ({:.1}, {:.1}) vel ({:.2}, {:.2}) crossing {} decision {:?} leg {:?} jammed {} step_out {}; vehicle {:?} speed {:.1} heading {:.0}",
+                            self.time, p.id, p.state.name(), w.pos.x, w.pos.y, w.vel.x, w.vel.y, p.on_crossing, p.last_decision, leg, p.boxes.jammed, p.step_out.is_some(), car, boxes[b].vel.length(), boxes[b].heading.to_degrees()
+                        );
+                    }
                 }
             }
         }
@@ -11330,7 +11378,7 @@ mod ped_tests {
         for _ in 0..frames {
             let mut want = Want { vel: DVec2::new(1.3, -pos.y), face: None, give: 1.0, corridor, idle: Activity::Stand };
             want.vel = want.vel.normalize() * 1.3;
-            past_boxes(&mut bw, &mut detour, pos, false, true, &mut want, blocks, &grid, block_car, cars, 0.1);
+            past_boxes(&mut bw, &mut detour, pos, false, true, &mut want, blocks, &grid, block_car, cars, &|_| true, 0.1);
             pos += want.vel * 0.1;
             let dev = if detour > 0.0 { 0.75 + ALONG_FIT } else { 0.75 };
             pos.y = pos.y.clamp(-dev, dev);
@@ -11362,6 +11410,27 @@ mod ped_tests {
         // (then on at 0.25 of 1.3 m/s, through it and beyond: jammed 300 s after they stopped)
         assert!(at(310.0).x > at(290.0).x + 1.0, "not squeezing on: {:?}", at(310.0));
         assert!(at(328.0).x > 5.0 + 2.3, "squeezed past by 328 s: {:?}", at(328.0));
+    }
+
+    #[test]
+    fn p1i_a_parked_car_on_the_path_is_passed_beside_it_but_never_inside_the_street_lane() {
+        // Wuluju 1026/1027: the map's cars parked on the 3 m footpath's line, the 1 m street lane
+        // 2.9 m off (here 2.6 m): the way past keeps off the lane's footprint and a body (y > -1.07)
+        // and within the path, hugging the car (PASS_BY) where the usual half metre does not fit
+        let parked = Block { center: DVec2::new(5.0, 0.3), half: DVec2::new(0.95, 2.3), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let corridor = Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.5));
+        let off = |q: DVec2| q.y > -2.6 + 1.25 + 0.28;
+        let Along::Route(wp) = along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, corridor, &off) else { panic!("no way past") };
+        assert!(wp.iter().all(|q| off(*q)), "{wp:?}");
+        // (the half metre fits on neither side - the lane, the path's edge - a body beside it does,
+        // on the side away from the lane)
+        assert!((wp[0].y - (0.3 + 0.95 + PASS_BY)).abs() < 1e-6, "{wp:?}");
+        // no lane beside: the usual half metre
+        let Along::Route(wp) = along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, corridor, &|_| true) else { panic!() };
+        assert!((wp[0].y - (0.3 - 0.95 - 0.5)).abs() < 1e-6, "{wp:?}");
+        // the lane too close for a body beside the car: no room
+        let tight = |q: DVec2| q.y > -1.2 + 1.25 + 0.28;
+        assert_eq!(along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.0)), &tight), Along::NoRoom);
     }
 
     #[test]
