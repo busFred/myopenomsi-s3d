@@ -1845,7 +1845,7 @@ impl PedLights for Traffic {
 
 /// [r9 C2] The traffic's lights and crossings as the people on foot read them, without the
 /// rest of `Traffic` (its vehicles cannot be shared between the threads of the people's
-/// read phase): what `Traffic::light_state`, `light_until_go` and `crossing_light` read.
+/// read phase): the light programs' states and the crossings' lights, from the simulation.
 #[derive(Clone, Copy)]
 struct LightsOf<'a> {
     sim: &'a omsi_traffic::Simulation,

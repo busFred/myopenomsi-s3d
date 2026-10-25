@@ -4850,25 +4850,6 @@ impl Traffic {
             .map(|c| (c.vehicle.position, c.vehicle.heading))
     }
 
-    /// State of light `li` of controller `c` now and the seconds it keeps showing it (the
-    /// pedestrians only start across on a green that lasts).
-    pub fn light_state(&self, c: usize, li: usize) -> Option<(i32, f32)> {
-        let ctl = self.sim.lights.get(c)?;
-        Some((ctl.state(li), ctl.remaining(li)))
-    }
-
-    /// Seconds until light `li` of controller `c` lets traffic go (0 while it does).
-    pub fn light_until_go(&self, c: usize, li: usize) -> Option<f32> {
-        self.sim.lights.get(c)?.time_until_go(li)
-    }
-
-    /// The light that governs footpath lane `lane`: its own, else the light of the
-    /// pedestrian crossing it is a piece of (the unlit pieces over the lanes beyond the lit
-    /// stub at the kerb, BeijingCity).
-    pub fn crossing_light(&self, lane: usize) -> Option<(usize, usize)> {
-        self.sim.crossing_light(&self.net, lane)
-    }
-
     /// Tell a scheduled bus's script who wants in or out (`PAX_Entry<i>_Req`,
     /// `PAX_Exit<i>_Req`) and who stands in its doorways (`_Busy`): the stock AI door
     /// scripts open the rear doors only for a stop request, which comes from the exit
