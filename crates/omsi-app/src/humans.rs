@@ -7429,6 +7429,8 @@ impl Humans {
             })
             .unwrap_or_default();
         let standing_grid = crowd::BlockGrid::new(&standing, BODY_OUTSIDE, crowd::BLOCK_CELL);
+        // (their waiting place moves with them: the passengers' engine keeps them at it)
+        let mut places: Vec<(i64, usize, DVec2)> = Vec::new();
         for p in self.people.iter_mut() {
             let State::Pax(x) = &mut p.state else { continue };
             if x.inside.is_some() || x.task != pax::Task::WaitingForBus || p.place != Place::Ground {
@@ -7453,6 +7455,15 @@ impl Humans {
                 x.pos.y += d.y;
                 p.position.x = to.x;
                 p.position.y = to.y;
+                if let (Some(stop), Some(k)) = (x.stop, x.spot) {
+                    places.push((stop, k, d));
+                }
+            }
+        }
+        for (stop, k, d) in places {
+            if let Some(sp) = self.stops.get_mut(&stop).and_then(|s| s.spots.get_mut(k)) {
+                sp.pos.x += d.x;
+                sp.pos.y += d.y;
             }
         }
         // [ROLLBACK r4c-P4] how long each vehicle has stood; the yields to those that move again end
