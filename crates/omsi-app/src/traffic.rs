@@ -208,7 +208,8 @@ struct EdgeFlag {
     /// Metres from its front to where `plan` rule 10b would stop it at the loaded tiles' edge,
     /// if its way ahead ends there (None: not heading for the edge).
     d_end: Option<f32>,
-    /// Beyond its perceptual horizon (`Viewer::beyond_horizon`; never with the lamps lit).
+    /// Beyond its perceptual horizon (`Viewer::beyond_horizon`; with the lamps lit only beyond
+    /// the draw distance).
     beyond: bool,
     blinker: i32,
     braking: bool,
@@ -476,8 +477,12 @@ pub struct Viewer {
     /// [round 9 A2 fix pass 1] The vertical field of view the horizon is reckoned with
     /// (radians): the camera's, or a triple screen's centre panel's when narrower (0: `fov`).
     pub horizon_fov: f64,
-    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (`Viewer::with_lamps`): no horizon.
+    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (`Viewer::with_lamps`): no two-pixel
+    /// horizon, only the draw distance.
     pub lamps_lit: bool,
+    /// The draw distance (m): the view distance the tiles are loaded to; nothing farther is in
+    /// the picture (0: not known; `Viewer::with_draw_distance`).
+    pub draw_dist: f64,
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
@@ -540,7 +545,14 @@ impl Viewer {
             px_height: 0.0,
             horizon_fov: 0.0,
             lamps_lit: false,
+            draw_dist: 0.0,
         }
+    }
+
+    /// The draw distance (m, the view distance): the horizon never lies beyond it.
+    pub fn with_draw_distance(mut self, dist: Option<f64>) -> Viewer {
+        self.draw_dist = dist.unwrap_or(0.0);
+        self
     }
 
     /// [round 9 A2] The picture's height in pixels (the window's, or the offscreen image's),
@@ -554,29 +566,34 @@ impl Viewer {
     }
 
     /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (dusk, night, gloom): a lamp is drawn
-    /// at a few pixels at any distance, so nothing is beyond the horizon.
+    /// at a few pixels at any distance, so only the draw distance bounds the horizon.
     pub fn with_lamps(mut self, lit: bool) -> Viewer {
         self.lamps_lit = lit;
         self
     }
 
-    /// [round 9 A2] The perceptual horizon (m) of a body `height` (m) high: farther off it covers
-    /// fewer than `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit
-    /// of the image plane, the vertical field of view `horizon_fov`) and is a dot the player
-    /// cannot tell from nothing. One measure for both ways: beyond it a random car may be woken
-    /// in frame (`Traffic::may_appear_car`) and a car reaching the loaded tiles' edge ends its
-    /// trip there in frame (`omsi_traffic::removal::goes_far`). With the picture's height
-    /// unknown, the documented `VISIBLE_RANGE` scaled from a car's height. [fix pass 1] With the
-    /// lamps lit, none (infinite): a lamp keeps a few pixels at any distance.
+    /// The perceptual horizon (m) of a body `height` (m) high: the nearer of the two-pixel
+    /// distance and the draw distance. Farther than the two-pixel distance the body covers fewer
+    /// than `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit of the
+    /// image plane, the vertical field of view `horizon_fov`) and is a dot the player cannot tell
+    /// from nothing; farther than the draw distance (`draw_dist`, the view distance; the
+    /// renderer's `max_dist` when nearer) nothing is drawn at all. One measure for every use:
+    /// beyond it a random car may be woken in frame (`Traffic::may_appear_car`), a car reaching
+    /// the loaded tiles' edge ends its trip there in frame (`omsi_traffic::removal::goes_far`), an
+    /// edge is out of sight (`Traffic::mark_edges_in_sight`) and the tiles are prefetched past it
+    /// (`prefetch_target`). With the picture's height unknown the two-pixel distance is the
+    /// documented `VISIBLE_RANGE` scaled from a car's height; with the lamps lit there is none (a
+    /// lamp keeps a few pixels at any distance) and only the draw distance remains.
     pub fn horizon(&self, height: f64) -> f64 {
-        if self.lamps_lit {
-            return f64::INFINITY;
-        }
-        if self.px_height <= 0.0 {
-            return VISIBLE_RANGE * height / CAR_HEIGHT;
-        }
-        let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
-        height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
+        let two_pixels = if self.lamps_lit {
+            f64::INFINITY
+        } else if self.px_height <= 0.0 {
+            VISIBLE_RANGE * height / CAR_HEIGHT
+        } else {
+            let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
+            height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
+        };
+        [self.draw_dist, self.max_dist].into_iter().filter(|d| *d > 0.0).fold(two_pixels, f64::min)
     }
 
     /// [round 9 A2] Is a body `height` (m) high, `dist` (m) from the eye, beyond its horizon -
@@ -2104,6 +2121,7 @@ impl Traffic {
                     px_height: 0.0,
                     horizon_fov: 0.0,
                     lamps_lit: false,
+                    draw_dist: 0.0,
                 });
             }
         }
@@ -5279,8 +5297,9 @@ fn edge_bound_of(net: &Network) -> hashbrown::HashSet<usize> {
 }
 
 /// The horizon `prefetch_target` keeps the edge beyond: a body `height` high with its lamps dark
-/// (lit lamps have no horizon and no loaded area reaches that far), never within `NEAR_HIDE`
-/// (as `Viewer::beyond_horizon`: the far trip end acts beyond both).
+/// (a lit lamp has no two-pixel distance), capped by the draw distance as every horizon is (so
+/// the reach is at most the view distance plus one tile load), never within `NEAR_HIDE` (as
+/// `Viewer::beyond_horizon`: the far trip end acts beyond both).
 fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
     Viewer { lamps_lit: false, ..viewer }.horizon(height).max(NEAR_HIDE)
 }
@@ -5323,8 +5342,8 @@ impl Traffic {
 
     /// [round 10 S4] Mark each loaded-edge lane in sight or not (`Lane::edge_in_sight`): its end
     /// within the perceptual horizon of the eye (`Viewer::horizon` of the tallest random-traffic
-    /// body, never within NEAR_HIDE; none while the lamps are lit, so then every edge is in
-    /// sight), and with the flags changed gather `edge_bound` again. Only an edge in sight is
+    /// body, never within NEAR_HIDE; only the draw distance while the lamps are lit, so then
+    /// every edge within it is in sight), and with the flags changed gather `edge_bound` again. Only an edge in sight is
     /// routed away from and kept clear of new cars (A4); beyond the horizon a car drives to it
     /// and its trip ends there out of sight (the far trip end, A2), as a SUMO vehicle leaves the
     /// network at its border. Before the first frame (no eye) every edge counts as in sight.
@@ -5931,7 +5950,7 @@ mod respawn_sight_tests {
 
     /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
     fn viewer() -> Viewer {
-        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, draw_dist: 0.0 }
     }
 
     /// [ROLLBACK r4d-B2] A bus is taken off the road by the rule it comes back by: never
@@ -5963,7 +5982,8 @@ mod respawn_sight_tests {
     /// with a 60 degree field of view at 585 m (r8-jzk's tile-edge queue at 869 m was 1.3 rows),
     /// at 701 m on 1080 lines; a 3 m bus twice as far; with the picture's height unknown it is
     /// VISIBLE_RANGE for a car. [fix pass 1] Never within NEAR_HIDE however small the picture;
-    /// none at all with the lamps lit; a triple screen's narrower centre panel pushes it out.
+    /// none at all with the lamps lit and the draw distance unknown; a triple screen's narrower
+    /// centre panel pushes it out.
     #[test]
     fn a2_the_horizon_is_where_a_body_is_two_pixel_rows() {
         use super::{VISIBLE_RANGE, CAR_HEIGHT, DOT_PIXELS};
@@ -6022,7 +6042,7 @@ mod prefetch_tests {
     /// the dark horizon (no area reaches a lamp's), a tiny one NEAR_HIDE, a bus twice the car's.
     #[test]
     fn the_reach_is_the_horizon_plus_one_load_at_the_road_speed() {
-        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }.with_screen(900, None);
+        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, draw_dist: 0.0 }.with_screen(900, None);
         let h = edge_horizon(v, CAR_HEIGHT);
         assert!((h - 584.6).abs() < 0.5, "{h}");
         assert_eq!(edge_horizon(v.with_lamps(true), CAR_HEIGHT), h, "lit lamps: the dark horizon");
@@ -6033,6 +6053,16 @@ mod prefetch_tests {
         assert_eq!(prefetch_target(h, 0.0, 3.0), h, "standing: the horizon");
         assert_eq!(prefetch_target(h, -5.0, 1.0), h, "no negative speed");
         assert_eq!(prefetch_target(h, 10.0, 0.0), h, "no load measured yet");
+        // the horizon is the nearer of the two-pixel distance and the draw distance: at a view
+        // distance of 600 m a 4.4 m double-decker's (1715 m) is 600 m and the reach 600 m plus one
+        // load; at 2500 m it is the two-pixel distance
+        let low = v.with_draw_distance(Some(600.0));
+        assert_eq!(edge_horizon(low, 4.4), 600.0);
+        assert_eq!(low.with_lamps(true).horizon(CAR_HEIGHT), 600.0, "lit lamps: the draw distance");
+        assert!((prefetch_target(edge_horizon(low, 4.4), 50.0 / 3.6, 1.2) - 616.67).abs() < 0.01);
+        let far = v.with_draw_distance(Some(2500.0));
+        assert!((edge_horizon(far, 4.4) - 4.4 / CAR_HEIGHT * h).abs() < 1e-6, "{}", edge_horizon(far, 4.4));
+        assert!(far.with_lamps(true).horizon(CAR_HEIGHT) == 2500.0);
     }
 }
 

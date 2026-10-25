@@ -66,7 +66,9 @@ pub(crate) fn lan_outlines(game: &lan::LanGame) -> Vec<(u32, traffic::PlayerBox)
 }
 
 /// What the traffic needs to know every frame besides the time: where the player looks
-/// from, the day of the week, who walks the footpaths, what hides what.
+/// from and how far the picture reaches (`draw_dist`, the view distance the tiles are streamed
+/// to; None with a fixed set of tiles), the day of the week, who walks the footpaths, what hides
+/// what.
 pub(crate) fn traffic_inputs(
     t: &mut traffic::Traffic,
     cam: Option<&Camera>,
@@ -78,11 +80,13 @@ pub(crate) fn traffic_inputs(
     humans: Option<&humans::Humans>,
     player: Option<&Player>,
     render: &omsi_render::RenderOptions,
+    draw_dist: Option<f64>,
 ) {
     if let Some(c) = cam {
         t.viewer = Some(
             traffic::Viewer::new(c, aspect, fog)
                 .with_screen(screen.0, screen.1)
+                .with_draw_distance(draw_dist)
                 .with_lamps(t.lamps_lit())
                 .with_extent(extent)
                 .with_culling(render.min_obj_size, render.max_obj_dist),

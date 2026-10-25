@@ -597,6 +597,7 @@ impl ApplicationHandler for App {
                         self.humans.as_ref(),
                         self.player.as_ref(),
                         &r.options,
+                        self.streamer.as_ref().map(|s| s.view_radius()),
                     );
                     // [ROLLBACK clockjump-93] a time set by hand: the timetable's buses are put out anew
                     if let Some(s) = self.schedule.as_mut().filter(|_| self.args.schedule) {

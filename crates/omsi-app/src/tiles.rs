@@ -960,6 +960,11 @@ impl Streamer {
         s
     }
 
+    /// The view distance asked for (m): the draw distance the traffic's horizon is capped by.
+    pub fn view_radius(&self) -> f64 {
+        self.view_radius
+    }
+
     /// The traffic's prefetch reach (m, `Traffic::prefetch_reach`): the tiles are loaded at
     /// least this far round every point, the view distance being the least. The loaded
     /// tiles' edge is where the traffic network ends without being the map's end; within the
