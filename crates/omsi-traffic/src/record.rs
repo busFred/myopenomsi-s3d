@@ -528,17 +528,17 @@ impl Recorder {
         self.full.as_deref()
     }
 
-    /// The frame about to run: `sim` with its inputs set, the vehicles as they go into
-    /// it. Writes what changed in the fleet (`type_name` names vehicle `i` of a new one)
-    /// and in the parked cars, a keyframe when one is due, and the frame's inputs.
-    /// `people` has the frame's people in `sim.people`'s order (with what the game knows
-    /// about them besides); `steer`, the ways the game set itself this frame.
     /// The sizes of what the recorder keeps between frames: (vehicles known, removal rules
     /// waiting for their frame), for the long-run profile (`OMSI_PROFILE`).
     pub fn sizes(&self) -> (usize, usize) {
         (self.known.len(), self.remove_rules.len())
     }
 
+    /// The frame about to run: `sim` with its inputs set, the vehicles as they go into
+    /// it. Writes what changed in the fleet (`type_name` names vehicle `i` of a new one)
+    /// and in the parked cars, a keyframe when one is due, and the frame's inputs.
+    /// `people` has the frame's people in `sim.people`'s order (with what the game knows
+    /// about them besides); `steer`, the ways the game set itself this frame.
     pub fn frame(&mut self, sim: &Simulation, dt: f32, vehicles: &[Vehicle], people: &[PersonRecord], steer: &[(u64, Steer)], type_name: &dyn Fn(usize) -> String) {
         let time = sim.time;
         let keyframe_due = time - self.last_keyframe >= KEYFRAME_SECS;

@@ -295,3 +295,26 @@ fn q84_the_last_resort_stop_at_a_lane_end_is_a_latch() {
     assert!(me.state.speed < 0.3 && me.state.lane == 1, "did not stand before the end");
     assert!(hardest < omsi_sim::traffic::MAX_BRAKE, "braked {hardest:.1} m/s²");
 }
+
+/// [J7-3] The request to make room does not depend on the vehicle order: the plans of a frame all
+/// read the frame's start, so a follower later in the order than its changer is asked and brakes
+/// as one earlier (SUMO `informFollower`, read in the follower's next `planMove`).
+#[test]
+fn j73_the_request_to_make_room_does_not_depend_on_the_order() {
+    let net = lane_drop(&[3]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 1, 400.0, 12.0), car(2, 0, 393.0, 12.0)];
+    cars[1].state.change_cooldown = 100.0;
+    let (mut asked, mut braked, mut changed) = (false, false, false);
+    let least = run(&net, &mut sim, &mut cars, 40.0, |_, cars| {
+        if let Some(f) = cars.iter().find(|c| c.id == 2) {
+            asked |= f.help_for.is_some_and(|h| h.0 == 1);
+            braked |= f.state.acc < -0.1;
+        }
+        changed |= cars.iter().any(|c| c.id == 1 && (c.state.lane == 0 || c.state.lane == 2));
+    });
+    assert!(asked, "the follower, later in the order, was never asked to make room");
+    assert!(braked, "the follower never made room");
+    assert!(changed, "the changer never moved over");
+    assert!(least > 0.3, "touched: {least:.2} m");
+}

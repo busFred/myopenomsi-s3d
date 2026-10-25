@@ -332,8 +332,8 @@ pub struct Vehicle {
     pub passed_on_go: Option<(usize, usize)>,
     /// [J7-3] Asked to make room for a car changing into this one's lane because its own ends:
     /// (its id, the gap from this one's front to its rear, its speed, the gap its acceptance
-    /// needs from this one; `Plan::help`). Set by the asker each frame it asks, read by this
-    /// one's plan, cleared when this one acts.
+    /// needs from this one; `Plan::help`). Set by the asker's act each frame it asks, read by
+    /// this one's plan in the next frame, cleared after that frame's plans.
     #[serde(default)]
     pub help_for: Option<(u64, f32, f32, f32)>,
     /// [J7-3, fix pass 1] SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
@@ -1098,11 +1098,15 @@ impl Simulation {
 
     /// One frame of `dt` seconds for every vehicle.
     pub fn tick(&mut self, net: &Network, dt: f32, vehicles: &mut [Vehicle]) {
+        // (the phase timers run only under OMSI_PROFILE: no clock reads otherwise)
+        let timed = std::env::var_os("OMSI_PROFILE").is_some();
         let mut mark = std::time::Instant::now();
         let mut lap = |phase: &mut f64| {
-            let now = std::time::Instant::now();
-            *phase += (now - mark).as_secs_f64();
-            mark = now;
+            if timed {
+                let now = std::time::Instant::now();
+                *phase += (now - mark).as_secs_f64();
+                mark = now;
+            }
         };
         self.time += dt as f64;
         self.day_time += dt as f64 * self.time_scale;
@@ -1547,6 +1551,10 @@ impl Simulation {
             (0..vs.len()).into_par_iter().map(|i| plan::plan(net, sim, vs, i, &perceptions[i], claim_of[i].map(|k| grants[k]))).collect()
         };
         lap(&mut self.phase_secs[4]);
+        // the requests the plans just read are used up; the acts below set the next frame's
+        for v in vehicles.iter_mut() {
+            v.help_for = None;
+        }
         for (i, plan) in plans.into_iter().enumerate() {
             self.act(net, vehicles, i, plan, dt);
         }
@@ -1699,9 +1707,8 @@ impl Simulation {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
-        // [J7-3] the follower asked to make room hears it (it reads it in its next plan); my own
-        // request, read in this frame's plan, is used up
-        vehicles[i].help_for = None;
+        // [J7-3] the follower asked to make room hears it: it reads the request in its next
+        // plan (SUMO `informFollower`, read in the follower's next `planMove`)
         if let Some((f, gap, speed, need)) = plan.help {
             let me_id = vehicles[i].id;
             if let Some(o) = vehicles.get_mut(f) {
