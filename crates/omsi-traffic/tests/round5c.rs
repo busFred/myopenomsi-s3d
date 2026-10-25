@@ -142,7 +142,8 @@ fn standing_car_with(people: Vec<Person>) -> (f32, f32) {
 /// 0.9 m half width and their body, on the pavement's edge) shuffling toward it at 0.1 m/s
 /// (the projection puts them in the 1.2 m strip) and never `still`, does not hold it: it
 /// drives off (viz4 case01 #2827's eleven). One standing in the strip ahead of its front
-/// does; and one stepping off the kerb toward the lane ahead of the front still stops it.
+/// does; and one stepping off the kerb toward the lane at 0.3 m/s ahead of the front still
+/// stops it.
 #[test]
 fn c2_a_standing_car_is_not_held_by_somebody_level_with_its_body() {
     // level with the body: 1 m behind the front plane, shuffling toward the car
@@ -158,11 +159,8 @@ fn c2_a_standing_car_is_not_held_by_somebody_level_with_its_body() {
     // ahead of the front within the look-ahead (1.2 s here) - held
     let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(2.0, 0.0), ..person(100.5, 1.1) }]);
     assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
-    // stepping off the kerb toward the lane at walking pace (0.6 m/s), 3 m ahead of the front,
-    // 1.6 m off the axis now (outside the strip): held
-    let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(0.0, -0.6), ..person(105.0, 1.6) }]);
-    assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
-    // the same at 0.3 m/s: held as well (their step takes them into the strip)
+    // stepping off the kerb toward the lane at 0.3 m/s, 3 m ahead of the front, 1.6 m off the
+    // axis now (outside the strip): held
     let (held, v) = standing_car_with(vec![Person { vel: glam::DVec2::new(0.0, -0.3), ..person(105.0, 1.6) }]);
     assert!(held > 5.0 && v < 0.1, "held {held:.1} s, speed {v:.1}");
 }

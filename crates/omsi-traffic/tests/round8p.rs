@@ -173,18 +173,15 @@ fn bus_past_waiter(serves: [Option<i64>; 2], waits_at: Option<i64>, off: f64) ->
 
 /// [P8-1, pass 1 B1] A bus pulls in beside the waiters of the stops it serves - the one it
 /// comes up to and the one it served last, known by the stop they wait at - held only by one
-/// whose body is over its footprint; a waiter of any other stop is held for by the car rule,
-/// which since [P2] is the same body test (SUMO's nextBlocking, its own width, no margin).
+/// whose body is over its footprint; a waiter of any other stop is held for by the car rule.
 /// No contact either way (round 4d's 0.3 m inside the flank is gone).
 #[test]
 fn p81_a_bus_pulls_in_beside_its_own_stops_waiters_only() {
-    // 1.54 m off the way: clear of a 1.25 m half-wide body and a 0.28 m disc
+    // 1.54 m off the way: clear of a 1.25 m half-wide body and a 0.28 m disc, inside the car
+    // rule's 1.25 + 0.3
     let own = bus_past_waiter([Some(7), None], Some(7), 1.54);
     let last = bus_past_waiter([Some(8), Some(7)], Some(7), 1.54);
-    let other_clear = bus_past_waiter([Some(8), None], Some(7), 1.54);
-    assert!(!other_clear.0 && other_clear.1 > 0.0, "held by (or touched) a waiter of another stop clear of its flank: {other_clear:?}");
-    // 1.4 m off: the disc over the flank
-    let other = bus_past_waiter([Some(8), None], Some(7), 1.4);
+    let other = bus_past_waiter([Some(8), None], Some(7), 1.54);
     let inside = bus_past_waiter([Some(7), None], Some(7), 1.0);
     eprintln!("own {own:?} last {last:?} other {other:?} inside {inside:?}");
     assert!(!own.0 && own.1 > 0.0, "held by (or touched) a waiter of its next stop beside it: {own:?}");
