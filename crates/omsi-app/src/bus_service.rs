@@ -1345,8 +1345,12 @@ impl BusService {
             let people_short = self.short_by_people && ctx.stopped < PEOPLE_SERVE_MAX;
             // [ROLLBACK r4d-B2] (a bus coming to its layover queues for the berth instead: it
             // stands out its wait there, not in the lane behind - only right behind another
-            // bus at the stop, `close`, it serves it where it stands)
-            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short && !self.layover);
+            // bus at the stop, `close`, it serves it where it stands; [P3-1] and held short of the
+            // berth by people for PEOPLE_SERVE_MAX, as any bus: they are its own waiters, who
+            // wait for it to come - d24 #194 stood 290 s before its first stop, its waiters on a
+            // 3.1 m island 0.03 m clear of its body on its lane and inside it on the way into the
+            // bay)
+            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short && (!self.layover || self.short_by_people));
             if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 - pull && crept_past) {
                 self.near_d = f32::INFINITY;
                 self.arrive(ctx, stop.depart, stop.id, (st.lane, st.s));
@@ -1881,6 +1885,18 @@ mod tests {
         let mut s = BusService::new(vec![stop()]);
         let mut st = at(92.0);
         ctx.people_hold = true;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Running);
+        ctx.stopped = PEOPLE_SERVE_MAX + 1.0;
+        s.step(&mut st, &mut v, &ctx);
+        assert_eq!(s.phase, Phase::Boarding);
+        // [P3-1] coming to its layover (its first stop) and held short by its own waiters: served
+        // where it stands after half a minute too, not queued for the berth for good (d24 #194)
+        let mut s = BusService::new(vec![stop()]);
+        s.layover = true;
+        let mut st = at(92.0);
+        ctx.people_hold = true;
+        ctx.stopped = 7.0;
         s.step(&mut st, &mut v, &ctx);
         assert_eq!(s.phase, Phase::Running);
         ctx.stopped = PEOPLE_SERVE_MAX + 1.0;
