@@ -5287,6 +5287,32 @@ fn crossings(args: &[String]) -> Res<()> {
         // anywhere, `compile_outside_converging`)
         let side = (0..net.crossings.len()).map(|a| net.crossings[a].iter().filter(|c| c.side && c.other > a && !(net.lanes[a].source == 2 && net.lanes[c.other].source == 2 && net.lanes[a].key.map(|k| (k.tile, k.id)) == net.lanes[c.other].key.map(|k| (k.tile, k.id)))).count()).sum::<usize>();
         println!("  side merges between lanes of no one object: {side}");
+        // (one right-of-way order per pair of roads at a crossing outside the objects: the lanes of
+        // one spline heading one way - the quarter of their start heading - against another
+        // spline's; an object's pieces are movements of their own, a turn yields where the straight
+        // way beside it does not)
+        let road = |l: usize| net.lanes[l].key.filter(|_| net.lanes[l].source == 1).map(|k| (k.tile, k.id, net.lanes[l].source, (net.lanes[l].start_heading().rem_euclid(360.0) / 90.0) as i32));
+        let mut orders: BTreeMap<(Option<((i32, i32), i64, u32, i32)>, Option<((i32, i32), i64, u32, i32)>), (usize, usize)> = BTreeMap::new();
+        for &(a, b) in &found {
+            if road(a).is_none() || road(b).is_none() {
+                continue;
+            }
+            if let (Some(&(ja, ma)), Some(&(jb, mb))) = (js.of_lane.get(&a), js.of_lane.get(&b)) {
+                if ja == jb {
+                    if let Some(f) = js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb) {
+                        let e = orders.entry((road(a), road(b))).or_insert((0, 0));
+                        if f.yields { e.0 += 1 } else { e.1 += 1 }
+                    }
+                }
+            }
+        }
+        let mixed = orders.values().filter(|&&(y, g)| y > 0 && g > 0).count();
+        if list {
+            for (k, v) in orders.iter().filter(|(_, &(y, g))| y > 0 && g > 0) {
+                println!("  two orders: {k:?} yields {} goes first {}", v.0, v.1);
+            }
+        }
+        println!("  pairs of spline roads crossing outside the objects: {}, with two right-of-way orders between their lanes: {mixed}", orders.len());
         let cats: Vec<String> = cats.iter().map(|(k, v)| format!("{k} {v}")).collect();
         println!(
             "{}: {} lane crossings outside the objects ({header_found} on the recorded header), {in_table} in a junction's foe table; {}; detection {whole_ms:.1} ms over {} lanes, per tile batch {:.2} ms mean / {batch_max:.2} ms max over {batches}",
