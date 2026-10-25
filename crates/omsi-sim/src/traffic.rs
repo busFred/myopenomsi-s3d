@@ -44,7 +44,7 @@ pub struct Lane {
     pub key: Option<LaneKey>,
     /// True for the backwards lane of a two-way path.
     pub reversed: bool,
-    /// [ROLLBACK pedoneway-1] The path is one-way (direction 0 or 1): a lit pavement stub
+    /// The path is one-way (direction 0 or 1): a lit pavement stub
     /// or a crossing piece is walked its way only, so the stub is the only way onto its
     /// crossing (a street lane is driven its way in any case).
     pub one_way: bool,
@@ -88,7 +88,7 @@ pub struct Lane {
     /// after them is not read (Grundorf's 110 `trucks` rules all say 0).
     pub rule_bus: bool,
     pub rule_trucks: bool,
-    /// [ROLLBACK unsched-93] the path is marked "no unscheduled traffic": no random AI car
+    /// The path is marked "no unscheduled traffic": no random AI car
     /// is put on it or drives over it, and no pedestrian is spawned on it.
     pub no_unsched: bool,
     /// The spline this lane belongs to is editor-only: OMSI's invisible service roads at
@@ -117,7 +117,7 @@ pub struct Lane {
     /// either side, see [`Lane::drivable`].
     #[serde(default)]
     pub drivable: (f32, f32),
-    /// [round 8 H8-7, fix pass 1] The lane ends at the edge of the loaded tiles: the road goes on
+    /// The lane ends at the edge of the loaded tiles: the road goes on
     /// into a tile of the map that is not loaded (set by the game, `Traffic::mark_loaded_edges`).
     /// A vehicle stops before its end (`plan`), as at the loaded end of a bus route, instead of
     /// driving off the network: it is not the map's end.
@@ -127,7 +127,7 @@ pub struct Lane {
     /// by the game as the eye or the horizon moves, `Traffic::mark_edges_in_sight`): only such an
     /// edge is routed away from (`Network::ends_at_loaded_edge`); beyond the horizon a car drives
     /// to the edge and its trip ends there out of sight, as at a SUMO network's border. A
-    /// recording without the field reads it as in sight (round 9's rule, every edge avoided).
+    /// recording without the field reads it as in sight (every edge avoided).
     #[serde(default = "edge_in_sight_default")]
     pub edge_in_sight: bool,
 }
@@ -136,7 +136,7 @@ fn edge_in_sight_default() -> bool {
     true
 }
 
-/// [round 9 A4 fix pass 2] How far along the road (m) `Network::ends_at_loaded_edge` looks for the
+/// How far along the road (m) `Network::ends_at_loaded_edge` looks for the
 /// edge of the loaded tiles: SUMO's `lcStrategicLookahead` default, how far a vehicle's best lanes
 /// look along its way (sumo.md; omsi-traffic's `LC_STRATEGIC_LOOKAHEAD`).
 pub const EDGE_LOOKAHEAD: f64 = 3000.0;
@@ -168,13 +168,13 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
 }
 
 /// The least `[rule] trafficdensity` of a group at which a path is open to the group's random
-/// vehicles: the one floor of the code (a yard way out, `YARD_DENSITY` before, is the same
+/// vehicles: the one floor of the code (a yard way out is the same
 /// cut). Source: the map editor offers the densities 0, 0.001, 0.1, 0.5, 1 and 3 and the 20 stock
 /// maps under `maps/` use only these (counted in every `.map`): 0 is "none" and 0.001 "almost
 /// none" - BeijingCity closes its bus paths to the normal cars with 0 and their feeder pieces
 /// with 0.001 - and 0.1 the lowest meant as traffic; 0.01 lies between the two groups of classes.
 /// Reach, on the fixtures' networks: BeijingCity 13.0 km of street (383 lanes) lie at 0.001 for
-/// the normal cars, X10 Berlin 70.9 km (2476 lanes, 58 % of its street length): newly closed to
+/// the normal cars, X10 Berlin 70.9 km (2476 lanes, 58 % of its street length): closed to
 /// them (no spawn, no routing while another way exists; they enter only through forks that have
 /// no open way, counted in `FORK_FALLBACKS`). Below the floor a path is closed to the group as
 /// SUMO's `disallow` closes a lane to a vClass: no vehicle of the group is inserted on it or
@@ -1729,7 +1729,7 @@ impl Network {
                     let (p, b) = (&self.lanes[pi], &self.lanes[bi]);
                     let bend = p.curvature.iter().fold(0.0f32, |m, c| m.max(c.abs()));
                     // (the two lanes' half widths - two lanes of a road side by side are no meeting
-                    // place, round 4b x1 - and the piece's off-tracking)
+                    // place - and the piece's off-tracking)
                     let radius = if bend > 0.0 { (1.0 / bend).max(SWEPT_MIN_RADIUS) } else { f32::INFINITY };
                     let reach = 0.5 * (p.width + b.width) + SWEPT_WHEELBASE * SWEPT_WHEELBASE / (2.0 * radius);
                     let lb = b.length();
@@ -1758,7 +1758,7 @@ impl Network {
                     // (the way on from `b` meets the piece there already - within half a bus of
                     // the swept stretch, where a bus standing at `b`'s end reaches: the lead-in
                     // of a way that crosses the turn a few metres on, its claim's chain carries
-                    // that meeting place, round 4 rule E)
+                    // that meeting place)
                     let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.other_at + c.other_after >= p0 - SWEPT_BUS_LENGTH * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BUS_LENGTH * 0.5)));
                     if covered {
                         continue;
@@ -2226,7 +2226,7 @@ impl Network {
 const ALONGSIDE_DEG: f32 = 35.0;
 
 impl Network {
-    /// [round 5 L1] The drivable extent of every street lane from `from` on is cut short of
+    /// The drivable extent of every street lane from `from` on is cut short of
     /// any other street lane running alongside it, whatever spline or object
     /// it belongs to (the cross-section knew its own spline's paths alone; BeijingCity lays
     /// a 10 m "noside" asphalt under a separate carriageway spline): the strip beyond a
@@ -2747,8 +2747,8 @@ mod stub_links_tests {
         net.link(1.5);
         assert!(net.lanes[2].next.contains(&1), "linked back to the other way's last piece");
         assert!(merges(&net, 1, 2), "{:?}", net.crossings[1]);
-        // (review4) the first way links past its last piece into the exit too, and the
-        // other way's stream runs through that piece: their meeting place stays
+        // (the first way links past its last piece into the exit too, and the
+        // other way's stream runs through that piece: their meeting place stays)
         assert!(net.lanes[0].next.contains(&3) && net.lanes[0].next.contains(&1));
         assert!(merges(&net, 0, 1), "{:?}", net.crossings[0]);
     }
@@ -3163,16 +3163,15 @@ pub enum Aspect {
 }
 
 /// How far ahead (m) a car decides which way it goes at least: far enough to signal a turn in
-/// good time and for the steering to look beyond the junction; [round 7 A8] and as far as its
+/// good time and for the steering to look beyond the junction; and as far as its
 /// junction claim reaches (`claim_horizon`), so that the junction is seen there.
 const PLAN_AHEAD: f32 = 90.0;
 /// At most this many lanes are planned ahead (junction pieces can be a few metres long).
-// [ROLLBACK lights-130] 20 lanes (was 10): on a road of short pieces ten lanes were not
-// ninety metres, and a light further ahead was not seen in time to stop; [round 7 A8] 40 for
-// the claim horizon's 220 m
+// 40 lanes: on a road of short pieces fewer lanes do not reach the claim horizon's 220 m, and
+// a light further ahead would not be seen in time to stop.
 const PLAN_LANES: usize = 40;
 
-/// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
+/// How far before its first meeting place (m, from its front) a vehicle at
 /// `speed` m/s files its junction claim - eight seconds, at least 60 m, at most 220 m - and
 /// so how far ahead it plans its way and looks for the junction.
 pub fn claim_horizon(speed: f32) -> f32 {
@@ -3182,7 +3181,7 @@ pub fn claim_horizon(speed: f32) -> f32 {
 /// the way is bent so that it has no step (half the gap on each side).
 const JOINT_BLEND: f32 = 6.0;
 /// Seconds of signalling before a lane change begins to move sideways.
-// [ROLLBACK lanechange-108] two seconds (was 1.2) before the car moves over
+// (two seconds of signal before the car moves over)
 pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
@@ -3233,7 +3232,7 @@ pub struct AiState {
     pub lateral_target: f32,
     /// The S-curve in progress: (from, to, odometer at its start, its length in m).
     pub lateral_ramp: (f32, f32, f32, f32),
-    /// [ROLLBACK deform-105] A way bent round something, laid out by the traffic planner:
+    /// A way bent round something, laid out by the traffic planner:
     /// (odometer, offset) points, every metre or so; the offset between them is straight
     /// between the points. While the odometer is short of the last point this is the offset
     /// (the S-curve above holds from there on, and the planner leaves it at 0 to 0).
@@ -3319,7 +3318,7 @@ pub fn arrival_time(dist: f32, v: f32, a: f32, v_max: f32) -> f32 {
 }
 
 /// The road a lane change at `speed` (m/s) moves over along (m): 2.8 to 4 s at that speed,
-/// at least 12 m ([ROLLBACK lanechange-108] a longer, gentler move: three to four seconds).
+/// at least 12 m (a long, gentle move).
 pub fn change_length(speed: f32) -> f32 {
     (speed * (4.0 - speed * 0.04).clamp(2.8, 4.0)).max(12.0)
 }
@@ -3369,7 +3368,7 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     Ok(())
 }
 
-/// [fix pass 2, 2; pass 3, 9] The swept path (`Network::compile_swept`), from the stock
+/// The swept path (`Network::compile_swept`), from the stock
 /// timetable bus (`Vehicles/NEOMAN_Overhaul_V3/_12a_MAN_A21_2D.bus`): its length, the
 /// `[boundingbox]`'s 11.8 m ...
 pub const SWEPT_BUS_LENGTH: f32 = 11.8;
@@ -3396,8 +3395,8 @@ const LEADS_ON_LANES: usize = PLAN_LANES;
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
 const STOP_LINE_GAP: f32 = 0.6;
-/// [Q8-1] A car backing up out of a packed queue does so at walking pace (m/s,
-/// `AiState::reverse_step`): [fix pass 2] 5 km/h, which the Austrian Supreme Court's decision
+/// A car backing up out of a packed queue does so at walking pace (m/s,
+/// `AiState::reverse_step`): 5 km/h, which the Austrian Supreme Court's decision
 /// OGH 23.03.2007, 2Ob262/05a equates with "Schrittgeschwindigkeit" in the lower court's findings
 /// (https://ris.bka.gv.at/Dokumente/Justiz/JJT_20070323_OGH0002_0020OB00262_05A0000_000/JJT_20070323_OGH0002_0020OB00262_05A0000_000.html),
 /// not as a definition; for Germany de.wikipedia ("Schrittgeschwindigkeit") gives the courts'
@@ -3557,7 +3556,7 @@ impl AiState {
         avoid: &dyn Fn(usize) -> bool,
     ) -> Option<usize> {
         let l = &net.lanes[lane];
-        // [ROLLBACK cycle-135] the ways that lead back round a loop of short lanes are not
+        // the ways that lead back round a loop of short lanes are not
         // among the choices (the others are: a street goes on where it has a way on)
         let next: Vec<usize> = l.next.iter().copied().filter(|&n| !avoid(n)).collect();
         let kind = l.kind;
@@ -3596,10 +3595,10 @@ impl AiState {
         };
         let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
         let mut choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
-        // [round 9 A4] not into the edge of the loaded tiles when another way of the same tier
+        // not into the edge of the loaded tiles when another way of the same tier
         // leads on: a random car has no trip, and the loaded-tile edge is not a place on the map,
         // only where what is loaded ends - a car turning in there stood in a queue that reached
-        // back 400 m towards the player (r9 jzk). (OMSI geometry, not SUMO: SUMO's vehicles have
+        // back 400 m towards the player. (OMSI geometry, not SUMO: SUMO's vehicles have
         // routes to real destinations and never aim at the network's edge.) With no other way it
         // drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
         // as they load) and the eye (`Lane::edge_in_sight`): a branch opens again once its tile
@@ -3617,7 +3616,7 @@ impl AiState {
         if choices.is_empty() {
             None
         } else if best == 2 {
-            // ([fix pass 2, 7] lanes another group drives: by how much traffic they carry, a
+            // (lanes another group drives: by how much traffic they carry, a
             // lane at 0.001 not as likely as one at 1.0)
             let total: f32 = choices.iter().map(|&n| net.lanes[n].density).sum();
             let mut pick = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0) * total;
@@ -3681,7 +3680,7 @@ impl AiState {
         let ahead = self.plan_ahead();
         while dist < ahead && plan.len() <= PLAN_LANES {
             let last = plan.last().copied().unwrap_or(from);
-            // [ROLLBACK cycle-135] not round a loop of short lanes to fill the plan (two
+            // not round a loop of short lanes to fill the plan (two
             // lanes of no length leading into each other made a plan of twenty), nor back
             // onto the lane the car came from: those ways are left out of the choice, so the
             // car still takes any other way on; where there is none, the plan ends and the
@@ -3747,9 +3746,9 @@ impl AiState {
             self.planned_next = plan.get(1).copied();
             self.ahead = plan.into_iter().skip(2).collect();
         }
-        // [round 7 E3 fix] a lane change under way: the way on from the lane it moves to
-        // (`change_plan`, chosen when the change began) takes the stubs too (viz case13 #45279
-        // crossed lit stub 9114's red mid-change)
+        // a lane change under way: the way on from the lane it moves to
+        // (`change_plan`, chosen when the change began) takes the stubs too (a lit stub's red
+        // holds a car mid-change)
         if let Some(c) = self.change {
             let mut plan: Vec<usize> = std::iter::once(c.to).chain(self.change_plan.iter().copied()).collect();
             if through(&mut plan, None) {
@@ -3872,9 +3871,8 @@ impl AiState {
     /// change, which goes by distance): settled where the body is, `done` in place (the car is
     /// on the lane it moved to, offset by what was left of the move) or given up (back on its
     /// own lane, offset by what it had moved). Either way the offset eases off over the S-curve
-    /// of a bay as the car drives on (`lateral_ramp`), so the body does not jump. (viz3 case09:
-    /// 13 cars that began a change at the tail of a red queue stood diagonally across the lines
-    /// for 40-95 s; case01 #4436 for 45 s.) Which: see the traffic's `settle_choice`.
+    /// of a bay as the car drives on (`lateral_ramp`), so the body does not jump. Which: see the
+    /// traffic's `settle_choice`.
     pub fn settle_change(&mut self, net: &Network, done: bool) {
         let Some(c) = self.change else { return };
         let Some((_, from_own, from_target)) = self.change_offsets(net) else {
@@ -4053,7 +4051,7 @@ impl AiState {
 
     /// The sideways offset of the way when the odometer reads `x`.
     fn lateral_at(&self, x: f32) -> f32 {
-        // [ROLLBACK deform-105] a bent way laid out point by point
+        // a bent way laid out point by point
         if let Some(&(x_last, _)) = self.lateral_curve.last() {
             if x < x_last {
                 let c = &self.lateral_curve;
@@ -4101,7 +4099,7 @@ impl AiState {
         } else if self.signal != 0 && self.signal_time > 0.0 {
             self.signal
         } else if (self.lateral_target - self.lateral).abs() > 0.3 && self.speed > 1.0 {
-            // [ROLLBACK blinker-130] (not standing: a car held in a queue beside a parked car
+            // (not standing: a car held in a queue beside a parked car
             // whose side kept changing flashed left and right in turns)
             if self.lateral_target > self.lateral { 2 } else { 1 }
         } else {
@@ -4110,12 +4108,12 @@ impl AiState {
         };
     }
 
-    /// [Q8-1] Back up along the way behind by at most `left` m this step (the traffic's queue
+    /// Back up along the way behind by at most `left` m this step (the traffic's queue
     /// escape, `omsi_traffic::plan`): from rest at `ai_motion::PULL_OUT_ACCEL` to `REVERSE_SPEED`,
     /// slowing at the driver's comfortable brake to stand where `left` runs out; the speed is
     /// negative meanwhile, the odometer runs back (the wheels turn backwards) and the lateral
     /// offset stays where it is (the ramps run by the odometer: the caller freezes them,
-    /// `freeze_lateral`). [fix pass 1] Never over the start of its own lane: it stops there.
+    /// `freeze_lateral`). Never over the start of its own lane: it stops there.
     /// Returns the distance moved back.
     pub fn reverse_step(&mut self, net: &Network, dt: f32, left: f32) -> f32 {
         self.change_cooldown = (self.change_cooldown - dt).max(0.0);
@@ -4127,7 +4125,7 @@ impl AiState {
         let mut back = (-(v0 + v1) * 0.5 * dt).clamp(0.0, left);
         let mut v1 = if back >= left { 0.0 } else { v1 };
         self.s -= back;
-        // ([fix pass 1] never back over the start of its own lane: the escape keeps the body on it)
+        // (never back over the start of its own lane: the escape keeps the body on it)
         if self.s < 0.0 {
             back += self.s;
             self.s = 0.0;
@@ -4142,7 +4140,7 @@ impl AiState {
         back
     }
 
-    /// [Q8-1] The lateral offset stays where it is while the odometer runs back (`reverse_step`):
+    /// The lateral offset stays where it is while the odometer runs back (`reverse_step`):
     /// no ramp or bent way left to follow, a new one starts from here as the car drives on.
     pub fn freeze_lateral(&mut self) {
         let lat = self.lateral;
@@ -4456,7 +4454,7 @@ mod tests {
         assert!(v < 7.5, "entered the bend at {v} m/s");
     }
 
-    /// [round 10 J1e] A standing car is held only by an explicit reason - the car ahead or the
+    /// A standing car is held only by an explicit reason - the car ahead or the
     /// stop point - never by a cap: under a tiny cap with nothing ahead it moves off at once at
     /// that cap; held by a stop that clears, it waits its reaction; a hold that comes back for a
     /// frame while the reaction runs pauses it, it does not wind it back.
@@ -4493,7 +4491,7 @@ mod tests {
 
     /// A pull-out started a few metres before the car's lane ends (a road of short spline
     /// pieces) carries on across the joint and ends on the lane beside's next piece, without
-    /// a jump: it used to be finished at the joint, the car moved sideways in one frame.
+    /// a jump (not finished at the joint, which would move the car sideways in one frame).
     #[test]
     fn a_lane_change_carries_on_across_a_joint() {
         let lane = |x: f64, y0: f64, y1: f64| LaneBuilder::polyline(vec![DVec3::new(x, y0, 0.0), DVec3::new(x, y1, 0.0)], LaneKind::Street, 3.0);
@@ -4923,7 +4921,7 @@ mod tests {
     /// The oncoming case: a straight way through and a left turn across it from the other
     /// direction. BeijingCity's object pieces carry `[rule] trafficdensity` 0.0-0.1 or 1.0
     /// as the author set them (spawn weights, not road classes); 27 such pairs in the viz3
-    /// fixtures now make the straight yield to the oncoming left turner (density ratio > 3 or
+    /// fixtures make the straight yield to the oncoming left turner (density ratio > 3 or
     /// yard <= 0.01, e.g. junction 32 lanes 12903/12938, junction 29 lanes 11329/11571).
     #[test]
     fn review7_right_of_way_the_oncoming_left_turn_still_waits_for_the_straight() {
@@ -4995,7 +4993,7 @@ mod tests {
 
     #[test]
     fn a_car_does_not_turn_back_onto_a_short_lane_it_came_from() {
-        // [ROLLBACK cycle-134] two short lanes that lead into each other: the car drives on
+        // two short lanes that lead into each other: the car drives on
         // to the second and, with no way on, is gone at its end
         let st = LaneKind::Street;
         let mut a = LaneBuilder::arc(DVec3::ZERO, 0.0, 3.0, 0.0, 0.0, st, 3.0);
