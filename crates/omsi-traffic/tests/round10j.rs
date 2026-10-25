@@ -87,6 +87,11 @@ fn d7_walkers_see_a_vehicle_clearing_the_box_across_their_crossing() {
         sim.claims = vec![(claim_on(&sim, 0, s, in_box), Grant::go(0))];
         assert_eq!(sim.clearing_across(&net, 2), expect, "s {s} in the box at the turn {in_box}");
     }
+    // (stuck - held by people or a standing lead - it does not clear: walkers are not held for it)
+    let mut c = claim_on(&sim, 0, 5.0, true);
+    c.stuck = true;
+    sim.claims = vec![(c, Grant::go(0))];
+    assert!(!sim.clearing_across(&net, 2), "a stuck car in the box holds the walkers");
 }
 
 /// A signalled crossing (review9's): northbound 0 -> lit stub 1 -> 2 -> 3; the southbound left

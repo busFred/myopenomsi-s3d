@@ -2996,8 +2996,13 @@ pub struct AiState {
     pub front: f32,
     pub rear: f32,
     /// Standing still and held there: the car ahead or the stop point (a light, a junction,
-    /// people, ...) asks it not to move; a cap (`accel_cap`) never holds it. Moving off again
-    /// starts `reaction` after that clears; `start_timer` counts it down.
+    /// people, ...) asks it not to move; a cap (`accel_cap`) never holds it. The start reaction
+    /// (`reaction`, OMSI's per-driver start delay; SUMO's `startupDelay` is 0) applies once per
+    /// standstill held: set when the hold begins, it runs while the hold is off and pauses while a
+    /// hold comes back, so the car moves off once `reaction` s of free frames have passed since
+    /// the first clearing. A car standing under a cap alone is not held and moves off at the cap
+    /// the frame the cap allows it, without the reaction (SUMO's start). `start_timer` counts it
+    /// down.
     pub held: bool,
     pub start_timer: f32,
     /// Acceleration of the last step (m/s²).
@@ -4210,8 +4215,7 @@ mod tests {
                 moved_at = Some(k);
             }
         }
-        // (the reaction runs out in its eighth free frame, frame 8 with the held frame 3 between;
-        // wound back by three frames' worth at the held frame, it went at frame 11)
+        // (the reaction runs out in its eighth free frame: frame 8, with the held frame 3 between)
         assert_eq!(moved_at, Some(8), "moved off at frame {moved_at:?}");
     }
 

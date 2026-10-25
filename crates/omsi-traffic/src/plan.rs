@@ -23,8 +23,8 @@ pub enum Why {
     /// junction-blocking test at the link).
     ExitFull,
     People,
-    /// A pedestrian at a crossing (round 4's zebra check; not produced any more:
-    /// `People` holds for them. Kept for the recordings that name it.)
+    /// A pedestrian at a crossing: not produced (`People` holds for them); kept for the
+    /// recordings that name it.
     Zebra,
     Service,
     Merge,
