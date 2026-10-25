@@ -343,8 +343,18 @@ fn info(path: &Path) -> Res<()> {
     let mut notes: Vec<String> = Vec::new();
     let mut scales: BTreeMap<String, u64> = BTreeMap::new();
     let mut offset = f64::NAN;
+    // (whether the people carry their game id: the first frame with anybody on foot tells;
+    // `PersonRecord::id` and `approach` are optional fields, so no version bump marks them)
+    let mut person_ids: Option<(bool, bool)> = None;
     while lines.next() {
         let (kind, time, day) = peek(&lines.buf);
+        if kind == "Frame" && person_ids.is_none() {
+            if let Ok(Record::Frame(f)) = omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?) {
+                if !f.people.is_empty() {
+                    person_ids = Some((f.people.iter().any(|p| p.id.is_some()), f.people.iter().any(|p| p.approach.is_some())));
+                }
+            }
+        }
         let e = counts.entry(kind.to_string()).or_default();
         e.0 += 1;
         e.1 += lines.buf.len() as u64 + 1;
@@ -427,6 +437,10 @@ fn info(path: &Path) -> Res<()> {
             "zlib stream: CUT SHORT ({})",
             lines.error.unwrap_or_default()
         ),
+    }
+    match person_ids {
+        Some((ids, approach)) => println!("people: ids present {} (approach seen in the first frame: {})", if ids { "yes" } else { "no" }, if approach { "yes" } else { "no" }),
+        None => println!("people: nobody on foot in any frame"),
     }
     Ok(())
 }
@@ -5789,9 +5803,59 @@ const FLIP_WINDOW: f64 = 5.0;
 const HOLD_SPEED: f32 = 0.3;
 /// Matching distance (m) of the id-less person tracker.
 const TRACK_MATCH: f64 = 0.5;
+/// The narrowest a path counts as for its area (m): one body abreast (2 x PERSON_RADIUS), the
+/// spawner's `humans::PED_PATH_MIN_WIDTH`.
+const PATH_MIN_WIDTH: f64 = 2.0 * PERSON_RADIUS;
+/// `density_max` is taken over paths of at least this area (m^2): at the 0.3 persons/m^2 target
+/// it holds three people, and below it one group's count swings the density (a 1.4 m kerb stub
+/// with a crowd waiting at it read 20 persons/m^2); `density_max_any` keeps every path.
+const DENSITY_MIN_AREA: f64 = 10.0;
 /// Histogram bin (persons/m^2) and range of the pavement density percentile.
 const DENSITY_BIN: f64 = 0.01;
 const DENSITY_BINS: usize = 600;
+
+/// [P9-6] Of the parked cars beside the lanes (a `Parked` record), how many there are and how many
+/// lie over a footpath's walking line: their box overlaps a body (PERSON_RADIUS) on a Sidewalk
+/// lane's axis (the app's `covers_footpath`, the slots the pull-out rule takes out), the lanes
+/// sampled every 0.25 m.
+fn parked_on_footpath(net: &Network, parked: &HashMap<usize, Vec<omsi_traffic::Parked>>) -> (usize, usize) {
+    let (mut all, mut on) = (0usize, 0usize);
+    for (&l, list) in parked {
+        let Some(lane) = net.lanes.get(l) else { continue };
+        for pc in list {
+            all += 1;
+            let (q, h) = lane.at(pc.s);
+            let hr = (h as f64).to_radians();
+            let right = glam::DVec2::new(hr.cos(), -hr.sin());
+            let c = q.truncate() + right * pc.lateral as f64;
+            let b = omsi_sim::collision::Obb::vehicle(c, h as f64, pc.half_len as f64, pc.half_len as f64, pc.half_width as f64);
+            let reach = (pc.half_len.max(pc.half_width) as f64) + 2.0;
+            let cell = ((c.x / 50.0).floor() as i32, (c.y / 50.0).floor() as i32);
+            let mut hit = false;
+            'cells: for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for &f in net.grid.get(&(cell.0 + dx, cell.1 + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let fl = &net.lanes[f];
+                        if fl.kind != LaneKind::Sidewalk {
+                            continue;
+                        }
+                        let mut s = 0.0f32;
+                        while s <= fl.length() {
+                            let (p, _) = fl.at(s);
+                            if (p.truncate() - c).length() <= reach && omsi_sim::collision::Obb::point(p, PERSON_RADIUS).separation(&b) < 0.0 {
+                                hit = true;
+                                break 'cells;
+                            }
+                            s += 0.25;
+                        }
+                    }
+                }
+            }
+            on += hit as usize;
+        }
+    }
+    (all, on)
+}
 
 /// What `people` knows about one person from frame to frame.
 #[derive(Clone)]
@@ -5944,6 +6008,11 @@ struct PeopleAcc {
     band_area_s: [f64; 4],
     hist: Vec<f64>,
     dens_max: (f64, usize, f64, f64, usize),
+    dens_max_any: (f64, usize, f64, f64, usize),
+    /// Whether any person carried an id (flip tracking exact) / the game's on-foot counts.
+    ids_seen: bool,
+    /// [P9-6] Parked cars of the last `Parked` record and those whose box lies over a footpath.
+    parked: (usize, usize),
     area_cache: Option<(DVec3, usize, f64)>,
     pave_sum: f64,
     // 5. counts
@@ -5980,6 +6049,9 @@ impl PeopleAcc {
             band_area_s: [0.0; 4],
             hist: vec![0.0; DENSITY_BINS + 1],
             dens_max: (0.0, 0, 0.0, 0.0, 0),
+            dens_max_any: (0.0, 0, 0.0, 0.0, 0),
+            ids_seen: false,
+            parked: (0, 0),
             area_cache: None,
             pave_sum: 0.0,
             stroll_sum: 0.0,
@@ -6028,7 +6100,7 @@ impl PeopleAcc {
                         continue;
                     }
                     if l.points.iter().any(|p| self.near(*p)) {
-                        area += l.length() as f64 * (l.width as f64).max(0.5);
+                        area += l.length() as f64 * (l.width as f64).max(PATH_MIN_WIDTH);
                     }
                 }
             }
@@ -6038,6 +6110,9 @@ impl PeopleAcc {
     }
 
     fn frame(&mut self, net: &Network, f: &omsi_traffic::record::Frame) {
+        if !self.ids_seen && f.people.iter().any(|p| p.id.is_some()) {
+            self.ids_seen = true;
+        }
         let t = f.time;
         if self.first_t.is_nan() {
             self.first_t = t;
@@ -6173,7 +6248,7 @@ impl PeopleAcc {
         // 4. density
         for (&lane, &n) in &per_lane {
             let l = &net.lanes[lane];
-            let area = l.length() as f64 * (l.width as f64).max(0.5);
+            let area = l.length() as f64 * (l.width as f64).max(PATH_MIN_WIDTH);
             if area <= 0.0 {
                 continue;
             }
@@ -6189,7 +6264,10 @@ impl PeopleAcc {
             };
             self.band_area_s[band] += area * w;
             self.hist[((d / DENSITY_BIN) as usize).min(DENSITY_BINS)] += area * w;
-            if d > self.dens_max.0 {
+            if d > self.dens_max_any.0 {
+                self.dens_max_any = (d, lane, l.length() as f64, l.width as f64, n);
+            }
+            if area >= DENSITY_MIN_AREA && d > self.dens_max.0 {
                 self.dens_max = (d, lane, l.length() as f64, l.width as f64, n);
             }
         }
@@ -6258,7 +6336,7 @@ impl PeopleAcc {
         kv!("people_mean", format!("{:.1}", self.all_sum / n), json!(r2(self.all_sum / n)));
         kv!("people_max", self.all_max, json!(self.all_max));
         // 1
-        kv!("street_ps", format!("{:.1}", self.street_ps), json!(r1(self.street_ps)));
+        kv!("street_ps", format!("{:.1} (strollers, state WalkStreet, with the game's on_crossing false, centre within max(width, 2.5)/2 of a street lane's axis)", self.street_ps), json!(r1(self.street_ps)));
         let mut top: Vec<_> = self.street_lane.iter().collect();
         top.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then(a.0.cmp(b.0)));
         let mut jt = Vec::new();
@@ -6276,7 +6354,7 @@ impl PeopleAcc {
         }
         js.insert("footpath_top".into(), json!(jt));
         // 2
-        kv!("flip_tft", self.flipped.len(), json!(self.flipped.len()));
+        kv!("flip_tft", format!("{} ({})", self.flipped.len(), if self.ids_seen { "by person id: exact" } else { "no ids: nearest-neighbour tracking, swaps inflate it" }), json!(self.flipped.len()));
         let mut jt = Vec::new();
         for (k, f) in self.flips.iter().take(10).enumerate() {
             let who = if f.has_id { format!("id {}", f.key) } else { format!("track {}", f.key) };
@@ -6321,7 +6399,10 @@ impl PeopleAcc {
         }
         kv!("density_p99", format!("{p99:.2} per m2 (area-time weighted, occupied pavements)"), json!(r2(p99)));
         let m = self.dens_max;
-        kv!("density_max", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {}", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
+        kv!("density_max", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {} (paths of {DENSITY_MIN_AREA} m2 or more)", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
+        let m = self.dens_max_any;
+        kv!("density_max_any", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {}", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
+        kv!("parked_on_footpath", format!("{} of {} parked cars beside lanes (the P9-6 pull-out rule's slots)", self.parked.1, self.parked.0), json!({"on_footpath": self.parked.1, "parked": self.parked.0}));
         kv!("pavement_density_mean", format!("{:.5} per m2", self.pave_sum / n), json!((self.pave_sum / n * 1e5).round() / 1e5));
         (out, Value::Object(js))
     }
@@ -6366,7 +6447,7 @@ fn people(args: &[String]) -> Res<()> {
         let mut first: Option<f64> = None;
         while lines.next() {
             let (kind, _, _) = peek(&lines.buf);
-            if !matches!(kind, "Frame" | "Keyframe" | "LanesAdded") {
+            if !matches!(kind, "Frame" | "Keyframe" | "LanesAdded" | "Parked") {
                 continue;
             }
             let rec = omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?)?;
@@ -6382,10 +6463,11 @@ fn people(args: &[String]) -> Res<()> {
                 }
                 Record::Keyframe { time, vehicles } => acc.keyframe(time, &vehicles),
                 Record::Frame(f) => acc.frame(&net, &f),
+                Record::Parked { parked, .. } => acc.parked = parked_on_footpath(&net, &parked),
                 _ => {}
             }
         }
-        if lines.clean != Some(true) {
+        if lines.clean != Some(true) && until.is_infinite() {
             eprintln!("{}: zlib stream cut short ({})", path.display(), lines.error.clone().unwrap_or_default());
         }
         let name = path.display().to_string();
