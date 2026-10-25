@@ -501,6 +501,12 @@ fn smoke_sprite(p: &SmokeParticle, ro: DVec3) -> Option<GpuCorona> {
 }
 
 /// The light map atlas: tiles a side and pixels a tile.
+/// An object already drawn stays drawn out to this multiple of `RenderOptions::max_obj_dist` (plus
+/// its radius), one not drawn comes in at the distance itself: the hysteresis that keeps an object on
+/// the boundary from flickering in and out (Omsi's `performance_maxObjDist`). The app culls a
+/// vehicle's lamp glows with the vehicle at the same reach, and the traffic's horizon takes it.
+pub const MAX_OBJ_DIST_HOLD: f32 = 1.05;
+
 pub const LM_ATLAS_TILES: u32 = 5;
 pub const LM_TILE_PX: u32 = 256;
 
@@ -9647,7 +9653,7 @@ impl Renderer {
                     f32::MAX
                 } else {
                     // performance_maxObjDist, by the distance and by the depth
-                    let reach = if was_drawn(i) { max_obj_dist * 1.05 } else { max_obj_dist };
+                    let reach = if was_drawn(i) { max_obj_dist * MAX_OBJ_DIST_HOLD } else { max_obj_dist };
                     if !inst.any_distance
                         && max_obj_dist > 0.0
                         && (od > radius + reach || oz - radius > reach)

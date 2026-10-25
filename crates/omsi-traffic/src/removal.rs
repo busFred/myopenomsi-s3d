@@ -120,8 +120,10 @@ pub fn goes_far(at_dead_end: bool, beyond_horizon: bool, v: &Vehicle) -> bool {
     at_dead_end && beyond_horizon && lamps_dark(v) && !in_a_queue(&v.last)
 }
 
-/// [round 9 A2 fix pass 2] No lamp of the vehicle's own glows: not braking, no indicator (the
-/// headlights are the app's, by the light of the day: no horizon at all then).
+/// [round 9 A2 fix pass 2] No lamp of the vehicle's own glows: not braking, no indicator. (The
+/// headlights are the app's, by the light of the day: with them on, the app's horizon has no
+/// two-pixel distance and a car is beyond it only where the renderer does not draw it, its lamp
+/// glows culled with it.)
 pub fn lamps_dark(v: &Vehicle) -> bool {
     !v.state.braking && v.state.blinker == 0
 }

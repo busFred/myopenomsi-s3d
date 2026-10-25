@@ -306,6 +306,9 @@ pub enum Record {
     /// of them at index `first`.
     LanesAdded { time: f64, first: usize, lanes: Vec<Lane> },
     LightsAdded { time: f64, first: usize, lights: Vec<TrafficLightController> },
+    /// Lanes whose `loaded_edge` or `edge_in_sight` the game changed: (lane, loaded_edge,
+    /// edge_in_sight), as they are from then on (the tiles loaded, the eye moved).
+    LaneFlags { time: f64, flags: Vec<(usize, bool, bool)> },
     /// The parked cars beside the lanes, whenever they changed.
     Parked { time: f64, parked: HashMap<usize, Vec<Parked>> },
     /// Free text: what triggered a save, a stuck car's report.
@@ -322,6 +325,7 @@ impl Record {
             | Record::VehicleChanged { time, .. }
             | Record::LanesAdded { time, .. }
             | Record::LightsAdded { time, .. }
+            | Record::LaneFlags { time, .. }
             | Record::Parked { time, .. }
             | Record::Note { time, .. } => *time,
         }
@@ -350,6 +354,7 @@ enum RecordRef<'a> {
     VehicleChanged { time: f64, vehicle: &'a Vehicle },
     LanesAdded { time: f64, first: usize, lanes: &'a [Lane] },
     LightsAdded { time: f64, first: usize, lights: &'a [TrafficLightController] },
+    LaneFlags { time: f64, flags: &'a [(usize, bool, bool)] },
     Parked { time: f64, parked: &'a HashMap<usize, Vec<Parked>> },
     Note { time: f64, text: &'a str },
 }
@@ -620,6 +625,14 @@ impl Recorder {
     pub fn lanes_added(&mut self, time: f64, first: usize, lanes: &[Lane]) {
         if self.full.is_some() {
             self.line(time, Kind::FileOnly, &RecordRef::LanesAdded { time, first, lanes });
+        }
+    }
+
+    /// Lanes whose `loaded_edge`/`edge_in_sight` changed (lane, loaded_edge, edge_in_sight): a
+    /// replay sets them at that time, so a recording replays the flags as they were.
+    pub fn lane_flags(&mut self, time: f64, flags: &[(usize, bool, bool)]) {
+        if self.full.is_some() && !flags.is_empty() {
+            self.line(time, Kind::FileOnly, &RecordRef::LaneFlags { time, flags });
         }
     }
 
@@ -955,5 +968,17 @@ mod remove_line_tests {
         }
         let old = r#"{"Remove":{"time":1.7,"id":111,"rule":"NetworkEnd","seen":false,"waiting":0.0}}"#;
         assert!(matches!(serde_json::from_str::<Record>(old).unwrap(), Record::Remove { from_eye: None, .. }));
+    }
+
+    /// [round 10 S4] A change of the lanes' edge flags is a line of its own, read back as written
+    /// (a replay sets the flags at its time).
+    #[test]
+    fn s4_lane_flag_changes_are_recorded() {
+        let flags = [(149usize, true, false), (151, false, true)];
+        let line = serde_json::to_string(&RecordRef::LaneFlags { time: 12.5, flags: &flags }).unwrap();
+        match serde_json::from_str::<Record>(&line).unwrap() {
+            Record::LaneFlags { time, flags: f } => assert!(time == 12.5 && f == flags.to_vec()),
+            _ => panic!("not lane flags: {line}"),
+        }
     }
 }

@@ -2048,8 +2048,10 @@ impl ApplicationHandler for App {
                     if let Some(p) = self.player.as_ref() {
                         vehicles.push(&p.vehicle);
                     }
+                    // (an AI car's lamps go with the car at the object distance)
+                    let max_obj = self.renderer.as_ref().map_or(0.0, |r| r.options.max_obj_dist);
                     if let Some(t) = self.traffic.as_ref() {
-                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle));
+                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, cam.position, max_obj)));
                     }
                     vehicles.extend(self.remotes.remotes.values().map(|r| r.vehicle()));
                     let __tc = Instant::now();

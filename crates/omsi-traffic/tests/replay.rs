@@ -295,6 +295,7 @@ fn a_recording_from_the_game_replays() {
             Record::VehicleChanged { .. } => "vehicle changed",
             Record::LanesAdded { .. } => "lanes added",
             Record::LightsAdded { .. } => "lights added",
+            Record::LaneFlags { .. } => "lane flags",
             Record::Parked { .. } => "parked",
             Record::Note { .. } => "note",
         };

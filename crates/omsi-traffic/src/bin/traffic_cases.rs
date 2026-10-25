@@ -510,7 +510,7 @@ fn cut(path: &Path, out_dir: &Path, times: &str) -> Res<()> {
             }
             for l in block.drain(..) {
                 match peek(&l).0 {
-                    "LanesAdded" | "LightsAdded" => added_before.push(l),
+                    "LanesAdded" | "LightsAdded" | "LaneFlags" => added_before.push(l),
                     "Parked" => parked_before = Some(l),
                     _ => {}
                 }
@@ -540,7 +540,7 @@ fn cut(path: &Path, out_dir: &Path, times: &str) -> Res<()> {
             block.push(line);
         } else {
             match kind.as_str() {
-                "LanesAdded" | "LightsAdded" => added_before.push(line),
+                "LanesAdded" | "LightsAdded" | "LaneFlags" => added_before.push(line),
                 "Parked" => parked_before = Some(line),
                 _ => {}
             }

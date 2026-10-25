@@ -186,6 +186,12 @@ fn budget_count(cars: impl Iterator<Item = (DVec3, bool, bool)>, near: Option<(D
     cars.filter(|&(p, scheduled, of_kind)| !scheduled && of_kind && near.is_none_or(|(c, r)| (p - c).length() < r)).count()
 }
 
+/// A vehicle type's half length (m), the radius the renderer's object distance is reckoned with
+/// (`Viewer::draws`): `VehicleType::half_length`, else `DEFAULT_BOX`'s.
+fn body_radius(ty: &VehicleType) -> f64 {
+    ty.half_length().map_or(DEFAULT_BOX[1] as f64 * 0.5, |h| h as f64)
+}
+
 /// [round 9 A2 fix pass 1] A vehicle type's body height (m), the size its perceptual horizon
 /// is reckoned for: its `[boundingbox]`'s, else its model's, else `DEFAULT_BOX`'s (bus-sized).
 fn body_height(ty: &VehicleType) -> f64 {
@@ -555,46 +561,54 @@ impl Viewer {
         self
     }
 
-    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (dusk, night, gloom): a lamp is drawn
-    /// at a few pixels at any distance, so only the draw distance bounds the horizon.
+    /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (dusk, night, gloom): a lamp glows at a
+    /// few pixels at any distance, so there is no two-pixel distance; a lit car is out of the
+    /// picture only where the renderer leaves it out, lamps included (`lights::lamps_drawn`).
     pub fn with_lamps(mut self, lit: bool) -> Viewer {
         self.lamps_lit = lit;
         self
     }
 
-    /// The perceptual horizon (m) of a body `height` (m) high: the nearer of the two-pixel
-    /// distance and the draw distance. Farther than the two-pixel distance the body covers fewer
-    /// than `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit of the
-    /// image plane, the vertical field of view `horizon_fov`) and is a dot the player cannot tell
-    /// from nothing; farther than the draw distance (`max_dist`, the renderer's object distance:
-    /// `max_obj_dist`, the view distance when that is `auto`) no vehicle is drawn at all. One measure for every use:
-    /// beyond it a random car may be woken in frame (`Traffic::may_appear_car`), a car reaching
-    /// the loaded tiles' edge ends its trip there in frame (`omsi_traffic::removal::goes_far`), an
-    /// edge is out of sight (`Traffic::mark_edges_in_sight`) and the tiles are prefetched past it
-    /// (`prefetch_target`). With the picture's height unknown the two-pixel distance is the
-    /// documented `VISIBLE_RANGE` scaled from a car's height; with the lamps lit there is none (a
-    /// lamp keeps a few pixels at any distance) and only the draw distance remains.
-    pub fn horizon(&self, height: f64) -> f64 {
-        let two_pixels = if self.lamps_lit {
+    /// The two-pixel distance (m) of a body `height` (m) high: farther off it covers fewer than
+    /// `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit of the image
+    /// plane, the vertical field of view `horizon_fov`) and is a dot the player cannot tell from
+    /// nothing. With the picture's height unknown, the documented `VISIBLE_RANGE` scaled from a
+    /// car's height; with the lamps lit, none (infinite).
+    fn two_pixels(&self, height: f64) -> f64 {
+        if self.lamps_lit {
             f64::INFINITY
         } else if self.px_height <= 0.0 {
             VISIBLE_RANGE * height / CAR_HEIGHT
         } else {
             let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
             height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
-        };
+        }
+    }
+
+    /// The perceptual horizon (m) of a place where a body `height` (m) high may stand: the nearer
+    /// of its two-pixel distance and the renderer's reach (`max_dist`, the object distance -
+    /// `max_obj_dist`, the view distance when that is `auto` - held out to `MAX_OBJ_DIST_HOLD`;
+    /// lamp glows are culled with their car there). For the loaded tiles' edge: whether it is in
+    /// sight (`Traffic::mark_edges_in_sight`) and how far the tiles are prefetched
+    /// (`prefetch_target`). A body itself is judged by `beyond_horizon`, with its own size.
+    pub fn horizon(&self, height: f64) -> f64 {
+        let two_pixels = self.two_pixels(height);
         if self.max_dist > 0.0 {
-            two_pixels.min(self.max_dist)
+            two_pixels.min(self.max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64)
         } else {
             two_pixels
         }
     }
 
-    /// [round 9 A2] Is a body `height` (m) high, `dist` (m) from the eye, beyond its horizon -
-    /// and ([fix pass 1]) never within `NEAR_HIDE`, where only cover hides a car whatever the
-    /// picture (the mirrors, a turn of the head)?
-    pub fn beyond_horizon(&self, dist: f64, height: f64) -> bool {
-        dist >= NEAR_HIDE && dist > self.horizon(height)
+    /// [round 9 A2] Is a body `height` (m) high and `radius` (m) round, `dist` (m) from the eye,
+    /// beyond its horizon: farther than its two-pixel distance, or where the renderer does not draw
+    /// it (`draws`; its lamps go with it) - and ([fix pass 1]) never within `NEAR_HIDE`, where only
+    /// cover hides a car whatever the picture (the mirrors, a turn of the head). One measure for
+    /// every use: beyond it a random car may be woken in frame (`Traffic::may_appear_car`) and a
+    /// car reaching the loaded tiles' edge ends its trip there in frame
+    /// (`omsi_traffic::removal::goes_far`).
+    pub fn beyond_horizon(&self, dist: f64, height: f64, radius: f64) -> bool {
+        dist >= NEAR_HIDE && (dist > self.two_pixels(height) || !self.draws(dist, radius))
     }
 
     /// A wider picture than the camera's own (a triple screen's side panels): the tangents
@@ -614,13 +628,15 @@ impl Viewer {
         self
     }
 
-    /// Would the renderer draw an object of radius `r` this far away at all? Beyond that a
-    /// car can come and go in plain view without anybody seeing it happen.
+    /// Would the renderer draw an object of radius `r` this far away at all (an object already
+    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance)? Beyond that a car, its
+    /// lamp glows included (`lights::lamps_drawn`), can come and go in plain view without anybody
+    /// seeing it happen.
     pub fn draws(&self, dist: f64, r: f64) -> bool {
         // (the renderer measures a vehicle by a sphere about its origin, which may stand
         // well off its middle: half as much again, and a metre, to be sure)
         let r = r * 1.5 + 1.0;
-        if self.max_dist > 0.0 && dist > self.max_dist + r {
+        if self.max_dist > 0.0 && dist > self.max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64 + r {
             return false;
         }
         self.min_size <= 0.0 || 2.0 * r / (dist.max(0.01) * self.fov.max(1e-3)) >= self.min_size
@@ -2043,8 +2059,8 @@ impl Traffic {
     /// nobody can tell from nothing - the line a car reaching the loaded tiles' edge ends its
     /// trip beyond, too. (A timetable bus keeps `may_appear`; a new car keeps the round-6 rule,
     /// `APPEAR_IN_VIEW_BEYOND`, which already lets it appear in plain view beyond 300 m.)
-    pub fn may_appear_car(&self, world: &World, p: DVec3, height: f64) -> bool {
-        self.may_appear(world, p) || self.viewer.is_some_and(|v| v.beyond_horizon((p - v.pos).length(), height))
+    pub fn may_appear_car(&self, world: &World, p: DVec3, ty: &VehicleType) -> bool {
+        self.may_appear(world, p) || self.viewer.is_some_and(|v| v.beyond_horizon((p - v.pos).length(), body_height(ty), body_radius(ty)))
     }
 
     /// [round 8 H8-7, fix pass 1] Car `c` stopped at the edge of the loaded tiles (`Lane::
@@ -2127,7 +2143,7 @@ impl Traffic {
         // (`removal::goes_far`); the queue behind it drains one car per arrival
         let far_trip_end: std::collections::HashSet<u64> = match self.viewer {
             Some(v) if !self.initial => far_trip_ends(self.cars.iter().filter(|c| !c.serves_stops()).map(|c| {
-                let beyond = v.beyond_horizon((c.vehicle.position - v.pos).length(), body_height(&c.vehicle.ty));
+                let beyond = v.beyond_horizon((c.vehicle.position - v.pos).length(), body_height(&c.vehicle.ty), body_radius(&c.vehicle.ty));
                 (c.id, self.at_loaded_edge(c), beyond, &c.ai)
             })),
             _ => Default::default(),
@@ -2854,7 +2870,7 @@ impl Traffic {
             // dormant car drives everywhere, and one woken there appeared inside a junction)
             let ok = near
                 && world.has_ground(p.x, p.y)
-                && self.may_appear_car(world, p, body_height(&ty))
+                && self.may_appear_car(world, p, &ty)
                 && self.may_put_on(lane)
                 // ([round 9 A4] nor where its road ends at the loaded tiles' edge: it sleeps on)
                 && !self.edge_bound.contains(&lane)
@@ -3118,8 +3134,7 @@ impl Traffic {
         // [round 9 A2] counted: a car put down in frame beyond the perceptual horizon
         if kind == LaneKind::Street && !self.initial {
             let pos = vehicle.position;
-            let height = body_height(&vehicle.ty);
-            self.appeared_far += self.viewer.is_some_and(|v| v.frames(pos, 2.5) && v.beyond_horizon((pos - v.pos).length(), height)) as usize;
+            self.appeared_far += self.viewer.is_some_and(|v| v.frames(pos, 2.5) && v.beyond_horizon((pos - v.pos).length(), body_height(&vehicle.ty), body_radius(&vehicle.ty))) as usize;
         }
         if self.debug_population && kind == LaneKind::Street {
             let v = self.viewer;
@@ -3838,7 +3853,7 @@ impl Traffic {
                 let d_end = way.iter().find(|&&(l, _)| net.lanes.get(l).is_some_and(|x| x.loaded_edge && x.next.is_empty())).map(|&(l, d0)| d0 + net.lanes[l].length() - 0.5 - st.front);
                 ext.edge_trip_end = edge_trip_end(EdgeFlag {
                     d_end,
-                    beyond: viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty))),
+                    beyond: viewer.is_some_and(|v| v.beyond_horizon((car.vehicle.position - v.pos).length(), body_height(&car.vehicle.ty), body_radius(&car.vehicle.ty))),
                     blinker: st.blinker,
                     braking: st.braking,
                     prev: car.ai.external.edge_trip_end,
@@ -5300,8 +5315,9 @@ fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
 
 impl Traffic {
     /// `prefetch_target` for this frame's picture (`viewer`), `None` before the first frame:
-    /// the `edge_horizon` of the tallest random-traffic body (under lit lamps A4 keeps the cars
-    /// off the roads that end at the edge), and the road's speed at the player (`player`:
+    /// the `edge_horizon` of the tallest random-traffic body (lamps dark: with them lit the edge
+    /// is in sight out to the renderer's reach and A4 keeps the cars off roads ending there), and
+    /// the road's speed at the player (`player`:
     /// position, speed in m/s) - the faster of its street lane's speed limit and its own speed.
     pub fn prefetch_reach(&self, player: Option<(DVec3, f64)>, load_secs: f64) -> Option<f64> {
         let viewer = self.viewer?;
@@ -5321,6 +5337,7 @@ impl Traffic {
     /// (Jiangzhaikou with `--radius 2`: lanes 149-155 at y = -2455, 873 m ahead).
     pub fn mark_loaded_edges(&mut self, world: &World) {
         let ts = omsi_map::tile_size();
+        let before: Vec<(bool, bool)> = self.net.lanes.iter().map(|l| (l.loaded_edge, l.edge_in_sight)).collect();
         for l in self.net.lanes.iter_mut() {
             l.loaded_edge = l.kind == LaneKind::Street && l.next.is_empty() && !l.points.is_empty() && {
                 let (end, h) = (l.end(), (l.end_heading() as f64).to_radians());
@@ -5329,9 +5346,11 @@ impl Traffic {
             };
         }
         self.edge_lanes = self.net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge).map(|(i, _)| i).collect();
-        if !self.mark_edges_in_sight() {
-            self.edge_bound = edge_bound_of(&self.net);
-        }
+        self.set_edges_in_sight();
+        self.edge_bound = edge_bound_of(&self.net);
+        // (recorded, so that a replay has the flags as they were from here on)
+        let changed: Vec<(usize, bool, bool)> = self.net.lanes.iter().enumerate().filter(|(i, l)| before[*i] != (l.loaded_edge, l.edge_in_sight)).map(|(i, l)| (i, l.loaded_edge, l.edge_in_sight)).collect();
+        self.recorder.lane_flags(self.sim.time, &changed);
     }
 
     /// [round 10 S4] Mark each loaded-edge lane in sight or not (`Lane::edge_in_sight`): its end
@@ -5341,21 +5360,30 @@ impl Traffic {
     /// routed away from and kept clear of new cars (A4); beyond the horizon a car drives to it
     /// and its trip ends there out of sight (the far trip end, A2), as a SUMO vehicle leaves the
     /// network at its border. Before the first frame (no eye) every edge counts as in sight.
-    /// Returns whether `edge_bound` was gathered.
-    pub fn mark_edges_in_sight(&mut self) -> bool {
+    /// Changes are recorded (`Record::LaneFlags`), so a replay routes with the flags as they were.
+    pub fn mark_edges_in_sight(&mut self) {
+        let changed = self.set_edges_in_sight();
+        if !changed.is_empty() {
+            self.edge_bound = edge_bound_of(&self.net);
+            let flags: Vec<(usize, bool, bool)> = changed.iter().map(|&i| (i, self.net.lanes[i].loaded_edge, self.net.lanes[i].edge_in_sight)).collect();
+            self.recorder.lane_flags(self.sim.time, &flags);
+        }
+    }
+
+    /// `Lane::edge_in_sight` of the edge lanes for this frame's eye; returns the lanes changed.
+    fn set_edges_in_sight(&mut self) -> Vec<usize> {
         let horizon = self.viewer.map(|v| {
             let height = self.types.iter().filter(|t| t.2 == LaneKind::Street).map(|t| body_height(&t.0)).fold(CAR_HEIGHT, f64::max);
             (v.pos, v.horizon(height).max(NEAR_HIDE))
         });
-        let mut changed = false;
+        let mut changed = Vec::new();
         for &i in &self.edge_lanes {
             let l = &mut self.net.lanes[i];
             let seen = horizon.is_none_or(|(eye, h)| edge_in_sight(l.end(), eye, h));
-            changed |= l.edge_in_sight != seen;
+            if l.edge_in_sight != seen {
+                changed.push(i);
+            }
             l.edge_in_sight = seen;
-        }
-        if changed {
-            self.edge_bound = edge_bound_of(&self.net);
         }
         changed
     }
@@ -5989,14 +6017,14 @@ mod respawn_sight_tests {
         let rows = |v: &Viewer, d: f64| CAR_HEIGHT / d * v.px_height / (2.0 * (v.fov * 0.5).tan());
         assert!((rows(&v9, v9.horizon(CAR_HEIGHT)) - DOT_PIXELS).abs() < 1e-9);
         assert!(rows(&v9, 869.0) < 1.4);
-        assert!(v9.beyond_horizon(600.0, CAR_HEIGHT) && !v9.beyond_horizon(570.0, CAR_HEIGHT));
+        assert!(v9.beyond_horizon(600.0, CAR_HEIGHT, 2.0) && !v9.beyond_horizon(570.0, CAR_HEIGHT, 2.0));
         assert!((v9.horizon(3.0) - 2.0 * v9.horizon(CAR_HEIGHT)).abs() < 1e-6, "a bus twice as far");
-        assert!(!v9.beyond_horizon(1000.0, 3.0));
+        assert!(!v9.beyond_horizon(1000.0, 3.0, 6.0));
         assert!((v.with_screen(1080, None).horizon(CAR_HEIGHT) - 701.5).abs() < 0.5);
         let tiny = v.with_screen(100, None);
-        assert!(tiny.horizon(CAR_HEIGHT) < 100.0 && !tiny.beyond_horizon(NEAR_HIDE - 1.0, CAR_HEIGHT) && tiny.beyond_horizon(NEAR_HIDE, CAR_HEIGHT));
+        assert!(tiny.horizon(CAR_HEIGHT) < 100.0 && !tiny.beyond_horizon(NEAR_HIDE - 1.0, CAR_HEIGHT, 2.0) && tiny.beyond_horizon(NEAR_HIDE, CAR_HEIGHT, 2.0));
         let lit = v9.with_lamps(true);
-        assert!(lit.horizon(CAR_HEIGHT).is_infinite() && !lit.beyond_horizon(5000.0, CAR_HEIGHT));
+        assert!(lit.horizon(CAR_HEIGHT).is_infinite() && !lit.beyond_horizon(5000.0, CAR_HEIGHT, 2.0));
         let triple = v.with_screen(900, Some(29.0));
         assert!(triple.horizon(CAR_HEIGHT) > 2.0 * v9.horizon(CAR_HEIGHT), "{}", triple.horizon(CAR_HEIGHT));
         assert_eq!(v.with_screen(900, Some(90.0)).horizon(CAR_HEIGHT), v9.horizon(CAR_HEIGHT), "the narrower of the two");
@@ -6015,7 +6043,7 @@ mod respawn_sight_tests {
         let mut v = viewer();
         v.fov = 60f64.to_radians();
         let v = v.with_screen(900, None);
-        let d = |m: f64| v.beyond_horizon(m, super::CAR_HEIGHT);
+        let d = |m: f64| v.beyond_horizon(m, super::CAR_HEIGHT, 2.0);
         let cars = vec![(1u64, true, d(869.0), &head), (2, false, d(500.0), &f1), (3, false, d(700.0), &f2)];
         let gone: Vec<u64> = super::far_trip_ends(cars.into_iter()).into_iter().collect();
         assert_eq!(gone, vec![1]);
@@ -6047,17 +6075,25 @@ mod prefetch_tests {
         assert_eq!(prefetch_target(h, 0.0, 3.0), h, "standing: the horizon");
         assert_eq!(prefetch_target(h, -5.0, 1.0), h, "no negative speed");
         assert_eq!(prefetch_target(h, 10.0, 0.0), h, "no load measured yet");
-        // the horizon is the nearer of the two-pixel distance and the draw distance (the renderer's
-        // object distance; the Low preset's view distance 600 m with `max_obj_dist` auto): a 4.4 m
-        // double-decker's (1715 m) is 600 m there and the reach 600 m plus one load; at 2500 m it
-        // is the two-pixel distance
+        // the horizon is the nearer of the two-pixel distance and the renderer's reach (the object
+        // distance held out to MAX_OBJ_DIST_HOLD; the Low preset's 600 m with `max_obj_dist` auto):
+        // a 4.4 m double-decker's (1715 m) is 630 m there and the reach 630 m plus one load; at
+        // 2500 m it is the two-pixel distance
+        let hold = omsi_render::MAX_OBJ_DIST_HOLD as f64;
         let low = v.with_culling(0.0, 600.0);
-        assert_eq!(edge_horizon(low, 4.4), 600.0);
-        assert_eq!(low.with_lamps(true).horizon(CAR_HEIGHT), 600.0, "lit lamps: the draw distance");
-        assert!((prefetch_target(edge_horizon(low, 4.4), 50.0 / 3.6, 1.2) - 616.67).abs() < 0.01);
+        assert_eq!(edge_horizon(low, 4.4), 600.0 * hold);
+        assert_eq!(low.with_lamps(true).horizon(CAR_HEIGHT), 600.0 * hold, "lit lamps: the reach (lamps are culled with the car)");
+        assert!((prefetch_target(edge_horizon(low, 4.4), 50.0 / 3.6, 1.2) - (600.0 * hold + 16.667)).abs() < 0.01);
         let far = v.with_culling(0.0, 2500.0);
         assert!((edge_horizon(far, 4.4) - 4.4 / CAR_HEIGHT * h).abs() < 1e-6, "{}", edge_horizon(far, 4.4));
-        assert!(far.with_lamps(true).horizon(CAR_HEIGHT) == 2500.0);
+        assert_eq!(far.with_lamps(true).horizon(CAR_HEIGHT), 2500.0 * hold);
+        // a body: beyond its two-pixel distance, or where the renderer does not draw it (`draws`,
+        // the same reach plus its padded radius) - by day and, lamps culled with it, by night
+        let lit = low.with_lamps(true);
+        let r = 6.0;
+        let drawn_to = 600.0 * hold + r * 1.5 + 1.0;
+        assert!(!lit.beyond_horizon(drawn_to - 1.0, 4.4, r) && lit.beyond_horizon(drawn_to + 1.0, 4.4, r));
+        assert!(!low.beyond_horizon(drawn_to - 1.0, 4.4, r) && low.beyond_horizon(drawn_to + 1.0, 4.4, r));
     }
 }
 
