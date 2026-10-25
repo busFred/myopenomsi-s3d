@@ -3197,6 +3197,10 @@ pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 /// process).
 pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// At most this many single-continuation lanes `choose_after` follows to find where a way on leads
+/// (past it the way is taken to lead on; the plan's own length, `PLAN_LANES`).
+const LEADS_ON_LANES: usize = PLAN_LANES;
+
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
@@ -3371,11 +3375,22 @@ impl AiState {
             Some(Closed::Density) if net.lanes[n].source != 2 && net.closed_marker(n, self) => None,
             c => c,
         };
-        // (SUMO's bestLanes, one step: a lane whose ways on are all closed to me is no way on
-        // for me - a car entered X10's 20754 and 20737, whose only continuation is no_cars)
+        // (SUMO's bestLanes looks along the route until a lane with a choice: a lane whose way on
+        // is a chain of single continuations that ends in a closed lane leads nowhere for me - a car
+        // entered X10's 20754 and 20737, whose only continuation is no_cars, and group 0's cars the
+        // bus path 13372/13373 by an open lane whose only continuation is the closed feeder)
         let leads_on = |n: usize| {
-            let ln = &net.lanes[n];
-            ln.next.is_empty() || ln.next.iter().any(|&m| closed(m).is_none())
+            let mut cur = n;
+            for _ in 0..LEADS_ON_LANES {
+                let ln = &net.lanes[cur];
+                match ln.next[..] {
+                    [] => return true,
+                    [m] if closed(m).is_some() => return false,
+                    [m] => cur = m,
+                    _ => return ln.next.iter().any(|&m| closed(m).is_none()),
+                }
+            }
+            true
         };
         let tier = |n: usize| -> usize {
             match closed(n) {

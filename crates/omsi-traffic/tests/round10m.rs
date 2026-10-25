@@ -150,3 +150,28 @@ fn a_closed_run_as_long_as_a_body_is_a_closure_and_the_groups_longest_body_decid
     let net = build(3.0);
     assert!(net.closed_marker(1, &st), "3 m < 4 m: a marker");
 }
+
+/// B9-1 pass 1 (SUMO bestLanes): a way whose only continuation is a chain ending in a closed lane
+/// leads nowhere: the fork takes the other way, which leads on (the bus path 13340 -> 12846 -> 13372
+/// entered through an open lane whose only continuation was the closed feeder).
+#[test]
+fn a_way_whose_single_continuation_chain_ends_closed_is_not_taken() {
+    let defaults = std::sync::Arc::new(vec![1, 2, 1, 1]);
+    let mut lanes = vec![
+        road((0.0, 0.0), (100.0, 0.0), 1, 0, 0.0),        // 0 forks into 1 and 3
+        road((100.0, 0.0), (160.0, 10.0), 2, 0, 0.0),     // 1 open, single continuation
+        road((160.0, 10.0), (220.0, 10.0), 3, 0, 0.0),    // 2 open, single continuation: ...
+        road((220.0, 10.0), (400.0, 10.0), 4, 0, 0.0),    // 3 closed feeder (bus path)
+        road((100.0, 0.0), (200.0, -10.0), 5, 0, 0.0),    // 4 open, leads on
+        road((200.0, -10.0), (500.0, -10.0), 6, 0, 0.0),  // 5 open
+    ];
+    lanes[3].group_density = vec![(0, 0.0), (3, 1.0)];
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    for seed in 0..40u64 {
+        let mut st = AiState::new(0, 95.0, seed + 1);
+        st.traffic_pool = Some((0, defaults.clone()));
+        st.plan_next(&net);
+        assert_eq!(st.planned_next, Some(4), "seed {seed}");
+    }
+}
