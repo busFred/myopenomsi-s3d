@@ -171,11 +171,11 @@ fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DV
 }
 
 /// [P1i] How far beside a box's flank (m) a walker passes it where the usual half metre would
-/// take them into a street lane: a body and a hand's breadth (BODY_OUTSIDE + 0.05).
-const PASS_BY: f64 = BODY_OUTSIDE + 0.05;
-/// [P1i] How far off the line of the way past a box (m) the crowd may push a pavement walker: a
-/// hand's breadth.
-const ROUTE_DEV: f64 = 0.05;
+/// take them into a street lane: their body (BODY_OUTSIDE).
+const PASS_BY: f64 = BODY_OUTSIDE;
+/// [P1i] How far off the line of the way past a box (m) the crowd may push a pavement walker:
+/// none, they walk the line.
+const ROUTE_DEV: f64 = 0.0;
 
 /// How far off the path's corridor (m) a way past a standing box may lie (`along_box`, and
 /// [P1c] the corridor a pavement walker keeps on it).
@@ -2742,7 +2742,7 @@ impl PedNet {
                 for k in 0..=n {
                     let q = w[0] + (w[1] - w[0]) * (k as f64 / n as f64);
                     for v in o.points.windows(2) {
-                        if (q.z - v[0].z).abs() > 3.0 {
+                        if (q.z - v[0].z).abs() > LEVEL_APART {
                             continue;
                         }
                         let (on, t) = crowd::project_on_segment(q.truncate(), v[0].truncate(), v[1].truncate());
@@ -2780,7 +2780,8 @@ impl PedNet {
     }
 
     /// [P2-B1] Whether pavement lane `lane` runs above or below the traffic: a street lane passes
-    /// under or over it (within `LEVEL_REACH` across) at more than `LEVEL_APART` in height, and
+    /// under or over it (its footprint and a body reaching the path, `footprint_reach`; its height
+    /// at the point under it) at more than `LEVEL_APART` in height, and
     /// none at its own level (BeijingCity's footbridge 2294485 at 6 m over Jiangzhaikou's lane 723:
     /// its walkers were taken for people inside the cars passing below, and the cars' boxes
     /// pushed and held them up there). Its walkers meet no vehicle box.
@@ -2800,9 +2801,10 @@ impl PedNet {
                         continue;
                     }
                     for w in o.points.windows(2) {
-                        let (c, _) = crowd::project_on_segment(q.truncate(), w[0].truncate(), w[1].truncate());
-                        if (c - q.truncate()).length() < LEVEL_REACH {
-                            if (w[0].z - q.z).abs() > LEVEL_APART {
+                        let (c, t) = crowd::project_on_segment(q.truncate(), w[0].truncate(), w[1].truncate());
+                        if (c - q.truncate()).length() < footprint_reach(o) {
+                            let z = w[0].z + (w[1].z - w[0].z) * t;
+                            if (z - q.z).abs() > LEVEL_APART {
                                 other = true;
                             } else {
                                 same = true;
@@ -3374,10 +3376,10 @@ const PED_OCCUPIED_CAP: f32 = 20.0;
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
 const HURRIES_ON: &str = "caught by the change: on across";
 
-/// [P2-B1] A street lane this close across (m) to a footpath point is under or beside it ...
-const LEVEL_REACH: f64 = 5.0;
-/// ... and one more than this (m) above or below it is on another level (the people's and the
-/// traffic's z test, `Simulation::people_near` users: 2.5 m).
+/// [P2-B1, P1d] A street lane more than this (m) above or below a footpath point is on another
+/// level (the cars' people test, `perception::people_ahead`: 2.5 m); one within it is at the
+/// path's level. (A street lane is under or beside the point when its footprint and a body,
+/// `footprint_reach`, reach it.)
 const LEVEL_APART: f64 = 2.5;
 /// [P2-B1] The crowd's space of the walkers on a level of their own above or below the traffic:
 /// they meet no vehicle box (the crowd's blocks are the ground's, space 0).
@@ -3533,24 +3535,37 @@ pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
     clear_of_lanes_by(net, q, &footprint_reach)
 }
 
-/// [P2-B2] How far beyond a body a waiter steps out of a standing vehicle's box (m): a hand's
-/// breadth.
-const WAITER_STEP_OUT: f64 = 0.05;
+/// [P3b] Past the touching point (m), so that the float rounding of the separation test does not
+/// leave a stepped-out waiter touching: a millimetre.
+const STEP_OUT_ROUNDING: f64 = 1e-3;
 /// [P2-B2, P3-2] Where a waiter at `here` (height `z`) inside a standing vehicle's body (`bodies`,
 /// as `blocks` for their sides, by `grid`) steps to: out along the nearest side's normal by the
-/// person's square's extent there and WAITER_STEP_OUT, by the cars' own test (`people_ahead`:
-/// the person a square of BODY_OUTSIDE against the body). None when no body overlaps them.
-fn waiter_step_out(here: DVec2, z: f64, bodies: &[omsi_sim::collision::Obb], blocks: &[Block], grid: &crowd::BlockGrid) -> Option<DVec2> {
-    let me = omsi_sim::collision::Obb::point(here.extend(z), BODY_OUTSIDE);
+/// person's square's extent there (`people_ahead`'s test: the person a square of BODY_OUTSIDE
+/// against the body), else out of the opposite side; a target is taken only where `free` holds
+/// (off every street lane's footprint, [P3b]) and no other standing body overlaps the person
+/// there. None when no body overlaps them or neither side is free (they stay).
+fn waiter_step_out(here: DVec2, z: f64, bodies: &[omsi_sim::collision::Obb], blocks: &[Block], grid: &crowd::BlockGrid, free: &dyn Fn(DVec2) -> bool) -> Option<DVec2> {
+    let square = |q: DVec2| omsi_sim::collision::Obb::point(q.extend(z), BODY_OUTSIDE);
+    let overlaps = |q: DVec2| {
+        let me = square(q);
+        let mut hit = false;
+        grid.for_each_near(q, |k| hit |= me.separation(&bodies[k]) < 0.0);
+        hit
+    };
     let mut out = None;
     grid.for_each_near(here, |k| {
-        if out.is_some() || me.separation(&bodies[k]) >= 0.0 {
+        if out.is_some() || square(here).separation(&bodies[k]) >= 0.0 {
             return;
         }
-        let (q, inside) = blocks[k].closest(here);
+        let b = &blocks[k];
+        let (q, inside) = b.closest(here);
         let n = if inside { (q - here).normalize_or_zero() } else { (here - q).normalize_or_zero() };
-        let extent = BODY_OUTSIDE * (n.x.abs() + n.y.abs());
-        out = Some(q + n * (extent + WAITER_STEP_OUT));
+        // (the same side's normal through the box to the opposite face)
+        let (r, f) = (DVec2::new(b.heading.cos(), -b.heading.sin()), DVec2::new(b.heading.sin(), b.heading.cos()));
+        let across = (b.half.x * 2.0) * n.dot(r).abs() + (b.half.y * 2.0) * n.dot(f).abs();
+        let extent = BODY_OUTSIDE * (n.x.abs() + n.y.abs()) + STEP_OUT_ROUNDING;
+        let sides = [q + n * extent, q - n * (across + extent)];
+        out = sides.into_iter().find(|&t| free(t) && !overlaps(t));
     });
     out
 }
@@ -4428,6 +4443,9 @@ pub struct Humans {
     /// [P1e] Counted for the gate (`summary`): person-seconds of strollers jammed, and of
     /// people on foot inside the box of a vehicle moving at 0.5 m/s or more (none should be).
     jam_stats: (f64, f64),
+    /// [P3b] The stops' waiting places moved out of a standing vehicle's body, with where they
+    /// were (they go back once no standing body covers that).
+    moved_places: HashMap<(i64, usize), DVec3>,
     /// The (person, vehicle) pairs already logged inside a moving vehicle's box.
     inside_seen: HashSet<(u32, u64)>,
     /// Where the time of this tick went (stage, ms since the one before), for the slow
@@ -4672,6 +4690,7 @@ impl Humans {
             tick_stats: (0, 0.0, 0.0),
             jam_stats: (0.0, 0.0),
             inside_seen: HashSet::new(),
+            moved_places: HashMap::new(),
             tick_stages: Vec::new(),
             bus_motion: HashMap::new(),
             map_humans_done: false,
@@ -7443,7 +7462,8 @@ impl Humans {
             .unwrap_or_default();
         let standing: Vec<Block> = bodies.iter().map(|o| Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }).collect();
         let standing_grid = crowd::BlockGrid::new(&standing, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
-        // (their waiting place moves with them: the passengers' engine keeps them at it)
+        // (their waiting place moves with them while the body stands there: the passengers'
+        // engine keeps them at it; it goes back once no standing body covers it, [P3b])
         let mut places: Vec<(i64, usize, DVec2)> = Vec::new();
         for p in self.people.iter_mut() {
             let State::Pax(x) = &mut p.state else { continue };
@@ -7451,8 +7471,9 @@ impl Humans {
                 continue;
             }
             let here = p.position.truncate();
-            let out = waiter_step_out(here, p.position.z, &bodies, &standing, &standing_grid);
-            if let Some(to) = out {
+            let z = p.position.z;
+            let free_here = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &footprint_reach));
+            if let Some(to) = waiter_step_out(here, z, &bodies, &standing, &standing_grid, &free_here) {
                 let d = to - here;
                 x.pos.x += d.x;
                 x.pos.y += d.y;
@@ -7465,8 +7486,28 @@ impl Humans {
         }
         for (stop, k, d) in places {
             if let Some(sp) = self.stops.get_mut(&stop).and_then(|s| s.spots.get_mut(k)) {
+                self.moved_places.entry((stop, k)).or_insert(sp.pos);
                 sp.pos.x += d.x;
                 sp.pos.y += d.y;
+            }
+        }
+        // (a moved place whose own place is free of every standing body again goes back)
+        let back: Vec<(i64, usize)> = self
+            .moved_places
+            .iter()
+            .filter(|(_, own)| {
+                let me = omsi_sim::collision::Obb::point(**own, BODY_OUTSIDE);
+                let mut hit = false;
+                standing_grid.for_each_near(own.truncate(), |k| hit |= me.separation(&bodies[k]) < 0.0);
+                !hit
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in back {
+            if let Some(own) = self.moved_places.remove(&key) {
+                if let Some(sp) = self.stops.get_mut(&key.0).and_then(|s| s.spots.get_mut(key.1)) {
+                    sp.pos = own;
+                }
             }
         }
         // [ROLLBACK r4c-P4] how long each vehicle has stood; the yields to those that move again end
@@ -11553,7 +11594,7 @@ mod ped_tests {
         // parking strip): they never leave the path to go round it through the street lane
         // beside, wait behind it, and after SUMO's jamtime (300 s) squeeze past at a quarter of
         // their pace
-        let parked = car_box(5.0, 0.3);
+        let parked = car_box(5.0, 0.0);
         let track = walk_past(DVec2::new(-5.0, 0.0), &[parked], &[None], &[], 3300);
         assert!(track.iter().all(|q| q.y.abs() <= 0.75 + ALONG_FIT + 1e-9), "left the path");
         let rear = 5.0 - 2.3;
@@ -11627,11 +11668,17 @@ mod ped_tests {
         let blocks = [Block { center: bus.center, half: bus.half, heading: bus.heading, vel: DVec2::ZERO }];
         let grid = crowd::BlockGrid::new(&blocks, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
         for here in [DVec2::new(1.5, 2.0), DVec2::new(1.52, -3.0), DVec2::new(1.0, 0.0), DVec2::new(0.9, 5.9)] {
-            let to = waiter_step_out(here, 0.0, std::slice::from_ref(&bus), &blocks, &grid).expect("inside");
+            let to = waiter_step_out(here, 0.0, std::slice::from_ref(&bus), &blocks, &grid, &|_| true).expect("inside");
             let sep = omsi_sim::collision::Obb::point(to.extend(0.0), BODY_OUTSIDE).separation(&bus);
             assert!(sep > 0.0, "{here:?} -> {to:?}: still {sep:.3}");
         }
-        assert!(waiter_step_out(DVec2::new(1.9, 0.0), 0.0, std::slice::from_ref(&bus), &blocks, &grid).is_none(), "clear already");
+        assert!(waiter_step_out(DVec2::new(1.9, 0.0), 0.0, std::slice::from_ref(&bus), &blocks, &grid, &|_| true).is_none(), "clear already");
+        // never into a street lane: the near side (x > 1.25) is a lane's footprint here, so out of
+        // the far side; both sides lanes: they stay
+        let off_right = |q: DVec2| q.x < 1.0;
+        let to = waiter_step_out(DVec2::new(1.1, 0.0), 0.0, std::slice::from_ref(&bus), &blocks, &grid, &off_right).expect("the far side");
+        assert!(to.x < -1.25 && off_right(to), "{to:?}");
+        assert!(waiter_step_out(DVec2::new(1.1, 0.0), 0.0, std::slice::from_ref(&bus), &blocks, &grid, &|_| false).is_none());
     }
 
     #[test]
