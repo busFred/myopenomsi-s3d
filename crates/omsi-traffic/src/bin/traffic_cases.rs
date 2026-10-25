@@ -5383,7 +5383,7 @@ fn converge_outside(args: &[String]) -> Res<()> {
                     continue;
                 }
                 let lvl = (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs();
-                if lvl > omsi_sim::traffic::LEVEL_DZ {
+                if lvl >= omsi_sim::traffic::MEET_DIST {
                     continue;
                 }
                 let tight = least < omsi_sim::traffic::CONVERGE_DIST;

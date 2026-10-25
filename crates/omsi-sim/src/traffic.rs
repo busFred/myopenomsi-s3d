@@ -564,12 +564,6 @@ pub struct Crossing {
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
 /// buses.
 pub const MEET_DIST: f64 = 2.6;
-/// Two vehicle lanes crossing with their centre lines at most this far apart in height (m) cross
-/// at one level (`Network::lane_crossings`); farther, one passes over the other on a bridge. The
-/// traffic's same-level band for a vehicle near the player (the app's player box and
-/// `perception`'s player test, 4 m: a bus under a bridge held up the traffic on it, #753); a road
-/// under a deck lies at least its 4.5 m clearance below.
-pub const LEVEL_DZ: f64 = 4.0;
 /// A meeting place reaches at most this far either side of the crossing point (m).
 const MEET_MAX: f32 = 14.0;
 
@@ -1405,8 +1399,10 @@ impl Network {
     /// matrix, whether or not the map draws a node (sumo.md 1.3); OMSI maps may draw two roads
     /// across each other with splines alone, or a spline across a piece of an object, and the
     /// crossing is then the junction. Two lanes whose polylines cross at an inner point
-    /// (`polyline_crossing`) at the same level (`LEVEL_DZ`: farther apart in height one passes
-    /// over the other), not two lanes of one crossing object (`conflicts_from` compiles those)
+    /// (`polyline_crossing`) at one level: their centre lines less than `MEET_DIST` apart in height
+    /// at the crossing point, where two bodies on them can touch, the distance `meeting_extent`
+    /// measures (farther apart one passes over the other: BeijingCity's and X10's underpasses lie
+    /// 3.1-3.7 m below the deck's lanes, and no fixture network has a crossing between 0.5 and 4 m), not two lanes of one crossing object (`conflicts_from` compiles those)
     /// nor of one spline, not two tracks (as inside an object: the railway's signals keep them
     /// apart), not pieces of one way (`one_way_pieces`), and with no meeting place yet. Only the
     /// pairs with a lane from index `first` on (a grown network looks at its new lanes,
@@ -1420,7 +1416,7 @@ impl Network {
                 continue;
             }
             let Some((sa, sb)) = polyline_crossing(a, b) else { continue };
-            if (a.at(sa).0.z - b.at(sb).0.z).abs() > LEVEL_DZ || self.one_way_pieces(i, j) {
+            if (a.at(sa).0.z - b.at(sb).0.z).abs() >= MEET_DIST || self.one_way_pieces(i, j) {
                 continue;
             }
             out.push((j, i, sb, sa));
@@ -1502,7 +1498,8 @@ impl Network {
     /// spline under the first metres of an object's piece). Not two lanes leaving one lane, or
     /// one leaving a lane the other's way leaves within three links (a fork: one lane before the
     /// split keeps them in queue order, as `same_root` inside an object), nor at different
-    /// levels (`LEVEL_DZ`), nor neighbours (`left`/`right`: lanes of one road). Only pairs with a
+    /// levels (centre lines `MEET_DIST` or more apart in height mid-stretch: the bodies cannot touch),
+    /// nor neighbours (`left`/`right`: lanes of one road). Only pairs with a
     /// lane from index `first` on (`outside_pairs`). Returns how many were added.
     pub fn compile_outside_converging(&mut self, first: usize) -> usize {
         let len = self.lanes.len();
@@ -1520,7 +1517,7 @@ impl Network {
                 continue;
             }
             let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { continue };
-            if (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs() > LEVEL_DZ {
+            if (a.at((a0 + a1) * 0.5).0.z - b.at((b0 + b1) * 0.5).0.z).abs() >= MEET_DIST {
                 continue;
             }
             if self.add_converging(i, j) {

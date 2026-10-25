@@ -779,9 +779,11 @@ mod tests {
         let j = &js.nodes[0];
         assert!(!j.movements[j.movement_of(0).unwrap()].foes[0].yields, "the main road goes first");
         assert!(j.movements[j.movement_of(1).unwrap()].foes[0].yields);
-        // within the same-level band still a crossing; a deck above it is a bridge
-        assert_eq!(build(None, omsi_sim::traffic::LEVEL_DZ - 0.5).crossings[0].len(), 1);
-        let bridge = build(None, 6.0);
+        // within reach of the bodies still a crossing; a deck 3.1 m above (BeijingCity's
+        // underpass of spline 295367 under 3841) is a bridge
+        assert_eq!(build(None, 0.5).crossings[0].len(), 1);
+        assert!(build(None, omsi_sim::traffic::MEET_DIST).crossings[0].is_empty());
+        let bridge = build(None, 3.1);
         assert!(bridge.crossings[0].is_empty());
         assert!(Junctions::compile(&bridge).nodes.is_empty());
     }
