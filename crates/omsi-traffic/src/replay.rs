@@ -235,7 +235,7 @@ impl Replay {
         self.dropped_spawns = 0;
         for i in 0..at {
             match &self.records[i] {
-                Record::LanesAdded { .. } | Record::LightsAdded { .. } | Record::Parked { .. } => self.apply(i),
+                Record::LanesAdded { .. } | Record::LightsAdded { .. } | Record::LaneFlags { .. } | Record::Parked { .. } => self.apply(i),
                 Record::Spawn { vehicle, type_name, .. } => {
                     self.types.insert(vehicle.id, type_name.clone());
                 }
@@ -386,6 +386,14 @@ impl Replay {
                 let from = (*first).min(self.sim.lights.len());
                 let skip = self.sim.lights.len() - from;
                 self.sim.lights.extend(lights.iter().skip(skip).cloned());
+            }
+            Record::LaneFlags { flags, .. } => {
+                for &(l, edge, in_sight) in flags {
+                    if let Some(lane) = self.net.lanes.get_mut(l) {
+                        lane.loaded_edge = edge;
+                        lane.edge_in_sight = in_sight;
+                    }
+                }
             }
             Record::Parked { parked, .. } => self.sim.parked = parked.clone(),
             Record::Note { .. } => {}
@@ -640,7 +648,7 @@ impl Replay {
         let mut parked: Option<&Record> = None;
         for r in &self.records[..k] {
             match r {
-                Record::LanesAdded { .. } | Record::LightsAdded { .. } => out_records.push(r),
+                Record::LanesAdded { .. } | Record::LightsAdded { .. } | Record::LaneFlags { .. } => out_records.push(r),
                 Record::Parked { .. } => parked = Some(r),
                 _ => {}
             }

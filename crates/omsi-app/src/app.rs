@@ -605,7 +605,7 @@ impl App {
                         .args
                         .view_distance
                         .or_else(settings::view_distance)
-                        .unwrap_or(1200.0)
+                        .unwrap_or(settings::DEFAULT_VIEW_DISTANCE)
                         .max(omsi_map::tile_size());
                     w.set_fast_texture_loads(true);
                     w.set_texture_budget(texture_budget(&self.settings));
@@ -617,7 +617,7 @@ impl App {
                         w.clone(),
                         &start_centers(&self.args, &cam, Some(&w)),
                         distance,
-                        700.0,
+                        tiles::FIRST_AREA,
                     ));
                     self.world = Some(w);
                     self.starting = Some(cam);
@@ -900,7 +900,7 @@ impl App {
                     &renderer,
                     &mut scene,
                     &centers,
-                    std::time::Duration::from_millis(30),
+                    tiles::LOADING_BUDGET,
                     None,
                 );
                 streamer.initial_progress()
@@ -1020,6 +1020,14 @@ impl App {
         if self.lan.as_ref().map(|l| l.role == omsi_net::Role::Host).unwrap_or(false) {
             centers.extend(self.remotes.remotes.values().map(|r| r.vehicle().position));
         }
+        // the tiles reach at least the traffic's prefetch reach round every point: the loaded
+        // edge lies beyond the perceptual horizon
+        if let (Some(streamer), Some(t)) = (self.streamer.as_mut(), self.traffic.as_ref()) {
+            let motion = self.player.as_ref().map(|p| (p.vehicle.position, p.vehicle.physics.speed as f64));
+            if let Some(reach) = t.prefetch_reach(motion, streamer.load_secs) {
+                streamer.reach_at_least(reach);
+            }
+        }
         let (Some(streamer), Some(w), Some(r), Some(scene)) = (
             self.streamer.as_mut(),
             self.world.as_ref(),
@@ -1043,7 +1051,7 @@ impl App {
             r,
             scene,
             &centers,
-            std::time::Duration::from_millis(6),
+            tiles::FRAME_BUDGET,
             self.audio.as_ref(),
         );
         // Uploads can temporarily exceed the texture budget before the next frame's

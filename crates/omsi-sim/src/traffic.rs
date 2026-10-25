@@ -122,6 +122,17 @@ pub struct Lane {
     /// driving off the network: it is not the map's end.
     #[serde(default)]
     pub loaded_edge: bool,
+    /// A `loaded_edge` lane whose end lies within the perceptual horizon of the player's eye (set
+    /// by the game as the eye or the horizon moves, `Traffic::mark_edges_in_sight`): only such an
+    /// edge is routed away from (`Network::ends_at_loaded_edge`); beyond the horizon a car drives
+    /// to the edge and its trip ends there out of sight, as at a SUMO network's border. A
+    /// recording without the field reads it as in sight (round 9's rule, every edge avoided).
+    #[serde(default = "edge_in_sight_default")]
+    pub edge_in_sight: bool,
+}
+
+fn edge_in_sight_default() -> bool {
+    true
 }
 
 /// [round 9 A4 fix pass 2] How far along the road (m) `Network::ends_at_loaded_edge` looks for the
@@ -369,7 +380,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), loaded_edge: false }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), loaded_edge: false, edge_in_sight: true }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -651,10 +662,11 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
-    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles: followed
-    /// along every way on, it reaches only lanes with `loaded_edge` and no way on ([fix pass 2]
-    /// at a fork, when every branch does: a road splitting into parallel lanes that all end at the
-    /// edge). The map's own end, a loop, or any branch leading elsewhere is not that edge.
+    /// [round 9 A4] Does the road from lane `n` on end at the edge of the loaded tiles within the
+    /// player's sight: followed along every way on (within `EDGE_LOOKAHEAD`), it reaches only
+    /// lanes with `loaded_edge` and `edge_in_sight` and no way on (at a fork, when every branch
+    /// does: a road splitting into parallel lanes that all end at the edge). The map's own end, a
+    /// loop, an edge beyond the perceptual horizon, or any branch leading elsewhere is not.
     pub fn ends_at_loaded_edge(&self, n: usize) -> bool {
         // (each lane walked once: a lane met again gives its answer, one still being walked - a
         // loop - is not the edge)
@@ -662,7 +674,7 @@ impl Network {
         fn walk(net: &Network, l: usize, from: f64, memo: &mut std::collections::HashMap<usize, Option<bool>>) -> bool {
             let Some(lane) = net.lanes.get(l) else { return false };
             if lane.next.is_empty() {
-                return lane.loaded_edge;
+                return lane.loaded_edge && lane.edge_in_sight;
             }
             if from > EDGE_LOOKAHEAD {
                 return false;
@@ -3315,7 +3327,8 @@ impl AiState {
         // back 400 m towards the player (r9 jzk). (OMSI geometry, not SUMO: SUMO's vehicles have
         // routes to real destinations and never aim at the network's edge.) With no other way it
         // drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
-        // as they load), so a branch opens again once its tile is loaded.
+        // as they load) and the eye (`Lane::edge_in_sight`): a branch opens again once its tile
+        // is loaded or its edge lies beyond the horizon, where the trip ends out of sight.
         if choices.len() > 1 {
             let open: Vec<usize> = choices.iter().copied().filter(|&n| !net.ends_at_loaded_edge(n)).collect();
             if !open.is_empty() && open.len() < choices.len() {

@@ -830,19 +830,64 @@ fn initial_stall_due(
         }
 }
 
+/// The streaming's share of a frame once the game runs (upload, placing, unloading): a few
+/// milliseconds of a 60 Hz frame's 16.
+pub const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
+/// Its share of a frame while the loading screen waits for the first area.
+pub const LOADING_BUDGET: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// How far round the start the loading screen waits for the tiles (m) before the game
+/// begins; the rest of the view distance streams in while it runs.
+pub const FIRST_AREA: f64 = 700.0;
+
+/// How much farther than the load radius a tile is kept before it is taken away (in tiles):
+/// a tile on the circle is not loaded and unloaded again as the bus moves to and fro.
+const UNLOAD_MARGIN_TILES: f64 = 1.5;
+
+/// A streamed tile's load time (s) from `latency` (its worker's start to placed), or None when
+/// the longest gap between two frames during it exceeds the rest of it: the time was mostly a
+/// stopped game (a debugger, a suspend, a frame held up elsewhere), not the loading.
+fn tile_load_time(latency: f64, longest_gap: f64) -> Option<f64> {
+    (longest_gap <= latency - longest_gap).then_some(latency)
+}
+
+/// The load radius (m): the view distance, or the prefetch reach when that is farther (see
+/// `Streamer::reach_at_least`).
+fn load_radius_for(view_radius: f64, reach: f64) -> f64 {
+    view_radius.max(reach)
+}
+
 /// Loads the tiles around a few points as they move (the camera, and the player's bus,
 /// which must not lose the ground under it when the free camera flies off), like OMSI's
 /// tile streaming: the tiles within `load_radius` of any of them are read, tessellated and
 /// placed on a worker thread (a few at a time, nearest first), put on the GPU a little each
 /// frame, and the tiles beyond `unload_radius` of all of them are taken away again, so the
-/// memory a map needs is bounded by the view distance and not by the size of the map.
+/// memory a map needs is bounded by the load radius (the view distance or the reach) and not by
+/// the size of the map.
+/// `load_radius` is the view distance, or the traffic's prefetch reach when that is farther
+/// (`reach_at_least`): the loaded tiles' edge must lie beyond the perceptual horizon. A tile
+/// the player drives toward is within `load_radius` before it is reached, and only tiles
+/// beyond `unload_radius` (> `load_radius`) of every point are taken away.
 pub struct Streamer {
     world: std::sync::Arc<crate::scene::World>,
     tiles: Vec<(i32, i32, PathBuf)>,
     /// Indices into `tiles`, including duplicate coordinates, in map-file order.
     tile_lookup: hashbrown::HashMap<(i32, i32), Vec<usize>>,
+    /// The view distance asked for (m), the least `load_radius`.
+    view_radius: f64,
     pub load_radius: f64,
     pub unload_radius: f64,
+    /// The time the latest streamed tile took from its worker's start to being placed (s),
+    /// outside the first area (whose tiles wait for each other behind the loading screen) and
+    /// leaving out a tile whose flight was mostly one stopped frame (`tile_load_time`): the time
+    /// one tile load takes while the player drives, for the traffic's prefetch reach. 0 until one
+    /// came.
+    pub load_secs: f64,
+    /// When each tile in flight was handed to its worker, and the longest gap between two
+    /// `update` calls since.
+    asked_at: hashbrown::HashMap<(i32, i32), (std::time::Instant, f64)>,
+    /// When `update` last ran.
+    last_update: Option<std::time::Instant>,
     tx: std::sync::mpsc::Sender<Batch>,
     rx: std::sync::mpsc::Receiver<Batch>,
     inflight: bool,
@@ -879,8 +924,9 @@ pub struct Streamer {
 }
 
 impl Streamer {
-    /// Start streaming around `centers`: the tiles within `initial_radius` of them form the
-    /// first area, which is what the loading screen waits for.
+    /// Start streaming around `centers`: the tiles within `initial_radius` of them that are
+    /// not loaded yet form the first area, which is what the loading screen waits for (none
+    /// when a world loaded them already, as offscreen).
     pub fn new(world: std::sync::Arc<crate::scene::World>, centers: &[DVec3], load_radius: f64, initial_radius: f64) -> Streamer {
         let tiles = world.select_tiles(None, None);
         let mut tile_lookup: hashbrown::HashMap<(i32, i32), Vec<usize>> = hashbrown::HashMap::new();
@@ -892,8 +938,12 @@ impl Streamer {
             world,
             tiles,
             tile_lookup,
+            view_radius: load_radius,
             load_radius,
-            unload_radius: load_radius + tile_size() * 1.5,
+            unload_radius: load_radius + tile_size() * UNLOAD_MARGIN_TILES,
+            load_secs: 0.0,
+            asked_at: Default::default(),
+            last_update: None,
             tx,
             rx,
             inflight: false,
@@ -917,10 +967,22 @@ impl Streamer {
             initial_upload: None,
             relieved_at: (0, 0, std::time::Instant::now()),
         };
-        let first: hashbrown::HashSet<(i32, i32)> = s.tiles.iter().filter(|t| Self::nearest(centers, t.0, t.1) <= initial_radius.min(load_radius)).map(|t| (t.0, t.1)).collect();
+        let loaded: hashbrown::HashSet<(i32, i32)> = s.world.loaded_tiles().into_iter().collect();
+        let first: hashbrown::HashSet<(i32, i32)> = s.tiles.iter().filter(|t| Self::nearest(centers, t.0, t.1) <= initial_radius.min(load_radius) && !loaded.contains(&(t.0, t.1))).map(|t| (t.0, t.1)).collect();
         log::info!("tile streaming: {} tiles in the map, load radius {:.0} m around {} points ({} tiles now), first area {} tiles", s.tiles.len(), load_radius, centers.len(), s.tiles.iter().filter(|t| Self::nearest(centers, t.0, t.1) <= load_radius).count(), first.len());
-        s.initial = Some((first, 0));
+        s.initial = (!first.is_empty()).then_some((first, 0));
         s
+    }
+
+    /// The traffic's prefetch reach (m, `Traffic::prefetch_reach`): the tiles are loaded at
+    /// least this far round every point, the view distance being the least. The loaded
+    /// tiles' edge is where the traffic network ends without being the map's end; within the
+    /// perceptual horizon it would be a visible dead end (a queue standing at nothing, or a
+    /// road A4 keeps empty). The radius follows the reach both ways; what a shorter radius
+    /// leaves goes only beyond `unload_radius`.
+    pub fn reach_at_least(&mut self, reach: f64) {
+        self.load_radius = load_radius_for(self.view_radius, reach);
+        self.unload_radius = self.load_radius + tile_size() * UNLOAD_MARGIN_TILES;
     }
 
     /// Distance from `p` to the nearest point of tile (tx, ty).
@@ -986,6 +1048,13 @@ impl Streamer {
     /// when the loaded tiles changed (the caller then refreshes whatever copies world data).
     pub fn update(&mut self, renderer: &omsi_render::Renderer, scene: &mut omsi_render::Scene, centers: &[DVec3], budget: std::time::Duration, audio: Option<&omsi_audio::AudioEngine>) -> bool {
         let mut changed = false;
+        let now = std::time::Instant::now();
+        if let Some(gap) = self.last_update.map(|t| now.duration_since(t).as_secs_f64()) {
+            for (_, longest) in self.asked_at.values_mut() {
+                *longest = longest.max(gap);
+            }
+        }
+        self.last_update = Some(now);
         while let Ok((asked, prepared, stats, secs)) = self.rx.try_recv() {
             self.inflight = false;
             if let Some((keys, started)) = self.inflight_batch.take() {
@@ -1002,6 +1071,7 @@ impl Streamer {
             for k in asked.into_iter().filter(|k| !made.contains(k)) {
                 log::warn!("tile streaming: tile {},{} could not be loaded; left out", k.0, k.1);
                 self.requested.remove(&k);
+                self.asked_at.remove(&k);
                 self.failed.insert(k);
                 if let Some((_, done)) = self.initial.as_mut().filter(|(set, _)| set.contains(&k)) {
                     *done += 1;
@@ -1026,6 +1096,7 @@ impl Streamer {
                 // gone out of range while it was being prepared: what it already holds on
                 // the GPU goes back with it
                 self.requested.remove(&key);
+                self.asked_at.remove(&key);
                 self.world.abandon_upload(renderer, scene, p, audio);
                 changed = true;
                 continue;
@@ -1042,6 +1113,11 @@ impl Streamer {
                 break;
             }
             self.requested.remove(&key);
+            if let Some((asked, longest_gap)) = self.asked_at.remove(&key).filter(|_| !initial) {
+                if let Some(t) = tile_load_time(asked.elapsed().as_secs_f64(), longest_gap) {
+                    self.load_secs = t;
+                }
+            }
             if initial {
                 let secs = self
                     .initial_upload
@@ -1120,7 +1196,7 @@ impl Streamer {
         if self.last_summary.elapsed().as_secs_f32() >= 10.0 && omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
             self.last_summary = std::time::Instant::now();
             let at: Vec<String> = centers.iter().map(|c| format!("({:.0}, {:.0})", c.x, c.y)).collect();
-            log::info!("tile streaming at {}: {} loaded / {} unloaded so far; {}", at.join(" "), self.loaded_total, self.unloaded_total, self.world.gpu_summary(scene));
+            log::info!("tile streaming at {}: {} loaded / {} unloaded so far; load radius {:.0} m (view {:.0} m), latest tile load {:.2} s; {}", at.join(" "), self.loaded_total, self.unloaded_total, self.load_radius, self.view_radius, self.load_secs, self.world.gpu_summary(scene));
             if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
                 log::info!("  {}", self.world.cpu_summary());
             }
@@ -1187,6 +1263,8 @@ impl Streamer {
                 let batch: Vec<(i32, i32, PathBuf)> = missing.into_iter().take(n).map(|(_, t)| t).collect();
                 let keys: Vec<(i32, i32)> = batch.iter().map(|t| (t.0, t.1)).collect();
                 self.requested.extend(keys.iter().copied());
+                let now = std::time::Instant::now();
+                self.asked_at.extend(keys.iter().map(|k| (*k, (now, 0.0))));
                 self.inflight = true;
                 let world = self.world.clone();
                 let tx = self.tx.clone();
@@ -1213,6 +1291,7 @@ impl Streamer {
                     self.inflight_batch = None;
                     for k in keys {
                         self.requested.remove(&k);
+                        self.asked_at.remove(&k);
                     }
                 }
             }
@@ -1224,6 +1303,51 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_loaded_edge_ahead_lies_beyond_the_reach() {
+        // The load radius is the view distance or the prefetch reach, the farther; every point on
+        // a tile not loaded is then farther than the reach from the player, along any road from
+        // anywhere on a tile; and a tile the player drives toward, once within the load radius,
+        // stays within the unload radius until passed.
+        let ts = tile_size();
+        let reach = 661.0;
+        assert_eq!(load_radius_for(600.0, reach), reach);
+        assert_eq!(load_radius_for(2500.0, reach), 2500.0);
+        let r = load_radius_for(600.0, reach);
+        let unload = r + ts * UNLOAD_MARGIN_TILES;
+        for start in [(10.0, 20.0), (0.5 * ts, 0.97 * ts), (0.99 * ts, 0.01 * ts)] {
+            for heading in [0.0f64, 30.0, 90.0, 200.0, 315.0] {
+                let p = DVec3::new(start.0, start.1, 0.0);
+                let (sx, sy) = (heading.to_radians().sin(), heading.to_radians().cos());
+                let mut d = 0.0;
+                let edge = loop {
+                    d += 1.0;
+                    let (x, y) = (p.x + sx * d, p.y + sy * d);
+                    if Streamer::nearest(&[p], (x / ts).floor() as i32, (y / ts).floor() as i32) > r {
+                        break d;
+                    }
+                };
+                assert!(edge > reach, "from {start:?} heading {heading}: edge {edge} m");
+            }
+        }
+        let mut within = false;
+        for y in (0..2000).step_by(10) {
+            let n = Streamer::distance(DVec3::new(0.5 * ts, y as f64, 0.0), 0, 6);
+            within |= n <= r;
+            assert!(!within || n <= unload, "a tile ahead is never taken away: {n} m at y {y}");
+        }
+        assert!(within);
+    }
+
+    #[test]
+    fn a_tile_load_is_timed_without_the_stopped_frames() {
+        // a load of 0.9 s over frames of 1/30 s counts; one mostly spent in a 60 s stop (a
+        // debugger, a suspend) does not; the latest counts, so a slow one is not kept for ever
+        assert_eq!(tile_load_time(0.9, 1.0 / 30.0), Some(0.9));
+        assert_eq!(tile_load_time(60.4, 60.0), None);
+        assert_eq!(tile_load_time(2.0, 1.0), Some(2.0), "half and half: still the load");
+    }
 
     #[test]
     fn first_area_stall_log_is_delayed_and_rate_limited() {

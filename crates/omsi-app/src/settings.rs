@@ -856,6 +856,9 @@ pub fn graphics_mode(v: &str) -> &'static str {
     }
 }
 
+/// The view distance (m) when the settings name none: the launcher's "Default (1200 m)".
+pub const DEFAULT_VIEW_DISTANCE: f64 = 1200.0;
+
 /// `view_distance=<metres>` of the settings file: how far around the camera the map's tiles
 /// are kept loaded (OMSI's "visible distance"). None when the file does not say.
 pub fn view_distance() -> Option<f64> {

@@ -66,7 +66,8 @@ pub(crate) fn lan_outlines(game: &lan::LanGame) -> Vec<(u32, traffic::PlayerBox)
 }
 
 /// What the traffic needs to know every frame besides the time: where the player looks
-/// from, the day of the week, who walks the footpaths, what hides what.
+/// from and how far the picture reaches (the renderer's culling), the day of the week, who walks
+/// the footpaths, what hides what.
 pub(crate) fn traffic_inputs(
     t: &mut traffic::Traffic,
     cam: Option<&Camera>,
@@ -87,6 +88,8 @@ pub(crate) fn traffic_inputs(
                 .with_extent(extent)
                 .with_culling(render.min_obj_size, render.max_obj_dist),
         );
+        // which loaded edges A4 routes away from follows the eye and its horizon
+        t.mark_edges_in_sight();
     }
     t.weekday = clock.weekday();
     t.walkers = humans.map(|h| h.strollers()).unwrap_or_default();

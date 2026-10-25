@@ -25,12 +25,14 @@ pub(crate) struct Args {
     /// Camera: x,y,z,yaw,pitch (world metres / degrees). Default: the map's editor camera.
     #[arg(long)]
     pub(crate) cam: Option<String>,
-    /// Only load tiles within this many tiles of the camera/spawn tile, all at once
-    /// (default: 2 for offscreen renders; the window streams the tiles around the camera).
+    /// Only load tiles within this many tiles of the camera/spawn tile, all at once, and keep
+    /// them (default: the window streams the tiles around the camera; an offscreen render
+    /// loads 2, and one with traffic streams them as the window does).
     #[arg(long)]
     pub(crate) radius: Option<i32>,
-    /// How far around the camera the window keeps tiles loaded (m); `view_distance` in the
-    /// settings file, 1200 m by default.
+    /// How far around the camera the tiles are kept loaded (m), at least: the traffic's
+    /// prefetch reach takes them farther when the perceptual horizon lies beyond it;
+    /// `view_distance` in the settings file, 1200 m by default.
     #[arg(long = "view-distance")]
     pub(crate) view_distance: Option<f64>,
     /// Load every tile of the map.

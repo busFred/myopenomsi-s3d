@@ -438,6 +438,32 @@ fn a4_random_cars_do_not_turn_towards_the_loaded_edge_when_another_way_leads_on(
     assert_eq!(picks(&build(true, false)), 200, "the only way on is still taken");
 }
 
+/// [round 10 S4] The same fork with the edge beyond the perceptual horizon (`edge_in_sight`
+/// cleared by the game): it is not routed away from - the car drives to it and its trip ends there
+/// out of sight - so the branch is a way like any other.
+#[test]
+fn s4_an_edge_beyond_the_horizon_is_not_routed_away_from() {
+    let mut net = Network::default();
+    net.lanes.push(road((0.0, 0.0), (0.0, 100.0), 1, 0));
+    net.lanes.push(road((0.0, 100.0), (30.0, 150.0), 2, 0));
+    net.lanes.push(road((30.0, 150.0), (60.0, 190.0), 3, 0));
+    net.lanes.push(road((0.0, 100.0), (0.0, 200.0), 4, 0));
+    net.lanes.push(road((0.0, 200.0), (0.0, 300.0), 5, 0));
+    net.lanes[2].loaded_edge = true;
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    assert!(net.ends_at_loaded_edge(1), "in sight (the default): avoided");
+    net.lanes[2].edge_in_sight = false;
+    assert!(!net.ends_at_loaded_edge(1), "beyond the horizon: a way like any other");
+    let n = (1..=200u64).filter(|&seed| {
+        let mut st = AiState::new(0, 50.0, seed * 7919);
+        st.plan_next(&net);
+        st.planned_next == Some(1)
+    }).count();
+    assert!(n > 50 && n < 150, "{n} of 200");
+}
+
 /// [round 9 A2 fix pass 2] With the edge its trip's end (`External::edge_trip_end`, beyond the
 /// horizon, lamps dark), a car does not stop at the loaded tiles' edge: it drives off the lane's
 /// end still moving and never brakes (no brake lamp lights); without it, it stops as before.
