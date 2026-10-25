@@ -629,7 +629,9 @@ impl Viewer {
     }
 
     /// Would the renderer draw an object of radius `r` this far away at all (an object already
-    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance)? Beyond that a car, its
+    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance; too small on screen, under
+    /// `min_size`, it is left out - but with the lamps lit its glows are not, so then only the
+    /// distance counts)? Beyond that a car, its
     /// lamp glows included (`lights::lamps_drawn`), can come and go in plain view without anybody
     /// seeing it happen.
     pub fn draws(&self, dist: f64, r: f64) -> bool {
@@ -639,7 +641,10 @@ impl Viewer {
         if self.max_dist > 0.0 && dist > self.max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64 + r {
             return false;
         }
-        self.min_size <= 0.0 || 2.0 * r / (dist.max(0.01) * self.fov.max(1e-3)) >= self.min_size
+        // (with the lamps lit only the distance counts: the renderer leaves a body under
+        // `min_size` out, but its lamp glows are culled by the distance alone,
+        // `lights::lamps_drawn`, and still show)
+        self.lamps_lit || self.min_size <= 0.0 || 2.0 * r / (dist.max(0.01) * self.fov.max(1e-3)) >= self.min_size
     }
 
     /// Could a vehicle of radius `r` at `p` come or go unseen with nothing hiding it: the
@@ -5309,6 +5314,11 @@ fn edge_bound_of(net: &Network) -> hashbrown::HashSet<usize> {
 /// the reach is at most the renderer's object distance plus one tile load; with `max_obj_dist`
 /// auto, the view distance), never within `NEAR_HIDE` (as
 /// `Viewer::beyond_horizon`: the far trip end acts beyond both).
+/// A stated trade, flagged for the user: the reach uses the dark horizon by dusk and night too.
+/// With the lamps lit an edge is in sight out to the renderer's reach (1.05 x the object
+/// distance: ~3150 m with the user's 3000 m), so beyond the view distance (2500 m) A4 keeps the
+/// roads to it empty at night; loading out to the lit reach instead (~3.25 km) would cost ~1.7x
+/// the tiles (coordinator decision, round 10: memory over the night picture at 2.5-3 km).
 fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
     Viewer { lamps_lit: false, ..viewer }.horizon(height).max(NEAR_HIDE)
 }
@@ -6094,6 +6104,13 @@ mod prefetch_tests {
         let drawn_to = 600.0 * hold + r * 1.5 + 1.0;
         assert!(!lit.beyond_horizon(drawn_to - 1.0, 4.4, r) && lit.beyond_horizon(drawn_to + 1.0, 4.4, r));
         assert!(!low.beyond_horizon(drawn_to - 1.0, 4.4, r) && low.beyond_horizon(drawn_to + 1.0, 4.4, r));
+        // a lit car too small for the renderer's minimum size (the user's 0.005) still glows: at
+        // 2000 m with objects to 3000 m it is not beyond the horizon; dark, it is (size-culled and
+        // past its two-pixel distance)
+        let user = v.with_culling(0.005, 3000.0);
+        assert!(!user.draws(2000.0, 2.0) && user.with_lamps(true).draws(2000.0, 2.0));
+        assert!(!user.with_lamps(true).beyond_horizon(2000.0, CAR_HEIGHT, 2.0));
+        assert!(user.beyond_horizon(2000.0, CAR_HEIGHT, 2.0));
     }
 }
 
