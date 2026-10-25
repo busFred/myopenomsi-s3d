@@ -326,3 +326,39 @@ fn pass1_a_mutual_refusal_eases_only_once_both_claims_stand() {
         assert_eq!(eased, !crawl, "claim filed crawling {crawl}: eased {eased}");
     }
 }
+
+/// [round 10 pass 1, J9-2 for people] A car on green whose rest inside the box is the zebra stop of
+/// a walk with somebody on it, at a waiting place (its body on no band), enters and waits there,
+/// as SUMO's vehicle waits before the crossing on its internal lane; it is not held at its line.
+/// (A guard of the behaviour: in this geometry the rule before pass 1 let it in after 1.0 s too.)
+#[test]
+fn pass1_a_car_waiting_for_people_at_a_walk_inside_the_box_enters_on_green() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-21.0, 0.0)], 1)); // 0 approach
+    let mut stub = piece(&[(-21.0, 0.0), (-20.0, 0.0)], 0, LaneKind::Street); // 1 lit stub
+    stub.traffic_light = Some((0, 0));
+    net.lanes.push(stub);
+    net.lanes.push(piece(&[(-20.0, 0.0), (30.0, 0.0)], 1, LaneKind::Street)); // 2
+    net.lanes.push(road(&[(30.0, 0.0), (300.0, 0.0)], 2)); // 3
+    net.lanes.push(piece(&[(-12.0, -15.0), (-12.0, 15.0)], 2, LaneKind::Street)); // 4 cross street
+    net.lanes.push(piece(&[(6.0, -8.0), (6.0, 8.0)], 3, LaneKind::Sidewalk)); // 5 walk at x 6
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    let ctl = TrafficLightController::new(vec![vec![(6, 900.0), (0, 100.0)]], 1000.0);
+    let mut sim = Simulation::new(&net, vec![ctl]);
+    sim.people.push(omsi_traffic::Person { pos: DVec3::new(6.0, 0.3, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 60.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
+    let mut cars = vec![car(1, 0, 279.0 - 40.0, 8.0)];
+    let mut kept = 0.0f32;
+    run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+        if cars[0].last.why == Why::KeepClear {
+            kept += DT;
+        }
+    });
+    let c = &cars[0];
+    let front = c.pos.x as f32 + c.state.front;
+    // (at the green's start the keep-clear test meets the people stop for a moment, while it is
+    // still placed before the walk's band is in reach; the car never waits at its line)
+    assert!(kept < 1.0 && c.state.lane == 2 && c.last.why == Why::People, "held at the line {kept:.1} s; lane {} why {:?}", c.state.lane, c.last.why);
+    assert!(front <= 6.0 - omsi_traffic::plan::ZEBRA_STOP + 0.1 && front > -7.0, "waits at the zebra stop inside, past the cross street: front {front:.1}");
+}

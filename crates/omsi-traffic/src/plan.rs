@@ -2259,11 +2259,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //     not drive onto a junction where it would get stuck): a car short of its junction's lit
     //     line does not cross it while where it would come to rest lies between the line and the
     //     way's exit and is no waiting place - behind a lead standing or coming to rest there (one
-    //     car to a waiting place), at people, or a refusal's stop with its body on a band (a
-    //     crossing meeting place, a walk, a convergence: `wait_bands`). A refusal's stop at a
-    //     waiting place inside (`refused_stop`, the body on no band) is a legal place: SUMO's
-    //     vehicle enters on green and waits at the internal junction (sumo.md 1.2), and at the end
-    //     of its green it clears first (`reservation::will_pass`). Held, it waits at the line,
+    //     car to a waiting place), or its own stop (a refusal, people) with its body on a band (a
+    //     crossing meeting place, a walk, a convergence: `wait_bands`), where it would block a
+    //     foe's way or a crossing. Its own stop at a waiting place inside (the body on no band:
+    //     `refused_stop`'s waiting place, or the zebra stop short of a walk) is a legal place:
+    //     SUMO's vehicle enters on green and waits at the internal junction (sumo.md 1.2), or
+    //     before the crossing on its internal lane (sumo.md 4.3), and at the end of its green it
+    //     clears first (`reservation::will_pass`). Held, it waits at the line,
     //     pulled back before a walk there (viz5 case05 #16535 crossed on green into a box its
     //     people stop lay in and stood 2.8 m in, over the crossing). A way through that crosses
     //     nothing - no crossing meeting place, walk or convergence, only merges, which the zipper
@@ -2277,7 +2279,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
             let len = me.length();
             let waiting_place = |r: f32| !bands.iter().any(|b| b.0 < r && b.1 > r - len - REST_SHORT);
-            let own = out.stop.filter(|&r| !(out.why == Why::Junction && waiting_place(r)));
+            let own = out.stop.filter(|&r| !(matches!(out.why, Why::Junction | Why::People) && waiting_place(r)));
             let rest = [own, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
             let exit = j.entry + j.way_len;
             if rest > line + 0.5 && rest < exit {
