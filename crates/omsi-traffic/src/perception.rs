@@ -47,7 +47,7 @@ pub struct Headway {
     pub at_stop: bool,
     /// Where its middle lies across my lane (m, + right of the lane's middle).
     pub lateral: f32,
-    /// [round5 C3] Where its rear comes to rest (m from my origin) when it brakes for a stop of
+    /// Where its rear comes to rest (m from my origin) when it brakes for a stop of
     /// its own (its plan's `stop`): a queue forming ahead of me, before it stands.
     pub rest: Option<f32>,
 }
@@ -94,7 +94,7 @@ impl Headway {
     }
 }
 
-/// [round 7 A3 fix] Somebody moving at this pace (m/s) or more is stepping, and is judged
+/// Somebody moving at this pace (m/s) or more is stepping, and is judged
 /// where their step takes them as well as where they are (`people_ahead`); slower is a shuffle
 /// (round 5 C2: 0.1 m/s beside a standing car's body).
 const STEP_SPEED: f32 = 0.5;
@@ -127,7 +127,7 @@ pub struct JunctionView {
     pub movement: usize,
     /// Distance from the origin to the start of the movement's lane (negative inside).
     pub entry: f32,
-    /// [round 7 A2-full] Distance from the origin to where the junction begins on this way:
+    /// Distance from the origin to where the junction begins on this way:
     /// the movement's lane's start (`entry`), but for a lane that is a movement only by
     /// joining another way (a spline lane, `Junctions::extend`) a metre before its first
     /// meeting place - up to there it is an approach lane like any lane leading in (the
@@ -237,10 +237,10 @@ pub struct NeighbourView {
     pub ahead: Option<(f32, f32)>,
     /// Nearest vehicle behind there: (gap to my rear, its speed).
     pub behind: Option<(f32, f32)>,
-    /// [J7-3] That vehicle's index, when it is an AI vehicle (the one asked to make room,
+    /// That vehicle's index, when it is an AI vehicle (the one asked to make room,
     /// `plan`'s cooperation).
     pub behind_id: Option<usize>,
-    /// [J7-3, fix pass 2] That vehicle's standing gap (m; a player's: the timetable bus preset's):
+    /// That vehicle's standing gap (m; a player's: the timetable bus preset's):
     /// the gap a change needs from it at rest (`plan::gap_needed_behind`).
     pub behind_min_gap: f32,
     /// How far the lane and its successors run on from beside me (m).
@@ -283,13 +283,13 @@ pub struct Perception {
     pub route_change: Option<(usize, i32)>,
     /// Metres the way runs on before it ends.
     pub road_left: f32,
-    /// A parked car the way should swerve round, or [round 5 L3] people on a kerbless
+    /// A parked car the way should swerve round, or people on a kerbless
     /// pavement strip beside the lane: the lateral offset needed.
     pub kerb_swerve: Option<f32>,
-    /// [round 5 L3] `kerb_swerve` is (also) the shift past people beside the lane: the car
+    /// `kerb_swerve` is (also) the shift past people beside the lane: the car
     /// eases past them.
     pub people_swerve: bool,
-    /// [round 7 A7] The swerve round a parked car alone (`kerb_swerve` without the shift
+    /// The swerve round a parked car alone (`kerb_swerve` without the shift
     /// past people): what a timetable bus between its stops takes.
     pub parked_swerve: Option<f32>,
     pub oncoming: Option<OncomingView>,
@@ -302,7 +302,7 @@ pub struct Perception {
     pub ahead: Vec<(f32, f32, f32)>,
     /// The current lane's limit at the driver's desire (m/s).
     pub v_want: f32,
-    /// [J7-3] Where my lane ends for me ahead (`lane_end`).
+    /// Where my lane ends for me ahead (`lane_end`).
     pub lane_end: Option<LaneEnd>,
 }
 
@@ -377,7 +377,7 @@ impl WayPts {
         let mut prev = qs[0].truncate();
         for (&d, q) in ds.iter().zip(&qs).skip(1) {
             let q2 = q.truncate();
-            // ([P8 pass 2, R3] a sample on top of the one before - a way's end sampled twice -
+            // (a sample on top of the one before - a way's end sampled twice -
             // is left out: a zero-length slice has no heading and left its wedge uncovered)
             if !pts.is_empty() && (q2 - prev).length_squared() < 1e-12 {
                 continue;
@@ -398,7 +398,7 @@ impl WayPts {
         WayPts { pts, zs, chunks }
     }
 
-    /// [P8-5] How far behind and ahead of sample `i` (m, along its heading) a point belongs to
+    /// How far behind and ahead of sample `i` (m, along its heading) a point belongs to
     /// it: half the real distance to each neighbour and the 5 cm overlap of round 4 (half a
     /// `WAY_STEP` where there is no neighbour). The samples are `WAY_STEP` apart along the way,
     /// but not on the ground: over a junction's short pieces two of them lay 2.5 m apart, and a
@@ -666,7 +666,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         if on_way && (along + o.state.front < -(st.rear + 2.0) || along - o.state.rear - st.front > look + 3.0) {
             continue;
         }
-        // (two bodies blocking each other, both moving: the higher id goes. [round 7 A2-full]
+        // (two bodies blocking each other, both moving: the higher id goes. 
         // Not past one that stands: a standing body is the lead of whoever rolls into it,
         // whatever it waits for - viz2 case11's cars rolled at 4-5 m/s into a car standing at
         // the join of 9844/9845 and 10340, 1.28 m deep, as it named them its body block; two
@@ -739,7 +739,7 @@ fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         if o.last.lead_id == Some(me.id) && rel.dot(my_fwd) < 0.0 {
             continue;
         }
-        // [J7-1] a body crossing my way that is out of my corridor before my front can be where
+        // a body crossing my way that is out of my corridor before my front can be where
         // it is: no lead - SUMO's follower case of `MSLink::blockedByFoe` at a crossing (its
         // leave time before my arrival), the junction leader that has passed the conflict point
         // by the time ego arrives (`MSVehicle::adaptToJunctionLeader`, `MSLink::getLeaderInfo`).
@@ -987,7 +987,7 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
             if !(-6.0..=100.0).contains(&along) {
                 continue;
             }
-            // ([fix pass 1, 13] against the offset the car holds without the kerb swerve - the
+            // (against the offset the car holds without the kerb swerve - the
             // lane's axis where the swerve is the plan's lateral, `plan` rule 9: measured
             // against `lateral_ahead`, which includes the swerve itself, the need flickered
             // 0 / -0.35 / 0 frame by frame on 37 cars of a run)
@@ -1013,7 +1013,7 @@ fn parked_on_way(sim: &Simulation, me: &Vehicle, way: &[(usize, f32)]) -> (Optio
 }
 
 /// Someone on foot in the strip ahead.
-/// [ROLLBACK r4d-B4] The clearance (m) a bus at its stop keeps round its footprint from the
+/// The clearance (m) a bus at its stop keeps round its footprint from the
 /// people standing at the kerb.
 const KERB_CLEAR: f32 = 0.3;
 
@@ -1031,7 +1031,7 @@ const STEP_LOOK: f32 = 4.0;
 /// people_wait_s +214 s, viz3 +290 s against the 2 s rule).
 const STEP_NEAR: f32 = 1.5;
 
-/// [round 5 L3] A car shifts inside the drawn road to pass people on a kerbless pavement
+/// A car shifts inside the drawn road to pass people on a kerbless pavement
 /// strip beside its lane (BeijingCity's Wuluju stop, round5 case01: walkers on the inner half
 /// of a pavement path laid on the asphalt, 0.3-0.5 m off the car's flank, held #2827 for 50 s)
 /// rather than standing: at least this far (m) - half a metre clears walkers at 1.3-1.5 m of
@@ -1100,7 +1100,7 @@ impl ZebraCut {
     }
 }
 
-/// [P8-5] SUMO's `MSPModel::SAFETY_GAP` (1 m, `MSPModel.cpp`): the band a vehicle asks the
+/// SUMO's `MSPModel::SAFETY_GAP` (1 m, `MSPModel.cpp`): the band a vehicle asks the
 /// crossing about is its width and this (`MSLink::getLeaderInfo`: `vehWidth = width +
 /// SAFETY_GAP`).
 const CROSSING_SAFETY_GAP: f32 = 1.0;
@@ -1113,7 +1113,7 @@ const JM_CROSSING_GAP: f32 = 10.0;
 const CROSSING_STANDING_WAIT: f32 = 2.0;
 
 impl ZebraCut {
-    /// [P8-5] SUMO's `blockedAtDist` for somebody on this crossing's walk: they hold a vehicle
+    /// SUMO's `blockedAtDist` for somebody on this crossing's walk: they hold a vehicle
     /// whose band (its width and `CROSSING_SAFETY_GAP`, centred `lat` off the lane's axis) they
     /// have not completely passed, when they are inside it, or walk towards it from at most
     /// `JM_CROSSING_GAP` and have not stood `CROSSING_STANDING_WAIT`. Their walking direction is
@@ -1185,7 +1185,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // who holds the car on its way, and who would on the lane's axis (the shift's candidates)
     let mut holders: Vec<Holder> = Vec::new();
     let mut on_axis: Vec<Holder> = Vec::new();
-    // [ROLLBACK r4d-B4] a bus coming up to its own stop pulls in beside the people standing
+    // a bus coming up to its own stop pulls in beside the people standing
     // at the kerb: only one inside its footprint and `KERB_CLEAR` round it holds it, where
     // they stand (where their shuffle would take them stopped a bus 7.4 m short of its pole),
     // and with no "stood at the edge a while" exemption (it crept on and stopped by turns)
@@ -1196,11 +1196,11 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     let (drivable_left, drivable_right) = lane.map(|l| l.drivable()).unwrap_or((0.0, 0.0));
     let lane_left = lane.map(|l| l.length() - st.s).unwrap_or(0.0);
     let zebras = zebra_cuts(net, me, lanes);
-    // ([fix pass 3, 3] my body already over a crossing my way cuts: I clear it forward - the
+    // (my body already over a crossing my way cuts: I clear it forward - the
     // people on it treat me as an obstacle, SUMO's pedestrian side, sumo.md §4.3)
     let covered_walks: Vec<usize> = lanes.iter().flat_map(|&(l, d0)| net.walks.get(l).map(|ws| ws.as_slice()).unwrap_or(&[]).iter().filter(move |&&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front).map(|&(w, _, _)| w)).collect();
     let covering = !covered_walks.is_empty();
-    // [P8-5] SUMO's crossing test (`MSLink::getLeaderInfo` with `blockedAtDist`, sumo.md 4.3):
+    // SUMO's crossing test (`MSLink::getLeaderInfo` with `blockedAtDist`, sumo.md 4.3):
     // for every crossing my way cuts whose zebra stop (`plan::ZEBRA_STOP` before the cut) my
     // front has not passed - a position test, no braking test, as SUMO's (`distToCrossing -
     // jmStoplineCrossingGap >= -SAFETY_GAP`: SUMO stops 1 m before the crossing and asks until
@@ -1252,13 +1252,13 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         if rel.truncate().length() > radius || rel.z.abs() > 2.5 {
             continue;
         }
-        // [round 8 H8-8, fix pass 2] a car pulling out of a parking space: not the walkers under
+        // a car pulling out of a parking space: not the walkers under
         // or beside its parked body who are off its way out
         if crate::plan::pull_out_exempt(net, me, p) {
             continue;
         }
         let standing = p.vel.length() < 0.3;
-        // [round 7 A3] somebody on the walk of a crossing ahead, within `ZEBRA_BESIDE` of my
+        // somebody on the walk of a crossing ahead, within `ZEBRA_BESIDE` of my
         // lane's footprint, not a kerb waiter (`at_kerb`: they let the vehicle go first, P4),
         // is held for as one on the crossing: the one people test (round 4's zebra check,
         // which held for them from the walkers' list, is gone; review-r5c-safety C2: a stander
@@ -1270,7 +1270,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // ahead is on the next crossing and holds as any)
         let hd = (me.heading as f64).to_radians();
         let ahead_of_front = rel.truncate().dot(DVec2::new(hd.sin(), hd.cos())) as f32 - st.front;
-        // ([P8 pass 3, C1] only somebody on a walk my body covers: one on the next walk - a
+        // (only somebody on a walk my body covers: one on the next walk - a
         // crowd stepping onto a short walk a turn crosses 3 m on - goes through the ordinary
         // strip and body tests below like anybody; w2-jzk #1902 re-accelerated into them.
         // SUMO's approaching-persons rule, myApproachingPersons, is not implemented: round 9)
@@ -1282,7 +1282,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             continue;
         }
         let at_kerb_of_stop = own_stop && !on_crossing && (standing || p.waiting_for_bus);
-        // [P8-1, pass 1 B1] somebody waiting for a bus at a stop this bus serves - the one it
+        // somebody waiting for a bus at a stop this bus serves - the one it
         // comes up to or stands at, or the one it served last (`External::serves`, the
         // waiter's `Person::waits_at`, the stop as the people know it, not a place in metres):
         // the bus pulls in beside them, held for them only where they stand and only where
@@ -1314,7 +1314,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let later = p.pos.truncate() + p.vel * t as f64;
         // (where somebody waiting for a bus is, not where their shuffle would take them)
         let positions: &[DVec2] = if at_kerb_of_stop || my_waiter { &[p.pos.truncate()] } else { &[p.pos.truncate(), later] };
-        // ([fix pass 1, 2; pass 2, 3] anybody whose body is over mine - beside it or behind
+        // (anybody whose body is over mine - beside it or behind
         // the front plane, now or where their step takes them - holds the car where it stands
         // until they are clear of it (SUMO: vehicles brake for persons on their lane): the
         // way's samples start at the front and let a car move off into a walker crossing
@@ -1324,14 +1324,14 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             let body = me.obb();
             // (where they are; where their step takes them only for one stepping - a shuffle
             // is no step, round 5 C2)
-            // ([fix pass 3, 3] and only somebody inside it NOW holds a car whose body already
+            // (and only somebody inside it NOW holds a car whose body already
             // covers a crossing: it clears the crossing forward - viz3 case20 #59845 stopped at
             // 3.7 m/s with the crossing under it and stood 78 s with a walker's projected step
             // inside its body)
             let stepping = (on_crossing || p.vel.length() >= STEP_SPEED as f64) && !covering;
             let at: &[DVec2] = if stepping { positions } else { &positions[..1] };
             let inside = |pos: DVec2| omsi_sim::collision::Obb::point(pos.extend(p.pos.z), crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0;
-            // ([pass 2, R1] out on a pass or bypass, somebody only their step brings over my
+            // (out on a pass or bypass, somebody only their step brings over my
             // body, whose line my rear passes at my present speed before they reach my flank,
             // is passed first - SUMO's time slots - not
             // stopped for with my body left across their path)
@@ -1348,14 +1348,14 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
         }
-        // [P8 pass 1, S2] a pass or bypass moving sideways: the body as it will go on the bent
+        // a pass or bypass moving sideways: the body as it will go on the bent
         // way over one body length against where they are and where their step takes them,
         // held short of the first place it would cover them (SUMO checks the target lane's
-        // pedestrians for every change, MSLaneChanger: `targetLane->hasPedestrians()`): the
+        // pedestrians for every change, MSLaneChanger: `targetLane->hasPedestrians`): the
         // strip test exempts somebody level with the body and outside its footprint, whom the
         // sideways move reaches (viz3 case11 #29300 passed out into a walker level with it)
         if sideways {
-            // ([pass 2, R1] timed: the person where they will be when the body reaches each
+            // (timed: the person where they will be when the body reaches each
             // pose (my arrival there at my speed and acceleration, `arrival_time`), and never a
             // stop that leaves the body across their path - none when I cannot stop short of
             // the meeting pose (`plan::cannot_stop`, the hard brake), none when the pose I
@@ -1402,7 +1402,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             // (where their body is now, off my way: the shift below is for somebody outside my
             // footprint, which a projected shuffle must not decide)
             let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
-            // [round 5 L3] one beside the lane - outside its footprint now and after their
+            // one beside the lane - outside its footprint now and after their
             // step, their body outside mine (C2 holds one inside it), inside the drawn road -
             // on the car's own lane: a shift inside the drawn road may clear them (a bus pulls
             // in beside its people; one on a crossing, or stepping into the lane, holds the car)
@@ -1422,7 +1422,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 let along = r.dot(fwd);
                 let across_way = r.dot(right) as f32;
                 let across = across_way.abs();
-                // ([round 7 A3 fix] outside my footprint at this position - now or where their
+                // (outside my footprint at this position - now or where their
                 // step takes them - for the exemptions below: one stepping into my body from
                 // beside it holds the car; review-cleanup-crate-safety: x10 case15 bus #33316
                 // swept a walker on a crossing 1.20 m deep at 4.4 m/s)
@@ -1434,14 +1434,14 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 if along < -span_back || along > span_ahead {
                     continue;
                 }
-                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
+                // somebody waiting at the kerb to cross, outside my own
                 // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
                 // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
                 // with a stream on the crossing they let the vehicle go first (P4)
                 if p.at_kerb && !on_crossing && across >= me.half_width + crate::plan::PERSON_RADIUS {
                     continue;
                 }
-                // [round5 C2] somebody level with my body (their body behind my front
+                // somebody level with my body (their body behind my front
                 // plane, now and where their step takes them, `later`) and outside my
                 // footprint holds nothing: my front never reaches them; one ahead of the
                 // front, or stepping there, holds as before (viz4 case01 #2827: eleven on
@@ -1470,7 +1470,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // occupies; elsewhere 1.5 m short of them)
                 // (a crossing whose zebra stop the front has passed: where the person is, as
                 // anywhere else - the car does not drive on into them)
-                // ([pass 2, R1] out on a pass or bypass, where only their step brings them into my
+                // (out on a pass or bypass, where only their step brings them into my
                 // strip: if my rear is past their line at my present speed before they reach my
                 // strip, I go first - SUMO's time slots, a
                 // vehicle that passes before the foe arrives is the leader - rather than
@@ -1630,7 +1630,7 @@ const EXIT_SLOW: f32 = 2.0;
 const EXIT_NEAR: f32 = 15.0;
 
 /// The next junction on the way (or the one the car is in), up to the claim horizon
-/// (`sim::claim_horizon`, [round 7 A8]: a fixed 120 m started the claims 5.4 s out at
+/// (`sim::claim_horizon`, : a fixed 120 m started the claims 5.4 s out at
 /// 22 m/s, not 8), with the room past its conflicts measured along the car's own way: a vehicle standing inside the piece past the
 /// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
 fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<JunctionView> {
@@ -1660,14 +1660,14 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
         // a queueing lane, not a box to keep clear: counting it put the "box" of BeijingCity's
         // twin stub chains 60 m on, where the exit queue's tail closed it for 25 s with the
-        // crossing itself clear, viz3 case03 #4436; the zipper of a side merge, [J7-2], keeps a
+        // crossing itself clear, viz3 case03 #4436; the zipper of a side merge, , keeps a
         // car off the one standing beside)
         let first = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
         let last = foes.iter().filter(|f| !f.side).map(|f| f.mine.1).fold(0.0f32, f32::max);
         let conflict_start = d0 + if first.is_finite() { first } else { way_len };
         let clear_from = d0 + if last > 0.0 { last } else { way_len };
         let need = me.length() + me.state.min_gap;
-        // [round6 J6] a box to keep clear: a crossing on the way through, or a zebra cut; a
+        // a box to keep clear: a crossing on the way through, or a zebra cut; a
         // merge-only lane join has no box, and the queue-place term below (`EXIT_NEAR`) does not
         // apply there, only the ordinary room (case10: taxis stood 22 s each at the j31 join,
         // exit-full for a queue forming 15 m on)
@@ -1848,7 +1848,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
 
-/// [J7-3] Why my lane ends for me (`LaneEnd`).
+/// Why my lane ends for me (`LaneEnd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneEndKind {
     /// The way runs into a lane closed to me (all the ways on at its fork are: the fork's
@@ -1860,7 +1860,7 @@ pub enum LaneEndKind {
     Merge,
 }
 
-/// [J7-3] Where my lane ends for me ahead (SUMO LC2013's dead lane / best lanes, sumo.md 3.2):
+/// Where my lane ends for me ahead (SUMO LC2013's dead lane / best lanes, sumo.md 3.2):
 /// the distance from my front (to the closed lane's start, the way's end, or the start of the
 /// merge stretch I give way at), why, and for a merge the lane beside me whose way the merge
 /// joins (`toward`).
@@ -1883,13 +1883,13 @@ fn leads_to(net: &Network, from: usize, target: usize) -> bool {
     at.contains(&target)
 }
 
-/// [J7-3] The first place along my way (`way`, within `look` m of my front) where my lane ends
+/// The first place along my way (`way`, within `look` m of my front) where my lane ends
 /// for me (`LaneEnd`).
 fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)], look: f32) -> Option<LaneEnd> {
     let st = &me.state;
     let cur = net.lanes.get(st.lane)?;
     let beside = [cur.left, cur.right];
-    // ([fix pass 2] the way as far as the strategic look-ahead, past the planned way where it does
+    // (the way as far as the strategic look-ahead, past the planned way where it does
     // not fork - SUMO's best lanes look far ahead: the planned way, eight seconds, ended on a
     // junction piece 170 m short of the closed lane, and the car found the end only on the piece,
     // where it has no neighbour)
@@ -1976,7 +1976,7 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
         // not yet level: the distance it still has to me
         let dist = (os - pos).max(0.0);
         let mut t = arrival_time(dist, speed, accel, limit);
-        // a car standing at a red light: counts from when it goes ([round 7 A9] the light's
+        // a car standing at a red light: counts from when it goes (the light's
         // own `until_go`, not a flat 5 s; never within a cycle: not coming)
         if let (Some(wait), true) = (red_for, speed < STANDING_SPEED) {
             t += wait;
@@ -2086,7 +2086,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.leader = Headway::nearer(p.leader, parked);
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
-        // [round 5 L3] the shift past people beside the lane, towards the middle only while
+        // the shift past people beside the lane, towards the middle only while
         // the oncoming lane is clear for its length (the shifted body may touch the oncoming
         // lane's painted edge)
         let shifted = shifted.filter(|&(sw, _)| {
@@ -2132,7 +2132,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         }
     }
     p.route_change = st.route_change_due(net);
-    // [J7-3] (within the strategic look-ahead towards the overtaking side, the longer one)
+    // (within the strategic look-ahead towards the overtaking side, the longer one)
     if lane.kind == LaneKind::Street && !me.is_rail() && (lane.left.is_some() || lane.right.is_some()) {
         let look = crate::plan::lane_end_look(me.look_ahead_speed.max(st.speed), true, me);
         p.lane_end = lane_end(net, sim, me, &p.way, look);
@@ -2189,7 +2189,7 @@ mod crossing_tests {
     use glam::{DVec2, DVec3};
     use omsi_sim::traffic::{LaneBuilder, LaneKind, Network};
 
-    /// [P8-5] SUMO's `blockedAtDist` on a crossing walked along x (3 m wide) that cuts my lane
+    /// SUMO's `blockedAtDist` on a crossing walked along x (3 m wide) that cuts my lane
     /// (heading north) at the origin: a car 0.9 m half-wide, band 1.4 m half-wide.
     #[test]
     fn a_walker_on_the_crossing_holds_the_car_until_past_its_band() {

@@ -65,7 +65,7 @@ pub struct Person {
     /// the carriageway: clear of a vehicle whose footprint they stand outside.
     #[serde(default)]
     pub at_kerb: bool,
-    /// [P8 pass 1, B1] The stop (its map object id, `bus_service::Stop::id`) somebody waiting
+    /// The stop (its map object id, `bus_service::Stop::id`) somebody waiting
     /// for a bus waits at: a timetable bus serving that stop pulls in beside them.
     #[serde(default)]
     pub waits_at: Option<i64>,
@@ -150,7 +150,7 @@ impl Passing {
 pub struct External {
     /// A stop the bus service asks for (distance from the origin).
     pub stop_at: Option<f32>,
-    /// [P8 pass 1, B1] The stops a timetable bus serves here (map object ids): the one it
+    /// The stops a timetable bus serves here (map object ids): the one it
     /// comes up to or stands at, and the one it served last. Their waiters (`Person::
     /// waits_at`) are the ones it pulls in beside.
     pub serves: [Option<i64>; 2],
@@ -164,21 +164,21 @@ pub struct External {
     pub standing_for: f32,
     /// `TrafficPriority`: goes first at junctions.
     pub priority: bool,
-    /// [round 6 B2] A timetable bus whose trip is over at the end of its track (no stop left,
+    /// A timetable bus whose trip is over at the end of its track (no stop left,
     /// the route complete, its last lane with a way on): it drives on off its route's end
     /// rather than standing there (`plan` rule 10).
     #[serde(default)]
     pub trip_over: bool,
-    /// [round 7 A7] A timetable bus ahead of its timetable drives at this share of its
+    /// A timetable bus ahead of its timetable drives at this share of its
     /// driver's speed factor (`AiState::desire`), set at the start of the frame.
     #[serde(default)]
     pub pace: Option<f32>,
-    /// [round 7 A7] An indicator the app shows (a car pulling into a parking space: 2,
+    /// An indicator the app shows (a car pulling into a parking space: 2,
     /// right), held for a second (`AiState::signal`/`signal_time`), set at the start of the
     /// frame.
     #[serde(default)]
     pub signal: Option<i32>,
-    /// [round 9 A2 fix pass 2] A random car beyond the player's perceptual horizon with its lamps
+    /// A random car beyond the player's perceptual horizon with its lamps
     /// dark, heading for the edge of the loaded tiles: the edge is its trip's end and it drives
     /// off the lane's end without stopping (`plan` rule 10b), so no brake lamp lights where a dot
     /// goes. Set by the app every frame.
@@ -221,7 +221,7 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
-/// [round 7 D6] A player's claim names it as `Decision::wait_for` does, `PLAYER_ID_BASE` +
+/// A player's claim names it as `Decision::wait_for` does, `PLAYER_ID_BASE` +
 /// its id (`Claim::vehicle`, `Grant::wait_for`; an AI vehicle's is its index).
 pub fn player_claim(id: u32) -> usize {
     (PLAYER_ID_BASE + id as u64) as usize
@@ -232,7 +232,7 @@ pub fn claim_player(vehicle: usize) -> Option<u32> {
     (vehicle as u64).checked_sub(PLAYER_ID_BASE).map(|k| k as u32)
 }
 
-/// [round 7 D6] A body `lateral` metres off the axis of `lane`, `half_width` to either side,
+/// A body `lateral` metres off the axis of `lane`, `half_width` to either side,
 /// is wholly beside the lane by more than `PARKED_CLEAR` (`player_parked_beside`; perception's
 /// exit room, which counts a player there as off the lane).
 pub fn beside_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
@@ -267,7 +267,7 @@ fn player_next(net: &Network, lane: usize, blinker: u8) -> Option<usize> {
 }
 
 /// One AI vehicle in the traffic: its way (`state`), its driver and its manoeuvres. (Read from
-/// a recording, a field it lacks takes `Vehicle::default()`'s, and a driver field its class's
+/// a recording, a field it lacks takes `Vehicle::default`'s, and a driver field its class's
 /// preset - `DriverParams::fill_missing`, `record::VERSION`'s rule.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -286,7 +286,7 @@ pub struct Vehicle {
     /// the road once out of sight. The crate sets it and clears it when the vehicle moves
     /// again (`Vehicle::give_up_clock`); a timetable bus's is the app's.
     pub gone: bool,
-    /// [round 7 B1] Its waiting time, as SUMO counts it for `--time-to-teleport` (s): it runs
+    /// Its waiting time, as SUMO counts it for `--time-to-teleport` (s): it runs
     /// while the vehicle stands (`UNHELD_SPEED`) whatever holds it but a red light and its own
     /// stop, which pause it; it restarts only when the vehicle moves (`give_up_clock`). The
     /// app's removals read this clock.
@@ -296,7 +296,7 @@ pub struct Vehicle {
     pub fresh: f32,
     /// Seconds before a car leaving a parking space moves.
     pub pull_out: f32,
-    /// [round 8 H8-1] A car leaving a parking space that is not on its lane yet: from its
+    /// A car leaving a parking space that is not on its lane yet: from its
     /// `pull_out`, standing off the lane's axis, until its way's offset has come back to the axis
     /// (`SIDESTEP_DONE`).
     /// It starts only when its lane has room behind it (SUMO: a parked vehicle is off the lane
@@ -306,7 +306,7 @@ pub struct Vehicle {
     #[serde(default)]
     pub pulling_out: bool,
     pub passing: Option<Passing>,
-    /// [round 7 fix pass 1] The decision taken at the amber onset of the light ahead:
+    /// The decision taken at the amber onset of the light ahead:
     /// (controller, light), through or stop, and the odometer reading at its line
     /// (`plan::light_call`, SUMO's yellow rule). Gone when that light is no longer ahead or
     /// turns green.
@@ -330,38 +330,38 @@ pub struct Vehicle {
     /// it, has none.
     #[serde(default)]
     pub passed_on_go: Option<(usize, usize)>,
-    /// [J7-3] Asked to make room for a car changing into this one's lane because its own ends:
+    /// Asked to make room for a car changing into this one's lane because its own ends:
     /// (its id, the gap from this one's front to its rear, its speed, the gap its acceptance
     /// needs from this one; `Plan::help`). Set by the asker each frame it asks, read by this
     /// one's plan, cleared when this one acts.
     #[serde(default)]
     pub help_for: Option<(u64, f32, f32, f32)>,
-    /// [J7-3, fix pass 1] SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
+    /// SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
     /// once with the speed and falls with `LOOK_AHEAD_SPEED_MEMORY` per second, so a car that has
     /// to slow keeps its sense of the lane's end (`plan::lane_end_look`).
     #[serde(default)]
     pub look_ahead_speed: f32,
-    /// [Q8-3] SUMO LC2013's keep-right wish (`myKeepRightProbability`, in units of its threshold,
+    /// SUMO LC2013's keep-right wish (`myKeepRightProbability`, in units of its threshold,
     /// `plan::KEEP_RIGHT_THRESHOLD`): accumulates by `Plan::keep_right_rate`, back to 0 when a lane
-    /// change starts (LC2013's `changed()`); kept with the vehicle, so a keyframe carries it.
+    /// change starts (LC2013's `changed`); kept with the vehicle, so a keyframe carries it.
     #[serde(default)]
     pub keep_right: f32,
-    /// [Q8-1] Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
-    /// [fix pass 1] (the odometer where it is to stand, fixed when it began or when it was told to
+    /// Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
+    /// (the odometer where it is to stand, fixed when it began or when it was told to
     /// stop; stopping); kept with the vehicle.
     #[serde(default)]
     pub reversing: Option<(f32, bool)>,
-    /// [Q8-4] The last-resort stop before the end of a lane that ends for the driver, once placed
+    /// The last-resort stop before the end of a lane that ends for the driver, once placed
     /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
     /// the car stands - a latch, not a margin.
     #[serde(default)]
     pub lane_end_stop: Option<f32>,
-    /// [Q8-1 fix pass 3] Seconds standing held by nothing (its decision's `held` false: no stop of
+    /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
     #[serde(default)]
     pub unheld_for: f32,
-    /// [J7-2, fix pass 2] The id of the foe it was capped behind at a zipper last frame: the
+    /// The id of the foe it was capped behind at a zipper last frame: the
     /// pair's order is kept while both are engaged (`reservation::zipper_cap`); kept with the
     /// vehicle, so a keyframe carries it.
     #[serde(default)]
@@ -391,31 +391,31 @@ pub struct Vehicle {
     pub ease_for: Option<(u64, usize, f32)>,
 }
 
-/// [round 7 A9] A player's pulling away (m/s²) before it is measured
+/// A player's pulling away (m/s²) before it is measured
 /// (`Simulation::measure_players`: the figure its claims used as a constant, between a bus
 /// preset's 1.0 and a car's 1.8), the floor of the estimate, and how long (s) a measured
 /// acceleration takes to fade back to it.
 pub const PLAYER_ACCEL: f32 = 1.2;
 pub const PLAYER_ACCEL_MIN: f32 = 0.6;
 pub const PLAYER_ACCEL_MEMORY: f32 = 20.0;
-/// [J7-1, J7-2] The driver a player's claim names (what an AI claimant reckons the player brakes
+/// The driver a player's claim names (what an AI claimant reckons the player brakes
 /// with and keeps behind a foe that cuts in, `Claim::decel`, `tau`, `min_gap`): the timetable
 /// bus preset, the vehicle a player drives.
 pub const PLAYER_PRESET: VehicleClass = VehicleClass::ScheduledBus;
 
-/// [round 7 A8] How far before its first meeting place (m, from its front) a vehicle at
+/// How far before its first meeting place (m, from its front) a vehicle at
 /// `speed` m/s files its claim at a junction - eight seconds, at least 60 m, at most 220 m -
 /// and how far ahead it looks for one (`perception::junction_ahead`).
 pub fn claim_horizon(speed: f32) -> f32 {
     omsi_sim::traffic::claim_horizon(speed)
 }
 
-/// [ROLLBACK r4d-B4] A timetable bus creeping up to its stop slower than this (m/s) has not
+/// A timetable bus creeping up to its stop slower than this (m/s) has not
 /// moved off: its standing time (`Vehicle::stopped`) runs on (`STANDING_SPEED` would reset
 /// it in a 0.3-0.4 m/s creep).
 pub const CREPT_OFF_SPEED: f32 = 0.5;
 
-/// [round 7 B1] A random vehicle whose waiting time (`Vehicle::waiting`) reaches this (s)
+/// A random vehicle whose waiting time (`Vehicle::waiting`) reaches this (s)
 /// gives up (`Vehicle::gone`): five minutes, SUMO's default `--time-to-teleport` of 300 s for
 /// a vehicle that waited too long - in a jam, at a yield, blocked (sumo.md 5.3,
 /// https://sumo.dlr.de/docs/Simulation/Why_Vehicles_are_teleporting.html).
@@ -423,7 +423,7 @@ pub const GIVE_UP_UNSEEN: f32 = 5.0 * 60.0;
 /// Faster than this (m/s) a vehicle is moving: its waiting time restarts and a vehicle that
 /// had given up is back in the traffic (SUMO's waiting time counts below 0.1 m/s, same page).
 pub const UNHELD_SPEED: f32 = 0.1;
-/// [Q8-1 fix pass 3] `player_waiting` follows the lanes a player's vehicle stands on into this many
+/// `player_waiting` follows the lanes a player's vehicle stands on into this many
 /// lanes on (a count of lanes, as `plan::runs_past`'s 16) for the next lit one.
 pub const PLAYER_LIGHT_LOOK: usize = 16;
 
@@ -471,19 +471,19 @@ pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
     }
 }
 
-/// [round6 J5] A standing player's claim names as its lead the AI vehicle in its corridor
+/// A standing player's claim names as its lead the AI vehicle in its corridor
 /// within this many metres of its front (review-r6 fix 7: a queue's gap, 2-3 m).
 pub const PLAYER_LEAD_REACH: f32 = 3.0;
-/// [round6 J5] ... its centre within this many metres of the player's axis (`traffic_cases
+/// ... its centre within this many metres of the player's axis (`traffic_cases
 /// heads`' 2.5 m corridor for the queue in front of the player).
 pub const PLAYER_LEAD_ACROSS: f32 = 2.5;
-/// [round6 J5] ... or within this many metres when it moves off ahead of the player (`heads`'
+/// ... or within this many metres when it moves off ahead of the player (`heads`'
 /// 12 m from one car of a queue to the next).
 pub const PLAYER_LEAD_AWAY: f32 = 12.0;
-/// [round6 J5] ... and its box reaching no more than this far (m) back past the player's front
+/// ... and its box reaching no more than this far (m) back past the player's front
 /// (review-r6j: a car alongside counted as the lead).
 pub const PLAYER_LEAD_OVERLAP: f32 = 0.5;
-/// [round6 J4] A player keeps the light of its lit lane until its rear is this far (m) past the
+/// A player keeps the light of its lit lane until its rear is this far (m) past the
 /// lane's start (`perception::signal_ahead`'s half metre for an AI car).
 pub const PLAYER_LINE_PAST: f32 = 0.5;
 /// Seconds a player stands before it counts as held where it is: blocked to the junction
@@ -600,7 +600,7 @@ impl Vehicle {
         Obb::vehicle(self.pos.truncate(), self.heading as f64, self.state.front as f64, self.state.rear as f64, self.half_width as f64)
     }
 
-    /// [round 7 B1] The give-up clock, after this frame's decision (`last`), SUMO's waiting
+    /// The give-up clock, after this frame's decision (`last`), SUMO's waiting
     /// time: standing (not faster than `UNHELD_SPEED`) it runs, whatever holds the vehicle -
     /// a yield, a jam, a body, people, a lead standing for good, a mutual refusal, nothing
     /// (SUMO's "blocked") - but a red light and its own stop, which pause it; moving, it
@@ -612,7 +612,7 @@ impl Vehicle {
     /// red.)
     pub fn give_up_clock(&mut self, dt: f32) {
         let d = &self.last;
-        // ([Q8-1 fix pass 1] backing up is moving too: SUMO's waiting time restarts with any motion)
+        // (backing up is moving too: SUMO's waiting time restarts with any motion)
         let moving = self.state.speed.abs() > UNHELD_SPEED;
         let counts = d.why != Why::Light && !self.external.at_stop;
         if moving {
@@ -635,13 +635,13 @@ impl Vehicle {
         self.state.speed < STANDING_SPEED && self.last.held
     }
 
-    /// [round 7 A4] A timetable bus (`VehicleClass::serves_stops`).
+    /// A timetable bus (`VehicleClass::serves_stops`).
     pub fn serves_stops(&self) -> bool {
         self.class.serves_stops()
     }
 
     /// A heavy vehicle: any bus or a truck (`VehicleClass::heavy`); a random heavy vehicle
-    /// is `heavy() && !serves_stops()`.
+    /// is `heavy && !serves_stops`.
     pub fn heavy(&self) -> bool {
         self.class.heavy()
     }
@@ -668,7 +668,7 @@ fn cell(p: DVec3) -> (i32, i32) {
     ((p.x / GRID).floor() as i32, (p.y / GRID).floor() as i32)
 }
 
-/// [J7-3] Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
+/// Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
 /// end, turn, obstacle, speed gain, keep side), every simulation of the process (diagnostics,
 /// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
 pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -685,7 +685,7 @@ pub struct Simulation {
     /// Each player's time standing held by nothing (`player_waiting`, from minus its start
     /// reaction): the player's `Vehicle::unheld_for`.
     pub player_wait: HashMap<u32, f32>,
-    /// [round 7 A9] Each player's pulling away as measured (`Simulation::player_accel`): (id,
+    /// Each player's pulling away as measured (`Simulation::player_accel`): (id,
     /// speed last frame, the estimate).
     pub player_pull: Vec<(u32, f32, f32)>,
     pub people: Vec<Person>,
@@ -714,7 +714,7 @@ pub struct Simulation {
     pub signal_groups: reservation::Context,
     /// This frame's claims and their grants (diagnostics: `traffic_cases watch`).
     pub claims: Vec<(Claim, Grant)>,
-    /// [J7-1] Keep the resolver's account of every claim's foes this frame (`foe_trace`):
+    /// Keep the resolver's account of every claim's foes this frame (`foe_trace`):
     /// set by the tools (`traffic_cases watch`), never by the game.
     pub trace_foes: bool,
     pub foe_trace: Vec<reservation::FoeTrace>,
@@ -889,7 +889,7 @@ impl Simulation {
         }
     }
 
-    /// [round 7 A9] Measure each player's pulling away: the hardest acceleration it showed,
+    /// Measure each player's pulling away: the hardest acceleration it showed,
     /// easing back towards `PLAYER_ACCEL` over `PLAYER_ACCEL_MEMORY` s, never under
     /// `PLAYER_ACCEL_MIN`. A player not seen before starts at `PLAYER_ACCEL`.
     fn measure_players(&mut self, dt: f32) {
@@ -1169,12 +1169,12 @@ impl Simulation {
                 let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
                 let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
                 let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
-                // ([J7-4, fix pass 1] SUMO's waiting positions: committed when the first place it can
+                // (SUMO's waiting positions: committed when the first place it can
                 // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
                 // place's band - not only when it cannot stop before the meeting place itself: a car
                 // let go onto a crossing and refused there stood on it 50 s, viz case06 #15801)
                 let next_wait = plan::next_wait(net, self, v, j, brake);
-                // ([fix pass 2] committed - in the way of everybody - only when it cannot stop before its
+                // (committed - in the way of everybody - only when it cannot stop before its
                 // next meeting place, `plan::cannot_stop`; short of its next waiting position it is
                 // committed only to the meeting places it would block, foe by foe, `Claim::next_wait`:
                 // a crawler at 1.1 m/s could stop within 0.3 m and is no `willPass`, and standing 0.8 m
@@ -1195,11 +1195,11 @@ impl Simulation {
                     // `JunctionView::clears_past`, and the car standing there is held by it, not
                     // clearing; viz case06 #4599 stood 50 s at the second red of a long object,
                     // committed to the cars waiting for it)
-                    // ([fix pass 2, 1b] and any light that holds the claimant before its first
+                    // (and any light that holds the claimant before its first
                     // meeting place, whatever the object's line: the light belongs to the claim -
                     // x10 case14 #35673, queued at the red at the end of join lane 33514, filed
                     // `light_red false` for j783 and two cars stood refused for it 28 m apart)
-                    // ([J7-1] every red on the way through, with where its line lies, `red_at`: the
+                    // (every red on the way through, with where its line lies, `red_at`: the
                     // resolver holds the claimant before the meeting places past that line only; a red
                     // past the first meeting place went unfiled and the foes took the car standing at
                     // it for one coming, x10 case12 #19087, red at 31 m, meeting place at 41 m)
@@ -1213,7 +1213,7 @@ impl Simulation {
                         if through {
                             (false, None, f32::INFINITY)
                         } else {
-                            // ([J7-1] its line along the way through, the claim's distances)
+                            // (its line along the way through, the claim's distances)
                             (true, sig.until_go, sig.dist - j.entry)
                         }
                     }
@@ -1387,9 +1387,9 @@ impl Simulation {
             // meeting place, red (or red and yellow) at its line with room to stop there
             // (not a stretch it runs side by side with another lane before its light, `Foe::side`;
             // nor a detector, `perception::detector_light`)
-            // ([J7-1] any red on the way through, with its line, `red_at`, as an AI claim's)
+            // (any red on the way through, with its line, `red_at`, as an AI claim's)
             let line_limit = -s_on + way_len;
-            // ([round6 J4] until its REAR is half a metre past the lit lane's start, as an AI
+            // (until its REAR is half a metre past the lit lane's start, as an AI
             // car's `signal_ahead`: the front 0.8 m past its stub, the player's bus lost its red,
             // stood blocked and held a green stream, case07 #37076 21 s)
             let lit = way.iter().filter(|&&(_, d)| d <= line_limit && d + p.half_len > -PLAYER_LINE_PAST).find_map(|&(l, d)| perception::stop_light(net, self, l).map(|lt| (lt, d)));
@@ -1411,7 +1411,7 @@ impl Simulation {
             // AI car held by its lead; it comes from rest when it moves off (an AI car waited
             // 26 s for the player's bus standing 47 m away, viz3 case08 #21332)
             let blocked = p.still > PLAYER_STILL && p.speed.abs() < STANDING_SPEED && !light_red;
-            // [round6 J5] standing, its lead: the AI vehicle in its corridor, its box
+            // standing, its lead: the AI vehicle in its corridor, its box
             // within `PLAYER_LEAD_REACH` ahead of the front and its centre within
             // `PLAYER_LEAD_ACROSS` of the axis (`traffic_cases heads`' queue in front of the
             // player), so that a foe the player stands behind does not wait for it (`reservation`:
@@ -1516,13 +1516,13 @@ impl Simulation {
                 }
             }
         }
-        // ([J7-2] no zipper memory: SUMO's zipper speed is a function of this frame's claims)
+        // (no zipper memory: SUMO's zipper speed is a function of this frame's claims)
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
         self.foe_trace.clear();
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
         let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
-        // [J7-2, fix pass 2] the zipper order kept with the vehicles while engaged
+        // the zipper order kept with the vehicles while engaged
         // (and whether its claim was refused: the resolver decides those first next frame)
         for v in vehicles.iter_mut() {
             v.zip_behind = None;
@@ -1579,7 +1579,7 @@ impl Simulation {
                 }
                 // (the other still short of, or in, the first meeting place of the two beyond
                 // where I stand, its rear not yet `JM_TIMEGAP_MINOR` s of its speed past that
-                // stretch's end. [round6 J3] Not every meeting place of the chain: two merging
+                // stretch's end. Not every meeting place of the chain: two merging
                 // run on along one way, and the ease held the one behind until the other had
                 // left the whole object, review-r6 case03/06)
                 let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
@@ -1712,7 +1712,7 @@ impl Simulation {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
-        // [J7-3] the follower asked to make room hears it (it reads it in its next plan); my own
+        // the follower asked to make room hears it (it reads it in its next plan); my own
         // request, read in this frame's plan, is used up
         vehicles[i].help_for = None;
         if let Some((f, gap, speed, need)) = plan.help {
@@ -1726,7 +1726,7 @@ impl Simulation {
             let v = &mut vehicles[i];
             let m = plan::LOOK_AHEAD_SPEED_MEMORY.powf(dt);
             v.look_ahead_speed = if v.state.speed >= v.look_ahead_speed { v.state.speed } else { m * v.look_ahead_speed + (1.0 - m) * v.state.speed };
-            // [Q8-3] the keep-right wish accumulates (SUMO: per action step)
+            // the keep-right wish accumulates (SUMO: per action step)
             if let Some(r) = plan.keep_right_rate {
                 v.keep_right += r * dt;
             }
@@ -1740,14 +1740,14 @@ impl Simulation {
         if let Some(lat) = plan.lateral {
             v.state.lateral_target = lat;
         }
-        // [Q8-4] the last-resort stop's latch: dropped with a start or standing (the plan places it
+        // the last-resort stop's latch: dropped with a start or standing (the plan places it
         // afresh only while the wish is blocked)
         v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
-        // [P8 pass 1, S1] held out of its lane on the way back in: the ramp back begins where
+        // held out of its lane on the way back in: the ramp back begins where
         // the body would first feel it once let go - its start kept a heading chord ahead of
         // the standing body, so the body is not drawn turned into the lane while it waits
         // (x10 case08 #10940 stood turned 17 degrees, heading 168 -> 152, for 3 s)
-        // ([round 8 fix, re-entry] laid as the way back from where the body is, `plan::way_back`:
+        // (laid as the way back from where the body is, `plan::way_back`:
         // moving the start of whatever ramp is laid put the body at that ramp's start - the
         // bay's way in still laid, the lane's axis: viz2 case10 bus #31063 jumped 3.48 m
         // sideways onto #34056 passing at 4.4 m/s, t=1418.2)
@@ -1852,8 +1852,8 @@ impl Simulation {
                 n += 1;
             }
         }
-        // [Q8-1] backing up out of a packed queue instead of driving: begun with the lateral
-        // offset frozen where it is; [fix pass 1] to the place the plan fixed, over once it stands
+        // backing up out of a packed queue instead of driving: begun with the lateral
+        // offset frozen where it is; to the place the plan fixed, over once it stands
         // there
         let alive = if let Some((target, stopping)) = plan.reverse {
             if v.reversing.is_none() {
@@ -1895,7 +1895,7 @@ impl Simulation {
         }
         // timers
         v.fresh = (v.fresh - dt).max(0.0);
-        // ([round 8 H8-1] the pull-out's clock runs only while its lane has room behind it:
+        // (the pull-out's clock runs only while its lane has room behind it:
         // until then the car stays where it is parked, `Plan::pull_out_held`)
         if v.pull_out > 0.0 && v.state.lateral.abs() > SIDESTEP_DONE {
             v.pulling_out = true;
@@ -1907,7 +1907,7 @@ impl Simulation {
         if v.pulling_out && v.pull_out <= 0.0 && (v.state.lateral.abs() <= SIDESTEP_DONE || v.state.change.is_some() || v.passing.is_some()) {
             v.pulling_out = false;
         }
-        // ([fix pass 1] standing at its offset with its signalling time run, its way out is the
+        // (standing at its offset with its signalling time run, its way out is the
         // shortest move its body can steer from rest, `plan::bypass_min_len`, starting where it
         // stands: the strip `plan::pull_out_clear` tested)
         if v.pulling_out && v.pull_out <= 0.0 && v.state.speed < STANDING_SPEED {
@@ -1916,7 +1916,7 @@ impl Simulation {
             v.state.lateral_ramp = (lat, 0.0, odo, plan::bypass_min_len(v.length(), lat));
         }
         let standing = v.state.speed < STANDING_SPEED;
-        // [ROLLBACK r4d-B4] a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
+        // a bus creeping up under `CREPT_OFF_SPEED` has not moved off: its
         // standing time runs on from there (reset by a 0.2-0.4 m/s creep, the bus held short of
         // its stop by people served the stop where it stood only after 12.7 s instead of 6)
         let moving = if v.serves_stops() { v.state.speed >= CREPT_OFF_SPEED } else { !standing };
@@ -1931,7 +1931,7 @@ impl Simulation {
             v.progress.1 += dt;
         }
         let held = standing && plan.held;
-        // [Q8-1 fix pass 3] the time standing held by nothing, continuous
+        // the time standing held by nothing, continuous
         v.unheld_for = if standing && !plan.held { v.unheld_for + dt } else { 0.0 };
         // A driver who is let go but has hardly rolled yet (the start reaction takes a moment,
         // then the car creeps off) keeps the impatience that earned the go. It used to cool
