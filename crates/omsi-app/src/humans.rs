@@ -1911,6 +1911,9 @@ struct Me {
     approach: Option<(DVec2, f32, f32)>,
 }
 
+/// How far (m) the player sees people at all (`seen_from`).
+const PEOPLE_SIGHT: f64 = 230.0;
+
 /// Whether the player, with eyes `eye` (none: about `center`), could see somebody standing at `p`.
 fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
     match eye {
@@ -1918,7 +1921,7 @@ fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
         Some(e) => {
             let d = p + DVec3::Z * 0.9 - e.pos;
             let dist = d.length();
-            if dist > 230.0 {
+            if dist > PEOPLE_SIGHT {
                 return false;
             }
             dist < 3.0 || d.dot(e.fwd) / dist > e.cos_half
@@ -2180,6 +2183,33 @@ const PED_DENSITY_TARGET: f32 = 0.3;
 const PED_DENSITY_CAP: f32 = 0.7;
 /// [P3] The narrowest a path counts as for its area (m): one body abreast (2 x BODY_OUTSIDE).
 const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
+
+/// [P3b] The share of its target density a pavement the player cannot see gets: such a path
+/// only feeds the ones in sight (the user: a pedestrian the player will never see need not be
+/// spawned); each path is walked both ways at random, so half of its walkers walk towards the
+/// paths in sight it joins, the other half away from them, out of the circle.
+const PED_SOURCE_SHARE: f32 = 0.5;
+/// [P3b] How far the player turns their head (degrees beyond half the field of view): a
+/// pavement within it is in sight for the density (a driver looks out of the side windows).
+const PED_HEAD_TURN: f64 = 90.0;
+
+/// [P3b] Whether the point `p` is in the player's sight for the density: within the people's
+/// sight distance (`seen_from`'s) and in frame or within `PED_HEAD_TURN` of it; with no eye,
+/// near the centre as `seen_from`.
+fn in_sight_reach(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
+    match eye {
+        None => seen_from(None, center, p),
+        Some(e) => {
+            let d = p + DVec3::Z * 0.9 - e.pos;
+            let dist = d.length();
+            if dist > PEOPLE_SIGHT || dist < 3.0 {
+                return dist <= PEOPLE_SIGHT;
+            }
+            let half = e.cos_half.clamp(-1.0, 1.0).acos().to_degrees() + PED_HEAD_TURN;
+            half >= 180.0 || d.dot(e.fwd) / dist > half.to_radians().cos()
+        }
+    }
+}
 
 /// [P3] The target density of strollers on a pavement and the most they are put down to
 /// (persons/m^2), at the hour's passenger curve `curve` (the map's `[trafficdensity_passenger]`
@@ -5621,7 +5651,19 @@ impl Humans {
             }
         }
         let (rho, cap) = stroll_density(self.density);
-        let wanted: f32 = candidates.iter().map(|(l, m, _)| area(*l, *m) * rho).sum();
+        // ([P3b] each path's own target: the full density where the player can see it - in
+        // frame or within a head turn of it, `in_sight_reach` - a source share elsewhere)
+        let eye = self.eye;
+        let share = |l: usize, ks: &[usize]| -> f32 {
+            let mid = net.lanes[l].points[ks[ks.len() / 2]];
+            if in_sight_reach(eye, center, mid) {
+                1.0
+            } else {
+                PED_SOURCE_SHARE
+            }
+        };
+        let path_target: Vec<f32> = candidates.iter().map(|(l, m, ks)| area(*l, *m) * rho * share(*l, ks)).collect();
+        let wanted: f32 = path_target.iter().sum();
         let target = (wanted.round() as usize).min(self.pedestrians);
         // (never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
@@ -5641,12 +5683,13 @@ impl Humans {
             // ([P3] by what each path lacks of its target: one at it or over gets nobody)
             let weights: Vec<f32> = candidates
                 .iter()
-                .map(|(l, m, ks)| {
+                .zip(&path_target)
+                .map(|((l, _, ks), want)| {
                     let mid = net.lanes[*l].points[ks[ks.len() / 2]];
                     let lead = ahead
                         .map(|a| ((mid - center).truncate().normalize_or_zero().extend(0.0)).dot(a).max(0.0) as f32)
                         .unwrap_or(0.0);
-                    let lacks = (area(*l, *m) * rho - on_path.get(l).copied().unwrap_or(0) as f32).max(0.0);
+                    let lacks = (want - on_path.get(l).copied().unwrap_or(0) as f32).max(0.0);
                     lacks * (1.0 + 2.0 * lead)
                 })
                 .collect();
@@ -10601,6 +10644,17 @@ mod ped_tests {
         // a 2.5 m pavement 100 m long at curve 1: 75 people; a 1 m path counts its width
         assert!((100.0 * 2.5 * stroll_density(1.0).0 - 75.0).abs() < 1e-3);
         assert!(PED_PATH_MIN_WIDTH < 1.0);
+    }
+
+    #[test]
+    fn p3b_pavements_in_frame_or_a_head_turn_away_are_in_sight_those_behind_are_not() {
+        let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
+        let at = |deg: f64, d: f64| DVec3::new(d * deg.to_radians().sin(), d * deg.to_radians().cos(), 0.0);
+        assert!(in_sight_reach(Some(e), DVec3::ZERO, at(0.0, 50.0)), "ahead");
+        assert!(in_sight_reach(Some(e), DVec3::ZERO, at(110.0, 50.0)), "beside, a head turn away");
+        assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(170.0, 50.0)), "behind");
+        assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(0.0, PEOPLE_SIGHT + 10.0)), "beyond sight");
+        assert!(PED_SOURCE_SHARE > 0.0 && PED_SOURCE_SHARE < 1.0);
     }
 
     #[test]
