@@ -91,9 +91,10 @@ fn x1_two_lanes_converging_from_starts_two_metres_apart_meet_over_the_whole_stre
     // neither turns nor comes off another road: no rule separates them, a zipper
     let mi = js.nodes[0].movement_of(2).unwrap();
     assert!(js.is_zipper(0, mi, foe), "{foe:?}");
-    // compiling them again (a recording's header) adds nothing
+    // compiling them again (a replay recompiles a recording's header) gives the same places
     let mut again = converging(0);
-    assert_eq!(again.compile_converging(), 0);
+    again.compute_conflicts();
+    assert_eq!(meeting(&again, 2, 3), meeting(&net, 2, 3));
 }
 
 #[test]
@@ -116,7 +117,7 @@ fn x1_a_header_network_without_them_gets_them_compiled() {
     for c in old.conflicts.iter_mut() {
         c.clear();
     }
-    assert_eq!(old.compile_converging(), 1);
+    old.compute_conflicts();
     assert_eq!(meeting(&old, 2, 3), meeting(&net, 2, 3));
 }
 

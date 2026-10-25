@@ -193,15 +193,17 @@ impl Replay {
         r
     }
 
-    /// The lit stubs on the recorded network: the links round them and the merges of one
-    /// way's pieces dropped (a recording from before them has them; one since, none), the
-    /// converging lanes compiled, the junctions compiled from what is left (lanes added later are linked and compiled with
-    /// them, `Network::extend`).
+    /// The recorded network made the current rules' network: the links round the lit stubs
+    /// dropped (a recording from before them has them), then every meeting place compiled again
+    /// from the lanes and links (`Network::compute_conflicts`: the crossings, merges, converging
+    /// lanes, swept paths, footpath crossings and lane crossings outside the objects), because a
+    /// header carries the meeting places the game derived under its own rules and a compile rule
+    /// only adds to them would be half applied; then the junctions from those (lanes added later
+    /// are linked and compiled with them, `Network::extend`). The recorded meeting places stay
+    /// in the header (`recorded`).
     fn stub_links(&mut self) {
         self.net.apply_stub_links();
-        // (and the lanes of one object converging side by side, that a header from before
-        // them has no meeting place for: `Network::add_converging`)
-        self.net.compile_converging();
+        self.net.compute_conflicts();
         self.sim.junctions = Junctions::compile(&self.net);
     }
 

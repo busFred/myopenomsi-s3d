@@ -1728,35 +1728,6 @@ impl Network {
         pairs
     }
 
-    /// The converging lanes of every crossing object (`add_converging`) on a network whose
-    /// meeting places were derived before them (a recording's header): the pairs with no
-    /// meeting place yet, the lane joins (`compile_joins`), the swept paths (`compile_swept`) and
-    /// the lane crossings and merges outside the objects (`compile_lane_crossings`,
-    /// `compile_outside_converging`). Returns how many were added.
-    pub fn compile_converging(&mut self) -> usize {
-        self.conflicts.resize(self.lanes.len(), Vec::new());
-        self.crossings.resize(self.lanes.len(), Vec::new());
-        let mut by_object: std::collections::BTreeMap<((i32, i32), i64), Vec<usize>> = std::collections::BTreeMap::new();
-        for (i, l) in self.lanes.iter().enumerate() {
-            if l.source != 2 || l.kind != LaneKind::Street {
-                continue;
-            }
-            if let Some(k) = l.key {
-                by_object.entry((k.tile, k.id)).or_default().push(i);
-            }
-        }
-        let mut n = 0;
-        for lanes in by_object.values() {
-            for (x, &i) in lanes.iter().enumerate() {
-                for &j in &lanes[x + 1..] {
-                    if self.add_converging(i, j) {
-                        n += 1;
-                    }
-                }
-            }
-        }
-        n + self.compile_joins() + self.compile_swept() + self.compile_lane_crossings(0) + self.compile_outside_converging(0)
-    }
 
     /// Lane `b` (in `a`'s `next`) goes on from `a`'s end: it ends further along than `a`
     /// does. (The 1.5 m linking distance also links a lane to a short piece that starts a
