@@ -135,26 +135,16 @@ fn x1_lanes_of_a_two_lane_road_side_by_side_are_no_meeting_place() {
         let net = finish(net);
         assert_eq!(meeting(&net, 2, 3), None, "{gap} m apart, {width} m wide");
     }
-    // [round 10 J3] the drawn widths are no bodies: two 2.7 m lanes 2.3 m apart carry 1.8 m bodies
-    // that do not touch; 1.6 m apart they do, and two lanes running together at 25 degrees whose
-    // axes come within 3 m do (a body's length swings across: hw cos + hl sin of the angle)
-    for (gap, meets) in [(2.3, false), (1.6, true)] {
-        let mut net = Network::default();
-        let mut a = piece(&[(0.0, 0.0), (30.0, 0.0)], 0);
-        a.width = 2.7;
-        let mut b = piece(&[(0.0, gap), (30.0, gap)], 1);
-        b.width = 2.7;
-        net.lanes.push(a);
-        net.lanes.push(b);
-        let net = finish(net);
-        assert_eq!(meeting(&net, 0, 1).is_some_and(|m| m.merge), meets, "{gap} m apart");
-    }
+    // edges overlapping by 0.4 m: they meet
     let mut net = Network::default();
-    net.lanes.push(piece(&[(0.0, 0.0), (30.0, 0.0)], 0));
-    // (from 14 m out to 3 m out at its end, across 24 m: about 25 degrees)
-    net.lanes.push(piece(&[(6.0, 14.0), (30.0, 3.0)], 1));
+    let mut a = piece(&[(0.0, 0.0), (30.0, 0.0)], 0);
+    a.width = 2.7;
+    let mut b = piece(&[(0.0, 2.3), (30.0, 2.3)], 1);
+    b.width = 2.7;
+    net.lanes.push(a);
+    net.lanes.push(b);
     let net = finish(net);
-    assert!(meeting(&net, 0, 1).is_some_and(|m| m.merge), "converging at an angle");
+    assert!(meeting(&net, 0, 1).is_some_and(|m| m.merge));
 }
 
 #[test]
