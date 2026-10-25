@@ -1,7 +1,7 @@
 //! The decision: from what the driver sees to one plan for this frame. A plan is the
 //! lead to follow, a stop point, a lateral target and at most one manoeuvre to start.
-//! No plan reads another vehicle's plan; the only cross-vehicle input is the junction
-//! grant.
+//! No plan reads another vehicle's plan; the cross-vehicle inputs are the junction grant and
+//! the follower's request to make room (`Vehicle::help_for`, set by the last frame's acts).
 
 use crate::driver::{DriverParams, VehicleClass, STANDING_SPEED};
 use crate::perception::{JunctionView, LaneEndKind, NeighbourView, Perception, Seen, SignalView};

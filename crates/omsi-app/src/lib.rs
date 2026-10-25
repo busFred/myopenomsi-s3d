@@ -641,6 +641,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         exiting: false,
         stand_in: None,
         cpu_mark: None,
+        window_mark: None,
         touch: touch::Touch::new(),
         quick: quick_menu::QuickMenu::new(),
         summary: trip_summary::SummaryWindow::new(),

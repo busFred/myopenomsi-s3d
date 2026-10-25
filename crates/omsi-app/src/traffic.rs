@@ -1174,6 +1174,25 @@ fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
 
 /// The driver of a random car: how fast, how close, how patient (see `AiState`).
 impl Traffic {
+    /// The counts of what a long drive could let grow, for the `OMSI_PROFILE` window lines.
+    pub fn sizes(&self) -> String {
+        let parked: usize = self.parked.values().map(Vec::len).sum();
+        let occupants: usize = self.sim.occupancy.values().map(Vec::len).sum();
+        let (known, rules) = self.recorder.sizes();
+        format!(
+            "cars {}, dormant {}, parked {parked} on {} lanes (+{} unplaced), sim people {}, walkers {}, occupancy {occupants} on {} lanes, recorder known {known} rules {rules}, lights {}, net lanes {}",
+            self.cars.len(),
+            self.dormant.len(),
+            self.parked.len(),
+            self.parked_waiting.len(),
+            self.sim.people.len(),
+            self.sim.walkers.len(),
+            self.sim.occupancy.len(),
+            self.sim.lights.len(),
+            self.net.lanes.len()
+        )
+    }
+
     /// Make the population deterministic for a LAN room.  The room's session id is
     /// shared by the host and every client, so the same map/time produces the same
     /// initial cars instead of each process inventing a different world.
@@ -4064,7 +4083,8 @@ impl Traffic {
             *n += 1;
             if *n >= TICK_PROFILE_FRAMES {
                 let ms = |x: f64| x * 1000.0 / *n as f64;
-                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]));
+                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame; Simulation::tick by phase (ms): {}", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]), omsi_traffic::sim::PHASES.iter().zip(self.sim.phase_secs).map(|(k, v)| format!("{k} {:.2}", ms(v))).collect::<Vec<_>>().join(", "));
+                self.sim.phase_secs = [0.0; omsi_traffic::sim::PHASES.len()];
                 self.tick_inner_sum = ([0.0; 3], 0);
             }
         }

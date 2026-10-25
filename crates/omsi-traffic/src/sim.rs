@@ -332,8 +332,8 @@ pub struct Vehicle {
     pub passed_on_go: Option<(usize, usize)>,
     /// [J7-3] Asked to make room for a car changing into this one's lane because its own ends:
     /// (its id, the gap from this one's front to its rear, its speed, the gap its acceptance
-    /// needs from this one; `Plan::help`). Set by the asker each frame it asks, read by this
-    /// one's plan, cleared when this one acts.
+    /// needs from this one; `Plan::help`). Set by the asker's act each frame it asks, read by
+    /// this one's plan in the next frame, cleared after that frame's plans.
     #[serde(default)]
     pub help_for: Option<(u64, f32, f32, f32)>,
     /// [J7-3, fix pass 1] SUMO LC2013's look-ahead speed (`myLookAheadSpeed`, m/s): it rises at
@@ -712,7 +712,13 @@ pub struct Simulation {
     /// set by the tools (`traffic_cases watch`), never by the game.
     pub trace_foes: bool,
     pub foe_trace: Vec<reservation::FoeTrace>,
+    /// Wall seconds of each phase of `tick`, summed over the ticks (diagnostics, read by the
+    /// game's `OMSI_PROFILE` line; the order is `PHASES`).
+    pub phase_secs: [f64; PHASES.len()],
 }
+
+/// The phases of `Simulation::tick` timed in `phase_secs`.
+pub const PHASES: [&str; 7] = ["positions+lights", "perceive", "claims", "resolve", "plan", "act", "negotiate"];
 
 /// How far on (m) a pass coming back in looks for a body beside it, and runs straight when
 /// one is: half a metre past its front (at least 2 m; its body turns with the way there).
@@ -746,6 +752,7 @@ impl Simulation {
             claims: Vec::new(),
             trace_foes: false,
             foe_trace: Vec::new(),
+            phase_secs: [0.0; PHASES.len()],
         }
     }
 
@@ -1091,6 +1098,16 @@ impl Simulation {
 
     /// One frame of `dt` seconds for every vehicle.
     pub fn tick(&mut self, net: &Network, dt: f32, vehicles: &mut [Vehicle]) {
+        // (the phase timers run only under OMSI_PROFILE: no clock reads otherwise)
+        let timed = std::env::var_os("OMSI_PROFILE").is_some();
+        let mut mark = std::time::Instant::now();
+        let mut lap = |phase: &mut f64| {
+            if timed {
+                let now = std::time::Instant::now();
+                *phase += (now - mark).as_secs_f64();
+                mark = now;
+            }
+        };
         self.time += dt as f64;
         self.day_time += dt as f64 * self.time_scale;
         self.removed.clear();
@@ -1104,6 +1121,7 @@ impl Simulation {
         self.build_occupancy(net, vehicles);
         self.update_lights(net, vehicles, dt);
         self.player_waiting(net, vehicles, dt);
+        lap(&mut self.phase_secs[0]);
 
         // perception: read-only over everything, so every vehicle's in parallel (an indexed
         // collect keeps the vehicle order: the same Vec the serial map built)
@@ -1112,6 +1130,8 @@ impl Simulation {
             let vs: &[Vehicle] = vehicles;
             (0..vs.len()).into_par_iter().map(|i| perception::perceive(net, sim, vs, i)).collect()
         };
+
+        lap(&mut self.phase_secs[1]);
 
         // claims and grants at the junctions
         let mut claims: Vec<Claim> = Vec::new();
@@ -1505,10 +1525,12 @@ impl Simulation {
         }
         // ([J7-2] no zipper memory: SUMO's zipper speed is a function of this frame's claims)
         self.eased_claims(vehicles, &mut claims, &claim_of, dt);
+        lap(&mut self.phase_secs[2]);
         self.foe_trace.clear();
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
         let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
+        lap(&mut self.phase_secs[3]);
         // [J7-2, fix pass 2] the zipper order kept with the vehicles while engaged
         for v in vehicles.iter_mut() {
             v.zip_behind = None;
@@ -1520,14 +1542,26 @@ impl Simulation {
             }
         }
 
-        // plan and act, one vehicle at a time
-        for i in 0..vehicles.len() {
-            let grant = claim_of[i].map(|k| grants[k]);
-            let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
+        // every vehicle plans from the frame's start, then every vehicle acts (SUMO's synchronous
+        // update: all vehicles plan their step from the same state, then all move; no vehicle
+        // sees another's move of this frame). A plan reads only the network, the simulation, the
+        // vehicles and the perception, so the plans are made in parallel and kept in vehicle order
+        let plans: Vec<Plan> = {
+            let (sim, vs): (&Simulation, &[Vehicle]) = (&*self, &*vehicles);
+            (0..vs.len()).into_par_iter().map(|i| plan::plan(net, sim, vs, i, &perceptions[i], claim_of[i].map(|k| grants[k]))).collect()
+        };
+        lap(&mut self.phase_secs[4]);
+        // the requests the plans just read are used up; the acts below set the next frame's
+        for v in vehicles.iter_mut() {
+            v.help_for = None;
+        }
+        for (i, plan) in plans.into_iter().enumerate() {
             self.act(net, vehicles, i, plan, dt);
         }
+        lap(&mut self.phase_secs[5]);
         self.negotiate(vehicles, &claim_of, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
+        lap(&mut self.phase_secs[6]);
     }
 
     /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
@@ -1673,9 +1707,8 @@ impl Simulation {
             Some(Seen::Vehicle(j)) | Some(Seen::Body(j)) => vehicles.get(j).map(|o| o.id),
             _ => None,
         };
-        // [J7-3] the follower asked to make room hears it (it reads it in its next plan); my own
-        // request, read in this frame's plan, is used up
-        vehicles[i].help_for = None;
+        // [J7-3] the follower asked to make room hears it: it reads the request in its next
+        // plan (SUMO `informFollower`, read in the follower's next `planMove`)
         if let Some((f, gap, speed, need)) = plan.help {
             let me_id = vehicles[i].id;
             if let Some(o) = vehicles.get_mut(f) {

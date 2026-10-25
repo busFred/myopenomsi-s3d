@@ -528,6 +528,12 @@ impl Recorder {
         self.full.as_deref()
     }
 
+    /// The sizes of what the recorder keeps between frames: (vehicles known, removal rules
+    /// waiting for their frame), for the long-run profile (`OMSI_PROFILE`).
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.known.len(), self.remove_rules.len())
+    }
+
     /// The frame about to run: `sim` with its inputs set, the vehicles as they go into
     /// it. Writes what changed in the fleet (`type_name` names vehicle `i` of a new one)
     /// and in the parked cars, a keyframe when one is due, and the frame's inputs.

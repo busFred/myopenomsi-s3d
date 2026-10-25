@@ -371,6 +371,9 @@ pub(crate) struct App {
     /// OMSI_PROFILE: process CPU seconds, time and frame count once the start-up is over,
     /// for the CPU time a frame costs (the wall time says little on a busy machine).
     pub(crate) cpu_mark: Option<(f64, Instant, u32)>,
+    /// OMSI_PROFILE: the time, frame count and `profile` as of the last 30 s window line
+    /// (`window_profile`), for the per-window stage times.
+    pub(crate) window_mark: Option<(Instant, u32, std::collections::BTreeMap<&'static str, f64>)>,
     /// The OMSI plugins (`plugins/*.opl`), loaded with the first frame.
     pub(crate) plugins: Option<omsi_plugin::Plugins>,
     /// The on-screen controls of a phone (see `touch.rs`).
