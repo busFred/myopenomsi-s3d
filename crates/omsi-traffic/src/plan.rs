@@ -555,7 +555,7 @@ fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
             return cap;
         }
         *budget -= 1;
-        if l.source != 2 && !crate::access::is_open(l, me) {
+        if l.source != 2 && !crate::access::is_open_at(net, lane, me) {
             return d;
         }
         let end = d + l.length();
@@ -654,7 +654,7 @@ fn open_on(net: &Network, me: &Vehicle, lane: usize, s: f32) -> bool {
     let mut d = -net.beside_s(st.lane, lane, s);
     for _ in 0..16 {
         let l = &net.lanes[cur];
-        if l.source != 2 && !crate::access::is_open(l, me) {
+        if l.source != 2 && !crate::access::is_open_at(net, cur, me) {
             return false;
         }
         d += l.length();

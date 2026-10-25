@@ -37,12 +37,17 @@ pub enum RemoveRule {
     OutOfSight,
     /// Given up, in view after its grace ([`goes_in_view`]).
     InViewAfterGrace,
-    /// At a dead end or the loaded route's end, far off, long, or with a queue behind it.
+    /// At a dead end or the loaded route's end by a rule that holds in view (a queue behind it,
+    /// at the loaded tiles' edge after its grace).
     DeadEnd,
-    /// [round 9 A2, fix pass 1] At the loaded tiles' edge beyond the perceptual horizon, the
-    /// first in line: its trip ends there ([`goes_far`]), in frame, a dot nobody can tell from
-    /// nothing. Not counted as removed in view (`ab`'s `removed_far`).
+    /// A random car's trip ends beyond the perceptual horizon, in frame, a dot nobody can tell
+    /// from nothing: at the loaded tiles' edge, the first in line ([`goes_far`]), or standing at a
+    /// dead end. Not counted as removed in view (`ab`'s `removed_far`).
     FarDeadEnd,
+    /// A timetable bus standing where the loaded part of its route ends, beyond the perceptual
+    /// horizon: its trip comes back with the tiles. Not counted as removed in view (`ab`'s
+    /// `removed_far`).
+    FarRouteEnd,
     /// A timetable bus taken off as the last resort (no loop or room), or its last trip over.
     BusLastResort,
     /// It parked: the parked object stands in its place.
@@ -63,7 +68,7 @@ impl RemoveRule {
     /// [round 9 A2] Whether this removal is made beyond the perceptual horizon by its rule, so
     /// it is not "removed in view" even in frame (`ab` counts it as `removed_far`).
     pub fn beyond_horizon(self) -> bool {
-        matches!(self, RemoveRule::FarDeadEnd)
+        matches!(self, RemoveRule::FarDeadEnd | RemoveRule::FarRouteEnd)
     }
 }
 

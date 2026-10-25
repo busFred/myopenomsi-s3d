@@ -2184,13 +2184,13 @@ pub(crate) fn run_offscreen(
             let no_cars = street.iter().filter(|l| l.no_cars).count();
             let zero = street
                 .iter()
-                .filter(|l| !l.no_cars && l.density <= 0.001)
+                .filter(|l| !l.no_cars && !omsi_sim::traffic::density_is_open(l.density))
                 .count();
             let quiet = street
                 .iter()
-                .filter(|l| l.density > 0.001 && l.density < 0.9)
+                .filter(|l| omsi_sim::traffic::density_is_open(l.density) && l.density < 0.9)
                 .count();
-            log::info!("traffic rules: {} street lanes, {no_cars} closed to cars, {zero} with density 0, {quiet} quieter than normal", street.len());
+            log::info!("traffic rules: {} street lanes, {no_cars} closed to cars, {zero} closed by density, {quiet} quieter than normal", street.len());
         }
     }
     // OMSI_CHECK_ROADS: walk every driving lane and report where no road surface is drawn
