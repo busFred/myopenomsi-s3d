@@ -718,7 +718,7 @@ pub struct Simulation {
 }
 
 /// The phases of `Simulation::tick` timed in `phase_secs`.
-pub const PHASES: [&str; 6] = ["positions+lights", "perceive", "claims", "resolve", "plan+act", "negotiate"];
+pub const PHASES: [&str; 7] = ["positions+lights", "perceive", "claims", "resolve", "plan", "act", "negotiate"];
 
 /// How far on (m) a pass coming back in looks for a body beside it, and runs straight when
 /// one is: half a metre past its front (at least 2 m; its body turns with the way there).
@@ -1538,16 +1538,22 @@ impl Simulation {
             }
         }
 
-        // plan and act, one vehicle at a time
-        for i in 0..vehicles.len() {
-            let grant = claim_of[i].map(|k| grants[k]);
-            let plan = plan::plan(net, self, vehicles, i, &perceptions[i], grant);
+        // every vehicle plans from the frame's start, then every vehicle acts (SUMO's synchronous
+        // update: all vehicles plan their step from the same state, then all move; no vehicle
+        // sees another's move of this frame). A plan reads only the network, the simulation, the
+        // vehicles and the perception, so the plans are made in parallel and kept in vehicle order
+        let plans: Vec<Plan> = {
+            let (sim, vs): (&Simulation, &[Vehicle]) = (&*self, &*vehicles);
+            (0..vs.len()).into_par_iter().map(|i| plan::plan(net, sim, vs, i, &perceptions[i], claim_of[i].map(|k| grants[k]))).collect()
+        };
+        lap(&mut self.phase_secs[4]);
+        for (i, plan) in plans.into_iter().enumerate() {
             self.act(net, vehicles, i, plan, dt);
         }
-        lap(&mut self.phase_secs[4]);
+        lap(&mut self.phase_secs[5]);
         self.negotiate(vehicles, &claim_of, dt);
         self.removed.sort_unstable_by(|a, b| b.cmp(a));
-        lap(&mut self.phase_secs[5]);
+        lap(&mut self.phase_secs[6]);
     }
 
     /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
