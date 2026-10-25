@@ -1196,7 +1196,7 @@ impl Streamer {
         if self.last_summary.elapsed().as_secs_f32() >= 10.0 && omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
             self.last_summary = std::time::Instant::now();
             let at: Vec<String> = centers.iter().map(|c| format!("({:.0}, {:.0})", c.x, c.y)).collect();
-            log::info!("tile streaming at {}: {} loaded / {} unloaded so far; load radius {:.0} m (view {:.0} m), longest tile load {:.2} s; {}", at.join(" "), self.loaded_total, self.unloaded_total, self.load_radius, self.view_radius, self.load_secs, self.world.gpu_summary(scene));
+            log::info!("tile streaming at {}: {} loaded / {} unloaded so far; load radius {:.0} m (view {:.0} m), latest tile load {:.2} s; {}", at.join(" "), self.loaded_total, self.unloaded_total, self.load_radius, self.view_radius, self.load_secs, self.world.gpu_summary(scene));
             if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
                 log::info!("  {}", self.world.cpu_summary());
             }
