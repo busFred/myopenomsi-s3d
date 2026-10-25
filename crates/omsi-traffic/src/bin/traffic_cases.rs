@@ -4660,7 +4660,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         ex.pedtouch_severe += (severe && note.is_empty()) as u64;
                         let fresh = person_since.get(pk).is_some_and(|&t0| r.sim.time - t0 < FRESH_PERSON);
                         ex.pedtouch_nospawn += (severe && note.is_empty() && !fresh) as u64;
-                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
+                        eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{} age {:.1}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note, person_since.get(pk).map(|&t0| r.sim.time - t0).unwrap_or(f64::NAN));
                     }
                 }
             }
@@ -4917,6 +4917,13 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
         close(&mut sc, run);
     }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
+    // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
+    // as loaded at the end of the run: how many such places the map has here)
+    {
+        let outside = |l: usize| r.net.lanes.get(l).is_some_and(|x| x.source != 2);
+        let n = r.net.crossings.iter().enumerate().map(|(i, cs)| cs.iter().filter(|c| !c.merge && c.other > i && outside(i) && outside(c.other)).count()).sum::<usize>();
+        eprintln!("LANECROSS {} {n} crossings of lanes outside crossing objects", sc.name);
+    }
     sc.divergence = r.divergence.iter().map(|d| d.1 as f64).fold(0.0, f64::max);
     for &(t, d, id) in r.divergence.iter().filter(|d| d.1 > 0.0005) {
         sc.drift_events.push(format!("{} t={t:.1} {d:.3} m (vehicle #{id})", sc.name));
@@ -5133,8 +5140,14 @@ fn ab(args: &[String]) -> Res<()> {
         total.red_cross,
         total.extra.removed_in_view,
         total.extra.removed_in_view_s,
-        if pedtouch { total.extra.pedtouch_severe.to_string() } else { "not run (--pedtouch)".into() }
+        if pedtouch { total.extra.pedtouch_nospawn.to_string() } else { "not run (--pedtouch)".into() }
     );
+    if pedtouch {
+        // (the GATE's severe leaves out people who came into the replay less than `FRESH_PERSON`
+        // ago: recorded people do not react to the free run's vehicles and appear where the game
+        // spawned them, as `ovl_nospawn` leaves out vehicles fresh on the road)
+        println!("(pedtouch_severe in GATE: people in the replay {FRESH_PERSON} s or longer; with the fresh ones {})", total.extra.pedtouch_severe);
+    }
     println!("(mutual waits, whole map: {} pair-seconds, both standing in {})", total.mutual_s, total.mutual_standing_s);
     {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
