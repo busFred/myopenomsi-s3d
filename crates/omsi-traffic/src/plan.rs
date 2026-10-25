@@ -806,7 +806,7 @@ fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         };
         let b = shifted_body(net, me, d, side_d);
         // (nobody on foot in the corridor: a squeeze stopped for people mid-ramp stands half
-        // out, its body in the car it passes - the BeijingCity 08:16 pair #376/#450)
+        // out, its body in the car it passes)
         for &k in &people {
             let p = &sim.people[k];
             if (p.pos.z - me.pos.z).abs() <= 2.5 && Obb::point(p.pos, PERSON_RADIUS as f64).separation(&b) < clearance {
@@ -2239,9 +2239,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //     before the crossing on its internal lane (sumo.md 4.3), and at the end of its green it
     //     clears first (`reservation::will_pass`). Held, it waits at the line,
     //     pulled back before a walk there. A way through that crosses
-    //     nothing - no crossing meeting place, walk or convergence, only merges, which the zipper
-    //     orders - has nothing to keep clear: SUMO applies no keep-clear at such geometry-like
-    //     nodes (sumo.md 1.6), and its queue stands in it as in a lane.
+    //     nothing has no box to keep clear (`perception::junction_ahead`).
     if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
         let line = sig.dist;
         let bands = if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 { wait_bands(net, sim, j) } else { Vec::new() };
