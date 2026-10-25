@@ -1004,6 +1004,18 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     if their_inside && o.speed < STANDING_SPEED && behind_me && (claims[ok].lead == Some(c.vehicle) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
         return Pass::Not("stopped_behind_me");
     }
+    // in the meeting place of a crossing, standing with my body as its lead or body block, while
+    // its body is neither of mine: it is physically behind me and waits for me, not in my way -
+    // SUMO's link leader of two on the junction is the one in front (MSLink::getLeaderInfo), and
+    // my perception keeps me off its body. (Two long ways through one box each occupy the other's
+    // next meeting place: x10 case06 #10810, standing behind #10932, held it at the place it stood
+    // in while it waited for #10932 at the next; eased four times over 120 s.)
+    // (behind me as its perception has it: me its lead at a gap, or my body blocking its way)
+    let its_lead_is_me = (claims[ok].lead == Some(c.vehicle) && claims[ok].lead_gap.is_some_and(|(gap, _)| gap >= 0.0)) || claims[ok].body_block == Some(c.id);
+    let mine_is_it = c.lead == Some(o.vehicle) || c.body_block == Some(o.id);
+    if their_inside && foe.kind != FoeKind::Merge && o.standing() && its_lead_is_me && !mine_is_it {
+        return Pass::Not("stopped_behind_me");
+    }
     // standing in the meeting place held by its plan (a lead, its stop): it does not leave on the
     // schedule its acceleration would give it - at its red past this place it leaves at its green
     // and its window from rest, else not (OMSI's reason: SUMO's foe carries its planned leave
@@ -2573,6 +2585,29 @@ mod tests {
                 assert_eq!(grant_of(&g, waiter).wait_for, Some(3 - waiter), "{g:?}");
             }
         }
+    }
+
+    /// [round 10 D7 rule 3] A foe standing inside a crossing's meeting place whose lead (at a gap) is
+    /// me, while it is not mine, is behind me and waits for me: it does not hold me although it has
+    /// the right of way and stands in the meeting place; without the gap (a lead that is one frame's
+    /// perception at an overlap), or when it is my lead too, it does.
+    #[test]
+    fn d7_a_foe_standing_inside_behind_me_with_me_as_its_lead_does_not_hold_me() {
+        let (_, js) = four_way(192.0, 64.0);
+        let (main, side) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+        let m0 = js.nodes[0].movements[main].foes.iter().find(|f| f.movement == side).unwrap().mine.0;
+        let s0 = js.nodes[0].movements[side].foes.iter().find(|f| f.movement == main).unwrap().mine.0;
+        let me = claim(1, side, s0 - 1.0 - 2.0, 0.0);
+        let mut foe = claim(2, main, m0 + 0.5 - 2.0, 0.0);
+        foe.lead = Some(1);
+        foe.lead_gap = Some((2.0, 0.0));
+        assert!(grant_of(&resolve(&js, &[me.clone(), foe.clone()]), 1).go, "held by a foe standing behind me");
+        foe.lead_gap = None;
+        assert_eq!(grant_of(&resolve(&js, &[me.clone(), foe.clone()]), 1).wait_for, Some(2));
+        foe.lead_gap = Some((2.0, 0.0));
+        let mut me2 = me;
+        me2.lead = Some(2);
+        assert_eq!(grant_of(&resolve(&js, &[me2, foe]), 1).wait_for, Some(2));
     }
 
     /// [J7-2] The queue-entry case: the foe ahead stands at the join (in its stretch): the
