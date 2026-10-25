@@ -18,16 +18,15 @@ const HEADLIGHT_INTENSITY: f32 = 45.0;
 /// A headlight's strength in the classic picture, as a map lamp's (`PointLight::intensity`).
 /// Measured against OMSI 2 from above, the stock NL202 at night in Spandau: its pool is
 /// some 18 of 255 over the unlit cobbles 1.5 - 2.5 m ahead, 12 at 4 - 5 m and nearly gone
-/// at 7 m; this gave 20, 12 and 5 there. (At 1 it was 60, 40 and 15.)
-/// [ROLLBACK vanlights-119] 0.5 (was 0.2): at 0.2 the spotlights were hardly to be seen in
-/// the Vanilla picture, its pool and the lit walls and kerbs ahead of the lamp.
+/// at 7 m. The strength is set to match that pool: a weaker one hardly shows the
+/// spotlights, their pool and the lit walls and kerbs ahead of the lamp.
 const VANILLA_HEADLIGHT_INTENSITY: f32 = 0.5;
 
 /// Lighting parameters for the renderer from the daylight model.
 pub fn lighting_from(d: &Daylight, fog_range: f32) -> Lighting {
     // fog density from the weather's visibility range (an object at `range` is ~90% fogged)
     let mut density = (2.3 / fog_range.max(50.0)).max(0.00005);
-    // [ROLLBACK twilight-1] the morning's mist, on the mornings that have one (`OMSI_NO_MIST=1`: none)
+    // the morning's mist, on the mornings that have one (`OMSI_NO_MIST=1`: none)
     if omsi_cfg::env::var_os("OMSI_NO_MIST").is_none() {
         let alt = d.sun_dir.normalize_or_zero().z.clamp(-1.0, 1.0).asin().to_degrees();
         density += omsi_sim::mist::dawn_mist(alt, d.azimuth_rad < std::f32::consts::PI, d.day_of_year, d.day_seed);
@@ -262,7 +261,7 @@ pub fn vehicle_lights(
             }
         }
     }
-    // [ROLLBACK aispot-83] An AI vehicle with no spotlight of any kind of its own ([spotlight],
+    // An AI vehicle with no spotlight of any kind of its own ([spotlight],
     // [spotlight_2], [spotlight_cookie], its sections' too) gets a [spotlight_2] pair as if it
     // had declared one: at the front of its bounding box, low, pointing straight ahead, 255 255
     // 200, cones 20 / 60, reaching 50 to 65 m (drawn once for the vehicle), switched by its
@@ -372,7 +371,7 @@ const COOKIE_PLAIN_COLOUR: [f32; 3] = [255.0, 255.0, 233.0];
 const COOKIE_CONE_INNER_DEG: f32 = 30.0;
 const COOKIE_CONE_OUTER_DEG: f32 = 100.0;
 
-/// [ROLLBACK flashlight-65] The walker's torch at `at` shining along `d`.
+/// The walker's torch at `at` shining along `d`.
 pub(crate) fn push_flashlight(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3) {
     // (colour 255/245/220, 35 m, a 10 degree hot spot inside a 45 degree cone)
     let vals: [f32; 12] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 255.0, 245.0, 220.0, 35.0, 10.0, 45.0];
@@ -523,7 +522,7 @@ mod spot_tests {
 
 /// Map lights and scenery coronas are only drawn this close to the camera.
 const MAP_LIGHT_RANGE: f64 = 600.0;
-/// [ROLLBACK aispot-83] How near (m) an AI vehicle is to be given its headlamp.
+/// How near (m) an AI vehicle is to be given its headlamp.
 const AUTO_SPOT_RANGE: f64 = 250.0;
 const CORONA_RANGE: f64 = 1500.0;
 /// How far the camera may move before the nearby static lights are gathered again.
@@ -749,7 +748,7 @@ pub fn particle_sprites_in(set: &omsi_sim::particles::ParticleSet, smoke: &mut V
         if !cab.is_empty() && !def.emissive && crate::puddles::is_tyre_spray(def) {
             alpha *= crate::puddles::cab_fade(cab, p.pos, p.size() * 0.5);
         }
-        // [ROLLBACK glassfx-1] the vapour of a cold exhaust: whiter, thicker, a little bigger
+        // the vapour of a cold exhaust: whiter, thicker, a little bigger
         let (mut colour, mut size_k) = (p.color, 1.0);
         if cold > 0.01 && !def.emissive && crate::glass_fx::is_exhaust(def) {
             let fade = 1.0 - p.age / p.life.max(1e-3);

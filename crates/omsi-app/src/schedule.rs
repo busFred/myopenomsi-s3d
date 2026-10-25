@@ -73,7 +73,7 @@ struct RunningTrip {
     served: Vec<bool>,
 }
 
-/// [ROLLBACK waitstop-136] `[profile_otherstopping]` values at which a bus waits for the
+/// `[profile_otherstopping]` values at which a bus waits for the
 /// departure time ("always + wait for departure time"). The file says 3 and 4 for stops that
 /// are not a plain "always" (1); which of the two is the waiting one is not settled, so both
 /// are taken.
@@ -242,7 +242,7 @@ fn trip_stations(trip: &omsi_timetable::Trip) -> Vec<i64> {
         .collect()
 }
 
-/// [ROLLBACK nexttrip-73] Seconds after its departure from the first stop that a trip is still
+/// Seconds after its departure from the first stop that a trip is still
 /// offered as the next one.
 const NEXT_TRIP_GRACE: f64 = 20.0;
 
@@ -401,9 +401,9 @@ pub struct Schedule {
     /// they are tried again then, so that a plane coming in over tiles nobody loads appears
     /// where its path enters the loaded ones, not up to half a minute later in mid-air.
     retry_at: HashMap<usize, f64>,
-    /// [ROLLBACK r4d-B1] Where the trips of buses taken off the road at a dead end go on.
+    /// Where the trips of buses taken off the road at a dead end go on.
     resumes: Resumes,
-    /// [ROLLBACK r4d-B2] Why the last placement failed (for a bus taken off the road).
+    /// Why the last placement failed (for a bus taken off the road).
     fail_reason: Option<&'static str>,
     /// Vehicle sets being read ahead on the workers, with the type to upload them with, and
     /// those read and waiting for their upload.
@@ -431,7 +431,7 @@ pub struct Schedule {
     lan_tours: HashSet<(String, String)>,
     /// Time of today's timetable at the last tick (s).
     last_tod: f64,
-    /// [ROLLBACK clockjump-93] The traffic's clock at the last frame `note_clock` saw.
+    /// The traffic's clock at the last frame `note_clock` saw.
     clock_seen: f64,
     /// The lines the date's chrono folders take off the timetable, with the folder that does
     /// it: why a duty on such a line cannot be driven.
@@ -478,14 +478,14 @@ pub struct Schedule {
 /// A tour's bus waits at the end of a trip for the next one of its tour when that leaves
 /// within this many seconds; for a longer break it goes (and a bus comes back for it).
 const TOUR_LAYOVER_MAX: f64 = 30.0 * 60.0;
-/// [round 6 B2] A bus handed its tour's next trip faster than this (m/s: a creep) is on the
+/// A bus handed its tour's next trip faster than this (m/s: a creep) is on the
 /// move (at the end of its track) ...
 const PIN_MOVING: f32 = 1.0;
-/// [round 6 B2] ... and stops for a first stop just behind it braking at this (m/s²: a
+/// ... and stops for a first stop just behind it braking at this (m/s²: a
 /// bus's comfortable braking, `DriverParams::preset` Bus `comfort_brake`).
 const PIN_DECEL: f32 = 1.5;
 
-/// [P8-3] Where a tour's bus handed its next trip at `s0` on its lane (`lane_len` m long) and
+/// Where a tour's bus handed its next trip at `s0` on its lane (`lane_len` m long) and
 /// moving at `v0` stops for that trip's first stop, which lies just behind it: where it
 /// stands, or on the move where it comes to rest braking at `PIN_DECEL` - when that lies on
 /// its lane. On the move with that rest past the lane's end the stop counts as passed (None), as SUMO's
@@ -525,7 +525,7 @@ impl Schedule {
         Schedule::build(root, world, clock, true)
     }
 
-    /// [ROLLBACK schedlist-123] The timetable for the lists of lines and tours and for the people
+    /// The timetable for the lists of lines and tours and for the people
     /// at the stops, in a game that brings no timetable buses: without loading the models of
     /// every depot vehicle and train of the map (what took tens of seconds on a big map, in the
     /// frame of the click on the Alt menu's timetable tile).
@@ -995,7 +995,7 @@ impl Schedule {
                     self.pending.push_back(j);
                 }
             }
-            // [round 6 B2] (one whose trip ended on the move at the end of its track drives
+            // (one whose trip ended on the move at the end of its track drives
             // off as a bus off a dead end - gone, taken off once out of sight - rather than
             // vanishing mid-road, possibly in view)
             let on_the_move = traffic.cars[ci].bus.as_ref().is_some_and(|b| b.drives_off());
@@ -1792,7 +1792,7 @@ impl Schedule {
     /// The name each bus stop object has in the timetable (`Busstops.cfg`, the first entry
     /// of an object id): what [`Schedule::stop_targets`] calls it. The map object's own
     /// label can read otherwise (renamed in the editor, another code page than the tiles').
-    /// [ROLLBACK ridemin-71] The minutes a bus needs between two stops by name, from the trips'
+    /// The minutes a bus needs between two stops by name, from the trips'
     /// times (the shortest over the trips that call at both, the first stop's departure to the
     /// second's arrival): how far a passenger rides who wants from one to the other.
     pub fn ride_minutes(&self) -> HashMap<(String, String), f32> {
@@ -1816,7 +1816,7 @@ impl Schedule {
         out
     }
 
-    /// [ROLLBACK soon-90] Per bus stop, the names of the stops a bus that leaves it within
+    /// Per bus stop, the names of the stops a bus that leaves it within
     /// `window` seconds of `now` (time of the day) goes on to: only the trips with a line (not
     /// the runs to and from the depot) that run today, that stop there, with the player's
     /// duty among them. The people who appear at a stop wait for these - not for a night line
@@ -1891,7 +1891,7 @@ impl Schedule {
         self.pending.len()
     }
 
-    /// [ROLLBACK clockjump-93] Every frame, with the traffic's clock: true when it has been set
+    /// Every frame, with the traffic's clock: true when it has been set
     /// to another time (more than the frame's run of the clock, `speed` times real time, off).
     pub fn note_clock(&mut self, day_time: f64, dt: f64, speed: f64) -> bool {
         let jumped = self.clock_seen.is_finite() && (day_time - self.clock_seen).abs() > 90.0 + dt.max(0.0) * speed.max(1.0) * 5.0;
@@ -1899,7 +1899,7 @@ impl Schedule {
         jumped
     }
 
-    /// [ROLLBACK clockjump-93] The clock was set to another time: the timetable's buses of the
+    /// The clock was set to another time: the timetable's buses of the
     /// old time are taken off the road (the player's tour excepted) and every departure may be
     /// put out again - the next ticks place the buses that are under way at the new time and
     /// leave the others at their stands.
@@ -1907,7 +1907,7 @@ impl Schedule {
         if traffic.is_mirror() {
             return;
         }
-        // [ROLLBACK clockjump-95] today's midnight lies where the clock now puts it (a time set
+        // today's midnight lies where the clock now puts it (a time set
         // back, or over midnight, left it where it was), and the date's tours are chosen anew
         self.day_base = traffic.day_time - clock.time;
         self.date_clock = clock.clone();
@@ -1991,7 +1991,7 @@ impl Schedule {
             .collect();
         for i in due {
             if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
-                // [ROLLBACK days-95] which tour is put out, with its mask and the day's bits
+                // which tour is put out, with its mask and the day's bits
                 let d = &self.departures[i];
                 log::info!("timetable: departure of line {} tour {} at {:.0} s: mask {} (today's bits {:?}, date {})", d.line, d.tour, d.time, d.mask, self.day_bits, self.day);
             }
@@ -2084,7 +2084,7 @@ impl Schedule {
                 self.waiting.push(i);
             }
         }
-        // [ROLLBACK r4d-B1] buses that drove off a dead end come back where the track goes
+        // buses that drove off a dead end come back where the track goes
         // on, at the time the timetable has them there
         for id in std::mem::take(&mut traffic.dead_ended) {
             self.running.retain(|r| r.car != id);
@@ -2094,7 +2094,7 @@ impl Schedule {
                 self.waiting.push(i);
             }
         }
-        // [ROLLBACK r4d-B2] buses taken off the road as the last resort come back on their
+        // buses taken off the road as the last resort come back on their
         // timetable for their departure
         for r in std::mem::take(&mut traffic.respawned) {
             let id = r.car;
@@ -2162,7 +2162,7 @@ impl Schedule {
             tried += 1;
             self.fail_reason = None;
             let placed = self.spawn_departure(i, world, traffic, renderer, scene, day_time, None);
-            // [ROLLBACK r4d-B2] a bus taken off the road as the last resort comes back however
+            // a bus taken off the road as the last resort comes back however
             // its placement fails, every few seconds until well past its departure
             let before_its_time = self.resumes.respawn.get(&i).is_some_and(|r| day_time < r.at);
             if !matches!(placed, Placed::Spawned) && !before_its_time {
@@ -2233,7 +2233,7 @@ impl Schedule {
                     let with: Vec<usize> = std::iter::once(l).chain(lanes.iter().copied()).collect();
                     Self::add_connectors(traffic, &with);
                     let (out, index) = bridge_gaps(&traffic.net, &with);
-                    // [ROLLBACK r4d-B1] not on past a dead end of the road (see `cut_at_dead_ends`)
+                    // not on past a dead end of the road (see `cut_at_dead_ends`)
                     let steps: Vec<usize> = std::iter::once(usize::MAX).chain(lane_steps.iter().copied()).collect();
                     let (out, _, cut_at) = cut_at_dead_ends(&traffic.net, out, &index, &steps, 0);
                     (out[1..].to_vec(), cut_at)
@@ -2396,7 +2396,7 @@ impl Schedule {
         let Some((at, offset)) = step_at(&steps, &slots, &est, leg, frac) else {
             return Placed::Drop;
         };
-        // [ROLLBACK r4d-B1] a trip whose bus drove off a dead end goes on past it: from the
+        // a trip whose bus drove off a dead end goes on past it: from the
         // step after the dead end, once its timetable has the bus there
         let resume = if onto.is_none() { self.resumes.resume_from.get(&i).copied() } else { None };
         let respawn_stop = if onto.is_none() { self.resumes.respawn_stop(i) } else { None };
@@ -2460,7 +2460,7 @@ impl Schedule {
         let net = &traffic.net;
         let (section, index) = bridge_gaps(net, &section);
         let start_index = index[start_index.min(index.len() - 1)];
-        // [ROLLBACK r4d-B1] the route ends where the road does (the bus drives off the dead
+        // the route ends where the road does (the bus drives off the dead
         // end and comes back where the track goes on), rather than jumping the gap
         let lane_steps: Vec<usize> = (start..end).filter(|&k| matches!(slots[k], Slot::Lane(_))).collect();
         let bridged_len = section.len();
@@ -2574,9 +2574,9 @@ impl Schedule {
             let route: Vec<usize> = prefix.iter().copied().chain(section[from..].iter().copied()).collect();
             let shift = prefix.len() as isize - from as isize;
             // the stops from the bus on; one just behind it on its lane is where it stands -
-            // [round 6 B2] or, handed over on the move at the end of its track, where it comes
+            // or, handed over on the move at the end of its track, where it comes
             // to rest braking gently (pinned at its front it stopped dead from speed)
-            // ([P8-3] on its lane, or not at all: `first_stop_pin`)
+            // (on its lane, or not at all: `first_stop_pin`)
             let pin = first_stop_pin(s0, v0, traffic.net.lanes[lane0].length());
             let stops: Vec<(usize, f32, f32, f64, i64, f32)> = stops
                 .into_iter()
@@ -2708,7 +2708,7 @@ impl Schedule {
                 s = (ss - 0.5).max(0.0);
             }
         }
-        // [ROLLBACK r4d-B2] a bus taken off the road as the last resort comes back at the stop
+        // a bus taken off the road as the last resort comes back at the stop
         // it was taken from (not at the start of its trip, 128 m before it)
         if let Some((ri, ss)) = respawn_stop.and_then(|id| respawn_start(&stops, id)) {
             // the stop first; taken (the queue behind it moved up into the berth), or in the
@@ -2961,7 +2961,7 @@ fn bridge_gaps(net: &Network, lanes: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (out, index)
 }
 
-/// [ROLLBACK r4d-B1] The trips of buses taken off the road at a dead end: where each bus's
+/// The trips of buses taken off the road at a dead end: where each bus's
 /// route ends in its trip, and where the trips of the buses taken off go on.
 #[derive(Debug, Default)]
 struct Resumes {
@@ -2971,16 +2971,16 @@ struct Resumes {
     /// Departures whose bus drove off a dead end: the step the trip resumes at. The bus
     /// comes back there when its timetable has it there, not before.
     resume_from: HashMap<usize, usize>,
-    /// [ROLLBACK r4d-B2] Departures whose bus was taken off the road as the last resort (it
+    /// Departures whose bus was taken off the road as the last resort (it
     /// blocked a through lane and could go nowhere): put back at their stop from the time
     /// given on, tried again every `RESPAWN_RETRY` s until `RESPAWN_GIVE_UP` after the
     /// departure.
     respawn: HashMap<usize, Respawn>,
-    /// [ROLLBACK r4d-B2] When each tour (`Schedule::tour_key`) last had its bus taken off.
+    /// When each tour (`Schedule::tour_key`) last had its bus taken off.
     tour_respawned: HashMap<u64, f64>,
 }
 
-/// [ROLLBACK r4d-B2] A departure whose bus was taken off the road as the last resort.
+/// A departure whose bus was taken off the road as the last resort.
 #[derive(Debug, Clone, PartialEq)]
 struct Respawn {
     /// Back at this stop (its map object), from this time of day, for this departure from it.
@@ -2991,7 +2991,7 @@ struct Respawn {
     told: Vec<&'static str>,
 }
 
-/// [ROLLBACK r4d-B2] What becomes of a respawned departure whose placement failed.
+/// What becomes of a respawned departure whose placement failed.
 #[derive(Debug, PartialEq)]
 enum RespawnNext {
     /// Again at this time; the reason is new (log it).
@@ -3007,7 +3007,7 @@ enum ResumeAt {
     Go,
     /// Its timetable has the bus before step `r` still: again when it is there.
     Before(usize),
-    /// [ROLLBACK r4d-B2] Its bus was taken off the road: again at this time of day.
+    /// Its bus was taken off the road: again at this time of day.
     Until(f64),
     /// Nothing of its track follows the dead end: the trip is over.
     Drop,
@@ -3031,7 +3031,7 @@ impl Resumes {
         Some((i, step))
     }
 
-    /// [ROLLBACK r4d-B2] Bus `car` (of departure `dep`, if it had one) was taken off the road
+    /// Bus `car` (of departure `dep`, if it had one) was taken off the road
     /// as the last resort: its trip comes back at `at`.
     fn respawned(&mut self, car: u64, dep: Option<usize>, r: crate::bus_service::Respawned, tour: Option<u64>) -> Option<usize> {
         self.route_end_step.remove(&car);
@@ -3043,12 +3043,12 @@ impl Resumes {
         Some(i)
     }
 
-    /// [ROLLBACK r4d-B2] The stop respawned departure `i` comes back at, if it is one.
+    /// The stop respawned departure `i` comes back at, if it is one.
     fn respawn_stop(&self, i: usize) -> Option<i64> {
         self.respawn.get(&i).map(|r| r.stop)
     }
 
-    /// [ROLLBACK r4d-B2] Placing respawned departure `i` failed at `day_time` for `reason`.
+    /// Placing respawned departure `i` failed at `day_time` for `reason`.
     fn respawn_failed(&mut self, i: usize, reason: &'static str, day_time: f64) -> Option<RespawnNext> {
         let r = self.respawn.get_mut(&i)?;
         if day_time > r.depart + crate::bus_service::RESPAWN_GIVE_UP {
@@ -3062,7 +3062,7 @@ impl Resumes {
         Some(RespawnNext::Retry(day_time + crate::bus_service::RESPAWN_RETRY, new))
     }
 
-    /// [ROLLBACK r4d-B2] Until when a bus of tour `tour` placed at `day_time` (put back after
+    /// Until when a bus of tour `tour` placed at `day_time` (put back after
     /// being taken off: `back`) may not be taken off the road again: `RESPAWN_COOLDOWN` after
     /// it is back, or after the tour's last time.
     fn respawn_block(&self, tour: u64, day_time: f64, back: bool) -> Option<f64> {
@@ -3094,7 +3094,7 @@ impl Resumes {
     }
 }
 
-/// [ROLLBACK r4d-B2] Bus `car` may not be taken off the road again before `t`: the longer
+/// Bus `car` may not be taken off the road again before `t`: the longer
 /// block holds (the tour's next trip handed to the bus put back had shortened it to the
 /// tour's, and the bus was taken off again 100 s after it was back).
 fn block_until(blocks: &mut HashMap<u64, f64>, car: u64, t: f64) {
@@ -3102,12 +3102,12 @@ fn block_until(blocks: &mut HashMap<u64, f64>, car: u64, t: f64) {
     *e = e.max(t);
 }
 
-/// [ROLLBACK r4d-B2] How far before its stop a bus taken off the road may come back (m), and
+/// How far before its stop a bus taken off the road may come back (m), and
 /// the step between the places tried on the way up to it.
 pub(crate) const RESPAWN_APPROACH: f32 = 150.0;
 const RESPAWN_STEP: f32 = 10.0;
 
-/// [ROLLBACK r4d-B2] The place `d` metres back along `section` from (`at.0`, `at.1`): lane
+/// The place `d` metres back along `section` from (`at.0`, `at.1`): lane
 /// index in it and distance along that lane. None before the section's start.
 fn back_along(net: &Network, section: &[usize], at: (usize, f32), d: f32) -> Option<(usize, f32)> {
     let (mut k, mut s) = (at.0, at.1 - d);
@@ -3121,12 +3121,12 @@ fn back_along(net: &Network, section: &[usize], at: (usize, f32), d: f32) -> Opt
     Some((k, s))
 }
 
-/// [ROLLBACK r4d-B2] The metres from `a` to `b` along `section`.
+/// The metres from `a` to `b` along `section`.
 fn stop_gap(net: &Network, section: &[usize], a: (usize, f32), b: (usize, f32)) -> f32 {
     (a.0..b.0).map(|k| net.lanes[section[k]].length()).sum::<f32>() - a.1 + b.1
 }
 
-/// [ROLLBACK r4d-B2] The places a bus taken off the road may be put back at, in order: its
+/// The places a bus taken off the road may be put back at, in order: its
 /// stop (`stop`), then on its way up to it every `RESPAWN_STEP` m back as far as
 /// `RESPAWN_APPROACH` (along its own trip's lanes).
 pub(crate) fn respawn_places(net: &Network, section: &[usize], stop: (usize, f32)) -> Vec<(usize, f32)> {
@@ -3139,7 +3139,7 @@ pub(crate) fn respawn_places(net: &Network, section: &[usize], stop: (usize, f32
     out
 }
 
-/// [ROLLBACK r4d-B2] The first of `places` that `check` lets the bus appear at; when none
+/// The first of `places` that `check` lets the bus appear at; when none
 /// does, why the first (its stop) would not.
 fn first_place(places: &[(usize, f32)], mut check: impl FnMut(usize, f32) -> Result<(), &'static str>) -> Result<(usize, f32), &'static str> {
     let mut why = None;
@@ -3154,14 +3154,14 @@ fn first_place(places: &[(usize, f32)], mut check: impl FnMut(usize, f32) -> Res
     Err(why.unwrap_or("other"))
 }
 
-/// [ROLLBACK r4d-B2] Where a bus taken off the road at stop `id` is put back: half a metre
+/// Where a bus taken off the road at stop `id` is put back: half a metre
 /// short of that stop's point (as a bus that would start a few metres short of its stop),
 /// on the route lane `stops` has it on.
 fn respawn_start(stops: &[(usize, f32, f32, f64, i64, f32)], id: i64) -> Option<(usize, f32)> {
     stops.iter().find(|st| st.4 == id).map(|st| (st.0, (st.1 - 0.5).max(0.0)))
 }
 
-/// [ROLLBACK r4d-B1] When a bus at step `at.0` (`at.1` metres into it) on leg `leg` (from
+/// When a bus at step `at.0` (`at.1` metres into it) on leg `leg` (from
 /// `t.0` to `t.1`) reaches step `r`, at the pace of its leg from `base` on (as a bus on a tile
 /// still to come reaches the loaded ones); on a later leg, the end of this one (look again).
 #[allow(clippy::too_many_arguments)]
@@ -3176,11 +3176,11 @@ fn time_at_step(steps: &[Step], est: &[f64], track: bool, leg: usize, at: (usize
     }
 }
 
-/// [ROLLBACK r4d-B1] A route lane that runs into nothing and whose next route lane starts at
+/// A route lane that runs into nothing and whose next route lane starts at
 /// least this far off (m) is a dead end of the road.
 const DEAD_END_GAP: f32 = 25.0;
 
-/// [ROLLBACK r4d-B1] The part of `section` (bridged, see `bridge_gaps`: `index` gives each
+/// The part of `section` (bridged, see `bridge_gaps`: `index` gives each
 /// lane of the route steps `lane_steps` its place in it) that the bus on lane `at` of it
 /// drives: up to the first dead end after it where the next lane does not join on (a road
 /// whose bridge the map left without paths), from the last such gap before it. Returns
@@ -4242,7 +4242,7 @@ impl Schedule {
 
     /// The position (in order of departure, as `tour_trip_stops` counts) of the trip of a
     /// tour next to leave its first stop at `now` (seconds of the day): one that has left
-    /// already (a few minutes ago) is not offered. [ROLLBACK nexttrip-73] With none left today,
+    /// already (a few minutes ago) is not offered. With none left today,
     /// the last trip of the day.
     pub fn tour_trip_now(&self, line: &str, tour: &str, now: f64) -> usize {
         let all = self.tour_stops(line, tour);
@@ -4278,7 +4278,7 @@ impl Schedule {
     /// The stops of the trip of a tour that is next to leave its first stop at `now` (seconds
     /// of the day), whole (see `tour_trip_now`). Same entries and numbering as `tour_stops`.
     pub fn tour_stops_from(&self, line: &str, tour: &str, now: f64) -> Vec<(usize, usize, String, f64)> {
-        // [ROLLBACK nexttrip-73] the trip next to leave its first stop, whole
+        // the trip next to leave its first stop, whole
         let pos = self.tour_trip_now(line, tour, now);
         self.tour_trip_stops(line, tour, pos)
     }
@@ -5508,7 +5508,7 @@ impl PlayerDuty {
 pub(crate) mod tests {
     use super::*;
 
-    /// [P8-3] The first stop behind a bus handed its next trip: where it stands when it
+    /// The first stop behind a bus handed its next trip: where it stands when it
     /// creeps, where it comes to rest braking gently on the move - and passed, not clamped
     /// to the lane's end, when that rest lies beyond its lane.
     #[test]
@@ -5524,7 +5524,7 @@ pub(crate) mod tests {
         assert_eq!(first_stop_pin(17.8, 0.0, 18.0), Some(18.0));
     }
 
-    /// [ROLLBACK r4d-B1] A road east (lanes 0, 1) whose bridge the map left without paths:
+    /// A road east (lanes 0, 1) whose bridge the map left without paths:
     /// lane 1 ends in nothing at x = 200, the track goes on 300 m further on (lanes 2, 3).
     fn bridge_gap() -> Network {
         use omsi_sim::traffic::{LaneBuilder, LaneKind};
@@ -5554,7 +5554,7 @@ pub(crate) mod tests {
         assert_eq!(cut_at_dead_ends(&joined, section, &index, &steps, 0), (vec![0, 1, 2, 3], 0, None));
     }
 
-    /// [ROLLBACK r4d-B1] The chain from a bus driving off a dead end to its trip's bus put
+    /// The chain from a bus driving off a dead end to its trip's bus put
     /// back past it: bus 11 of departure 3 has its route up to step 8 (the bridge's steps 6
     /// and 7 are not in the map). Off the dead end, the departure waits while its timetable
     /// has the bus before step 8, is placed from step 8 on once it is there, and the bus put
@@ -5586,7 +5586,7 @@ pub(crate) mod tests {
         assert_eq!(r.dead_ended(13, None), None);
     }
 
-    /// [ROLLBACK r4d-B2] A bus taken off the road as the last resort: its departure is not put
+    /// A bus taken off the road as the last resort: its departure is not put
     /// on the road again before the time it was given, and then as any departure.
     #[test]
     fn a_bus_taken_off_as_the_last_resort_comes_back_at_its_time() {
@@ -5628,7 +5628,7 @@ pub(crate) mod tests {
         assert_eq!(blocks.get(&22), Some(&1300.0));
     }
 
-    /// [ROLLBACK r4d-B2] (1) A bus taken off at its stop comes back at it, half a metre short
+    /// (1) A bus taken off at its stop comes back at it, half a metre short
     /// of its point, not at the start of its trip.
     #[test]
     fn a_bus_taken_off_comes_back_at_its_stop() {
@@ -5637,7 +5637,7 @@ pub(crate) mod tests {
         assert_eq!(respawn_start(&stops, 44), None);
     }
 
-    /// [ROLLBACK r4d-B2] A bus taken off the road whose stop is taken when it is due back is
+    /// A bus taken off the road whose stop is taken when it is due back is
     /// put on its way up to it (the first clear place out of view, every 10 m back as far as
     /// 150 m); with the player close by for the whole window it is given up, said once.
     #[test]

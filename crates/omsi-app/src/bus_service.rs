@@ -54,7 +54,7 @@ pub enum Phase {
 
 #[derive(Debug, Clone)]
 pub struct BusService {
-    /// [round 7 A7] The offset it steers to at or into a stop (its bay, a place parked away):
+    /// The offset it steers to at or into a stop (its bay, a place parked away):
     /// the planner's `External::bay`. None between stops, where the traffic's own rules
     /// (the kerb swerve, the settle creep) place it in its lane.
     pub bay_wish: Option<f32>,
@@ -76,7 +76,7 @@ pub struct BusService {
     pub delay: f64,
     /// Put out before its departure: it waits for it at its first stop.
     pub layover: bool,
-    /// [ROLLBACK aiparked-73] The wait at this stop is a long one (`PARKED_WAIT`): the engine stops.
+    /// The wait at this stop is a long one (`PARKED_WAIT`): the engine stops.
     long_wait: bool,
     /// This stop is a layover on a through lane: the doors are open for the whole wait, and
     /// the bus goes early when a queue builds up behind it.
@@ -97,11 +97,11 @@ pub struct BusService {
     /// more than `EARLY_STOP_SHORT` early (`schedule::TripTimes::kinds`).
     pub always: Vec<i64>,
     pub serve_early: Vec<i64>,
-    /// [ROLLBACK waitstop-136] Stops where the timetable has it wait for the departure time
+    /// Stops where the timetable has it wait for the departure time
     /// (`[profile_otherstopping]` 3 and 4, `schedule::WAIT_KINDS`); at any other it leaves
     /// when the people are off and on, early or not.
     pub wait_stops: Vec<i64>,
-    /// [ROLLBACK r4d-B2] Away from the stop it waits at (round the block, or to a place with
+    /// Away from the stop it waits at (round the block, or to a place with
     /// room off the through lane), to be back for its departure.
     pub away: Option<Away>,
     /// A way off decided while the doors were open: taken once they are shut.
@@ -114,35 +114,35 @@ pub struct BusService {
     this_layover: bool,
     /// Its route was changed this frame (for the recording).
     pub rerouted: bool,
-    /// [ROLLBACK r4d-B3] Seconds ahead of its timetable since it left a stop early for the
+    /// Seconds ahead of its timetable since it left a stop early for the
     /// traffic it held up (the roadside layover's early start): it drives slower
     /// (`pace`, the factor on its usual speed) until that is made up, and waits out what is
     /// left at its next stop.
     pub ahead_by: f64,
     pub pace: f32,
-    /// [ROLLBACK r4d-B3] When it is to be at its next stop to have made the lead up (seconds
+    /// When it is to be at its next stop to have made the lead up (seconds
     /// of the day): the lead is that less when it would be there at its usual speed, every
     /// frame - time stood at a light or in a queue counts it off as well as time driven slow.
     pace_target: Option<f64>,
     /// It leaves this stop early for the traffic behind it.
     left_early: bool,
-    /// [ROLLBACK r4d-B4] Held short of its stop by somebody in its way: it creeps up to the
+    /// Held short of its stop by somebody in its way: it creeps up to the
     /// pole once they are clear rather than serving the stop where it stands.
     short_by_people: bool,
-    /// [ROLLBACK r4d-B5] How far past its stop point it pulls on for a bus behind it for the
+    /// How far past its stop point it pulls on for a bus behind it for the
     /// same stop (kept until it is at the stop: a follower lost from view for a frame made the
     /// bus 10 m past its point take the stop for missed), and, standing at the stop with the
     /// doors shut, the odometer reading it pulls on to (once a stop).
     pull: f32,
     pull_to: Option<f32>,
     pulled_here: bool,
-    /// [round 6 B2] Its trip ended at the end of its route with no stop there (a track that
+    /// Its trip ended at the end of its route with no stop there (a track that
     /// ends on a lane with a way on): it drives on until the timetable hands it the tour's
     /// next trip or lets it go, rather than standing at the lane's end.
     track_end: bool,
 }
 
-/// [ROLLBACK r4d-B2] A bus away from its stop until its departure.
+/// A bus away from its stop until its departure.
 #[derive(Debug, Clone)]
 pub struct Away {
     /// Parked somewhere with room: where, and what it comes back by.
@@ -165,7 +165,7 @@ struct ParkAway {
     arrived: bool,
 }
 
-/// [ROLLBACK r4d-B2] A way off a stop for a bus that blocks a through lane: `route` starts
+/// A way off a stop for a bus that blocks a through lane: `route` starts
 /// on the lane it stands on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detour {
@@ -210,15 +210,14 @@ fn early_wait(depart: f64, now: f64, layover: bool, rail: bool) -> f64 {
     };
     (depart - lead - now).clamp(0.0, LAYOVER_WAIT)
 }
-/// [ROLLBACK aiparked-73] A wait at a stop this long (3.5 minutes) stops the engine; it starts
-/// again this long (s) before the departure.
-// [ROLLBACK engine-95] was 210 s / 75 s: the engine stops for any wait over two minutes and starts a minute before
+/// A wait at a stop this long (s: two minutes) stops the engine; it starts
+/// again `PARKED_START` (s) before the departure.
 const PARKED_WAIT: f64 = 120.0;
 const PARKED_START: f64 = 60.0;
-/// [ROLLBACK terminus-130] Seconds after its trip is over that a bus stands before the
+/// Seconds after its trip is over that a bus stands before the
 /// engine stops (the passengers are off by then).
 const TRIP_DONE_PARK: f32 = 20.0;
-/// [ROLLBACK stopstuck-130] Seconds of boarding past the departure after which the doors
+/// Seconds of boarding past the departure after which the doors
 /// close whoever is still said to be at them.
 const BOARDING_MAX: f32 = 120.0;
 /// On a layover, the doors open this long before the departure.
@@ -228,14 +227,14 @@ const LAYOVER_BOARDING: f64 = 45.0;
 /// town more than a few minutes' lead on the timetable.
 const ROADSIDE_QUEUE: f32 = 20.0;
 const ROADSIDE_EARLY_MIN: f64 = 30.0;
-/// [ROLLBACK r4d-B3] A bus ahead of its timetable drives no slower than this share of its
+/// A bus ahead of its timetable drives no slower than this share of its
 /// usual speed while it makes the lead up; a lead under a second is none.
 pub const PACE_MIN: f32 = 0.6;
-/// [ROLLBACK r4d-B3] With a vehicle closer than this behind it (m) a bus ahead of its
+/// With a vehicle closer than this behind it (m) a bus ahead of its
 /// timetable drives at its usual speed.
 pub const PACE_FOLLOWER: f32 = 15.0;
 
-/// [ROLLBACK r4d-B3] The share of its usual speed at which a bus `ahead_by` seconds early,
+/// The share of its usual speed at which a bus `ahead_by` seconds early,
 /// `dist` metres before its next stop at `v_nom`, takes the lead up by the time it is there
 /// (at least `PACE_MIN`).
 pub fn pace_for(ahead_by: f64, dist: f32, v_nom: f32) -> f32 {
@@ -245,7 +244,7 @@ pub fn pace_for(ahead_by: f64, dist: f32, v_nom: f32) -> f32 {
     let t = dist / v_nom.max(1.0);
     (t / (t + ahead_by as f32)).clamp(PACE_MIN, 1.0)
 }
-/// [ROLLBACK r4d-B2] A bus standing out a long wait at its stop (or queueing for an occupied
+/// A bus standing out a long wait at its stop (or queueing for an occupied
 /// berth) with its body over a through lane leaves once a vehicle has stood behind it this
 /// long (s), or more than `LAYOVER_QUEUE_CARS` stand queued behind it: round the shortest
 /// loop back to the stop of at most `LAYOVER_LOOP_MAX` m that it drives in the time to its
@@ -254,7 +253,7 @@ pub fn pace_for(ahead_by: f64, dist: f32, v_nom: f32) -> f32 {
 pub const LAYOVER_QUEUE: f32 = 20.0;
 pub const LAYOVER_QUEUE_CARS: usize = 3;
 pub const LAYOVER_LOOP_MAX: f32 = 1200.0;
-/// [ROLLBACK r4d-B2] The least way round the block (m) from the end of the lane back to its
+/// The least way round the block (m) from the end of the lane back to its
 /// start that counts as one.
 pub const LAYOVER_LOOP_MIN: f32 = 100.0;
 pub const LAYOVER_PARK_MAX: f32 = 400.0;
@@ -267,17 +266,17 @@ const DETOUR_MIN_LEFT: f64 = 90.0;
 const DETOUR_RETRY: f64 = 30.0;
 /// Room a parked bus needs beyond its length (m).
 pub const PARK_ROOM: f32 = 4.0;
-/// [ROLLBACK r4d-B2] A bus taken off the road as the last resort comes back this long (s)
+/// A bus taken off the road as the last resort comes back this long (s)
 /// before its departure.
 pub const RESPAWN_LEAD: f64 = 60.0;
-/// [ROLLBACK r4d-B2] Placing a bus taken off the road back on it is tried again this often (s)
+/// Placing a bus taken off the road back on it is tried again this often (s)
 /// until `RESPAWN_GIVE_UP` after its departure, when the trip is given up; and the tour's bus
 /// is not taken off the road again within `RESPAWN_COOLDOWN` of the last time (s).
 pub const RESPAWN_RETRY: f64 = 3.0;
 pub const RESPAWN_GIVE_UP: f64 = 120.0;
 pub const RESPAWN_COOLDOWN: f64 = 300.0;
 
-/// [ROLLBACK r4d-B2] A timetable bus taken off the road as the last resort: its trip comes back
+/// A timetable bus taken off the road as the last resort: its trip comes back
 /// at stop `stop` at time `at`, for its departure `depart` from there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Respawned {
@@ -289,43 +288,43 @@ pub struct Respawned {
     pub stop: i64,
 }
 
-/// [ROLLBACK r4d-B2] Seconds a detour of `len` metres takes.
+/// Seconds a detour of `len` metres takes.
 fn detour_time(len: f32) -> f64 {
     (len / DETOUR_SPEED) as f64
 }
 
-/// [ROLLBACK r4d-B2] A street lane that is a through lane (`ThroughLanes::through`): other
+/// A street lane that is a through lane (`ThroughLanes::through`): other
 /// vehicles drive it.
 pub fn covers_through_lane(net: &Network, lane: usize, lateral: f32, half_width: f32, through: bool) -> bool {
     through && net.lanes.get(lane).is_some_and(|l| l.kind == LaneKind::Street) && covers_lane(net, lane, lateral, half_width)
 }
 
-/// [ROLLBACK r4d-B2] A bus `lateral` metres right of lane `lane` covers it: its body
+/// A bus `lateral` metres right of lane `lane` covers it: its body
 /// (`half_width`) is not moved off the lane into a bay (a bus half on the pavement still
 /// holds up a car).
 pub fn covers_lane(net: &Network, lane: usize, lateral: f32, half_width: f32) -> bool {
     net.lanes.get(lane).is_some_and(|l| lateral.abs() < half_width + l.width * 0.5 - 0.5)
 }
 
-/// [round 6 B1] A bus standing across the fan of lanes of a junction object holds up the
+/// A bus standing across the fan of lanes of a junction object holds up the
 /// traffic of the lanes beside its own (review-r6-cases case11: the layover bus on junction
 /// piece 12074 stood over the stretches of j30 while B2 looked at its own lane only). A lane
 /// of its object is covered when a car driving on its axis would come within this much (m)
 /// of the bus's body: `covers_lane`'s 0.5 m margin ...
 pub const FAN_COVER: f32 = 0.5;
-/// [round 6 B1] ... with the car this wide either side of the axis (m: half a typical town
-/// car's 1.8 m, the box every parked car had until round 7). A lane 2.7 m or more off the axis of a 2.5 m bus is
+/// ... with the car this wide either side of the axis (m: half a typical town
+/// car's 1.8 m). A lane 2.7 m or more off the axis of a 2.5 m bus is
 /// then not covered (a bus in a bay beside the through lane stays).
 pub const FAN_CAR_HALF: f32 = 0.9;
-/// [round 6 B1] A vehicle standing on a covered lane, or whose way runs into one within
+/// A vehicle standing on a covered lane, or whose way runs into one within
 /// this far of its front (m), and held by the bus (it waits for it, follows it or is held
 /// by its body), queues behind the bus (the gap list's 40 m horizon of a junction approach,
 /// review-r6-cases section 1 case11).
 pub const FAN_QUEUE_REACH: f32 = 40.0;
-/// [round 6 B1] Lane samples are tested against the body this far apart (m).
+/// Lane samples are tested against the body this far apart (m).
 const FAN_STEP: f64 = 0.5;
 
-/// [round 6 B1] The other street lanes of the junction object whose piece `own` the bus
+/// The other street lanes of the junction object whose piece `own` the bus
 /// stands on that its body covers: a car of `FAN_CAR_HALF` on the lane's axis would come
 /// within `FAN_COVER` of the body (origin `pos`, `heading` degrees clockwise from north,
 /// `front`/`rear` from the origin, `half_width`), and `through` says other vehicles drive
@@ -372,7 +371,7 @@ pub fn fan_lanes_covered(net: &Network, own: usize, pos: glam::DVec2, heading: f
     out
 }
 
-/// [round 6 B1] One of the others for `fan_queue`.
+/// One of the others for `fan_queue`.
 #[derive(Debug, Clone, Default)]
 pub struct FanOther {
     pub id: u64,
@@ -393,7 +392,7 @@ pub struct FanOther {
     pub held_by_bus: bool,
 }
 
-/// [round 6 B1] The queue at the lanes a bus covers (`fan_lanes_covered`): of the vehicles
+/// The queue at the lanes a bus covers (`fan_lanes_covered`): of the vehicles
 /// `others` the ones standing on a covered lane or whose way runs into one within
 /// `FAN_QUEUE_REACH` and that the bus holds, and the ones standing queued behind those (as
 /// far back as 30): the longest any of the first has stood, and how many stand in all.
@@ -427,7 +426,7 @@ pub fn fan_queue(fan: &[usize], others: &[FanOther]) -> (f32, usize) {
     (secs, chain.len())
 }
 
-/// [round 6 B1] A layover bus blocks the traffic and the queue asks it to go
+/// A layover bus blocks the traffic and the queue asks it to go
 /// (`Traffic::bus_detour`): it covers its own through lane (`covers_through_lane`) and the
 /// queue behind it asks (`queue_asks_to_go`: `behind_secs` stood behind it, `behind` in the
 /// queue), or it covers lanes of its fan and the queue held there asks (`fan_queue`'s
@@ -436,7 +435,7 @@ pub fn layover_asked_to_go(covers_own: bool, behind_secs: f32, behind: usize, fa
     (covers_own && queue_asks_to_go(behind_secs, behind)) || (!fan.is_empty() && queue_asks_to_go(fan_secs, fan_queued))
 }
 
-/// [ROLLBACK r4d-B2] The through lanes, as the traffic has driven them: a street lane is one
+/// The through lanes, as the traffic has driven them: a street lane is one
 /// when a vehicle of the random traffic has been on it, when another timetable vehicle's
 /// route runs over it, or when it has a lane beside it (a road of several lanes). The lane
 /// density says nothing: 25 street lanes of BeijingCity with density 0 carried 287 cars in
@@ -464,12 +463,12 @@ impl ThroughLanes {
     }
 }
 
-/// [ROLLBACK r4d-B2] Where on a lane a bus `len` metres long and `half_width` wide stands out
+/// Where on a lane a bus `len` metres long and `half_width` wide stands out
 /// of the through traffic, nearest the start of the lane first: its origin's place and its
 /// offset right of the lane. `lane_len`, `width`: the lane; `free(a, b)`: nobody on the lane
 /// between `a` and `b`; `on_way`: some vehicle's way uses the lane; `bays`: other stops'
 /// places off the lane (origin, offset); `parked`: the cars parked beside it (their boxes in
-/// the lane's frame, [round 7 A10]);
+/// the lane's frame);
 /// `keep_off`: places along the lane a bus must not stand on (junction mouths, crossings).
 /// Candidates, in order: another stop's bay, the lane itself when nobody's way uses it (a
 /// lay-by, a stand), a gap in a parked row or the kerb before or after the row.
@@ -512,13 +511,13 @@ pub fn room_on_lane(lane_len: f32, width: f32, len: f32, half_width: f32, on_way
     spots.into_iter().find(|&(mid, lat)| clear(mid) && free(mid - need * 0.5, mid + need * 0.5, lat))
 }
 
-/// [ROLLBACK r4d-B2] The queue behind a bus asks it to go: somebody has stood behind it for
+/// The queue behind a bus asks it to go: somebody has stood behind it for
 /// longer than `LAYOVER_QUEUE`, or more than `LAYOVER_QUEUE_CARS` stand in it.
 pub fn queue_asks_to_go(queue_behind_secs: f32, queued: usize) -> bool {
     queue_behind_secs > LAYOVER_QUEUE || queued > LAYOVER_QUEUE_CARS
 }
 
-/// [ROLLBACK r4d-B2] A way off for a bus at `s` on `lane` that is to be back at `back_to`
+/// A way off for a bus at `s` on `lane` that is to be back at `back_to`
 /// on that lane (where its origin stands at the stop) within `time_left` seconds: the
 /// shortest loop through the network back onto the lane, or - if none fits - the nearest
 /// place with room (`room`: where on a lane a bus can stand off the through traffic, its
@@ -599,7 +598,7 @@ pub fn plan_detour(net: &Network, lane: usize, s: f32, back_to: f32, time_left: 
     None
 }
 
-/// [ROLLBACK r4d-B2] Put `route` (starting on the lane the bus is on) on the bus's way.
+/// Put `route` (starting on the lane the bus is on) on the bus's way.
 fn set_route(st: &mut AiState, net: &Network, route: Vec<usize>) {
     st.route = route;
     st.route_index = 0;
@@ -625,11 +624,11 @@ const STOP_REACH: f32 = 80.0;
 const SKIP_DECIDE: f32 = 50.0;
 const EARLY_STOP: f64 = 120.0;
 const EARLY_STOP_SHORT: f64 = 20.0;
-/// [ROLLBACK r4d-B4] A bus held short of its pole by people serves the stop where it stands
+/// A bus held short of its pole by people serves the stop where it stands
 /// only after this long (s); before, it creeps up to the pole once they are clear.
 const PEOPLE_SERVE_MAX: f32 = 30.0;
 
-/// [ROLLBACK r4d-B5] The room on the bus's way past a point `from` metres ahead of its origin
+/// The room on the bus's way past a point `from` metres ahead of its origin
 /// (its front at its stop point), less 2 m: up to the first junction after it, the meeting
 /// place of a junction on the lane it is on (its mouth), a footpath crossing (a zebra: its
 /// near edge), or the end of the way it knows; at a stop with a bay (`bay` over 0.3 m) no
@@ -663,7 +662,7 @@ fn room_past(ctx: &Ctx, from: f32, bay: f32) -> f32 {
     }
 }
 
-/// [ROLLBACK r4d-B5] Half the width of a footpath crossing (m), and how far on a bus pulls
+/// Half the width of a footpath crossing (m), and how far on a bus pulls
 /// at most in a bay (m).
 const ZEBRA_HALF: f32 = 2.0;
 const BAY_PULL: f32 = 4.0;
@@ -680,10 +679,10 @@ pub struct Ctx<'a> {
     pub stopped: f32,
     /// Passing something (the passing manoeuvre owns the lateral position).
     pub passing: bool,
-    /// [ROLLBACK bus-106] Another bus stands at the same stop close ahead of it (its tail within
+    /// Another bus stands at the same stop close ahead of it (its tail within
     /// 9 m): this one, once in its bay and still, serves the stop where it stands.
     pub lead_close: bool,
-    /// [ROLLBACK bus-108] Another bus comes up behind it for the same stop: it pulls on a
+    /// Another bus comes up behind it for the same stop: it pulls on a
     /// few metres past its stop point, to leave the one behind room in the bay.
     pub follower_close: bool,
     /// Somebody aboard wants to get off at the front stop or somebody waits there (None:
@@ -695,15 +694,15 @@ pub struct Ctx<'a> {
     pub roadside: bool,
     /// Seconds a vehicle has stood right behind this bus (0 when none does).
     pub queue_behind_secs: f32,
-    /// [ROLLBACK r4d-B3] Its usual speed on the lane it is on (m/s: the limit at its driver's
+    /// Its usual speed on the lane it is on (m/s: the limit at its driver's
     /// speed factor).
     pub v_nom: f32,
-    /// [ROLLBACK r4d-B4] What holds it is somebody in its way (`Why::People`).
+    /// What holds it is somebody in its way (`Why::People`).
     pub people_hold: bool,
-    /// [ROLLBACK r4d-B3] A vehicle follows it within `PACE_FOLLOWER` m: it does not drive
+    /// A vehicle follows it within `PACE_FOLLOWER` m: it does not drive
     /// slower than the traffic.
     pub close_behind: bool,
-    /// [ROLLBACK r4d-B3] It stands over a through lane (`covers_through_lane`, as the layover
+    /// It stands over a through lane (`covers_through_lane`, as the layover
     /// rules have it).
     pub covers_through: bool,
 }
@@ -768,13 +767,13 @@ impl BusService {
         self.phase == Phase::TripDone
     }
 
-    /// [round 6 B2] Its trip is over at the end of its track, and it drives on off the end
+    /// Its trip is over at the end of its track, and it drives on off the end
     /// of its route (the planner does not hold it there: `External::trip_over`).
     pub fn drives_off(&self) -> bool {
         self.phase == Phase::TripDone && self.track_end
     }
 
-    /// [round 6 B2] Driving with no stop left, it has reached the last lane of its route,
+    /// Driving with no stop left, it has reached the last lane of its route,
     /// a street lane with a way on, and the route is complete (not `route_open`) and its own
     /// (not round the block or to a place with room).
     fn track_ends(&self, st: &AiState, net: &Network) -> bool {
@@ -789,10 +788,10 @@ impl BusService {
             && net.lanes.get(st.lane).is_some_and(|l| l.kind == LaneKind::Street && !l.next.is_empty())
     }
 
-    /// [ROLLBACK aiparked-73] Standing out a long layover with the engine off: it starts again
+    /// Standing out a long layover with the engine off: it starts again
     /// `PARKED_START` before the doors open for the departure.
     pub fn parked(&self, day_time: f64) -> bool {
-        // [ROLLBACK terminus-130] a bus that has finished its trip and stands at the end of
+        // a bus that has finished its trip and stands at the end of
         // the line waits for its next trip with the engine off, as one placed there does
         // (it stood with the engine running until the next trip was handed to it)
         if self.phase == Phase::TripDone {
@@ -846,7 +845,7 @@ impl BusService {
         self.roadside_layover = false;
         self.away = None;
         self.pending = None;
-        // [ROLLBACK r4d-B3] a new trip has a timetable of its own
+        // a new trip has a timetable of its own
         self.ahead_by = 0.0;
         self.pace = 1.0;
         self.pace_target = None;
@@ -877,7 +876,7 @@ impl BusService {
             log::info!("t={:.1}: timetable bus {} serves its stop {:?}", ctx.day_time, ctx.id, self.stops.front().map(|s| s.id));
         }
         let layover = std::mem::take(&mut self.layover);
-        // [ROLLBACK r4d-B2] back from round the block (or never away)
+        // back from round the block (or never away)
         self.away = None;
         self.this_layover = layover;
         self.short_by_people = false;
@@ -886,14 +885,14 @@ impl BusService {
         self.pulled_here = false;
         self.pull_to = None;
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
-        // [ROLLBACK waitstop-136] it stands out its time where the timetable says so, on its
+        // it stands out its time where the timetable says so, on its
         // layover and (a train) at its stations; elsewhere it goes when the people are done
         let wait = if layover || rail || self.wait_stops.contains(&id) {
             early_wait(depart, ctx.day_time, layover, rail)
         } else {
             0.0
         };
-        // [ROLLBACK r4d-B3] still ahead of its timetable from an early start: it waits the
+        // still ahead of its timetable from an early start: it waits the
         // rest out here - where it is out of the way (not at a stop on a through lane: the
         // next stop of a terminus a few metres on had it wait out the whole lead again in
         // the lane it had left early to free; there it keeps making the lead up on the way)
@@ -937,7 +936,7 @@ impl BusService {
     /// Off from the stop: the next one is the front.
     fn depart(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) {
         let bay = self.stops.front().map(|s| s.bay).unwrap_or(0.0);
-        // [ROLLBACK r4d-B3] off early for the traffic behind: the lead is made up on the way
+        // off early for the traffic behind: the lead is made up on the way
         if std::mem::take(&mut self.left_early) {
             if let Some(stop) = self.stops.front() {
                 self.ahead_by = (stop.depart - ctx.day_time).max(0.0);
@@ -945,7 +944,7 @@ impl BusService {
             }
         }
         if let Some(d) = self.pending.take() {
-            // [ROLLBACK r4d-B2] off round the block (or to a place with room): the stop stays
+            // off round the block (or to a place with room): the stop stays
             // the next one
             self.take_detour(st, ctx.net, d, ctx.day_time, ctx.id);
         } else {
@@ -991,7 +990,7 @@ impl BusService {
         }
     }
 
-    /// [ROLLBACK r4d-B2] The seconds left before the bus may leave the front stop, when it
+    /// The seconds left before the bus may leave the front stop, when it
     /// stands out a long wait there - or queues for it (`queued`, standing behind what holds
     /// the stop) - and a way off is worth looking for now.
     pub fn detour_wanted(&self, speed: f32, day_time: f64, queued: bool) -> Option<f64> {
@@ -1009,7 +1008,7 @@ impl BusService {
         (left > DETOUR_MIN_LEFT).then_some(left)
     }
 
-    /// [ROLLBACK r4d-B2] Looked for a way off and found none: it stays (said once a stop).
+    /// Looked for a way off and found none: it stays (said once a stop).
     pub fn no_detour(&mut self, day_time: f64, id: u64) {
         self.detour_looked = day_time;
         let stop = self.stops.front().map(|s| s.id);
@@ -1019,7 +1018,7 @@ impl BusService {
         }
     }
 
-    /// [ROLLBACK r4d-B2] Leave the stop (or the queue for it) on `d`: at once while driving,
+    /// Leave the stop (or the queue for it) on `d`: at once while driving,
     /// at a stop once the doors are shut (`depart`).
     pub fn start_detour(&mut self, st: &mut AiState, net: &Network, d: Detour, day_time: f64, id: u64) {
         self.detour_looked = day_time;
@@ -1084,7 +1083,7 @@ impl BusService {
         self.set_phase(Phase::Running);
     }
 
-    /// [ROLLBACK r4d-B2] Driving to the place with room, standing there, and setting off back
+    /// Driving to the place with room, standing there, and setting off back
     /// for the stop when it is time: where it has to stop, if anywhere.
     fn park_away(&mut self, st: &mut AiState, ctx: &Ctx) -> Option<f32> {
         let away = self.away.as_mut()?;
@@ -1153,7 +1152,7 @@ impl BusService {
         if self.boarding <= 0.0 && ctx.day_time >= self.leave_at {
             self.set_phase(Phase::Closing);
         } else if ctx.day_time >= self.leave_at && self.phase_t > BOARDING_MAX {
-            // [ROLLBACK stopstuck-130] somebody always said to be at the doors (a
+            // somebody always said to be at the doors (a
             // passenger who never gets in) kept the bus at its stop for good
             self.set_phase(Phase::Closing);
         }
@@ -1165,12 +1164,12 @@ impl BusService {
         self.phase_t += ctx.dt;
         let here = Some(st.front);
         match self.phase {
-            // [round 6 B2] (at the end of its track it drives on: no stop)
+            // (at the end of its track it drives on: no stop)
             Phase::TripDone if self.track_end => None,
             Phase::TripDone => here,
             Phase::Waiting => {
                 self.wait(ctx);
-                // [ROLLBACK r4d-B5] doors shut, a bus behind it for this stop: it pulls on by
+                // doors shut, a bus behind it for this stop: it pulls on by
                 // its length (as far as the road before the next junction lets it) to leave
                 // the one behind the pole
                 if ctx.follower_close && !self.pulled_here && self.phase == Phase::Waiting && !ctx.passing {
@@ -1224,10 +1223,10 @@ impl BusService {
         }
         loop {
             let Some(stop) = self.stops.front().copied() else {
-                // ([round 7 A7] out of any bay: where it sits in its lane is the traffic's -
+                // (out of any bay: where it sits in its lane is the traffic's -
                 // the target is not written here every frame)
                 self.bay_wish = None;
-                // [round 6 B2] the end of its track with no stop left: its trip is over here
+                // the end of its track with no stop left: its trip is over here
                 // (the timetable hands it the tour's next trip where it is, or lets it go),
                 // as at its last stop - not on at a tile edge (`route_open`: it waits for the
                 // tiles), nor round the block, nor at a dead end (the road ends: it drives
@@ -1263,7 +1262,7 @@ impl BusService {
                 continue;
             }
             let d = st.route_distance(ctx.net, stop.ri, stop.s);
-            // [ROLLBACK r4d-B3] slower while ahead of the timetable: the lead goes by the time
+            // slower while ahead of the timetable: the lead goes by the time
             // it is at the stop (the time it drives slower is time it is behind its usual pace)
             if self.ahead_by >= 1.0 || self.pace_target.is_some() {
                 let eta = ctx.day_time + (d.max(0.0) / ctx.v_nom.max(1.0)) as f64;
@@ -1294,7 +1293,7 @@ impl BusService {
                 self.pace_target = None;
                 self.pull = 0.0;
                 crate::traffic::ibis_to_next_stop(vehicle, self.stops.len());
-                // ([round 7 A7] out of any bay: where it sits in its lane is the traffic's -
+                // (out of any bay: where it sits in its lane is the traffic's -
                 // the target is not written here every frame)
                 self.bay_wish = None;
                 continue;
@@ -1324,7 +1323,7 @@ impl BusService {
             // after a while it serves the stop where it stands, as drivers do
             let in_bay = (st.lateral - stop.bay).abs() < 0.5;
             // (a bus with another one behind it for this stop pulls on past the stop point:
-            // [ROLLBACK r4d-B5] by its length, as far as the road before the next junction
+            // by its length, as far as the road before the next junction
             // lets it, so that the one behind serves the pole)
             if ctx.follower_close && d > -2.0 {
                 let want = (st.front + st.rear).min(room_past(ctx, d.max(0.0) + st.front, stop.bay));
@@ -1337,15 +1336,15 @@ impl BusService {
                 && ctx.stopped > 0.8
                 && d < 45.0
                 && d >= 2.0;
-            // [ROLLBACK r4d-B4] (not when people held it short: it creeps up to the pole once
+            // (not when people held it short: it creeps up to the pole once
             // they are clear, unless it is within 2 m of it)
             if ctx.people_hold && d >= 2.0 {
                 self.short_by_people = true;
             }
             let people_short = self.short_by_people && ctx.stopped < PEOPLE_SERVE_MAX;
-            // [ROLLBACK r4d-B2] (a bus coming to its layover queues for the berth instead: it
+            // (a bus coming to its layover queues for the berth instead: it
             // stands out its wait there, not in the lane behind - only right behind another
-            // bus at the stop, `close`, it serves it where it stands; [P3-1] and held short of the
+            // bus at the stop, `close`, it serves it where it stands; and held short of the
             // berth by people for PEOPLE_SERVE_MAX, as any bus: they are its own waiters, who
             // wait for it to come - d24 #194 stood 290 s before its first stop, its waiters on a
             // 3.1 m island 0.03 m clear of its body on its lane and inside it on the way into the
@@ -1425,7 +1424,6 @@ mod tests {
 
     #[test]
     fn a_bus_at_the_end_of_its_line_stops_the_engine() {
-        // [ROLLBACK terminus-130]
         let mut s = BusService::new(vec![]);
         s.phase = Phase::TripDone;
         s.phase_t = 5.0;
@@ -1581,7 +1579,7 @@ mod tests {
         assert_eq!(s.leave_at, 480.0);
     }
 
-    /// [ROLLBACK r4d-B2] A ring road of four quarter lanes (0..3, 100 m each, clockwise) and
+    /// A ring road of four quarter lanes (0..3, 100 m each, clockwise) and
     /// a road on from the end of lane 0 (lane 4): a block to go round.
     fn ring() -> Network {
         ring_of(400.0)
@@ -1774,7 +1772,7 @@ mod tests {
         assert_eq!((s.ahead_by, s.pace), (0.0, 1.0));
     }
 
-    /// [ROLLBACK r4d-B3] A roadside layover that starts 60 s early for the queue behind it
+    /// A roadside layover that starts 60 s early for the queue behind it
     /// makes the lead up over the next 2 km to its next stop and is there on time, not a
     /// minute early.
     #[test]
@@ -1833,7 +1831,7 @@ mod tests {
         assert!(left > 20.0 && gone < 170.0, "not waited out in the lane: {left}, on at {gone}");
     }
 
-    /// [ROLLBACK r4d-B4] Held short of its pole by somebody in its way, a bus does not serve
+    /// Held short of its pole by somebody in its way, a bus does not serve
     /// the stop where it stands after 6 s (as behind another bus) but creeps up to the pole
     /// once they are clear; only after `PEOPLE_SERVE_MAX` does it serve it where it is. Off
     /// the bay again it is back in the middle of its lane.
@@ -1860,10 +1858,10 @@ mod tests {
         let target = s.step(&mut st, &mut v, &ctx).expect("its stop");
         assert_eq!(s.phase, Phase::Running);
         assert!((target - (8.0 + 6.0 - 0.3)).abs() < 0.01, "{target}");
-        // [round 7 A7] into its stop it asks for its bay
+        // into its stop it asks for its bay
         assert_eq!(s.bay_wish, Some(1.2));
         assert_eq!(st.lateral_target, 1.2);
-        // [round 7 A7] far from it (beyond BAY_REACH) no bay, and its lateral target is the
+        // far from it (beyond BAY_REACH) no bay, and its lateral target is the
         // traffic's: not written by the service
         let mut far = BusService::new(vec![stop()]);
         let mut st_far = at(20.0);
@@ -1890,7 +1888,7 @@ mod tests {
         ctx.stopped = PEOPLE_SERVE_MAX + 1.0;
         s.step(&mut st, &mut v, &ctx);
         assert_eq!(s.phase, Phase::Boarding);
-        // [P3-1] coming to its layover (its first stop) and held short by its own waiters: served
+        // coming to its layover (its first stop) and held short by its own waiters: served
         // where it stands after half a minute too, not queued for the berth for good (d24 #194)
         let mut s = BusService::new(vec![stop()]);
         s.layover = true;
@@ -1930,7 +1928,7 @@ mod tests {
         assert!(st.lateral.abs() < 0.05, "back in the lane: {}", st.lateral);
     }
 
-    /// [ROLLBACK r4d-B5] Two buses, one stop: the first, knowing the second behind it,
+    /// Two buses, one stop: the first, knowing the second behind it,
     /// pulls on by its length past the pole (as far as the road lets it) and serves the stop
     /// there; the second comes up close behind it and serves the stop where it stands. A
     /// first one standing out its layover with the doors shut pulls on as well.
@@ -2031,7 +2029,7 @@ mod tests {
         assert!((st.s - 112.0).abs() < 1.0 && st.speed < 0.1, "pulled on: {} at {}", st.s, st.speed);
     }
 
-    /// [ROLLBACK r4d-B2] Only a layover (or a queue for an occupied berth) looks for a way off:
+    /// Only a layover (or a queue for an occupied berth) looks for a way off:
     /// not the wait at a stop on the way where the timetable holds the bus.
     #[test]
     fn only_a_layover_or_a_queue_for_the_berth_looks_for_a_way_off() {
@@ -2055,7 +2053,7 @@ mod tests {
         assert!(s.detour_wanted(0.0, 131.0, true).is_some());
     }
 
-    /// [ROLLBACK r4d-B2] A layover sent round the block while people get on keeps its doors
+    /// A layover sent round the block while people get on keeps its doors
     /// open for them: it leaves only once nobody holds them any more.
     #[test]
     fn a_layover_sent_round_the_block_waits_for_the_people_at_its_doors() {
@@ -2108,7 +2106,7 @@ mod tests {
         assert_eq!(st.route, vec![0, 1, 2, 3, 0, 4], "and round the block");
     }
 
-    /// [ROLLBACK r4d-B2] The through lanes are the lanes the traffic drives, not those of a
+    /// The through lanes are the lanes the traffic drives, not those of a
     /// density: a density-0 lane the random cars use is one, a density-1 lane nobody drives
     /// is not; another bus's route makes one, the bus's own does not; so does a lane beside.
     #[test]
@@ -2134,14 +2132,14 @@ mod tests {
         assert!(!covers_through_lane(&net, 0, 0.0, 1.25, false));
     }
 
-    /// [ROLLBACK r4d-B2] Where a 12 m bus stands out of the way on a lane: another stop's bay,
+    /// Where a 12 m bus stands out of the way on a lane: another stop's bay,
     /// the lane itself only when no vehicle's way uses it, the kerb of a parked row (a gap,
     /// before it, after it) - never on a lane in use, never over a crossing, never where a
     /// vehicle is.
     #[test]
     fn a_bus_parks_in_a_bay_on_an_unused_lane_or_at_the_kerb_of_a_parked_row() {
         let none = |_: f32, _: f32, _: f32| true;
-        // (a town car's box, the one every parked car had until round 7)
+        // (a town car's box)
         let car_at = |s: f32, lateral: f32| omsi_traffic::Parked { s, lateral, half_width: 0.9, half_len: 2.3 };
         // a lane in use, nothing beside it: nowhere
         assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &[], &[], &none), None);
@@ -2157,7 +2155,7 @@ mod tests {
         let row: Vec<omsi_traffic::Parked> = (0..7).map(|k| car_at(60.0 + 5.0 * k as f32, 3.0)).collect();
         let (s, lat) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none).expect("the kerb before the row");
         assert!(s < 60.0 - 2.3 - 8.0 && (lat - 3.35).abs() < 0.01, "{s} {lat}");
-        // [round 7 A10] a row of vans (2.2 x 6 m) 3.2 m over: the bus lines up with their
+        // a row of vans (2.2 x 6 m) 3.2 m over: the bus lines up with their
         // inner sides and keeps clear of the first van's own length
         let vans: Vec<omsi_traffic::Parked> = (0..5).map(|k| omsi_traffic::Parked { s: 60.0 + 7.0 * k as f32, lateral: 3.2, half_width: 1.1, half_len: 3.0 }).collect();
         let (s, lat) = room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &vans, &[], &none).expect("the kerb before the vans");
@@ -2177,7 +2175,7 @@ mod tests {
         assert_eq!(room_on_lane(200.0, 3.5, 12.0, 1.25, true, &[], &row, &[], &none), None);
     }
 
-    /// [ROLLBACK r4d-B3] The lead counts off by the clock: a bus 50 s early held 40 s at a red
+    /// The lead counts off by the clock: a bus 50 s early held 40 s at a red
     /// light half-way has made the rest up by then and drives on at its usual speed - late at
     /// its next stop only by what it gave away before the light it could not foresee (counted
     /// off only while moving, the lead had kept it slow after the light too, 40 s more); with a
@@ -2247,7 +2245,7 @@ mod tests {
         assert!(leave >= there + 30.0, "and waits the lead out there: {leave} (there {there})");
     }
 
-    /// [ROLLBACK r4d-B2] A bus put back 30 m before its layover stop, the berth taken: it
+    /// A bus put back 30 m before its layover stop, the berth taken: it
     /// queues, drives up once the berth frees, waits out its layover there and departs on
     /// time.
     #[test]
@@ -2308,7 +2306,7 @@ mod tests {
         assert_eq!(s.at_station_side(), 0.0);
     }
 
-    /// [round 6 B1] A fan of a junction object: lane 0 runs north from the origin, lane 1
+    /// A fan of a junction object: lane 0 runs north from the origin, lane 1
     /// leaves the same point to the north-west, lane 2 lies 10 m to the east (all pieces of
     /// object 12074), lane 3 is another object's on top of lane 1, lane 4 a spline's.
     fn fan() -> Network {
@@ -2397,7 +2395,7 @@ mod tests {
         assert!(!queue_asks_to_go(0.0, 0));
     }
 
-    /// [round 6 B1] `Traffic::bus_detour`'s ask: the own lane's queue only while the bus
+    /// `Traffic::bus_detour`'s ask: the own lane's queue only while the bus
     /// covers its own through lane, the fan's only with a fan; neither mixed into the other.
     #[test]
     fn b1_a_layover_is_asked_to_go_by_the_queue_of_what_it_covers() {
@@ -2414,7 +2412,7 @@ mod tests {
         assert!(!layover_asked_to_go(false, 30.0, 5, &[3], 0.0, 0));
     }
 
-    /// [round 6 B2] Lane 0 north 200 m into lane 1 (100 m) and on into lane 3, and lane 2 that
+    /// Lane 0 north 200 m into lane 1 (100 m) and on into lane 3, and lane 2 that
     /// runs into nothing.
     fn track() -> Network {
         use omsi_sim::traffic::LaneBuilder;

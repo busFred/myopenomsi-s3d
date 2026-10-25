@@ -676,7 +676,7 @@ pub(crate) fn run_offscreen(
             t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
             t.player_blinker = player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
             t.tick(dt, player.as_ref().map(|p| player_outline(p)));
-            // [ROLLBACK r4d-B1] the riders of the timetable buses taken off the road
+            // the riders of the timetable buses taken off the road
             let out = std::mem::take(&mut t.riders_out);
             if let Some(h) = humans_off.as_mut() {
                 for id in out {
@@ -1012,10 +1012,10 @@ pub(crate) fn run_offscreen(
                 .passenger_density((run_clock.time / 3600.0) as f32)
                 * settings.pax_density;
             h.time_of_day = run_clock.time;
-            // [P8 pass 2, harness] where buses leave for in the next 20 minutes - whom the
-            // people appearing at the stops wait for - renewed every 15 s of the clock, as the
-            // window does (app_events.rs, [ROLLBACK soon-90]/[reshuffle-91]); without it no
-            // waiter was ever put down at a stop in an offscreen run with --schedule
+            // where buses leave for in the next 20 minutes - whom the people appearing at the
+            // stops wait for - renewed every 15 s of the clock, as the window does
+            // (app_events.rs); without it no waiter was ever put down at a stop in an
+            // offscreen run with --schedule
             if let Some(s) = schedule.as_ref() {
                 let step = (run_clock.time - h.clock_seen + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
                 let jumped = h.clock_seen.is_finite() && step.abs() > 90.0 + dt as f64 * settings.time_speed as f64 * 5.0;

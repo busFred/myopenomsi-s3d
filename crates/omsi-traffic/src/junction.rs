@@ -251,8 +251,8 @@ impl Junctions {
             lanes.sort_unstable();
             // (an object among the lanes, else among the lanes they run into: a spline lane
             // joining an object's way in, as part of that object, so the way through it is one
-            // junction - a junction of its own just before the object hid the object's foes
-            // until the car was on its first piece, viz2 case11 #40894)
+            // junction - a junction of its own just before the object would hide the object's foes
+            // until the car was on its first piece)
             let objects: Vec<((i32, i32), i64)> = {
                 let mut o: Vec<_> = lanes.iter().filter_map(|&l| object(l)).collect();
                 if o.is_empty() {
@@ -587,9 +587,9 @@ impl Junctions {
     /// nearest lit piece before it along the chain (walking back towards the kerb its walk
     /// starts at). A piece with no lit piece before it has the chain's light when the
     /// chain has one light group, and none when it has several: it lies before the stubs
-    /// (a corner piece at the kerb), whose own lights govern what follows them. (The
-    /// chain's first light for every piece put 18.1 on Taijichang's 18.2 side, case09;
-    /// 7 of BeijingCity's 59 lit crossings carry several groups.)
+    /// (a corner piece at the kerb), whose own lights govern what follows them. (Giving every
+    /// piece the chain's first light would put one group's light on another group's crossing;
+    /// several of BeijingCity's lit crossings carry several groups.)
     fn piece_lights(net: &Network, chain: &[usize]) -> Vec<Option<(usize, usize)>> {
         let mut groups: Vec<(usize, usize)> = chain.iter().filter_map(|&l| net.lanes[l].traffic_light).collect();
         groups.sort_unstable();
@@ -734,8 +734,7 @@ mod tests {
         assert_ne!(east.foes[0].yields, north.foes[0].yields);
     }
 
-    /// Two spline roads drawn across each other with no crossing object (viz case01: AndingR_noside
-    /// 191/3-4 across 723743/3): the crossing is the junction, as in SUMO every crossing of two
+    /// Two spline roads drawn across each other with no crossing object: the crossing is the junction, as in SUMO every crossing of two
     /// connections is a foe of its node. The pair gets a crossing meeting place in one junction
     /// table, with the map's priority where the paths carry one and right before left between
     /// equals; a road passing over the other on a bridge gets none.
@@ -789,8 +788,8 @@ mod tests {
     }
 
     /// Two three-lane spline roads crossing with no object, one lane of the east-west road past a
-    /// bus bay's gap and so linked to no neighbour (viz case01 AndingR_noside 723743/9), another
-    /// of three times its neighbours' density (191/6): every lane of one road meets every lane of
+    /// bus bay's gap and so linked to no neighbour, another of
+    /// three times its neighbours' density: every lane of one road meets every lane of
     /// the other with the same right of way - the road's lanes count for the road class
     /// (`Network::road_class`), as SUMO ranks edges, not lanes - here right before left.
     #[test]
@@ -821,7 +820,7 @@ mod tests {
     }
 
     /// A long spline lane that starts heading against the other road and bends to cross it at a
-    /// right angle (viz case01 28/3131, 44 degrees off at the crossing): the right of way reads the
+    /// right angle (44 degrees off at the crossing): the right of way reads the
     /// headings as the two come to the meeting place, so the pair is right before left - exactly
     /// one yields - not two oncoming ways that both go on.
     #[test]

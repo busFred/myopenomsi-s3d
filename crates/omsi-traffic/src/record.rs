@@ -34,15 +34,15 @@ use std::sync::mpsc;
 
 /// The format's version (the header's first field). 2: vehicles carry their claim
 /// standing hysteresis (`Vehicle::claim_standing`); before, the simulation kept it. 3: the
-/// lanes carry their drivable extent (`Lane::drivable`, round 5 L1); a recording without it
-/// reads back the lanes' half widths. 4 ([round 7 E1]): the header names the rules by their
+/// lanes carry their drivable extent (`Lane::drivable`); a recording without it
+/// reads back the lanes' half widths. 4: the header names the rules by their
 /// hash (`Header::rules`, [`rules_hash`]), and every field added with a `serde(default)`
-/// since 3 is written - `Vehicle::passed_on_go`, `amber_line`, `zip_won`, `change_still`,
+/// since 3 is written - `Vehicle::passed_on_go`, `change_still`,
 /// `mutual`, `mutual_gap`, `ease_for`, `waiting`, `External::trip_over`,
 /// `Frame::steer`, `Frame::order`; a format-3 recording may lack some (read as their
 /// defaults, `Replay::load` warns).
 ///
-/// [fix pass 1, 15] Compatibility rule: a recording is read by the tools of its format and
+/// Compatibility rule: a recording is read by the tools of its format and
 /// later ones. On read, a field the recording has and the code no longer knows is ignored
 /// (no `deny_unknown_fields` anywhere), and a field the code has and the recording lacks
 /// takes its container's default - `Vehicle`, `AiState`, `External` and `DriverParams` are
@@ -50,17 +50,16 @@ use std::sync::mpsc;
 /// lane 0; `External::default`: no input) - except a driver field, which reads as unknown
 /// and then takes the preset of the vehicle's class (`DriverParams::fill_missing`, in
 /// `Replay::new`: a bus's missing `comfort_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
-/// e.g. format 4 in a round-6 tool) is not for that tool: `Replay::load` refuses it with that
+/// e.g. format 4 in a tool of format 3) is not for that tool: `Replay::load` refuses it with that
 /// message, as fields it requires may be missing; read it with the branch's own tool.
 pub const VERSION: u32 = 4;
 /// The rule switches a recording names (`Header::switches`), for information: the rule
-/// changes once tried behind switches and accepted, now always on, and the junction rules of
-/// round 4. Frozen since round 4: which rules a recording was made under is
-/// [`rules_hash`]'s (format 4).
+/// changes once tried behind switches and accepted, now always on, and the earlier junction
+/// rules. Frozen: which rules a recording was made under is [`rules_hash`]'s (format 4).
 pub const RULES: &str = "competitor_filter,signal_foes,stub_links,lights_first,right_of_way,blocked_foe,stop_placement,player_chain,amber_clear";
-/// [round 7 E1] The rules the traffic runs with, as a hash: FNV-1a (64 bit) over the
+/// The rules the traffic runs with, as a hash: FNV-1a (64 bit) over the
 /// sources of the rules - the driver, perception, plan, junctions, resolver, simulation,
-/// access rule (omsi-traffic) and the lane model (omsi-sim's traffic.rs) - with comment
+/// access rule (omsi-traffic) and the lane model (omsi-sim's traffic.rs and ai_motion.rs) - with comment
 /// lines, blank lines and the test modules left out, so that a changed constant or rule changes it and a
 /// reworded comment does not. A recording names it (`Header::rules`); one naming another
 /// does not replay bit-exactly (`replay::other_rules`).
@@ -101,7 +100,7 @@ pub fn rules_hash() -> String {
     .clone()
 }
 
-/// [round 7 E3] The decision a person waiting at the kerb for a red light records
+/// The decision a person waiting at the kerb for a red light records
 /// (`PersonRecord::decision`): the replay leaves them out of the walkers (the game's
 /// `Humans::strollers`).
 pub const RED_LIGHT: &str = "red light";
@@ -196,7 +195,7 @@ pub struct PersonRecord {
     /// Their id in the game (`Person::id`; None in a recording from before it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u32>,
-    /// [P9-2] Walking up to a crossing to step onto it (`Person::approach`).
+    /// Walking up to a crossing to step onto it (`Person::approach`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approach: Option<(DVec2, f32, f32)>,
 }
@@ -289,7 +288,7 @@ pub enum Record {
     /// Every vehicle, before the frame of the same time.
     Keyframe { time: f64, vehicles: Vec<Vehicle> },
     Spawn { time: f64, vehicle: Vehicle, type_name: String },
-    /// [round 7 R7-1 fix 1] With the rule the game took it off by (`None`: an older
+    /// With the rule the game took it off by (`None`: an older
     /// recording, or a removal nobody named), whether the eye saw it (in frame and not
     /// behind a building, as the game judged; the traffic's own network end: in frame) and
     /// its waiting time then (`Vehicle::waiting`).
@@ -302,7 +301,7 @@ pub enum Record {
         seen: bool,
         #[serde(default)]
         waiting: f32,
-        /// [round 9 A2] Its distance from the eye (m) when the population took it off (`None`:
+        /// Its distance from the eye (m) when the population took it off (`None`:
         /// an older recording, or not a population removal).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_eye: Option<f32>,
@@ -442,7 +441,7 @@ pub struct Recorder {
     /// The vehicles' ids in the order of the last frame, and as a set.
     order: Vec<u64>,
     known: HashSet<u64>,
-    /// [round 7 R7-1 fix 1] The rule (and seen, waiting) of each vehicle the game is taking
+    /// The rule (and seen, waiting) of each vehicle the game is taking
     /// off, named by `note_remove` before the frame that finds it gone.
     remove_rules: HashMap<u64, (RemoveRule, bool, f32, Option<f32>)>,
     ids: Vec<u64>,
@@ -514,13 +513,13 @@ impl Recorder {
         }
     }
 
-    /// [round 7 R7-1 fix 1] The game is taking vehicle `id` off by `rule` (`seen`: the eye
+    /// The game is taking vehicle `id` off by `rule` (`seen`: the eye
     /// saw it; `waiting`: its waiting time): written with its `Record::Remove`.
     pub fn note_remove(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32) {
         self.note_remove_from(id, rule, seen, waiting, None);
     }
 
-    /// [round 9 A2] `note_remove` with its distance from the eye (m), for the population's
+    /// `note_remove` with its distance from the eye (m), for the population's
     /// removals (the rule and the distance band of each, `Record::Remove::from_eye`).
     pub fn note_remove_from(&mut self, id: u64, rule: RemoveRule, seen: bool, waiting: f32, from_eye: Option<f32>) {
         // (the ring of the last minute records too: every removal is named)
@@ -608,7 +607,7 @@ impl Recorder {
             time_scale: sim.time_scale,
             players: sim.players.clone(),
             people: people.to_vec(),
-            // ([round 7 E3] not with the people's legs: the replay rebuilds the list from them)
+            // (not with the people's legs: the replay rebuilds the list from them)
             walkers: if people.iter().any(|p| p.leg.is_some()) { Vec::new() } else { sim.walkers.clone() },
             externals: self.externals.clone(),
             steer: steer.to_vec(),
@@ -967,7 +966,7 @@ mod remove_line_tests {
     use super::{Record, RecordRef};
     use crate::removal::RemoveRule;
 
-    /// [round 9 A2 fix pass 3] A removal's line carries its rule, whether the eye saw it and its
+    /// A removal's line carries its rule, whether the eye saw it and its
     /// distance from the eye; one with no distance is written as before, and an older line (no
     /// `from_eye`) reads as None.
     #[test]
@@ -984,7 +983,7 @@ mod remove_line_tests {
         assert!(matches!(serde_json::from_str::<Record>(old).unwrap(), Record::Remove { from_eye: None, .. }));
     }
 
-    /// [round 10 S4] A change of the lanes' edge flags is a line of its own, read back as written
+    /// A change of the lanes' edge flags is a line of its own, read back as written
     /// (a replay sets the flags at its time).
     #[test]
     fn s4_lane_flag_changes_are_recorded() {
