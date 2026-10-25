@@ -32,7 +32,7 @@ pub struct Walker {
     /// Passes through other walkers for a moment: the way out of a deadlock in a doorway
     /// or a narrow aisle (two people who have pushed against each other for seconds).
     pub ghost: bool,
-    /// [ROLLBACK solidcars-1] Vehicles are solid to this walker even as a ghost: a ghost
+    /// Vehicles are solid to this walker even as a ghost: a ghost
     /// passes through people, never through a car (people walked into the cars in front
     /// of them).
     pub solid: bool,
@@ -106,12 +106,12 @@ impl Block {
     }
 }
 
-/// [r9 C1] How much wider than exact `Block::bounds` are (m): the rounding of `near`'s dot
+/// How much wider than exact `Block::bounds` are (m): the rounding of `near`'s dot
 /// products against the bounds' sums is far below a millimetre; a wider bound only adds
 /// candidates that `near` itself then turns down.
 const BOUNDS_SLACK: f64 = 1e-3;
 
-/// [r9 C1] A grid over the ground of the blocks that may lie near a point: each block is filed
+/// A grid over the ground of the blocks that may lie near a point: each block is filed
 /// in every cell its `bounds(margin)` overlap, in the order of the slice it was built from,
 /// so the list of the cell of `p` holds every block `near(p, m)` is true of for any
 /// `m <= margin`, in that order. A per-walker test of the blocks in its cell then visits the
@@ -124,15 +124,15 @@ pub struct BlockGrid {
     wide: Vec<u32>,
 }
 
-/// [r9 C1] Side of a `BlockGrid` cell (m): about a car's length, so that with the crowd's
+/// Side of a `BlockGrid` cell (m): about a car's length, so that with the crowd's
 /// 4 m look-ahead (`CrowdParams::sense`) a car is filed in two or three cells a side.
 pub const BLOCK_CELL: f64 = 8.0;
 
-/// [r9 C1] A block whose bounds span more cells a side than this goes in `BlockGrid::wide`
+/// A block whose bounds span more cells a side than this goes in `BlockGrid::wide`
 /// (no vehicle or parked box does; it keeps a malformed one from being filed in millions).
 const GRID_WIDE_CELLS: i64 = 64;
 
-/// [r9 C1] Which of `blocks` lie within `margin` of any of `points` (`Block::near`), one flag
+/// Which of `blocks` lie within `margin` of any of `points` (`Block::near`), one flag
 /// per block: the points by a grid of cells of side `margin`, each block tested against the
 /// points of the cells its `bounds(margin)` overlap only (the same answer as testing every
 /// point, which took blocks x walkers tests a frame: 400 x 3700 on a busy street).
@@ -317,7 +317,7 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
         grid.entry(cell_of(w.space, w.pos)).or_default().push(i);
     }
     let reach = (params.sense / CELL).ceil() as i32;
-    // [r9 C1] the blocks by where they are: within `sense` of a walker for the avoidance, within
+    // the blocks by where they are: within `sense` of a walker for the avoidance, within
     // a body's radius and CONTACT_REACH for the contacts
     let widest = walkers.iter().map(|w| w.radius).fold(0.0f64, f64::max);
     let block_grid = BlockGrid::new(blocks, params.sense.max(widest + CONTACT_REACH), BLOCK_CELL);
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_jammed_walker_ignores_only_the_box_it_squeezes_through() {
-        // [P1e] SUMO's jam ignores the blocking obstacle only: the parked box `through` gives no
+        // SUMO's jam ignores the blocking obstacle only: the parked box `through` gives no
         // force, a car moving at the walker is avoided as ever
         let parked = Block { center: DVec2::new(0.0, 2.0), half: DVec2::new(0.95, 2.3), heading: 0.0, vel: DVec2::ZERO };
         let run = |through: Option<DVec2>, blocks: &[Block]| {
