@@ -409,15 +409,16 @@ fn joins_behind(crossed: bool, tail: f32) -> bool {
 }
 
 #[test]
-fn j6_a_merge_only_lane_join_keeps_the_ordinary_room_rule() {
+fn j6_a_merge_only_lane_join_is_no_box_and_a_crossed_one_keeps_the_room_rule() {
     let js = Junctions::compile(&lane_join(false));
     assert!(js.nodes.iter().flat_map(|n| n.movements.iter()).flat_map(|m| m.foes.iter()).all(|f| f.kind == omsi_traffic::FoeKind::Merge));
     // a car standing 11 m past the join: room by the gap (11 >= 4 + 2); at a merge-only join
     // the queue-place term (EXIT_NEAR) does not apply, the car joins behind it (case10: taxis
     // stood exit-full 22 s each at the j31 join)
     assert!(!joins_behind(false, 11.0), "held for a full exit at a lane join with 11 m of room");
-    // no room by the gap: held as before
-    assert!(joins_behind(false, 4.0), "joined with 4 m of room");
+    // no room by the gap: a way through that crosses nothing is no box to keep clear (SUMO
+    // applies no keep-clear at geometry-like nodes, sumo.md 1.6), the car edges in behind the queue
+    assert!(!joins_behind(false, 4.0), "held for a full exit at a merge-only join with 4 m of room");
     // with a crossing on the way through (x10 case06 #11146): the box is kept clear as before
     assert!(joins_behind(true, 11.0), "a box with a crossing was entered behind a queue 11 m past it");
 }

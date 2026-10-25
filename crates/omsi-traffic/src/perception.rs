@@ -1763,7 +1763,17 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         let cannot_stop = crate::plan::cannot_stop(me.state.speed, to_line, crate::plan::HARD_BRAKE);
         let in_box_at_turn = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go;
         let clearing = in_box_at_turn && (cannot_stop || light_line - me.state.front <= 0.5);
-        return Some(JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, in_box_at_turn, clearing, way_len });
+        let mut jv = JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, in_box_at_turn, clearing, way_len };
+        // (the room past the junction keeps a box clear - SUMO's junction blocking, a car does not
+        // enter where it would come to rest in a foe's way. A way through that crosses nothing -
+        // no crossing meeting place, walk or convergence, `plan::wait_bands`; only merges, which
+        // the zipper orders - is no box: SUMO applies no keep-clear at such geometry-like nodes
+        // (sumo.md 1.6), and the queue runs on into it behind its lead. viz5 case10: at the
+        // merge-only j41 the heads stood 20-60 s exit-full at the line with 25 m free to their lead)
+        if !jv.exit_room && crate::plan::wait_bands(net, sim, &jv).is_empty() {
+            jv.exit_room = true;
+        }
+        return Some(jv);
     }
     None
 }

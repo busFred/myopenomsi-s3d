@@ -1586,7 +1586,7 @@ fn refused_stop(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView,
 /// meeting places, from a metre before), the pedestrian crossings and the convergences - not the
 /// merges, where the zipper puts the two one behind the other ([J7-2]; a queue stands in a side
 /// merge as in a lane, viz4 case02's twin chains).
-fn wait_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
+pub(crate) fn wait_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
     let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| f.kind != crate::junction::FoeKind::Merge).map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
     bands.extend(walk_bands(net, sim, j));
     bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
@@ -2265,13 +2265,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //     vehicle enters on green and waits at the internal junction (sumo.md 1.2), and at the end
     //     of its green it clears first (`reservation::will_pass`). Held, it waits at the line,
     //     pulled back before a walk there (viz5 case05 #16535 crossed on green into a box its
-    //     people stop lay in and stood 2.8 m in, over the crossing).
+    //     people stop lay in and stood 2.8 m in, over the crossing). A way through that crosses
+    //     nothing - no crossing meeting place, walk or convergence, only merges, which the zipper
+    //     orders - has nothing to keep clear: SUMO applies no keep-clear at such geometry-like
+    //     nodes (sumo.md 1.6), and its queue stands in it as in a lane (viz5 case10: cars
+    //     held at the line of a merge-only join behind a queue standing in it).
     if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
         let line = sig.dist;
-        if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 {
+        let bands = if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 { wait_bands(net, sim, j) } else { Vec::new() };
+        if !bands.is_empty() {
             let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
             let len = me.length();
-            let waiting_place = |r: f32| !wait_bands(net, sim, j).iter().any(|b| b.0 < r && b.1 > r - len - REST_SHORT);
+            let waiting_place = |r: f32| !bands.iter().any(|b| b.0 < r && b.1 > r - len - REST_SHORT);
             let own = out.stop.filter(|&r| !(out.why == Why::Junction && waiting_place(r)));
             let rest = [own, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
             let exit = j.entry + j.way_len;

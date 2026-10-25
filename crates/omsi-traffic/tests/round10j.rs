@@ -197,3 +197,46 @@ fn q91_the_players_standing_clock_after_its_red_starts_after_the_start_reaction(
     let w6 = at(2.0, &mut sim);
     assert!(w6 >= omsi_traffic::plan::QUEUE_OBSTACLE_STAND, "6 s after the green: {w6}");
 }
+
+/// [round 10 H8-5] A lit way through that crosses nothing (a merge-only join: no crossing meeting
+/// place, walk or convergence) has nothing to keep clear - SUMO applies no keep-clear at such
+/// geometry-like nodes - so a car on green follows the queue standing in it as in a lane; with a
+/// walk across the join's exit piece, it is held at its line as before (here by the exit's room).
+#[test]
+fn h85_a_merge_only_join_is_no_box_to_keep_clear() {
+    for walk in [false, true] {
+        let mut net = Network::default();
+        net.lanes.push(road(&[(-300.0, 0.0), (-21.0, 0.0)], 1)); // 0 approach
+        let mut stub = piece(&[(-21.0, 0.0), (-20.0, 0.0)], 0, LaneKind::Street); // 1 lit stub
+        stub.traffic_light = Some((0, 0));
+        net.lanes.push(stub);
+        net.lanes.push(piece(&[(-20.0, 0.0), (0.0, 0.0)], 1, LaneKind::Street)); // 2
+        net.lanes.push(piece(&[(-14.0, -8.0), (0.0, 0.0)], 2, LaneKind::Street)); // 3 merging in
+        net.lanes.push(piece(&[(0.0, 0.0), (30.0, 0.0)], 3, LaneKind::Street)); // 4 exit piece
+        net.lanes.push(road(&[(30.0, 0.0), (300.0, 0.0)], 2)); // 5
+        if walk {
+            net.lanes.push(piece(&[(20.0, -8.0), (20.0, 8.0)], 4, LaneKind::Sidewalk)); // 6
+        }
+        net.link(1.5);
+        net.build_grid();
+        net.compute_conflicts();
+        let ctl = TrafficLightController::new(vec![vec![(6, 1000.0)]], 1000.0);
+        let mut sim = Simulation::new(&net, vec![ctl]);
+        // (a queue standing on the exit piece: its tail at x 10; the car 40 m before the line)
+        let mut q = car(1, 4, 12.0, 0.0);
+        q.external.stop_at = Some(q.state.front + 0.1);
+        let mut cars = vec![q, car(2, 0, 279.0 - 40.0, 8.0)];
+        let mut kept = 0.0f32;
+        run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
+            if cars.iter().any(|c| c.id == 2 && c.last.why == Why::KeepClear) {
+                kept += DT;
+            }
+        });
+        let c = cars.iter().find(|c| c.id == 2).unwrap();
+        if walk {
+            assert!(c.state.lane <= 1 && matches!(c.last.why, Why::KeepClear | Why::ExitFull), "a walk across the exit: held at the line (lane {} s {:.1} why {:?})", c.state.lane, c.state.s, c.last.why);
+        } else {
+            assert!(kept == 0.0 && c.state.lane >= 2, "merge only: kept clear {kept:.1} s, lane {} s {:.1}", c.state.lane, c.state.s);
+        }
+    }
+}
