@@ -2224,11 +2224,6 @@ const PED_DENSITY_CAP: f32 = 0.7;
 /// The narrowest a path counts as for its area (m): one body abreast (2 x BODY_OUTSIDE).
 const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
 
-/// The share of its target density a pavement the player cannot see gets: such a path
-/// only feeds the ones in sight (the user: a pedestrian the player will never see need not be
-/// spawned); each path is walked both ways at random, so half of its walkers walk towards the
-/// paths in sight it joins, the other half away from them, out of the circle.
-const PED_SOURCE_SHARE: f32 = 0.5;
 /// How far the player turns their head (degrees beyond half the field of view): a
 /// pavement within it is in sight for the density (a driver looks out of the side windows).
 const PED_HEAD_TURN: f64 = 90.0;
@@ -2256,6 +2251,104 @@ fn in_sight_reach(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
 /// times the passengers setting): the target scales with the curve, both stop at LOS D's top.
 fn stroll_density(curve: f32) -> (f32, f32) {
     ((PED_DENSITY_TARGET * curve.max(0.0)).min(PED_DENSITY_CAP), PED_DENSITY_CAP)
+}
+
+/// Where strollers are put down and how many each place wants (`stroll_targets`).
+#[derive(Debug, Clone, PartialEq)]
+struct StrollTarget {
+    lane: usize,
+    /// The lane's metres inside the circle.
+    metres: f32,
+    /// The point indices of the lane somebody is put down after (on the segment to the next).
+    ks: Vec<usize>,
+    /// The way they walk it (true: forwards); None: either, at random.
+    toward: Option<bool>,
+    /// The strollers wanted there (walking `toward`, if set).
+    want: f32,
+    /// A source (a pavement out of sight feeding one in sight), not a pavement in sight.
+    source: bool,
+}
+
+/// The strollers each pavement within the circle wants, from the pavement graph. A pavement
+/// in sight (`in_reach` at the middle of its part inside the circle) wants the target
+/// density `rho` over its area. Any other is a source only: it holds the walkers who will
+/// walk into a pavement in sight - those of its walkers heading to a junction it shares with one,
+/// put down where it leaves the sight (its first point from that junction out of `in_reach`),
+/// over the stretch from there to the junction. In the steady state each pavement in
+/// sight at a junction of `deg` pavements sends out the flow q = k v per direction (the
+/// fundamental relation; half its density `rho` walks each way) across its width `w`, spread over
+/// the `deg - 1` pavements on; the sources bring the same flow back, so a source walker's leg
+/// leads into sight within T = d / v of the stretch `d`, and the source holds
+/// q T = rho / 2 * w * d / (deg - 1) per pavement in sight there (the pace cancels). A pavement
+/// that leaves the sight at the junction itself wants nobody (the one in sight is put down on
+/// out of sight there); one that leads into none, nobody either: what the player cannot see
+/// and nobody walks into sight from is not spawned. `candidates`: (lane, metres inside,
+/// point indices inside) as `populate_on_foot_with` finds them; `inside` whether a point lies
+/// in the circle.
+fn stroll_targets(
+    ped: &PedNet,
+    net: &Network,
+    candidates: &[(usize, f32, Vec<usize>)],
+    in_reach: &dyn Fn(DVec3) -> bool,
+    inside: &dyn Fn(DVec3) -> bool,
+    rho: f32,
+) -> Vec<StrollTarget> {
+    let width = |l: usize| net.lanes[l].width.max(PED_PATH_MIN_WIDTH);
+    let seen: Vec<bool> = candidates.iter().map(|(l, _, ks)| in_reach(net.lanes[*l].points[ks[ks.len() / 2]])).collect();
+    // (per junction, the pavements in sight there)
+    let mut seen_at: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (c, (l, _, _)) in candidates.iter().enumerate() {
+        if let (true, Some(&(a, b))) = (seen[c], ped.ends.get(l)) {
+            seen_at.entry(a).or_default().push(*l);
+            if b != a {
+                seen_at.entry(b).or_default().push(*l);
+            }
+        }
+    }
+    let degree = |n: usize| {
+        let mut ls: Vec<usize> = ped.out.get(n).map(|o| o.iter().map(|x| x.0).collect()).unwrap_or_default();
+        ls.sort_unstable();
+        ls.dedup();
+        ls.len()
+    };
+    let mut out = Vec::new();
+    for (c, (l, m, ks)) in candidates.iter().enumerate() {
+        if seen[c] {
+            out.push(StrollTarget { lane: *l, metres: *m, ks: ks.clone(), toward: None, want: rho * m * width(*l), source: false });
+            continue;
+        }
+        let Some(&(a, b)) = ped.ends.get(l) else { continue };
+        let lane = &net.lanes[*l];
+        let last = lane.points.len() - 1;
+        for (node, toward) in [(a, false), (b, true)] {
+            if toward && b == a {
+                continue;
+            }
+            let Some(there) = seen_at.get(&node) else { continue };
+            let deg = degree(node);
+            if deg < 2 {
+                continue;
+            }
+            let feed: f32 = there.iter().filter(|s| **s != *l).map(|&s| width(s)).sum::<f32>() / (deg - 1) as f32;
+            if feed <= 0.0 {
+                continue;
+            }
+            // (from the junction along the lane: its first point out of sight)
+            let order: Vec<usize> = if toward { (0..=last).rev().collect() } else { (0..=last).collect() };
+            let Some(&k) = order.iter().find(|&&k| !in_reach(lane.points[k])) else { continue };
+            if !inside(lane.points[k]) {
+                continue;
+            }
+            let d = if toward { lane.dist[last] - lane.dist[k] } else { lane.dist[k] };
+            if d <= 0.0 {
+                continue;
+            }
+            // (put down on the segment beyond that point, away from the junction)
+            let seg = if toward { k.saturating_sub(1) } else { k.min(last.saturating_sub(1)) };
+            out.push(StrollTarget { lane: *l, metres: *m, ks: vec![seg], toward: Some(toward), want: rho / 2.0 * feed * d, source: true });
+        }
+    }
+    out
 }
 
 /// The median gap (m) for `target` strollers on `pavement_m` metres of pavement
@@ -5828,8 +5921,9 @@ impl Humans {
     ) {
         let center = self.center;
         let radius = STROLL_RADIUS * 0.9;
-        // strollers: as many as the pavements' areas hold at the hour's target density
-        // (`stroll_density`, walkway level of service), never more than the `pedestrians`
+        // strollers: as many as the areas of the pavements in sight hold at the hour's target
+        // density (`stroll_density`, walkway level of service), and on the others only those on
+        // their way into sight (`stroll_targets`), never more than the `pedestrians`
         // setting asks for (an upper bound) nor past the people pool (`ai_max_humans`; OMSI lets
         // at most half of its pool walk, 0x62463c); put down on the paths below their target.
         // The pavements are those that pass within the radius (found
@@ -5881,32 +5975,37 @@ impl Humans {
         // each path's area inside the circle (its metres there times its width, a body
         // abreast at least) and the strollers on it now (by the leg they walk)
         let area = |l: usize, m: f32| m * net.lanes[l].width.max(PED_PATH_MIN_WIDTH);
+        // (the strollers on each path now by the leg they walk, and by the way they walk it)
         let mut on_path: HashMap<usize, usize> = HashMap::new();
+        let mut on_way: HashMap<(usize, bool), usize> = HashMap::new();
         for q in &self.people {
             if let State::Strolling(w) = &q.state {
                 if let Some(leg) = w.legs.get(w.leg) {
                     *on_path.entry(leg.lane).or_default() += 1;
+                    *on_way.entry((leg.lane, leg.b >= leg.a)).or_default() += 1;
                 }
             }
         }
         let (rho, cap) = stroll_density(self.density);
-        // (each path's own target: the full density where the player can see it - in
-        // frame or within a head turn of it, `in_sight_reach` - a source share elsewhere)
+        // (each path's own target: the target density where the player can see it - in
+        // frame or within a head turn of it, `in_sight_reach` - and elsewhere only the walkers
+        // on their way into sight, `stroll_targets`)
         let eye = self.eye;
-        let share = |l: usize, ks: &[usize]| -> f32 {
-            let mid = net.lanes[l].points[ks[ks.len() / 2]];
-            if in_sight_reach(eye, center, mid) {
-                1.0
-            } else {
-                PED_SOURCE_SHARE
-            }
+        let in_reach = |p: DVec3| in_sight_reach(eye, center, p);
+        let in_circle = |p: DVec3| (p - center).truncate().length() < radius;
+        let targets = stroll_targets(ped, net, &candidates, &in_reach, &in_circle, rho);
+        let lacks = |t: &StrollTarget, on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>| {
+            let on = match t.toward {
+                None => on_path.get(&t.lane).copied().unwrap_or(0),
+                Some(fwd) => on_way.get(&(t.lane, fwd)).copied().unwrap_or(0),
+            };
+            (t.want - on as f32).max(0.0)
         };
-        let path_target: Vec<f32> = candidates.iter().map(|(l, m, ks)| area(*l, *m) * rho * share(*l, ks)).collect();
-        let wanted: f32 = path_target.iter().sum();
-        let target = (wanted.round() as usize).min(self.pedestrians);
-        // (never past the pool)
+        let wanted: f32 = targets.iter().map(|t| t.want).sum();
+        // (the setting is an upper bound, and never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
-        let target = target.min((self.max_people + strolling).saturating_sub(self.pool_used()));
+        let limit = self.pedestrians.min((self.max_people + strolling).saturating_sub(self.pool_used()));
+        let target = (wanted.round() as usize).min(limit);
         // (around this player only: whoever walked off behind the bus no longer counts
         // against the people wanted about it)
         let have = self
@@ -5914,33 +6013,33 @@ impl Humans {
             .iter()
             .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
             .count();
+        let deficit: f32 = targets.iter().map(|t| lacks(t, &on_path, &on_way)).sum();
+        let room = limit.saturating_sub(have).min(deficit.ceil() as usize);
         let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-        if have < target && !candidates.is_empty() {
-            // weighted by the metres inside, and by lying ahead of the player: somebody put
-            // down beside or behind a moving bus never gets in front of it, and the street
-            // ahead looked empty until the bus stopped
-            // (by what each path lacks of its target: one at it or over gets nobody)
-            let weights: Vec<f32> = candidates
+        if room > 0 && !targets.is_empty() {
+            // weighted by lying ahead of the player: somebody put down beside or behind a
+            // moving bus never gets in front of it, and the street ahead looked empty until
+            // the bus stopped
+            // (by what each place lacks of its target: one at it or over gets nobody)
+            let weights: Vec<f32> = targets
                 .iter()
-                .zip(&path_target)
-                .map(|((l, _, ks), want)| {
-                    let mid = net.lanes[*l].points[ks[ks.len() / 2]];
+                .map(|t| {
+                    let mid = net.lanes[t.lane].points[t.ks[t.ks.len() / 2]];
                     let lead = ahead
                         .map(|a| ((mid - center).truncate().normalize_or_zero().extend(0.0)).dot(a).max(0.0) as f32)
                         .unwrap_or(0.0);
-                    let lacks = (want - on_path.get(l).copied().unwrap_or(0) as f32).max(0.0);
-                    lacks * (1.0 + 2.0 * lead)
+                    lacks(t, &on_path, &on_way) * (1.0 + 2.0 * lead)
                 })
                 .collect();
             let total: f32 = weights.iter().sum();
             // (12 a second at most, the members of a group counted)
-            let per_second = (target - have).min(12);
-            for _ in 0..((target - have) * 3).min(36) {
+            let per_second = room.min(12);
+            for _ in 0..(room * 3).min(36) {
                 if placed >= per_second || total <= 0.0 {
                     break;
                 }
                 let mut x = self.rand_f() as f32 * total;
-                let mut ci = candidates.len() - 1;
+                let mut ci = targets.len() - 1;
                 for (k, w) in weights.iter().enumerate() {
                     if x < *w {
                         ci = k;
@@ -5948,10 +6047,9 @@ impl Humans {
                     }
                     x -= *w;
                 }
-                let (lane, path_m, ks) = &candidates[ci];
-                let lane = *lane;
+                let (lane, path_m, ks, toward) = (targets[ci].lane, targets[ci].metres, &targets[ci].ks, targets[ci].toward);
                 // (never past LOS D on the path, the group counted as it is put down)
-                let path_cap = (area(lane, *path_m) * cap).floor() as usize;
+                let path_cap = (area(lane, path_m) * cap).floor() as usize;
                 let l = &net.lanes[lane];
                 let k = ks[(self.rand() as usize) % ks.len()];
                 let seg = if k + 1 < l.points.len() { l.dist[k + 1] - l.dist[k] } else { 0.0 };
@@ -5971,7 +6069,9 @@ impl Humans {
                     rej_ground += 1;
                     continue;
                 }
-                let fwd = self.rand_f() < 0.5;
+                // (a source's walkers walk into sight, the others either way)
+                let either = self.rand_f() < 0.5;
+                let fwd = toward.unwrap_or(either);
                 // spaced: not within a log-normal gap of another stroller on
                 // this lane walking the same way
                 let z = self.rand_normal();
@@ -6025,6 +6125,7 @@ impl Humans {
                         self.people[i].activity = Activity::Walk;
                         placed += 1;
                         *on_path.entry(lane).or_default() += 1;
+                        *on_way.entry((lane, fwd)).or_default() += 1;
                         match leader_pace {
                             None => leader_pace = Some(self.people[i].pace),
                             Some(lp) => {
@@ -6040,10 +6141,15 @@ impl Humans {
                 }
             }
         }
-        if debug_pax() && (have < target || placed > 0) {
+        // (and every 30 s with OMSI_PROFILE: the pavement within the circle and what it asks for)
+        let profile_line = omsi_cfg::env::var_os("OMSI_PROFILE").is_some() && (self.time / 30.0).floor() != ((self.time - 1.0) / 30.0).floor();
+        if (debug_pax() && (have < target || placed > 0)) || profile_line {
+            let all_m2: f32 = candidates.iter().map(|(l, m, _)| area(*l, *m)).sum();
+            let seen_m2: f32 = targets.iter().filter(|t| !t.source).map(|t| area(t.lane, t.metres)).sum();
+            let sources: f32 = targets.iter().filter(|t| t.source).map(|t| t.want).sum();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2 on {:.0} m2 of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
-                self.time, self.pedestrians, self.density, candidates.iter().map(|(l, m, _)| area(*l, *m)).sum::<f32>(), metres, candidates.len()
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
+                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count()
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -11044,6 +11150,49 @@ mod ped_tests {
     }
 
     #[test]
+    fn p3c_a_pavement_out_of_sight_holds_only_the_walkers_on_their_way_into_sight() {
+        // a T at the origin: A from the west (x -100..0), B to the east, C to the south, all
+        // 2.5 m wide, points every 10 m; a path D far off, E on from A's west end; the player
+        // sees x > -30
+        let mut net = Network::default();
+        let line = |a: (f64, f64), b: (f64, f64)| (0..=10).map(|k| p(a.0 + (b.0 - a.0) * k as f64 / 10.0, a.1 + (b.1 - a.1) * k as f64 / 10.0)).collect::<Vec<_>>();
+        net.lanes.push(lane(line((-100.0, 0.0), (0.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((0.0, 0.0), (100.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((0.0, 0.0), (0.0, -100.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((-100.0, 300.0), (0.0, 300.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((-200.0, 0.0), (-100.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let all: Vec<(usize, f32, Vec<usize>)> = (0..5).map(|l| (l, 100.0, (0..=10).collect())).collect();
+        let in_reach = |q: DVec3| q.x > -30.0 && q.y < 200.0;
+        let rho = 0.3;
+        let t = stroll_targets(&ped, &net, &all, &in_reach, &|_| true, rho);
+        // B and C in sight: their area at the target density, either way
+        for l in [1, 2] {
+            let x = t.iter().find(|x| x.lane == l).unwrap();
+            assert!(!x.source && x.toward.is_none() && (x.want - rho * 250.0).abs() < 1e-3, "{x:?}");
+        }
+        // A: only a source, its walkers heading east into sight, put down 30 m out (where it
+        // leaves the sight), as many as walk that stretch at the flow B and C send out
+        // west: rho/2 x (2.5 + 2.5)/(3 - 1) x 30 m
+        let a: Vec<_> = t.iter().filter(|x| x.lane == 0).collect();
+        assert_eq!(a.len(), 1);
+        assert!(a[0].source && a[0].toward == Some(true) && a[0].ks == vec![6], "{:?}", a[0]);
+        assert!((a[0].want - rho / 2.0 * 2.5 * 30.0).abs() < 1e-3, "{:?}", a[0]);
+        // far less than the half density over its area the free share gave it
+        assert!(a[0].want < 0.5 * rho * 250.0 / 2.0);
+        // D (seen by nobody, joined to nothing in sight) and E (on from A, out of sight): nobody
+        assert!(t.iter().all(|x| x.lane != 3 && x.lane != 4), "{t:?}");
+        // the junction itself out of sight: A has nothing to feed from (B is put down on out of
+        // sight there)
+        let t = stroll_targets(&ped, &net, &all, &|q: DVec3| q.x > 30.0, &|_| true, rho);
+        assert!(t.iter().all(|x| x.lane == 1), "{t:?}");
+        // a source point outside the circle: none
+        let t = stroll_targets(&ped, &net, &all, &in_reach, &|q: DVec3| q.x > -25.0, rho);
+        assert!(t.iter().all(|x| !x.source), "{t:?}");
+    }
+
+    #[test]
     fn p3b_pavements_in_frame_or_a_head_turn_away_are_in_sight_those_behind_are_not() {
         let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
         let at = |deg: f64, d: f64| DVec3::new(d * deg.to_radians().sin(), d * deg.to_radians().cos(), 0.0);
@@ -11051,7 +11200,6 @@ mod ped_tests {
         assert!(in_sight_reach(Some(e), DVec3::ZERO, at(110.0, 50.0)), "beside, a head turn away");
         assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(170.0, 50.0)), "behind");
         assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(0.0, PEOPLE_SIGHT + 10.0)), "beyond sight");
-        assert!(PED_SOURCE_SHARE > 0.0 && PED_SOURCE_SHARE < 1.0);
     }
 
     #[test]
