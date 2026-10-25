@@ -162,9 +162,7 @@ impl Junctions {
     /// (`Network::compile_joins`) or lane crossing outside the objects
     /// (`Network::compile_lane_crossings`, `Crossing::outside`) whose two lanes are not of one
     /// object: a spline lane joining or crossing an object's way goes into that object as one
-    /// of its movements (a join also when the lane it runs into is the object's), and spline lanes
-    /// alone make a junction of their own (`JOIN_TILE`), crossings whose boxes lie closer along a
-    /// way than the longest body one junction, so
+    /// of its movements, and spline lanes alone make a junction of their own (`JOIN_TILE`), so
     /// that every such meeting place is in one junction table (`foe_between`). The swept path
     /// of an object's piece over a lane leading into it (`Network::compile_swept`) groups
     /// nothing: that lane stays an approach, where the queue stands. Junctions keep their index (a new
@@ -224,14 +222,10 @@ impl Junctions {
                 if !c.merge && !c.outside {
                     continue;
                 }
-                // (a join runs into its way on: an object there takes it in; a crossing runs into
-                // nothing - its lanes go on past it)
-                if c.merge {
-                    let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
-                    let ways_on: Vec<usize> = if shared.is_empty() { net.lanes[a].next.iter().chain(&net.lanes[b].next).copied().collect() } else { shared };
-                    for n in ways_on {
-                        into.push((a, n));
-                    }
+                let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
+                let ways_on: Vec<usize> = if shared.is_empty() { net.lanes[a].next.iter().chain(&net.lanes[b].next).copied().collect() } else { shared };
+                for n in ways_on {
+                    into.push((a, n));
                 }
                 parent.entry(a).or_insert(a);
                 parent.entry(b).or_insert(b);
@@ -239,44 +233,6 @@ impl Junctions {
                 if ra != rb {
                     parent.insert(ra.max(rb), ra.min(rb));
                 }
-            }
-        }
-        // crossings outside the objects whose boxes lie closer along a way than the longest body
-        // (`SWEPT_BUS_LENGTH`, the stock bus) are one junction: there is nowhere to stand between
-        // them, and a car waits before the first or clears both (SUMO: one node; the space
-        // between two links is the room checked before entering, `checkRewindLinkLanes`).
-        // Along a lane with such a crossing to the next lane with one, through at most one lane
-        // between: the room from the last place on the first to the first place on the last.
-        let outside = |l: usize| net.crossings.get(l).is_some_and(|v| v.iter().any(|c| c.outside));
-        let last_end = |l: usize| net.crossings[l].iter().map(|c| c.at + c.after).fold(0.0f32, f32::max).min(net.lanes[l].length());
-        let first_start = |l: usize| net.crossings[l].iter().map(|c| c.at - c.before).fold(f32::INFINITY, f32::min).max(0.0);
-        let mut touching: Vec<(usize, usize)> = Vec::new();
-        for a in (0..net.lanes.len().min(net.crossings.len())).filter(|&a| object(a).is_none() && outside(a)) {
-            let room_a = net.lanes[a].length() - last_end(a);
-            for &n in &net.lanes[a].next {
-                if object(n).is_some() {
-                    continue;
-                }
-                if outside(n) {
-                    if room_a + first_start(n) < omsi_sim::traffic::SWEPT_BUS_LENGTH {
-                        touching.push((a, n));
-                    }
-                    continue;
-                }
-                let via = room_a + net.lanes[n].length();
-                for &m in &net.lanes[n].next {
-                    if object(m).is_none() && outside(m) && via + first_start(m) < omsi_sim::traffic::SWEPT_BUS_LENGTH {
-                        touching.push((a, m));
-                    }
-                }
-            }
-        }
-        for (a, b) in touching {
-            parent.entry(a).or_insert(a);
-            parent.entry(b).or_insert(b);
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                parent.insert(ra.max(rb), ra.min(rb));
             }
         }
         let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
@@ -862,30 +818,6 @@ mod tests {
         assert_eq!(yields.len(), 9);
         // the southbound road comes from the eastbound one's left: the eastbound goes first
         assert!(yields.iter().all(|&y| !y), "{yields:?}");
-    }
-
-    /// Two crossings outside the objects with nowhere to stand between them along a way (viz case01:
-    /// AndingR's two carriageways 723743 and 723744, 0.3 m apart, were two tables and a car entered
-    /// the first seeing the second's foes only past it) are one junction; a second crossing a
-    /// bus length and more further on is a junction of its own.
-    #[test]
-    fn crossings_closer_than_a_body_are_one_junction() {
-        let build = |second: f64| {
-            let mut net = Network::default();
-            net.lanes.push(road((-60.0, 0.0), (0.0, 0.0), 1)); // 0: eastbound, then
-            net.lanes.push(road((0.0, 0.0), (80.0, 0.0), 2)); // 1: its way on
-            net.lanes.push(road((-4.0, -30.0), (-4.0, 30.0), 3)); // 2: across 0 near its end
-            net.lanes.push(road((second, -30.0), (second, 30.0), 4)); // 3: across 1
-            net.link(1.5);
-            net.compute_conflicts();
-            Junctions::compile(&net)
-        };
-        let js = build(4.0);
-        assert_eq!(js.nodes.len(), 1);
-        assert_eq!(js.of_lane[&0].0, js.of_lane[&1].0);
-        let js = build(40.0);
-        assert_eq!(js.nodes.len(), 2);
-        assert_ne!(js.of_lane[&0].0, js.of_lane[&1].0);
     }
 
     /// A long spline lane that starts heading against the other road and bends to cross it at a
