@@ -1267,7 +1267,10 @@ impl Simulation {
                     // (people or a zebra in front of it, or a lead that stands too: nothing that
                     // lets it go on a schedule, as a light or a lead moving off does)
                     // in the box when its light turned: it clears it (rule F)
-                    clearing: j.clearing && !light_red,
+                    // (clearing is committed and moving through: one its junction refused last frame
+                    // waits at its stop and clears nothing - two such inside one object, each
+                    // "clearing" towards the other, waited for each other, x10 case06 #10810/#10932)
+                    clearing: j.clearing && !light_red && !v.refused_last,
                     in_box_at_turn: j.in_box_at_turn && !light_red,
                     stuck: v.is_held()
                         && match v.last.why {
