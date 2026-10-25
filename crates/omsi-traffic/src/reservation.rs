@@ -1272,6 +1272,23 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                         }
                     }
                 }
+                // two both inside the meeting place, each in the other's way: one goes first, the
+                // other waits for it - the one the table gives the right of way, between equals (or
+                // a pair that yields both ways) the one further along, less of its stretch left to
+                // clear (SUMO's link leader of two on the junction, MSLink::getLeaderInfo), a tie
+                // the lower index. Without it each let the other out first and both stood (an
+                // opposing left-turner standing in the box at the end of its green, x10 case06
+                // #10810/#10932: eased four times, 120 s). Inside both is geometry, the same from
+                // either side, so exactly one of the two goes.
+                let me_inside = c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
+                if me_inside && their_inside && !o.absolute && !c.absolute {
+                    let they_yield = node.movements[foe.movement].foes.iter().any(|f| f.movement == my_piece && f.yields);
+                    let (my_left, their_left) = (foe.mine.1 - (c.s - c.rear), foe.theirs.1 - (o.s - o.rear));
+                    let i_lead = if foe.yields != they_yield { they_yield } else { my_left < their_left || (my_left == their_left && c.vehicle < o.vehicle) };
+                    if i_lead {
+                        continue;
+                    }
+                }
                 if theirs_first && !take_anyway {
                     // the right of way is theirs, and the time test found neither me out before
                     // they come nor them out before I come ([J7-1]: round 4's `merge_window`, a
@@ -2530,6 +2547,32 @@ mod tests {
         foe.next_wait = s0 + 3.0;
         let g = resolve(&js, &[me, foe]);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "it cannot wait short of it: {g:?}");
+    }
+
+    /// [round 10 D7 rule 3] Two standing inside one meeting place, each in the other's way (two
+    /// opposing left-turners in the box, clearing, or held there): exactly one goes first - the
+    /// one the table gives the right of way, else the one further along - and the other waits for
+    /// it; never a mutual wait for the ease to break.
+    #[test]
+    fn d7_two_inside_one_meeting_place_never_wait_for_each_other() {
+        for (main, side) in [(192.0f32, 64.0f32), (128.0, 128.0)] {
+            let (_, js) = four_way(main, side);
+            let (a, b) = (js.nodes[0].movement_of(0).unwrap(), js.nodes[0].movement_of(1).unwrap());
+            let fa = *js.nodes[0].movements[a].foes.iter().find(|f| f.movement == b).unwrap();
+            let fb = *js.nodes[0].movements[b].foes.iter().find(|f| f.movement == a).unwrap();
+            for (da, db) in [(0.5f32, 0.5f32), (0.5, 1.5), (1.5, 0.5)] {
+                // (fronts `da`/`db` m into their stretches, standing, both clearing)
+                let mut x = claim(1, a, fa.mine.0 + da - 2.0, 0.0);
+                let mut y = claim(2, b, fb.mine.0 + db - 2.0, 0.0);
+                x.clearing = true;
+                y.clearing = true;
+                let g = resolve(&js, &[x, y]);
+                let goes = [grant_of(&g, 1).go, grant_of(&g, 2).go];
+                assert_eq!(goes.iter().filter(|&&v| v).count(), 1, "{main}/{side} {da}/{db}: {g:?}");
+                let waiter = if goes[0] { 2 } else { 1 };
+                assert_eq!(grant_of(&g, waiter).wait_for, Some(3 - waiter), "{g:?}");
+            }
+        }
     }
 
     /// [J7-2] The queue-entry case: the foe ahead stands at the join (in its stretch): the
