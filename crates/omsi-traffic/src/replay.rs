@@ -39,7 +39,7 @@ const IN_SYNC: f32 = 0.01;
 /// A spawn is put off when a vehicle is this close ahead on its lane (m, bumper to bumper).
 const SPAWN_GAP: f32 = 6.0;
 
-/// [round 7 R7-1 fix 1] A vehicle the population took off (`Replay::removals`).
+/// A vehicle the population took off (`Replay::removals`).
 #[derive(Debug, Clone, Copy)]
 pub struct Removal {
     pub time: f64,
@@ -83,7 +83,7 @@ pub struct Replay {
     /// network end takes vehicles off. Of the frame's inputs the players and the people
     /// apply as recorded; the light clocks run on with the run's own demand after the first
     /// frame, and the game's stops and lateral ramps are laid from the run's own vehicles
-    /// ([round 7 E2], `free_inputs`). (The people are the game's: they walk by the game's
+    /// (`free_inputs`). (The people are the game's: they walk by the game's
     /// light phases while the run's vehicles see the run's own clocks - a pedestrian may
     /// cross on a phase the run's light no longer shows.) This is how a rule change is tried: what the recording
     /// does differently with it is not undone by the next keyframe.
@@ -108,21 +108,21 @@ pub struct Replay {
     /// The vehicles the run's own network end took off (`Simulation::removed`): (time, id,
     /// speed, place). Appended frame by frame; a caller may drain it.
     pub ended: Vec<(f64, u64, f32, glam::DVec3)>,
-    /// [round 7 R7-1 fix 1] The population's removals: replaying as recorded, the game's
+    /// The population's removals: replaying as recorded, the game's
     /// (`Record::Remove` with the rule it wrote); in a free run, the run's own by the game's
     /// in-view rule (`removal::goes_in_view`, the eye at the player). Appended frame by
     /// frame; a caller may drain it.
     pub removals: Vec<Removal>,
-    /// [round 7 E2] Free run: the light clocks were taken from the recording (the first
+    /// Free run: the light clocks were taken from the recording (the first
     /// frame after the starting keyframe); from then on they run on with the run's own
     /// demand (`Simulation::update_lights`).
     clocks_taken: bool,
-    /// [round 7 E2] Free run, per vehicle: the stop the game's bus service last asked for,
+    /// Free run, per vehicle: the stop the game's bus service last asked for,
     /// (its distance as recorded, the run's odometer reading at it) - see `free_inputs`.
     free_stops: HashMap<u64, (f32, f32)>,
-    /// [round 7 E2] Free run, per vehicle: the lateral ramp the game had last (`Steer`).
+    /// Free run, per vehicle: the lateral ramp the game had last (`Steer`).
     free_ramps: HashMap<u64, (f32, f32, f32, f32)>,
-    /// [fix pass 3, 10] Free run: where the game had each vehicle at the last keyframe (lane,
+    /// Free run: where the game had each vehicle at the last keyframe (lane,
     /// s), for the first frame after it: a stop the game asks for then is laid at its route
     /// place, found from there (`free_inputs`).
     game_at: HashMap<u64, (usize, f32)>,
@@ -131,7 +131,7 @@ pub struct Replay {
     start_net: Option<(Network, Junctions)>,
 }
 
-/// [round 7 E2] A recorded stop distance (`External::stop_at`) growing by more than this (m)
+/// A recorded stop distance (`External::stop_at`) growing by more than this (m)
 /// from one frame to the next is a new stop: the game's bus approaching one sees it shrink by
 /// its travel, at most 0.6 m a frame (18 m/s at 30 frames a second), and a stop it serves
 /// stays put; a jump up of a metre is the next stop (`bus_service::step` hands it on).
@@ -171,8 +171,8 @@ impl Replay {
 
     pub fn new(header: Header, mut records: Vec<Record>, skipped: Vec<(usize, String)>, truncated: bool) -> Replay {
         let waiting_of_old = |v: &Vehicle| if v.last.why == crate::plan::Why::Light || (v.serves_stops() && v.external.at_stop) { 0.0 } else { v.stopped };
-        // ([fix pass 2, 5] a driver field a record lacked: its class's preset)
-        // ([round 8 Q8 fill] a recording before format 4 has no `Vehicle::waiting`, SUMO's
+        // (a driver field a record lacked: its class's preset)
+        // (a recording before format 4 has no `Vehicle::waiting`, SUMO's
         // waiting time: it is the time standing, `stopped`, but where the recorded decision is a red
         // light or a timetable bus at its own stop - which pause the clock (`give_up_clock`) -
         // where it is 0; read as 0, SUMO's impatience restarted at every window's start)
@@ -359,7 +359,7 @@ impl Replay {
                         // has it is the game's)
                         Some(i) if !in_step(&self.vehicles[i], &v) => take_way(&mut self.vehicles[i], &v, &self.net),
                         Some(i) => {
-                            // ([round 8 Q8 fill] a recording before format 4 has no waiting time:
+                            // (a recording before format 4 has no waiting time:
                             // the replay's own runs on)
                             let mut v = v;
                             if self.header.version < 4 {
@@ -426,7 +426,7 @@ impl Replay {
         }
     }
 
-    /// [round 7 E2] Free run: the game's inputs of a frame on the run's own vehicles, which
+    /// Free run: the game's inputs of a frame on the run's own vehicles, which
     /// are not where the game's were. The flags and the bay (`External` but `stop_at`) and
     /// the indicator and lateral target (`Steer`) as recorded (`free_ramps`: the game's last
     /// ramp); a stop distance is the game
@@ -442,11 +442,10 @@ impl Replay {
             let mut e = ext.get(&v.id).copied().unwrap_or_default();
             if let Some(d) = e.stop_at {
                 let odo = v.state.odometer;
-                // ([fix pass 3, 10] at the frame after a keyframe, where the game had the
-                // vehicle is known: the stop is laid at its route place, `d` on from there along
-                // the route, whatever the run's vehicle's own place - laid from the run's
-                // odometer instead, x10 case11's bus #18542 ahead of the game ran off its
-                // lane's end with its stop 76 m on)
+                // (at the frame after a keyframe, where the game had the vehicle is known:
+                // the stop is laid at its route place, `d` on from there along the route,
+                // whatever the run's vehicle's own place - laid from the run's odometer
+                // instead, a bus ahead of the game's would run off its lane's end)
                 let placed = game_at.get(&v.id).and_then(|&(lane, s)| route_place(net, &v.state, lane, s, d)).map(|ahead| odo + ahead);
                 let at = match (placed, free_stops.get(&v.id)) {
                     (Some(at), _) => at,
@@ -474,7 +473,7 @@ impl Replay {
         *free_stops = stops;
     }
 
-    /// [round 7 E3] A recording from before the lit stubs: its vehicles planned their ways on
+    /// A recording from before the lit stubs: its vehicles planned their ways on
     /// the network as the game linked it, and the ways round the lit stubs take the stubs
     /// (`AiState::route_through_stubs`) - once, as a vehicle comes from the recording
     /// (keyframe, spawn, changed way) and when the network grows, not every frame: a
@@ -541,7 +540,7 @@ impl Replay {
         sim.time_scale = f.time_scale;
         sim.players.clone_from(&f.players);
         sim.people = f.people.iter().map(|p| p.person()).collect();
-        // [round5 C1] the walkers as `Humans::strollers()` lists them now, rebuilt from the
+        // the walkers as `Humans::strollers()` lists them now, rebuilt from the
         // people records (their footpath leg; not a kerb waiter on a red light): the recorded
         // list is the game's at recording time, so a change of that rule showed in no replay
         // (a recording without the legs keeps its own list)
@@ -581,8 +580,8 @@ impl Replay {
                 }
             }
         }
-        // ([round 7 E2] a free run takes the clocks once and runs them on itself: the demand
-        // phases follow its own vehicles, not the game's)
+        // (a free run takes the clocks once and runs them on itself: the demand phases follow
+        // its own vehicles, not the game's)
         if !self.free_run || !self.clocks_taken {
             for (c, (time, held, _)) in sim.lights.iter_mut().zip(&f.light_clocks) {
                 c.time = *time;
@@ -598,7 +597,7 @@ impl Replay {
                 self.ended.push((sim.time, v.id, v.state.speed, v.pos));
             }
         }
-        // [round 7 R7-1 fix 1] a free run takes off, as the game does, a car that gave up and
+        // a free run takes off, as the game does, a car that gave up and
         // goes in view by the game's rule (the eye: the player, the recording has no camera;
         // out of sight the game takes it off earlier, which a run cannot tell)
         if self.free_run {
@@ -675,7 +674,7 @@ fn in_step(o: &Vehicle, rec: &Vehicle) -> bool {
     o.state.lane == rec.state.lane && (o.state.s - rec.state.s).abs() <= IN_SYNC
 }
 
-/// [fix pass 3, 10] How far along `st`'s route (m from its origin) lies the place `d` metres
+/// How far along `st`'s route (m from its origin) lies the place `d` metres
 /// on from (`lane`, `s`) along the same route - the route place the game's stop distance
 /// names, counted from where the game had the vehicle; None off the route.
 fn route_place(net: &Network, st: &omsi_sim::traffic::AiState, lane: usize, s: f32, d: f32) -> Option<f32> {
@@ -691,7 +690,7 @@ fn route_place(net: &Network, st: &omsi_sim::traffic::AiState, lane: usize, s: f
 
 /// A free run's vehicle `o` gets the way the game changed (`rec`): the route and where in it
 /// the vehicle is, its class, driver, size and external inputs. It stays where it is: its
-/// place, speed, odometer and lane changes in progress; [round 7 E2] a new route is planned
+/// place, speed, odometer and lane changes in progress; a new route is planned
 /// afresh from where it is, as the game's `set_route` does (bus_service.rs), not along the
 /// lanes the old one had planned.
 fn take_way(o: &mut Vehicle, rec: &Vehicle, net: &Network) {
@@ -726,7 +725,7 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle, net: &Network) {
 
 /// Why the recording was made under other rules than the current ones ([`rules_hash`]), if
 /// it was: another hash, or a format before 4, which names its rules only by the frozen
-/// switch list (`record::RULES`, unchanged since round 4 while the rules changed). Such a
+/// switch list (`record::RULES`, frozen while the rules changed). Such a
 /// recording does not replay bit-exactly.
 pub fn other_rules(h: &Header) -> Option<String> {
     let now = rules_hash();
