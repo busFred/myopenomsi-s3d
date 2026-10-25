@@ -571,7 +571,6 @@ pub(crate) fn run_offscreen(
                 humans_off.as_ref(),
                 player.as_ref(),
                 &renderer.options,
-                streamer.as_ref().map(|s| s.view_radius()),
             );
             // the tiles round the eye and the bus, as the window streams them
             if let Some(st) = streamer.as_mut() {

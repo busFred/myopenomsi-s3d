@@ -478,11 +478,8 @@ pub struct Viewer {
     /// (radians): the camera's, or a triple screen's centre panel's when narrower (0: `fov`).
     pub horizon_fov: f64,
     /// [round 9 A2 fix pass 1] The vehicles' lamps are lit (`Viewer::with_lamps`): no two-pixel
-    /// horizon, only the draw distance.
+    /// horizon, only the draw distance (`max_dist`).
     pub lamps_lit: bool,
-    /// The draw distance (m): the view distance the tiles are loaded to; nothing farther is in
-    /// the picture (0: not known; `Viewer::with_draw_distance`).
-    pub draw_dist: f64,
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
@@ -545,14 +542,7 @@ impl Viewer {
             px_height: 0.0,
             horizon_fov: 0.0,
             lamps_lit: false,
-            draw_dist: 0.0,
         }
-    }
-
-    /// The draw distance (m, the view distance): the horizon never lies beyond it.
-    pub fn with_draw_distance(mut self, dist: Option<f64>) -> Viewer {
-        self.draw_dist = dist.unwrap_or(0.0);
-        self
     }
 
     /// [round 9 A2] The picture's height in pixels (the window's, or the offscreen image's),
@@ -576,8 +566,8 @@ impl Viewer {
     /// distance and the draw distance. Farther than the two-pixel distance the body covers fewer
     /// than `DOT_PIXELS` rows of this picture (`px_height / (2 tan(fov/2))` pixels per unit of the
     /// image plane, the vertical field of view `horizon_fov`) and is a dot the player cannot tell
-    /// from nothing; farther than the draw distance (`draw_dist`, the view distance; the
-    /// renderer's `max_dist` when nearer) nothing is drawn at all. One measure for every use:
+    /// from nothing; farther than the draw distance (`max_dist`, the renderer's object distance:
+    /// `max_obj_dist`, the view distance when that is `auto`) no vehicle is drawn at all. One measure for every use:
     /// beyond it a random car may be woken in frame (`Traffic::may_appear_car`), a car reaching
     /// the loaded tiles' edge ends its trip there in frame (`omsi_traffic::removal::goes_far`), an
     /// edge is out of sight (`Traffic::mark_edges_in_sight`) and the tiles are prefetched past it
@@ -593,7 +583,11 @@ impl Viewer {
             let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
             height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
         };
-        [self.draw_dist, self.max_dist].into_iter().filter(|d| *d > 0.0).fold(two_pixels, f64::min)
+        if self.max_dist > 0.0 {
+            two_pixels.min(self.max_dist)
+        } else {
+            two_pixels
+        }
     }
 
     /// [round 9 A2] Is a body `height` (m) high, `dist` (m) from the eye, beyond its horizon -
@@ -2121,7 +2115,6 @@ impl Traffic {
                     px_height: 0.0,
                     horizon_fov: 0.0,
                     lamps_lit: false,
-                    draw_dist: 0.0,
                 });
             }
         }
@@ -5298,7 +5291,8 @@ fn edge_bound_of(net: &Network) -> hashbrown::HashSet<usize> {
 
 /// The horizon `prefetch_target` keeps the edge beyond: a body `height` high with its lamps dark
 /// (a lit lamp has no two-pixel distance), capped by the draw distance as every horizon is (so
-/// the reach is at most the view distance plus one tile load), never within `NEAR_HIDE` (as
+/// the reach is at most the renderer's object distance plus one tile load; with `max_obj_dist`
+/// auto, the view distance), never within `NEAR_HIDE` (as
 /// `Viewer::beyond_horizon`: the far trip end acts beyond both).
 fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
     Viewer { lamps_lit: false, ..viewer }.horizon(height).max(NEAR_HIDE)
@@ -5950,7 +5944,7 @@ mod respawn_sight_tests {
 
     /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
     fn viewer() -> Viewer {
-        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, draw_dist: 0.0 }
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }
     }
 
     /// [ROLLBACK r4d-B2] A bus is taken off the road by the rule it comes back by: never
@@ -6042,7 +6036,7 @@ mod prefetch_tests {
     /// the dark horizon (no area reaches a lamp's), a tiny one NEAR_HIDE, a bus twice the car's.
     #[test]
     fn the_reach_is_the_horizon_plus_one_load_at_the_road_speed() {
-        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, draw_dist: 0.0 }.with_screen(900, None);
+        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }.with_screen(900, None);
         let h = edge_horizon(v, CAR_HEIGHT);
         assert!((h - 584.6).abs() < 0.5, "{h}");
         assert_eq!(edge_horizon(v.with_lamps(true), CAR_HEIGHT), h, "lit lamps: the dark horizon");
@@ -6053,14 +6047,15 @@ mod prefetch_tests {
         assert_eq!(prefetch_target(h, 0.0, 3.0), h, "standing: the horizon");
         assert_eq!(prefetch_target(h, -5.0, 1.0), h, "no negative speed");
         assert_eq!(prefetch_target(h, 10.0, 0.0), h, "no load measured yet");
-        // the horizon is the nearer of the two-pixel distance and the draw distance: at a view
-        // distance of 600 m a 4.4 m double-decker's (1715 m) is 600 m and the reach 600 m plus one
-        // load; at 2500 m it is the two-pixel distance
-        let low = v.with_draw_distance(Some(600.0));
+        // the horizon is the nearer of the two-pixel distance and the draw distance (the renderer's
+        // object distance; the Low preset's view distance 600 m with `max_obj_dist` auto): a 4.4 m
+        // double-decker's (1715 m) is 600 m there and the reach 600 m plus one load; at 2500 m it
+        // is the two-pixel distance
+        let low = v.with_culling(0.0, 600.0);
         assert_eq!(edge_horizon(low, 4.4), 600.0);
         assert_eq!(low.with_lamps(true).horizon(CAR_HEIGHT), 600.0, "lit lamps: the draw distance");
         assert!((prefetch_target(edge_horizon(low, 4.4), 50.0 / 3.6, 1.2) - 616.67).abs() < 0.01);
-        let far = v.with_draw_distance(Some(2500.0));
+        let far = v.with_culling(0.0, 2500.0);
         assert!((edge_horizon(far, 4.4) - 4.4 / CAR_HEIGHT * h).abs() < 1e-6, "{}", edge_horizon(far, 4.4));
         assert!(far.with_lamps(true).horizon(CAR_HEIGHT) == 2500.0);
     }
