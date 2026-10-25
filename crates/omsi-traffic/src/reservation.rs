@@ -918,8 +918,13 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     // place stuck (people, a standing lead: it is not coming while that holds), nor while it
     // stands outside it waiting for me through its lead or the junction's answer (`held_by`:
     // it is not coming before I go) - both made rings of mutual waits
+    // (refused this pass, standing outside this meeting place: it stays where it stands this frame,
+    // `refused` below - in the box at the end of its green but waiting for a third, it is no car
+    // clearing the box: viz3 case21 #59961 on its fresh green waited 45 s for #59951, itself
+    // refused for a queue 32 m on)
+    let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go);
     let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
-    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o))) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
+    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
         o.committed = true;
     }
     // in the box at the end of my green, a foe on the fresh green across my way that is neither
@@ -992,7 +997,7 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     // decided yet counts (its answer may be a go); a player's claim always counts (its grant is
     // not read); so does one blocked by what lets it go on a schedule (a lead moving off): its
     // refusal may be its block's (a blocked claimant drops nobody), the time test decides
-    if !their_inside && !o.committed && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go) {
+    if refused_here && !o.committed {
         return Pass::Not("refused");
     }
     // (one held by something that lets it go on a schedule, a light or a lead moving off, counts
