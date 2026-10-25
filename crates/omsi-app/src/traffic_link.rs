@@ -87,6 +87,8 @@ pub(crate) fn traffic_inputs(
                 .with_extent(extent)
                 .with_culling(render.min_obj_size, render.max_obj_dist),
         );
+        // which loaded edges A4 routes away from follows the eye and its horizon
+        t.mark_edges_in_sight();
     }
     t.weekday = clock.weekday();
     t.walkers = humans.map(|h| h.strollers()).unwrap_or_default();

@@ -817,8 +817,11 @@ pub struct Traffic {
     /// log line).
     appeared_far: usize,
     removed_far: usize,
-    /// [round 9 A4] The lanes whose road ends at the loaded tiles' edge (`mark_loaded_edges`).
+    /// [round 9 A4] The lanes whose road ends at a loaded tiles' edge in sight
+    /// (`mark_loaded_edges`, `mark_edges_in_sight`).
     edge_bound: hashbrown::HashSet<usize>,
+    /// [round 10 S4] The lanes with `loaded_edge` (`mark_loaded_edges`).
+    edge_lanes: Vec<usize>,
     /// Cars placed since the last look inside the view frustum (hidden behind something):
     /// (id, position). `OMSI_POPULATION_SHOTS` photographs them to check.
     pub framed_spawns: Vec<(u64, DVec3)>,
@@ -1521,6 +1524,7 @@ impl Traffic {
             appeared_far: 0,
             removed_far: 0,
             edge_bound: Default::default(),
+            edge_lanes: Vec::new(),
             framed_spawns: Vec::new(),
             player: None,
             player_priority: false,
@@ -5246,6 +5250,34 @@ pub fn prefetch_target(horizon: f64, road_speed: f64, load_secs: f64) -> f64 {
     horizon + road_speed.max(0.0) * load_secs.max(0.0)
 }
 
+/// [round 10 S4] Is a loaded-edge lane ending at `end` in sight of the eye at `eye`: within the
+/// perceptual `horizon` (m, straight from the eye, as the horizon is reckoned).
+fn edge_in_sight(end: DVec3, eye: DVec3, horizon: f64) -> bool {
+    (end - eye).length() <= horizon
+}
+
+/// [round 9 A4 fix pass 2] The lanes whose every way on ends at a loaded edge in sight within
+/// EDGE_LOOKAHEAD (`Network::ends_at_loaded_edge`, gathered back from the edges once rather than
+/// walked forward for every spawn place): no car is put down or woken there.
+fn edge_bound_of(net: &Network) -> hashbrown::HashSet<usize> {
+    let mut bound: hashbrown::HashMap<usize, f64> = net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge && l.edge_in_sight && l.next.is_empty()).map(|(i, _)| (i, 0.0)).collect();
+    let mut work: Vec<usize> = bound.keys().copied().collect();
+    while let Some(m) = work.pop() {
+        for &p in net.prev.get(m).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if bound.contains_key(&p) {
+                continue;
+            }
+            let lp = &net.lanes[p];
+            let far = lp.next.iter().map(|n| bound.get(n).map(|d| d + net.lanes[*n].length() as f64)).collect::<Option<Vec<f64>>>();
+            if let Some(d) = far.and_then(|v| v.into_iter().reduce(f64::max)).filter(|d| *d <= omsi_sim::traffic::EDGE_LOOKAHEAD) {
+                bound.insert(p, d);
+                work.push(p);
+            }
+        }
+    }
+    bound.into_keys().collect()
+}
+
 /// The horizon `prefetch_target` keeps the edge beyond: a body `height` high with its lamps dark
 /// (lit lamps have no horizon and no loaded area reaches that far), never within `NEAR_HIDE`
 /// (as `Viewer::beyond_horizon`: the far trip end acts beyond both).
@@ -5283,26 +5315,36 @@ impl Traffic {
                 loaded_edge_at(probe, ts, &|k| world.has_tile(k), &self.lane_tiles)
             };
         }
-        // [round 9 A4 fix pass 2] the lanes whose every way on ends at an edge within
-        // EDGE_LOOKAHEAD (`Network::ends_at_loaded_edge`, gathered back from the edges once here
-        // rather than walked forward for every spawn place): no car is put down or woken there
-        let net = &self.net;
-        let mut bound: hashbrown::HashMap<usize, f64> = net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge && l.next.is_empty()).map(|(i, _)| (i, 0.0)).collect();
-        let mut work: Vec<usize> = bound.keys().copied().collect();
-        while let Some(m) = work.pop() {
-            for &p in net.prev.get(m).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if bound.contains_key(&p) {
-                    continue;
-                }
-                let lp = &net.lanes[p];
-                let far = lp.next.iter().map(|n| bound.get(n).map(|d| d + net.lanes[*n].length() as f64)).collect::<Option<Vec<f64>>>();
-                if let Some(d) = far.and_then(|v| v.into_iter().reduce(f64::max)).filter(|d| *d <= omsi_sim::traffic::EDGE_LOOKAHEAD) {
-                    bound.insert(p, d);
-                    work.push(p);
-                }
-            }
+        self.edge_lanes = self.net.lanes.iter().enumerate().filter(|(_, l)| l.loaded_edge).map(|(i, _)| i).collect();
+        if !self.mark_edges_in_sight() {
+            self.edge_bound = edge_bound_of(&self.net);
         }
-        self.edge_bound = bound.into_keys().collect();
+    }
+
+    /// [round 10 S4] Mark each loaded-edge lane in sight or not (`Lane::edge_in_sight`): its end
+    /// within the perceptual horizon of the eye (`Viewer::horizon` of the tallest random-traffic
+    /// body, never within NEAR_HIDE; none while the lamps are lit, so then every edge is in
+    /// sight), and with the flags changed gather `edge_bound` again. Only an edge in sight is
+    /// routed away from and kept clear of new cars (A4); beyond the horizon a car drives to it
+    /// and its trip ends there out of sight (the far trip end, A2), as a SUMO vehicle leaves the
+    /// network at its border. Before the first frame (no eye) every edge counts as in sight.
+    /// Returns whether `edge_bound` was gathered.
+    pub fn mark_edges_in_sight(&mut self) -> bool {
+        let horizon = self.viewer.map(|v| {
+            let height = self.types.iter().filter(|t| t.2 == LaneKind::Street).map(|t| body_height(&t.0)).fold(CAR_HEIGHT, f64::max);
+            (v.pos, v.horizon(height).max(NEAR_HIDE))
+        });
+        let mut changed = false;
+        for &i in &self.edge_lanes {
+            let l = &mut self.net.lanes[i];
+            let seen = horizon.is_none_or(|(eye, h)| edge_in_sight(l.end(), eye, h));
+            changed |= l.edge_in_sight != seen;
+            l.edge_in_sight = seen;
+        }
+        if changed {
+            self.edge_bound = edge_bound_of(&self.net);
+        }
+        changed
     }
 
     /// Take in what the tiles loaded since the last call brought: their lanes (linked into
@@ -5991,6 +6033,35 @@ mod prefetch_tests {
         assert_eq!(prefetch_target(h, 0.0, 3.0), h, "standing: the horizon");
         assert_eq!(prefetch_target(h, -5.0, 1.0), h, "no negative speed");
         assert_eq!(prefetch_target(h, 10.0, 0.0), h, "no load measured yet");
+    }
+}
+
+#[cfg(test)]
+mod edge_sight_tests {
+    use super::*;
+
+    /// [round 10 S4] One horizon (648 m, the harness's picture): an edge 500 m from the eye is in
+    /// sight - avoided by A4, its road kept clear of new cars - one 2500 m off is not: the road to
+    /// it is a way like any other and gets cars.
+    #[test]
+    fn s4_an_edge_at_500_m_is_avoided_and_one_at_2500_m_is_not() {
+        let horizon = 648.0;
+        let eye = DVec3::ZERO;
+        for (d, seen) in [(500.0, true), (2500.0, false)] {
+            let mut net = Network::default();
+            let mut a = omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, d - 200.0, 0.0), DVec3::new(0.0, d - 100.0, 0.0)], LaneKind::Street, 3.5);
+            a.source = 1;
+            let mut b = omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, d - 100.0, 0.0), DVec3::new(0.0, d, 0.0)], LaneKind::Street, 3.5);
+            b.source = 1;
+            net.lanes.push(a);
+            net.lanes.push(b);
+            net.link(LANE_LINK_TOL);
+            net.lanes[1].loaded_edge = true;
+            net.lanes[1].edge_in_sight = edge_in_sight(net.lanes[1].end(), eye, horizon);
+            assert_eq!(net.lanes[1].edge_in_sight, seen, "edge at {d} m");
+            assert_eq!(net.ends_at_loaded_edge(0), seen, "routed away from at {d} m");
+            assert_eq!(edge_bound_of(&net).contains(&0), seen, "kept clear of new cars at {d} m");
+        }
     }
 }
 
