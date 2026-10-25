@@ -443,7 +443,7 @@ pub fn arc_point(start: DVec3, heading_deg: f64, s: f64, radius: f64) -> (DVec2,
 }
 
 /// The whole network.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Network {
     pub lanes: Vec<Lane>,
     /// Lanes by map identity (both directions of a two-way path share a key).

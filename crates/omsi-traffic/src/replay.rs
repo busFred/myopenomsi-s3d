@@ -126,6 +126,9 @@ pub struct Replay {
     /// s), for the first frame after it: a stop the game asks for then is laid at its route
     /// place, found from there (`free_inputs`).
     game_at: HashMap<u64, (usize, f32)>,
+    /// The network as `stub_links` made it from the header, and its junctions: a seek
+    /// (`Replay::at`) starts from a copy instead of compiling the header again.
+    start_net: Option<(Network, Junctions)>,
 }
 
 /// [round 7 E2] A recorded stop distance (`External::stop_at`) growing by more than this (m)
@@ -187,8 +190,8 @@ impl Replay {
             }
         }
         let keyframes = records.iter().enumerate().filter(|(_, r)| matches!(r, Record::Keyframe { .. })).map(|(i, _)| i).collect();
-        let (net, sim) = build(&header);
-        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), removals: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new(), game_at: HashMap::new() };
+        let (net, sim) = build(&header, false);
+        let mut r = Replay { header, records, skipped, truncated, net, sim, vehicles: Vec::new(), types: HashMap::new(), cursor: 0, divergence: Vec::new(), missing: Vec::new(), free_run: false, pending_spawns: Vec::new(), in_sync: true, spawn_patience: SPAWN_PATIENCE, deferred_spawns: 0, dropped_spawns: 0, keyframes, ended: Vec::new(), removals: Vec::new(), clocks_taken: false, free_stops: HashMap::new(), free_ramps: HashMap::new(), game_at: HashMap::new(), start_net: None };
         r.stub_links();
         r
     }
@@ -202,9 +205,15 @@ impl Replay {
     /// are linked and compiled with them, `Network::extend`). The recorded meeting places stay
     /// in the header (`recorded`).
     fn stub_links(&mut self) {
+        if let Some((net, js)) = &self.start_net {
+            self.net = net.clone();
+            self.sim.junctions = js.clone();
+            return;
+        }
         self.net.apply_stub_links();
         self.net.compute_conflicts();
         self.sim.junctions = Junctions::compile(&self.net);
+        self.start_net = Some((self.net.clone(), self.sim.junctions.clone()));
     }
 
     pub fn keyframe_count(&self) -> usize {
@@ -221,7 +230,7 @@ impl Replay {
     /// keyframe.
     pub fn at(&mut self, k: usize) -> bool {
         let Some(&at) = self.keyframes.get(k) else { return false };
-        let (net, sim) = build(&self.header);
+        let (net, sim) = build(&self.header, false);
         self.net = net;
         self.sim = sim;
         self.stub_links();
@@ -725,11 +734,12 @@ pub fn other_rules(h: &Header) -> Option<String> {
 /// derived data (the junction table too), without the lit stubs applied (`Replay` applies
 /// them).
 pub fn recorded(h: &Header) -> (Network, Simulation) {
-    build(h)
+    build(h, true)
 }
 
-/// The network and the simulation the header describes.
-fn build(h: &Header) -> (Network, Simulation) {
+/// The network and the simulation the header describes; with `compile`, the meeting places of a
+/// header without derived data compiled (a replay compiles them in `stub_links`, once).
+fn build(h: &Header, compile: bool) -> (Network, Simulation) {
     let mut net = Network { lanes: h.lanes.clone(), left_hand: h.left_hand, ..Default::default() };
     for (i, l) in net.lanes.iter().enumerate() {
         if let Some(k) = l.key {
@@ -762,13 +772,16 @@ fn build(h: &Header) -> (Network, Simulation) {
                     }
                 }
             }
-            net.compute_conflicts();
+            if compile {
+                net.compute_conflicts();
+            }
             net.compute_reach();
         }
     }
     let junctions = match &h.derived {
         Some(d) => d.junctions.clone(),
-        None => Junctions::compile(&net),
+        None if compile => Junctions::compile(&net),
+        None => Junctions::default(),
     };
     // (the recorded junctions: `Replay::new` compiles its own after the lit stubs; these are
     // the game's, for `recorded`)
