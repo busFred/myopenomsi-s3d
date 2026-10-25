@@ -3536,6 +3536,28 @@ pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
 /// [P2-B2] How far beyond a body a waiter steps out of a standing vehicle's box (m): a hand's
 /// breadth.
 const WAITER_STEP_OUT: f64 = 0.05;
+/// [P2-B2, P3-2] Where a waiter at `here` (height `z`) inside a standing vehicle's body (`bodies`,
+/// as `blocks` for their sides, by `grid`) steps to: out along the nearest side's normal by the
+/// person's square's extent there and WAITER_STEP_OUT, by the cars' own test (`people_ahead`:
+/// the person a square of BODY_OUTSIDE against the body). None when no body overlaps them.
+fn waiter_step_out(here: DVec2, z: f64, bodies: &[omsi_sim::collision::Obb], blocks: &[Block], grid: &crowd::BlockGrid) -> Option<DVec2> {
+    let me = omsi_sim::collision::Obb::point(here.extend(z), BODY_OUTSIDE);
+    let mut out = None;
+    grid.for_each_near(here, |k| {
+        if out.is_some() || me.separation(&bodies[k]) >= 0.0 {
+            return;
+        }
+        let (q, inside) = blocks[k].closest(here);
+        let n = if inside { (q - here).normalize_or_zero() } else { (here - q).normalize_or_zero() };
+        let extent = BODY_OUTSIDE * (n.x.abs() + n.y.abs());
+        out = Some(q + n * (extent + WAITER_STEP_OUT));
+    });
+    out
+}
+
+/// [P3-2] The farthest a person's square body (BODY_OUTSIDE a side, the cars' people test)
+/// reaches from its centre (m): half its diagonal.
+const WAITER_SQUARE_REACH: f64 = BODY_OUTSIDE * std::f64::consts::SQRT_2;
 
 /// [P2-B2] A street lane's footprint and a body (m from its axis): half its width,
 /// `LANE_MIN_WIDTH` at least, and `WAITER_BODY`.
@@ -7416,19 +7438,11 @@ impl Humans {
         // its side: a waiter never stands inside a vehicle (SUMO's waiting persons are on the
         // platform), and the vehicle can then leave. The body is the one the cars' people test
         // holds them by (`omsi_traffic::Vehicle::obb`; the drawn bounding box is smaller)
-        let standing: Vec<Block> = traffic
-            .map(|t| {
-                t.cars
-                    .iter()
-                    .filter(|c| c.ai.state.speed < 0.5 && (c.vehicle.position - self.center).length() < 320.0)
-                    .map(|c| {
-                        let o = c.ai.obb();
-                        Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }
-                    })
-                    .collect()
-            })
+        let bodies: Vec<omsi_sim::collision::Obb> = traffic
+            .map(|t| t.cars.iter().filter(|c| c.ai.state.speed < 0.5 && (c.vehicle.position - self.center).length() < 320.0).map(|c| c.ai.obb()).collect())
             .unwrap_or_default();
-        let standing_grid = crowd::BlockGrid::new(&standing, BODY_OUTSIDE, crowd::BLOCK_CELL);
+        let standing: Vec<Block> = bodies.iter().map(|o| Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }).collect();
+        let standing_grid = crowd::BlockGrid::new(&standing, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
         // (their waiting place moves with them: the passengers' engine keeps them at it)
         let mut places: Vec<(i64, usize, DVec2)> = Vec::new();
         for p in self.people.iter_mut() {
@@ -7437,18 +7451,7 @@ impl Humans {
                 continue;
             }
             let here = p.position.truncate();
-            let mut out = None;
-            standing_grid.for_each_near(here, |k| {
-                let b = &standing[k];
-                if out.is_some() {
-                    return;
-                }
-                let (q, inside) = b.closest(here);
-                if inside || (here - q).length() < BODY_OUTSIDE {
-                    let n = if inside { (q - here).normalize_or_zero() } else { (here - q).normalize_or_zero() };
-                    out = Some(q + n * (BODY_OUTSIDE + WAITER_STEP_OUT));
-                }
-            });
+            let out = waiter_step_out(here, p.position.z, &bodies, &standing, &standing_grid);
             if let Some(to) = out {
                 let d = to - here;
                 x.pos.x += d.x;
@@ -11615,6 +11618,65 @@ mod ped_tests {
         let ped = PedNet::build(&net);
         assert!(ped.elevated(&net, 1), "the bridge");
         assert!(!ped.elevated(&net, 2), "the pavement beside the street");
+    }
+
+    #[test]
+    fn p3_a_waiter_inside_a_standing_body_steps_out_clear_of_the_cars_test() {
+        // Wuluju #208: waiters of another stop 0.01-0.11 m inside a bus's body in its bay
+        let bus = omsi_sim::collision::Obb::vehicle(DVec2::ZERO, 0.0, 6.0, 6.0, 1.25);
+        let blocks = [Block { center: bus.center, half: bus.half, heading: bus.heading, vel: DVec2::ZERO }];
+        let grid = crowd::BlockGrid::new(&blocks, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
+        for here in [DVec2::new(1.5, 2.0), DVec2::new(1.52, -3.0), DVec2::new(1.0, 0.0), DVec2::new(0.9, 5.9)] {
+            let to = waiter_step_out(here, 0.0, std::slice::from_ref(&bus), &blocks, &grid).expect("inside");
+            let sep = omsi_sim::collision::Obb::point(to.extend(0.0), BODY_OUTSIDE).separation(&bus);
+            assert!(sep > 0.0, "{here:?} -> {to:?}: still {sep:.3}");
+        }
+        assert!(waiter_step_out(DVec2::new(1.9, 0.0), 0.0, std::slice::from_ref(&bus), &blocks, &grid).is_none(), "clear already");
+    }
+
+    #[test]
+    fn p3_a_crossing_begun_from_the_last_piece_of_another_keeps_the_flag() {
+        // two crossings with an island between (as l2), both green: the flag never drops between
+        // the kerbs (it dropped for the island's first 0.3 m, d24's 83 flips)
+        let (mut net, _) = crossing(true);
+        net.lanes.truncate(6);
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(vec![p(0.0, 4.0), p(0.0, 8.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 8.0), p(0.0, 9.5)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 9.5), p(0.0, 13.75)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 13.75), p(0.0, 18.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 18.0), p(20.0, 18.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(street(11.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(15.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes[7].traffic_light = Some((0, 1));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let legs = vec![
+            Leg { lane: 2, a: 10.0, b: 20.0 },
+            Leg { lane: 3, a: 0.0, b: 1.5 },
+            Leg { lane: 4, a: 0.0, b: 4.0 },
+            Leg { lane: 5, a: 0.0, b: 4.0 },
+            Leg { lane: 6, a: 0.0, b: 4.0 },
+            Leg { lane: 7, a: 0.0, b: 1.5 },
+            Leg { lane: 8, a: 0.0, b: 4.25 },
+            Leg { lane: 9, a: 0.0, b: 4.25 },
+            Leg { lane: 10, a: 0.0, b: 20.0 },
+        ];
+        let mut walk = PedWalk::new(legs, false, 0.0);
+        let mut m = me(2, DVec2::new(-10.0, -5.5), 1.2);
+        let (mut was_on, mut drops) = (false, 0);
+        for k in 0..800 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if m.pos.y > -3.0 && m.pos.y < 17.0 {
+                if was_on && !m.on_crossing {
+                    drops += 1;
+                }
+                was_on = m.on_crossing;
+            }
+        }
+        assert!(m.pos.y > 17.5, "not across: {:?}", m.pos);
+        assert_eq!(drops, 0, "the flag dropped between the kerbs");
     }
 
     #[test]
