@@ -2165,12 +2165,18 @@ const PED_GAP_MIN: f64 = 0.8;
 const PED_GAP_SIGMA: f64 = 1.0;
 
 /// [P3] The target density of strollers on a pavement (persons/m^2) at the map's passenger
-/// curve 1: the boundary of walkway levels of service B and C in the user's bands (Fruin 1971,
-/// "Pedestrian Planning and Design"; HCM walkway LOS: free flow under 0.3, busy 0.3-0.7,
-/// congested 0.7-1.3, jammed over 1.3), the default "LOS B-C".
+/// curve 1, the user's default "LOS B-C" (2026-10-24). The bands are the walkway levels of
+/// service of the Highway Capacity Manual (HCM 2010, ch. 23, walkway LOS by space per person:
+/// C 24-40 ft^2, D 15-24, E 8-15, F under 8, i.e. 0.27-0.45, 0.45-0.72, 0.72-1.34 and over 1.34
+/// persons/m^2; the user's rounding: under 0.3 free, 0.3-0.7 busy, 0.7-1.3 congested, over 1.3
+/// jammed). The level-of-service idea for walkways is Fruin's (1971, "Pedestrian Planning and
+/// Design"), whose own bands are wider (A from 35 ft^2 per person). The figures are quoted, not
+/// checked against a copy of either book here.
 const PED_DENSITY_TARGET: f32 = 0.3;
-/// [P3] Nobody is put down on a pavement past this density (persons/m^2): the top of LOS D in
-/// those bands (bus waiters at stops and people queueing are counted apart).
+/// [P3] Nobody is put down on a pavement past this density (persons/m^2): the top of HCM's LOS
+/// D in the user's rounding (bus waiters at stops and people queueing are counted apart). The
+/// hour's curve scales the target up to it and no further (the user: never above LOS D except
+/// at stops and queues).
 const PED_DENSITY_CAP: f32 = 0.7;
 /// [P3] The narrowest a path counts as for its area (m): one body abreast (2 x BODY_OUTSIDE).
 const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
