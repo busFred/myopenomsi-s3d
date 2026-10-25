@@ -352,7 +352,7 @@ fn pass1_a_car_waiting_for_people_at_a_walk_inside_the_box_enters_on_green() {
     net.compute_conflicts();
     let ctl = TrafficLightController::new(vec![vec![(6, 900.0), (0, 100.0)]], 1000.0);
     let mut sim = Simulation::new(&net, vec![ctl]);
-    sim.people.push(omsi_traffic::Person { pos: DVec3::new(6.0, 0.3, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 60.0, waiting_for_bus: false, at_kerb: false, waits_at: None });
+    sim.people.push(omsi_traffic::Person { pos: DVec3::new(6.0, 0.3, 0.0), vel: glam::DVec2::ZERO, on_crossing: true, still: 60.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None });
     let mut cars = vec![car(1, 0, 279.0 - 40.0, 8.0)];
     let mut kept = 0.0f32;
     run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {

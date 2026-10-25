@@ -58,6 +58,8 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
         tau: 1.3,
         min_gap: 2.0,
         red_at: f32::INFINITY,
+        refused_last: false,
+        in_box_at_turn: false,
         committed: false,
         exit_room: true,
         impatience: Impatience::default(),
