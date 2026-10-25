@@ -3221,7 +3221,8 @@ fn kerb_look(pace: f64) -> f32 {
 }
 
 /// Waiting at the kerb before `next`: facing the way across, spread along it and a step back,
-/// [ROLLBACK r4c-P3] off the carriageway (see `kerb_spot`).
+/// off the carriageway (see `kerb_spot`); somebody refused already nearer the kerb than their
+/// spot, off every lane's waiter reach, waits where they are ([P1a]: nobody steps back).
 fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, _leg: &Leg, next: &Leg) -> Want {
     let net = at.net;
     let (_, h) = next.at(net, 0.3);
@@ -3496,10 +3497,9 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     let next = walk.legs[c.from];
     let pace = me.pace;
     let held = walk.held;
-    // [ROLLBACK r4c-L1] the whole crossing, kerb to kerb (the first piece alone was timed, and
-    // only where it cut a lane: a kerb stub cuts none, and nobody looked at the cars at all),
-    // from where they are: `approach` metres short of the kerb ([P1a] the verdict taken on
-    // the way to it)
+    // the time to the far kerb over the whole crossing, kerb to kerb (a kerb stub cuts no lane,
+    // so the first piece alone says nothing), from where they are: `approach` metres short of
+    // the kerb ([P1a] the verdict taken on the way to it)
     let t_cross = (approach + c.span) as f64 / pace.max(0.5) + 1.0;
     let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
     // [ROLLBACK r5-P6] nobody starts across while a vehicle stands on the crossing - its box
@@ -3545,12 +3545,9 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
             }
             if held <= 150.0 {
                 // A pedestrian green is short (8 s at Grundorf for an 11.6 m crossing that
-                // takes 10.7 s): who starts on green crosses in the clearance time after
-                // it, until the cars get their green. Only the green alone was counted, so
-                // nobody ever started on green and everybody went across on red after
-                // 150 s, in front of moving cars.
-                // [ROLLBACK r4c-P2] the whole crossing, kerb to kerb (the next piece alone was
-                // counted: people stepped onto a 28 s crossing 1-4 s before the red)
+                // takes 10.7 s): who starts on green crosses in the clearance time after it,
+                // until the cars get their green (`pedestrian_window`), timed over the whole
+                // crossing (`t_cross`)
                 let arrival = t_cross;
                 let paths: Vec<usize> = walk.legs[c.from..=c.to].iter().map(|l| l.lane).collect();
                 let window = pedestrian_window(Some(ped), net, t, &paths, left);
@@ -3911,7 +3908,7 @@ impl Person {
     fn inside(&self, bus: BusId) -> bool {
         matches!(self.place, Place::Bus(b, _) if b == bus)
     }
-    /// [ROLLBACK r4c-L4] Waiting at a kerb to cross (held there by `may_cross`'s verdict), off the
+    /// [ROLLBACK r4c-L4] Waiting at a kerb to cross (held there by `kerb_verdict`), off the
     /// carriageway: the cars' people check takes them as clear outside their footprint.
     fn at_kerb(&self) -> bool {
         matches!(&self.state, State::Strolling(w) if w.held > 0.0) && !self.on_crossing && self.last_decision.map(|d| d != "go").unwrap_or(false)
@@ -5034,6 +5031,8 @@ impl Humans {
 
     /// Someone has gone: hidden, and their meshes kept for the next person of the type.
     fn retire(&mut self, p: &Person) {
+        // (what is kept per person goes with them)
+        self.seat_moved.remove(&p.id);
         let tkey = Arc::as_ptr(&p.ty) as usize;
         for (mi, m) in p.meshes.iter().enumerate() {
             self.hidden.push(m.1);
@@ -6369,6 +6368,12 @@ impl Humans {
         }
         self.seats.remove(&bus);
         self.bus_motion.remove(&bus);
+        // (and what is kept per bus: nothing of a bus that went stays behind)
+        self.odometer.remove(&bus);
+        self.pax_places.remove(&bus);
+        self.last_door_open.remove(&bus);
+        self.seat_gift.remove(&bus);
+        self.door_prev.retain(|k, _| k.0 != bus);
         if bus == BusId::Player {
             self.player_cabin = None;
             self.served_stop = None;

@@ -1467,10 +1467,10 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 if along < -span_back || along > span_ahead {
                     continue;
                 }
-                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross, outside my own
-                // footprint and its 0.3 m (to the 0.02 m beyond their body radius: the kerb spot is half a lane and
-                // 0.3 m off the lane's axis, and a bus is as wide as a lane), holds nobody:
-                // with a stream on the crossing they let the vehicle go first (P4)
+                // [ROLLBACK r4c-L4] somebody waiting at the kerb to cross whose body is outside my
+                // footprint holds nobody (the kerb spot lies outside every lane's waiter reach,
+                // `humans::kerb_spot`): with a stream on the crossing they let the vehicle go
+                // first (P4)
                 if p.at_kerb && !on_crossing && across >= me.half_width + crate::plan::PERSON_RADIUS {
                     continue;
                 }
