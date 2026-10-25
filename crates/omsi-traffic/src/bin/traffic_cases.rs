@@ -76,6 +76,12 @@ const PERSON_RADIUS: f64 = 0.28;
 /// How far ahead (m) `heads` looks for the junction pieces of a head's way: past the claim's
 /// furthest reach (`Simulation::tick`'s horizon, at most 220 m) and a way through of its own.
 const HEADS_WAY: f32 = 400.0;
+/// `ab`'s `pedtouch_nospawn`: a person this young (s since they came into the replay, matched from
+/// frame to frame by position) is left out - the same 3 s as `ovl_nospawn`'s vehicle spawns.
+const FRESH_PERSON: f64 = 3.0;
+/// A person this far (m) from where anybody stood last frame came into the replay this frame
+/// (people walk under 2.5 m/s: 0.08 m a 30 Hz frame; the recording's keyframes jump nobody further).
+const PERSON_MATCH: f64 = 0.5;
 /// `ab`'s `capped_by_red`: a start capped to this or less (m/s^2) is "capped to nothing" - the
 /// round 10 drive analysis's measure of J9-1 (report2/junctions.md), the old held threshold.
 const CAPPED_START: f32 = 0.05;
@@ -4273,6 +4279,11 @@ struct Extra {
     /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
     /// player's passengers out not counted).
     pedtouch_severe: u64,
+    /// Of `pedtouch_severe`, the frames with a person that came into the replay more than
+    /// `FRESH_PERSON` s before (recorded people do not react to the free run's vehicles: one the
+    /// recording puts down where the free run has a car is the replay's, as `ovl_nospawn` leaves
+    /// out vehicles touching within 3 s of coming on the road).
+    pedtouch_nospawn: u64,
     events: Vec<String>,
 }
 
@@ -4436,6 +4447,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
     let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
     let mut on_cut_ids: HashSet<u64> = HashSet::new();
+    // (`--pedtouch`: last frame's people, each with when it came into the replay)
+    let mut prev_people: Vec<(glam::DVec3, f64)> = Vec::new();
     // (pairs already listed as `CAPRED` events)
     let mut capped_seen: HashSet<(u64, u64)> = HashSet::new();
     // (an eased-off car standing: since when; the last frame's time)
@@ -4607,6 +4620,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
             }
         }
+        // (`--pedtouch`: when each person came into the replay, matched to last frame's by position)
+        let person_since: Vec<f64> = if pedtouch {
+            let since: Vec<f64> = r.sim.people.iter().map(|p| prev_people.iter().filter(|(q, _)| (p.pos - *q).length() < PERSON_MATCH).map(|&(_, t0)| t0).fold(r.sim.time, f64::min)).collect();
+            prev_people = r.sim.people.iter().zip(&since).map(|(p, &t0)| (p.pos, t0)).collect();
+            since
+        } else {
+            Vec::new()
+        };
         // ---- every frame: the odometers and the stop lines
         for v in &r.vehicles {
             let st = &v.state;
@@ -4624,7 +4645,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             // person's disc, 0.28 m, every frame, on stderr)
             if pedtouch && st.speed >= 0.3 {
                 let b = v.obb();
-                for p in &r.sim.people {
+                for (pk, p) in r.sim.people.iter().enumerate() {
                     if (p.pos - v.pos).truncate().length() > 15.0 || (p.pos.z - v.pos.z).abs() > 2.5 {
                         continue;
                     }
@@ -4637,6 +4658,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         let severe = -sep > 0.28 || (st.speed > 1.0 && -sep > 0.05);
                         let note = if v.last.why == Why::LetOut { " artefact: passengers placed by the recording beside the run's car" } else { "" };
                         ex.pedtouch_severe += (severe && note.is_empty()) as u64;
+                        let fresh = person_since.get(pk).is_some_and(|&t0| r.sim.time - t0 < FRESH_PERSON);
+                        ex.pedtouch_nospawn += (severe && note.is_empty() && !fresh) as u64;
                         eprintln!("PEDTOUCH {} t={:.2} #{} class {:?} coach {} len {:.1} v {:.1} why {} depth {:.2} waiting {} pvel {:.2} still {:.1} crossing {} kerb {} ppos {:.1},{:.1} severe {}{}", sc.name, r.sim.time, v.id, v.class, coach, v.state.length, v.state.speed, why_name(v.last.why), -sep, p.waiting_for_bus, p.vel.length(), p.still, p.on_crossing, p.at_kerb, p.pos.x, p.pos.y, severe, note);
                     }
                 }
@@ -4935,6 +4958,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
         ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
+        ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
         ("removed_far", e.removed_far.to_string()),
     ]
 }
@@ -4964,6 +4988,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.removed_in_view_s += e.removed_in_view_s;
     t.removed_far += e.removed_far;
     t.pedtouch_severe += e.pedtouch_severe;
+    t.pedtouch_nospawn += e.pedtouch_nospawn;
     t.end_in_view += e.end_in_view;
     t.end_moving += e.end_moving;
     t.wait60 += e.wait60;
