@@ -2613,7 +2613,15 @@ impl PedNet {
         best.map(|b| b.1)
     }
 
-    /// Where pavement lane `lane` crosses a carriageway, and the carriageway lanes it crosses.
+    /// Where pavement lane `lane` crosses a carriageway, and the carriageway lanes it crosses:
+    /// where its axis cuts a street lane's, and [P1d] where it runs into the footprint of a
+    /// junction object's street piece (`source` 2; half its width, `LANE_MIN_WIDTH` at least,
+    /// from its axis) without cutting the axis - the point of that piece's axis nearest to it is
+    /// the cut (BeijingCity's object 3433: footpath 790 enters the 1 m turn piece 676 at its start
+    /// and its walkers stood in the turn's way off any crossing, 88 person-s in 300 s at
+    /// Jiangzhaikou). A walk over such a piece is a crossing, decided at its kerb and walked with
+    /// the crossing flag, which the cars see (SUMO: a pedestrian on a vehicle lane is on a
+    /// crossing or a shared walking area, never on a plain sidewalk).
     fn cuts_of(net: &Network, lane: usize) -> LaneCuts {
         let l = &net.lanes[lane];
         let mut cand: Vec<usize> = Vec::new();
@@ -2651,6 +2659,35 @@ impl PedNet {
                             out.push(x);
                         }
                     }
+                }
+            }
+            // [P1d] into a junction piece's footprint without cutting its axis
+            if crossed.contains(&i) || o.source != 2 {
+                continue;
+            }
+            let reach = (o.width as f64).max(LANE_MIN_WIDTH) * 0.5;
+            let mut nearest: Option<(f64, DVec2)> = None;
+            for w in l.points.windows(2) {
+                let n = ((w[1] - w[0]).truncate().length() / FOOT_SAMPLE).ceil().max(1.0) as usize;
+                for k in 0..=n {
+                    let q = w[0] + (w[1] - w[0]) * (k as f64 / n as f64);
+                    for v in o.points.windows(2) {
+                        if (q.z - v[0].z).abs() > 3.0 {
+                            continue;
+                        }
+                        let (on, t) = crowd::project_on_segment(q.truncate(), v[0].truncate(), v[1].truncate());
+                        let d = (on - q.truncate()).length();
+                        let inner = (t > 0.0 && t < 1.0) || (on - o.points[0].truncate()).length() > 1e-6 && (on - o.points[o.points.len() - 1].truncate()).length() > 1e-6;
+                        if d < reach && inner && nearest.is_none_or(|b| d < b.0) {
+                            nearest = Some((d, on));
+                        }
+                    }
+                }
+            }
+            if let Some((_, x)) = nearest {
+                crossed.push(i);
+                if !out.iter().any(|q: &DVec2| (*q - x).length() < 1.5) {
+                    out.push(x);
                 }
             }
         }
@@ -3156,6 +3193,10 @@ const PED_OCCUPIED_CAP: f32 = 20.0;
 /// [ROLLBACK r4c-P1] Decisions on a crossing as the recording shows them.
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
 const HURRIES_ON: &str = "caught by the change: on across";
+
+/// [P1d] The spacing (m) of the points of a footpath tested against a junction piece's
+/// footprint (`PedNet::cuts_of`): under a body's width (2 x BODY_OUTSIDE).
+const FOOT_SAMPLE: f64 = 0.5;
 
 /// [P1a] At a leg's end within this (m): at its end (a step short of the node, as the walk's
 /// legs join within `PED_NODE_MERGE`).
@@ -9842,6 +9883,44 @@ mod ped_tests {
             frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
         }
         assert!(m.pos.x < -5.0, "across against the chain's way on green: {:?}", m.pos);
+    }
+
+    #[test]
+    fn p1d_a_footpath_entering_a_junction_pieces_footprint_without_cutting_it_is_a_crossing() {
+        // BeijingCity object 3433: footpath 790 (3 m, southbound) starts 0.2 m beside the start of
+        // the 1 m turn piece 676 and never cuts its axis: its walkers stood in the turn's way with
+        // no crossing flag. Now the piece's nearest axis point is a cut: the footpath is a crossing
+        // piece, decided at its kerb and walked with the flag
+        let mut net = Network::default();
+        let mut turn = lane(vec![p(450.1, -1678.1), p(451.6, -1678.8), p(453.0, -1679.9), p(454.9, -1682.6), p(455.7, -1685.8)], LaneKind::Street, 1.0);
+        turn.source = 2;
+        net.lanes.push(turn); // 0
+        net.lanes.push(lane(vec![p(451.1, -1670.0), p(451.1, -1678.8)], LaneKind::Sidewalk, 3.0)); // 1 the pavement up to it
+        net.lanes.push(lane(vec![p(451.1, -1678.8), p(451.1, -1682.8), p(450.7, -1686.8)], LaneKind::Sidewalk, 3.0)); // 2 footpath 790
+        net.lanes.push(lane(vec![p(450.7, -1686.8), p(450.7, -1700.0)], LaneKind::Sidewalk, 3.0)); // 3 on
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        assert!(!ped.crossings(&net, 2).is_empty(), "no cut for the footpath in the turn's footprint");
+        assert_eq!(&ped.crossed_lanes(&net, 2)[..], &[0]);
+        assert!(core_piece(&mut ped, &net, None, 2));
+        // (the pavement leading up to it ends in the footprint too: its walk is part of the
+        // crossing, decided at its start; the pavement on beyond is none)
+        assert!(!ped.crossings(&net, 1).is_empty() && ped.crossings(&net, 3).is_empty());
+        // a spline lane (source 1) as close is no junction piece: no cut
+        net.lanes[0].source = 1;
+        let ped = PedNet::build(&net);
+        assert!(ped.crossings(&net, 2).is_empty());
+        // walked: on the piece they carry the crossing flag
+        net.lanes[0].source = 2;
+        let mut ped = PedNet::build(&net);
+        let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 0.0, b: net.lanes[1].length() }], true, 0.0);
+        let mut m = me(3, DVec2::new(451.1, -1670.0), 1.3);
+        let mut flagged = false;
+        for k in 0..300 {
+            frame(&net, &mut ped, None, &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+            flagged |= m.on_crossing && m.pos.y < -1679.5 && m.pos.y > -1682.0;
+        }
+        assert!(flagged, "not on a crossing on the piece: {:?}", m.pos);
     }
 
     #[test]
