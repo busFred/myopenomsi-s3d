@@ -119,9 +119,10 @@ const QUEUE_BEHIND_DIST: f64 = 25.0;
 // are the crate's, `omsi_traffic::removal`: the free-run replay asks the same rule)
 use omsi_traffic::removal::{goes_far, goes_in_view, lead_of, in_a_queue, RemoveRule};
 
-/// [P9-6] Whether the parked box `b` lies over a footpath: some point of a pavement lane near it,
-/// with half the lane's width round it, overlaps the box (the lanes' points sampled every
-/// `FOOTPATH_STEP`).
+/// [P9-6] Whether the parked box `b` lies over a footpath's walking line: a body (`FOOT_BODY`) on
+/// the axis of a pavement lane near it overlaps the box (the lanes' points sampled every
+/// `FOOTPATH_STEP`). A box only over the path's edge leaves its walkers room beside it (they pass
+/// it inside the path, `humans::along_box`); one on its line stands among them.
 fn covers_footpath(net: &Network, b: &omsi_sim::collision::Obb) -> bool {
     let reach = b.half.length() + 2.0 * FOOTPATH_STEP as f64;
     let (cx, cy) = ((b.center.x / 50.0).floor() as i32, (b.center.y / 50.0).floor() as i32);
@@ -137,7 +138,7 @@ fn covers_footpath(net: &Network, b: &omsi_sim::collision::Obb) -> bool {
                 let (mut s, len) = (0.0f32, lane.length());
                 while s <= len {
                     let (q, _) = lane.at(s);
-                    if (q.truncate() - b.center).length() <= reach && omsi_sim::collision::Obb::point(q, (lane.width as f64 * 0.5).max(0.0)).separation(b) < 0.0 {
+                    if (q.truncate() - b.center).length() <= reach && omsi_sim::collision::Obb::point(q, FOOT_BODY).separation(b) < 0.0 {
                         return true;
                     }
                     s += FOOTPATH_STEP;
@@ -149,8 +150,10 @@ fn covers_footpath(net: &Network, b: &omsi_sim::collision::Obb) -> bool {
 }
 
 /// [P9-6] The spacing (m) of the points of a footpath tested against a parked box: under half a
-/// body (`humans::BODY_OUTSIDE` 0.28 m), so no stretch of the path between two of them is missed.
+/// body, so no stretch of the path between two of them is missed.
 const FOOTPATH_STEP: f32 = 0.25;
+/// [P9-6] A walker's body radius (m, `humans::BODY_OUTSIDE`).
+const FOOT_BODY: f64 = 0.28;
 
 /// A random car goes out of range beyond `VISIBLE_RANGE` times this (and `NEAR_HIDE` from the
 /// eye): a margin over what is drawn.
