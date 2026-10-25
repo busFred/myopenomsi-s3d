@@ -2354,6 +2354,10 @@ struct PedNet {
     /// is set once, by whichever thread of the people's read phase asks first; the answer
     /// is a function of the network alone, so who asks first does not matter.
     cuts: Vec<std::sync::OnceLock<LaneCuts>>,
+    /// [P1h] Per pavement lane (worked out the first time asked, as `cuts`): the strip of it that
+    /// lies off every street lane's footprint, where the map lays the footpath along a street
+    /// lane (`free_strip`).
+    strips: Vec<std::sync::OnceLock<Option<(f64, f64)>>>,
     /// Pavement lanes by 50 m cell.
     grid: HashMap<(i32, i32), Vec<usize>>,
     /// The junctions and a 1.5 m grid of them, for joining the paths of tiles loaded later.
@@ -2371,6 +2375,7 @@ impl PedNet {
             out: Vec::new(),
             against: Vec::new(),
             cuts: Vec::new(),
+            strips: Vec::new(),
             grid: HashMap::new(),
             nodes: Vec::new(),
             cells: HashMap::new(),
@@ -2400,8 +2405,10 @@ impl PedNet {
         // in this call is of the whole network as it is now, which this call does not change)
         if from > 0 && (from..net.lanes.len()).any(|i| net.lanes[i].kind == LaneKind::Street) {
             self.cuts.clear();
+            self.strips.clear();
         }
         self.cuts.resize_with(net.lanes.len(), std::sync::OnceLock::new);
+        self.strips.resize_with(net.lanes.len(), std::sync::OnceLock::new);
         let mut nodes: HashMap<usize, (usize, usize)> = HashMap::new();
         for &i in &lit {
             let l = &net.lanes[i];
@@ -2730,6 +2737,64 @@ impl PedNet {
         (out, crossed)
     }
 
+    /// [P1h] Where on pavement lane `lane` its walkers keep off the carriageway, when the map
+    /// lays it along a street lane, its width partly inside that lane's footprint (half the
+    /// street lane's width, `LANE_MIN_WIDTH` at least, from its axis; Wuluju: footpath 1033/1034
+    /// 0.9 m off the 3 m street lane 1127, whose cars stood 275 s for the walkers on it): the
+    /// strip of the path's width left beyond the footprint and a body, as (from, to) offsets
+    /// right of the lane's direction. None where the path stays off every street lane, cuts one
+    /// (a crossing), or leaves no strip (then it is walked as drawn). OMSI geometry: the
+    /// pavement drawn over the lane; SUMO's sidewalk is never part of a vehicle lane.
+    fn free_strip(&self, net: &Network, lane: usize) -> Option<(f64, f64)> {
+        match self.strips.get(lane) {
+            Some(c) => *c.get_or_init(|| PedNet::strip_of(self, net, lane)),
+            None => PedNet::strip_of(self, net, lane),
+        }
+    }
+
+    fn strip_of(&self, net: &Network, lane: usize) -> Option<(f64, f64)> {
+        if !self.crossings(net, lane).is_empty() {
+            return None;
+        }
+        let l = &net.lanes[lane];
+        let half = l.width as f64 * 0.5;
+        let (mut lo, mut hi) = (-half + WAITER_BODY, half - WAITER_BODY);
+        let (mut samples, mut inside) = (0usize, 0usize);
+        let len = l.length();
+        let mut s = 0.0f32;
+        while s <= len {
+            let (q, h) = l.at(s);
+            let hr = (h as f64).to_radians();
+            let right = DVec2::new(hr.cos(), -hr.sin());
+            samples += 1;
+            let cell = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
+            let mut hit = false;
+            for &i in net.grid.get(&cell).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let o = &net.lanes[i];
+                if o.kind != LaneKind::Street {
+                    continue;
+                }
+                let reach = (o.width as f64).max(LANE_MIN_WIDTH) * 0.5;
+                let Some((sa, d)) = o.nearest_point(q) else { continue };
+                if d >= reach + half || sa <= 0.0 || sa >= o.length() {
+                    continue;
+                }
+                hit = true;
+                // (the street's axis across my path: its footprint covers my offsets within reach)
+                let off = (o.at(sa).0 - q).truncate().dot(right);
+                if off < 0.0 {
+                    lo = lo.max(off + reach + WAITER_BODY);
+                } else {
+                    hi = hi.min(off - reach - WAITER_BODY);
+                }
+            }
+            inside += hit as usize;
+            s += FOOT_SAMPLE as f32;
+        }
+        // (along most of the path, not where it only meets a street at its end)
+        (inside * 2 > samples && lo < hi && (lo > -half + WAITER_BODY || hi < half - WAITER_BODY)).then_some((lo, hi))
+    }
+
     /// `cuts_of`, kept: a lane the network gained since the last `extend` (not kept, as
     /// none of its pavements is in yet) is worked out afresh.
     fn lane_cuts(&self, net: &Network, lane: usize) -> std::borrow::Cow<'_, LaneCuts> {
@@ -3032,6 +3097,10 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     // traffic drives on the left
     let side = if crossing { (walk.side.abs() as f64).min(0.3) } else { (walk.side.abs() as f64).min(width * 0.5 - 0.3).max(0.0) };
     let side = if net.left_hand { -side } else { side };
+    // ([P1h] on a path the map lays along a street lane: in the strip of it off the lane's
+    // footprint, `free_strip`, whichever way they walk)
+    let strip = if crossing { None } else { ped.and_then(|p| p.free_strip(net, leg.lane)) }.map(|(lo, hi)| if leg.b >= leg.a { (lo, hi) } else { (-hi, -lo) });
+    let side = strip.map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or(side);
     let hr = h.to_radians();
     let right = DVec2::new(hr.cos(), -hr.sin());
     let target = p.truncate() + right * side;
@@ -3041,7 +3110,11 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let (b, _) = leg.at(net, (walk.s + 2.5).min(len));
     let (m, _) = leg.at(net, (walk.s + 0.25).min(len));
     let bow = crowd::project_on_segment(m.truncate(), a.truncate(), b.truncate()).0.distance(m.truncate());
-    let corridor = ((b - a).truncate().length() > 0.5).then(|| (a.truncate() + right * side, b.truncate() + right * side, (width * 0.5 - side).max(0.35) + bow));
+    let dev = match strip {
+        Some((lo, hi)) => (hi - lo) * 0.5 + bow,
+        None => (width * 0.5 - side).max(0.35) + bow,
+    };
+    let corridor = ((b - a).truncate().length() > 0.5).then(|| (a.truncate() + right * side, b.truncate() + right * side, dev));
     let corridor = path_corridor_band(pos2, corridor, STROLL_BAND);
     if me.why != "queueing behind somebody" {
         me.why = "";
@@ -9975,6 +10048,39 @@ mod ped_tests {
             flagged |= m.on_crossing && m.pos.y < -1679.5 && m.pos.y > -1682.0;
         }
         assert!(flagged, "not on a crossing on the piece: {:?}", m.pos);
+    }
+
+    #[test]
+    fn p1h_on_a_footpath_laid_along_a_street_lane_they_walk_the_strip_off_its_footprint() {
+        // Wuluju: footpath 1033 (2.6 m) 0.9 m beside the axis of the 3 m street lane 1127: its
+        // walkers stood in the lane and its cars waited 275 s. They walk the strip of the path
+        // beyond the lane's footprint and a body, either way along it
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(479.5, -1120.0), p(479.5, -960.0)], LaneKind::Street, 3.0)); // 0
+        net.lanes.push(lane(vec![p(480.4, -1080.0), p(480.4, -965.0)], LaneKind::Sidewalk, 2.6)); // 1 northbound
+        net.build_grid();
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let (lo, hi) = ped.free_strip(&net, 1).expect("a strip");
+        assert!(lo < hi && lo > 0.8 && hi < 1.1, "{lo} {hi}");
+        for (a, b, x0) in [(0.0, 115.0, 480.4), (115.0, 0.0, 480.4)] {
+            let mut walk = PedWalk::new(vec![Leg { lane: 1, a, b }], false, 0.5);
+            let y0 = if a < b { -1080.0 } else { -965.0 };
+            let mut m = me(4, DVec2::new(x0, y0), 1.3);
+            let mut worst = f64::MAX;
+            for k in 0..900 {
+                let v = frame(&net, &mut ped, None, &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+                let _ = v;
+                if k > 100 {
+                    worst = worst.min(m.pos.x - 479.5);
+                }
+            }
+            assert!(worst > 1.5 + 0.28 - 0.05, "into the lane's footprint walking {a}->{b}: {worst:.2}");
+        }
+        // a path well clear of every lane has no strip
+        net.lanes[1].points.iter_mut().for_each(|q| q.x += 3.0);
+        let ped = PedNet::build(&net);
+        assert!(ped.free_strip(&net, 1).is_none());
     }
 
     #[test]
