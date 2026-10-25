@@ -918,11 +918,15 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     // place stuck (people, a standing lead: it is not coming while that holds), nor while it
     // stands outside it waiting for me through its lead or the junction's answer (`held_by`:
     // it is not coming before I go) - both made rings of mutual waits
-    // (refused this pass, standing outside this meeting place: it stays where it stands this frame,
-    // `refused` below - in the box at the end of its green but waiting for a third, it is no car
-    // clearing the box: viz3 case21 #59961 on its fresh green waited 45 s for #59951, itself
-    // refused for a queue 32 m on)
-    let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go);
+    // (refused this pass, standing outside this meeting place, for a stretch that begins at or
+    // short of this one: it comes to rest short of it - a refused car stops before the first
+    // stretch it waits for, `Grant::at`; none, held at its line or where it stands - `refused`
+    // below; and in the box at the end of its green it is no car clearing the box: viz3 case21
+    // #59961 on its fresh green waited 45 s for #59951, itself refused for a queue 32 m on. One
+    // refused for a stretch past this one still drives through this one to wait there, so it
+    // counts, as SUMO's car allowed to wait at its internal junction still asks for the entry link)
+    let stops_short = |g: &Grant| g.at.map_or(true, |a| a - (claims[ok].s - o.s) <= foe.theirs.0);
+    let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go && stops_short(&g));
     let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
     if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
         o.committed = true;
@@ -992,11 +996,13 @@ fn will_pass(ctx: &Context, claims: &[Claim], claim_of: &hashbrown::HashMap<usiz
     }
     // SUMO's `willPass` (blockedByFoe drops a foe whose request is not to pass: its planned speed
     // at the link is 0): a foe standing outside the meeting place, not committed to it, that this
-    // pass has refused already (decided before me: the claimants standing refused last frame are
-    // decided first, `decide_in`) stays where it stands this frame - it is not coming. One not
-    // decided yet counts (its answer may be a go); a player's claim always counts (its grant is
-    // not read); so does one blocked by what lets it go on a schedule (a lead moving off): its
-    // refusal may be its block's (a blocked claimant drops nobody), the time test decides
+    // pass has refused already for a stretch at or short of this one (`refused_here`: decided
+    // before me - the claimants standing refused last frame are decided first, `decide_in`) comes
+    // to rest short of this place - it is not coming. One not decided yet counts (its answer may
+    // be a go; also when it is refused afterwards for a third, a hold SUMO would not have: the
+    // order cannot know it); a player's claim always counts (its grant is not read); so does one
+    // blocked by what lets it go on a schedule (a lead moving off): its refusal may be its
+    // block's (a blocked claimant drops nobody), the time test decides
     if refused_here && !o.committed {
         return Pass::Not("refused");
     }
@@ -1272,7 +1278,11 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                                 // ordinary rules decide, its window from rest after its start;
                                 // review9)
                                 let on_schedule = o.blocked && !o.stuck;
-                                if me_inside || (!ahead_goes && !on_schedule) {
+                                // (one before me that stays refused comes to rest short of the
+                                // stretch it waits for, `Grant::at`: past this place, it still
+                                // drives through this one to wait there, and counts)
+                                let stops_short = theirs > mine || out[ok].is_some_and(|g| g.at.map_or(true, |a| a - (claims[ok].s - o.s) <= foe.theirs.0));
+                                if me_inside || (!ahead_goes && !on_schedule && stops_short) {
                                     continue;
                                 }
                                 if ahead_goes {
@@ -2613,6 +2623,33 @@ mod tests {
         let mut me2 = me;
         me2.lead = Some(2);
         assert_eq!(grant_of(&resolve(&js, &[me2, foe]), 1).wait_for, Some(2));
+    }
+
+    /// [round 10 pass 1, safety review probe] A foe standing refused for a stretch PAST our meeting
+    /// place still comes through ours to wait there (a refused car stops just before the stretch it
+    /// waits for; inside the box at a legal waiting place, J9-2): it is no "refused, not coming"
+    /// foe. X eastbound at y = -5 (64), Y northbound (128) to y = 16, Z eastbound at y = 11 (192),
+    /// 40 m out at 8 m/s: Y, refused last frame, waits for Z at a stretch past the Y-X one, so X
+    /// waits for Y. With Z's stretch before X's (the j81 geometry) X goes.
+    #[test]
+    fn pass1_a_foe_refused_for_a_stretch_past_ours_still_comes_through_ours() {
+        let mut net = Network::default();
+        net.lanes.push(piece((-20.0, -5.0), (20.0, -5.0), 0, 64.0));
+        net.lanes.push(piece((0.0, -10.0), (0.0, 16.0), 1, 128.0));
+        net.lanes.push(piece((-60.0, 11.0), (20.0, 11.0), 2, 192.0));
+        net.link(1.5);
+        net.compute_conflicts();
+        let js = Junctions::compile(&net);
+        let m = |l: usize| js.nodes[0].movement_of(l).unwrap();
+        let start = |a: usize, b: usize| js.nodes[0].movements[m(a)].foes.iter().find(|f| f.movement == m(b)).unwrap().mine.0;
+        let x = claim(1, m(0), start(0, 1) - 1.0 - 2.0, 0.0);
+        let mut y = claim(2, m(1), start(1, 0) - 1.0 - 2.0, 0.0);
+        y.refused_last = true;
+        let z = claim(3, m(2), start(2, 1) - 40.0 - 2.0, 8.0);
+        let g = resolve(&js, &[x, y, z]);
+        assert_eq!(grant_of(&g, 2).wait_for, Some(3), "Y waits for Z: {g:?}");
+        assert!(grant_of(&g, 2).at.is_some_and(|a| a > start(1, 0)), "Y's stretch lies past the Y-X one: {g:?}");
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "X let into the place Y drives through: {g:?}");
     }
 
     /// The queue-entry case: the foe ahead stands at the join (in its stretch): the
