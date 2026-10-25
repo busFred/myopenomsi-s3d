@@ -579,21 +579,30 @@ fn meeting_extent(a: &Lane, at: f32, b: &Lane) -> (f32, f32) {
     (before, after)
 }
 
-/// Two lanes of one object that neither cross nor run into one another but whose centre lines
-/// come this close (m) over a stretch meet there: two cars on them touch (`converging_stretch`).
-/// (Lanes of a two-lane road lie 2.3-2.6 m apart: they stay apart.)
-pub const CONVERGE_DIST: f64 = MEET_DIST - 0.6;
-/// ... or whose edges overlap by this much (m), given the two lanes' widths ...
-pub const CONVERGE_EDGE: f64 = 0.3;
+/// The body a converging test sweeps along each lane (`converging_stretch`): the stock car's half
+/// width and half length (1.8 m wide, 5 m long: `AiState::new`'s body, the app's car width). No
+/// margin: two bodies touch when their extents across the gap meet.
+pub const SWEEP_HALF_WIDTH: f64 = 0.9;
+pub const SWEEP_HALF_LENGTH: f64 = 2.5;
 /// ... running the same way there (degrees between their headings at most).
 pub const CONVERGE_HEADING: f32 = 60.0;
 
-/// Where lanes `a` and `b` run side by side closer than `MEET_DIST`: the stretch along `a`
-/// (from, to), the one along `b`, and the least distance between the centre lines - when they
-/// come within `CONVERGE_DIST`, or their edges overlap by `CONVERGE_EDGE`, somewhere on it.
-/// Sampled every half metre of each lane. (Two lanes of one crossing object that run together
-/// before they part, or converge without ending in one place: case07's 5229/5231, 3769/3770,
-/// 1430/1179; the network compiled no meeting place for them and cars met side by side.)
+/// The extent (m) of a body across the line to a lane whose heading differs from its own by
+/// `theta` (degrees): hw cos theta + hl sin theta - its half width square to its own heading, its
+/// half length as the heading turns towards the other.
+fn body_reach(theta: f32) -> f64 {
+    let t = (theta.abs().min(90.0) as f64).to_radians();
+    SWEEP_HALF_WIDTH * t.cos() + SWEEP_HALF_LENGTH * t.sin()
+}
+
+/// Where lanes `a` and `b` run so close that a body on each would touch: the stretch along `a`
+/// (from, to), the one along `b`, and the least distance between the centre lines. One compiled body
+/// sweep per pair, sampled every half metre of each lane (as `compile_swept`): at each sample the
+/// body on this lane and one at the nearest point of the other, each reaching `body_reach` of the
+/// angle between the two headings towards the other, touch when the centre lines are closer than
+/// the two reaches. (Parallel lanes of a road 2.3-2.6 m apart: 1.8 m of bodies, apart; lanes running
+/// together at an angle: the body's length swings in - case07's 5229/5231, 3769/3770, 1430/1179,
+/// viz4 case05 3754-57/3760-65.)
 pub fn converging_stretch(a: &Lane, b: &Lane) -> Option<((f32, f32), (f32, f32), f64)> {
     if a.points.len() < 2 || b.points.len() < 2 {
         return None;
@@ -604,9 +613,11 @@ pub fn converging_stretch(a: &Lane, b: &Lane) -> Option<((f32, f32), (f32, f32),
         let mut s = 0.0f32;
         loop {
             let at = s.min(len);
-            if let Some((_, d)) = y.nearest_point(x.at(at).0) {
+            let (p, h) = x.at(at);
+            if let Some((sp, d)) = y.nearest_point(p) {
                 least = least.min(d);
-                if d < MEET_DIST {
+                let theta = wrap_deg(h - y.at(sp).1);
+                if d < 2.0 * body_reach(theta) {
                     s0 = s0.min(at);
                     s1 = s1.max(at);
                 }
@@ -620,9 +631,7 @@ pub fn converging_stretch(a: &Lane, b: &Lane) -> Option<((f32, f32), (f32, f32),
     };
     let (a0, a1, least_a) = stretch(a, b)?;
     let (b0, b1, least_b) = stretch(b, a)?;
-    let least = least_a.min(least_b);
-    let edges = (a.width as f64 + b.width as f64) * 0.5 - least;
-    (least < CONVERGE_DIST || edges >= CONVERGE_EDGE).then_some(((a0, a1), (b0, b1), least))
+    Some(((a0, a1), (b0, b1), least_a.min(least_b)))
 }
 
 /// Where two polylines cross: the distance along each (ends excluded).
@@ -1309,10 +1318,11 @@ impl Network {
         if (a.start() - b.start()).truncate().length() <= 0.5 || self.one_way_pieces(i, j) || self.links_within(i, j, 3) || self.links_within(j, i, 3) {
             return false;
         }
-        // (lanes whose boxes lie further apart than that never come so close)
+        // (lanes whose boxes lie further apart than two bodies' half diagonals never touch)
         let bbox = |l: &Lane| l.points.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)));
         let (ba, bb) = (bbox(a), bbox(b));
-        if ba.0 > bb.2 + MEET_DIST || bb.0 > ba.2 + MEET_DIST || ba.1 > bb.3 + MEET_DIST || bb.1 > ba.3 + MEET_DIST {
+        let reach = 2.0 * SWEEP_HALF_WIDTH.hypot(SWEEP_HALF_LENGTH);
+        if ba.0 > bb.2 + reach || bb.0 > ba.2 + reach || ba.1 > bb.3 + reach || bb.1 > ba.3 + reach {
             return false;
         }
         let Some(((a0, a1), (b0, b1), _)) = converging_stretch(a, b) else { return false };
