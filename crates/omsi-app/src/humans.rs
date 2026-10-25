@@ -3103,9 +3103,13 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let width = (lane.width as f64).max(1.0);
     let crosses = ped.map(|p| !p.crossings(net, leg.lane).is_empty()).unwrap_or(false);
     // [ROLLBACK r4c-P1] on the crossing from the first steps off the kerb to the far kerb, on
-    // every piece of it (the cars of the lanes ahead stop for them)
+    // every piece of it (the cars of the lanes ahead stop for them); [P2-3] one begun straight
+    // from the last piece of another (no pavement between them: a junction object's chained
+    // crossings) from its first step, the flag kept (it dropped for the first 0.3 m and came
+    // back: 83 such flips at d24's object 6346)
+    let from_crossing = walk.leg > 0 && ped.is_some_and(|p| core_piece(p, net, at.lights, walk.legs[walk.leg - 1].lane));
     me.on_crossing = match walk.cross {
-        Some(c) if c.on(walk.leg) => walk.leg > c.from || walk.s > 0.3 || c.back,
+        Some(c) if c.on(walk.leg) => walk.leg > c.from || walk.s > 0.3 || c.back || (walk.leg == c.from && from_crossing),
         _ => false,
     };
     let crossing = lane.traffic_light.is_some() || crosses || me.on_crossing;
