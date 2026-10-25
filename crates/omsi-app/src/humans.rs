@@ -9797,6 +9797,54 @@ mod ped_tests {
     }
 
     #[test]
+    fn p1b_beijingcitys_one_way_chain_walked_backwards_finds_its_lit_stubs_light() {
+        // the 6132-6142 geometry (08:39 case04): a crossing object's chain west to east, all one
+        // way: a lit stub at the west kerb, unlit pieces over the carriageway, a piece onto the
+        // east kerb. A walker comes down the east pavement to the chain's far end: across it
+        // against its way, under the stub's light (Junctions::crossing_light's chain mapping)
+        let mut net = Network::default();
+        let object = |mut l: omsi_sim::traffic::Lane, path: u16| {
+            l.source = 2;
+            l.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 9, path });
+            l
+        };
+        let street = |x: f64, from: f64, to: f64| (0..=20).map(|k| p(x, from + (to - from) * k as f64 / 20.0)).collect::<Vec<_>>();
+        net.lanes.push(object(lane(street(-1.75, -15.0, 15.0), LaneKind::Street, 3.5), 0)); // 0
+        net.lanes.push(object(lane(street(1.75, 15.0, -15.0), LaneKind::Street, 3.5), 1)); // 1
+        let piece = |a: f64, b: f64, path: u16| object(lane(vec![p(a, 0.0), p(b, 0.0)], LaneKind::Sidewalk, 2.0), path);
+        net.lanes.push(piece(-5.5, -4.0, 2)); // 2 the lit stub at the west kerb
+        net.lanes.push(piece(-4.0, 0.0, 3)); // 3 over the southbound lane
+        net.lanes.push(piece(0.0, 4.0, 4)); // 4 over the northbound lane
+        net.lanes.push(piece(4.0, 5.5, 5)); // 5 onto the east kerb (6142)
+        net.lanes.push(lane(vec![p(5.5, 20.0), p(5.5, 0.0)], LaneKind::Sidewalk, 2.5)); // 6 east pavement
+        net.lanes.push(lane(vec![p(-5.5, 0.0), p(-5.5, -20.0)], LaneKind::Sidewalk, 2.5)); // 7 west pavement
+        for l in 2..=5 {
+            net.lanes[l].one_way = true;
+        }
+        net.lanes[2].traffic_light = Some((0, 0));
+        net.link(1.5);
+        net.compute_conflicts();
+        let junctions = omsi_traffic::Junctions::compile(&net);
+        for l in [3, 4] {
+            assert_eq!(junctions.crossing_light(&net, l), Some((0, 0)), "piece {l} has the stub's light");
+        }
+        let mut ped = PedNet::build(&net);
+        let lights = JunctionLights { net: &net, junctions, states: vec![Cell::new(RED)] };
+        let mut walk = PedWalk::new(vec![Leg { lane: 6, a: 6.0, b: 20.0 }], true, 0.0);
+        let mut m = me(5, DVec2::new(5.5, 14.0), 1.3);
+        for k in 0..600 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert_eq!(m.decision, Some("red light"), "at {:?}", m.pos);
+        assert!(m.pos.x > 3.5, "on the carriageway on red: {:?}", m.pos);
+        lights.states[0].set(GREEN);
+        for k in 600..1200 {
+            frame(&net, &mut ped, Some(&lights), &[], k as f64 * 0.05, &mut m, &mut walk, 0.05);
+        }
+        assert!(m.pos.x < -5.0, "across against the chain's way on green: {:?}", m.pos);
+    }
+
+    #[test]
     fn r6l1_a_metre_lit_stub_is_walked_and_its_light_holds_them_at_its_kerb() {
         // Taijichang j28 (case09): a kerb corner piece, a 1.005 m stub lit 18.2, the pieces
         // over the road; the chain's other side is lit 18.1 (here: a second street beyond an
