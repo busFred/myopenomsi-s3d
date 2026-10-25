@@ -174,10 +174,13 @@ fn in_corridor(q: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> bool {
 /// [P1e] SUMO's `pedestrian.striping.jamtime` (300 s, MSFrame.cpp): a pedestrian blocked this
 /// long is jammed and squeezes on.
 const PED_JAM_TIME: f32 = 300.0;
-/// [P1e] SUMO's `jamtime.crossing` (10 s): on a crossing, or blocked by a vehicle that has
-/// itself waited longer than this on a shared walking area (MSPModel_Striping PState::walk:
-/// "treat shared walkingarea like a crossing to avoid deadlocking vehicles"): here a vehicle
-/// standing for people (`SeenCar::yielding`), which waits for the walker it pins.
+/// [P1e] SUMO's `jamtime.crossing` (10 s): SUMO applies it on a crossing, and on a shared
+/// walking area to a pedestrian blocked by a vehicle that has itself waited longer than this
+/// (MSPModel_Striping PState::walk: "treat shared walkingarea like a crossing to avoid
+/// deadlocking vehicles"). On a pavement it is our adaptation, not SUMO's: OMSI lays footpaths
+/// where vehicles stand (parking strips, pull-outs), so a pavement walker pinned by a vehicle
+/// standing for people (`SeenCar::yielding`) that has stood this long is treated as on SUMO's
+/// shared walking area.
 const PED_JAM_TIME_CROSSING: f32 = 10.0;
 /// [P1e] SUMO's `pedestrian.striping.jamfactor` (0.25): the share of the pace a jammed
 /// pedestrian squeezes on at.
@@ -209,9 +212,11 @@ struct BoxWait {
     car_wait: f32,
     /// [P1c/e] Seconds blocked by a standing box with no way past it, and whether that made
     /// them "jammed" (SUMO's PState::walk: `jamtime`, `jamfactor`): on at a quarter of their
-    /// pace, the boxes not solid to them, until the way ahead is clear.
+    /// pace through that box (`through`, not solid to them; every other one is), until the way
+    /// ahead is clear of it.
     jam: f32,
     jammed: bool,
+    through: Option<Block>,
     /// [ROLLBACK around-86] Going round a standing bus or lorry: the two corners of its box to
     /// walk through (the near end, the far side of it), the one on its way and the seconds left.
     around: Option<([DVec2; 2], usize, f32)>,
@@ -273,13 +278,21 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
         bw.car_wait = 0.0;
         bw.jam = 0.0;
         bw.jammed = false;
+        bw.through = None;
         return BoxOutcome::Done;
     }
-    // [P1e] jammed: on through it at a quarter of the pace (the crowd step takes no box as solid
-    // for them meanwhile), until the way ahead is clear
+    // [P1e] jammed: on through the box they are jammed at, at a quarter of the pace (the crowd
+    // step takes that box, and only that one, as not solid for them), until the way ahead is
+    // clear of it; another box in the way ends the jam and its clock starts again
     if bw.jammed {
-        want.vel = wv * PED_JAM_FACTOR;
-        return BoxOutcome::Done;
+        let same = blocker.zip(bw.through).is_some_and(|(k, b)| blocks[k].center == b.center);
+        if same {
+            want.vel = wv * PED_JAM_FACTOR;
+            return BoxOutcome::Done;
+        }
+        bw.jammed = false;
+        bw.through = None;
+        bw.jam = 0.0;
     }
     // [ROLLBACK around-86] a bus or a lorry (not a car or a post) that the way leads
     // into: round its nearer end by its bounding box, not into its side and waiting
@@ -320,6 +333,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     bw.jam += dt;
     if bw.jam >= jam_time(on_crossing, blocker.and_then(|k| block_car.get(k).copied().flatten()).and_then(|c| cars.get(c))) {
         bw.jammed = true;
+        bw.through = blocker.map(|k| blocks[k]);
         want.vel = wv * PED_JAM_FACTOR;
         return BoxOutcome::Done;
     }
@@ -4139,6 +4153,9 @@ pub struct Humans {
     message: Option<String>,
     /// Frames ticked, total and longest tick (ms).
     tick_stats: (u32, f64, f64),
+    /// [P1e] Counted for the gate (`summary`): person-seconds of strollers jammed, and of
+    /// people on foot inside the box of a vehicle moving at 0.5 m/s or more (none should be).
+    jam_stats: (f64, f64),
     /// Where the time of this tick went (stage, ms since the one before), for the slow
     /// ticks OMSI_PROFILE reports.
     tick_stages: Vec<(&'static str, f64)>,
@@ -4379,6 +4396,7 @@ impl Humans {
             center: DVec3::ZERO,
             message: None,
             tick_stats: (0, 0.0, 0.0),
+            jam_stats: (0.0, 0.0),
             tick_stages: Vec::new(),
             bus_motion: HashMap::new(),
             map_humans_done: false,
@@ -6884,6 +6902,7 @@ impl Humans {
                 total / n as f64
             ));
         }
+        out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -7265,9 +7284,11 @@ impl Humans {
                 space: 0,
                 fixed,
                 // [ROLLBACK nocoll-93] people on foot touch nothing but the vehicles (`solid`):
-                // not each other, not the scenery ([P1e] and, jammed, not the vehicles either)
+                // not each other, not the scenery ([P1e] jammed, not the box they squeeze
+                // through either, `through`)
                 ghost: true,
-                solid: VEHICLE_COLLISIONS && !p.boxes.jammed,
+                solid: VEHICLE_COLLISIONS,
+                through: p.boxes.through.filter(|_| p.boxes.jammed).map(|b| b.center),
                 // ([P1c] on a pavement the path holds them even on the way past a box: widened
                 // by what `along_box` lets a route lie off it)
                 corridor: match (p.detour > 0.0, pavement_walker(p)) {
@@ -7284,6 +7305,20 @@ impl Humans {
         let near_blocks: Vec<Block> = blocks.into_iter().zip(near).filter(|(_, n)| *n).map(|(b, _)| b).collect();
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
+        // ([P1e] the gate's counts: jammed strollers, and anybody inside a moving vehicle's box)
+        {
+            let moving: Vec<Block> = near_blocks.iter().copied().filter(|b| b.vel.length() >= 0.5).collect();
+            let grid = crowd::BlockGrid::new(&moving, 0.0, crowd::BLOCK_CELL);
+            for (k, w) in g.iter().enumerate() {
+                let p = &self.people[who[k]];
+                if p.boxes.jammed {
+                    self.jam_stats.0 += dt as f64;
+                }
+                if grid.any_near(w.pos, |b| moving[b].closest(w.pos).1) {
+                    self.jam_stats.1 += dt as f64;
+                }
+            }
+        }
         let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
         let mut moved = vec![false; self.people.len()];
         for (k, w) in ground {
