@@ -7414,7 +7414,21 @@ impl Humans {
         // bus pulled into a bay over another stop's waiting places: Wuluju #208 stood 280 s with
         // seven waiters of stop 2296499 0.1 m inside its flank) steps out of it, to a body clear of
         // its side: a waiter never stands inside a vehicle (SUMO's waiting persons are on the
-        // platform), and the vehicle can then leave
+        // platform), and the vehicle can then leave. The body is the one the cars' people test
+        // holds them by (`omsi_traffic::Vehicle::obb`; the drawn bounding box is smaller)
+        let standing: Vec<Block> = traffic
+            .map(|t| {
+                t.cars
+                    .iter()
+                    .filter(|c| c.ai.state.speed < 0.5 && (c.vehicle.position - self.center).length() < 320.0)
+                    .map(|c| {
+                        let o = c.ai.obb();
+                        Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let standing_grid = crowd::BlockGrid::new(&standing, BODY_OUTSIDE, crowd::BLOCK_CELL);
         for p in self.people.iter_mut() {
             let State::Pax(x) = &mut p.state else { continue };
             if x.inside.is_some() || x.task != pax::Task::WaitingForBus || p.place != Place::Ground {
@@ -7422,9 +7436,9 @@ impl Humans {
             }
             let here = p.position.truncate();
             let mut out = None;
-            block_grid.for_each_near(here, |k| {
-                let b = &blocks[k];
-                if out.is_some() || block_car[k].is_none() || b.vel.length() >= 0.5 {
+            standing_grid.for_each_near(here, |k| {
+                let b = &standing[k];
+                if out.is_some() {
                     return;
                 }
                 let (q, inside) = b.closest(here);
