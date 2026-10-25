@@ -714,6 +714,11 @@ fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize
     false
 }
 
+/// The longest ring of standing claimants `Simulation::break_rings` follows (links): a search bound
+/// past the longest ring seen in the fixtures and game runs (nine cars at viz case01's AndingR
+/// crossing, area N).
+pub const RING_MAX: usize = 16;
+
 /// Links of a chain followed by `held_by`, `held_by_standing` and `held_off` (a three-car ring).
 const LEAD_CHAIN: usize = 4;
 

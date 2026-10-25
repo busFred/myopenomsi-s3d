@@ -1695,6 +1695,76 @@ impl Simulation {
             vehicles[a].mutual_gap = 0.0;
             vehicles[b].mutual_gap = 0.0;
         }
+        self.break_rings(vehicles, claim_of, &by_id);
+    }
+
+    /// Rings of three or more standing claimants each refused by the junction for the next (its
+    /// `wait_for`), at one junction, none at a red light, every claim filed standing: the pair
+    /// ease generalised (SUMO resolves such deadlocks only by its jam teleport; ours is the last
+    /// resort, counted as an ease). One member goes: the first, by id, whose body is not held by
+    /// the one it waits for (its body block or lead: that one could not go anyway); the one it
+    /// waits for eases off for it (`Vehicle::ease_for`), so its claim alone no longer sees that
+    /// foe - every other hold of the released car stays, people, lights, leads and other foes
+    /// included.
+    fn break_rings(&self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], by_id: &HashMap<u64, usize>) {
+        // (the junction refusal of a standing claimant filed standing, not at red, not eased)
+        let link = |i: usize| -> Option<(usize, usize)> {
+            let v = &vehicles[i];
+            if v.state.speed >= STANDING_SPEED || v.ease_for.is_some() || v.last.hold != Some(crate::reservation::Hold::Foe) {
+                return None;
+            }
+            let c = &self.claims.get(claim_of[i]?)?.0;
+            if c.light_red || !c.standing() || c.vehicle != i {
+                return None;
+            }
+            let next = *by_id.get(&v.last.wait_for?)?;
+            Some((next, c.junction))
+        };
+        let n = vehicles.len();
+        let mut eases: Vec<(usize, (u64, usize, f32))> = Vec::new();
+        let mut done: Vec<bool> = vec![false; n];
+        for start in 0..n {
+            if done[start] {
+                continue;
+            }
+            let mut path: Vec<usize> = vec![start];
+            let mut junction = None;
+            let mut ring = false;
+            let mut at = start;
+            for _ in 0..crate::reservation::RING_MAX {
+                let Some((next, j)) = link(at) else { break };
+                if *junction.get_or_insert(j) != j {
+                    break;
+                }
+                if next == start {
+                    ring = path.len() >= 3;
+                    break;
+                }
+                if path.contains(&next) {
+                    break;
+                }
+                path.push(next);
+                at = next;
+            }
+            for &k in &path {
+                done[k] = true;
+            }
+            let (true, Some(j)) = (ring, junction) else { continue };
+            if path.iter().any(|&k| vehicles[k].ease_for.is_some()) {
+                continue;
+            }
+            // (the member to go: not held by the body of the one it waits for; the lowest id)
+            let target = |k: usize| path[(path.iter().position(|&x| x == k).unwrap() + 1) % path.len()];
+            let free = |k: usize| {
+                let t = vehicles[target(k)].id;
+                vehicles[k].last.body_block != Some(t) && vehicles[k].last.lead_id != Some(t)
+            };
+            let Some(&go) = path.iter().filter(|&&k| free(k)).min_by_key(|&&k| vehicles[k].id) else { continue };
+            eases.push((target(go), (vehicles[go].id, j, 0.0)));
+        }
+        for (k, e) in eases {
+            vehicles[k].ease_for = Some(e);
+        }
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
