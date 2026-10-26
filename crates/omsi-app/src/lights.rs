@@ -546,12 +546,14 @@ struct NearLights {
 static NEAR_LIGHTS: std::sync::Mutex<Option<NearLights>> = std::sync::Mutex::new(None);
 
 /// Are an AI vehicle's lamp glows drawn this frame: only while the vehicle itself can be, within
-/// the renderer's object distance `max_obj_dist` held out to `MAX_OBJ_DIST_HOLD` plus its half
-/// length (as `Renderer` culls its meshes; 0: no limit). A lamp glows at a few pixels at any
+/// the drawn reach (`traffic::draw_reach`: the renderer's object distance `max_obj_dist` held out
+/// to `MAX_OBJ_DIST_HOLD`, as `Renderer` culls its meshes, and no farther than the loaded tiles'
+/// radius `loaded`) plus its half length (a reach of 0: no limit). A lamp glows at a few pixels at any
 /// distance (corona.wgsl), so a lamp of a car that is not drawn would float in the dark on its own,
 /// and the traffic's perceptual horizon, capped at that reach, would not hold by night.
-pub fn lamps_drawn(v: &VehicleInstance, camera_pos: DVec3, max_obj_dist: f32) -> bool {
-    max_obj_dist <= 0.0 || (v.position - camera_pos).length() <= (max_obj_dist * omsi_render::MAX_OBJ_DIST_HOLD + v.ty.half_length().unwrap_or(0.0)) as f64
+pub fn lamps_drawn(v: &VehicleInstance, camera_pos: DVec3, max_obj_dist: f32, loaded: f64) -> bool {
+    let reach = crate::traffic::draw_reach(max_obj_dist as f64, loaded);
+    reach <= 0.0 || (v.position - camera_pos).length() <= reach + v.ty.half_length().unwrap_or(0.0) as f64
 }
 
 /// Fill the scene's lights for this frame.

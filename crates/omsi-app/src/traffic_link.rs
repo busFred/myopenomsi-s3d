@@ -79,6 +79,7 @@ pub(crate) fn traffic_inputs(
     humans: Option<&humans::Humans>,
     player: Option<&Player>,
     render: &omsi_render::RenderOptions,
+    loaded: f64,
 ) {
     if let Some(c) = cam {
         t.viewer = Some(
@@ -86,7 +87,8 @@ pub(crate) fn traffic_inputs(
                 .with_screen(screen.0, screen.1)
                 .with_lamps(t.lamps_lit())
                 .with_extent(extent)
-                .with_culling(render.min_obj_size, render.max_obj_dist),
+                .with_culling(render.min_obj_size, render.max_obj_dist)
+                .with_loaded(loaded),
         );
         // which loaded edges A4 routes away from follows the eye and its horizon
         t.mark_edges_in_sight();

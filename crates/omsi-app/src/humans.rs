@@ -11296,6 +11296,7 @@ mod ped_tests {
             px_height: 900.0,
             horizon_fov: 0.0,
             lamps_lit: false,
+            loaded: 0.0,
         };
         let ahead = |d: f64| DVec3::new(0.0, d, 0.0);
         assert!(!stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(300.0)), "in frame at 300 m");
