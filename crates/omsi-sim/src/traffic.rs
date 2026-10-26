@@ -150,7 +150,11 @@ pub const NEIGHBOUR_EDGE_GAP: f32 = 2.0;
 /// How much of `unsched_vehgroups.txt` group `pool`'s traffic a path carries: its `[rule]
 /// trafficdensity` for the group (`rules`, see `Lane::group_density`: the last rule of a
 /// group counts), else the group's default there (`defaults`): 0 none, for the first group 1
-/// its medium density, for any other k that of the k-th group on the same path.
+/// its medium density, for any other k that of the k-th group on the same path. A default
+/// that names the group itself (BeijingCity's coaches: group 2 with default 2) reads as the
+/// medium density too, like the first group's 1: the map closes that group explicitly on
+/// hundreds of lanes, which only makes sense where the default is open (user decision M11-1,
+/// 2026-10-26). A default chain that comes back to a group through another one is none.
 pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 {
     let mut u = pool;
     // (a default naming another group that names this one again would go round for ever)
@@ -161,6 +165,7 @@ pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 
         match defaults.get(u).copied().unwrap_or(0) {
             d if d <= 0 => return 0.0,
             _ if u == 0 => return 1.0,
+            d if d as usize - 1 == u => return 1.0,
             d => u = d as usize - 1,
         }
     }
@@ -5182,5 +5187,19 @@ mod aurora_pool_tests {
         assert_eq!(lane.pool_density(&defaults, 5), 0.0);
         lane.group_density.push((1, 0.5));
         assert_eq!(lane.pool_density(&defaults, 1), 0.5);
+    }
+
+    #[test]
+    fn a_self_referring_default_is_the_medium_density() {
+        // BeijingCity's coaches: group 2 (index 1) with default 2; open where no rule names
+        // them, closed where a rule does; a two-step cycle stays none.
+        let mut lane = LaneBuilder::arc(DVec3::ZERO, 0.0, 100.0, 0.0, 0.0, LaneKind::Street, 3.0);
+        lane.group_density = vec![(0, 1.0)];
+        let defaults = [1, 2, 4, 3];
+        assert_eq!(lane.pool_density(&defaults, 1), 1.0);
+        assert_eq!(lane.pool_density(&defaults, 2), 0.0);
+        assert_eq!(lane.pool_density(&defaults, 3), 0.0);
+        lane.group_density.push((1, 0.0));
+        assert_eq!(lane.pool_density(&defaults, 1), 0.0);
     }
 }
