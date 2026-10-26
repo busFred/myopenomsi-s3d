@@ -1679,6 +1679,10 @@ struct PedWalk {
     /// once more before they step on. `.2` the stripe they would take (`crossing_stripe`, m
     /// right of the first piece's axis): where on the kerb they step on.
     kerb_go: Option<(usize, f32, f32)>,
+    /// The current leg is the way back from a map-parked car they turned round at
+    /// (`turn_round`): a second one on it is waited out by SUMO's jam rule, not turned at again
+    /// (two parked cars over one path held strollers turning to and fro between them).
+    walled: bool,
 }
 
 impl PedWalk {
@@ -1694,6 +1698,7 @@ impl PedWalk {
             kerb_hold: false,
             spot: None,
             kerb_go: None,
+            walled: false,
         }
     }
 
@@ -1706,6 +1711,7 @@ impl PedWalk {
         self.spot = None;
         self.kerb_hold = false;
         self.kerb_go = None;
+        self.walled = false;
     }
 
     /// Round where they stand on a pavement leg (`BoxOutcome::Wall`): back along it to the end
@@ -1722,6 +1728,7 @@ impl PedWalk {
         self.kerb_hold = false;
         self.spot = None;
         self.kerb_go = None;
+        self.walled = true;
     }
 
     /// Caught by the change before the middle of the crossing: back to the
@@ -8775,7 +8782,7 @@ impl Humans {
             let z = p.position.z;
             let off_lanes = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY));
             // (a stroller may turn round at a wall; somebody walking somewhere waits it out)
-            let turns = matches!(&p.state, State::Strolling(w) if w.roam);
+            let turns = matches!(&p.state, State::Strolling(w) if w.roam && !w.walled);
             let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, &mut wants[i], &blocks, &block_grid, &block_car, &cars, &off_lanes, dt);
             if outcome == BoxOutcome::Wall {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
