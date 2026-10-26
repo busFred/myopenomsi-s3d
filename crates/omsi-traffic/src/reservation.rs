@@ -149,6 +149,17 @@ impl Claim {
     pub fn standing(&self) -> bool {
         self.speed < STANDING_SPEED || (self.was_standing && self.speed <= 1.0)
     }
+
+    /// Where its front comes to rest behind a standing lead - or a body across its way, which
+    /// perception gives as its lead - in its origin's distances (`s` + `front` + the gap,
+    /// `lead_gap`); INFINITY with no lead or one that moves. Not people: they clear on their own
+    /// schedule (a stand for people is `stuck`'s, `held_off`).
+    pub fn lead_rest(&self) -> f32 {
+        match self.lead_gap {
+            Some((gap, v)) if v < STANDING_SPEED => self.s + self.front + gap,
+            _ => f32::INFINITY,
+        }
+    }
 }
 
 /// Why a vehicle waits.
@@ -1013,6 +1024,15 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // held so myself: my window is no more real than its, and two such would let each other go
     if !their_inside && !o.committed && !c.blocked && held_off(claims, claim_of, plain, ok, c.vehicle) {
         return Pass::Not("held_off");
+    }
+    // SUMO's `setRequest` (MSVehicle.cpp: a link is requested only when the planned speed after
+    // the leader constraint is above `NUMERICAL_EPS_SPEED`) and `willPass`: a foe standing outside
+    // the meeting place whose front comes to rest short of it behind a standing lead or a body
+    // across its way (`Claim::lead_rest`) is not coming while that holds, whatever its why names
+    // (a car at its zipper waiting place 2 m behind a lead held at red is labelled Junction,
+    // neither blocked nor stuck). When the lead moves off, its window from rest counts again
+    if !their_inside && !o.committed && o.standing() && o.lead_rest() <= foe.theirs.0 {
+        return Pass::Not("stops_short");
     }
     // SUMO's `willPass` (blockedByFoe drops a foe whose request is not to pass: its planned speed
     // at the link is 0): a foe standing outside the meeting place, not committed to it, that this
@@ -1930,6 +1950,39 @@ mod tests {
         both[0].clear_ahead = 1.0;
         let g = resolve(&js, &both);
         assert!(grant_of(&g, 1).go && grant_of(&g, 1).leader_go == 0, "{g:?}");
+    }
+
+    #[test]
+    fn will_pass_a_foe_standing_behind_its_standing_lead_short_of_the_meeting_place_is_not_coming() {
+        // 1 m out, standing, from rest it would be there before I am out (the test below) - but
+        // its standing lead 0.5 m ahead of its front stops it short of the meeting place
+        // (`lead_rest`), whatever its why names: neither held, blocked nor stuck (a car at its
+        // zipper waiting place, labelled Junction). SUMO's `setRequest`: no request at v = 0
+        let (_, js, mut claims) = held_main_road_foe(1.0, 3.0, false);
+        claims[1].held = false;
+        claims[1].lead_gap = Some((0.5, 0.0));
+        let g = resolve(&js, &claims);
+        assert!(grant_of(&g, 1).go, "{g:?}");
+        // its lead 3 m on, past the meeting place's start: it can come, and it counts
+        claims[1].lead_gap = Some((3.0, 0.0));
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // its lead 0.5 m on but moving off: it counts, its window from rest
+        claims[1].lead_gap = Some((0.5, 1.0));
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // people stopping it there: not this rule (they clear on their own schedule; `held_off`
+        // drops a foe stuck for people)
+        claims[1].lead_gap = None;
+        claims[1].clear_ahead = claims[1].front + 0.5;
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        // rolling up to a standing lead it registers its request (SUMO: v > eps): the time test decides
+        claims[1].clear_ahead = f32::INFINITY;
+        claims[1].lead_gap = Some((0.5, 0.0));
+        claims[1].speed = 6.0;
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
     }
 
     #[test]

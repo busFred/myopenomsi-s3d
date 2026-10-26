@@ -1362,11 +1362,14 @@ impl Simulation {
                     // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                     // answer or a full exit)
                     blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull | Why::KeepClear),
-                    // (people or a zebra in front of it, or a lead that stands too: nothing that
-                    // lets it go on a schedule, as a light or a lead moving off does)
                     // in the box when its light turned: it clears it (rule F)
                     clearing: j.clearing && !light_red,
                     in_box_at_turn: j.in_box_at_turn && !light_red,
+                    // (people or a zebra in front of it, or a lead that stands too: nothing that
+                    // lets it go on a schedule, as a light or a lead moving off does. A car whose
+                    // why names its junction - its zipper waiting place - is not stuck by this,
+                    // but its standing lead still tells its foes where it comes to rest,
+                    // `Claim::lead_rest`, `will_pass`)
                     stuck: v.is_held()
                         && match v.last.why {
                             Why::People | Why::Zebra => true,
