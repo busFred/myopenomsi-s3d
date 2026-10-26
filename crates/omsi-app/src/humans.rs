@@ -1679,10 +1679,15 @@ struct PedWalk {
     /// once more before they step on. `.2` the stripe they would take (`crossing_stripe`, m
     /// right of the first piece's axis): where on the kerb they step on.
     kerb_go: Option<(usize, f32, f32)>,
-    /// The current leg is the way back from a map-parked car they turned round at
-    /// (`turn_round`): a second one on it is waited out by SUMO's jam rule, not turned at again
-    /// (two parked cars over one path held strollers turning to and fro between them).
-    walled: bool,
+    /// The current leg is the way back from a map-parked car they turned round at (`turn_round`).
+    from_wall: bool,
+    /// Ends of the stroll they found closed in a row: a wall, or a dead end that walls make (a
+    /// node whose other ways are all walled, `PedNet::walls`). Two: both ends of where they are
+    /// are closed - a pocket.
+    closed_ends: u8,
+    /// Caught in a pocket between walls (`closed_ends` 2): they stand idle there, off SUMO's jam
+    /// clock (nothing they wait for will move), until the out-of-sight removal takes them.
+    pocket: bool,
 }
 
 impl PedWalk {
@@ -1698,7 +1703,9 @@ impl PedWalk {
             kerb_hold: false,
             spot: None,
             kerb_go: None,
-            walled: false,
+            from_wall: false,
+            closed_ends: 0,
+            pocket: false,
         }
     }
 
@@ -1711,11 +1718,12 @@ impl PedWalk {
         self.spot = None;
         self.kerb_hold = false;
         self.kerb_go = None;
-        self.walled = false;
+        self.from_wall = false;
     }
 
     /// Round where they stand on a pavement leg (`BoxOutcome::Wall`): back along it to the end
-    /// it came from, and on from there as a stroll goes on (`plan_next_leg`, never straight back).
+    /// it came from, and on from there as a stroll goes on (`plan_next_leg`, never straight back,
+    /// never onto a walled path); a closed end counted (`closed_ends`, `pocket`).
     fn turn_round(&mut self, net: &Network) {
         let Some(&cur) = self.legs.get(self.leg) else { return };
         let here = cur.dist(self.s.min(cur.len()));
@@ -1728,7 +1736,9 @@ impl PedWalk {
         self.kerb_hold = false;
         self.spot = None;
         self.kerb_go = None;
-        self.walled = true;
+        self.from_wall = true;
+        self.closed_ends += 1;
+        self.pocket = self.closed_ends >= 2;
     }
 
     /// Caught by the change before the middle of the crossing: back to the
@@ -2811,6 +2821,10 @@ struct PedNet {
     /// How many lanes of the traffic network are in (the network only grows: tiles bring
     /// their lanes and the indices stay).
     built: usize,
+    /// The paths a map-parked car closes for strollers (`BoxOutcome::Wall`), with where along
+    /// them it was met: dead ends of the stroll network, as a walking area edge SUMO leaves
+    /// unconnected; the way on (`next_leg`) and the strollers' placer never take them.
+    walls: HashMap<usize, Vec<f32>>,
 }
 
 impl PedNet {
@@ -2826,6 +2840,7 @@ impl PedNet {
             nodes: Vec::new(),
             cells: HashMap::new(),
             built: 0,
+            walls: HashMap::new(),
         };
         p.extend(net);
         log::info!(
@@ -3008,7 +3023,7 @@ impl PedNet {
             .get(node)?
             .iter()
             .copied()
-            .filter(|(l, _)| !twin(*l))
+            .filter(|(l, _)| !twin(*l) && !self.walls.contains_key(l))
             .collect();
         // the way on rather than back: a path leaving the junction within 110° of the way
         // the walker came (there usually is one - a pavement goes on past a side street),
@@ -3372,6 +3387,20 @@ fn plan_next_leg(ped: Option<&PedNet>, net: &Network, walk: &mut PedWalk, rng: &
                 Leg { lane: leg.lane, a: leg.b, b: leg.a }
             }
         });
+    // (a dead end turned at - straight back along the path they came - where the way on is closed
+    // by walls, or right after a wall: another closed end; any other way on opens the pocket)
+    let node = ped.and_then(|p| p.end_node(net, &leg));
+    let uturn = next.lane == leg.lane;
+    let walled_here = match (ped, node) {
+        (Some(p), Some(n)) => p.out.get(n).is_some_and(|v| v.iter().any(|(l, _)| *l != leg.lane && p.walls.contains_key(l))),
+        _ => false,
+    };
+    if uturn && (walled_here || walk.from_wall) {
+        walk.closed_ends += 1;
+        walk.pocket = walk.closed_ends >= 2;
+    } else if !uturn {
+        walk.closed_ends = 0;
+    }
     walk.legs.push(next);
     if walk.leg > 6 {
         let gone = walk.leg;
@@ -3389,7 +3418,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let net = at.net;
     let pos2 = me.pos;
     me.walk_pace = me.pace;
-    if walk.leg >= walk.legs.len() {
+    if walk.leg >= walk.legs.len() || walk.pocket {
         me.on_crossing = false;
         return Want::stand(None, Activity::Stand);
     }
@@ -3990,13 +4019,15 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                 let stay = Some(grid_point(grid_index(me.pos))).filter(|q| usable(*q));
                 let near = || ped.and_then(|p| nearest_free_place(p, net, at.queues, me.pos.extend(z), me.pos, KERB_SPOT_REACH, me.id));
                 let spot = || Some(grid_point(grid_index(kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK)))).filter(|q| usable(*q));
-                let q = stay.or_else(near).or_else(spot).unwrap_or_else(|| {
-                    if debug_pax() {
-                        log::info!("t={:.1} pax #{} kerb queue: no free place reached off the lanes: stands where they are", at.time, me.id);
+                match stay.or_else(near).or_else(spot) {
+                    Some(q) => behind(q),
+                    None => {
+                        if debug_pax() {
+                            log::info!("t={:.1} pax #{} kerb queue: no free place reached off the lanes: stands where they are", at.time, me.id);
+                        }
+                        (me.pos, WHERE_THEY_STAND, frame.rank(me.pos).1)
                     }
-                    me.pos
-                });
-                behind(q)
+                }
             });
             KerbPlace { leg: walk.leg, next: next.lane, pos, row, lat, key }
         }
@@ -4026,6 +4057,8 @@ const QUEUE_ROW: f64 = QUEUE_AREA_PER_PERSON / STRIPE_WIDTH;
 const KERB_STEP_BACK: f64 = BODY_OUTSIDE;
 /// The row of a place outside a kerb's waiting area: behind the queue on the pavement.
 const BEHIND_THE_QUEUE: u32 = u32::MAX;
+/// The row of the last fallback: where they stand, no place found (recorded as `kerb_fallback`).
+const WHERE_THEY_STAND: u32 = u32::MAX - 1;
 
 /// A kerb queue is the waiting area of a pedestrian node (`PedNet` node): every kerb and corner
 /// that meets at the node shares it (SUMO builds one walking area per node,
@@ -4270,6 +4303,12 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
             return;
         }
     }
+}
+
+/// Whether strollers may be put down on or routed onto path `lane`: no map-parked car closes it
+/// (`PedNet::walls`).
+fn stroll_path_open(ped: Option<&PedNet>, lane: usize) -> bool {
+    !ped.is_some_and(|p| p.walls.contains_key(&lane))
 }
 
 /// Where the people waiting for crossing `c` (its pieces among `legs`) stand: before its first
@@ -6134,6 +6173,7 @@ impl Humans {
                     },
                     id: Some(p.id),
                     approach: p.approach,
+                    kerb_fallback: p.at_kerb() && matches!(&p.state, State::Strolling(w) if w.spot.is_some_and(|s| s.row == WHERE_THEY_STAND)),
                 }
             })
             .collect()
@@ -7018,7 +7058,7 @@ impl Humans {
             .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
             .count();
         let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
-        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap, mut rej_queue) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap, mut rej_queue, mut rej_wall) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         if room > 0 && !targets.is_empty() {
             // weighted by lying ahead of the player: somebody put down beside or behind a
             // moving bus never gets in front of it, and the street ahead looked empty until
@@ -7051,6 +7091,11 @@ impl Humans {
                     x -= *w;
                 }
                 let (lane, path_m, ks, toward) = (targets[ci].lane, targets[ci].metres, &targets[ci].ks, targets[ci].toward);
+                // (never onto a path a map-parked car closes: a dead end of the stroll network)
+                if !stroll_path_open(self.ped.as_ref(), lane) {
+                    rej_wall += 1;
+                    continue;
+                }
                 // (never past LOS D on the path, the group counted as it is put down)
                 let path_cap = (area(lane, path_m) * cap).floor() as usize;
                 let l = &net.lanes[lane];
@@ -7164,14 +7209,16 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, no figure {rej_spawn}; turned at a parked car {} ({})",
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a walled path {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
                     let mut cells: Vec<(&(i64, i64), &u32)> = self.wall_turns.iter().collect();
                     cells.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
                     cells.iter().take(4).map(|((x, y), n)| format!("{n} at ({:.0}, {:.0})", (*x as f64 + 0.5) * WALL_TURN_CELL, (*y as f64 + 0.5) * WALL_TURN_CELL)).collect::<Vec<_>>().join(", ")
-                }
+                },
+                self.ped.as_ref().map(|pn| pn.walls.len()).unwrap_or(0),
+                self.people.iter().filter(|p| matches!(&p.state, State::Strolling(w) if w.pocket)).count()
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -8782,10 +8829,13 @@ impl Humans {
             let z = p.position.z;
             let off_lanes = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY));
             // (a stroller may turn round at a wall; somebody walking somewhere waits it out)
-            let turns = matches!(&p.state, State::Strolling(w) if w.roam && !w.walled);
+            let turns = matches!(&p.state, State::Strolling(w) if w.roam);
             let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, &mut wants[i], &blocks, &block_grid, &block_car, &cars, &off_lanes, dt);
             if outcome == BoxOutcome::Wall {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
+                    if let (Some(pn), Some(l)) = (self.ped.as_mut(), walk.legs.get(walk.leg)) {
+                        pn.walls.entry(l.lane).or_default().push(l.dist(walk.s.min(l.len())));
+                    }
                     walk.turn_round(net);
                     p.last_decision = Some(TURNS_AT_A_WALL);
                     *self.wall_turns.entry(((here.x / WALL_TURN_CELL).floor() as i64, (here.y / WALL_TURN_CELL).floor() as i64)).or_default() += 1;
@@ -13486,7 +13536,11 @@ mod ped_tests {
         let lights = FakeLights::new(RED, 30.0);
         let node = ped.ends[&3].0;
         let area = node_area(&ped, &net, Some(&lights), node);
-        assert!(!area.places.is_empty());
+        // (the grid points x -0.64, 0, 0.64, 1.28 of the row y = -7 x 0.871 = -6.10: one row of
+        // four - the row y -5.23 is in front of the kerb, y -6.97 off the pavement)
+        let mut pts: Vec<(i64, i64)> = area.places.iter().map(|q| grid_index(*q)).collect();
+        pts.sort();
+        assert_eq!(pts, vec![(-1, -7), (0, -7), (1, -7), (2, -7)]);
         for q in &area.places {
             assert!((grid_point(grid_index(*q)) - *q).length() < 1e-9, "off the grid {q:?}");
             assert!(q.x >= -0.64 - 1e-9 && q.x <= 1.28 + 1e-9 && q.y <= -5.5 && q.y >= -6.75, "{q:?}");
@@ -13792,6 +13846,43 @@ mod ped_tests {
         assert!(room_for(&net, &ped, &lights, &full(1), kerb, 1, 0, 0.0), "those coming back leave");
         assert!(!room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, 0.0), "those bound elsewhere stay");
         assert!(room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, PED_JAM_TIME), "refused the jam time: on");
+    }
+
+    #[test]
+    fn p4_d0_a_walled_path_is_a_dead_end_and_a_pocket_walker_stands_idle() {
+        // a node with three paths: the way on never takes the one a map-parked car closes, and
+        // nobody is put down on it
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(20.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(0.0, 20.0)], LaneKind::Sidewalk, 2.0));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        let node = ped.ends[&0].1;
+        let open: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
+        assert!(open.contains(&1) && open.contains(&2));
+        ped.walls.entry(1).or_default().push(10.0);
+        assert!(!stroll_path_open(Some(&ped), 1) && stroll_path_open(Some(&ped), 2));
+        let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
+        assert!(!on.contains(&1), "{on:?}");
+        // the other way closed too: the dead end turns them round (a closed end), and a walker who
+        // turned at a wall and meets a closed end again is in a pocket: idle, not walking or jammed
+        ped.walls.entry(2).or_default().push(10.0);
+        let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 15.0, b: 5.0 }], true, 0.0);
+        walk.s = 2.0;
+        walk.turn_round(&net);
+        assert!(walk.from_wall && !walk.pocket);
+        let mut rng = 5u64;
+        walk.s = walk.legs[walk.leg].len();
+        plan_next_leg(Some(&ped), &net, &mut walk, &mut rng);
+        assert!(walk.pocket, "{:?}", walk.legs);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let streams: Streams = HashMap::new();
+        let queues = Queues::default();
+        let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: 0.0 };
+        let mut m = me(9, DVec2::new(0.0, 0.0), 1.2);
+        let w = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+        assert_eq!(w.vel, DVec2::ZERO);
     }
 }
 

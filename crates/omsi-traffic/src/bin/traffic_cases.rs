@@ -6375,6 +6375,8 @@ struct PeopleAcc {
     kerb_over_ps: f64,
     kerb_over_still_ps: f64,
     kerb_over_settled_ps: f64,
+    kerb_fallback_s: f64,
+    kerb_fallback_pair_s: f64,
     kerb_over_max: (usize, f64, DVec3),
     /// The standing pairs of the frame with the most of them: (time, [(id, pos, leg, decision) x 2]).
     kerb_over_pairs: (usize, f64, Vec<String>),
@@ -6425,6 +6427,8 @@ impl PeopleAcc {
             kerb_over_ps: 0.0,
             kerb_over_still_ps: 0.0,
             kerb_over_settled_ps: 0.0,
+            kerb_fallback_s: 0.0,
+            kerb_fallback_pair_s: 0.0,
             kerb_over_max: (0, 0.0, DVec3::ZERO),
             kerb_over_pairs: (0, 0.0, Vec::new()),
             kerb_dens_max: (0.0, 0, 0.0, DVec3::ZERO),
@@ -6572,6 +6576,7 @@ impl PeopleAcc {
         // (waiters at a kerb by the end of the path they wait on: position, standing)
         let mut waiters: HashMap<(usize, bool), Vec<(DVec3, bool)>> = HashMap::new();
         let mut settled: Vec<bool> = Vec::new();
+        let mut fallback: Vec<bool> = Vec::new();
         let mut settled_groups: HashMap<(usize, bool), Vec<glam::DVec2>> = HashMap::new();
         let mut who: Vec<String> = Vec::new();
         for p in &f.people {
@@ -6587,6 +6592,7 @@ impl PeopleAcc {
                 if let Some((lane, s, len)) = p.leg {
                     waiters.entry((lane, s > len * 0.5)).or_default().push((p.pos, p.still > 0.0));
                     settled.push(p.still >= KERB_SETTLED);
+                    fallback.push(p.kerb_fallback);
                     if p.still >= KERB_SETTLED {
                         settled_groups.entry((lane, s > len * 0.5)).or_default().push(p.pos.truncate());
                     }
@@ -6697,6 +6703,9 @@ impl PeopleAcc {
                         if settled[i] && settled[j] {
                             settled_pairs += 1;
                         }
+                        if all[i].1 && all[j].1 && (fallback[i] || fallback[j]) {
+                            self.kerb_fallback_pair_s += w;
+                        }
                         if all[i].1 && all[j].1 {
                             still_pairs += 1;
                             if pair_text.len() < 6 {
@@ -6709,6 +6718,7 @@ impl PeopleAcc {
             self.kerb_over_ps += pairs as f64 * w;
             self.kerb_over_still_ps += still_pairs as f64 * w;
             self.kerb_over_settled_ps += settled_pairs as f64 * w;
+            self.kerb_fallback_s += fallback.iter().filter(|f| **f).count() as f64 * w;
             if pairs > self.kerb_over_max.0 {
                 self.kerb_over_max = (pairs, f.time, at);
             }
@@ -6969,6 +6979,7 @@ impl PeopleAcc {
             let _ = writeln!(out, "  kerb_overlap_standing    at {:.1} s: {t}", self.kerb_over_pairs.1);
         }
         kv!("kerb_overlap_settled", format!("{:.1} pair-s (both still {KERB_SETTLED} s or more)", self.kerb_over_settled_ps), json!(r1(self.kerb_over_settled_ps)));
+        kv!("kerb_fallback", format!("{:.1} person-s waiting where they stand with no queue place ({:.1} standing pair-s with one of them in kerb_overlap's standing count)", self.kerb_fallback_s, self.kerb_fallback_pair_s), json!({"person_s": r1(self.kerb_fallback_s), "standing_pair_s": r1(self.kerb_fallback_pair_s)}));
         kv!("kerb_overlap", format!("{:.1} pair-s ({:.1} both standing); most in a frame {} at {:.1} s at ({:.1}, {:.1}) (waiters at a kerb closer than {BODY_ELLIPSE_DEPTH} m)", self.kerb_over_ps, self.kerb_over_still_ps, o.0, o.1, o.2.x, o.2.y), json!({"pair_s": r1(self.kerb_over_ps), "standing_pair_s": r1(self.kerb_over_still_ps), "max": o.0, "t": r1(o.1)}));
         (out, Value::Object(js))
     }
