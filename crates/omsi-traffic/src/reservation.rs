@@ -251,6 +251,9 @@ pub struct ZipCap {
     pub inside: bool,
     /// From my front to the stretch's start (m; negative past it): against `zipper_reach`.
     pub dist: f32,
+    /// The foe stops at its own red short of the stretch (ahead of me only when its green
+    /// brings it there first): for the tool's `capped_by_red`.
+    pub red_short: bool,
 }
 
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
@@ -571,7 +574,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     }
     let gap = (p_f - o_len) - p_e;
     if o.speed < STANDING_SPEED && p_f >= 0.0 {
-        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e });
+        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e, red_short });
     }
     let d_e = -p_e;
     let t_target = arrival_time(o_len - p_f, o.speed, o.accel, o.v_max) + red_shift + c.tau;
@@ -589,7 +592,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // not with the right of way over its stream: the foe is my link leader, and I advance behind
     // it, SUMO's `jmAdvance` - waiting at the start, a car with priority let a whole minor stream by)
     let hold = (!yields_to_me && d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
-    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0, dist: -p_e })
+    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0, dist: -p_e, red_short })
 }
 
 /// The car-following model's (IDM's) acceleration for the claimant behind a lead `gap` m

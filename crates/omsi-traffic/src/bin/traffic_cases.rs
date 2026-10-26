@@ -4293,10 +4293,15 @@ struct Extra {
     /// ahead at a merge caps the speed, or the queue-entry stop behind it).
     zipper_capped_s: f64,
     /// Vehicle-seconds within the radius standing with its start capped to `CAPPED_START` or less
-    /// by a zipper foe (not the queue-entry stop, not one in the stretch) that stands at or rolls
-    /// up to its own red (`Claim::light_red`): a partner held at red whose green comes after my
-    /// arrival is not ahead (`reservation::zipper_cap`), so this is 0 when the rule holds.
+    /// by a zipper foe (not the queue-entry stop, not one in the stretch, not a body across the
+    /// way) whose plan stops at its own red short of the stretch (`ZipCap::red_short`): such a
+    /// partner is ahead only when its green brings it there first and a foe behind a standing
+    /// lead short of the stretch gives no cap at all (`reservation::zipper_cap`), so this is 0
+    /// when the rule holds. (Round 10's column counted any partner standing at its red.)
     capped_by_red_s: f64,
+    /// The same start capped to nothing by the vehicle whose body lies across the car's way
+    /// (`Claim::body_block`): a physical lead, no red cap.
+    capped_by_body_s: f64,
     /// Vehicle-seconds within the radius standing refused for a full exit (`Hold::ExitFull`) with
     /// no lead on its way (`Plan::lead`): nothing ahead of its front closes the exit, so this is 0
     /// when the exit room counts only what is ahead of the car (`perception::junction_ahead`).
@@ -4554,8 +4559,12 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     // (J9-1's symptom, round 10 analysis: the start capped to nothing, 0.05 m/s^2 or
                     // less, by a partner short of the merge standing at or rolling up to its red -
                     // not one in the merged way ahead, a lead to follow)
-                    let partner = g.zipper.filter(|z| !z.stop && !z.inside).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe)).filter(|(o, _)| o.light_red);
                     let tiny = r.vehicles.get(c.vehicle).and_then(|v| v.state.accel_cap).is_some_and(|cap| cap <= CAPPED_START);
+                    let body = g.zipper.is_some_and(|z| r.vehicles.get(z.foe).map(|o| o.id) == c.body_block);
+                    if c.speed < 0.3 && tiny && body {
+                        ex.capped_by_body_s += fdt;
+                    }
+                    let partner = g.zipper.filter(|z| !z.stop && !z.inside && z.red_short && !body).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe));
                     if let (Some((o, _)), true) = (partner, c.speed < 0.3 && tiny) {
                         ex.capped_by_red_s += fdt;
                         let (me_id, foe_id) = (r.vehicles[c.vehicle].id, o.id);
@@ -5008,6 +5017,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
         ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
+        ("capped_by_body", format!("{:.0}", e.capped_by_body_s)),
         ("exitfull_nolead", format!("{:.0}", e.exitfull_nolead_s)),
         ("zip_capped_outside_reach", format!("{:.0}", e.zip_outside_reach_s)),
         ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
@@ -5056,6 +5066,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.leader_go_s += e.leader_go_s;
     t.zipper_capped_s += e.zipper_capped_s;
     t.capped_by_red_s += e.capped_by_red_s;
+    t.capped_by_body_s += e.capped_by_body_s;
     t.exitfull_nolead_s += e.exitfull_nolead_s;
     t.zip_outside_reach_s += e.zip_outside_reach_s;
 }
