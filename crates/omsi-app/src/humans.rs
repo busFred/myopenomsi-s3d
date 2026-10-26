@@ -4140,12 +4140,23 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
     area
 }
 
-/// Whether somebody may wait at `q`: outside every street lane's waiter reach (`in_waiter_reach`:
-/// half the lane's or the widest vehicle's width, a body and a clearance). Nearer, a car on the
-/// lane holds for them (its footprint strip, or the crossing band test of a walk it cuts, SUMO's
-/// blockedAtDist on the car's width and SAFETY_GAP), so nobody waits there.
+/// SUMO's `MSPModel::SAFETY_GAP` (1 m): the band a vehicle asks a crossing about is its width and
+/// this (`MSLink::getLeaderInfo`; omsi-traffic's `perception::CROSSING_SAFETY_GAP`).
+const CROSSING_BAND_GAP: f64 = 1.0;
+
+/// How far from the axis of street lane `l` a kerb waiter keeps: outside the crossing band of the
+/// widest vehicle on it (half the lane's or `WAITER_VEHICLE_WIDTH`, whichever is wider, and half
+/// `CROSSING_BAND_GAP`, perception's `blocked_by`) and a body (`WAITER_BODY`): somebody standing
+/// on a crossing's walk nearer than that holds a car on the lane (c08 #334, #770: waiters at
+/// 1.85-1.95 m from a right-turn lane's axis, inside the 1.88 m waiter reach's margin of a 2.5 m
+/// vehicle's band, held it 30 s); off a walk the footprint strip reaches less far.
+fn waiting_reach(l: &omsi_sim::traffic::Lane) -> f64 {
+    (l.width as f64).max(WAITER_VEHICLE_WIDTH) * 0.5 + CROSSING_BAND_GAP * 0.5 + WAITER_BODY
+}
+
+/// Whether somebody may wait at `q` in a kerb queue: outside every street lane's `waiting_reach`.
 fn clear_for_waiting(net: &Network, q: DVec3) -> bool {
-    !in_waiter_reach(net, q)
+    !within_lanes(net, q, &waiting_reach)
 }
 
 /// A free place behind a full (or missing) kerb waiting area, on the pavement the walker came
