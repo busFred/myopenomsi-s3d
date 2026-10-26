@@ -32,8 +32,9 @@
 //! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch` on the person's bus, the
 //!   player's or a timetable bus, `Humans::ask_stop`), to the nearest exit, 0.7 m short of
 //!   it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus stands at a
-//!   stop - and on along the pavement as a pedestrian. With no exit open but an entry open,
-//!   by the nearest open entry (`leave_by_entry`).
+//!   stop - and on along the pavement as a pedestrian. Off a timetable bus with no exit open
+//!   but an entry open, by the nearest open entry (`leave_by_entry`; the player's bus: the
+//!   exits only, as Omsi.exe).
 //! * `WalkingToBusstop` (6): back to a waiting place of the stop, then waiting again.
 //!
 //! A timetable bus stays at its stop while somebody passes one of its doors (`holds_bus`):
@@ -980,10 +981,18 @@ pub(super) fn holds_bus(x: &Pax, bus: BusId, doors_open: bool) -> Option<Option<
     }
 }
 
-/// A rider on the way out leaves by an entry: no exit of theirs is open and an entry is
-/// (`exit_open` / `entry_open`: the doors of the sections they are in, open or opening).
-pub(super) fn leave_by_entry(exit_open: &[bool], entry_open: &[bool]) -> bool {
-    !exit_open.iter().any(|o| *o) && entry_open.iter().any(|o| *o)
+/// A rider on the way out of timetable bus `bus` leaves by an entry: no exit of theirs is
+/// open and an entry is (`exit_open` / `entry_open`: the doors of the sections they are in,
+/// open or opening). Never on the player's bus: there Omsi.exe's way stands (0x62d6b1 passes
+/// the exits only), the rider keeps their exit and asks for it.
+pub(super) fn leave_by_entry(bus: BusId, exit_open: &[bool], entry_open: &[bool]) -> bool {
+    bus != BusId::Player && !exit_open.iter().any(|o| *o) && entry_open.iter().any(|o| *o)
+}
+
+/// The exit a rider on the way out asks for (`PAX_Exit<i>_Req`): their door when it is an
+/// exit; an entry they leave by is open already.
+pub(super) fn exit_asked(door: Option<usize>, door_entry: bool) -> Option<usize> {
+    door.filter(|_| !door_entry)
 }
 
 /// sub_7f3a24: the distance with the height difference weighed by `w` (5 everywhere).
@@ -3049,7 +3058,7 @@ impl Humans {
                 // entries: a rider leaves through a door that is open (SUMO: persons alight
                 // through the vehicle's doors, docs/tmp/sumo.md 6.2), never waits for good at
                 // one that stays shut (a bus type whose script opens no exit for the AI).
-                let by_entry = leave_by_entry(&exit_open, &entry_open);
+                let by_entry = leave_by_entry(bn.id, &exit_open, &entry_open);
                 let (doors, open) = if by_entry { (&entries, &entry_open) } else { (&exits, &exit_open) };
                 // With no door open nobody is sent anywhere: the nearest exit stays theirs (the
                 // search gave the first of the list when none was open - the front door - and
@@ -3105,7 +3114,8 @@ impl Humans {
             }
             self.ask_stop(bn.id);
             // (their exit asked for; an entry they leave by is open already)
-            if let Some(d) = self.pax(i).unwrap().door.filter(|_| !self.pax(i).unwrap().door_entry) {
+            let asked = self.pax(i).map(|x| exit_asked(x.door, x.door_entry)).unwrap_or(None);
+            if let Some(d) = asked {
                 if let Some((_, x)) = self.pax_req.get_mut(&b) {
                     if let Some(r) = x.get_mut(d) {
                         *r = true;
@@ -3664,10 +3674,16 @@ mod tests {
     /// nowhere new while nothing is open.
     #[test]
     fn a_rider_leaves_by_an_open_door() {
-        assert!(!leave_by_entry(&[true, false], &[true, true]), "an exit is open: the exits");
-        assert!(leave_by_entry(&[false, false], &[true, false]), "only an entry is open");
-        assert!(!leave_by_entry(&[false, false], &[false, false]), "nothing open: their exit stays");
-        assert!(!leave_by_entry(&[], &[]), "a bus with no doors in their section");
+        let ai = BusId::Ai(7);
+        assert!(!leave_by_entry(ai, &[true, false], &[true, true]), "an exit is open: the exits");
+        assert!(leave_by_entry(ai, &[false, false], &[true, false]), "only an entry is open");
+        assert!(!leave_by_entry(ai, &[false, false], &[false, false]), "nothing open: their exit stays");
+        assert!(!leave_by_entry(ai, &[], &[]), "a bus with no doors in their section");
+        // the player's bus as before: with only the entry open the rider keeps their exit and
+        // asks for it (PAX_Exit1_Req)
+        assert!(!leave_by_entry(BusId::Player, &[false, false], &[true, false]));
+        assert_eq!(exit_asked(Some(1), false), Some(1));
+        assert_eq!(exit_asked(Some(0), true), None, "an entry they leave by is not asked for");
     }
 
     /// Smooth driving upsets nobody; a hard stop, a fast bend and a jerky foot do, as in
