@@ -1745,6 +1745,20 @@ impl Humans {
                 ));
             }
         }
+        // each timetable bus's riders, aboard, on the way out, and come up for it
+        self.ai_riders.clear();
+        for p in &self.people {
+            let State::Pax(x) = &p.state else { continue };
+            if let Some(BusId::Ai(id)) = x.inside {
+                let r = self.ai_riders.entry(id).or_default();
+                r.aboard += 1;
+                if x.task == Task::InBusToExit {
+                    r.leaving += 1;
+                }
+            } else if let (Some(BusId::Ai(id)), Task::ToBus | Task::WalkingToBus) = (x.bus, x.task) {
+                self.ai_riders.entry(id).or_default().boarders += 1;
+            }
+        }
         // timetable buses wait while people still get on or off (0x7d9e8b - 0x7d9f5e):
         // somebody of this bus walking in it to an exit, or walking up to its doors from
         // the stop the bus serves - the traffic checks the stop (`hold_boarding`). People

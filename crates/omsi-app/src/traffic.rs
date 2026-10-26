@@ -860,6 +860,8 @@ pub struct Traffic {
     /// aboard wants to get off, the stops where somebody waits. None without passengers:
     /// every bus then serves every stop.
     stop_wishes: Option<(hashbrown::HashSet<u64>, hashbrown::HashSet<i64>)>,
+    /// Each timetable bus's passengers (`Humans::ai_riders`), for the record of its stands.
+    bus_riders: hashbrown::HashMap<u64, crate::humans::BusRiders>,
     /// Seconds the player's vehicle has been standing.
     player_still: f32,
     /// Time of day (seconds since midnight); light cycles and timetables run on it.
@@ -1616,6 +1618,7 @@ impl Traffic {
             sound_cfgs: HashMap::new(),
             root: root.to_path_buf(),
             stop_wishes: None,
+            bus_riders: hashbrown::HashMap::new(),
             player_still: 0.0,
             day_time: 0.0,
             time_scale: 1.0,
@@ -3918,6 +3921,7 @@ impl Traffic {
             }
             let day_time = self.day_time;
             let stop_wishes = &self.stop_wishes;
+            let riders = self.bus_riders.get(&self.cars[i].id).copied().unwrap_or_default();
             let net = &self.net;
             let viewer = self.viewer;
             let car = &mut self.cars[i];
@@ -3973,6 +3977,43 @@ impl Traffic {
                     None => {}
                 }
                 ext.stop_at = service.step(&mut car.ai.state, &mut car.vehicle, &ctx);
+                // (OMSI_DEBUG_STOPS: what its door script makes of the people, every second
+                // with the doors open)
+                if service.at_station() && (day_time - dt as f64).floor() != day_time.floor() && omsi_cfg::env::var_os("OMSI_DEBUG_STOPS").is_some() {
+                    let v = |n: &str| car.vehicle.var(n).map_or("-".to_string(), |x| format!("{x:.2}"));
+                    log::info!(
+                        "t={day_time:.1}: timetable bus {} doors at stop {:?}: haltewunsch {} door_0..3 {} {} {} {} Exit0/1_Req {} {} Exit0/1_Open {} {} Entry0_Open {} bremse_halte {} busbar {} riders {:?}",
+                        car.id,
+                        service.stops.front().map(|s| s.id),
+                        v("haltewunsch"), v("door_0"), v("door_1"), v("door_2"), v("door_3"),
+                        v("PAX_Exit0_Req"), v("PAX_Exit1_Req"), v("PAX_Exit0_Open"), v("PAX_Exit1_Open"), v("PAX_Entry0_Open"),
+                        v("bremse_halte"), v("elec_busbar_main"), riders
+                    );
+                }
+                // its stand at a stop: the riders aboard as it came to rest, and the whole
+                // stand into the recording as it pulls away
+                if let Some(d) = service.dwell.as_mut().filter(|d| d.arrived == day_time) {
+                    d.aboard_arrival = riders.aboard;
+                }
+                if let Some(mut d) = service.dwell_done.take() {
+                    d.aboard_departure = riders.aboard;
+                    d.bound_left = riders.leaving;
+                    d.boarders_left = riders.boarders;
+                    d.pos = (car.vehicle.position.x, car.vehicle.position.y);
+                    log::info!(
+                        "t={day_time:.1}: timetable bus {} leaves stop {}: planned {:.1} s, doors closed after {:.1} s{}, riders {} -> {}, {} still on the way out, {} left at the stop",
+                        car.id,
+                        d.stop,
+                        d.planned,
+                        d.closed,
+                        if d.at_cap { " (at the boarding cap)" } else { "" },
+                        d.aboard_arrival,
+                        d.aboard_departure,
+                        d.bound_left,
+                        d.boarders_left
+                    );
+                    self.recorder.dwell(self.sim.time, car.id, &d);
+                }
                 // the stops whose waiters it pulls in beside
                 ext.serves = [service.stops.front().map(|s| s.id), service.served];
                 // its trip over at the end of its track: on off the route's end
@@ -4944,6 +4985,11 @@ impl Traffic {
 
     /// Keep a scheduled bus at its stop for at least `secs` more with the doors open:
     /// passengers are still queueing at a door or stepping in.
+    /// Each timetable bus's passengers this frame (`Humans::ai_riders`).
+    pub fn set_bus_riders(&mut self, riders: &hashbrown::HashMap<u64, crate::humans::BusRiders>) {
+        self.bus_riders.clone_from(riders);
+    }
+
     /// The passengers' wishes for the timetable buses' next stops (see `stop_wishes`).
     pub fn set_stop_wishes(&mut self, alighting: hashbrown::HashSet<u64>, waiting: hashbrown::HashSet<i64>) {
         self.stop_wishes = Some((alighting, waiting));

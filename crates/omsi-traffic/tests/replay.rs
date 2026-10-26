@@ -298,6 +298,7 @@ fn a_recording_from_the_game_replays() {
             Record::LaneFlags { .. } => "lane flags",
             Record::Parked { .. } => "parked",
             Record::Note { .. } => "note",
+            Record::Dwell { .. } => "dwell",
         };
         let e = kinds.entry(k).or_default();
         e.0 += 1;
@@ -495,7 +496,7 @@ fn a_free_run_reproduces_a_game_recording_made_under_the_current_rules() {
     };
     record(net, lights, cars, 40.0, &path, &mut hook);
     let r = Replay::load(&path).expect("the fixture reads");
-    assert_eq!(r.header.version, 4);
+    assert_eq!(r.header.version, 5);
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
     free_run_reproduces(r, "the format-4 fixture");
     let _ = std::fs::remove_file(&path);
@@ -602,7 +603,7 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     let r = Replay::load(&path).expect("the recording reads");
     let _ = std::fs::remove_file(&path);
     assert_eq!(r.header.version, omsi_traffic::record::VERSION);
-    assert_eq!(r.header.version, 4);
+    assert_eq!(r.header.version, 5);
     assert_eq!(r.header.switches.as_deref(), Some(omsi_traffic::record::RULES));
     assert_eq!(r.header.rules, Some(omsi_traffic::record::rules_hash()));
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);

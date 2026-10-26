@@ -407,7 +407,7 @@ impl Replay {
                 }
             }
             Record::Parked { parked, .. } => self.sim.parked = parked.clone(),
-            Record::Note { .. } => {}
+            Record::Note { .. } | Record::Dwell { .. } => {}
         }
     }
 

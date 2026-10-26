@@ -129,9 +129,10 @@ fn main() {
         Some("compare") if args.len() >= 3 => compare(Path::new(&args[2]), &args[3..]),
         Some("index") if args.len() >= 3 => index(Path::new(&args[2])),
         Some("people") if args.len() >= 3 => people(&args[2..]),
+        Some("dwells") if args.len() >= 3 => dwells(&args[2..]),
         _ => {
             eprintln!(
-                "usage: traffic_cases info|cut|trace|mask|diagnose|heads|ab|stubs|converge|people|viewer|viewer2|compare|index ... (see the source)"
+                "usage: traffic_cases info|cut|trace|mask|diagnose|heads|ab|stubs|converge|people|dwells|viewer|viewer2|compare|index ... (see the source)"
             );
             std::process::exit(2);
         }
@@ -6753,6 +6754,123 @@ fn people(args: &[String]) -> Res<()> {
     }
     if let Some(p) = json_out {
         std::fs::write(p, serde_json::to_string_pretty(&all)?)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// dwells: the timetable buses' stands at their stops (format 5, `Record::Dwell`)
+
+/// A bus held by people this long (s) after it pulled away from a stop, still within its own
+/// length of where it stood, counts as kept there by them: a boarder left at its shut door
+/// and the bus waiting for each other.
+const DWELL_PEOPLE_HOLD: f32 = 10.0;
+
+/// `traffic_cases dwells <rec>... [--until S]`: per recording, the timetable buses' stands at
+/// their stops: how many, how many ended at the boarding cap, the seconds the doors stayed open
+/// beyond the plan (sum, max, the longest by bus and stop), the riders carried past their stop
+/// (still on their way out as the bus pulled away), the people left at the stop, and the buses
+/// standing `why People` more than `DWELL_PEOPLE_HOLD` s after pulling away while still within
+/// their own length of the place they stood (from the keyframes).
+fn dwells(args: &[String]) -> Res<()> {
+    let mut recs: Vec<PathBuf> = Vec::new();
+    let mut until = f64::INFINITY;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--until" => until = it.next().ok_or("--until needs a value")?.parse()?,
+            s if s.starts_with("--") => return Err(format!("unknown option {s}").into()),
+            s => recs.push(PathBuf::from(s)),
+        }
+    }
+    if recs.is_empty() {
+        return Err("usage: traffic_cases dwells <rec>... [--until S]".into());
+    }
+    for path in &recs {
+        let mut lines = Lines::open(path)?;
+        if !lines.next() {
+            return Err(format!("{}: empty recording", path.display()).into());
+        }
+        let header: Header = omsi_traffic::finite::from_str(std::str::from_utf8(&lines.buf)?)?;
+        if header.version < 5 {
+            println!("{}: format {} records no stands at stops (format 5 and later do)", path.display(), header.version);
+            continue;
+        }
+        let mut first: Option<f64> = None;
+        let mut all: Vec<(u64, omsi_traffic::record::Dwell)> = Vec::new();
+        // (the buses that pulled away: where they stood and how long they are; the longest
+        // stand `why People` since, per bus and stop)
+        let mut left: HashMap<u64, (usize, (f64, f64))> = HashMap::new();
+        let mut held: BTreeMap<(u64, i64), f32> = BTreeMap::new();
+        while lines.next() {
+            let (kind, time, _) = peek(&lines.buf);
+            if !matches!(kind, "Frame" | "Keyframe" | "Dwell") {
+                continue;
+            }
+            let t0 = *first.get_or_insert(time);
+            if time - t0 > until {
+                break;
+            }
+            if kind == "Frame" {
+                continue;
+            }
+            match omsi_traffic::finite::from_str::<Record>(std::str::from_utf8(&lines.buf)?)? {
+                Record::Dwell { id, dwell, .. } => {
+                    left.insert(id, (all.len(), dwell.pos));
+                    all.push((id, dwell));
+                }
+                Record::Keyframe { vehicles, .. } => {
+                    for v in &vehicles {
+                        let Some(&(k, (x, y))) = left.get(&v.id) else { continue };
+                        let away = ((v.pos.x - x).powi(2) + (v.pos.y - y).powi(2)).sqrt();
+                        if v.external.at_stop || away > (v.state.front + v.state.rear) as f64 {
+                            left.remove(&v.id);
+                            continue;
+                        }
+                        if v.last.why == Why::People && v.stopped > DWELL_PEOPLE_HOLD {
+                            let e = held.entry((v.id, all[k].1.stop)).or_default();
+                            *e = e.max(v.stopped);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let n = all.len();
+        let at_cap = all.iter().filter(|(_, d)| d.at_cap).count();
+        let over = |d: &omsi_traffic::record::Dwell| (d.closed - d.planned).max(0.0);
+        let over_sum: f32 = all.iter().map(|(_, d)| over(d)).sum();
+        let over_max = all.iter().map(|(_, d)| over(d)).fold(0.0f32, f32::max);
+        let carried: u32 = all.iter().map(|(_, d)| d.bound_left).sum();
+        let carried_n = all.iter().filter(|(_, d)| d.bound_left > 0).count();
+        let left_behind: u32 = all.iter().map(|(_, d)| d.boarders_left).sum();
+        let held_max = held.values().copied().fold(0.0f32, f32::max);
+        println!(
+            "{}: DWELLS {n} at_cap {at_cap} over_plan_s {over_sum:.1} over_max_s {over_max:.1} carried_past {carried} ({carried_n} dwells) boarders_left {left_behind} people_hold_after {} (max {held_max:.0} s)",
+            path.display(),
+            held.len()
+        );
+        let mut worst: Vec<&(u64, omsi_traffic::record::Dwell)> = all.iter().filter(|(_, d)| over(d) >= 1.0 || d.at_cap || d.bound_left > 0).collect();
+        worst.sort_by(|a, b| over(&b.1).total_cmp(&over(&a.1)));
+        for (id, d) in worst.iter().take(20) {
+            println!(
+                "  bus {id} stop {} at {}: planned {:.1} s, doors closed after {:.1} s ({:+.1}){}, left after {:.1} s, riders {} -> {}, {} carried on, {} left at the stop",
+                d.stop,
+                hms(d.arrived),
+                d.planned,
+                d.closed,
+                d.closed - d.planned,
+                if d.at_cap { " AT CAP" } else { "" },
+                d.left,
+                d.aboard_arrival,
+                d.aboard_departure,
+                d.bound_left,
+                d.boarders_left
+            );
+        }
+        for ((id, stop), secs) in &held {
+            println!("  bus {id} stood why People {secs:.0} s after leaving stop {stop}");
+        }
     }
     Ok(())
 }

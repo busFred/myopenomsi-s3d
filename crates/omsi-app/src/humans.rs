@@ -501,6 +501,19 @@ pub struct DoorWants {
     pub places: Vec<(String, bool)>,
 }
 
+/// The passengers of a timetable bus in a frame, for its stands at the stops
+/// (`omsi_traffic::record::Dwell`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusRiders {
+    /// Riders aboard.
+    pub aboard: u32,
+    /// Riders aboard on their way out (`WalkingInBusToExit`).
+    pub leaving: u32,
+    /// People who came up for it from a stop (at the gather point or walking to its doors)
+    /// and are not aboard yet.
+    pub boarders: u32,
+}
+
 /// A bus as the passengers know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BusId {
@@ -4466,6 +4479,8 @@ pub struct Humans {
     holds: Vec<(u64, Option<i64>, f32)>,
     /// Door requests for the timetable buses' scripts.
     ai_requests: Vec<(u64, DoorWants)>,
+    /// Each timetable bus's passengers this frame (for the traffic's record of its stands).
+    ai_riders: HashMap<u64, BusRiders>,
     pub tickets: Option<Arc<omsi_content::tickets::TicketPack>>,
     /// Current ticket request at the player's cash desk: (ticket name, value).
     pub request: Option<(String, f32)>,
@@ -4794,6 +4809,7 @@ impl Humans {
             last_door_open: HashMap::new(),
             holds: Vec::new(),
             ai_requests: Vec::new(),
+            ai_riders: HashMap::new(),
             tickets: None,
             request: None,
             paid: None,
@@ -7324,6 +7340,11 @@ impl Humans {
     /// Door requests for the timetable buses, for the traffic to hand to their scripts.
     pub fn take_ai_requests(&mut self) -> Vec<(u64, DoorWants)> {
         std::mem::take(&mut self.ai_requests)
+    }
+
+    /// Each timetable bus's passengers (as of the last passenger frame), for the traffic.
+    pub fn ai_riders(&self) -> &HashMap<u64, BusRiders> {
+        &self.ai_riders
     }
 
     /// A line for the HUD about something that just happened.

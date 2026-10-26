@@ -1095,6 +1095,7 @@ pub(crate) fn run_offscreen(
             if let Some(t) = traffic.as_mut() {
                 let (alighting, waiting) = h.stop_wishes();
                 t.set_stop_wishes(alighting, waiting);
+                t.set_bus_riders(h.ai_riders());
                 for (id, stop, secs) in h.take_holds() {
                     t.hold_boarding(id, stop, secs);
                 }
