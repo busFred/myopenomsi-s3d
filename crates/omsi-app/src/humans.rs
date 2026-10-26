@@ -1982,12 +1982,30 @@ fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
     }
 }
 
-/// Whether a stroller at `p` goes: out of sight (`seen_from`) and out of everybody's stroll
-/// radius (`center` and the other players' `others`), where strollers are put down and counted:
-/// past it they are nobody's. (Out to twice the radius they kept wandering, never counted
-/// against a target and never seen, and the people climbed for as long as the player stood.)
-fn stroller_goes(eye: Option<Eye>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
-    !seen_from(eye, center, p) && far_from(center, others, p, STROLL_RADIUS)
+/// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
+/// adult's, as `seen_from` aims at its middle 0.9 m up.
+const FIGURE_HEIGHT: f64 = 1.8;
+
+/// Whether the player could see a figure standing at `p`: in the view cone (`Eye`) and not
+/// beyond the vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its
+/// two-pixel distance and the renderer's reach, never within `NEAR_HIDE`), reckoned without
+/// the vehicles' lamps, which a person does not carry; with no viewer, `seen_from`.
+fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
+    match (eye, viewer) {
+        (Some(e), Some(v)) => {
+            let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
+            let dist = d.length();
+            dist < 3.0 || (d.dot(e.fwd) / dist > e.cos_half && !v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_HEIGHT * 0.5))
+        }
+        _ => seen_from(eye, center, p),
+    }
+}
+
+/// Whether a stroller at `p` goes: out of the player's sight (`figure_in_sight`) and out of
+/// everybody's stroll radius (`center` and the other players' `others`), because strollers are
+/// put down and counted only within it.
+fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
+    far_from(center, others, p, STROLL_RADIUS) && !figure_in_sight(eye, viewer, center, p)
 }
 
 /// Is `p` further than `r` from `center` and from every one of `others`?
@@ -2072,6 +2090,8 @@ struct DecideCtx<'a> {
     ped: Option<&'a PedNet>,
     streams: &'a Streams,
     eye: Option<Eye>,
+    /// The traffic's picture of the player's view (`figure_in_sight`), if any.
+    viewer: Option<crate::traffic::Viewer>,
     center: DVec3,
     lan_centers: &'a [DVec3],
     time: f64,
@@ -2094,7 +2114,7 @@ impl DecideCtx<'_> {
                     d.gone = true;
                     return d;
                 };
-                if stroller_goes(self.eye, self.center, self.lan_centers, p.position) {
+                if stroller_goes(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
                     d.gone = true;
                     return d;
                 }
@@ -7727,7 +7747,7 @@ impl Humans {
             p.t_state += dt;
         }
         let decided: Vec<Option<Decision>> = {
-            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
             let people = &self.people;
             let cars = &cars;
             let lights = traffic.map(LightsOf::of);
@@ -7759,7 +7779,7 @@ impl Humans {
                 let d = match d {
                     Some(d) => d,
                     None => {
-                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
                         ctx.decide(&self.people[i], dt, world, net, traffic.map(LightsOf::of).as_ref(), &cars, &mut YieldBook::Book(&mut self.yields))
                     }
                 };
@@ -11254,11 +11274,34 @@ mod ped_tests {
         // it, kept; within it, kept; near another player, kept
         let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
         let behind = DVec3::new(0.0, -(STROLL_RADIUS + 5.0), 0.0);
-        assert!(stroller_goes(Some(e), DVec3::ZERO, &[], behind));
-        assert!(stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0)), "short of twice the radius");
-        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0)), "in sight");
-        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0)), "within the radius");
-        assert!(!stroller_goes(Some(e), DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind), "near another player");
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], behind));
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0)), "short of twice the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0)), "in sight");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0)), "within the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind), "near another player");
+        // with the traffic's picture (900 lines, 60 degrees: a 1.8 m figure is two pixels at
+        // 1.8 x 900 / (2 x 2 tan 30) = 701 m): in frame at 300 m, kept; at 800 m, gone; behind
+        // at 300 m, gone; the vehicles' lamps lit change nothing for a person
+        let v = crate::traffic::Viewer {
+            pos: DVec3::ZERO,
+            forward: DVec3::Y,
+            tan_x: (30f64).to_radians().tan() * 16.0 / 9.0,
+            tan_y: (30f64).to_radians().tan(),
+            range: 5000.0,
+            min_size: 0.0,
+            max_dist: 0.0,
+            fov: (60f64).to_radians(),
+            px_height: 900.0,
+            horizon_fov: 0.0,
+            lamps_lit: false,
+        };
+        let ahead = |d: f64| DVec3::new(0.0, d, 0.0);
+        assert!(!stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(300.0)), "in frame at 300 m");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(800.0)), "past the horizon");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(-300.0)), "behind");
+        let lit = v.with_lamps(true);
+        assert!(stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(800.0)), "lamps lit");
+        assert!(!stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(300.0)));
     }
 
     #[test]
