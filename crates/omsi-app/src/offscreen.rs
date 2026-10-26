@@ -571,6 +571,7 @@ pub(crate) fn run_offscreen(
                 humans_off.as_ref(),
                 player.as_ref(),
                 &renderer.options,
+                streamer.as_ref().map_or(0.0, |s| s.load_radius),
             );
             // the tiles round the eye and the bus, as the window streams them
             if let Some(st) = streamer.as_mut() {
@@ -1281,9 +1282,10 @@ pub(crate) fn run_offscreen(
                     if let Some(p) = player.as_ref() {
                         vehicles.push(&p.vehicle);
                     }
-                    // (an AI car's lamps go with the car at the object distance)
+                    // (an AI car's lamps go with the car at the drawn reach)
                     if let Some(t) = traffic.as_ref() {
-                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, cam.position, renderer.options.max_obj_dist)));
+                        let loaded = streamer.as_ref().map_or(0.0, |s| s.load_radius);
+                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, cam.position, renderer.options.max_obj_dist, loaded)));
                     }
                     vehicles.extend(remotes_off.remotes.values().map(|r| r.vehicle()));
                     lights::set_cone_strength(weather.fog.0, precip_of(&weather).1, daylight.night);
@@ -2621,7 +2623,8 @@ pub(crate) fn run_offscreen(
             vehicles.push(&p.vehicle);
         }
         if let Some(t) = traffic.as_ref() {
-            vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, camera.position, renderer.options.max_obj_dist)));
+            let loaded = streamer.as_ref().map_or(0.0, |s| s.load_radius);
+            vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, camera.position, renderer.options.max_obj_dist, loaded)));
         }
         vehicles.extend(remotes_off.remotes.values().map(|r| r.vehicle()));
         lights::set_cone_strength(weather.fog.0, precip_of(&weather).1, daylight.night);

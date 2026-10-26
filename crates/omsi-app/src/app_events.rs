@@ -597,6 +597,7 @@ impl ApplicationHandler for App {
                         self.humans.as_ref(),
                         self.player.as_ref(),
                         &r.options,
+                        self.streamer.as_ref().map_or(0.0, |s| s.load_radius),
                     );
                     // [ROLLBACK clockjump-93] a time set by hand: the timetable's buses are put out anew
                     if let Some(s) = self.schedule.as_mut().filter(|_| self.args.schedule) {
@@ -2048,10 +2049,11 @@ impl ApplicationHandler for App {
                     if let Some(p) = self.player.as_ref() {
                         vehicles.push(&p.vehicle);
                     }
-                    // (an AI car's lamps go with the car at the object distance)
+                    // (an AI car's lamps go with the car at the drawn reach)
                     let max_obj = self.renderer.as_ref().map_or(0.0, |r| r.options.max_obj_dist);
+                    let loaded = self.streamer.as_ref().map_or(0.0, |s| s.load_radius);
                     if let Some(t) = self.traffic.as_ref() {
-                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, cam.position, max_obj)));
+                        vehicles.extend(t.cars.iter().map(|c| &c.vehicle).filter(|v| lights::lamps_drawn(v, cam.position, max_obj, loaded)));
                     }
                     vehicles.extend(self.remotes.remotes.values().map(|r| r.vehicle()));
                     let __tc = Instant::now();

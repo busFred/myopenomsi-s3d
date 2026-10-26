@@ -480,8 +480,27 @@ pub struct Viewer {
     /// (radians): the camera's, or a triple screen's centre panel's when narrower (0: `fov`).
     pub horizon_fov: f64,
     /// The vehicles' lamps are lit (`Viewer::with_lamps`): no two-pixel
-    /// horizon, only the draw distance (`max_dist`).
+    /// horizon, only the drawn reach (`reach`).
     pub lamps_lit: bool,
+    /// The loaded tiles' radius about the eye (m; `Viewer::with_loaded`, 0: the map is not
+    /// streamed, no bound): nothing is drawn beyond it, lamps included (`reach`).
+    pub loaded: f64,
+}
+
+/// How far the renderer draws a vehicle, lamp glows included (m; 0: no limit): the object
+/// distance `max_dist` held out to `MAX_OBJ_DIST_HOLD`, but never past the loaded tiles' radius
+/// `loaded` (0: unbounded). The lamp glows would show at any distance (corona.wgsl) and so, by
+/// night, farther than the map is loaded: a car reaching the loaded edge would be seen to vanish
+/// as a light. Bounding the glows at the loaded circle keeps the night horizon inside it at no
+/// memory cost (user decision D8, 2026-10-26, over loading 1.7x the tiles by night).
+pub fn draw_reach(max_dist: f64, loaded: f64) -> f64 {
+    let held = if max_dist > 0.0 { max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64 } else { 0.0 };
+    match (held > 0.0, loaded > 0.0) {
+        (true, true) => held.min(loaded),
+        (true, false) => held,
+        (false, true) => loaded,
+        (false, false) => 0.0,
+    }
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
@@ -544,7 +563,19 @@ impl Viewer {
             px_height: 0.0,
             horizon_fov: 0.0,
             lamps_lit: false,
+            loaded: 0.0,
         }
+    }
+
+    /// The loaded tiles' radius about the eye (m): the farthest anything is drawn (`reach`).
+    pub fn with_loaded(mut self, radius: f64) -> Viewer {
+        self.loaded = radius.max(0.0);
+        self
+    }
+
+    /// How far the renderer draws a vehicle and its lamps from this eye (`draw_reach`; 0: no limit).
+    pub fn reach(&self) -> f64 {
+        draw_reach(self.max_dist, self.loaded)
     }
 
     /// The picture's height in pixels (the window's, or the offscreen image's),
@@ -582,15 +613,17 @@ impl Viewer {
     }
 
     /// The perceptual horizon (m) of a place where a body `height` (m) high may stand: the nearer
-    /// of its two-pixel distance and the renderer's reach (`max_dist`, the object distance -
-    /// `max_obj_dist`, the view distance when that is `auto` - held out to `MAX_OBJ_DIST_HOLD`;
-    /// lamp glows are culled with their car there). For the loaded tiles' edge: whether it is in
-    /// sight (`Traffic::mark_edges_in_sight`) and how far the tiles are prefetched
-    /// (`prefetch_target`). A body itself is judged by `beyond_horizon`, with its own size.
+    /// of its two-pixel distance and the renderer's drawn reach (`reach`: the object distance -
+    /// `max_obj_dist`, the view distance when that is `auto` - held out to `MAX_OBJ_DIST_HOLD`,
+    /// within the loaded tiles; lamp glows are culled with their car there). For the loaded
+    /// tiles' edge: whether it is in sight (`Traffic::mark_edges_in_sight`) and how far the tiles
+    /// are prefetched (`prefetch_target`). A body itself is judged by `beyond_horizon`, with its
+    /// own size.
     pub fn horizon(&self, height: f64) -> f64 {
         let two_pixels = self.two_pixels(height);
-        if self.max_dist > 0.0 {
-            two_pixels.min(self.max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64)
+        let reach = self.reach();
+        if reach > 0.0 {
+            two_pixels.min(reach)
         } else {
             two_pixels
         }
@@ -625,16 +658,17 @@ impl Viewer {
     }
 
     /// Would the renderer draw an object of radius `r` this far away at all (an object already
-    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance; too small on screen, under
-    /// `min_size`, it is left out - but with the lamps lit its glows are not, so then only the
-    /// distance counts)? Beyond that a car, its
+    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance, within the loaded tiles:
+    /// `reach`; too small on screen, under `min_size`, it is left out - but with the lamps lit its
+    /// glows are not, so then only the distance counts)? Beyond that a car, its
     /// lamp glows included (`lights::lamps_drawn`), can come and go in plain view without anybody
     /// seeing it happen.
     pub fn draws(&self, dist: f64, r: f64) -> bool {
         // (the renderer measures a vehicle by a sphere about its origin, which may stand
         // well off its middle: half as much again, and a metre, to be sure)
         let r = r * 1.5 + 1.0;
-        if self.max_dist > 0.0 && dist > self.max_dist * omsi_render::MAX_OBJ_DIST_HOLD as f64 + r {
+        let reach = self.reach();
+        if reach > 0.0 && dist > reach + r {
             return false;
         }
         // (with the lamps lit only the distance counts: the renderer leaves a body under
@@ -2211,6 +2245,7 @@ impl Traffic {
                     px_height: 0.0,
                     horizon_fov: 0.0,
                     lamps_lit: false,
+                    loaded: 0.0,
                 });
             }
         }
@@ -6045,12 +6080,29 @@ mod group_density_tests {
 
 #[cfg(test)]
 mod respawn_sight_tests {
-    use super::{Viewer, NEAR_HIDE, NEVER_VANISH_WITHIN};
+    use super::{draw_reach, Viewer, CAR_HEIGHT, NEAR_HIDE, NEVER_VANISH_WITHIN};
     use glam::DVec3;
 
     /// A viewer at the origin looking along +Y, a 90 degree picture, seeing 900 m.
     fn viewer() -> Viewer {
-        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }
+        Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 1.57, px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, loaded: 0.0 }
+    }
+
+    #[test]
+    fn the_drawn_reach_stays_inside_the_loaded_tiles() {
+        // the user's settings: object distance 3000 m held to 3150 m, tiles loaded to 2500 m;
+        // by night the horizon is the reach, so the loaded edge is never in sight
+        assert_eq!(draw_reach(3000.0, 2500.0), 2500.0);
+        assert!((draw_reach(3000.0, 0.0) - 3150.0).abs() < 0.01);
+        assert_eq!(draw_reach(0.0, 2500.0), 2500.0);
+        assert_eq!(draw_reach(0.0, 0.0), 0.0);
+        let night = viewer().with_culling(0.0, 3000.0).with_loaded(2500.0).with_lamps(true);
+        assert_eq!(night.horizon(CAR_HEIGHT), 2500.0);
+        assert!(night.draws(2400.0, 1.0));
+        assert!(!night.draws(2600.0, 1.0));
+        // the same by day: the two-pixel distance is the nearer bound
+        let day = viewer().with_screen(900, None).with_culling(0.0, 3000.0).with_loaded(2500.0);
+        assert!(day.horizon(CAR_HEIGHT) < 2500.0);
     }
 
     /// A bus is taken off the road by the rule it comes back by: never
@@ -6142,7 +6194,7 @@ mod prefetch_tests {
     /// the dark horizon (no area reaches a lamp's), a tiny one NEAR_HIDE, a bus twice the car's.
     #[test]
     fn the_reach_is_the_horizon_plus_one_load_at_the_road_speed() {
-        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false }.with_screen(900, None);
+        let v = Viewer { pos: DVec3::ZERO, forward: DVec3::Y, tan_x: 1.0, tan_y: 1.0, range: 900.0, min_size: 0.0, max_dist: 0.0, fov: 60f64.to_radians(), px_height: 0.0, horizon_fov: 0.0, lamps_lit: false, loaded: 0.0 }.with_screen(900, None);
         let h = edge_horizon(v, CAR_HEIGHT);
         assert!((h - 584.6).abs() < 0.5, "{h}");
         assert_eq!(edge_horizon(v.with_lamps(true), CAR_HEIGHT), h, "lit lamps: the dark horizon");

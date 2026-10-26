@@ -504,7 +504,8 @@ fn smoke_sprite(p: &SmokeParticle, ro: DVec3) -> Option<GpuCorona> {
 /// An object already drawn stays drawn out to this multiple of `RenderOptions::max_obj_dist` (plus
 /// its radius), one not drawn comes in at the distance itself: the hysteresis that keeps an object on
 /// the boundary from flickering in and out (Omsi's `performance_maxObjDist`). The app culls a
-/// vehicle's lamp glows with the vehicle at the same reach, and the traffic's horizon takes it.
+/// vehicle's lamp glows with the vehicle at the same reach, bounded by the loaded tiles
+/// (`openomsi_game::traffic::draw_reach`), and the traffic's horizon takes it.
 pub const MAX_OBJ_DIST_HOLD: f32 = 1.05;
 
 pub const LM_ATLAS_TILES: u32 = 5;
