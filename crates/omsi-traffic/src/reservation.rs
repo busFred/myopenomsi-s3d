@@ -797,7 +797,8 @@ fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize
 
 /// When the standing lead chain of claim `k` lets it go (s from now): the first link standing
 /// at its red (`Claim::light_red`) is released at its green (`until_go`; INFINITY: not within a
-/// cycle), as round 10 J9-1 times a partner at red; a link standing behind a standing lead of
+/// cycle), from rest; a link stuck (people, a zebra, a standing lead: `Claim::stuck`) releases
+/// it on no schedule (INFINITY, as `held_off`); a link standing behind a standing lead of
 /// its own passes the question on, within `LEAD_CHAIN` links. None: a link held by anything
 /// else, without a claim, or the chain too long - its release is not known, and the foe counts
 /// as coming from rest now.
@@ -808,6 +809,11 @@ fn lead_release(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, k
         let l = &claims[next];
         if !l.standing() {
             return None;
+        }
+        // (one stuck - people, a zebra, a lead that stands too - goes on no schedule: not while
+        // that holds, as `held_off` reads it)
+        if l.stuck {
+            return Some(f32::INFINITY);
         }
         if l.light_red {
             return Some(l.until_go.unwrap_or(f32::INFINITY));
@@ -2112,6 +2118,14 @@ mod tests {
         claims[2].until_go = Some(0.5);
         let g = resolve(&js, &claims);
         assert!(!grant_of(&g, 1).go, "{g:?}");
+        // a lead standing for people (stuck): not while that holds (the 08:19 class: a foe
+        // labelled Junction behind a head held by walkers)
+        claims[2].until_go = None;
+        claims[2].light_red = false;
+        claims[2].stuck = true;
+        claims[2].blocked = true;
+        let g = resolve(&js, &claims);
+        assert!(grant_of(&g, 1).go, "{g:?}");
         // a lead held by something not known (no claim): it counts from rest now
         claims.pop();
         let g = resolve(&js, &claims);
