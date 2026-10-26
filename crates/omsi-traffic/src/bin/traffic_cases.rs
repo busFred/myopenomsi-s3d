@@ -6379,6 +6379,7 @@ struct PeopleAcc {
     /// The standing pairs of the frame with the most of them: (time, [(id, pos, leg, decision) x 2]).
     kerb_over_pairs: (usize, f64, Vec<String>),
     kerb_dens_max: (f64, usize, f64, DVec3),
+    kerb_dens_settled: (f64, usize, f64, glam::DVec2),
     kerb_group_max: (usize, f64, DVec3),
 }
 
@@ -6427,6 +6428,7 @@ impl PeopleAcc {
             kerb_over_max: (0, 0.0, DVec3::ZERO),
             kerb_over_pairs: (0, 0.0, Vec::new()),
             kerb_dens_max: (0.0, 0, 0.0, DVec3::ZERO),
+            kerb_dens_settled: (0.0, 0, 0.0, glam::DVec2::ZERO),
             kerb_group_max: (0, 0.0, DVec3::ZERO),
         }
     }
@@ -6570,6 +6572,7 @@ impl PeopleAcc {
         // (waiters at a kerb by the end of the path they wait on: position, standing)
         let mut waiters: HashMap<(usize, bool), Vec<(DVec3, bool)>> = HashMap::new();
         let mut settled: Vec<bool> = Vec::new();
+        let mut settled_groups: HashMap<(usize, bool), Vec<glam::DVec2>> = HashMap::new();
         let mut who: Vec<String> = Vec::new();
         for p in &f.people {
             if !self.near(p.pos) {
@@ -6584,6 +6587,9 @@ impl PeopleAcc {
                 if let Some((lane, s, len)) = p.leg {
                     waiters.entry((lane, s > len * 0.5)).or_default().push((p.pos, p.still > 0.0));
                     settled.push(p.still >= KERB_SETTLED);
+                    if p.still >= KERB_SETTLED {
+                        settled_groups.entry((lane, s > len * 0.5)).or_default().push(p.pos.truncate());
+                    }
                     who.push(format!("#{} ({:.2}, {:.2}) leg {lane} s {s:.1}/{len:.1} still {:.1} {:?}", p.id.unwrap_or(0), p.pos.x, p.pos.y, p.still, p.decision.as_deref().unwrap_or("-")));
                 }
             }
@@ -6734,6 +6740,28 @@ impl PeopleAcc {
                 let dens = if area > 1e-9 { n as f64 / area } else { f64::INFINITY };
                 if dens > self.kerb_dens_max.0 {
                     self.kerb_dens_max = (dens, n, f.time, group[0].0);
+                }
+            }
+            // (the same among the waiters standing at their places: still KERB_SETTLED or more)
+            let spts: Vec<glam::DVec2> = settled_groups.values().flatten().copied().collect();
+            for group in settled_groups.values() {
+                let n = group.len();
+                if n < 2 {
+                    continue;
+                }
+                let area: f64 = group
+                    .iter()
+                    .map(|&me| {
+                        let mut others: Vec<glam::DVec2> = spts.iter().copied().filter(|q| (*q - me).length() < 2.0 * KERB_CELL_REACH).collect();
+                        if let Some(k) = others.iter().position(|q| *q == me) {
+                            others.swap_remove(k);
+                        }
+                        kerb_cell(me, &others)
+                    })
+                    .sum();
+                let dens = if area > 1e-9 { n as f64 / area } else { f64::INFINITY };
+                if dens > self.kerb_dens_settled.0 {
+                    self.kerb_dens_settled = (dens, n, f.time, group[0]);
                 }
             }
         }
@@ -6932,6 +6960,8 @@ impl PeopleAcc {
         // 7
         let m = self.kerb_dens_max;
         kv!("kerb_density_max", format!("{:.2} per m2 ({} waiters at {:.1} s at ({:.1}, {:.1}); a waiter's space = their Voronoi cell among the waiters, cut to {KERB_CELL_REACH} m; groups by the end of the path they wait on)", m.0, m.1, m.2, m.3.x, m.3.y), json!({"density": if m.0.is_finite() { r2(m.0) } else { -1.0 }, "n": m.1, "t": r1(m.2), "pos": [r1(m.3.x), r1(m.3.y)]}));
+        let m = self.kerb_dens_settled;
+        kv!("kerb_density_settled", format!("{:.2} per m2 ({} waiters at {:.1} s at ({:.1}, {:.1}); as kerb_density_max among the waiters still {KERB_SETTLED} s or more)", m.0, m.1, m.2, m.3.x, m.3.y), json!({"density": if m.0.is_finite() { r2(m.0) } else { -1.0 }, "n": m.1, "t": r1(m.2)}));
         let g = self.kerb_group_max;
         kv!("kerb_group_max", format!("{} waiters at {:.1} s at ({:.1}, {:.1})", g.0, g.1, g.2.x, g.2.y), json!({"n": g.0, "t": r1(g.1), "pos": [r1(g.2.x), r1(g.2.y)]}));
         let o = self.kerb_over_max;
