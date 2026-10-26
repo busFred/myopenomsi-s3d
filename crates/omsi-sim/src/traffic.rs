@@ -5201,5 +5201,12 @@ mod aurora_pool_tests {
         assert_eq!(lane.pool_density(&defaults, 3), 0.0);
         lane.group_density.push((1, 0.0));
         assert_eq!(lane.pool_density(&defaults, 1), 0.0);
+        // a group whose default names a self-referring group takes that group's density: its
+        // rule where one exists, else the medium density
+        let defaults = [1, 2, 2];
+        lane.group_density = vec![(0, 1.0)];
+        assert_eq!(lane.pool_density(&defaults, 2), 1.0);
+        lane.group_density.push((1, 0.1));
+        assert_eq!(lane.pool_density(&defaults, 2), 0.1);
     }
 }

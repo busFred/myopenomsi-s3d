@@ -547,8 +547,8 @@ static NEAR_LIGHTS: std::sync::Mutex<Option<NearLights>> = std::sync::Mutex::new
 
 /// Are an AI vehicle's lamp glows drawn this frame: only while the vehicle itself can be, within
 /// the drawn reach (`traffic::draw_reach`: the renderer's object distance `max_obj_dist` held out
-/// to `MAX_OBJ_DIST_HOLD`, within the loaded tiles' radius `loaded`) plus its half length (as
-/// `Renderer` culls its meshes; a reach of 0: no limit). A lamp glows at a few pixels at any
+/// to `MAX_OBJ_DIST_HOLD`, as `Renderer` culls its meshes, and no farther than the loaded tiles'
+/// radius `loaded`) plus its half length (a reach of 0: no limit). A lamp glows at a few pixels at any
 /// distance (corona.wgsl), so a lamp of a car that is not drawn would float in the dark on its own,
 /// and the traffic's perceptual horizon, capped at that reach, would not hold by night.
 pub fn lamps_drawn(v: &VehicleInstance, camera_pos: DVec3, max_obj_dist: f32, loaded: f64) -> bool {

@@ -613,9 +613,10 @@ impl Viewer {
     }
 
     /// The perceptual horizon (m) of a place where a body `height` (m) high may stand: the nearer
-    /// of its two-pixel distance and the renderer's drawn reach (`reach`: the object distance -
+    /// of its two-pixel distance and the drawn reach (`reach`: the object distance -
     /// `max_obj_dist`, the view distance when that is `auto` - held out to `MAX_OBJ_DIST_HOLD`,
-    /// within the loaded tiles; lamp glows are culled with their car there). For the loaded
+    /// and no farther than the loaded radius: the lamp glows are culled there, the renderer's
+    /// mesh culling stays at the object distance). For the loaded
     /// tiles' edge: whether it is in sight (`Traffic::mark_edges_in_sight`) and how far the tiles
     /// are prefetched (`prefetch_target`). A body itself is judged by `beyond_horizon`, with its
     /// own size.
@@ -657,9 +658,9 @@ impl Viewer {
         self
     }
 
-    /// Would the renderer draw an object of radius `r` this far away at all (an object already
-    /// drawn stays out to `MAX_OBJ_DIST_HOLD` times the object distance, within the loaded tiles:
-    /// `reach`; too small on screen, under `min_size`, it is left out - but with the lamps lit its
+    /// Would an object of radius `r` this far away show at all (an object already drawn stays
+    /// out to `MAX_OBJ_DIST_HOLD` times the object distance; its lamp glows no farther than the
+    /// loaded radius: `reach`; too small on screen, under `min_size`, it is left out - but with the lamps lit its
     /// glows are not, so then only the distance counts)? Beyond that a car, its
     /// lamp glows included (`lights::lamps_drawn`), can come and go in plain view without anybody
     /// seeing it happen.
@@ -5417,23 +5418,21 @@ fn edge_bound_of(net: &Network) -> hashbrown::HashSet<usize> {
 }
 
 /// The horizon `prefetch_target` keeps the edge beyond: a body `height` high with its lamps dark
-/// (a lit lamp has no two-pixel distance), capped by the draw distance as every horizon is (so
-/// the reach is at most the renderer's object distance plus one tile load; with `max_obj_dist`
-/// auto, the view distance), never within `NEAR_HIDE` (as
-/// `Viewer::beyond_horizon`: the far trip end acts beyond both).
-/// A stated trade, flagged for the user: the reach uses the dark horizon by dusk and night too.
-/// With the lamps lit an edge is in sight out to the renderer's reach (1.05 x the object
-/// distance: ~3150 m with the user's 3000 m), so beyond the view distance (2500 m) the edge-in-sight rule keeps the
-/// roads to it empty at night; loading out to the lit reach instead (~3.25 km) would cost ~1.7x
-/// the tiles (memory is preferred over the night picture at 2.5-3 km).
+/// (a lit lamp has no two-pixel distance) and the loaded radius left out (the radius is what
+/// this horizon decides: with it in, the radius could never grow past the view distance),
+/// capped by the object distance as every horizon is (so the reach is at most the renderer's
+/// object distance plus one tile load; with `max_obj_dist` auto, the view distance), never within
+/// `NEAR_HIDE` (as `Viewer::beyond_horizon`: the far trip end acts beyond both). By night the
+/// lamps' reach is bounded by the loaded radius (`draw_reach`), so an edge is never in sight
+/// beyond it and the roads to it carry cars (user decision D8, 2026-10-26).
 fn edge_horizon(viewer: Viewer, height: f64) -> f64 {
-    Viewer { lamps_lit: false, ..viewer }.horizon(height).max(NEAR_HIDE)
+    Viewer { lamps_lit: false, loaded: 0.0, ..viewer }.horizon(height).max(NEAR_HIDE)
 }
 
 impl Traffic {
     /// `prefetch_target` for this frame's picture (`viewer`), `None` before the first frame:
-    /// the `edge_horizon` of the tallest random-traffic body (lamps dark: with them lit the edge
-    /// is in sight out to the renderer's reach and the edge-in-sight rule keeps the cars off roads ending there), and
+    /// the `edge_horizon` of the tallest random-traffic body (lamps dark, the loaded radius left
+    /// out: see `edge_horizon`), and
     /// the road's speed at the player (`player`:
     /// position, speed in m/s) - the faster of its street lane's speed limit and its own speed.
     pub fn prefetch_reach(&self, player: Option<(DVec3, f64)>, load_secs: f64) -> Option<f64> {
@@ -5471,8 +5470,8 @@ impl Traffic {
 
     /// Mark each loaded-edge lane in sight or not (`Lane::edge_in_sight`): its end
     /// within the perceptual horizon of the eye (`Viewer::horizon` of the tallest random-traffic
-    /// body, never within NEAR_HIDE; only the draw distance while the lamps are lit, so then
-    /// every edge within it is in sight), and with the flags changed gather `edge_bound` again. Only an edge in sight is
+    /// body, never within NEAR_HIDE; only the drawn reach while the lamps are lit, which stays
+    /// inside the loaded radius, so by night no edge is in sight), and with the flags changed gather `edge_bound` again. Only an edge in sight is
     /// routed away from and kept clear of new cars; beyond the horizon a car drives to it
     /// and its trip ends there out of sight (the far trip end), as a SUMO vehicle leaves the
     /// network at its border. Before the first frame (no eye) every edge counts as in sight.
