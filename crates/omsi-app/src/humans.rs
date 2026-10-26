@@ -1346,6 +1346,17 @@ impl Cabin {
 
 }
 
+/// The pavement within `STANDING_REACH` of `at` that is reached without going over a
+/// carriageway: (lane, distance along it). None: nowhere to step onto there.
+fn kerb_beside(ped: &PedNet, net: &Network, at: DVec3) -> Option<(usize, f32)> {
+    ped.nearest(net, at, STANDING_REACH)
+        .filter(|&(lane, s, _)| {
+            let (q, _) = net.lanes[lane].at(s);
+            !crosses_street(net, at.truncate(), q.truncate())
+        })
+        .map(|(lane, s, _)| (lane, s))
+}
+
 /// Whether the straight way from `a` to `b` goes over a carriageway: across the centre
 /// line of a street lane (walking along the kerb on the carriageway's edge does not).
 fn crosses_street(net: &Network, a: DVec2, b: DVec2) -> bool {
@@ -1408,6 +1419,11 @@ struct BusNow {
     /// The stop a timetable bus stands boarding at (its timetable's, whatever stop object
     /// lies nearest): its riders get off there. None for any other bus, and while it drives.
     boarding_stop: Option<i64>,
+    /// A timetable bus boarding short of its stop's pole (not in the box of a stop of the
+    /// people's with a pavement): for each exit and each entry, the pavement beside its
+    /// outside point (`kerb_beside`); a door with none counts shut for the people
+    /// (`Humans::kerb_doors`). None at the pole, and for any other bus.
+    kerb: Option<(Vec<Option<(usize, f32)>>, Vec<Option<(usize, f32)>>)>,
     /// The doors a walker may use (another player's bus: its doors as they are, while
     /// `entry_open` stays shut for the passengers here); None: as `entry_open`/`exit_open`.
     walk_open: Option<(Vec<bool>, Vec<bool>)>,
@@ -2160,15 +2176,10 @@ impl DecideCtx<'_> {
                 // found, or not loaded yet, stood there for good - and walks on along it
                 let t = p.t_state;
                 if let (Some(net), true) = (net, t % 1.0 < dt || t == 0.0) {
-                    let at = p.position;
-                    let found = self.ped.and_then(|pn| pn.nearest(net, at, STANDING_REACH));
                     // a pavement across the street does not count (they
                     // walked into the bus to reach it); with none within reach they are gone
-                    let found = found.filter(|&(lane, s, _)| {
-                        let (q, _) = net.lanes[lane].at(s);
-                        !crosses_street(net, at.truncate(), q.truncate())
-                    });
-                    if let Some((lane, s, _)) = found {
+                    let found = self.ped.and_then(|pn| kerb_beside(pn, net, p.position));
+                    if let Some((lane, s)) = found {
                         let leg = Leg { lane, a: s, b: s };
                         d.state = Some(State::Strolling(PedWalk::new(vec![leg], true, 0.0)));
                         d.t_state = 0.0;
@@ -6483,6 +6494,35 @@ impl Humans {
         self.request_stop(*id, Some(&name), None)
     }
 
+    /// A timetable bus boarding short of its stop's pole - not in the box of a stop of the
+    /// people's that has a pavement (`register_buses`; the people's stops are set up only
+    /// where people are, and a bus queued behind another serves up to 45 m short) - lets its
+    /// riders off only by a door with a pavement beside it that is not across a street
+    /// (`kerb_beside`, the rule of somebody standing with no pavement known): a door with none
+    /// counts shut for the people, so nobody steps off beside it into the road, nobody waits
+    /// at it holding the bus, and the riders bound there ride on. Without a pavement network
+    /// (a map without one) the doors stay as the script has them.
+    fn kerb_doors(&self, buses: &mut [BusNow], net: Option<&Network>) {
+        let (Some(ped), Some(net)) = (self.ped.as_ref(), net) else { return };
+        for bn in buses.iter_mut() {
+            let Some(stop) = bn.boarding_stop else { continue };
+            let at_pole = self.in_stop_box(stop, bn.id) && self.stops.get(&stop).is_some_and(|s| s.lane.is_some());
+            if at_pole {
+                continue;
+            }
+            let beside = |doors: &[Door]| -> Vec<Option<(usize, f32)>> {
+                doors.iter().map(|d| kerb_beside(ped, net, bn.world(d.outside))).collect()
+            };
+            let (exits, entries) = (beside(&bn.cabin.exits), beside(&bn.cabin.entries));
+            for (open, kerb) in [(&mut bn.exit_open, &exits), (&mut bn.entry_open, &entries)] {
+                for (o, k) in open.iter_mut().zip(kerb) {
+                    *o &= k.is_some();
+                }
+            }
+            bn.kerb = Some((exits, entries));
+        }
+    }
+
     /// The buses passengers deal with this frame.
     fn gather_buses(
         &mut self,
@@ -6577,6 +6617,7 @@ impl Humans {
                 exit_open,
                 boards: true,
                 boarding_stop: None,
+                kerb: None,
                 interior: b.interior_light(),
                 air: CabinAir::of(b),
                 half,
@@ -6679,6 +6720,7 @@ impl Humans {
                     exit_open,
                     boards: c.at_station(),
                     boarding_stop: stop,
+                    kerb: None,
                     interior: c.vehicle.interior_light(),
                     air: CabinAir::of(&c.vehicle),
                     half,
@@ -6734,6 +6776,7 @@ impl Humans {
             exit_open: vec![false; cabin.exits.len()],
             boards: true,
             boarding_stop: None,
+            kerb: None,
             walk_open: Some(walk_open),
             cabin,
             pos: v.position,
@@ -6914,6 +6957,7 @@ impl Humans {
                 exit_open: vec![false; cabin.exits.len()],
                 boards: true,
                 boarding_stop: None,
+                kerb: None,
                 walk_open: Some(walk_open),
                 cabin,
                 pos: v.position,
@@ -7636,6 +7680,9 @@ impl Humans {
         let bus_ix: HashMap<BusId, usize> = buses.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
         // the stops: which buses stand at them (sub_61f93c), who waits there (sub_61bf94)
         let at_stops = self.register_buses(&buses, dt);
+        let mut buses = buses;
+        self.kerb_doors(&mut buses, net);
+        let buses = buses;
         self.claim_waiting();
         self.ride_comfort(dt, bus, &buses, &bus_ix, world);
         if !self.avatar_only {
@@ -9515,6 +9562,29 @@ mod tests {
         assert!((x[0] - DVec2::new(0.0, 4.0)).length() < 1e-6);
     }
 
+    /// A timetable bus boarding 40 m short of its stop in a through lane: beside its door
+    /// is the carriageway, the pavement on its side starts at the stop and the one across the
+    /// street is over the lanes, so the door has no pavement to step onto (it counts shut for
+    /// the people, `Humans::kerb_doors`: nobody steps off into the road or vanishes there);
+    /// at the stop the door has the pavement beside it.
+    #[test]
+    fn a_bus_short_of_its_stop_in_a_through_lane_has_no_kerb_at_its_door() {
+        let mut net = Network::default();
+        // two through lanes northwards, x 0 and 3.5; the near pavement from the stop on
+        net.lanes.push(lane(vec![DVec3::new(0.0, -100.0, 0.0), DVec3::new(0.0, 100.0, 0.0)], LaneKind::Street));
+        net.lanes.push(lane(vec![DVec3::new(-3.5, -100.0, 0.0), DVec3::new(-3.5, 100.0, 0.0)], LaneKind::Street));
+        net.lanes.push(lane(vec![DVec3::new(3.2, 40.0, 0.0), DVec3::new(3.2, 80.0, 0.0)], LaneKind::Sidewalk));
+        // the pavement across the street, 7.5 m from the door
+        net.lanes.push(lane(vec![DVec3::new(-5.5, -100.0, 0.0), DVec3::new(-5.5, 100.0, 0.0)], LaneKind::Sidewalk));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        // the right door's outside point of a bus in lane 0, 40 m short of the stop at y 40
+        let short = DVec3::new(1.8, 0.0, 0.0);
+        assert_eq!(kerb_beside(&ped, &net, short), None, "no pavement beside the door 40 m short");
+        let at_stop = DVec3::new(1.8, 45.0, 0.0);
+        assert_eq!(kerb_beside(&ped, &net, at_stop).map(|k| k.0), Some(2), "the pavement beside the door at the stop");
+    }
+
     /// An articulated bus: the front section's cabin and the rear section's (which only has
     /// exits and a seat) become one network through the joint, numbered front first, and a
     /// walk through the bent joint moves on without a jump.
@@ -10025,6 +10095,7 @@ mod tests {
             exit_open: Vec::new(),
             boards: true,
             boarding_stop: None,
+            kerb: None,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),
@@ -10085,6 +10156,7 @@ mod tests {
             exit_open: vec![true],
             boards: true,
             boarding_stop: None,
+            kerb: None,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),

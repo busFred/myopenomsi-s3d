@@ -3114,11 +3114,13 @@ impl Humans {
             }
             return;
         }
-        // out of the bus: into the world, on along the pavement (task 8)
+        // out of the bus: into the world, on along the pavement (task 8) - short of the pole
+        // onto the pavement beside their door (`Humans::kerb_doors`)
         let Some((w, h)) = self.pax_world(&p, buses, bus_ix) else {
             return;
         };
         let stop = here;
+        let kerb = bn.kerb.as_ref().and_then(|(x, e)| p.door.and_then(|d| if p.door_entry { e.get(d) } else { x.get(d) }).copied().flatten());
         let pp = self.pax_mut(i).unwrap();
         pp.inside = None;
         pp.pos = w;
@@ -3132,7 +3134,10 @@ impl Humans {
                 p.door
             );
         }
-        self.walk_street(i, w, h, stop, world, remove);
+        match kerb {
+            Some(leg) => self.walk_street_on(i, w, h, Some(leg)),
+            None => self.walk_street(i, w, h, stop, world, remove),
+        }
         // [ROLLBACK stepout-70] straight away from the bus's side first (1.8 m), whatever the
         // pavement's path does: just off, they stood up to eight seconds - the standing bus
         // was "in the way" of the first step along its side
@@ -3171,13 +3176,19 @@ impl Humans {
         remove: &mut Vec<usize>,
     ) {
         let lane = stop.and_then(|s| self.stops.get(&s)).and_then(|s| s.lane);
+        let _ = &remove;
+        self.walk_street_on(i, at, heading, lane)
+    }
+
+    /// On as a pedestrian from `at` along pavement `lane` (lane, distance along it) - or
+    /// standing, looking for one, when there is none.
+    pub(super) fn walk_street_on(&mut self, i: usize, at: DVec3, heading: f64, lane: Option<(usize, f32)>) {
         let p = &mut self.people[i];
         p.position = at;
         p.heading = heading;
         p.place = Place::Ground;
         p.interior = 0.0;
         p.vel = DVec2::ZERO;
-        let _ = &remove;
         match (lane, self.ped.as_ref()) {
             (Some((l, s)), Some(_)) => {
                 let leg = Leg {
