@@ -3805,6 +3805,9 @@ const PED_OCCUPIED_CAP: f32 = 20.0;
 
 /// Decisions on a crossing as the recording shows them.
 const TURNS_BACK: &str = "caught by the change: back to the kerb";
+/// The cells (m) the strollers profile line counts the turns at a map-parked car by: the
+/// gate's spots ((446.6,-1216.9), (486.4,-1220.4)) are 40 m apart, a cell holds one of them.
+const WALL_TURN_CELL: f64 = 10.0;
 /// A stroller turned round at a map-parked car over the whole path (`BoxOutcome::Wall`).
 const TURNS_AT_A_WALL: &str = "a parked car over the path: turns round";
 const HURRIES_ON: &str = "caught by the change: on across";
@@ -5381,6 +5384,9 @@ pub struct Humans {
     streams: Streams,
     /// The kerb queues this frame (`Queues`), with the kerbs' waiting areas.
     queues: Queues,
+    /// How many strollers turned round at a map-parked car (`BoxOutcome::Wall`), by
+    /// `WALL_TURN_CELL` cell of where they stood (the strollers profile line reports them).
+    wall_turns: HashMap<(i64, i64), u32>,
     hidden: Vec<usize>,
     /// GPU side of the human types, shared by everyone of a type: textures by file and the
     /// materials of every (type, mesh) - each person used to upload its own copies - and
@@ -5723,6 +5729,7 @@ impl Humans {
             yields: HashMap::new(),
             streams: HashMap::new(),
             queues: Queues::default(),
+            wall_turns: HashMap::new(),
             hidden: Vec::new(),
             gpu_textures: HashMap::new(),
             gpu_materials: HashMap::new(),
@@ -7150,8 +7157,14 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, no figure {rej_spawn}",
-                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len()
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, no figure {rej_spawn}; turned at a parked car {} ({})",
+                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
+                self.wall_turns.values().sum::<u32>(),
+                {
+                    let mut cells: Vec<(&(i64, i64), &u32)> = self.wall_turns.iter().collect();
+                    cells.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    cells.iter().take(4).map(|((x, y), n)| format!("{n} at ({:.0}, {:.0})", (*x as f64 + 0.5) * WALL_TURN_CELL, (*y as f64 + 0.5) * WALL_TURN_CELL)).collect::<Vec<_>>().join(", ")
+                }
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -8768,6 +8781,7 @@ impl Humans {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
                     walk.turn_round(net);
                     p.last_decision = Some(TURNS_AT_A_WALL);
+                    *self.wall_turns.entry(((here.x / WALL_TURN_CELL).floor() as i64, (here.y / WALL_TURN_CELL).floor() as i64)).or_default() += 1;
                 }
                 continue;
             }
