@@ -755,6 +755,21 @@ fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain:
     false
 }
 
+/// The standing claim `k` is refused (the first pass's `wait_for`) for a vehicle that itself waits
+/// for `me` through its lead chain (`held_by` of that one, or its lead is me): what `k` waits for
+/// cannot move before I go, so `k` cannot come before I go either (a ring of three: I wait for
+/// `k`, `k` for one standing in its way, that one behind me). Second pass only.
+fn waits_through(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
+    let Some(w) = plain.and_then(|p| p[k].wait_for) else { return false };
+    if w == me {
+        return false;
+    }
+    match claim_of.get(&w) {
+        Some(&next) if next != k => claims[next].standing() && (claims[next].lead == Some(me) || held_by(claims, claim_of, plain, next, me)),
+        _ => false,
+    }
+}
+
 /// A rolling foe `k` is no competitor when it rolls up to a queue that waits for me: its lead
 /// chain (up to `LEAD_CHAIN` links) ends at `me` through at least one standing vehicle (every
 /// intermediate under 0.3 m/s). It cannot be at the meeting place before the standing one
@@ -1048,7 +1063,7 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     let stops_short = |g: &Grant| rests_short(js, claims, ok, g, foe.theirs.0 + (claims[ok].s - o.s));
     let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go && stops_short(&g));
     let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
-    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && held_by(claims, claim_of, plain, ok, c.vehicle)) {
+    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && (held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(claims, claim_of, plain, ok, c.vehicle))) {
         o.committed = true;
     }
     // in the box at the end of my green, a foe on the fresh green across my way that is neither
@@ -1083,7 +1098,7 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // and the two bodies locked across a crossing, viz3 case07 j20); a lead is one frame's
     // perception, so one rolling faster is not taken on it - or rolling up to a queue whose lead
     // chain reaches me through a standing vehicle (`held_by_standing`)
-    if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
+    if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
         return Pass::Not("waits_for_me");
     }
     // a foe at its red is not coming before its light goes (SUMO's foe arrival is its planned
