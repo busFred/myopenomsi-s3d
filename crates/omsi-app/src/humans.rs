@@ -1803,9 +1803,9 @@ const STRIPE_ONCOMING_CONFLICT_PENALTY: f64 = -1000.0;
 const STRIPE_DIST_FAR_AWAY: f64 = 10000.0;
 
 /// The stripes of a crossing `width` metres wide (`STRIPE_WIDTH`), numbered from the walker's
-/// left, centred on the crossing's axis (SUMO lays them from one edge of the lane; an OMSI
-/// crossing is walked both ways on the same pieces, so the set is laid symmetric about the
-/// axis and is the same set whichever way one walks it).
+/// left, centred on the crossing's axis: an OMSI choice (SUMO counts its stripes' lateral position
+/// from one edge of the lane, `MSPModel_Striping` posLat; its set too is the same whichever way the
+/// lane is walked); centred, the outer stripe's body keeps inside the piece on both sides.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Stripes {
     n: usize,
@@ -4002,11 +4002,11 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
 /// they would stand up to this far off their point of the queue grid.
 const KERB_ARRIVE: f64 = 0.1;
 
-/// HCM 2010 (p. 4-32): people waiting to cross at street corners queue at 3-6 ft^2 a person
-/// (0.28-0.56 m^2). The upper end, 6 ft^2: the lower end is the HCM body ellipse itself (3 ft^2,
-/// p. 4-24, bodies touching), and the crowd's people are discs of `BODY_OUTSIDE`, which a
-/// stripe (`STRIPE_WIDTH`) apart need 0.64 x 0.56 = 0.36 m^2 not to touch: of the range only
-/// its upper end keeps them apart. A kerb's waiting area holds its area / this many waiters.
+/// HCM 2010 (p. 4-32, text): people waiting to cross at street corners queue at 3-6 ft^2 a person
+/// (0.28-0.56 m^2). Taken: the upper end, 6 ft^2, the roomier queue (the lower end is the HCM body
+/// ellipse itself, 3 ft^2, p. 4-24, bodies touching; the crowd's discs of `BODY_OUTSIDE` a stripe
+/// apart stay clear from 0.64 x 0.56 = 0.36 m^2 up, so the choice within the range is not forced
+/// by them). A waiting area holds its area / this many waiters.
 const QUEUE_AREA_PER_PERSON: f64 = 6.0 * 0.092_903_04;
 /// The depth of one row of a kerb queue (m): a place is a stripe wide and this deep, so that it
 /// is `QUEUE_AREA_PER_PERSON` (0.87 m).
@@ -4515,9 +4515,9 @@ impl Queues {
 /// waiting at the kerb keeps (m).
 const KERB_CLEAR: f64 = 0.3;
 
-/// The outermost of the spots `kerb_spot` tries either side of the way when it backs
-/// away from a kerb inside a lane's reach (m: two of the stripes of a kerb queue, rounded as
-/// the spot's spread rows were).
+/// The outermost of the spots `kerb_spot` tries either side of the way when it backs away from
+/// a kerb inside a lane's reach (m): two of the 0.45 m spread spots the kerb's waiting spot had
+/// before the queue grid; kept as `kerb_spot`'s search width, its result is put on the grid.
 const KERB_SPREAD_MAX: f64 = 0.9;
 
 /// The width a carriageway lane is taken to have at least (m): the pieces
@@ -5248,8 +5248,11 @@ impl Person {
     fn inside(&self, bus: BusId) -> bool {
         matches!(self.place, Place::Bus(b, _) if b == bus)
     }
-    /// Waiting at a kerb to cross (held there by `kerb_verdict`), off the
-    /// carriageway: the cars' people check takes them as clear outside their footprint.
+    /// Waiting at a kerb to cross (held there by `kerb_verdict`), off the carriageway: the cars'
+    /// footprint strip takes them as clear outside their footprint; the crossing band test
+    /// (perception `blocked_by`) does not ask, and holds a car for a waiter standing on a
+    /// crossing's walk whose offset across the car's lane at the cut falls in its band - on an
+    /// oblique or curving turn that is a waiter metres from the lane - until J11-10 lands.
     fn at_kerb(&self) -> bool {
         matches!(&self.state, State::Strolling(w) if w.held > 0.0) && !self.on_crossing && self.last_decision.map(|d| d != "go").unwrap_or(false)
     }
