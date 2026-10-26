@@ -1656,8 +1656,11 @@ const EXIT_NEAR: f32 = 15.0;
 
 /// The next junction on the way (or the one the car is in), up to the claim horizon
 /// (`sim::claim_horizon`: eight seconds of speed), with the room past its conflicts measured
-/// along the car's own way: a vehicle standing inside the piece past the
-/// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
+/// along the car's own way: a vehicle standing ahead of the car's front inside the piece past
+/// the meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear"). The
+/// room is the space from the end of the last crossing (`clear_from`) to that vehicle's tail,
+/// which the car's whole body needs; a vehicle whose tail is behind the car's own front is
+/// behind it and never counts (SUMO's junction blocking judges the exit lane ahead of the link).
 fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<JunctionView> {
     let me = &vehicles[i];
     let js: &Junctions = &sim.junctions;
@@ -1706,6 +1709,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
                 let o = &vehicles[occ.vehicle];
                 let tail = wd + occ.s - o.state.rear;
+                // (only what stands ahead of my own front is in the exit I would enter: on a way
+                // whose side merges lie behind my front, `clear_from` lies behind it too, and my
+                // follower's tail would count. SUMO's junction-blocking test judges the space on
+                // the exit lane ahead of the link; a vehicle behind ego never counts)
+                if tail <= me.state.front {
+                    continue;
+                }
                 if o.state.speed < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
@@ -1733,6 +1743,9 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                     continue;
                 }
                 let tail = wd + s - p.half_len;
+                if tail <= me.state.front {
+                    continue;
+                }
                 if p.speed.abs() < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }

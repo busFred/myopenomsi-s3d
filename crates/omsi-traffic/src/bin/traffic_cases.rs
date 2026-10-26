@@ -4297,6 +4297,10 @@ struct Extra {
     /// (`Claim::light_red`): a partner held at red whose green comes after my arrival is not
     /// ahead (`reservation::zipper_cap`), so this is 0 when the rule holds.
     capped_by_red_s: f64,
+    /// Vehicle-seconds within the radius standing refused for a full exit (`Hold::ExitFull`) with
+    /// no lead on its way (`Plan::lead`): nothing ahead of its front closes the exit, so this is 0
+    /// when the exit room counts only what is ahead of the car (`perception::junction_ahead`).
+    exitfull_nolead_s: f64,
     /// [round 7 R7-1] With `--pedtouch`: frames a moving vehicle's body is severely over a
     /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
     /// player's passengers out not counted).
@@ -4567,6 +4571,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             change_since.retain(|id, _| ids.contains(id));
             pass_seen.retain(|id, _| ids.contains(id));
             for v in r.vehicles.iter().filter(|v| v.state.speed < 0.3 && near(v.pos)) {
+                if v.last.hold == Some(Hold::ExitFull) && v.last.lead.is_none() {
+                    ex.exitfull_nolead_s += fdt;
+                }
                 let st = &v.state;
                 let over = r.net.walks.get(st.lane).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| sa >= st.s - st.rear && sa <= st.s + st.front));
                 if over {
@@ -4987,6 +4994,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("follower_go/leader_go", format!("{:.0}/{:.0}", e.follower_go_s, e.leader_go_s)),
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
         ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
+        ("exitfull_nolead", format!("{:.0}", e.exitfull_nolead_s)),
         ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
         ("removed_far", e.removed_far.to_string()),
     ]
@@ -5033,6 +5041,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.leader_go_s += e.leader_go_s;
     t.zipper_capped_s += e.zipper_capped_s;
     t.capped_by_red_s += e.capped_by_red_s;
+    t.exitfull_nolead_s += e.exitfull_nolead_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -6044,8 +6053,9 @@ fn lights(fixture: &Path, args: &[String]) -> Res<()> {
 }
 
 /// `foes <fixture> <lane>...`: the foes of each lane's movement on the network the replay runs
-/// (the other lane, the kind, who yields, the stretches), and whether the meeting place is
-/// one of two converging lanes (`Network::add_converging`).
+/// (the other lane, the kind, who yields, the stretches), whether the meeting place is
+/// one of two converging lanes (`Network::add_converging`), and whether it is a side-by-side
+/// merge (`Foe::side`, which the exit room of `perception::junction_ahead` leaves out).
 fn foes(fixture: &Path, args: &[String]) -> Res<()> {
     let (r, _) = grown(fixture, true)?;
     let js = &r.sim.junctions;
@@ -6062,7 +6072,7 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
             let ol = js.nodes[j].movements[f.movement].lane;
             let conv = omsi_sim::traffic::converging_stretch(ln, &r.net.lanes[ol]).is_some() && f.kind == omsi_traffic::FoeKind::Merge && (ln.end() - r.net.lanes[ol].end()).truncate().length() >= 1.5;
             let back = js.nodes[j].movements[f.movement].foes.iter().find(|g| g.movement == m).map(|g| g.yields);
-            println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" });
+            println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" }, if f.side { " [side]" } else { "" });
         }
     }
     Ok(())
