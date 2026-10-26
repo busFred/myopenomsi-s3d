@@ -1042,10 +1042,12 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     let (mut their_in, mut their_out) = window(o, foe.theirs.0, foe.theirs.1);
     // my own follower comes after me whatever the table says, one in the meeting place or
     // committed to it excepted: standing with me as its lead (or waiting for me through the
-    // chain, `held_by`) - a lead is one frame's perception, so a rolling one is not taken on it -
-    // or rolling up to a queue whose lead chain reaches me through a standing vehicle
-    // (`held_by_standing`)
-    if !their_inside && !o.committed && ((o.speed < STANDING_SPEED && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
+    // chain, `held_by`) - standing with the claim's hysteresis, `Claim::standing`: one that has
+    // just crept off after me under 1 m/s is still my follower (counted as coming, it refused me
+    // and the two bodies locked across a crossing, viz3 case07 j20); a lead is one frame's
+    // perception, so one rolling faster is not taken on it - or rolling up to a queue whose lead
+    // chain reaches me through a standing vehicle (`held_by_standing`)
+    if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
         return Pass::Not("waits_for_me");
     }
     // a foe at its red is not coming before its light goes (SUMO's foe arrival is its planned
