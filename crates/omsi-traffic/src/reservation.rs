@@ -773,6 +773,31 @@ fn held_by_standing(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize
     false
 }
 
+/// When the standing lead chain of claim `k` lets it go (s from now): the first link standing
+/// at its red (`Claim::light_red`) is released at its green (`until_go`; INFINITY: not within a
+/// cycle), as round 10 J9-1 times a partner at red; a link standing behind a standing lead of
+/// its own passes the question on, within `LEAD_CHAIN` links. None: a link held by anything
+/// else, without a claim, or the chain too long - its release is not known, and the foe counts
+/// as coming from rest now.
+fn lead_release(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, k: usize) -> Option<f32> {
+    let mut at = k;
+    for _ in 0..LEAD_CHAIN {
+        let &next = claim_of.get(&claims[at].lead?)?;
+        let l = &claims[next];
+        if !l.standing() {
+            return None;
+        }
+        if l.light_red {
+            return Some(l.until_go.unwrap_or(f32::INFINITY));
+        }
+        if !l.lead_rest().is_finite() {
+            return None;
+        }
+        at = next;
+    }
+    None
+}
+
 /// Links of a chain followed by `held_by`, `held_by_standing` and `held_off` (a three-car ring).
 const LEAD_CHAIN: usize = 4;
 
@@ -1054,12 +1079,16 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // one, and it plans to stop at its red): standing (creeping up under 1 m/s after a stand
     // counts, `Claim::was_standing`), from rest at its green; rolling, not before its green nor
     // before its own window says
+    // (the seconds its start from rest is put off by: its own red's, below; its lead's release,
+    // further below, adds only what lies beyond it)
+    let mut released_at = 0.0f32;
     if at_red {
         let t = o.until_go.unwrap_or(f32::INFINITY);
         let standing = o.standing();
         let shift = if standing { t } else { (t - their_in).max(0.0) };
         their_in += shift;
         their_out += shift;
+        released_at = shift;
     } else if o.light_red && !their_inside && o.red_at <= foe.theirs.0 {
         // (the same at a red that does not exclude mine, held short of this meeting place)
         match o.until_go {
@@ -1067,6 +1096,7 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
                 let shift = if o.standing() { t } else { (t - their_in).max(0.0) };
                 their_in += shift;
                 their_out += shift;
+                released_at = shift;
             }
             None => {
                 return Pass::Not("red");
@@ -1081,13 +1111,25 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
         return Pass::Not("held_off");
     }
     // SUMO's `setRequest` (MSVehicle.cpp: a link is requested only when the planned speed after
-    // the leader constraint is above `NUMERICAL_EPS_SPEED`) and `willPass`: a foe standing outside
-    // the meeting place whose front comes to rest short of it behind a standing lead or a body
-    // across its way (`Claim::lead_rest`) is not coming while that holds, whatever its why names
-    // (a car at its zipper waiting place 2 m behind a lead held at red is labelled Junction,
-    // neither blocked nor stuck). When the lead moves off, its window from rest counts again
+    // the leader constraint is above `NUMERICAL_EPS_SPEED`) and `willPass`, a statement of time
+    // re-made every step: a foe standing outside the meeting place whose front comes to rest
+    // short of it behind a standing lead or a body across its way (`Claim::lead_rest`), whatever
+    // its why names (a car at its zipper waiting place 2 m behind a lead held at red is labelled
+    // Junction, neither blocked nor stuck), starts no sooner than its lead chain is released
+    // (`lead_release`: the first of the chain standing at a red, at its green - round 10 J9-1's
+    // green and start from rest): its window from rest is put off to then, and the time test
+    // decides. A chain held by anything else, or not known, lets it come from rest now; one whose
+    // release never comes within a cycle is not coming
     if !their_inside && !o.committed && o.standing() && o.lead_rest() <= foe.theirs.0 {
-        return Pass::Not("stops_short");
+        match lead_release(claims, claim_of, ok) {
+            Some(t) if t.is_infinite() => return Pass::Not("stops_short"),
+            Some(t) => {
+                let extra = (t - released_at).max(0.0);
+                their_in += extra;
+                their_out += extra;
+            }
+            None => {}
+        }
     }
     // SUMO's `willPass` (blockedByFoe drops a foe whose request is not to pass: its planned speed
     // at the link is 0): a foe standing outside the meeting place, not committed to it, that this
@@ -2009,15 +2051,37 @@ mod tests {
 
     #[test]
     fn will_pass_a_foe_standing_behind_its_standing_lead_short_of_the_meeting_place_is_not_coming() {
-        // 1 m out, standing, from rest it would be there before I am out (the test below) - but
-        // its standing lead 0.5 m ahead of its front stops it short of the meeting place
-        // (`lead_rest`), whatever its why names: neither held, blocked nor stuck (a car at its
-        // zipper waiting place, labelled Junction). SUMO's `setRequest`: no request at v = 0
-        let (_, js, mut claims) = held_main_road_foe(1.0, 3.0, false);
+        // 10 m out, standing, from rest it would be there before I am out (the test below) - but
+        // its standing lead 0.5 m ahead of its front (`lead_rest`) stands at a red with 48 s
+        // left: it starts no sooner than that green (`lead_release`), whatever its why names -
+        // neither held, blocked nor stuck (a car at its zipper waiting place, labelled Junction).
+        // SUMO's `setRequest`: no request while its planned speed is 0, re-made every step
+        let (_, js, mut claims) = held_main_road_foe(10.0, 3.0, false);
         claims[1].held = false;
         claims[1].lead_gap = Some((0.5, 0.0));
+        claims[1].lead = Some(3);
+        let mut lead = claims[1].clone();
+        lead.vehicle = 3;
+        lead.id = 3;
+        lead.s = claims[1].s + 6.5;
+        lead.lead = None;
+        lead.lead_gap = None;
+        lead.light_red = true;
+        lead.until_go = Some(48.0);
+        lead.red_at = lead.s + lead.front + 0.5;
+        claims.push(lead);
         let g = resolve(&js, &claims);
         assert!(grant_of(&g, 1).go, "{g:?}");
+        // its lead's green half a second off: the queue comes from rest after it, before I am
+        // out (I wait for its head)
+        claims[2].until_go = Some(0.5);
+        let g = resolve(&js, &claims);
+        assert!(!grant_of(&g, 1).go, "{g:?}");
+        // a lead held by something not known (no claim): it counts from rest now
+        claims.pop();
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+        claims[1].lead = None;
         // its lead 3 m on, past the meeting place's start: it can come, and it counts
         claims[1].lead_gap = Some((3.0, 0.0));
         let g = resolve(&js, &claims);
