@@ -1072,6 +1072,9 @@ struct ZebraCut {
     at: DVec2,
     right: DVec2,
     half: f32,
+    /// The lanes of my way round the cut (the one cut, the one before and the one after): the
+    /// axis my body sweeps there, which a person must be within the band of to stand in my way.
+    axis: [Option<usize>; 3],
 }
 
 impl ZebraCut {
@@ -1112,7 +1115,9 @@ impl ZebraCut {
     /// whose band (its width and `CROSSING_SAFETY_GAP`, centred `lat` off the lane's axis) they
     /// have not completely passed, when they are inside it, or walk towards it from at most
     /// `JM_CROSSING_GAP` and have not stood `CROSSING_STANDING_WAIT`. Their walking direction is
-    /// their step across my lane; somebody without one (standing) holds only from inside.
+    /// their step across my lane; somebody without one (standing) holds only from inside. Inside
+    /// is in the band across my lane at the cut and within it of the axis my body sweeps there
+    /// (`ZebraCut::axis`): standing clear of every lane axis of my way is outside the band.
     fn blocked_by(&self, net: &Network, p: &crate::sim::Person, half_width: f32, lat: f32) -> bool {
         let Some(walk) = net.lanes.get(self.walk) else { return false };
         if !walk.nearest_point(p.pos).is_some_and(|(_, d)| (d as f32) < walk.width * 0.5 + crate::plan::PERSON_RADIUS) {
@@ -1123,7 +1128,12 @@ impl ZebraCut {
         // (across my lane: where they are from the band's middle, and their step)
         let off = (p.pos.truncate() - self.at).dot(self.right) as f32 - lat;
         let step = p.vel.dot(self.right) as f32;
-        if off.abs() < band + r {
+        // (inside: in the band across my lane at the cut, and within it of the axis my body
+        // sweeps there - on an oblique crossing of a curving way, people metres along the walk at
+        // its kerb project into the band at the cut while they stand clear of every lane axis;
+        // SUMO's `blockedAtDist` measures along the crossing against the vehicle's own extent)
+        let swept = self.axis.iter().flatten().filter_map(|&l| net.lanes.get(l)).filter_map(|l| l.nearest_point(p.pos)).map(|(_, d)| d as f32).fold(f32::INFINITY, f32::min);
+        if off.abs() < band + r && (swept.is_infinite() || swept < band + r + lat.abs()) {
             return true;
         }
         // (approaching: only somebody already on the crossing - the game's crossing flag, SUMO's
@@ -1145,11 +1155,12 @@ impl ZebraCut {
 fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraCut> {
     let st = &me.state;
     let mut out = Vec::new();
-    for &(l, d0) in lanes {
+    for (k, &(l, d0)) in lanes.iter().enumerate() {
         if d0 > ZEBRA_WAY {
             break;
         }
         let Some(lane) = net.lanes.get(l) else { continue };
+        let axis = [k.checked_sub(1).map(|i| lanes[i].0), Some(l), lanes.get(k + 1).map(|x| x.0)];
         let half = (lane.width * 0.5).max(me.half_width) + ZEBRA_BESIDE;
         for &(w, sa, _) in net.walks.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let point = d0 + sa;
@@ -1158,7 +1169,7 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
             }
             let (q, h) = lane.at(sa);
             let hr = (h as f64).to_radians();
-            out.push(ZebraCut { walk: w, along: point, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half });
+            out.push(ZebraCut { walk: w, along: point, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half, axis });
         }
     }
     out
@@ -2242,7 +2253,7 @@ mod crossing_tests {
     #[test]
     fn a_walker_on_the_crossing_holds_the_car_until_past_its_band() {
         let net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::new(-12.0, 0.0, 0.0), DVec3::new(12.0, 0.0, 0.0)], LaneKind::Sidewalk, 3.0)], ..Default::default() };
-        let z = ZebraCut { walk: 0, along: 20.0, at: DVec2::ZERO, right: DVec2::X, half: 2.5 };
+        let z = ZebraCut { walk: 0, along: 20.0, at: DVec2::ZERO, right: DVec2::X, half: 2.5, axis: [None; 3] };
         let p = |x: f64, vx: f64, on: bool, still: f32| Person { pos: DVec3::new(x, 0.0, 0.0), vel: DVec2::new(vx, 0.0), on_crossing: on, still, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None };
         // coming in from 4 m at 1.8 m/s: held (2.3 m from the band, within 10 m)
         assert!(z.blocked_by(&net, &p(4.0, -1.8, true, 0.0), 0.9, 0.0));
@@ -2256,6 +2267,26 @@ mod crossing_tests {
         assert!(!z.blocked_by(&net, &p(9.0, -1.4, false, 0.0), 0.9, 0.0));
         // off the walk altogether: not
         assert!(!z.blocked_by(&net, &p(0.0, 0.0, true, 0.0).with_y(5.0), 0.9, 0.0));
+    }
+
+    /// J11-10 (the 08:17 corner, lane 2833 -> 2835, walks 2978/2979): on an oblique walk across
+    /// a way that curves away, somebody standing 3 m along the walk at its kerb is within the
+    /// band across my lane at the cut (1.2 m off) but 3 m from the axis my body sweeps: not in my
+    /// way. Without the axis (the projection alone) they held the car.
+    #[test]
+    fn a_kerb_waiter_clear_of_the_swept_axis_does_not_hold_the_car() {
+        let walk = LaneBuilder::polyline(vec![DVec3::new(-2.0, 4.0, 0.0), DVec3::new(3.0, 9.0, 0.0)], LaneKind::Sidewalk, 3.0);
+        let way = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 5.0, 0.0), DVec3::new(-3.0, 8.0, 0.0), DVec3::new(-8.0, 9.0, 0.0)], LaneKind::Street, 3.5);
+        let net = Network { lanes: vec![walk, way], ..Default::default() };
+        let waiter = Person { pos: DVec3::new(1.2, 8.0, 0.0), vel: DVec2::ZERO, on_crossing: true, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None };
+        let mut z = ZebraCut { walk: 0, along: 20.0, at: DVec2::new(0.0, 5.0), right: DVec2::X, half: 2.5, axis: [None; 3] };
+        assert!(z.blocked_by(&net, &waiter, 0.9, 0.0), "the projection alone puts them in the band");
+        z.axis = [None, Some(1), None];
+        assert!(!z.blocked_by(&net, &waiter, 0.9, 0.0));
+        // on the walk where my body goes: held
+        let mut inside = waiter.clone();
+        inside.pos = DVec3::new(0.3, 5.3, 0.0);
+        assert!(z.blocked_by(&net, &inside, 0.9, 0.0));
     }
 
     trait WithY {
