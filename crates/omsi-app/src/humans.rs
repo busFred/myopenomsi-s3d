@@ -1405,6 +1405,9 @@ struct BusNow {
     /// for people, `BusService::at_station`); any other bus always (the player's and the
     /// others' doors are their drivers').
     boards: bool,
+    /// The stop a timetable bus stands boarding at (its timetable's, whatever stop object
+    /// lies nearest): its riders get off there. None for any other bus, and while it drives.
+    boarding_stop: Option<i64>,
     /// The doors a walker may use (another player's bus: its doors as they are, while
     /// `entry_open` stays shut for the passengers here); None: as `entry_open`/`exit_open`.
     walk_open: Option<(Vec<bool>, Vec<bool>)>,
@@ -6573,6 +6576,7 @@ impl Humans {
                 entry_open,
                 exit_open,
                 boards: true,
+                boarding_stop: None,
                 interior: b.interior_light(),
                 air: CabinAir::of(b),
                 half,
@@ -6601,8 +6605,13 @@ impl Humans {
                     continue;
                 };
                 let speed = c.ai.state.speed as f64;
+                // the stop it boards at: the one its timetable serves now (`BusService`), else
+                // the nearest stop object in reach of where it stands. A bus queued behind
+                // another one serves where it stands, tens of metres from the pole, and its
+                // doors counted shut for the people: riders stood at its open doors to the cap
+                let boarding_stop = if c.at_station() { c.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id) } else { None };
                 let stop = if c.at_station() && speed.abs() < 0.3 {
-                    serving(c.vehicle.position, c.vehicle.heading, 18.0)
+                    boarding_stop.or_else(|| serving(c.vehicle.position, c.vehicle.heading, 18.0))
                 } else {
                     None
                 };
@@ -6669,6 +6678,7 @@ impl Humans {
                     entry_open,
                     exit_open,
                     boards: c.at_station(),
+                    boarding_stop: stop,
                     interior: c.vehicle.interior_light(),
                     air: CabinAir::of(&c.vehicle),
                     half,
@@ -6723,6 +6733,7 @@ impl Humans {
             entry_open: vec![false; cabin.entries.len()],
             exit_open: vec![false; cabin.exits.len()],
             boards: true,
+            boarding_stop: None,
             walk_open: Some(walk_open),
             cabin,
             pos: v.position,
@@ -6902,6 +6913,7 @@ impl Humans {
                 entry_open: vec![false; cabin.entries.len()],
                 exit_open: vec![false; cabin.exits.len()],
                 boards: true,
+                boarding_stop: None,
                 walk_open: Some(walk_open),
                 cabin,
                 pos: v.position,
@@ -10012,6 +10024,7 @@ mod tests {
             entry_open: vec![false],
             exit_open: Vec::new(),
             boards: true,
+            boarding_stop: None,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),
@@ -10071,6 +10084,7 @@ mod tests {
             entry_open: vec![true],
             exit_open: vec![true],
             boards: true,
+            boarding_stop: None,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),

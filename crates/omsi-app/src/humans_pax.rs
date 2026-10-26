@@ -2742,7 +2742,7 @@ impl Humans {
                         {
                             let departing = bn.speed.abs() > 0.1
                                 && !bn.entry_open.iter().chain(&bn.exit_open).any(|open| *open);
-                            let arrived = reg.next == Some(stop.id)
+                            let arrived = bn.boarding_stop.or(reg.next) == Some(stop.id)
                                 && bn.speed.abs() < 1.0
                                 && bn.exit_open.iter().any(|open| *open);
                             if arrived
@@ -2987,6 +2987,12 @@ impl Humans {
             return;
         };
         let reg = at_stops.get(&b).cloned().unwrap_or_default();
+        // the stop they get off at: the one a timetable bus boards at (its timetable's, SUMO:
+        // persons alight at the stop the vehicle stops at), else the stop ahead of the bus as
+        // the people see it (sub_61f238: within 60 m, facing its way) - the people's stops are
+        // set up where people are, and riders of a bus boarding farther off stood at its open
+        // doors to the cap
+        let here = bn.boarding_stop.or(reg.next);
         if bn.speed.abs() >= 1.0 {
             self.pax_mut(i).unwrap().timer = 1.0;
         }
@@ -2994,11 +3000,11 @@ impl Humans {
             .door
             .map(|d| if p.door_entry { &bn.entry_open } else { &bn.exit_open }.get(d).copied().unwrap_or(false))
             .unwrap_or(false);
-        let may_leave = door_open && (reg.next.is_some() || p.complaint == 3);
+        let may_leave = door_open && (here.is_some() || p.complaint == 3);
         self.pax_mut(i).unwrap().short = !may_leave;
         let out = p.st == 7 && bn.speed.abs() < 1.0 && may_leave;
         if !out {
-            if reg.next.is_none() {
+            if here.is_none() {
                 self.ask_stop(bn.id);
                 return;
             }
@@ -3112,7 +3118,7 @@ impl Humans {
         let Some((w, h)) = self.pax_world(&p, buses, bus_ix) else {
             return;
         };
-        let stop = reg.next;
+        let stop = here;
         let pp = self.pax_mut(i).unwrap();
         pp.inside = None;
         pp.pos = w;
