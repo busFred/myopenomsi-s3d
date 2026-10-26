@@ -42,7 +42,9 @@
 //!
 //! `people` streams recordings once and measures the pedestrians within `--radius` of the player:
 //! person-seconds of strollers inside a street lane's footprint, on-crossing true-false-true flips,
-//! cars held by people for a minute or more (keyframes), Fruin pavement density bands, stroller counts.
+//! cars held by people for a minute or more (keyframes), Fruin pavement density bands, stroller counts,
+//! the walkers' lateral spread on crossings and their nearest neighbour there, and the kerb
+//! waiters' density and overlapping pairs.
 //!
 //! `ab` scores free runs (or with `--reset`, reset-at-keyframe replays) of fixtures, one row
 //! each; the footer names the rules each recording's header gives. `stubs` lists what the
@@ -6087,6 +6089,66 @@ const DENSITY_MIN_AREA: f64 = 10.0;
 /// Histogram bin (persons/m^2) and range of the pavement density percentile.
 const DENSITY_BIN: f64 = 0.01;
 const DENSITY_BINS: usize = 600;
+/// `crossing_lateral_sd` is taken over the crossing pieces with at least this many sampled
+/// walkers (a standard deviation of a handful says nothing).
+const LATERAL_MIN_SAMPLES: usize = 25;
+/// The HCM 2010 body ellipse's short axis (1.5 ft, p. 4-24, the ellipse 1.5 x 2 ft): two waiters
+/// whose centres are closer than this overlap whichever way they face (`kerb_overlap`).
+const BODY_ELLIPSE_DEPTH: f64 = 0.4572;
+/// A waiter's own space (`kerb_density_max`) is their Voronoi cell among the waiters of the
+/// frame, cut to this far around them (m): the space of somebody with nobody beside them is
+/// not counted to the horizon, and a cell of a queue at 0.56 m^2 a person (half-diagonal
+/// 0.54 m) is left whole.
+const KERB_CELL_REACH: f64 = 1.0;
+/// Sides of the polygon the cell starts from (the disc of `KERB_CELL_REACH`).
+const KERB_CELL_SIDES: usize = 32;
+
+/// The area of the Voronoi cell of `me` among `others`, cut to the disc of `KERB_CELL_REACH`
+/// about it; others at the same point (within a millimetre) share the cell.
+fn kerb_cell(me: glam::DVec2, others: &[glam::DVec2]) -> f64 {
+    let mut poly: Vec<glam::DVec2> = (0..KERB_CELL_SIDES)
+        .map(|k| {
+            let a = k as f64 / KERB_CELL_SIDES as f64 * std::f64::consts::TAU;
+            me + glam::DVec2::new(a.cos(), a.sin()) * KERB_CELL_REACH
+        })
+        .collect();
+    let mut same = 1usize;
+    for &o in others {
+        let d = o - me;
+        if d.length() < 1e-3 {
+            same += 1;
+            continue;
+        }
+        if d.length() > 2.0 * KERB_CELL_REACH {
+            continue;
+        }
+        // (keep the half nearer `me`: (x - mid) . d <= 0)
+        let mid = (me + o) * 0.5;
+        let inside = |x: glam::DVec2| (x - mid).dot(d) <= 0.0;
+        let mut out = Vec::with_capacity(poly.len() + 1);
+        for k in 0..poly.len() {
+            let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+            let (ia, ib) = (inside(a), inside(b));
+            if ia {
+                out.push(a);
+            }
+            if ia != ib {
+                let t = (mid - a).dot(d) / (b - a).dot(d);
+                out.push(a + (b - a) * t);
+            }
+        }
+        poly = out;
+        if poly.len() < 3 {
+            return 0.0;
+        }
+    }
+    let mut area = 0.0;
+    for k in 0..poly.len() {
+        let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+        area += a.perp_dot(b);
+    }
+    area.abs() * 0.5 / same as f64
+}
 
 /// [P9-6] Of the parked cars beside the lanes (a `Parked` record), how many there are and how many
 /// lie over a footpath's walking line: their box overlaps a body (PERSON_RADIUS) on a Sidewalk
@@ -6129,6 +6191,11 @@ fn parked_on_footpath(net: &Network, parked: &HashMap<usize, Vec<omsi_traffic::P
         }
     }
     (all, on)
+}
+
+/// The recorded width of lane `l` (`people`'s crossing pieces), NaN when not seen.
+fn net_width(widths: &HashMap<usize, f64>, l: usize) -> f64 {
+    widths.get(&l).copied().unwrap_or(f64::NAN)
 }
 
 /// What `people` knows about one person from frame to frame.
@@ -6294,6 +6361,18 @@ struct PeopleAcc {
     stroll_max: usize,
     all_sum: f64,
     all_max: usize,
+    // 6. crossings: per piece (samples, sum and sum of squares of the offset from its axis),
+    // the nearest other walker on a crossing
+    cross_off: HashMap<usize, (usize, f64, f64)>,
+    widths: HashMap<usize, f64>,
+    cross_nn: Vec<f32>,
+    // 7. kerbs: waiter pairs closer than the body ellipse (pair-seconds, all / standing), the
+    // most in one frame (pairs, time, where), the densest kerb group (density, n, time, where)
+    kerb_over_ps: f64,
+    kerb_over_still_ps: f64,
+    kerb_over_max: (usize, f64, DVec3),
+    kerb_dens_max: (f64, usize, f64, DVec3),
+    kerb_group_max: (usize, f64, DVec3),
 }
 
 impl PeopleAcc {
@@ -6332,6 +6411,14 @@ impl PeopleAcc {
             stroll_max: 0,
             all_sum: 0.0,
             all_max: 0,
+            cross_off: HashMap::new(),
+            widths: HashMap::new(),
+            cross_nn: Vec::new(),
+            kerb_over_ps: 0.0,
+            kerb_over_still_ps: 0.0,
+            kerb_over_max: (0, 0.0, DVec3::ZERO),
+            kerb_dens_max: (0.0, 0, 0.0, DVec3::ZERO),
+            kerb_group_max: (0, 0.0, DVec3::ZERO),
         }
     }
 
@@ -6470,6 +6557,9 @@ impl PeopleAcc {
         self.grow_boxes(net);
         let (mut n_all, mut n_stroll) = (0usize, 0usize);
         let mut per_lane: HashMap<usize, usize> = HashMap::new();
+        let mut crossers: Vec<glam::DVec2> = Vec::new();
+        // (waiters at a kerb by the end of the path they wait on: position, standing)
+        let mut waiters: HashMap<(usize, bool), Vec<(DVec3, bool)>> = HashMap::new();
         for p in &f.people {
             if !self.near(p.pos) {
                 continue;
@@ -6479,6 +6569,26 @@ impl PeopleAcc {
                 continue;
             }
             n_stroll += 1;
+            if p.at_kerb {
+                if let Some((lane, s, len)) = p.leg {
+                    waiters.entry((lane, s > len * 0.5)).or_default().push((p.pos, p.still > 0.0));
+                }
+            }
+            if p.on_crossing {
+                crossers.push(p.pos.truncate());
+                if let Some((lane, s, _)) = p.leg {
+                    if let Some(l) = net.lanes.get(lane).filter(|l| l.kind == LaneKind::Sidewalk && l.points.len() >= 2) {
+                        let (q, h) = l.at(s.clamp(0.0, l.length()));
+                        let hr = (h as f64).to_radians();
+                        let off = (p.pos - q).truncate().dot(glam::DVec2::new(hr.cos(), -hr.sin()));
+                        self.widths.insert(lane, l.width as f64);
+                        let e = self.cross_off.entry(lane).or_insert((0, 0.0, 0.0));
+                        e.0 += 1;
+                        e.1 += off;
+                        e.2 += off * off;
+                    }
+                }
+            }
             if let Some((lane, _, _)) = p.leg {
                 if net.lanes.get(lane).map(|l| l.kind == LaneKind::Sidewalk).unwrap_or(false) {
                     *per_lane.entry(lane).or_default() += 1;
@@ -6512,6 +6622,80 @@ impl PeopleAcc {
                 e.0 += w;
                 if let Some((fl, _, _)) = p.leg {
                     *self.foot_lane.entry(fl).or_default() += w;
+                }
+            }
+        }
+        // 6. the nearest other walker on a crossing (a 2 m grid, out to 4 m)
+        {
+            let cell = |q: glam::DVec2| ((q.x / 2.0).floor() as i64, (q.y / 2.0).floor() as i64);
+            let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+            for (k, q) in crossers.iter().enumerate() {
+                grid.entry(cell(*q)).or_default().push(k);
+            }
+            for (k, q) in crossers.iter().enumerate() {
+                let c = cell(*q);
+                let mut best = f64::INFINITY;
+                for dx in -2..=2 {
+                    for dy in -2..=2 {
+                        for &j in grid.get(&(c.0 + dx, c.1 + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if j != k {
+                                best = best.min((crossers[j] - *q).length());
+                            }
+                        }
+                    }
+                }
+                if best <= 4.0 {
+                    self.cross_nn.push(best as f32);
+                }
+            }
+        }
+        // 7. kerb waiters: overlapping pairs, and each kerb group's density over their own space
+        {
+            let all: Vec<(DVec3, bool)> = waiters.values().flatten().copied().collect();
+            let pts: Vec<glam::DVec2> = all.iter().map(|w| w.0.truncate()).collect();
+            let (mut pairs, mut still_pairs) = (0usize, 0usize);
+            let mut at = DVec3::ZERO;
+            for i in 0..all.len() {
+                for j in i + 1..all.len() {
+                    if (pts[i] - pts[j]).length() < BODY_ELLIPSE_DEPTH && (all[i].0.z - all[j].0.z).abs() < 2.0 {
+                        pairs += 1;
+                        at = all[i].0;
+                        if all[i].1 && all[j].1 {
+                            still_pairs += 1;
+                        }
+                    }
+                }
+            }
+            self.kerb_over_ps += pairs as f64 * w;
+            self.kerb_over_still_ps += still_pairs as f64 * w;
+            if pairs > self.kerb_over_max.0 {
+                self.kerb_over_max = (pairs, f.time, at);
+            }
+            for group in waiters.values() {
+                let n = group.len();
+                if n > self.kerb_group_max.0 {
+                    self.kerb_group_max = (n, f.time, group[0].0);
+                }
+                if n < 2 {
+                    continue;
+                }
+                let area: f64 = group
+                    .iter()
+                    .map(|g| {
+                        let me = g.0.truncate();
+                        let others: Vec<glam::DVec2> = pts.iter().copied().filter(|q| (*q - me).length() < 2.0 * KERB_CELL_REACH).collect();
+                        // (`me` itself is among them: the cell's own site is skipped by distance 0
+                        // only once, so it is removed first)
+                        let mut others = others;
+                        if let Some(k) = others.iter().position(|q| *q == me) {
+                            others.swap_remove(k);
+                        }
+                        kerb_cell(me, &others)
+                    })
+                    .sum();
+                let dens = if area > 1e-9 { n as f64 / area } else { f64::INFINITY };
+                if dens > self.kerb_dens_max.0 {
+                    self.kerb_dens_max = (dens, n, f.time, group[0].0);
                 }
             }
         }
@@ -6678,6 +6862,42 @@ impl PeopleAcc {
         kv!("density_max_any", format!("{:.2} per m2 lane {} length {:.1} width {:.2} count {}", m.0, m.1, m.2, m.3, m.4), json!({"density": r2(m.0), "lane": m.1, "length": r1(m.2), "width": r2(m.3), "count": m.4}));
         kv!("parked_on_footpath", format!("{} of {} parked cars beside lanes (the P9-6 pull-out rule's slots)", self.parked.1, self.parked.0), json!({"on_footpath": self.parked.1, "parked": self.parked.0}));
         kv!("pavement_density_mean", format!("{:.5} per m2", self.pave_sum / n), json!((self.pave_sum / n * 1e5).round() / 1e5));
+        // 6
+        let mut pieces: Vec<(usize, usize, f64, f64)> = self
+            .cross_off
+            .iter()
+            .filter(|(_, e)| e.0 >= LATERAL_MIN_SAMPLES)
+            .map(|(&l, e)| {
+                let mean = e.1 / e.0 as f64;
+                (l, e.0, mean, (e.2 / e.0 as f64 - mean * mean).max(0.0).sqrt())
+            })
+            .collect();
+        pieces.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut sds: Vec<f64> = pieces.iter().map(|p| p.3).collect();
+        sds.sort_by(|a, b| a.total_cmp(b));
+        let med = sds.get(sds.len() / 2).copied().unwrap_or(0.0);
+        let (tn, ts, tq) = self.cross_off.values().fold((0usize, 0.0, 0.0), |a, e| (a.0 + e.0, a.1 + e.1, a.2 + e.2));
+        let pooled = if tn > 0 { (tq / tn as f64 - (ts / tn as f64).powi(2)).max(0.0).sqrt() } else { 0.0 };
+        kv!("crossing_lateral_sd", format!("median {med:.2} m over {} pieces with {LATERAL_MIN_SAMPLES}+ samples; pooled {pooled:.2} m over {tn} samples (offset from the piece's axis of walkers on_crossing)", pieces.len()), json!({"median": r2(med), "pieces": pieces.len(), "pooled": r2(pooled), "samples": tn}));
+        let mut jt = Vec::new();
+        for (k, (l, cnt, mean, sd)) in pieces.iter().take(6).enumerate() {
+            let w = net_width(&self.widths, *l);
+            let _ = writeln!(out, "  crossing_top_{:<2}         lane {l} width {w:.2} samples {cnt} mean {mean:+.2} sd {sd:.2}", k + 1);
+            jt.push(json!({"lane": l, "width": r2(w), "samples": cnt, "mean": r2(*mean), "sd": r2(*sd)}));
+        }
+        js.insert("crossing_top".into(), json!(jt));
+        let mut nn = self.cross_nn.clone();
+        nn.sort_by(|a, b| a.total_cmp(b));
+        let nn_med = nn.get(nn.len() / 2).copied().unwrap_or(f32::NAN);
+        let nn_low = nn.iter().filter(|d| (**d as f64) < BODY_ELLIPSE_DEPTH).count();
+        kv!("crossing_nn_median", format!("{nn_med:.2} m over {} samples; {nn_low} closer than {BODY_ELLIPSE_DEPTH} m (nearest other walker on a crossing, within 4 m)", nn.len()), json!({"median": nn_med, "samples": nn.len(), "below_ellipse": nn_low}));
+        // 7
+        let m = self.kerb_dens_max;
+        kv!("kerb_density_max", format!("{:.2} per m2 ({} waiters at {:.1} s at ({:.1}, {:.1}); a waiter's space = their Voronoi cell among the waiters, cut to {KERB_CELL_REACH} m; groups by the end of the path they wait on)", m.0, m.1, m.2, m.3.x, m.3.y), json!({"density": if m.0.is_finite() { r2(m.0) } else { -1.0 }, "n": m.1, "t": r1(m.2), "pos": [r1(m.3.x), r1(m.3.y)]}));
+        let g = self.kerb_group_max;
+        kv!("kerb_group_max", format!("{} waiters at {:.1} s at ({:.1}, {:.1})", g.0, g.1, g.2.x, g.2.y), json!({"n": g.0, "t": r1(g.1), "pos": [r1(g.2.x), r1(g.2.y)]}));
+        let o = self.kerb_over_max;
+        kv!("kerb_overlap", format!("{:.1} pair-s ({:.1} both standing); most in a frame {} at {:.1} s at ({:.1}, {:.1}) (waiters at a kerb closer than {BODY_ELLIPSE_DEPTH} m)", self.kerb_over_ps, self.kerb_over_still_ps, o.0, o.1, o.2.x, o.2.y), json!({"pair_s": r1(self.kerb_over_ps), "standing_pair_s": r1(self.kerb_over_still_ps), "max": o.0, "t": r1(o.1)}));
         (out, Value::Object(js))
     }
 }

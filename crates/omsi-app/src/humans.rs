@@ -1652,8 +1652,9 @@ struct PedWalk {
     /// link every step): while it holds they walk on, and the cars see them coming
     /// (`Person::approach`, SUMO's `registerCrossingApproach`). `.1` the crossing's span (m, kerb
     /// to kerb). Dropped when a later verdict refuses them; at the kerb the verdict is taken
-    /// once more before they step on.
-    kerb_go: Option<(usize, f32)>,
+    /// once more before they step on. `.2` the stripe they would take (`crossing_stripe`, m
+    /// right of the first piece's axis): where on the kerb they step on.
+    kerb_go: Option<(usize, f32, f32)>,
 }
 
 impl PedWalk {
@@ -1723,8 +1724,163 @@ impl PedWalk {
         self.s = 0.0;
         self.held = 0.0;
         self.spot = None;
-        self.cross = Some(Cross { from: k, to: k + n - 1, total, lead: 0.0, back: true, caught: true, kerb, ..c });
+        // (on the stripe they were on: the way back runs the other way, so it lies on their
+        // other side)
+        self.cross = Some(Cross { from: k, to: k + n - 1, total, lead: 0.0, back: true, caught: true, kerb, stripe: c.stripe.map(|s| -s), ..c });
     }
+}
+
+/// SUMO's striping model (`MSPModel_Striping`): a crossing is cut lengthwise into stripes of
+/// `--pedestrian.striping.stripe-width` (default 0.64 m, `MSFrame.cpp`; the Simulation/Pedestrians
+/// docs page gives 0.65), `numStripes = max(1, floor(width / stripeWidth))`, and each walker
+/// walks one of them: the people of a crossing cross abreast in rows (HCM 2010 Eq. 19-70), not
+/// in single file.
+const STRIPE_WIDTH: f64 = 0.64;
+/// SUMO's `--pedestrian.striping.reserve-oncoming.junctions` (0.34, `MSFrame.cpp`): the share of
+/// a crossing's stripes, on the walker's left (on the right where traffic drives on the left),
+/// that is kept for the walkers coming the other way (`MSPModel_Striping::getReserved`) ...
+const RESERVE_ONCOMING: f64 = 0.34;
+/// ... and at most this width of them (m, `--pedestrian.striping.reserve-oncoming.max`, 1.28).
+const RESERVE_ONCOMING_MAX: f64 = 1.28;
+/// `MSPModel_Striping::LOOKAHEAD_SAMEDIR` (s): a stripe is worth the distance the walker
+/// could walk on it in this time, at most (`PState::walk`) ...
+const STRIPE_LOOKAHEAD_SAMEDIR: f64 = 4.0;
+/// ... and with somebody coming the other way on it, `LOOKAHEAD_ONCOMING` (s) of their walk
+/// is taken off.
+const STRIPE_LOOKAHEAD_ONCOMING: f64 = 10.0;
+/// `MSPModel_Striping::LATERAL_PENALTY` (m per stripe moved), for a walker who is not waiting.
+const STRIPE_LATERAL_PENALTY: f64 = -1.0;
+/// `MSPModel_Striping::INAPPROPRIATE_PENALTY` (m): a reserved stripe (half of it on the walker's
+/// own stripe); no stripe worth less than half of it is taken.
+const STRIPE_INAPPROPRIATE_PENALTY: f64 = -20000.0;
+/// `MSPModel_Striping::ONCOMING_CONFLICT_PENALTY` (m): a stripe where they would meet
+/// somebody coming the other way within the look-ahead.
+const STRIPE_ONCOMING_CONFLICT_PENALTY: f64 = -1000.0;
+/// `MSPModel_Striping::DIST_FAR_AWAY` (m): the free distance of a stripe nobody walks ahead on.
+const STRIPE_DIST_FAR_AWAY: f64 = 10000.0;
+
+/// The stripes of a crossing `width` metres wide (`STRIPE_WIDTH`), numbered from the walker's
+/// left, centred on the crossing's axis (SUMO lays them from one edge of the lane; an OMSI
+/// crossing is walked both ways on the same pieces, so the set is laid symmetric about the
+/// axis and is the same set whichever way one walks it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stripes {
+    n: usize,
+    /// How many of them, on the walker's left, are kept for the oncoming (`RESERVE_ONCOMING`).
+    reserved: usize,
+    left_hand: bool,
+}
+
+impl Stripes {
+    fn of(width: f64, left_hand: bool) -> Stripes {
+        let n = ((width.max(0.0) / STRIPE_WIDTH).floor() as usize).max(1);
+        let reserved = ((n as f64 * RESERVE_ONCOMING).floor() as usize).min((RESERVE_ONCOMING_MAX / STRIPE_WIDTH).floor() as usize);
+        Stripes { n, reserved, left_hand }
+    }
+    /// The centre of stripe `i` (m right of the axis, in the walking direction).
+    fn offset(&self, i: usize) -> f64 {
+        (i as f64 - (self.n as f64 - 1.0) * 0.5) * STRIPE_WIDTH
+    }
+    /// The stripe whose centre is nearest `lat` (m right of the axis).
+    fn nearest(&self, lat: f64) -> usize {
+        (lat / STRIPE_WIDTH + (self.n as f64 - 1.0) * 0.5).round().clamp(0.0, (self.n - 1) as f64) as usize
+    }
+    /// Whether stripe `i` is kept for the walkers coming the other way: the walker's left ones
+    /// (the right ones where the traffic drives on the left and people keep left).
+    fn reserved(&self, i: usize) -> bool {
+        if self.left_hand {
+            i + self.reserved >= self.n
+        } else {
+            i < self.reserved
+        }
+    }
+}
+
+/// The stripe a walker takes onto a crossing, as SUMO's `PState::walk` chooses it: each stripe
+/// is worth the distance they could walk on it within `STRIPE_LOOKAHEAD_SAMEDIR` (less what
+/// somebody coming the other way on it walks towards them in `STRIPE_LOOKAHEAD_ONCOMING`; a
+/// meeting costs `STRIPE_ONCOMING_CONFLICT_PENALTY`), the stripes kept for the oncoming cost
+/// `STRIPE_INAPPROPRIATE_PENALTY`, and somebody not waiting pays `STRIPE_LATERAL_PENALTY` per
+/// stripe moved; they keep their current stripe (the one nearest `lat`) unless another is worth
+/// more. `others`: the people on the crossing, as (metres ahead of the walker along the
+/// crossing, metres right of its axis, speed along it, positive the walker's way).
+fn choose_stripe(st: &Stripes, lat: f64, others: &[(f64, f64, f64)], vmax: f64, waiting: bool) -> usize {
+    let cur = st.nearest(lat);
+    // (the nearest one ahead on each stripe: the gap to them, their speed)
+    let mut obs: Vec<(f64, f64)> = vec![(STRIPE_DIST_FAR_AWAY, 0.0); st.n];
+    for &(along, olat, speed) in others {
+        if along <= 0.0 {
+            continue;
+        }
+        let i = st.nearest(olat);
+        let gap = (along - 2.0 * BODY_OUTSIDE).max(0.0);
+        if gap < obs[i].0 {
+            obs[i] = (gap, speed);
+        }
+    }
+    let utility: Vec<f64> = (0..st.n)
+        .map(|i| {
+            let mut u = 0.0;
+            if st.reserved(i) {
+                u += STRIPE_INAPPROPRIATE_PENALTY * if i == cur { 0.5 } else { 1.0 };
+            }
+            let (walk, speed) = obs[i];
+            let look = if speed >= 0.0 { STRIPE_LOOKAHEAD_SAMEDIR } else { STRIPE_LOOKAHEAD_ONCOMING };
+            let expected = (vmax * STRIPE_LOOKAHEAD_SAMEDIR).min(walk + speed * look);
+            u += if expected >= 0.0 { expected } else { STRIPE_ONCOMING_CONFLICT_PENALTY + walk };
+            if !waiting {
+                u += (i as f64 - cur as f64).abs() * STRIPE_LATERAL_PENALTY;
+            }
+            u
+        })
+        .collect();
+    let mut chosen = cur;
+    for i in 0..st.n {
+        if utility[i] > utility[chosen] && utility[i] >= STRIPE_INAPPROPRIATE_PENALTY * 0.5 {
+            chosen = i;
+        }
+    }
+    chosen
+}
+
+/// The axis of crossing `c` where they step onto it: its first piece's start, the walking
+/// direction there and its right.
+fn crossing_axis(net: &Network, walk: &PedWalk, c: &Cross) -> (DVec2, DVec2, DVec2) {
+    let first = walk.legs[c.from];
+    let (start, _) = first.at(net, 0.0);
+    let (_, h) = first.at(net, 0.3_f32.min(first.len()));
+    let hr = h.to_radians();
+    (start.truncate(), DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()))
+}
+
+/// The stripes of crossing `c`: across its narrowest piece proper (`core_piece`), so that the
+/// stripes fit on every piece of it (the map's path width; a piece with none has one stripe on
+/// its axis, SUMO's `max(1, ...)`).
+fn crossing_stripes(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &PedWalk, c: &Cross) -> Stripes {
+    let pieces = &walk.legs[c.from..=c.to.min(walk.legs.len() - 1)];
+    let width = pieces
+        .iter()
+        .filter(|l| core_piece(ped, net, lights, l.lane))
+        .map(|l| net.lanes[l.lane].width as f64)
+        .reduce(f64::min)
+        .unwrap_or(net.lanes[pieces[0].lane].width as f64);
+    Stripes::of(width, net.left_hand)
+}
+
+/// The stripe (its centre, m right of the axis in the walking direction) somebody at `me.pos`
+/// takes onto crossing `c` (`choose_stripe`, the people on its carriageway, `Around::streams`,
+/// as the obstacles; `waiting`: they stood at the kerb).
+fn crossing_stripe(ped: &PedNet, at: &Around, me: &Me, walk: &PedWalk, c: &Cross, waiting: bool) -> f32 {
+    let net = at.net;
+    let st = crossing_stripes(ped, net, at.lights, walk, c);
+    let (start, fwd, right) = crossing_axis(net, walk, c);
+    let mine = (me.pos - start).dot(fwd);
+    let others: Vec<(f64, f64, f64)> = at
+        .streams
+        .get(&c.key)
+        .map(|v| v.iter().filter(|(id, _, _)| *id != me.id).map(|(_, q, vel)| ((*q - start).dot(fwd) - mine, (*q - start).dot(right), vel.dot(fwd))).collect())
+        .unwrap_or_default();
+    st.offset(choose_stripe(&st, (me.pos - start).dot(right), &others, me.pace, waiting)) as f32
 }
 
 /// A crossing: the footpath pieces from one kerb to the other (the lit stub,
@@ -1754,6 +1910,10 @@ struct Cross {
     kerb: Option<Leg>,
     /// The crossing's key: its lowest lane (the same both ways).
     key: usize,
+    /// The stripe walked (`crossing_stripe`): its centre in metres right of the axis of the
+    /// piece walked, in their walking direction, kept across every piece of the crossing.
+    /// None until they step on.
+    stripe: Option<f32>,
 }
 
 impl Cross {
@@ -2513,6 +2673,7 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
         caught: false,
         kerb: None,
         key: pieces.iter().map(|l| l.lane).min().unwrap_or(0),
+        stripe: None,
     })
 }
 
@@ -3125,7 +3286,7 @@ fn plan_next_leg(ped: Option<&PedNet>, net: &Network, walk: &mut PedWalk, rng: &
         walk.legs.drain(..gone);
         walk.leg = 0;
         walk.spot = None;
-        walk.kerb_go = walk.kerb_go.filter(|g| g.0 == gone).map(|g| (0, g.1));
+        walk.kerb_go = walk.kerb_go.filter(|g| g.0 == gone).map(|g| (0, g.1, g.2));
     }
 }
 
@@ -3189,9 +3350,10 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         if let (Some(&next), Some(p)) = (walk.legs.get(walk.leg + 1), ped) {
             if next.from_end(net) && !core_piece(p, net, at.lights, leg.lane) {
                 if let Some(c) = crossing_span(p, net, at.lights, walk, walk.leg + 1) {
-                    match kerb_verdict(p, at, walk, &c, me, yields, to_end) {
+                    let side = crossing_stripe(p, at, me, walk, &c, false);
+                    match kerb_verdict(p, at, walk, &c, me, yields, to_end, side) {
                         Ok(()) => {
-                            walk.kerb_go = Some((walk.leg, c.span));
+                            walk.kerb_go = Some((walk.leg, c.span, side));
                             me.decision = Some("go");
                         }
                         Err(why) => {
@@ -3211,9 +3373,13 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     // (somebody who has the verdict "go" walks up to the crossing: the cars see where and when
     // they step onto it)
     me.approach = match (walk.kerb_go, walk.legs.get(walk.leg + 1)) {
-        (Some((l, span)), Some(next)) if l == walk.leg => {
+        (Some((l, span, side)), Some(next)) if l == walk.leg => {
             let pace = me.pace.max(0.5) as f32;
-            Some((next.at(net, 0.0).0.truncate(), to_end.max(0.0) / pace, (to_end.max(0.0) + span) / pace))
+            // (where on the kerb: their stripe)
+            let (_, h) = next.at(net, 0.3_f32.min(next.len()));
+            let hr = h.to_radians();
+            let on = next.at(net, 0.0).0.truncate() + DVec2::new(hr.cos(), -hr.sin()) * side as f64;
+            Some((on, to_end.max(0.0) / pace, (to_end.max(0.0) + span) / pace))
         }
         _ => None,
     };
@@ -3260,9 +3426,11 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                 match span {
                     Some(c) if at_kerb => {
                         // (asked once more at the kerb: what changed since the last verdict on the
-                        // way - a red, a vehicle that will pass - holds them here)
+                        // way - a red, a vehicle that will pass - holds them here; for the stripe
+                        // they would take from where they stand)
+                        let side = ped.map(|p| crossing_stripe(p, at, me, walk, &c, walk.held > 0.0)).unwrap_or(0.0);
                         let verdict = match ped {
-                            Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0)),
+                            Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0), side),
                             None => Ok(()),
                         };
                         match verdict {
@@ -3272,7 +3440,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                                     log::info!("t={:.1} pax #{} crosses path {} after waiting {:.0} s", at.time, me.id, next.lane, walk.held);
                                 }
                                 let from_pavement = !ped.map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
-                                walk.cross = Some(Cross { kerb: from_pavement.then_some(leg), ..c });
+                                walk.cross = Some(Cross { kerb: from_pavement.then_some(leg), stripe: Some(side), ..c });
                                 walk.step_on();
                             }
                             Err(why) => {
@@ -3300,7 +3468,8 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                     }
                     Some(c) => {
                         me.decision = Some("go");
-                        walk.cross = Some(c);
+                        let side = ped.map(|p| crossing_stripe(p, at, me, walk, &c, false));
+                        walk.cross = Some(Cross { stripe: side, ..c });
                         walk.step_on();
                     }
                     None => {
@@ -3334,10 +3503,17 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         me.walk_pace = hurried(me.id, me.pace);
     }
     let pace = me.walk_pace;
-    // keep to the right of the pavement (less so on a crossing) - the left where the
-    // traffic drives on the left
-    let side = if crossing { (walk.side.abs() as f64).min(0.3) } else { (walk.side.abs() as f64).min(width * 0.5 - 0.3).max(0.0) };
-    let side = if net.left_hand { -side } else { side };
+    // on a crossing walked from kerb to kerb, on their stripe (`crossing_stripe`); elsewhere
+    // keep to the right of the pavement (less so on a lit or crossing piece walked outside a
+    // crossing) - the left where the traffic drives on the left
+    let stripe = walk.cross.filter(|c| c.on(walk.leg)).and_then(|c| c.stripe).map(|s| s as f64);
+    let side = match stripe {
+        Some(s) => s,
+        None => {
+            let side = if crossing { (walk.side.abs() as f64).min(0.3) } else { (walk.side.abs() as f64).min(width * 0.5 - 0.3).max(0.0) };
+            if net.left_hand { -side } else { side }
+        }
+    };
     // (on a path the map lays along a street lane: in the strip of it off the lane's
     // footprint, `free_strip`, whichever way they walk)
     let strip = if crossing { None } else { ped.and_then(|p| p.free_strip(net, leg.lane)) }.map(|(lo, hi)| if leg.b >= leg.a { (lo, hi) } else { (-hi, -lo) });
@@ -3353,7 +3529,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let bow = crowd::project_on_segment(m.truncate(), a.truncate(), b.truncate()).0.distance(m.truncate());
     let dev = match strip {
         Some((lo, hi)) => (hi - lo) * 0.5 + bow,
-        None => (width * 0.5 - side).max(0.35) + bow,
+        None => (width * 0.5 - side.abs()).max(0.35) + bow,
     };
     let corridor = ((b - a).truncate().length() > 0.5).then(|| (a.truncate() + right * side, b.truncate() + right * side, dev));
     let corridor = path_corridor_band(pos2, corridor, STROLL_BAND);
@@ -3899,20 +4075,26 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
 }
 
 /// May a pedestrian at the kerb, or `approach` metres short of it, start across crossing `c`
-/// (from `walk.legs[c.from]` on)? A pedestrian light must show green, and the time left to get across - the green and then
+/// (from `walk.legs[c.from]` on) on their stripe `side` (m right of its axis, `crossing_stripe`:
+/// the cuts and the way off the kerb are taken on it)? A pedestrian light must show green, and the time left to get across - the green and then
 /// the clearance until a light of the carriageway turns green - must do; without a light no
 /// car may be about to pass the crossing. Somebody who has waited very long takes any green
 /// (never a red).
-fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut YieldBook, approach: f32) -> Result<(), &'static str> {
+#[allow(clippy::too_many_arguments)]
+fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut YieldBook, approach: f32, side: f32) -> Result<(), &'static str> {
     let net = at.net;
     let next = walk.legs[c.from];
+    // (their way across is their stripe, `side` m right of the axis: the cuts and the way off
+    // the kerb are where they will walk)
+    let (_, _, right) = crossing_axis(net, walk, c);
+    let shift = right * side as f64;
     let pace = me.pace;
     let held = walk.held;
     // the time to the far kerb over the whole crossing, kerb to kerb (a kerb stub cuts no lane,
     // so the first piece alone says nothing), from where they are: `approach` metres short of
     // the kerb (the verdict taken on the way to it)
     let t_cross = (approach + c.span) as f64 / pace.max(0.5) + 1.0;
-    let cuts = span_cuts(ped, net, &walk.legs[c.from..=c.to]);
+    let cuts: Vec<DVec2> = span_cuts(ped, net, &walk.legs[c.from..=c.to]).into_iter().map(|x| x + shift).collect();
     // nobody starts across while a vehicle stands on the crossing - its box
     // over any of its cuts, under 0.5 m/s, not one stopping for people - for PED_OCCUPIED_CAP
     // of its standing at most; those on the carriageway are dealt with on the crossing itself. (At a lit crossing
@@ -3921,13 +4103,14 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     // (the cuts of the first metres of the way only, and a vehicle creeping
     // onto one at under PED_CREEP_SPEED counts as standing on it: a queue car rolling onto the
     // crossing at 0.5-0.7 m/s at a lit green passed)
-    let start = next.at(net, 0.0).0.truncate();
+    let start = next.at(net, 0.0).0.truncate() + shift;
     let near_cuts: Vec<DVec2> = cuts.iter().copied().filter(|x| (*x - start).length() <= PED_OCCUPIED_REACH).collect();
     // (or its box over the first 1.5 m of the way off the kerb, where no cut
     // lies: a bus on the kerb stub; they wait for it like for a vehicle on a cut, then step round it)
     let (from, _) = next.at(net, 0.0);
     let (ahead, _) = next.at(net, 1.5);
     let way = (ahead - from).truncate().normalize_or_zero();
+    let from = from + shift.extend(0.0);
     let occupied = || {
         at.cars
             .iter()
@@ -12318,6 +12501,105 @@ mod ped_tests {
         assert!(stop.cleared && (stop.spots[0].pos.y - reach).abs() < 0.02 && stop.spots[1].pos.y == 1.5 && stop.spots[2].pos.y == 3.0);
         assert!((stop.kerb_shift.y - (reach - 1.5)).abs() < 0.02);
     }
+
+    #[test]
+    fn p11_6_a_3_m_crossing_has_four_stripes_one_kept_for_the_oncoming() {
+        let st = Stripes::of(3.0, false);
+        assert_eq!((st.n, st.reserved), (4, 1));
+        let offs: Vec<f64> = (0..st.n).map(|i| st.offset(i)).collect();
+        for (o, want) in offs.iter().zip([-0.96, -0.32, 0.32, 0.96]) {
+            assert!((o - want).abs() < 1e-9, "{offs:?}");
+        }
+        assert!(st.reserved(0) && !st.reserved(1) && !st.reserved(3));
+        // (left-hand traffic: kept on the right)
+        let lh = Stripes::of(3.0, true);
+        assert!(lh.reserved(3) && !lh.reserved(0));
+        // narrower than a stripe: one, on the axis (SUMO's max(1, ...))
+        let one = Stripes::of(0.0, false);
+        assert_eq!((one.n, one.reserved, one.offset(0)), (1, 0, 0.0));
+        // a waiter standing in the oncoming share steps over to the nearest of their own
+        assert_eq!(choose_stripe(&st, -0.9, &[], 1.2, true), 1);
+        // nobody ahead: they keep the stripe they are on
+        assert_eq!(choose_stripe(&st, 0.35, &[], 1.2, false), 2);
+        assert_eq!(choose_stripe(&st, 0.9, &[], 1.2, true), 3);
+        // somebody standing 3 m ahead on it: a free one beside, never the oncoming share
+        let c = choose_stripe(&st, 0.35, &[(3.0, 0.32, 0.0)], 1.2, false);
+        assert!(c == 1 || c == 3, "{c}");
+        // somebody coming the other way on it: the same
+        let c = choose_stripe(&st, 0.35, &[(4.0, 0.32, -1.2)], 1.2, false);
+        assert!(c == 1 || c == 3, "{c}");
+    }
+
+    #[test]
+    fn p11_6_walkers_cross_on_their_stripes_not_in_single_file() {
+        // the crossing of `crossing` 3 m wide: four stripes, the left one (x -0.96) kept for
+        // the oncoming; walkers stepping off the kerb at x -0.9 .. 0.9 cross abreast on the
+        // stripes of their own share, each on the one nearest them
+        let (mut net, _) = crossing(true);
+        for l in 3..=6 {
+            net.lanes[l].width = 3.0;
+        }
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut xs = Vec::new();
+        for (k, x0) in [-0.9f64, -0.3, 0.3, 0.9].into_iter().enumerate() {
+            let mut walk = PedWalk::new(
+                vec![
+                    Leg { lane: 3, a: 0.0, b: 1.5 },
+                    Leg { lane: 4, a: 0.0, b: 4.0 },
+                    Leg { lane: 5, a: 0.0, b: 4.0 },
+                    Leg { lane: 6, a: 0.0, b: 1.5 },
+                    Leg { lane: 7, a: 0.0, b: 20.0 },
+                ],
+                false,
+                0.3,
+            );
+            walk.legs.insert(0, Leg { lane: 2, a: 19.6, b: 20.0 });
+            walk.s = 0.0;
+            let mut m = me(10 + k as u32, DVec2::new(x0, -5.9), 1.2);
+            let mut on_road = Vec::new();
+            for f in 0..400 {
+                frame(&net, &mut ped, Some(&lights), &[], f as f64 * 0.05, &mut m, &mut walk, 0.05);
+                if in_road(m.pos) && m.pos.y > -2.0 {
+                    on_road.push(m.pos.x);
+                }
+            }
+            assert!(m.pos.y > 5.0, "#{k} not across: {:?}", m.pos);
+            let mean = on_road.iter().sum::<f64>() / on_road.len().max(1) as f64;
+            let dev = on_road.iter().map(|x| (x - mean).abs()).fold(0.0, f64::max);
+            assert!(dev < 0.15, "#{k} kept no stripe: mean {mean:.2} spread {dev:.2}");
+            xs.push(mean);
+        }
+        for (got, want) in xs.iter().zip([-0.32, -0.32, 0.32, 0.96]) {
+            assert!((got - want).abs() < 0.12, "stripes {xs:?}");
+        }
+    }
+
+    #[test]
+    fn p11_6_a_walker_takes_a_free_stripe_beside_somebody_standing_on_theirs() {
+        let (mut net, _) = crossing(true);
+        for l in 3..=6 {
+            net.lanes[l].width = 3.0;
+        }
+        let mut ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        let mut walk = across();
+        let mut m = me(4, DVec2::new(-10.0, -5.5), 1.2);
+        // (somebody standing on the carriageway on stripe x 0.32, the one they would take)
+        let mut streams: Streams = HashMap::new();
+        streams.insert(3, vec![(99, DVec2::new(0.32, -2.0), DVec2::ZERO)]);
+        let mut yields: Yields = HashMap::new();
+        let mut on_road = Vec::new();
+        for f in 0..600 {
+            frame_with(&net, &mut ped, Some(&lights), &[], &streams, &mut yields, f as f64 * 0.05, &mut m, &mut walk, 0.05);
+            if in_road(m.pos) && m.pos.y > -2.5 && m.pos.y < 3.0 {
+                on_road.push(m.pos.x);
+            }
+        }
+        assert!(m.pos.y > 5.0, "not across: {:?}", m.pos);
+        let mean = on_road.iter().sum::<f64>() / on_road.len().max(1) as f64;
+        assert!((mean + 0.32).abs() < 0.12 || (mean - 0.96).abs() < 0.12, "x on the carriageway {mean:.2}");
+    }
 }
 
 
@@ -12346,4 +12628,5 @@ fn wrap_heading(h: f64) -> f64 {
 /// The angle between two headings (degrees, 0..180).
 fn angle_between(a: f64, b: f64) -> f64 {
     ((b - a + 540.0).rem_euclid(360.0) - 180.0).abs()
+
 }
