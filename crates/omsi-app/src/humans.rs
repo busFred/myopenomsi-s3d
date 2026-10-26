@@ -2368,6 +2368,25 @@ fn stroll_targets(
     out
 }
 
+/// What place `t` lacks of its target: its want less the strollers on its lane (a source:
+/// those walking it its way, into sight), none when at it or over.
+fn stroll_lacks(t: &StrollTarget, on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>) -> f32 {
+    let on = match t.toward {
+        None => on_path.get(&t.lane).copied().unwrap_or(0),
+        Some(fwd) => on_way.get(&(t.lane, fwd)).copied().unwrap_or(0),
+    };
+    (t.want - on as f32).max(0.0)
+}
+
+/// What the places lack in all, and how many strollers may be put down now: no more than
+/// they lack, nor than the `target` (all the places want, within the setting and the pool)
+/// leaves over the `have` strollers within the radius - a place over its target and the
+/// strollers on pavements wanting nobody count against the total as before.
+fn stroll_room(targets: &[StrollTarget], on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>, target: usize, have: usize) -> (f32, usize) {
+    let deficit: f32 = targets.iter().map(|t| stroll_lacks(t, on_path, on_way)).sum();
+    (deficit, target.saturating_sub(have).min(deficit.ceil() as usize))
+}
+
 /// The median gap (m) for `target` strollers on `pavement_m` metres of pavement
 /// in the circle: half the pavement per person wanted, within PED_GAP_MIN..PED_GAP_MEDIAN, so
 /// that the count wanted is reached while the gaps keep their skew. Where the target density
@@ -6011,13 +6030,7 @@ impl Humans {
         let in_reach = |p: DVec3| in_sight_reach(eye, center, p);
         let in_circle = |p: DVec3| (p - center).truncate().length() < radius;
         let targets = stroll_targets(ped, net, &candidates, &in_reach, &in_circle, rho);
-        let lacks = |t: &StrollTarget, on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>| {
-            let on = match t.toward {
-                None => on_path.get(&t.lane).copied().unwrap_or(0),
-                Some(fwd) => on_way.get(&(t.lane, fwd)).copied().unwrap_or(0),
-            };
-            (t.want - on as f32).max(0.0)
-        };
+        let lacks = stroll_lacks;
         let wanted: f32 = targets.iter().map(|t| t.want).sum();
         // (the setting is an upper bound, and never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
@@ -6030,8 +6043,7 @@ impl Humans {
             .iter()
             .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
             .count();
-        let deficit: f32 = targets.iter().map(|t| lacks(t, &on_path, &on_way)).sum();
-        let room = limit.saturating_sub(have).min(deficit.ceil() as usize);
+        let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
         let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         if room > 0 && !targets.is_empty() {
             // weighted by lying ahead of the player: somebody put down beside or behind a
@@ -11215,6 +11227,25 @@ mod ped_tests {
         // a source point outside the circle: none
         let t = stroll_targets(&ped, &net, &all, &in_reach, &|q: DVec3| q.x > -25.0, rho);
         assert!(t.iter().all(|x| !x.source), "{t:?}");
+    }
+
+    #[test]
+    fn p3c_a_place_over_its_target_counts_against_the_total() {
+        // two pavements in sight wanting 10 each: one holds 18, the other 2 (it lacks 8); 20
+        // in the circle of 20 wanted: nobody is put down though one lacks; with 4 more on a
+        // pavement wanting nobody, still nobody; with 14 in the circle, 6 (not the 8 it lacks)
+        let place = |lane: usize| StrollTarget { lane, metres: 10.0, ks: vec![0], toward: None, want: 10.0, source: false };
+        let targets = [place(1), place(2)];
+        let on_path: HashMap<usize, usize> = [(1, 18), (2, 2)].into_iter().collect();
+        let on_way = HashMap::new();
+        let (deficit, room) = stroll_room(&targets, &on_path, &on_way, 20, 20);
+        assert_eq!((deficit, room), (8.0, 0));
+        assert_eq!(stroll_room(&targets, &on_path, &on_way, 20, 24).1, 0);
+        assert_eq!(stroll_room(&targets, &on_path, &on_way, 20, 14).1, 6);
+        // a source counts the walkers heading its way only
+        let src = StrollTarget { toward: Some(true), want: 3.0, source: true, ..place(3) };
+        let on_way: HashMap<(usize, bool), usize> = [((3, false), 5), ((3, true), 1)].into_iter().collect();
+        assert_eq!(stroll_lacks(&src, &HashMap::new(), &on_way), 2.0);
     }
 
     #[test]
