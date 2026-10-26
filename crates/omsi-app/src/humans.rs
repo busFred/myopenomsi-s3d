@@ -2703,7 +2703,7 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
                 break;
             }
             let prev = walk.legs[k - 1];
-            let Some(n) = ped.straight_on(net, &prev, 60.0, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT) else { break };
+            let Some(n) = ped.straight_on(net, &prev, PED_STRAIGHT_ON_TURN, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT) else { break };
             walk.legs.push(n);
         }
         let leg = walk.legs[k];
@@ -2754,6 +2754,10 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
         stripe: None,
     })
 }
+
+/// The most a path that goes on "straight" from another turns (degrees, `PedNet::straight_on`):
+/// the way on over a crossing's pieces, and back along the pavement behind a kerb queue.
+const PED_STRAIGHT_ON_TURN: f64 = 60.0;
 
 /// Path ends closer than this (m) are one node of the walking network (the grid of
 /// `PedNet::cells` is 1.5 m, so a search of the 3x3 cells around finds them all).
@@ -3431,7 +3435,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
             if next.from_end(net) && !core_piece(p, net, at.lights, leg.lane) {
                 if let Some(c) = crossing_span(p, net, at.lights, walk, walk.leg + 1) {
                     let side = crossing_stripe(p, at, me, walk, &c, false);
-                    match kerb_verdict(p, at, walk, &c, me, yields, to_end, side) {
+                    match kerb_verdict(p, at, walk, &c, me, yields, to_end, side).and_then(|()| room_beyond(p, at, walk, &c, me)) {
                         Ok(()) => {
                             walk.kerb_go = Some((walk.leg, c.span, side));
                             me.decision = Some("go");
@@ -3510,7 +3514,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                         // they would take from where they stand)
                         let side = ped.map(|p| crossing_stripe(p, at, me, walk, &c, walk.held > 0.0)).unwrap_or(0.0);
                         let verdict = match ped {
-                            Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0), side),
+                            Some(p) => kerb_verdict(p, at, walk, &c, me, yields, (leg.len() - walk.s).max(0.0), side).and_then(|()| room_beyond(p, at, walk, &c, me)),
                             None => Ok(()),
                         };
                         match verdict {
@@ -3841,11 +3845,19 @@ fn kerb_look(pace: f64) -> f32 {
 /// Waiting at the kerb before `next` (the first piece of crossing `c`), facing the way across, in
 /// the kerb's queue: a free place of its waiting area (`KerbArea`, `KerbArea::pick`), or, with it
 /// full, behind it on the pavement they came along (`behind_the_queue`); a place once taken is
-/// kept, but for one in an earlier row of the area that is free (the queue moves up). A kerb with
-/// no place found (the whole way in a lane's reach) has the one spot of `kerb_spot`.
+/// kept, but for one in an earlier row of the area that is free (the queue moves up). Behind the
+/// legs they walked the queue goes on along the paths that continue them straight on. A kerb
+/// with no place found (the whole way in a lane's reach) has the one spot of `kerb_spot`.
 fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, c: Option<&Cross>, next: &Leg) -> Want {
     let net = at.net;
     let (_, h) = next.at(net, 0.3);
+    // (the queue stands before the crossing's first piece proper: on an island's or a corner's
+    // pieces ahead, `kerb_of`, as on the pavement behind)
+    let (kerb, lead) = match (ped, c) {
+        (Some(p), Some(c)) => kerb_of(p, net, at.lights, &walk.legs, c),
+        _ => (*next, Vec::new()),
+    };
+    let next = &kerb;
     let key = kerb_key(next);
     let kept = walk.spot.filter(|s| s.leg == walk.leg && s.next == next.lane);
     let spot = match kept {
@@ -3857,19 +3869,20 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
             }
         }
         None => {
-            // the legs walked up to the kerb, the current one first, as long as they join
-            let mut way: Vec<Leg> = Vec::new();
+            // the legs walked up to the kerb, the current one first, as long as they join, after
+            // the island's or corner's pieces ahead of them
+            let mut way: Vec<Leg> = lead.clone();
             for k in (0..=walk.leg.min(walk.legs.len().saturating_sub(1))).rev() {
                 let l = walk.legs[k];
-                // (never back onto a crossing just walked: at an island between
-                // two lights the spot was backed across the first street)
-                if ped.map(|p| core_piece(p, net, at.lights, l.lane)).unwrap_or(false) {
+                // (never back onto the carriageway of a crossing just walked: at an island between
+                // two lights the spot was backed across the first street; its pieces at a corner,
+                // off the street lanes, are where they stand: SUMO's walking area joins crossings)
+                if ped.is_some_and(|p| core_piece(p, net, at.lights, l.lane) && !off_road(p, net, l.lane)) {
                     break;
                 }
                 if let Some(after) = way.last() {
                     let joins = (l.at(net, l.len()).0 - after.at(net, 0.0).0).truncate().length() < 1.2;
-                    let on_cross = walk.cross.map(|c| c.on(k)).unwrap_or(false) || net.lanes[l.lane].traffic_light.is_some();
-                    if !joins || on_cross {
+                    if !joins {
                         break;
                     }
                 }
@@ -3894,8 +3907,27 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                 }
                 (None, None) => None,
             };
-            let place = area.and_then(|a| a.pick(at.queues, me.id, me.pos, BEHIND_THE_QUEUE)).or_else(|| behind_the_queue(net, at.queues, area, &way, me.id, me.pos).map(|q| (q, BEHIND_THE_QUEUE)));
-            let (pos, row) = place.unwrap_or_else(|| (kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK), BEHIND_THE_QUEUE));
+            let mut place = area.and_then(|a| a.pick(at.queues, me.id, me.pos, BEHIND_THE_QUEUE)).or_else(|| behind_the_queue(net, at.queues, area, &way, me.id, me.pos).map(|q| (q, BEHIND_THE_QUEUE)));
+            // (the queue longer than the legs they walked: on back along the paths that continue
+            // the way straight on, `PedNet::straight_on`, as far as the network goes)
+            if let (None, Some(p), Some(_)) = (place, ped, way.last()) {
+                let mut longer = way.clone();
+                while place.is_none() {
+                    let last = *longer.last().unwrap();
+                    let away = Leg { lane: last.lane, a: last.b, b: last.a };
+                    let Some(n) = p.straight_on(net, &away, PED_STRAIGHT_ON_TURN, |pn, l| !core_piece(pn, net, at.lights, l)) else { break };
+                    if longer.iter().any(|l| l.lane == n.lane) {
+                        break;
+                    }
+                    longer.push(Leg { lane: n.lane, a: n.b, b: n.a });
+                    place = behind_the_queue(net, at.queues, area, &longer, me.id, me.pos).map(|q| (q, BEHIND_THE_QUEUE));
+                }
+            }
+            // (no place anywhere - arrived off a crossing at a corner whose places are all taken -
+            // they wait where they are when that is off the lanes' reach, else at `kerb_spot`)
+            let here = me.pos.extend(next.at(net, 0.0).0.z);
+            let stay = (!in_waiter_reach(net, here) && at.queues.free(me.pos, me.id)).then_some(me.pos);
+            let (pos, row) = place.unwrap_or_else(|| (stay.unwrap_or_else(|| kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK)), BEHIND_THE_QUEUE));
             KerbPlace { leg: walk.leg, next: next.lane, pos, row, key, stripes }
         }
     };
@@ -4018,7 +4050,7 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
     let node = if next.b >= next.a { na } else { nb };
     let mut paths: Vec<usize> = ped.out.get(node).map(|v| v.iter().map(|(l, _)| *l).collect()).unwrap_or_default();
     paths.extend(ped.against.get(node).into_iter().flatten().copied());
-    paths.retain(|&l| !core_piece(ped, net, lights, l));
+    paths.retain(|&l| l != next.lane && (!core_piece(ped, net, lights, l) || off_road(ped, net, l)));
     paths.sort_unstable();
     paths.dedup();
     // (the queue stands behind where the pavement ends at the kerb: the end of a path there
@@ -4057,6 +4089,17 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
 /// one), off every street lane's waiter reach and outside the waiting area; the nearest the kerb
 /// first, in a row the one nearest the walker's own offset.
 fn behind_the_queue(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &[Leg], id: u32, pos: DVec2) -> Option<DVec2> {
+    let mut found = None;
+    behind_places(net, queues, area, way, id, pos, &mut |q| {
+        found = Some(q);
+        false
+    });
+    found
+}
+
+/// The free places of `behind_the_queue` in its order, each handed to `each` until it says
+/// stop (false).
+fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &[Leg], id: u32, pos: DVec2, each: &mut dyn FnMut(DVec2) -> bool) {
     let mut from_kerb = KERB_STEP_BACK as f32;
     for l in way {
         let len = l.len();
@@ -4072,15 +4115,73 @@ fn behind_the_queue(net: &Network, queues: &Queues, area: Option<&KerbArea>, way
             offs.sort_by(|a, b| (a - lat).abs().total_cmp(&(b - lat).abs()));
             for off in offs {
                 let q = c + (right * off).extend(0.0);
-                if queues.free(q.truncate(), id) && !area.is_some_and(|a| a.contains(q.truncate())) && !in_waiter_reach(net, q) {
-                    return Some(q.truncate());
+                if queues.free(q.truncate(), id) && !area.is_some_and(|a| a.contains(q.truncate())) && !in_waiter_reach(net, q) && !each(q.truncate()) {
+                    return;
                 }
             }
             d += QUEUE_ROW as f32;
         }
         from_kerb = d - len;
     }
-    None
+}
+
+/// Where the people waiting for crossing `c` (its pieces among `legs`) stand: before its first
+/// piece proper (`core_piece`), and on the pieces before that (an island or a corner between two
+/// crossings, which the crossing's span takes in: `crossing_span`'s short pieces), the last first.
+fn kerb_of(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, legs: &[Leg], c: &Cross) -> (Leg, Vec<Leg>) {
+    let to = c.to.min(legs.len() - 1);
+    let first = (c.from..=to).find(|&i| core_piece(ped, net, lights, legs[i].lane)).unwrap_or(c.from);
+    (legs[first], legs[c.from..first].iter().rev().copied().collect())
+}
+
+/// Whether footpath lane `l` lies off the carriageway: it cuts no street lane and its middle is
+/// outside every street lane's footprint (`on_carriageway`) - a crossing's piece at a corner or on
+/// an island, where the walking area joins two crossings.
+fn off_road(ped: &PedNet, net: &Network, l: usize) -> bool {
+    let lane = &net.lanes[l];
+    ped.crossings(net, l).is_empty() && !on_carriageway(net, lane.at(lane.length() * 0.5).0)
+}
+
+/// Whether there is room to wait where crossing `c` leads straight onto another crossing whose
+/// light does not let them on (an island, or the corner between two crossings of a junction): a
+/// free place there (`KerbArea`, or on the island's or corner's pieces, `behind_places`) for them
+/// and for everybody on `c`'s carriageway walking their way, else they wait at this kerb (SUMO:
+/// the walking area holds a jam; a corner with no room is not stepped towards across a street).
+fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) -> Result<(), &'static str> {
+    let net = at.net;
+    let mut ahead = walk.clone();
+    let Some(c2) = crossing_span(ped, net, at.lights, &mut ahead, c.to + 1) else { return Ok(()) };
+    let red = c2.light.and_then(|(ctl, li)| at.lights.and_then(|t| t.light_state(ctl, li))).is_some_and(|(state, _)| !omsi_sim::traffic::TrafficLightController::allows_go(state));
+    if !red {
+        return Ok(());
+    }
+    let (next, lead) = kerb_of(ped, net, at.lights, &ahead.legs, &c2);
+    let start = next.at(net, 0.0).0.truncate();
+    let st = crossing_stripes(ped, net, at.lights, &ahead, &c2);
+    let fresh;
+    let area = match at.queues.areas.get(&kerb_key(&next)) {
+        Some(a) => a.as_ref(),
+        None => {
+            fresh = kerb_area(ped, net, at.lights, &next, &st);
+            &fresh
+        }
+    };
+    // (a free place for them and for each of those on the crossing already, walking the same
+    // way: they will wait there before them)
+    let (_, fwd, _) = crossing_axis(net, walk, c);
+    let ahead_of_me = at.streams.get(&c.key).map(|v| v.iter().filter(|(id, _, vel)| *id != me.id && vel.dot(fwd) > 0.0).count()).unwrap_or(0);
+    let mut free = area.places.iter().filter(|(q, _, _)| at.queues.free(*q, me.id)).count();
+    if free <= ahead_of_me {
+        behind_places(net, at.queues, Some(area), &lead, me.id, start, &mut |_| {
+            free += 1;
+            free <= ahead_of_me
+        });
+    }
+    if free > ahead_of_me {
+        Ok(())
+    } else {
+        Err("no room at the corner beyond")
+    }
 }
 
 /// The kerb queues as the frame begins (built before the people decide, read by all of them):
@@ -13017,6 +13118,12 @@ mod ped_tests {
     /// (`Queues::rebuild`), each walker deciding from them, their new places claimed in turn
     /// (`claim_spot`). Returns the walkers (position, walk) at every second.
     fn queue_at_red(n: usize, red: f32, secs: f32) -> (Network, Vec<Vec<(DVec2, Option<DVec2>)>>, Arc<KerbArea>) {
+        queue_at_red_from(n, red, secs, false)
+    }
+
+    /// `queue_at_red`, every other walker coming from the far end of the pavement (lane 8) when
+    /// `both`.
+    fn queue_at_red_from(n: usize, red: f32, secs: f32, both: bool) -> (Network, Vec<Vec<(DVec2, Option<DVec2>)>>, Arc<KerbArea>) {
         let (net, ped) = kerb_both_sides();
         let lights = FakeLights::new(RED, red);
         let mut people: Vec<(Me, PedWalk, f32)> = Vec::new();
@@ -13032,7 +13139,13 @@ mod ped_tests {
             }
             if people.len() < n && t >= people.len() as f32 {
                 let id = 100 + people.len() as u32;
-                people.push((me(id, DVec2::new(-12.0, -5.5), 1.2), across(), 0.0));
+                if both && people.len() % 2 == 1 {
+                    let mut walk = across();
+                    walk.legs[0] = Leg { lane: 8, a: 12.0, b: 0.0 };
+                    people.push((me(id, DVec2::new(12.0, -5.5), 1.2), walk, 0.0));
+                } else {
+                    people.push((me(id, DVec2::new(-12.0, -5.5), 1.2), across(), 0.0));
+                }
             }
             let places: Vec<(u32, KerbPlace)> = people.iter().filter_map(|(m, w, _)| w.spot.map(|s| (m.id, s))).collect();
             queues.rebuild(places.iter().map(|(id, s)| (*id, s)), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
@@ -13178,6 +13291,106 @@ mod ped_tests {
         walk.turn_round(&net);
         let l = walk.legs[walk.leg];
         assert!((l.a - 13.0).abs() < 1e-6 && l.b == 0.0 && walk.s == 0.0, "{l:?}");
+    }
+
+    #[test]
+    fn p11_7_waiters_from_both_sides_of_the_kerb_never_stand_on_each_other() {
+        let (net, seconds, area) = queue_at_red_from(24, 45.0, 75.0, true);
+        let at_red = &seconds[40];
+        let waiting: Vec<DVec2> = at_red.iter().filter(|(_, w)| w.is_some()).map(|(q, _)| *q).collect();
+        let places: Vec<DVec2> = at_red.iter().filter_map(|(_, w)| *w).collect();
+        assert_eq!(waiting.len(), 24, "{at_red:?}");
+        assert_eq!(places.iter().filter(|q| area.contains(**q)).count(), area.places.len());
+        for (i, a) in places.iter().enumerate() {
+            for b in &places[i + 1..] {
+                assert!((*a - *b).length() > STRIPE_WIDTH - 1e-6, "places {a:?} {b:?}");
+            }
+        }
+        for (i, a) in waiting.iter().enumerate() {
+            assert!(!on_carriageway(&net, a.extend(0.0)), "{a:?}");
+            for b in &waiting[i + 1..] {
+                assert!((*a - *b).length() > 0.4572, "{a:?} {b:?} of {at_red:?}");
+            }
+        }
+        let last = seconds.last().unwrap();
+        assert!(last.iter().all(|(q, _)| q.y > -3.0), "{last:?}");
+    }
+
+    #[test]
+    fn p11_7_nobody_crosses_onto_an_island_whose_places_are_all_taken() {
+        // two crossings with an island between (as p3_a_crossing_begun...): the first green, the
+        // second red; 20 walkers: the island holds its places, the rest wait at the near kerb, and
+        // nobody stands on another or on the carriageway
+        let (mut net, _) = crossing(true);
+        net.lanes.truncate(6);
+        let street = |y: f64, from: f64, to: f64| (0..=20).map(|k| p(from + (to - from) * k as f64 / 20.0, y)).collect::<Vec<_>>();
+        net.lanes.push(lane(vec![p(0.0, 4.0), p(0.0, 8.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 8.0), p(0.0, 9.5)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 9.5), p(0.0, 13.75)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 13.75), p(0.0, 18.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(vec![p(0.0, 18.0), p(20.0, 18.0)], LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(street(11.75, -60.0, 60.0), LaneKind::Street, 3.5));
+        net.lanes.push(lane(street(15.75, 60.0, -60.0), LaneKind::Street, 3.5));
+        net.lanes[7].traffic_light = Some((0, 1));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 600.0);
+        lights.second.set(RED);
+        let legs = vec![
+            Leg { lane: 2, a: 8.0, b: 20.0 },
+            Leg { lane: 3, a: 0.0, b: 1.5 },
+            Leg { lane: 4, a: 0.0, b: 4.0 },
+            Leg { lane: 5, a: 0.0, b: 4.0 },
+            Leg { lane: 6, a: 0.0, b: 4.0 },
+            Leg { lane: 7, a: 0.0, b: 1.5 },
+            Leg { lane: 8, a: 0.0, b: 4.25 },
+            Leg { lane: 9, a: 0.0, b: 4.25 },
+            Leg { lane: 10, a: 0.0, b: 20.0 },
+        ];
+        let mut people: Vec<(Me, PedWalk, DVec2)> = Vec::new();
+        let mut queues = Queues::default();
+        let dt = 0.05f32;
+        for frame in 0..1200u32 {
+            let t = frame as f32 * dt;
+            if people.len() < 20 && frame % 20 == 0 {
+                people.push((me(200 + people.len() as u32, DVec2::new(-12.0, -5.5), 1.2), PedWalk::new(legs.clone(), false, 0.0), DVec2::ZERO));
+            }
+            let places: Vec<(u32, KerbPlace)> = people.iter().filter_map(|(m, w, _)| w.spot.map(|s| (m.id, s))).collect();
+            // (who is on the carriageway of which crossing, as the game's frame has it)
+            let mut streams: Streams = HashMap::new();
+            for (m, w, v) in &people {
+                if let Some(c) = w.cross.filter(|c| c.on(w.leg) && m.on_crossing) {
+                    streams.entry(c.key).or_default().push((m.id, m.pos, *v));
+                }
+            }
+            queues.rebuild(places.iter().map(|(id, s)| (*id, s)), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
+            let mut claimed = HashMap::new();
+            for (m, w, v) in people.iter_mut() {
+                let old = w.spot;
+                let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: t as f64 };
+                let mut rng = 7u64 ^ m.id as u64;
+                let mut want = stroll(Some(&ped), &at, m, w, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), dt);
+                if !claim_spot(m.id, old, w, &queues, &mut claimed) {
+                    want.vel = DVec2::ZERO;
+                }
+                m.pos += want.vel * dt as f64;
+                *v = want.vel;
+                if let Some(leg) = w.legs.get(w.leg) {
+                    w.s = leg.project(&net, m.pos.extend(0.0), w.s).max(w.s - 0.3);
+                }
+            }
+        }
+        let on_island: Vec<DVec2> = people.iter().map(|(m, _, _)| m.pos).filter(|q| q.y > 3.6 && q.y < 9.9).collect();
+        let near_kerb: Vec<DVec2> = people.iter().map(|(m, _, _)| m.pos).filter(|q| q.y < -3.5).collect();
+        assert!(!on_island.is_empty() && !near_kerb.is_empty(), "island {on_island:?} kerb {near_kerb:?}");
+        assert_eq!(on_island.len() + near_kerb.len(), 20, "{:?}", people.iter().map(|(m, _, _)| m.pos).collect::<Vec<_>>());
+        let all: Vec<DVec2> = people.iter().map(|(m, _, _)| m.pos).collect();
+        for (i, a) in all.iter().enumerate() {
+            assert!(!on_carriageway(&net, a.extend(0.0)), "{a:?}");
+            for b in &all[i + 1..] {
+                assert!((*a - *b).length() > 0.4572, "{a:?} {b:?} of {all:?}");
+            }
+        }
     }
 }
 
