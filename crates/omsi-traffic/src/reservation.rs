@@ -590,7 +590,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     let floor = -(w * c.decel + (1.0 - w) * MAX_BRAKE);
     // (short of the start while the foe's rear has not been past it for `tau`: wait at the start;
     // not with the right of way over its stream: the foe is my link leader, and I advance behind
-    // it, SUMO's `jmAdvance` - waiting at the start, a car with priority let a whole minor stream by)
+    // it, SUMO's `jmAdvance`, because a hold at the start would let a whole minor stream by)
     let hold = (!yields_to_me && d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
     Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0, dist: -p_e, red_short })
 }
@@ -1103,8 +1103,8 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // my own follower comes after me whatever the table says, one in the meeting place or
     // committed to it excepted: standing with me as its lead (or waiting for me through the
     // chain, `held_by`) - standing with the claim's hysteresis, `Claim::standing`: one that has
-    // just crept off after me under 1 m/s is still my follower (counted as coming, it refused me
-    // and the two bodies locked across a crossing, viz3 case07 j20); a lead is one frame's
+    // just crept off after me under 1 m/s is still my follower, because counted as coming it would
+    // refuse me while it follows me in and the two bodies lock; a lead is one frame's
     // perception, so one rolling faster is not taken on it - or rolling up to a queue whose lead
     // chain reaches me through a standing vehicle (`held_by_standing`)
     if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
@@ -1157,8 +1157,8 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // short of it behind a standing lead or a body across its way (`Claim::lead_rest`), whatever
     // its why names (a car at its zipper waiting place 2 m behind a lead held at red is labelled
     // Junction, neither blocked nor stuck), starts no sooner than its lead chain is released
-    // (`lead_release`: the first of the chain standing at a red, at its green - round 10 J9-1's
-    // green and start from rest): its window from rest is put off to then, and the time test
+    // (`lead_release`: the first of the chain standing at a red, at its green, from rest): its
+    // window from rest is put off to then, and the time test
     // decides. A chain held by anything else, or not known, lets it come from rest now; one whose
     // release never comes within a cycle is not coming
     if !their_inside && !o.committed && o.standing() && o.lead_rest() <= foe.theirs.0 {
@@ -3592,6 +3592,14 @@ mod tests {
         blocked_ahead.clear_ahead = 10.0;
         let g = resolve(&js, &[blocked_ahead, through(68.0, 9.4)]);
         assert!(!gives_way(&g, 2, 1) && !gives_way(&g, 1, 2), "{g:?}");
+        // ... and once it stands inside the stretch for them, the through car queues behind it
+        // (the queue-entry stop, `ZipCap::stop`)
+        let mut inside = merger.clone();
+        inside.s = a0 + 2.0;
+        inside.speed = 0.0;
+        inside.clear_ahead = inside.front + 0.5;
+        let g = resolve(&js, &[inside, through(40.0, 9.4)]);
+        assert!(grant_of(&g, 2).zipper.is_some_and(|z| z.foe == 1 && z.stop), "{g:?}");
         // 2-3 s off: it gives way still (the turner against the player; capped by it
         // at the zipper)
         let g = resolve(&js, &[merger.clone(), through(25.0, 9.4)]);

@@ -1627,9 +1627,8 @@ pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, u
 /// The next light on the way within 150 m. A second line of the same junction object on a
 /// straight run that shows the same light (controller and index) holds nobody: the car has
 /// passed that light's line, and the repeated head is no new link. A line further on carrying
-/// another light is its own link and is read (SUMO: each link has its own signal index) - a
-/// left-turn waiting area entered on one light and left on another (viz case04, object 3433:
-/// lane 603 light 2.2, then lane 901 light 2.3 11 m on). Of the lines ahead, the first that does
+/// another light is its own link and is read (SUMO: each link has its own signal index), because
+/// a left-turn waiting area is entered on one light and left on another. Of the lines ahead, the first that does
 /// not let the car go is the one it reads (SUMO checks every link of its look-ahead, not the
 /// first): a green line before a red one holds nobody; with every line letting it go, the first.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {

@@ -1380,9 +1380,9 @@ impl Simulation {
                     light: j.light.map(|(c, l, _)| (c, l)),
                     id: v.id,
                     yields_now: None,
-                    // (where people, a zebra or a standing lead will stop the front)
                     // (standing for its stop: the bus service's hold, `Why::Service`, or dwelling there)
                     serving: v.external.at_stop || v.last.why == Why::Service,
+                    // (where people, a zebra or a standing lead will stop the front)
                     clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                     brake,
                 };
