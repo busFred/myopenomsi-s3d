@@ -6629,3 +6629,71 @@ mod winding_exporter_tests {
         assert!(keep_authored_winding(80, 40, 1, 1));
     }
 }
+
+#[cfg(test)]
+mod ai_stop_request_tests {
+    use super::*;
+
+    /// One AI stop at `bus` (under `OMSI_ROOT`, default `~/Game/omsi2`): driven in, standing
+    /// with `AI_Scheduled_AtStation` 1 for 10 s, the rider's request made every frame by
+    /// `how` ("trigger": `int_haltewunsch`, "req": `PAX_Exit0_Req`, "none"); the most the
+    /// first rear leaf (`door_2`) opened. None when the bus is not installed.
+    fn rear_door_at_stop(bus: &str, how: &str) -> Option<f32> {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Game/omsi2")))?;
+        let path = root.join(bus);
+        if !path.exists() {
+            eprintln!("skipped: no {}", path.display());
+            return None;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &path).expect("the bus loads"));
+        let mut v = VehicleInstance::new(ty, VehicleHost::new(crate::SimClock::default()));
+        let mut ai = AiFrame { speed: 5.0, ..Default::default() };
+        for _ in 0..60 {
+            v.update_ai(1.0 / 30.0, &ai);
+        }
+        ai.speed = 0.0;
+        ai.at_station = 1;
+        let mut rear = 0.0f32;
+        for _ in 0..300 {
+            match how {
+                "trigger" => {
+                    v.trigger("int_haltewunsch");
+                }
+                "req" => {
+                    v.set_var("PAX_Exit0_Req", 1.0);
+                }
+                _ => {}
+            }
+            v.update_ai(1.0 / 30.0, &ai);
+            rear = rear.max(v.var("door_2").unwrap_or(0.0));
+        }
+        Some(rear)
+    }
+
+    /// The AI door branches of BeijingCity's timetable buses open the rear doors at a stop
+    /// only for a stop request: the WG120FK's and the BJ6123/6180's (`door.osc`,
+    /// `door-6.osc`) for the trigger `int_haltewunsch`, the MAN D92's and SD77's (`door.osc`
+    /// :275, their automatic rear doors) for the exit request `PAX_Exit0_Req`, not the
+    /// trigger. It names the buses it covered and fails when none is installed.
+    #[test]
+    fn the_ai_rear_doors_open_for_the_stop_request() {
+        let mut covered = Vec::new();
+        for bus in ["Vehicles/BPT-WG120FK/WG120FK_RDBJ.bus", "Vehicles/BJ6180_BJC/6123.bus", "Vehicles/BJ6180_BJC/6180.bus"] {
+            let Some(none) = rear_door_at_stop(bus, "none") else { continue };
+            assert!(none < 0.05, "{bus}: shut without a request ({none})");
+            assert!(rear_door_at_stop(bus, "trigger").unwrap() > 0.9, "{bus}: open for int_haltewunsch");
+            covered.push(bus);
+        }
+        for bus in ["Vehicles/MAN_SD202/MAN_D92.bus", "Vehicles/MAN_SD200/MAN_SD77.bus"] {
+            let Some(none) = rear_door_at_stop(bus, "none") else { continue };
+            assert!(none < 0.05, "{bus}: shut without a request ({none})");
+            assert!(rear_door_at_stop(bus, "trigger").unwrap() < 0.05, "{bus}: the trigger is not its");
+            assert!(rear_door_at_stop(bus, "req").unwrap() > 0.9, "{bus}: open for PAX_Exit0_Req");
+            covered.push(bus);
+        }
+        println!("covered: {covered:?}");
+        assert!(!covered.is_empty(), "none of the buses is installed (OMSI_ROOT or ~/Game/omsi2)");
+    }
+}

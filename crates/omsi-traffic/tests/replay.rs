@@ -298,6 +298,7 @@ fn a_recording_from_the_game_replays() {
             Record::LaneFlags { .. } => "lane flags",
             Record::Parked { .. } => "parked",
             Record::Note { .. } => "note",
+            Record::Dwell { .. } => "dwell",
         };
         let e = kinds.entry(k).or_default();
         e.0 += 1;
@@ -477,9 +478,9 @@ fn fixture(name: &str) -> Option<PathBuf> {
 
 /// A free run of a recording made under the current rules must be the recording: the first
 /// 30 s of it (`cargo test --release -p omsi-traffic --test replay free_run -- --nocapture`).
-/// [round 7 E1] Always a format-4 recording made here under the current rules (a signalled
+/// [round 7 E1] Always a recording of the current format (`record::VERSION`) made here under the current rules (a signalled
 /// junction, a stream, a player standing by: the gate the game fixtures, all of formats
-/// before 4, can no longer be); and a game fixture too when one on this machine was made
+/// before it, can no longer be); and a game fixture too when one on this machine was made
 /// under the current rules.
 #[test]
 fn a_free_run_reproduces_a_game_recording_made_under_the_current_rules() {
@@ -495,17 +496,17 @@ fn a_free_run_reproduces_a_game_recording_made_under_the_current_rules() {
     };
     record(net, lights, cars, 40.0, &path, &mut hook);
     let r = Replay::load(&path).expect("the fixture reads");
-    assert_eq!(r.header.version, 4);
+    assert_eq!(r.header.version, 5);
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);
-    free_run_reproduces(r, "the format-4 fixture");
+    free_run_reproduces(r, "the fixture made here");
     let _ = std::fs::remove_file(&path);
     let Some(path) = fixture("case01-0811.rec") else {
-        eprintln!("no game fixture case01-0811.rec: only the format-4 one");
+        eprintln!("no game fixture case01-0811.rec: only the one made here");
         return;
     };
     let r = Replay::load(&path).expect("the fixture reads");
     if let Some(why) = omsi_traffic::replay::other_rules(&r.header) {
-        eprintln!("{} was made under other rules ({why}): only the format-4 one", path.display());
+        eprintln!("{} was made under other rules ({why}): only the one made here", path.display());
         return;
     }
     free_run_reproduces(r, "case01");
@@ -602,7 +603,7 @@ fn the_recording_names_its_rules_and_one_made_under_others_is_known() {
     let r = Replay::load(&path).expect("the recording reads");
     let _ = std::fs::remove_file(&path);
     assert_eq!(r.header.version, omsi_traffic::record::VERSION);
-    assert_eq!(r.header.version, 4);
+    assert_eq!(r.header.version, 5);
     assert_eq!(r.header.switches.as_deref(), Some(omsi_traffic::record::RULES));
     assert_eq!(r.header.rules, Some(omsi_traffic::record::rules_hash()));
     assert_eq!(omsi_traffic::replay::other_rules(&r.header), None);

@@ -11,13 +11,17 @@
 //!   - within 60 m, facing the stop's way (sub_61f238) - that still rolls faster than 2 m/s,
 //!   or stands in the stop's box, sends them to the stop's gather point (task 2).
 //! * task 2 (no name): walking to the gather point, 0.7 m short of it. When the bus stands
-//!   (under 3 m/s) in the box, a free place in it is reserved (sub_7e910c: a random free
-//!   `[passpos]`, seat or standing place - no free place, nobody gets on), the ticket is
-//!   decided (sub_5ce4e0) and they walk to the bus (3).
+//!   (under 3 m/s) in the box and boards (a timetable bus: its doors open for people), a
+//!   free place in it is reserved (sub_7e910c: a random free `[passpos]`, seat or standing
+//!   place - no free place, nobody gets on), the ticket is decided (sub_5ce4e0) and they
+//!   walk to the bus (3).
 //! * `WalkingToBus` (3): to the nearest entry that is open or has a button (and sells
 //!   tickets when they buy one), 0.5 m outside the bus side until they are level with it;
 //!   a shut door is asked for (`PAX_Entry<n>_Req`) and waited at 0.7 m. In the doorway
-//!   they greet the driver or complain (the player's bus only) and board (4).
+//!   they greet the driver or complain (the player's bus only) and board (4). A timetable
+//!   bus that stops boarding (its doors close) before they reach the doorway leaves them at
+//!   the stop: back to the gather point (2) until it has gone (SUMO: a person who could not
+//!   board stays at the stop).
 //! * `WalkingInBusToPlace` (4): along the paths to the validator (stamping for a second,
 //!   `ev_Stamper`) or the cash desk (the ticket sale with the player) and on to the place
 //!   reserved. In any bus but the player's they are at their place at once.
@@ -25,10 +29,16 @@
 //!   and the approach, independently of the 60 m boarding range. Otherwise, until
 //!   it passed their alternative stop and drove on a random part of the way, or - with
 //!   no destination - it drove 1..20 km; a bus at its terminus empties.
-//! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch`), to the nearest exit, 0.7
-//!   m short of it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus
-//!   stands at a stop - and on along the pavement as a pedestrian.
+//! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch` on the person's bus, the
+//!   player's or a timetable bus, `Humans::ask_stop`), to the nearest exit, 0.7 m short of
+//!   it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus stands at a
+//!   stop - and on along the pavement as a pedestrian. Off a timetable bus with no exit open
+//!   but an entry open, by the nearest open entry (`leave_by_entry`; the player's bus: the
+//!   exits only, as Omsi.exe).
 //! * `WalkingToBusstop` (6): back to a waiting place of the stop, then waiting again.
+//!
+//! A timetable bus stays at its stop while somebody passes one of its doors (`holds_bus`):
+//! a boarder walking up to it, a rider on the way out while a door is open.
 //!
 //! People do not avoid each other: somebody within 0.6 m in front stops them (sub_626860),
 //! a person facing them makes them turn aside once, and that is all.
@@ -37,9 +47,11 @@ use super::*;
 
 // [ROLLBACK seatpick-69]
 /// From this age on a passenger counts as elderly: tries to sit, gets a seat given up.
-/// [ROLLBACK doorwait-82] How long (s) somebody waits for their own exit to open while another
-/// one is open already, before they go to the open one: a rear door of an articulated bus opens
-/// a little after the front ones, and they ran forward to the front door at once.
+/// How long (s) somebody on the way out waits for their own exit to open while another door
+/// (an exit, or an entry when no exit is open) is open already, before they go to the open one:
+/// a rear door opens a little after the front ones, and they ran forward to the front door at
+/// once. The value has no measured source: it is longer than the stock scripts' lag of the
+/// rear doors (door-6.osc:372 opens them 0.6 s after the stop, then about 2 s to open).
 const DOOR_PATIENCE: f32 = 12.0;
 const ELDERLY_AGE: f32 = 65.0;
 /// Seconds before a passenger who changed places changes again.
@@ -382,8 +394,8 @@ pub(super) struct Pax {
     /// [ROLLBACK party-70] The party travelling together (0: alone) and how many it was made of.
     pub party: u32,
     pub party_n: u8,
-    /// [ROLLBACK doorwait-82] Seconds at a stop that the exit they walk to has been shut while
-    /// another was open (see `DOOR_PATIENCE`).
+    /// Seconds at a stop that the door they walk to has been shut while another was open (see
+    /// `DOOR_PATIENCE`).
     pub shut_wait: f32,
     pub km_start: f64,
     /// Drawn once per passenger: where between departure and the approach they ask
@@ -403,6 +415,8 @@ pub(super) struct Pax {
     pub sub: u8,
     /// The entry or exit asked for (+0x640).
     pub door: Option<usize>,
+    /// On the way out, `door` is an entry (no exit was open; see `leave_by_entry`), not an exit.
+    pub door_entry: bool,
     /// The validator they stamp at (an index into the cabin's: a bus may have several).
     pub stamper: Option<usize>,
     /// `HeightOfSeat` (+0x648) and `PAX_State` (+0x64c: 0 stand, 1 walk, 2 sit).
@@ -488,6 +502,7 @@ impl Pax {
             bad_change: false,
             sub: 0,
             door: None,
+            door_entry: false,
             stamper: None,
             seat_h: 0.0,
             pax_state: 0.0,
@@ -948,18 +963,37 @@ pub(super) fn build_routes(n: usize, links: &[(i32, i32, bool)]) -> Vec<Vec<Rout
     adj
 }
 
-/// Whether passenger `x` keeps timetable bus `bus` at its stop (Omsi.exe 0x7d9e8b): on the
-/// way out of it (`Some(None)`, at whatever stop), or walking up to its doors from stop `s`
-/// (`Some(Some(s))`: only while the bus serves that stop). Anybody else, not.
-pub(super) fn holds_bus(x: &Pax, bus: BusId) -> Option<Option<i64>> {
+/// Whether passenger `x` keeps timetable bus `bus` at its stop (Omsi.exe 0x7d9e8b) while
+/// they pass one of its doors (SUMO: the stop lasts while persons board or alight,
+/// docs/tmp/sumo.md 6.2-6.3): on the way out of it while it has a door open
+/// (`doors_open`; `Some(None)`, at whatever stop - walking to the door, or at their own door
+/// that opens a little after the others, `DOOR_PATIENCE`), or walking up to its doors from
+/// stop `s` (`Some(Some(s))`: only while the bus serves that stop), not standing at a shut
+/// door. With no door open nobody passes one: nobody holds it. Anybody else, not.
+pub(super) fn holds_bus(x: &Pax, bus: BusId, doors_open: bool) -> Option<Option<i64>> {
     if x.bus != Some(bus) {
         return None;
     }
     match x.task {
-        Task::InBusToExit if x.inside == Some(bus) => Some(None),
-        Task::WalkingToBus => Some(x.stop),
+        Task::InBusToExit if x.inside == Some(bus) && doors_open => Some(None),
+        // (st 2: standing short of a shut entry)
+        Task::WalkingToBus if x.st != 2 => Some(x.stop),
         _ => None,
     }
+}
+
+/// A rider on the way out of timetable bus `bus` leaves by an entry: no exit of theirs is
+/// open and an entry is (`exit_open` / `entry_open`: the doors of the sections they are in,
+/// open or opening). Never on the player's bus: there Omsi.exe's way stands (0x62d6b1 passes
+/// the exits only), the rider keeps their exit and asks for it.
+pub(super) fn leave_by_entry(bus: BusId, exit_open: &[bool], entry_open: &[bool]) -> bool {
+    bus != BusId::Player && !exit_open.iter().any(|o| *o) && entry_open.iter().any(|o| *o)
+}
+
+/// The exit a rider on the way out asks for (`PAX_Exit<i>_Req`): their door when it is an
+/// exit; an entry they leave by is open already.
+pub(super) fn exit_asked(door: Option<usize>, door_entry: bool) -> Option<usize> {
+    door.filter(|_| !door_entry)
 }
 
 /// sub_7f3a24: the distance with the height difference weighed by `w` (5 everywhere).
@@ -1745,12 +1779,25 @@ impl Humans {
                 ));
             }
         }
+        // each timetable bus's riders, aboard, on the way out, and come up for it
+        self.ai_riders.clear();
+        for p in &self.people {
+            let State::Pax(x) = &p.state else { continue };
+            if let Some(BusId::Ai(id)) = x.inside {
+                let r = self.ai_riders.entry(id).or_default();
+                r.aboard += 1;
+                if x.task == Task::InBusToExit {
+                    r.leaving += 1;
+                }
+            } else if let (Some(BusId::Ai(id)), Task::ToBus | Task::WalkingToBus) = (x.bus, x.task) {
+                self.ai_riders.entry(id).or_default().boarders += 1;
+            }
+        }
         // timetable buses wait while people still get on or off (0x7d9e8b - 0x7d9f5e):
-        // somebody of this bus walking in it to an exit, or walking up to its doors from
-        // the stop the bus serves - the traffic checks the stop (`hold_boarding`). People
-        // still on their way to the gather point do not hold it: they walk up to the doors
-        // as soon as the bus has a place for them, and with the bus full they stood there
-        // and kept it at the stop with its doors open for good (#767)
+        // somebody of this bus on the way out while it has a door open, or walking up to its
+        // doors from the stop the bus serves - the traffic checks the stop (`hold_boarding`) -
+        // not standing at a shut door (`holds_bus`). People at the gather point do not hold
+        // it: with the bus full they stood there and kept it at the stop for good (#767)
         for bn in buses {
             let BusId::Ai(id) = bn.id else { continue };
             if bn.speed.abs() > 0.5 {
@@ -1758,9 +1805,10 @@ impl Humans {
             }
             let mut any_exit = false;
             let mut stops: Vec<i64> = Vec::new();
+            let doors_open = bn.entry_open.iter().chain(&bn.exit_open).any(|o| *o);
             for p in &self.people {
                 let State::Pax(x) = &p.state else { continue };
-                match holds_bus(x, bn.id) {
+                match holds_bus(x, bn.id, doors_open) {
                     Some(None) => any_exit = true,
                     Some(Some(s)) if !stops.contains(&s) => stops.push(s),
                     _ => {}
@@ -2334,9 +2382,7 @@ impl Humans {
                     return;
                 };
                 // the stop button
-                if bn.id == BusId::Player {
-                    self.stop_request = true;
-                }
+                self.ask_stop(bn.id);
                 let seat = self.pax(i).unwrap().seat;
                 let all = bn.cabin.all_points();
                 let from = seat
@@ -2361,6 +2407,7 @@ impl Humans {
                 p.door = p
                     .pt_target
                     .and_then(|t| exits.iter().position(|e| *e == Some(t)));
+                p.door_entry = false;
                 if let Some(d) = p.door {
                     if let Some((_, x)) = self.pax_req.get_mut(&bn.id) {
                         if let Some(r) = x.get_mut(d) {
@@ -2640,7 +2687,8 @@ impl Humans {
             Task::ToBus => {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
-                    if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
+                    // (a timetable bus once its doors open for people: `BusNow::boards`)
+                    if bn.speed.abs() < 3.0 && bn.boards && self.in_stop_box(stop, bn.id) {
                         if let Some(k) = self.choose_place(i, bn) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self
@@ -2704,7 +2752,7 @@ impl Humans {
                         {
                             let departing = bn.speed.abs() > 0.1
                                 && !bn.entry_open.iter().chain(&bn.exit_open).any(|open| *open);
-                            let arrived = reg.next == Some(stop.id)
+                            let arrived = bn.boarding_stop.or(reg.next) == Some(stop.id)
                                 && bn.speed.abs() < 1.0
                                 && bn.exit_open.iter().any(|open| *open);
                             if arrived
@@ -2802,7 +2850,10 @@ impl Humans {
             return;
         }
         let stop = p.stop;
+        // on while the bus stands in the stop's box and boards; somebody in the doorway
+        // (st 3) steps in as its doors begin to close
         let ok = bn.speed.abs() < 3.0
+            && (bn.boards || p.st == 3)
             && stop.is_some_and(|s| self.in_stop_box(s, bn.id))
             && !bn.cabin.graph.points.is_empty();
         if ok {
@@ -2827,12 +2878,15 @@ impl Humans {
             self.set_task(i, Task::InBusToPlace, buses, bus_ix, world);
             return;
         }
-        // the bus pulls away again: the place is given back
+        // the bus pulls away again, or boards no longer (its doors close): the place is given
+        // back and they are at the stop again, at its gather point until it has gone, then at
+        // a waiting place for the next bus (SUMO: a person who could not board stays at the
+        // stop; they do not keep the bus)
         if let Some(k) = p.seat {
             self.free_seat(bn.id, k);
         }
         self.pax_mut(i).unwrap().seat = None;
-        if bn.speed.abs() >= 3.0 {
+        if bn.speed.abs() >= 3.0 || !bn.boards {
             self.set_task(i, Task::ToBus, buses, bus_ix, world);
         } else {
             self.set_task(i, Task::WalkingToBusstop, buses, bus_ix, world);
@@ -2912,6 +2966,21 @@ impl Humans {
         }
     }
 
+    /// A rider's stop request (sub_62e42c fires the trigger `int_haltewunsch` on the
+    /// person's bus, whoever drives it): the player's bus through `stop_request`, a timetable
+    /// bus through `ai_stop_requests`. The stock AI door scripts (WG120FK `door.osc`, BJ6123 and
+    /// BJ6180 `door-6.osc`) open the rear doors at a stop only with `haltewunsch` set, which
+    /// that trigger sets; the MAN D92 has no such trigger and raises it from the exit requests
+    /// (`PAX_Exit<i>_Req`, written every frame from `pax_req`).
+    pub(super) fn ask_stop(&mut self, bus: BusId) {
+        match bus {
+            BusId::Player => self.stop_request = true,
+            BusId::Ai(id) => {
+                self.ai_stop_requests.insert(id);
+            }
+        }
+    }
+
     /// Task 5 (case 5): to the exit, out.
     pub(super) fn task_to_exit(
         &mut self,
@@ -2928,21 +2997,25 @@ impl Humans {
             return;
         };
         let reg = at_stops.get(&b).cloned().unwrap_or_default();
+        // the stop they get off at: the one a timetable bus boards at (its timetable's, SUMO:
+        // persons alight at the stop the vehicle stops at), else the stop ahead of the bus as
+        // the people see it (sub_61f238: within 60 m, facing its way) - the people's stops are
+        // set up where people are, and riders of a bus boarding farther off stood at its open
+        // doors to the cap
+        let here = bn.boarding_stop.or(reg.next);
         if bn.speed.abs() >= 1.0 {
             self.pax_mut(i).unwrap().timer = 1.0;
         }
         let door_open = p
             .door
-            .map(|d| bn.exit_open.get(d).copied().unwrap_or(false))
+            .map(|d| if p.door_entry { &bn.entry_open } else { &bn.exit_open }.get(d).copied().unwrap_or(false))
             .unwrap_or(false);
-        let may_leave = door_open && (reg.next.is_some() || p.complaint == 3);
+        let may_leave = door_open && (here.is_some() || p.complaint == 3);
         self.pax_mut(i).unwrap().short = !may_leave;
         let out = p.st == 7 && bn.speed.abs() < 1.0 && may_leave;
         if !out {
-            if reg.next.is_none() {
-                if bn.id == BusId::Player {
-                    self.stop_request = true;
-                }
+            if here.is_none() {
+                self.ask_stop(bn.id);
                 return;
             }
             if p.timer < 0.0 {
@@ -2955,38 +3028,50 @@ impl Humans {
                 // to it - the people coming down from the upper deck never got off the stairs.
                 self.pax_mut(i).unwrap().timer = 1.0;
                 let all = bn.cabin.all_points();
-                // [ROLLBACK doorwait-66] an exit that is opening counts as open
-                let moving = self
+                // an entry that is opening counts as open (`door_moving`: the entries only;
+                // an exit counts once its script flags it open)
+                let opening = self
                     .door_moving
                     .get(&bn.id)
-                    .map(|m| m.1.clone())
+                    .map(|m| m.0.clone())
                     .unwrap_or_default();
                 let pp = self.pax_mut(i).unwrap();
                 let here = pp.pos.as_vec3();
-                // (the exits of the sections they are in)
+                // (the doors of the sections they are in)
                 let group = bn.cabin.group_at(
                     pp.pt
                         .or_else(|| bn.cabin.omsi_nearest(here, &all, false, false, None, None)),
                 );
                 let exits = bn.cabin.in_group(bn.cabin.exit_points(), group);
-                let open: Vec<bool> = (0..exits.len())
+                let entries = bn.cabin.in_group(bn.cabin.entry_points(), group);
+                let exit_open: Vec<bool> = (0..exits.len())
+                    .map(|k| exits[k].is_some() && bn.exit_open.get(k).copied().unwrap_or(false))
+                    .collect();
+                let entry_open: Vec<bool> = (0..entries.len())
                     .map(|k| {
-                        bn.exit_open.get(k).copied().unwrap_or(false)
-                            || moving.get(k).copied().unwrap_or(false)
+                        entries[k].is_some()
+                            && (bn.entry_open.get(k).copied().unwrap_or(false)
+                                || opening.get(k).copied().unwrap_or(false))
                     })
                     .collect();
-                // [ROLLBACK doorwait-82] With no exit open nobody is sent anywhere: the nearest
-                // exit stays theirs (the search gave the first of the list when none was open -
-                // the front door - and everybody ran to it, from the rear doors of an
-                // articulated bus too). And whoever's own exit is shut while another is open
-                // waits a while for it to open (`DOOR_PATIENCE`) before going to the open one.
-                let any_open = open
-                    .iter()
-                    .zip(exits.iter())
-                    .any(|(o, e)| *o && e.is_some());
-                let own_shut = p
-                    .door
-                    .is_some_and(|d| !open.get(d).copied().unwrap_or(true));
+                // The exits as Omsi.exe has them (0x62d6b1 passes the exits' open states,
+                // +0x6e0: a shut one is skipped); with no exit open but an entry open, the open
+                // entries: a rider leaves through a door that is open (SUMO: persons alight
+                // through the vehicle's doors, docs/tmp/sumo.md 6.2), never waits for good at
+                // one that stays shut (a bus type whose script opens no exit for the AI).
+                let by_entry = leave_by_entry(bn.id, &exit_open, &entry_open);
+                let (doors, open) = if by_entry { (&entries, &entry_open) } else { (&exits, &exit_open) };
+                // With no door open nobody is sent anywhere: the nearest exit stays theirs (the
+                // search gave the first of the list when none was open - the front door - and
+                // everybody ran to it, from the rear doors of an articulated bus too). Whoever's
+                // own door is shut while another is open waits a while for it to open
+                // (`DOOR_PATIENCE`: a rear door opens a little after the front ones) before
+                // going to the open one.
+                let any_open = open.iter().any(|o| *o);
+                let own_open = p.door.map(|d| {
+                    if p.door_entry { entry_open.get(d) } else { exit_open.get(d) }.copied().unwrap_or(true)
+                });
+                let own_shut = own_open == Some(false);
                 let patient = own_shut && any_open && pp.shut_wait < DOOR_PATIENCE;
                 if patient {
                     // (their door is asked for below as before)
@@ -2994,7 +3079,7 @@ impl Humans {
                 } else {
                     let target = bn.cabin.omsi_nearest(
                         here,
-                        &exits,
+                        doors,
                         false,
                         false,
                         None,
@@ -3008,12 +3093,12 @@ impl Humans {
                         && target.is_some()
                         && (target == pp.pt || target == pp.pt_target)
                     {
-                        // [ROLLBACK exitstay-95] already standing at that exit's point: they stay
-                        // (nearest to where they stood was the point before it at times, and
-                        // they walked back to it and round to the point they had left)
+                        // already standing at that door's point: they stay (nearest to where
+                        // they stood was the point before it at times, and they walked back
+                        // to it and round to the point they had left)
                         pp.pt_target = target;
                     } else if target != pp.pt_target || pp.st != 7 {
-                        // [ROLLBACK exitstay-95] from the point they stand at, when they stand at one
+                        // from the point they stand at, when they stand at one
                         pp.pt = if pp.st == 7 && pp.pt.is_some() {
                             pp.pt
                         } else {
@@ -3024,13 +3109,14 @@ impl Humans {
                     }
                     pp.door = pp
                         .pt_target
-                        .and_then(|t| exits.iter().position(|e| *e == Some(t)));
+                        .and_then(|t| doors.iter().position(|e| *e == Some(t)));
+                    pp.door_entry = by_entry && pp.door.is_some();
                 }
             }
-            if bn.id == BusId::Player {
-                self.stop_request = true;
-            }
-            if let Some(d) = self.pax(i).unwrap().door {
+            self.ask_stop(bn.id);
+            // (their exit asked for; an entry they leave by is open already)
+            let asked = self.pax(i).map(|x| exit_asked(x.door, x.door_entry)).unwrap_or(None);
+            if let Some(d) = asked {
                 if let Some((_, x)) = self.pax_req.get_mut(&b) {
                     if let Some(r) = x.get_mut(d) {
                         *r = true;
@@ -3039,11 +3125,13 @@ impl Humans {
             }
             return;
         }
-        // out of the bus: into the world, on along the pavement (task 8)
+        // out of the bus: into the world, on along the pavement (task 8) - short of the pole
+        // onto the pavement beside their door (`Humans::kerb_doors`)
         let Some((w, h)) = self.pax_world(&p, buses, bus_ix) else {
             return;
         };
-        let stop = reg.next;
+        let stop = here;
+        let kerb = bn.kerb.as_ref().and_then(|(x, e)| p.door.and_then(|d| if p.door_entry { e.get(d) } else { x.get(d) }).copied().flatten());
         let pp = self.pax_mut(i).unwrap();
         pp.inside = None;
         pp.pos = w;
@@ -3057,11 +3145,14 @@ impl Humans {
                 p.door
             );
         }
-        self.walk_street(i, w, h, stop, world, remove);
+        match kerb {
+            Some(leg) => self.walk_street_on(i, w, h, Some(leg)),
+            None => self.walk_street(i, w, h, stop, world, remove),
+        }
         // [ROLLBACK stepout-70] straight away from the bus's side first (1.8 m), whatever the
         // pavement's path does: just off, they stood up to eight seconds - the standing bus
         // was "in the way" of the first step along its side
-        if let Some(d) = p.door.and_then(|d| bn.cabin.exits.get(d)) {
+        if let Some(d) = p.door.and_then(|d| if p.door_entry { &bn.cabin.entries } else { &bn.cabin.exits }.get(d)) {
             if matches!(self.people[i].state, State::Strolling(_)) {
                 let dir = (d.outside - d.inside).truncate().normalize_or_zero();
                 if dir != glam::Vec2::ZERO {
@@ -3096,13 +3187,19 @@ impl Humans {
         remove: &mut Vec<usize>,
     ) {
         let lane = stop.and_then(|s| self.stops.get(&s)).and_then(|s| s.lane);
+        let _ = &remove;
+        self.walk_street_on(i, at, heading, lane)
+    }
+
+    /// On as a pedestrian from `at` along pavement `lane` (lane, distance along it) - or
+    /// standing, looking for one, when there is none.
+    pub(super) fn walk_street_on(&mut self, i: usize, at: DVec3, heading: f64, lane: Option<(usize, f32)>) {
         let p = &mut self.people[i];
         p.position = at;
         p.heading = heading;
         p.place = Place::Ground;
         p.interior = 0.0;
         p.vel = DVec2::ZERO;
-        let _ = &remove;
         match (lane, self.ped.as_ref()) {
             (Some((l, s)), Some(_)) => {
                 let leg = Leg {
@@ -3537,17 +3634,57 @@ mod tests {
         x.bus = Some(bus);
         x.stop = Some(42);
         x.task = Task::ToBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
         x.task = Task::WaitingForBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
         x.task = Task::WalkingToBus;
-        assert_eq!(holds_bus(&x, bus), Some(Some(42)));
-        assert_eq!(holds_bus(&x, BusId::Ai(8)), None);
+        x.st = 1;
+        assert_eq!(holds_bus(&x, bus, true), Some(Some(42)));
+        assert_eq!(holds_bus(&x, BusId::Ai(8), true), None);
         x.task = Task::InBusToExit;
         x.inside = Some(bus);
-        assert_eq!(holds_bus(&x, bus), Some(None));
+        assert_eq!(holds_bus(&x, bus, true), Some(None));
         x.task = Task::SittingInBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
+    }
+
+    /// Nobody standing at a shut door keeps a timetable bus: a boarder short of a shut entry
+    /// does not, a rider on the way out of a bus with no door open does not (#3127 at
+    /// Jiangzhaikou stood to the 120 s cap for riders at a shut rear door); a rider on the
+    /// way out while a door is open does (walking to it, or waiting for their own).
+    #[test]
+    fn nobody_at_a_shut_door_keeps_the_bus() {
+        let bus = BusId::Ai(7);
+        let mut x = Pax::new(1.1, 0.5);
+        x.bus = Some(bus);
+        x.stop = Some(42);
+        x.task = Task::WalkingToBus;
+        x.st = 2;
+        assert_eq!(holds_bus(&x, bus, true), None, "standing short of a shut entry");
+        x.st = 3;
+        assert_eq!(holds_bus(&x, bus, true), Some(Some(42)), "in the doorway");
+        x.task = Task::InBusToExit;
+        x.inside = Some(bus);
+        x.st = 7;
+        assert_eq!(holds_bus(&x, bus, false), None, "no door open: nobody passes one");
+        assert_eq!(holds_bus(&x, bus, true), Some(None));
+    }
+
+    /// A rider leaves by an open exit when there is one, by an open entry when no exit is
+    /// open (the AI branch of a door script that opens the front doors only), and is sent
+    /// nowhere new while nothing is open.
+    #[test]
+    fn a_rider_leaves_by_an_open_door() {
+        let ai = BusId::Ai(7);
+        assert!(!leave_by_entry(ai, &[true, false], &[true, true]), "an exit is open: the exits");
+        assert!(leave_by_entry(ai, &[false, false], &[true, false]), "only an entry is open");
+        assert!(!leave_by_entry(ai, &[false, false], &[false, false]), "nothing open: their exit stays");
+        assert!(!leave_by_entry(ai, &[], &[]), "a bus with no doors in their section");
+        // the player's bus as before: with only the entry open the rider keeps their exit and
+        // asks for it (PAX_Exit1_Req)
+        assert!(!leave_by_entry(BusId::Player, &[false, false], &[true, false]));
+        assert_eq!(exit_asked(Some(1), false), Some(1));
+        assert_eq!(exit_asked(Some(0), true), None, "an entry they leave by is not asked for");
     }
 
     /// Smooth driving upsets nobody; a hard stop, a fast bend and a jerky foot do, as in

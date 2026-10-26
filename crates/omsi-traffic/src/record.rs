@@ -40,7 +40,8 @@ use std::sync::mpsc;
 /// since 3 is written - `Vehicle::passed_on_go`, `change_still`,
 /// `mutual`, `mutual_gap`, `ease_for`, `waiting`, `External::trip_over`,
 /// `Frame::steer`, `Frame::order`; a format-3 recording may lack some (read as their
-/// defaults, `Replay::load` warns).
+/// defaults, `Replay::load` warns). 5: a timetable bus's stand at a stop is written when it
+/// pulls away ([`Record::Dwell`]); a tool of format 4 cannot read that line.
 ///
 /// Compatibility rule: a recording is read by the tools of its format and
 /// later ones. On read, a field the recording has and the code no longer knows is ignored
@@ -52,7 +53,7 @@ use std::sync::mpsc;
 /// `Replay::new`: a bus's missing `comfort_brake` is a bus's). A recording of a later format than the tool's (`header.version > VERSION`,
 /// e.g. format 4 in a tool of format 3) is not for that tool: `Replay::load` refuses it with that
 /// message, as fields it requires may be missing; read it with the branch's own tool.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// The rule switches a recording names (`Header::switches`), for information: the rule
 /// changes once tried behind switches and accepted, now always on, and the earlier junction
 /// rules. Frozen: which rules a recording was made under is [`rules_hash`]'s (format 4).
@@ -281,6 +282,36 @@ pub struct Frame {
     pub order: Option<Vec<u64>>,
 }
 
+/// A timetable bus's stand at one of its stops, as the game saw it (format 5): what was
+/// planned when it came to rest, how long it stood, and who was left on the wrong side of
+/// its doors when it pulled away (`traffic_cases dwells`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Dwell {
+    /// The stop (its map object id).
+    pub stop: i64,
+    /// The day time it came to rest there (s).
+    pub arrived: f64,
+    /// Seconds from then to the doors closing as planned on arrival: its own boarding time
+    /// or the timetable's wait, whichever is longer.
+    pub planned: f32,
+    /// Seconds from arrival to the doors closing as it was.
+    pub closed: f32,
+    /// Seconds from arrival to pulling away.
+    pub left: f32,
+    /// The doors closed at the boarding cap with somebody still said to be at them.
+    pub at_cap: bool,
+    /// Riders aboard when it came to rest and when it pulled away.
+    pub aboard_arrival: u32,
+    pub aboard_departure: u32,
+    /// Riders aboard still on their way out when it pulled away (carried past their stop).
+    pub bound_left: u32,
+    /// People who had come up for it at the stop (at the gather point or walking to its
+    /// doors) and were not aboard when it pulled away.
+    pub boarders_left: u32,
+    /// Where it stood when it pulled away (its origin, x and y).
+    pub pos: (f64, f64),
+}
+
 /// One line of a recording after the header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
@@ -320,6 +351,8 @@ pub enum Record {
     Parked { time: f64, parked: HashMap<usize, Vec<Parked>> },
     /// Free text: what triggered a save, a stuck car's report.
     Note { time: f64, text: String },
+    /// Timetable bus `id` pulled away from a stop (format 5).
+    Dwell { time: f64, id: u64, dwell: Dwell },
 }
 
 impl Record {
@@ -334,7 +367,8 @@ impl Record {
             | Record::LightsAdded { time, .. }
             | Record::LaneFlags { time, .. }
             | Record::Parked { time, .. }
-            | Record::Note { time, .. } => *time,
+            | Record::Note { time, .. }
+            | Record::Dwell { time, .. } => *time,
         }
     }
 }
@@ -364,6 +398,7 @@ enum RecordRef<'a> {
     LaneFlags { time: f64, flags: &'a [(usize, bool, bool)] },
     Parked { time: f64, parked: &'a HashMap<usize, Vec<Parked>> },
     Note { time: f64, text: &'a str },
+    Dwell { time: f64, id: u64, dwell: &'a Dwell },
 }
 
 #[cfg(test)]
@@ -630,6 +665,11 @@ impl Recorder {
 
     pub fn note(&mut self, time: f64, text: &str) {
         self.line(time, Kind::Other, &RecordRef::Note { time, text });
+    }
+
+    /// Timetable bus `id` pulled away from a stop after `dwell`.
+    pub fn dwell(&mut self, time: f64, id: u64, dwell: &Dwell) {
+        self.line(time, Kind::Other, &RecordRef::Dwell { time, id, dwell });
     }
 
     /// Lanes about to be handed to `Network::extend` (as they are before it links them),
@@ -992,6 +1032,17 @@ mod remove_line_tests {
         match serde_json::from_str::<Record>(&line).unwrap() {
             Record::LaneFlags { time, flags: f } => assert!(time == 12.5 && f == flags.to_vec()),
             _ => panic!("not lane flags: {line}"),
+        }
+    }
+
+    /// A bus's stand at a stop is a line of its own (format 5), read back as written.
+    #[test]
+    fn b4_a_dwell_is_recorded() {
+        let dwell = super::Dwell { stop: 2296442, arrived: 30338.4, planned: 9.0, closed: 120.0, left: 123.3, at_cap: true, aboard_arrival: 31, aboard_departure: 29, bound_left: 3, boarders_left: 1, pos: (461.1, -1596.2) };
+        let line = serde_json::to_string(&RecordRef::Dwell { time: 952.0, id: 3127, dwell: &dwell }).unwrap();
+        match serde_json::from_str::<Record>(&line).unwrap() {
+            Record::Dwell { time, id, dwell: d } => assert!(time == 952.0 && id == 3127 && d == dwell),
+            _ => panic!("not a dwell: {line}"),
         }
     }
 }

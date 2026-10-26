@@ -140,6 +140,13 @@ pub struct BusService {
     /// ends on a lane with a way on): it drives on until the timetable hands it the tour's
     /// next trip or lets it go, rather than standing at the lane's end.
     track_end: bool,
+    /// Its stand at the stop it is at, from the moment it came to rest (`arrive`), and the
+    /// last one finished when it pulled away (`depart`), for the traffic to complete with the
+    /// riders and write into the recording (`Record::Dwell`).
+    pub dwell: Option<omsi_traffic::record::Dwell>,
+    pub dwell_done: Option<omsi_traffic::record::Dwell>,
+    /// The stand began this frame: the traffic notes the riders aboard on arrival.
+    pub arrival_pending: bool,
 }
 
 /// A bus away from its stop until its departure.
@@ -217,9 +224,14 @@ const PARKED_START: f64 = 60.0;
 /// Seconds after its trip is over that a bus stands before the
 /// engine stops (the passengers are off by then).
 const TRIP_DONE_PARK: f32 = 20.0;
-/// Seconds of boarding past the departure after which the doors
-/// close whoever is still said to be at them.
+/// Seconds of boarding past the departure after which the doors close whoever is still
+/// said to be at them: a guard, not the norm. The stop lasts while somebody is actually
+/// passing a door (SUMO's stop: `duration` plus `boardingDuration` per person boarding or
+/// alighting, docs/tmp/sumo.md §6.2-6.3), so it fires only when a person's hold never ends;
+/// each firing is logged and counted (`BOARDING_CAP_FIRED`, `Dwell::at_cap`).
 const BOARDING_MAX: f32 = 120.0;
+/// How many dwells the boarding cap has ended in this run (logged with each firing).
+static BOARDING_CAP_FIRED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
 /// A layover bus on a through lane leaves early once a vehicle has stood behind it this
@@ -745,6 +757,9 @@ impl BusService {
             pull_to: None,
             pulled_here: false,
             track_end: false,
+            dwell: None,
+            dwell_done: None,
+            arrival_pending: false,
         }
     }
 
@@ -851,6 +866,7 @@ impl BusService {
         self.pace_target = None;
         self.left_early = false;
         self.track_end = false;
+        self.dwell = None;
     }
 
     fn set_phase(&mut self, p: Phase) {
@@ -921,6 +937,11 @@ impl BusService {
             self.boarded = true;
         }
         self.delay = (ctx.day_time + (self.boarding as f64).max(wait)) - depart;
+        // (what is planned now: the doors close after its boarding time, or at the
+        // departure it waits for, whichever is later)
+        let planned = if self.phase == Phase::Boarding { self.boarding.max(wait as f32) } else { wait as f32 };
+        self.dwell = Some(omsi_traffic::record::Dwell { stop: id, arrived: ctx.day_time, planned, ..Default::default() });
+        self.arrival_pending = true;
         if ctx.debug {
             log::info!(
                 "t={:.1}: timetable bus {} at its stop, {:.0} s to its departure ({:?}) at {:?}",
@@ -936,6 +957,10 @@ impl BusService {
     /// Off from the stop: the next one is the front.
     fn depart(&mut self, st: &mut AiState, vehicle: &mut VehicleInstance, ctx: &Ctx) {
         let bay = self.stops.front().map(|s| s.bay).unwrap_or(0.0);
+        if let Some(mut d) = self.dwell.take() {
+            d.left = (ctx.day_time - d.arrived) as f32;
+            self.dwell_done = Some(d);
+        }
         // off early for the traffic behind: the lead is made up on the way
         if std::mem::take(&mut self.left_early) {
             if let Some(stop) = self.stops.front() {
@@ -1030,6 +1055,9 @@ impl BusService {
                 self.pending = Some(d);
                 self.leave_at = day_time;
                 self.set_phase(Phase::Closing);
+                if let Some(w) = self.dwell.as_mut() {
+                    w.closed = (day_time - w.arrived) as f32;
+                }
             }
             Phase::Boarding => {
                 self.pending = Some(d);
@@ -1133,7 +1161,26 @@ impl BusService {
             self.boarding = self.boarding.max((self.leave_at - ctx.day_time) as f32 - 3.0);
             self.set_phase(Phase::Boarding);
         } else if self.boarded && ctx.day_time >= self.leave_at {
-            self.set_phase(Phase::Closing);
+            self.close_doors(ctx, false);
+        }
+    }
+
+    /// The doors close: the stand's closing time is noted, and a close at the boarding cap
+    /// (`BOARDING_MAX`) is logged and counted.
+    fn close_doors(&mut self, ctx: &Ctx, at_cap: bool) {
+        self.set_phase(Phase::Closing);
+        if let Some(d) = self.dwell.as_mut() {
+            d.closed = (ctx.day_time - d.arrived) as f32;
+            d.at_cap = at_cap;
+        }
+        if at_cap {
+            let n = BOARDING_CAP_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            log::warn!(
+                "t={:.1}: timetable bus {} closes its doors at stop {:?} at the boarding cap ({BOARDING_MAX} s) with somebody still said to be at them ({n} so far)",
+                ctx.day_time,
+                ctx.id,
+                self.stops.front().map(|s| s.id)
+            );
         }
     }
 
@@ -1150,11 +1197,10 @@ impl BusService {
         // (shut, it stood at the stop for half a minute for no reason anyone could
         // see); the doors close when it is time to go
         if self.boarding <= 0.0 && ctx.day_time >= self.leave_at {
-            self.set_phase(Phase::Closing);
+            self.close_doors(ctx, false);
         } else if ctx.day_time >= self.leave_at && self.phase_t > BOARDING_MAX {
-            // somebody always said to be at the doors (a
-            // passenger who never gets in) kept the bus at its stop for good
-            self.set_phase(Phase::Closing);
+            // the guard: somebody still said to be at the doors after the cap
+            self.close_doors(ctx, true);
         }
     }
 
@@ -2104,6 +2150,40 @@ mod tests {
         assert!(closed >= 115.0 && closed < 118.0, "doors shut once nobody holds them: {closed}");
         assert!(closed_at.is_some_and(|t| t < 115.0), "nobody at the doors: off once boarding is over");
         assert_eq!(st.route, vec![0, 1, 2, 3, 0, 4], "and round the block");
+    }
+
+    /// A stand at a stop is recorded: the planned dwell, when the doors closed, and whether
+    /// the boarding cap closed them. Held while somebody passes a door, the doors close 2.5 s
+    /// after the last hold; held for good, at the cap, which is noted as such.
+    #[test]
+    fn a_stand_records_its_plan_its_close_and_the_cap() {
+        let net = ring();
+        let mut v = test_vehicle();
+        let stop = Stop { ri: 0, s: 50.0, bay: 0.0, depart: 0.0, id: 7, side: 0.0 };
+        for hold_until in [105.0, f64::INFINITY] {
+            let mut s = BusService::new(vec![stop]);
+            let mut st = AiState::new(0, 50.0, 1);
+            st.route = vec![0, 4];
+            s.arrive(&ctx_on(&net, &[], 100.0, 0.0), 0.0, 7, (0, 50.0));
+            assert_eq!(s.phase, Phase::Boarding);
+            let planned = boarding_time(1);
+            assert_eq!(s.dwell.as_ref().map(|d| (d.stop, d.planned)), Some((7, planned)));
+            let mut t = 100.0;
+            while s.dwell_done.is_none() && t < 400.0 {
+                if t < hold_until {
+                    s.hold(Some(7), 2.5);
+                }
+                s.step(&mut st, &mut v, &ctx_on(&net, &[], t, 0.0));
+                t += 0.1;
+            }
+            let d = s.dwell_done.take().expect("it pulls away");
+            if hold_until.is_finite() {
+                assert!(!d.at_cap && (d.closed - planned).abs() < 0.3, "{d:?}");
+            } else {
+                assert!(d.at_cap && (d.closed - BOARDING_MAX).abs() < 0.3, "{d:?}");
+            }
+            assert!(d.left >= d.closed);
+        }
     }
 
     /// The through lanes are the lanes the traffic drives, not those of a
