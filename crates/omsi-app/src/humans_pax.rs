@@ -28,7 +28,8 @@
 //! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch` on the person's bus, the
 //!   player's or a timetable bus, `Humans::ask_stop`), to the nearest exit, 0.7 m short of
 //!   it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus stands at a
-//!   stop - and on along the pavement as a pedestrian.
+//!   stop - and on along the pavement as a pedestrian. With no exit open but an entry open,
+//!   by the nearest open entry (`leave_by_entry`).
 //! * `WalkingToBusstop` (6): back to a waiting place of the stop, then waiting again.
 //!
 //! People do not avoid each other: somebody within 0.6 m in front stops them (sub_626860),
@@ -38,9 +39,10 @@ use super::*;
 
 // [ROLLBACK seatpick-69]
 /// From this age on a passenger counts as elderly: tries to sit, gets a seat given up.
-/// [ROLLBACK doorwait-82] How long (s) somebody waits for their own exit to open while another
-/// one is open already, before they go to the open one: a rear door of an articulated bus opens
-/// a little after the front ones, and they ran forward to the front door at once.
+/// How long (s) somebody on the way out waits for their own exit to open while another door
+/// (an exit, or an entry when no exit is open) is open already, before they go to the open one:
+/// a rear door opens a little after the front ones, and they ran forward to the front door at
+/// once.
 const DOOR_PATIENCE: f32 = 12.0;
 const ELDERLY_AGE: f32 = 65.0;
 /// Seconds before a passenger who changed places changes again.
@@ -383,8 +385,8 @@ pub(super) struct Pax {
     /// [ROLLBACK party-70] The party travelling together (0: alone) and how many it was made of.
     pub party: u32,
     pub party_n: u8,
-    /// [ROLLBACK doorwait-82] Seconds at a stop that the exit they walk to has been shut while
-    /// another was open (see `DOOR_PATIENCE`).
+    /// Seconds at a stop that the door they walk to has been shut while another was open (see
+    /// `DOOR_PATIENCE`).
     pub shut_wait: f32,
     pub km_start: f64,
     /// Drawn once per passenger: where between departure and the approach they ask
@@ -404,6 +406,8 @@ pub(super) struct Pax {
     pub sub: u8,
     /// The entry or exit asked for (+0x640).
     pub door: Option<usize>,
+    /// On the way out, `door` is an entry (no exit was open; see `leave_by_entry`), not an exit.
+    pub door_entry: bool,
     /// The validator they stamp at (an index into the cabin's: a bus may have several).
     pub stamper: Option<usize>,
     /// `HeightOfSeat` (+0x648) and `PAX_State` (+0x64c: 0 stand, 1 walk, 2 sit).
@@ -489,6 +493,7 @@ impl Pax {
             bad_change: false,
             sub: 0,
             door: None,
+            door_entry: false,
             stamper: None,
             seat_h: 0.0,
             pax_state: 0.0,
@@ -961,6 +966,12 @@ pub(super) fn holds_bus(x: &Pax, bus: BusId) -> Option<Option<i64>> {
         Task::WalkingToBus => Some(x.stop),
         _ => None,
     }
+}
+
+/// A rider on the way out leaves by an entry: no exit of theirs is open and an entry is
+/// (`exit_open` / `entry_open`: the doors of the sections they are in, open or opening).
+pub(super) fn leave_by_entry(exit_open: &[bool], entry_open: &[bool]) -> bool {
+    !exit_open.iter().any(|o| *o) && entry_open.iter().any(|o| *o)
 }
 
 /// sub_7f3a24: the distance with the height difference weighed by `w` (5 everywhere).
@@ -2374,6 +2385,7 @@ impl Humans {
                 p.door = p
                     .pt_target
                     .and_then(|t| exits.iter().position(|e| *e == Some(t)));
+                p.door_entry = false;
                 if let Some(d) = p.door {
                     if let Some((_, x)) = self.pax_req.get_mut(&bn.id) {
                         if let Some(r) = x.get_mut(d) {
@@ -2961,7 +2973,7 @@ impl Humans {
         }
         let door_open = p
             .door
-            .map(|d| bn.exit_open.get(d).copied().unwrap_or(false))
+            .map(|d| if p.door_entry { &bn.entry_open } else { &bn.exit_open }.get(d).copied().unwrap_or(false))
             .unwrap_or(false);
         let may_leave = door_open && (reg.next.is_some() || p.complaint == 3);
         self.pax_mut(i).unwrap().short = !may_leave;
@@ -2981,38 +2993,50 @@ impl Humans {
                 // to it - the people coming down from the upper deck never got off the stairs.
                 self.pax_mut(i).unwrap().timer = 1.0;
                 let all = bn.cabin.all_points();
-                // [ROLLBACK doorwait-66] an exit that is opening counts as open
-                let moving = self
+                // an entry that is opening counts as open (`door_moving`: the entries only;
+                // an exit counts once its script flags it open)
+                let opening = self
                     .door_moving
                     .get(&bn.id)
-                    .map(|m| m.1.clone())
+                    .map(|m| m.0.clone())
                     .unwrap_or_default();
                 let pp = self.pax_mut(i).unwrap();
                 let here = pp.pos.as_vec3();
-                // (the exits of the sections they are in)
+                // (the doors of the sections they are in)
                 let group = bn.cabin.group_at(
                     pp.pt
                         .or_else(|| bn.cabin.omsi_nearest(here, &all, false, false, None, None)),
                 );
                 let exits = bn.cabin.in_group(bn.cabin.exit_points(), group);
-                let open: Vec<bool> = (0..exits.len())
+                let entries = bn.cabin.in_group(bn.cabin.entry_points(), group);
+                let exit_open: Vec<bool> = (0..exits.len())
+                    .map(|k| exits[k].is_some() && bn.exit_open.get(k).copied().unwrap_or(false))
+                    .collect();
+                let entry_open: Vec<bool> = (0..entries.len())
                     .map(|k| {
-                        bn.exit_open.get(k).copied().unwrap_or(false)
-                            || moving.get(k).copied().unwrap_or(false)
+                        entries[k].is_some()
+                            && (bn.entry_open.get(k).copied().unwrap_or(false)
+                                || opening.get(k).copied().unwrap_or(false))
                     })
                     .collect();
-                // [ROLLBACK doorwait-82] With no exit open nobody is sent anywhere: the nearest
-                // exit stays theirs (the search gave the first of the list when none was open -
-                // the front door - and everybody ran to it, from the rear doors of an
-                // articulated bus too). And whoever's own exit is shut while another is open
-                // waits a while for it to open (`DOOR_PATIENCE`) before going to the open one.
-                let any_open = open
-                    .iter()
-                    .zip(exits.iter())
-                    .any(|(o, e)| *o && e.is_some());
-                let own_shut = p
-                    .door
-                    .is_some_and(|d| !open.get(d).copied().unwrap_or(true));
+                // The exits as Omsi.exe has them (0x62d6b1 passes the exits' open states,
+                // +0x6e0: a shut one is skipped); with no exit open but an entry open, the open
+                // entries: a rider leaves through a door that is open (SUMO: persons alight
+                // through the vehicle's doors, docs/tmp/sumo.md 6.2), never waits for good at
+                // one that stays shut (a bus type whose script opens no exit for the AI).
+                let by_entry = leave_by_entry(&exit_open, &entry_open);
+                let (doors, open) = if by_entry { (&entries, &entry_open) } else { (&exits, &exit_open) };
+                // With no door open nobody is sent anywhere: the nearest exit stays theirs (the
+                // search gave the first of the list when none was open - the front door - and
+                // everybody ran to it, from the rear doors of an articulated bus too). Whoever's
+                // own door is shut while another is open waits a while for it to open
+                // (`DOOR_PATIENCE`: a rear door opens a little after the front ones) before
+                // going to the open one.
+                let any_open = open.iter().any(|o| *o);
+                let own_open = p.door.map(|d| {
+                    if p.door_entry { entry_open.get(d) } else { exit_open.get(d) }.copied().unwrap_or(true)
+                });
+                let own_shut = own_open == Some(false);
                 let patient = own_shut && any_open && pp.shut_wait < DOOR_PATIENCE;
                 if patient {
                     // (their door is asked for below as before)
@@ -3020,7 +3044,7 @@ impl Humans {
                 } else {
                     let target = bn.cabin.omsi_nearest(
                         here,
-                        &exits,
+                        doors,
                         false,
                         false,
                         None,
@@ -3034,12 +3058,12 @@ impl Humans {
                         && target.is_some()
                         && (target == pp.pt || target == pp.pt_target)
                     {
-                        // [ROLLBACK exitstay-95] already standing at that exit's point: they stay
-                        // (nearest to where they stood was the point before it at times, and
-                        // they walked back to it and round to the point they had left)
+                        // already standing at that door's point: they stay (nearest to where
+                        // they stood was the point before it at times, and they walked back
+                        // to it and round to the point they had left)
                         pp.pt_target = target;
                     } else if target != pp.pt_target || pp.st != 7 {
-                        // [ROLLBACK exitstay-95] from the point they stand at, when they stand at one
+                        // from the point they stand at, when they stand at one
                         pp.pt = if pp.st == 7 && pp.pt.is_some() {
                             pp.pt
                         } else {
@@ -3050,11 +3074,13 @@ impl Humans {
                     }
                     pp.door = pp
                         .pt_target
-                        .and_then(|t| exits.iter().position(|e| *e == Some(t)));
+                        .and_then(|t| doors.iter().position(|e| *e == Some(t)));
+                    pp.door_entry = by_entry && pp.door.is_some();
                 }
             }
             self.ask_stop(bn.id);
-            if let Some(d) = self.pax(i).unwrap().door {
+            // (their exit asked for; an entry they leave by is open already)
+            if let Some(d) = self.pax(i).unwrap().door.filter(|_| !self.pax(i).unwrap().door_entry) {
                 if let Some((_, x)) = self.pax_req.get_mut(&b) {
                     if let Some(r) = x.get_mut(d) {
                         *r = true;
@@ -3085,7 +3111,7 @@ impl Humans {
         // [ROLLBACK stepout-70] straight away from the bus's side first (1.8 m), whatever the
         // pavement's path does: just off, they stood up to eight seconds - the standing bus
         // was "in the way" of the first step along its side
-        if let Some(d) = p.door.and_then(|d| bn.cabin.exits.get(d)) {
+        if let Some(d) = p.door.and_then(|d| if p.door_entry { &bn.cabin.entries } else { &bn.cabin.exits }.get(d)) {
             if matches!(self.people[i].state, State::Strolling(_)) {
                 let dir = (d.outside - d.inside).truncate().normalize_or_zero();
                 if dir != glam::Vec2::ZERO {
@@ -3572,6 +3598,17 @@ mod tests {
         assert_eq!(holds_bus(&x, bus), Some(None));
         x.task = Task::SittingInBus;
         assert_eq!(holds_bus(&x, bus), None);
+    }
+
+    /// A rider leaves by an open exit when there is one, by an open entry when no exit is
+    /// open (the AI branch of a door script that opens the front doors only), and is sent
+    /// nowhere new while nothing is open.
+    #[test]
+    fn a_rider_leaves_by_an_open_door() {
+        assert!(!leave_by_entry(&[true, false], &[true, true]), "an exit is open: the exits");
+        assert!(leave_by_entry(&[false, false], &[true, false]), "only an entry is open");
+        assert!(!leave_by_entry(&[false, false], &[false, false]), "nothing open: their exit stays");
+        assert!(!leave_by_entry(&[], &[]), "a bus with no doors in their section");
     }
 
     /// Smooth driving upsets nobody; a hard stop, a fast bend and a jerky foot do, as in
