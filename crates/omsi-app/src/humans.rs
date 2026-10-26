@@ -1771,8 +1771,11 @@ impl PedWalk {
 }
 
 /// SUMO's striping model (`MSPModel_Striping`): a crossing is cut lengthwise into stripes of
-/// `--pedestrian.striping.stripe-width` (default 0.64 m, `MSFrame.cpp`; the Simulation/Pedestrians
-/// docs page gives 0.65), `numStripes = max(1, floor(width / stripeWidth))`, and each walker
+/// `--pedestrian.striping.stripe-width`, default 0.64 m: `src/microsim/MSFrame.cpp`,
+/// `oc.doRegister("pedestrian.striping.stripe-width", new Option_Float(0.64));` (SUMO v1_24_0 line
+/// 564, the same in v1_22_0, v1_23_1 and main of 2026-10-26; the code's default is the source - the
+/// Simulation/Pedestrians docs page rounds it to 0.65), `numStripes = max(1, floor(width /
+/// stripeWidth))` (`MSPModel_Striping::numStripes`), and each walker
 /// walks one of them: the people of a crossing cross abreast in rows (HCM 2010 Eq. 19-70), not
 /// in single file.
 const STRIPE_WIDTH: f64 = 0.64;
