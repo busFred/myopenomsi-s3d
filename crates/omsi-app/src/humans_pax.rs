@@ -11,13 +11,17 @@
 //!   - within 60 m, facing the stop's way (sub_61f238) - that still rolls faster than 2 m/s,
 //!   or stands in the stop's box, sends them to the stop's gather point (task 2).
 //! * task 2 (no name): walking to the gather point, 0.7 m short of it. When the bus stands
-//!   (under 3 m/s) in the box, a free place in it is reserved (sub_7e910c: a random free
-//!   `[passpos]`, seat or standing place - no free place, nobody gets on), the ticket is
-//!   decided (sub_5ce4e0) and they walk to the bus (3).
+//!   (under 3 m/s) in the box and boards (a timetable bus: its doors open for people), a
+//!   free place in it is reserved (sub_7e910c: a random free `[passpos]`, seat or standing
+//!   place - no free place, nobody gets on), the ticket is decided (sub_5ce4e0) and they
+//!   walk to the bus (3).
 //! * `WalkingToBus` (3): to the nearest entry that is open or has a button (and sells
 //!   tickets when they buy one), 0.5 m outside the bus side until they are level with it;
 //!   a shut door is asked for (`PAX_Entry<n>_Req`) and waited at 0.7 m. In the doorway
-//!   they greet the driver or complain (the player's bus only) and board (4).
+//!   they greet the driver or complain (the player's bus only) and board (4). A timetable
+//!   bus that stops boarding (its doors close) before they reach the doorway leaves them at
+//!   the stop: back to the gather point (2) until it has gone (SUMO: a person who could not
+//!   board stays at the stop).
 //! * `WalkingInBusToPlace` (4): along the paths to the validator (stamping for a second,
 //!   `ev_Stamper`) or the cash desk (the ticket sale with the player) and on to the place
 //!   reserved. In any bus but the player's they are at their place at once.
@@ -31,6 +35,9 @@
 //!   stop - and on along the pavement as a pedestrian. With no exit open but an entry open,
 //!   by the nearest open entry (`leave_by_entry`).
 //! * `WalkingToBusstop` (6): back to a waiting place of the stop, then waiting again.
+//!
+//! A timetable bus stays at its stop while somebody passes one of its doors (`holds_bus`):
+//! a boarder walking up to it, a rider on the way out while a door is open.
 //!
 //! People do not avoid each other: somebody within 0.6 m in front stops them (sub_626860),
 //! a person facing them makes them turn aside once, and that is all.
@@ -954,16 +961,21 @@ pub(super) fn build_routes(n: usize, links: &[(i32, i32, bool)]) -> Vec<Vec<Rout
     adj
 }
 
-/// Whether passenger `x` keeps timetable bus `bus` at its stop (Omsi.exe 0x7d9e8b): on the
-/// way out of it (`Some(None)`, at whatever stop), or walking up to its doors from stop `s`
-/// (`Some(Some(s))`: only while the bus serves that stop). Anybody else, not.
-pub(super) fn holds_bus(x: &Pax, bus: BusId) -> Option<Option<i64>> {
+/// Whether passenger `x` keeps timetable bus `bus` at its stop (Omsi.exe 0x7d9e8b) while
+/// they pass one of its doors (SUMO: the stop lasts while persons board or alight,
+/// docs/tmp/sumo.md 6.2-6.3): on the way out of it while it has a door open
+/// (`doors_open`; `Some(None)`, at whatever stop - walking to the door, or at their own door
+/// that opens a little after the others, `DOOR_PATIENCE`), or walking up to its doors from
+/// stop `s` (`Some(Some(s))`: only while the bus serves that stop), not standing at a shut
+/// door. With no door open nobody passes one: nobody holds it. Anybody else, not.
+pub(super) fn holds_bus(x: &Pax, bus: BusId, doors_open: bool) -> Option<Option<i64>> {
     if x.bus != Some(bus) {
         return None;
     }
     match x.task {
-        Task::InBusToExit if x.inside == Some(bus) => Some(None),
-        Task::WalkingToBus => Some(x.stop),
+        Task::InBusToExit if x.inside == Some(bus) && doors_open => Some(None),
+        // (st 2: standing short of a shut entry)
+        Task::WalkingToBus if x.st != 2 => Some(x.stop),
         _ => None,
     }
 }
@@ -1772,11 +1784,10 @@ impl Humans {
             }
         }
         // timetable buses wait while people still get on or off (0x7d9e8b - 0x7d9f5e):
-        // somebody of this bus walking in it to an exit, or walking up to its doors from
-        // the stop the bus serves - the traffic checks the stop (`hold_boarding`). People
-        // still on their way to the gather point do not hold it: they walk up to the doors
-        // as soon as the bus has a place for them, and with the bus full they stood there
-        // and kept it at the stop with its doors open for good (#767)
+        // somebody of this bus on the way out while it has a door open, or walking up to its
+        // doors from the stop the bus serves - the traffic checks the stop (`hold_boarding`) -
+        // not standing at a shut door (`holds_bus`). People at the gather point do not hold
+        // it: with the bus full they stood there and kept it at the stop for good (#767)
         for bn in buses {
             let BusId::Ai(id) = bn.id else { continue };
             if bn.speed.abs() > 0.5 {
@@ -1784,9 +1795,10 @@ impl Humans {
             }
             let mut any_exit = false;
             let mut stops: Vec<i64> = Vec::new();
+            let doors_open = bn.entry_open.iter().chain(&bn.exit_open).any(|o| *o);
             for p in &self.people {
                 let State::Pax(x) = &p.state else { continue };
-                match holds_bus(x, bn.id) {
+                match holds_bus(x, bn.id, doors_open) {
                     Some(None) => any_exit = true,
                     Some(Some(s)) if !stops.contains(&s) => stops.push(s),
                     _ => {}
@@ -2665,7 +2677,8 @@ impl Humans {
             Task::ToBus => {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
-                    if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
+                    // (a timetable bus once its doors open for people: `BusNow::boards`)
+                    if bn.speed.abs() < 3.0 && bn.boards && self.in_stop_box(stop, bn.id) {
                         if let Some(k) = self.choose_place(i, bn) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self
@@ -2827,7 +2840,10 @@ impl Humans {
             return;
         }
         let stop = p.stop;
+        // on while the bus stands in the stop's box and boards; somebody in the doorway
+        // (st 3) steps in as its doors begin to close
         let ok = bn.speed.abs() < 3.0
+            && (bn.boards || p.st == 3)
             && stop.is_some_and(|s| self.in_stop_box(s, bn.id))
             && !bn.cabin.graph.points.is_empty();
         if ok {
@@ -2852,12 +2868,15 @@ impl Humans {
             self.set_task(i, Task::InBusToPlace, buses, bus_ix, world);
             return;
         }
-        // the bus pulls away again: the place is given back
+        // the bus pulls away again, or boards no longer (its doors close): the place is given
+        // back and they are at the stop again, at its gather point until it has gone, then at
+        // a waiting place for the next bus (SUMO: a person who could not board stays at the
+        // stop; they do not keep the bus)
         if let Some(k) = p.seat {
             self.free_seat(bn.id, k);
         }
         self.pax_mut(i).unwrap().seat = None;
-        if bn.speed.abs() >= 3.0 {
+        if bn.speed.abs() >= 3.0 || !bn.boards {
             self.set_task(i, Task::ToBus, buses, bus_ix, world);
         } else {
             self.set_task(i, Task::WalkingToBusstop, buses, bus_ix, world);
@@ -3587,17 +3606,40 @@ mod tests {
         x.bus = Some(bus);
         x.stop = Some(42);
         x.task = Task::ToBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
         x.task = Task::WaitingForBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
         x.task = Task::WalkingToBus;
-        assert_eq!(holds_bus(&x, bus), Some(Some(42)));
-        assert_eq!(holds_bus(&x, BusId::Ai(8)), None);
+        x.st = 1;
+        assert_eq!(holds_bus(&x, bus, true), Some(Some(42)));
+        assert_eq!(holds_bus(&x, BusId::Ai(8), true), None);
         x.task = Task::InBusToExit;
         x.inside = Some(bus);
-        assert_eq!(holds_bus(&x, bus), Some(None));
+        assert_eq!(holds_bus(&x, bus, true), Some(None));
         x.task = Task::SittingInBus;
-        assert_eq!(holds_bus(&x, bus), None);
+        assert_eq!(holds_bus(&x, bus, true), None);
+    }
+
+    /// Nobody standing at a shut door keeps a timetable bus: a boarder short of a shut entry
+    /// does not, a rider on the way out of a bus with no door open does not (#3127 at
+    /// Jiangzhaikou stood to the 120 s cap for riders at a shut rear door); a rider on the
+    /// way out while a door is open does (walking to it, or waiting for their own).
+    #[test]
+    fn nobody_at_a_shut_door_keeps_the_bus() {
+        let bus = BusId::Ai(7);
+        let mut x = Pax::new(1.1, 0.5);
+        x.bus = Some(bus);
+        x.stop = Some(42);
+        x.task = Task::WalkingToBus;
+        x.st = 2;
+        assert_eq!(holds_bus(&x, bus, true), None, "standing short of a shut entry");
+        x.st = 3;
+        assert_eq!(holds_bus(&x, bus, true), Some(Some(42)), "in the doorway");
+        x.task = Task::InBusToExit;
+        x.inside = Some(bus);
+        x.st = 7;
+        assert_eq!(holds_bus(&x, bus, false), None, "no door open: nobody passes one");
+        assert_eq!(holds_bus(&x, bus, true), Some(None));
     }
 
     /// A rider leaves by an open exit when there is one, by an open entry when no exit is

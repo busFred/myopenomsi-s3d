@@ -1401,6 +1401,10 @@ struct BusNow {
     speed: f64,
     entry_open: Vec<bool>,
     exit_open: Vec<bool>,
+    /// It takes people on now: a timetable bus while it boards at its stop (its doors open
+    /// for people, `BusService::at_station`); any other bus always (the player's and the
+    /// others' doors are their drivers').
+    boards: bool,
     /// The doors a walker may use (another player's bus: its doors as they are, while
     /// `entry_open` stays shut for the passengers here); None: as `entry_open`/`exit_open`.
     walk_open: Option<(Vec<bool>, Vec<bool>)>,
@@ -6568,6 +6572,7 @@ impl Humans {
                 speed,
                 entry_open,
                 exit_open,
+                boards: true,
                 interior: b.interior_light(),
                 air: CabinAir::of(b),
                 half,
@@ -6663,6 +6668,7 @@ impl Humans {
                     speed,
                     entry_open,
                     exit_open,
+                    boards: c.at_station(),
                     interior: c.vehicle.interior_light(),
                     air: CabinAir::of(&c.vehicle),
                     half,
@@ -6716,6 +6722,7 @@ impl Humans {
             next_stop: None,
             entry_open: vec![false; cabin.entries.len()],
             exit_open: vec![false; cabin.exits.len()],
+            boards: true,
             walk_open: Some(walk_open),
             cabin,
             pos: v.position,
@@ -6894,6 +6901,7 @@ impl Humans {
                 next_stop: None,
                 entry_open: vec![false; cabin.entries.len()],
                 exit_open: vec![false; cabin.exits.len()],
+                boards: true,
                 walk_open: Some(walk_open),
                 cabin,
                 pos: v.position,
@@ -10003,6 +10011,7 @@ mod tests {
             speed: 0.0,
             entry_open: vec![false],
             exit_open: Vec::new(),
+            boards: true,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),
@@ -10061,6 +10070,7 @@ mod tests {
             speed: 0.0,
             entry_open: vec![true],
             exit_open: vec![true],
+            boards: true,
             walk_open: None,
             interior: 0.0,
             air: CabinAir::default(),
