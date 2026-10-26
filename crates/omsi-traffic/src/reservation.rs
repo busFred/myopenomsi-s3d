@@ -961,7 +961,9 @@ fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
 /// (`Grant::at`) where its body lies on none of its crossing meeting places, from a metre before
 /// each (`plan::refused_stop`'s waiting place, with the bands the resolver knows: a walk or a
 /// convergence moves it further back still, so this errs towards "it comes"); no `at`: held at its
-/// line or where it stands. SUMO's willPass per link: a car that waits past a link still asks for it.
+/// line or where it stands. A waiting place that lies behind its front gives it no stop (the plan
+/// lets it roll on): it does not rest short. SUMO's willPass per link: a car that waits past a
+/// link still asks for it.
 fn rests_short(js: &Junctions, claims: &[Claim], ok: usize, g: &Grant, before: f32) -> bool {
     let Some(at) = g.at else { return true };
     let o = &claims[ok];
@@ -970,13 +972,18 @@ fn rests_short(js: &Junctions, claims: &[Claim], ok: usize, g: &Grant, before: f
     // (the front's place at rest, pulled back a band at a time, as `plan::legal_before`)
     let mut p = at - 1.0;
     for _ in 0..64 {
-        if p <= before {
-            return true;
-        }
         match bands.iter().filter(|b| b.0 < p && b.1 > p - len - REST_SHORT_OF_STOP).map(|b| b.0).fold(f32::INFINITY, f32::min) {
             x if x.is_finite() => p = x,
             _ => break,
         }
+        if p <= before {
+            break;
+        }
+    }
+    // (a waiting place behind its front is none: the plan gives it no stop there and it rolls
+    // on, `plan::STOP_BEHIND_FRONT`)
+    if p < o.s + o.front - crate::plan::STOP_BEHIND_FRONT {
+        return false;
     }
     p <= before
 }

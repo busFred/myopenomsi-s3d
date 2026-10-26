@@ -1475,6 +1475,10 @@ fn hold_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f3
 /// `STOP_LINE_GAP` and a creep): `pulled_back` keeps that much more of the body out of a band
 /// (the rear would otherwise stand inside a convergence the car is stopped behind).
 pub(crate) const REST_SHORT: f32 = 1.0;
+/// A refused car whose waiting place lies more than this behind its front (m) is past it: it is
+/// given no stop there and rolls on (`plan`'s refusal stop; `reservation::rests_short` reads
+/// the same).
+pub(crate) const STOP_BEHIND_FRONT: f32 = 0.3;
 
 /// `stop` (a distance from the origin, the front's) pulled back before every band of
 /// `bands` (from, to) the body would stand in, a band at a time.
@@ -1680,7 +1684,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     out.lead = Some(behind);
                     out.lead_seen = Some(Seen::Vehicle(w));
                 }
-            } else if at > st.front - 0.3 {
+            } else if at > st.front - STOP_BEHIND_FRONT {
                 out.hold = g.hold;
                 out.wait_for = g.wait_for;
                 let w = if g.hold == Some(Hold::ExitFull) { Why::ExitFull } else { Why::Junction };
