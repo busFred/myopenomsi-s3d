@@ -4490,6 +4490,9 @@ pub struct Humans {
     pub money: Option<crate::money::Money>,
     /// A rider pressed the stop button for the next stop (the app fires the vehicle trigger `int_haltewunsch`).
     pub stop_request: bool,
+    /// The timetable buses a rider asked to stop this frame (the app fires `int_haltewunsch`
+    /// on each, as on the player's bus: `Humans::take_ai_stop_requests`).
+    ai_stop_requests: HashSet<u64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -4816,6 +4819,7 @@ impl Humans {
             change_due: None,
             money: None,
             stop_request: false,
+            ai_stop_requests: HashSet::new(),
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -7340,6 +7344,11 @@ impl Humans {
     /// Door requests for the timetable buses, for the traffic to hand to their scripts.
     pub fn take_ai_requests(&mut self) -> Vec<(u64, DoorWants)> {
         std::mem::take(&mut self.ai_requests)
+    }
+
+    /// The timetable buses whose riders asked for the next stop since the last call.
+    pub fn take_ai_stop_requests(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.ai_stop_requests)
     }
 
     /// Each timetable bus's passengers (as of the last passenger frame), for the traffic.

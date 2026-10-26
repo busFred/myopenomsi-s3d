@@ -1096,6 +1096,9 @@ pub(crate) fn run_offscreen(
                 let (alighting, waiting) = h.stop_wishes();
                 t.set_stop_wishes(alighting, waiting);
                 t.set_bus_riders(h.ai_riders());
+                for id in h.take_ai_stop_requests() {
+                    t.stop_request(id);
+                }
                 for (id, stop, secs) in h.take_holds() {
                     t.hold_boarding(id, stop, secs);
                 }

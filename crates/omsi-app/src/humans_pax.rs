@@ -25,9 +25,10 @@
 //!   and the approach, independently of the 60 m boarding range. Otherwise, until
 //!   it passed their alternative stop and drove on a random part of the way, or - with
 //!   no destination - it drove 1..20 km; a bus at its terminus empties.
-//! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch`), to the nearest exit, 0.7
-//!   m short of it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus
-//!   stands at a stop - and on along the pavement as a pedestrian.
+//! * `WalkingInBusToExit` (5): stop request (`int_haltewunsch` on the person's bus, the
+//!   player's or a timetable bus, `Humans::ask_stop`), to the nearest exit, 0.7 m short of
+//!   it while it is shut (`PAX_Exit<n>_Req`), out when it is open and the bus stands at a
+//!   stop - and on along the pavement as a pedestrian.
 //! * `WalkingToBusstop` (6): back to a waiting place of the stop, then waiting again.
 //!
 //! People do not avoid each other: somebody within 0.6 m in front stops them (sub_626860),
@@ -2348,9 +2349,7 @@ impl Humans {
                     return;
                 };
                 // the stop button
-                if bn.id == BusId::Player {
-                    self.stop_request = true;
-                }
+                self.ask_stop(bn.id);
                 let seat = self.pax(i).unwrap().seat;
                 let all = bn.cabin.all_points();
                 let from = seat
@@ -2926,6 +2925,21 @@ impl Humans {
         }
     }
 
+    /// A rider's stop request (sub_62e42c fires the trigger `int_haltewunsch` on the
+    /// person's bus, whoever drives it): the player's bus through `stop_request`, a timetable
+    /// bus through `ai_stop_requests`. The stock AI door scripts (WG120FK `door.osc`, BJ6123 and
+    /// BJ6180 `door-6.osc`) open the rear doors at a stop only with `haltewunsch` set, which
+    /// that trigger sets; the MAN D92 has no such trigger and raises it from the exit requests
+    /// (`PAX_Exit<i>_Req`, written every frame from `pax_req`).
+    pub(super) fn ask_stop(&mut self, bus: BusId) {
+        match bus {
+            BusId::Player => self.stop_request = true,
+            BusId::Ai(id) => {
+                self.ai_stop_requests.insert(id);
+            }
+        }
+    }
+
     /// Task 5 (case 5): to the exit, out.
     pub(super) fn task_to_exit(
         &mut self,
@@ -2954,9 +2968,7 @@ impl Humans {
         let out = p.st == 7 && bn.speed.abs() < 1.0 && may_leave;
         if !out {
             if reg.next.is_none() {
-                if bn.id == BusId::Player {
-                    self.stop_request = true;
-                }
+                self.ask_stop(bn.id);
                 return;
             }
             if p.timer < 0.0 {
@@ -3041,9 +3053,7 @@ impl Humans {
                         .and_then(|t| exits.iter().position(|e| *e == Some(t)));
                 }
             }
-            if bn.id == BusId::Player {
-                self.stop_request = true;
-            }
+            self.ask_stop(bn.id);
             if let Some(d) = self.pax(i).unwrap().door {
                 if let Some((_, x)) = self.pax_req.get_mut(&b) {
                     if let Some(r) = x.get_mut(d) {

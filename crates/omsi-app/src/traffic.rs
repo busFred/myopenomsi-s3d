@@ -4974,9 +4974,10 @@ impl Traffic {
     }
 
     /// Tell a scheduled bus's script who wants in or out (`PAX_Entry<i>_Req`,
-    /// `PAX_Exit<i>_Req`) and who stands in its doorways (`_Busy`): the stock AI door
-    /// scripts open the rear doors only for a stop request, which comes from the exit
-    /// requests.
+    /// `PAX_Exit<i>_Req`) and who stands in its doorways (`_Busy`). The stock AI door
+    /// scripts open the rear doors only for a stop request (`haltewunsch`): the MAN D92's
+    /// raises it from these exit requests, the others' from `int_haltewunsch`
+    /// (`Traffic::stop_request`).
     pub fn set_pax_requests(&mut self, id: u64, doors: &crate::humans::DoorWants) {
         if let Some(c) = self.cars.iter_mut().find(|c| c.id == id) {
             crate::humans::Humans::write_door_requests(&mut c.vehicle, doors);
@@ -4985,6 +4986,14 @@ impl Traffic {
 
     /// Keep a scheduled bus at its stop for at least `secs` more with the doors open:
     /// passengers are still queueing at a door or stepping in.
+    /// A rider of timetable bus `id` asked for the next stop: its script's `int_haltewunsch`
+    /// (the trigger Omsi.exe fires on the person's bus, sub_62e42c).
+    pub fn stop_request(&mut self, id: u64) {
+        if let Some(c) = self.cars.iter_mut().find(|c| c.id == id) {
+            c.vehicle.trigger("int_haltewunsch");
+        }
+    }
+
     /// Each timetable bus's passengers this frame (`Humans::ai_riders`).
     pub fn set_bus_riders(&mut self, riders: &hashbrown::HashMap<u64, crate::humans::BusRiders>) {
         self.bus_riders.clone_from(riders);
