@@ -6646,8 +6646,9 @@ impl Humans {
                     continue;
                 };
                 let speed = c.ai.state.speed as f64;
-                // the stop it boards at: the one its timetable serves now (`BusService`), else
-                // the nearest stop object in reach of where it stands. A bus queued behind
+                // the stop it boards at: the one its timetable serves now (`BusService`; the
+                // nearest stop object in reach of where it stands only with no stop left in its
+                // queue). A bus queued behind
                 // another one serves where it stands, tens of metres from the pole, and its
                 // doors counted shut for the people: riders stood at its open doors to the cap
                 let boarding_stop = if c.at_station() { c.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id) } else { None };

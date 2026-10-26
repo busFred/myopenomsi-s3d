@@ -3992,8 +3992,10 @@ impl Traffic {
                 }
                 // its stand at a stop: the riders aboard as it came to rest, and the whole
                 // stand into the recording as it pulls away
-                if let Some(d) = service.dwell.as_mut().filter(|d| d.arrived == day_time) {
-                    d.aboard_arrival = riders.aboard;
+                if std::mem::take(&mut service.arrival_pending) {
+                    if let Some(d) = service.dwell.as_mut() {
+                        d.aboard_arrival = riders.aboard;
+                    }
                 }
                 if let Some(mut d) = service.dwell_done.take() {
                     d.aboard_departure = riders.aboard;
@@ -4984,8 +4986,6 @@ impl Traffic {
         }
     }
 
-    /// Keep a scheduled bus at its stop for at least `secs` more with the doors open:
-    /// passengers are still queueing at a door or stepping in.
     /// A rider of timetable bus `id` asked for the next stop: its script's `int_haltewunsch`
     /// (the trigger Omsi.exe fires on the person's bus, sub_62e42c).
     pub fn stop_request(&mut self, id: u64) {
@@ -5004,6 +5004,8 @@ impl Traffic {
         self.stop_wishes = Some((alighting, waiting));
     }
 
+    /// Keep a scheduled bus at its stop for at least `secs` more with the doors open:
+    /// passengers are still queueing at a door or stepping in.
     pub fn hold_boarding(&mut self, id: u64, stop: Option<i64>, secs: f32) {
         if let Some(c) = self.cars.iter_mut().find(|c| c.id == id) {
             if let Some(b) = c.bus.as_mut() {

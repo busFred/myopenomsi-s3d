@@ -145,6 +145,8 @@ pub struct BusService {
     /// riders and write into the recording (`Record::Dwell`).
     pub dwell: Option<omsi_traffic::record::Dwell>,
     pub dwell_done: Option<omsi_traffic::record::Dwell>,
+    /// The stand began this frame: the traffic notes the riders aboard on arrival.
+    pub arrival_pending: bool,
 }
 
 /// A bus away from its stop until its departure.
@@ -757,6 +759,7 @@ impl BusService {
             track_end: false,
             dwell: None,
             dwell_done: None,
+            arrival_pending: false,
         }
     }
 
@@ -938,6 +941,7 @@ impl BusService {
         // departure it waits for, whichever is later)
         let planned = if self.phase == Phase::Boarding { self.boarding.max(wait as f32) } else { wait as f32 };
         self.dwell = Some(omsi_traffic::record::Dwell { stop: id, arrived: ctx.day_time, planned, ..Default::default() });
+        self.arrival_pending = true;
         if ctx.debug {
             log::info!(
                 "t={:.1}: timetable bus {} at its stop, {:.0} s to its departure ({:?}) at {:?}",

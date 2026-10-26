@@ -6674,20 +6674,26 @@ mod ai_stop_request_tests {
 
     /// The AI door branches of BeijingCity's timetable buses open the rear doors at a stop
     /// only for a stop request: the WG120FK's and the BJ6123/6180's (`door.osc`,
-    /// `door-6.osc`) for the trigger `int_haltewunsch`, the MAN D92's (`door.osc`, its
-    /// automatic rear doors) for the exit request `PAX_Exit0_Req`, not the trigger.
+    /// `door-6.osc`) for the trigger `int_haltewunsch`, the MAN D92's and SD77's (`door.osc`
+    /// :275, their automatic rear doors) for the exit request `PAX_Exit0_Req`, not the
+    /// trigger. It names the buses it covered and fails when none is installed.
     #[test]
     fn the_ai_rear_doors_open_for_the_stop_request() {
+        let mut covered = Vec::new();
         for bus in ["Vehicles/BPT-WG120FK/WG120FK_RDBJ.bus", "Vehicles/BJ6180_BJC/6123.bus", "Vehicles/BJ6180_BJC/6180.bus"] {
             let Some(none) = rear_door_at_stop(bus, "none") else { continue };
             assert!(none < 0.05, "{bus}: shut without a request ({none})");
             assert!(rear_door_at_stop(bus, "trigger").unwrap() > 0.9, "{bus}: open for int_haltewunsch");
+            covered.push(bus);
         }
-        let d92 = "Vehicles/MAN_SD202/MAN_D92.bus";
-        if let Some(none) = rear_door_at_stop(d92, "none") {
-            assert!(none < 0.05, "D92: shut without a request ({none})");
-            assert!(rear_door_at_stop(d92, "trigger").unwrap() < 0.05, "D92: the trigger is not its");
-            assert!(rear_door_at_stop(d92, "req").unwrap() > 0.9, "D92: open for PAX_Exit0_Req");
+        for bus in ["Vehicles/MAN_SD202/MAN_D92.bus", "Vehicles/MAN_SD200/MAN_SD77.bus"] {
+            let Some(none) = rear_door_at_stop(bus, "none") else { continue };
+            assert!(none < 0.05, "{bus}: shut without a request ({none})");
+            assert!(rear_door_at_stop(bus, "trigger").unwrap() < 0.05, "{bus}: the trigger is not its");
+            assert!(rear_door_at_stop(bus, "req").unwrap() > 0.9, "{bus}: open for PAX_Exit0_Req");
+            covered.push(bus);
         }
+        println!("covered: {covered:?}");
+        assert!(!covered.is_empty(), "none of the buses is installed (OMSI_ROOT or ~/Game/omsi2)");
     }
 }

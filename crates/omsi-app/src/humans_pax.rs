@@ -50,7 +50,8 @@ use super::*;
 /// How long (s) somebody on the way out waits for their own exit to open while another door
 /// (an exit, or an entry when no exit is open) is open already, before they go to the open one:
 /// a rear door opens a little after the front ones, and they ran forward to the front door at
-/// once.
+/// once. The value has no measured source: it is longer than the stock scripts' lag of the
+/// rear doors (door-6.osc:372 opens them 0.6 s after the stop, then about 2 s to open).
 const DOOR_PATIENCE: f32 = 12.0;
 const ELDERLY_AGE: f32 = 65.0;
 /// Seconds before a passenger who changed places changes again.
