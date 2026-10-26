@@ -180,6 +180,15 @@ fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DV
     Along::Route([here + n * x + fd * near, here + n * x + fd * (c_d + e_d + 0.8)])
 }
 
+/// Whether the way through `points` keeps where `off_lanes` holds, tested every
+/// `FOOT_SAMPLE` along each leg of it and at its ends.
+fn way_off_lanes(points: &[DVec2], off_lanes: &dyn Fn(DVec2) -> bool) -> bool {
+    points.windows(2).all(|w| {
+        let n = ((w[1] - w[0]).length() / FOOT_SAMPLE).ceil().max(1.0) as usize;
+        (0..=n).all(|k| off_lanes(w[0] + (w[1] - w[0]) * (k as f64 / n as f64)))
+    })
+}
+
 /// How far beside a box's flank (m) a walker passes it where the usual half metre would
 /// take them into a street lane: their body (BODY_OUTSIDE).
 const PASS_BY: f64 = BODY_OUTSIDE;
@@ -355,9 +364,12 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     if route.is_none() && !no_room {
         route = near_big.iter().find_map(|b| around_box(b, here, dir));
         // (on a pavement only round it inside the path: never out over the kerb into a
-        // street lane, SUMO's stripes of the own lane)
+        // street lane, SUMO's stripes of the own lane; and, as the way along a box, off every
+        // street lane's footprint and a body from corner to corner, not at the corners only:
+        // where the want holds no corridor, at the kerb, the way round a bus pulling in led
+        // behind its end across the lane it stood in, both corners off it)
         if on_pavement {
-            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)));
+            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_off_lanes(wp, off_lanes));
         }
     }
     if let Some(wp) = route {
@@ -11847,6 +11859,33 @@ mod ped_tests {
         // the lane too close for a body beside the car: no room
         let tight = |q: DVec2| q.y > -1.2 + 1.25 + 0.28;
         assert_eq!(along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.0)), &tight), Along::NoRoom);
+    }
+
+    #[test]
+    fn p4_the_way_round_a_box_on_a_pavement_keeps_off_the_street_lanes_with_no_corridor_too() {
+        // Jiangzhaikou 3054: a walker at the kerb (their want holds no corridor) walking north
+        // into a box lying across the way, the path between street lanes past |x| = 3 (their
+        // footprints and a body); round either end of the box leads over one: no way round, they
+        // wait (the jam clock runs); with the street lanes away, round it as before
+        let across = Block { center: DVec2::new(0.0, 2.5), half: DVec2::new(1.2, 5.4), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let blocks = [across];
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let run = |off: &dyn Fn(DVec2) -> bool| {
+            let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
+            let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
+            (bw, want)
+        };
+        let (bw, want) = run(&|q: DVec2| q.x.abs() < 3.0);
+        assert!(bw.around.is_none() && want.vel == DVec2::ZERO && bw.jam > 0.0, "{bw:?} {:?}", want.vel);
+        // (Jiangzhaikou: both corners off the lane, the way between them across it - the 1 m
+        // street lane the bus stands in, along its axis y = 2.5: footprint and a body 1.53 m, the
+        // corners 2 m off it)
+        let off = |q: DVec2| (q.y - 2.5).abs() > 1.53 || q.x.abs() < 3.0;
+        let (bw, _) = run(&off);
+        assert!(bw.around.is_none(), "{bw:?}");
+        let (bw, _) = run(&|_| true);
+        assert!(bw.around.is_some(), "{bw:?}");
     }
 
     #[test]
