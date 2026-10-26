@@ -4034,6 +4034,8 @@ struct KerbArea {
     /// Its places only clear the lanes' footprints (`clear_for_waiting`): none cleared their
     /// waiter reach.
     loose: bool,
+    /// A junction's pedestrian corner (`corner_places`): the polygon the area is.
+    corner: Option<Vec<DVec2>>,
 }
 
 impl KerbArea {
@@ -4041,6 +4043,9 @@ impl KerbArea {
     /// line (half the widest path's width: the pavement between the path's axis and its edge) back
     /// to its last row.
     fn contains(&self, q: DVec2) -> bool {
+        if let Some(poly) = &self.corner {
+            return in_convex(poly, q);
+        }
         let (lo, hi, back) = self.places.iter().fold((f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |a, (p, _, off)| (a.0.min(*off), a.1.max(*off), a.2.max((self.start - *p).dot(self.fwd))));
         let lat = (q - self.start).dot(self.right);
         let depth = (self.start - q).dot(self.fwd);
@@ -4089,10 +4094,17 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
     let (_, h) = next.at(net, 0.3_f32.min(next.len()));
     let hr = h.to_radians();
     let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
-    let mut area = KerbArea { places: Vec::new(), start: on.truncate(), fwd, right, deep: 0.0, loose: false };
+    let mut area = KerbArea { places: Vec::new(), start: on.truncate(), fwd, right, deep: 0.0, loose: false, corner: None };
     // (the pavement paths meeting the crossing at the kerb: the node it is stepped onto from)
     let Some(&(na, nb)) = ped.ends.get(&next.lane) else { return area };
     let node = if next.b >= next.a { na } else { nb };
+    // (a node where only crossing pieces meet: the junction's corner, its own polygon)
+    if let Some((poly, places)) = corner_places(ped, net, lights, node).filter(|(_, p)| !p.is_empty()) {
+        area.places = places.into_iter().map(|q| (q, ((q - area.start).length() / QUEUE_ROW) as u32, (q - area.start).dot(right))).collect();
+        area.corner = Some(poly);
+        area.loose = true;
+        return area;
+    }
     let mut paths: Vec<usize> = ped.out.get(node).map(|v| v.iter().map(|(l, _)| *l).collect()).unwrap_or_default();
     paths.extend(ped.against.get(node).into_iter().flatten().copied());
     paths.retain(|&l| l != next.lane && (!core_piece(ped, net, lights, l) || off_road(ped, net, l)));
@@ -4200,6 +4212,96 @@ fn kerb_of(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, legs: &[
     (legs[first], legs[c.from..first].iter().rev().copied().collect())
 }
 
+/// The convex hull of `pts` (Andrew's monotone chain), counter-clockwise.
+fn convex_hull(mut pts: Vec<DVec2>) -> Vec<DVec2> {
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup_by(|a, b| (*a - *b).length() < 1e-6);
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: DVec2, a: DVec2, b: DVec2| (a - o).perp_dot(b - o);
+    let mut lower: Vec<DVec2> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<DVec2> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+/// The area of polygon `poly` (m^2, the shoelace formula).
+fn polygon_area(poly: &[DVec2]) -> f64 {
+    (0..poly.len()).map(|k| poly[k].perp_dot(poly[(k + 1) % poly.len()])).sum::<f64>().abs() * 0.5
+}
+
+/// Whether `q` lies inside the counter-clockwise convex polygon `poly`.
+fn in_convex(poly: &[DVec2], q: DVec2) -> bool {
+    poly.len() >= 3 && (0..poly.len()).all(|k| (poly[(k + 1) % poly.len()] - poly[k]).perp_dot(q - poly[k]) >= 0.0)
+}
+
+/// A junction's pedestrian corner (SUMO: the walking area that joins two crossings, its shape
+/// from the crossings' ends and widths, `NBNode::buildWalkingAreas`): at node `node` where only
+/// crossing pieces meet (no pavement path), the convex hull of each piece's end there, as wide as
+/// the piece. Its waiting places: a grid of `STRIPE_WIDTH` by `QUEUE_ROW` along its longest edge,
+/// inside it and off every lane's footprint and a body (`clear_for_waiting`, loose: a corner lies
+/// at the lanes), the nearest the hull's middle first, at most its area / `QUEUE_AREA_PER_PERSON`.
+fn corner_places(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, node: usize) -> Option<(Vec<DVec2>, Vec<DVec2>)> {
+    let mut lanes: Vec<usize> = ped.out.get(node).map(|v| v.iter().map(|(l, _)| *l).collect()).unwrap_or_default();
+    lanes.extend(ped.against.get(node).into_iter().flatten().copied());
+    lanes.sort_unstable();
+    lanes.dedup();
+    if lanes.is_empty() || lanes.iter().any(|&l| !core_piece(ped, net, lights, l)) {
+        return None;
+    }
+    let mut pts = Vec::new();
+    let mut z = 0.0;
+    for &l in &lanes {
+        let Some(&(a, _)) = ped.ends.get(&l) else { continue };
+        let lane = &net.lanes[l];
+        let s = if a == node { 0.0 } else { lane.length() };
+        let (p, h) = lane.at(s);
+        z = p.z;
+        let hr = (h as f64).to_radians();
+        let n = DVec2::new(hr.cos(), -hr.sin()) * (lane.width as f64 * 0.5);
+        pts.push(p.truncate() + n);
+        pts.push(p.truncate() - n);
+    }
+    let poly = convex_hull(pts);
+    let area = polygon_area(&poly);
+    let cap = (area / QUEUE_AREA_PER_PERSON).floor() as usize;
+    if poly.len() < 3 || cap == 0 {
+        return Some((poly, Vec::new()));
+    }
+    let mid = poly.iter().copied().sum::<DVec2>() / poly.len() as f64;
+    let edge = (0..poly.len()).map(|k| poly[(k + 1) % poly.len()] - poly[k]).max_by(|a, b| a.length().total_cmp(&b.length())).unwrap_or(DVec2::X).normalize_or_zero();
+    let across = edge.perp();
+    let reach = poly.iter().map(|p| (*p - mid).length()).fold(0.0, f64::max);
+    let (ni, nj) = ((reach / STRIPE_WIDTH).ceil() as i64, (reach / QUEUE_ROW).ceil() as i64);
+    let mut places: Vec<DVec2> = Vec::new();
+    for i in -ni..=ni {
+        for j in -nj..=nj {
+            let q = mid + edge * (i as f64 * STRIPE_WIDTH) + across * (j as f64 * QUEUE_ROW);
+            if in_convex(&poly, q) && clear_for_waiting(net, q.extend(z), true) {
+                places.push(q);
+            }
+        }
+    }
+    places.sort_by(|a, b| (*a - mid).length().total_cmp(&(*b - mid).length()));
+    places.truncate(cap);
+    Some((poly, places))
+}
+
 /// Whether footpath lane `l` lies off the carriageway: it cuts no street lane and its middle is
 /// outside every street lane's footprint (`on_carriageway`) - a crossing's piece at a corner or on
 /// an island, where the walking area joins two crossings.
@@ -4215,6 +4317,19 @@ fn off_road(ped: &PedNet, net: &Network, l: usize) -> bool {
 /// the walking area holds a jam; a corner with no room is not stepped towards across a street).
 fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) -> Result<(), &'static str> {
     let net = at.net;
+    let (_, fwd, _) = crossing_axis(net, walk, c);
+    let ahead_of_me = at.streams.get(&c.key).map(|v| v.iter().filter(|(id, _, vel)| *id != me.id && vel.dot(fwd) > 0.0).count()).unwrap_or(0);
+    // (a crossing ending at a junction's corner with room to wait, `corner_places`: whatever the
+    // way on, they stand there unless the next light lets them on, so the corner must have room for
+    // them and for those on the crossing before them; a corner with no room, a node in the road,
+    // is no waiting place: the light beyond decides, below)
+    if let Some((_, places)) = walk.legs.get(c.to).and_then(|l| ped.end_node(net, l)).and_then(|n| corner_places(ped, net, at.lights, n)).filter(|(_, p)| !p.is_empty()) {
+        let free = places.iter().filter(|q| at.queues.free(**q, me.id)).count();
+        if debug_pax() {
+            log::info!("t={:.1} pax #{} corner beyond crossing {}: {} places, {} free, {} on the crossing", at.time, me.id, c.key, places.len(), free, ahead_of_me);
+        }
+        return if free > ahead_of_me { Ok(()) } else { Err("the corner beyond is full") };
+    }
     let mut ahead = walk.clone();
     let Some(c2) = crossing_span(ped, net, at.lights, &mut ahead, c.to + 1) else { return Ok(()) };
     let red = c2.light.and_then(|(ctl, li)| at.lights.and_then(|t| t.light_state(ctl, li))).is_some_and(|(state, _)| !omsi_sim::traffic::TrafficLightController::allows_go(state));
@@ -4234,8 +4349,6 @@ fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) ->
     };
     // (a free place for them and for each of those on the crossing already, walking the same
     // way: they will wait there before them)
-    let (_, fwd, _) = crossing_axis(net, walk, c);
-    let ahead_of_me = at.streams.get(&c.key).map(|v| v.iter().filter(|(id, _, vel)| *id != me.id && vel.dot(fwd) > 0.0).count()).unwrap_or(0);
     let mut free = area.places.iter().filter(|(q, _, _)| at.queues.free(*q, me.id)).count();
     if free <= ahead_of_me {
         behind_places(net, at.queues, Some(area), &lead, me.id, start, &mut |_| {
@@ -13506,6 +13619,34 @@ mod ped_tests {
                 assert!((*a - *b).length() > 0.4572, "{a:?} {b:?} of {all:?}");
             }
         }
+    }
+
+    #[test]
+    fn p11_7_a_corner_of_crossing_pieces_holds_its_polygon_area_at_queueing_space() {
+        // two 3 m crossings meeting at a node with no pavement (a junction's corner): the hull of
+        // their ends is a 4.5 m^2 diamond, so at most floor(4.5 / 0.557) = 8 waiters, a stripe apart
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(-10.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 3.0));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(0.0, 10.0)], LaneKind::Sidewalk, 3.0));
+        net.lanes[0].traffic_light = Some((0, 0));
+        net.lanes[1].traffic_light = Some((0, 1));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let node = ped.ends[&0].1;
+        let (poly, places) = corner_places(&ped, &net, None, node).expect("a corner");
+        assert!((polygon_area(&poly) - 4.5).abs() < 1e-6, "{poly:?}");
+        assert!(!places.is_empty() && places.len() <= 8, "{places:?}");
+        for (i, a) in places.iter().enumerate() {
+            assert!(in_convex(&poly, *a));
+            for b in &places[i + 1..] {
+                assert!((*a - *b).length() > STRIPE_WIDTH - 1e-6);
+            }
+        }
+        // a node with a pavement path is no corner
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(-5.0, -5.0)], LaneKind::Sidewalk, 2.0));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        assert!(corner_places(&ped, &net, None, ped.ends[&0].1).is_none());
     }
 }
 
