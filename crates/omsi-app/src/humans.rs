@@ -78,6 +78,16 @@ const IN_WAY_REACH: f64 = BODY_OUTSIDE + 0.15;
 /// than once in PED_TURN_EVERY seconds.
 const TURN_BOX_REACH: f64 = 3.0;
 
+/// The points of the way ahead (m) at which a standing box is a box to be got round
+/// (`around_box`, `along_box_off`): a box further off than the last holds none of them.
+const BOX_LOOK: [f64; 3] = [0.9, 1.8, 3.0];
+
+/// The margin of the walkers' grid of the boxes (m): every box the box rule (`past_boxes`)
+/// or the turn rule may test lies within it.
+fn box_grid_margin() -> f64 {
+    IN_WAY_REACH.max(TURN_BOX_REACH).max(BOX_LOOK[BOX_LOOK.len() - 1])
+}
+
 /// Vehicles' boxes further than this (m) from every walker on the ground are left out of
 /// the crowd step (it looks `CrowdParams::sense`, 4 m, round each walker).
 const CROWD_BLOCK_REACH: f64 = 25.0;
@@ -92,7 +102,7 @@ fn around_box(b: &Block, here: DVec2, dir: DVec2) -> Option<[DVec2; 2]> {
     const MARGIN: f64 = 0.8;
     let (s, c) = (b.heading.sin(), b.heading.cos());
     let (r, f) = (DVec2::new(c, -s), DVec2::new(s, c));
-    if [0.9, 1.8, 3.0].iter().all(|t| !b.closest(here + dir * *t).1) {
+    if BOX_LOOK.iter().all(|t| !b.closest(here + dir * *t).1) {
         return None;
     }
     let d = here - b.center;
@@ -142,7 +152,7 @@ fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DV
     if f.dot(dir).abs() < 0.7 {
         return Along::Across;
     }
-    if [0.9, 1.8, 3.0].iter().all(|t| !b.closest(here + dir * *t).1) && !b.near(here + dir * 0.9, BODY_OUTSIDE + 0.15) {
+    if BOX_LOOK.iter().all(|t| !b.closest(here + dir * *t).1) && !b.near(here + dir * 0.9, BODY_OUTSIDE + 0.15) {
         return Along::Across;
     }
     // (in the box's own axes: the way along it, and across)
@@ -168,6 +178,15 @@ fn along_box_off(b: &Block, here: DVec2, dir: DVec2, corridor: Option<(DVec2, DV
     let Some(x) = sides.into_iter().chain(near_sides).find(|x| ok(*x)) else { return Along::NoRoom };
     let near = (c_d - e_d).max(0.3);
     Along::Route([here + n * x + fd * near, here + n * x + fd * (c_d + e_d + 0.8)])
+}
+
+/// Whether the way through `points` keeps where `off_lanes` holds, tested every
+/// `FOOT_SAMPLE` along each leg of it and at its ends.
+fn way_off_lanes(points: &[DVec2], off_lanes: &dyn Fn(DVec2) -> bool) -> bool {
+    points.windows(2).all(|w| {
+        let n = ((w[1] - w[0]).length() / FOOT_SAMPLE).ceil().max(1.0) as usize;
+        (0..=n).all(|k| off_lanes(w[0] + (w[1] - w[0]) * (k as f64 / n as f64)))
+    })
 }
 
 /// How far beside a box's flank (m) a walker passes it where the usual half metre would
@@ -250,7 +269,8 @@ enum BoxOutcome {
     Stuck,
 }
 
-/// A walker at `here` wanting `want` past the standing boxes (`blocks`, by `grid`; `block_car`
+/// A walker at `here` wanting `want` past the standing boxes (`blocks`, by `grid`, of margin
+/// `box_grid_margin`; `block_car`
 /// the vehicle among `cars` each is the body of): on the way round a big one already, on to its
 /// next corner; a big one along the way, beside it inside the path (`along_box`), across it,
 /// round its end (`around_box`, on a pavement only where both corners lie in the path);
@@ -318,10 +338,20 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     // one that lies along the way (a bus standing half on the pavement):
     // along its free side within the path's width; round its end it was across the
     // way, and the people paced to and fro in front of its nose (the bus held by them)
-    let big = |b: &&Block| b.vel.length() < 0.5 && b.half.max_element() >= 2.0;
+    // (the big standing boxes within the grid's margin of `here`, in the order of `blocks`:
+    // `along_box_off` and `around_box` find a way past a box only if it holds one of the points
+    // of `BOX_LOOK` ahead (within the grid's margin), so the boxes further off,
+    // which every waiting walker tested every frame, could never answer)
+    let mut near_big: Vec<&Block> = Vec::new();
+    grid.for_each_near(here, |k| {
+        let b = &blocks[k];
+        if b.vel.length() < 0.5 && b.half.max_element() >= 2.0 {
+            near_big.push(b);
+        }
+    });
     let mut no_room = false;
     let mut route = None;
-    for b in blocks.iter().filter(big) {
+    for &b in &near_big {
         match along_box_off(b, here, dir, want.corridor, if on_pavement { off_lanes } else { &|_| true }) {
             Along::Route(wp) => {
                 route = Some(wp);
@@ -332,11 +362,14 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
         }
     }
     if route.is_none() && !no_room {
-        route = blocks.iter().filter(big).find_map(|b| around_box(b, here, dir));
+        route = near_big.iter().find_map(|b| around_box(b, here, dir));
         // (on a pavement only round it inside the path: never out over the kerb into a
-        // street lane, SUMO's stripes of the own lane)
+        // street lane, SUMO's stripes of the own lane; and, as the way along a box, off every
+        // street lane's footprint and a body from corner to corner, not at the corners only:
+        // where the want holds no corridor, at the kerb, the way round a bus pulling in led
+        // behind its end across the lane it stood in, both corners off it)
         if on_pavement {
-            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)));
+            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_off_lanes(wp, off_lanes));
         }
     }
     if let Some(wp) = route {
@@ -1949,6 +1982,32 @@ fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
     }
 }
 
+/// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
+/// adult's, as `seen_from` aims at its middle 0.9 m up.
+const FIGURE_HEIGHT: f64 = 1.8;
+
+/// Whether the player could see a figure standing at `p`: in the view cone (`Eye`) and not
+/// beyond the vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its
+/// two-pixel distance and the renderer's reach, never within `NEAR_HIDE`), reckoned without
+/// the vehicles' lamps, which a person does not carry; with no viewer, `seen_from`.
+fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
+    match (eye, viewer) {
+        (Some(e), Some(v)) => {
+            let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
+            let dist = d.length();
+            dist < 3.0 || (d.dot(e.fwd) / dist > e.cos_half && !v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_HEIGHT * 0.5))
+        }
+        _ => seen_from(eye, center, p),
+    }
+}
+
+/// Whether a stroller at `p` goes: out of the player's sight (`figure_in_sight`) and out of
+/// everybody's stroll radius (`center` and the other players' `others`), because strollers are
+/// put down and counted only within it.
+fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
+    far_from(center, others, p, STROLL_RADIUS) && !figure_in_sight(eye, viewer, center, p)
+}
+
 /// Is `p` further than `r` from `center` and from every one of `others`?
 fn far_from(center: DVec3, others: &[DVec3], p: DVec3, r: f64) -> bool {
     (p - center).length() > r && others.iter().all(|c| (p - *c).length() > r)
@@ -2031,6 +2090,8 @@ struct DecideCtx<'a> {
     ped: Option<&'a PedNet>,
     streams: &'a Streams,
     eye: Option<Eye>,
+    /// The traffic's picture of the player's view (`figure_in_sight`), if any.
+    viewer: Option<crate::traffic::Viewer>,
     center: DVec3,
     lan_centers: &'a [DVec3],
     time: f64,
@@ -2049,14 +2110,11 @@ impl DecideCtx<'_> {
         }
         match &p.state {
             State::Strolling(walk) => {
-                let seen = seen_from(self.eye, self.center, p.position);
-                // (a stroller goes only once well out of everybody's range and out of sight)
-                let far = far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS * 2.0);
                 let Some(net) = net else {
                     d.gone = true;
                     return d;
                 };
-                if far && !seen {
+                if stroller_goes(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
                     d.gone = true;
                     return d;
                 }
@@ -2203,11 +2261,6 @@ const PED_DENSITY_CAP: f32 = 0.7;
 /// The narrowest a path counts as for its area (m): one body abreast (2 x BODY_OUTSIDE).
 const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
 
-/// The share of its target density a pavement the player cannot see gets: such a path
-/// only feeds the ones in sight (the user: a pedestrian the player will never see need not be
-/// spawned); each path is walked both ways at random, so half of its walkers walk towards the
-/// paths in sight it joins, the other half away from them, out of the circle.
-const PED_SOURCE_SHARE: f32 = 0.5;
 /// How far the player turns their head (degrees beyond half the field of view): a
 /// pavement within it is in sight for the density (a driver looks out of the side windows).
 const PED_HEAD_TURN: f64 = 90.0;
@@ -2235,6 +2288,125 @@ fn in_sight_reach(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
 /// times the passengers setting): the target scales with the curve, both stop at LOS D's top.
 fn stroll_density(curve: f32) -> (f32, f32) {
     ((PED_DENSITY_TARGET * curve.max(0.0)).min(PED_DENSITY_CAP), PED_DENSITY_CAP)
+}
+
+/// Where strollers are put down and how many each place wants (`stroll_targets`).
+#[derive(Debug, Clone, PartialEq)]
+struct StrollTarget {
+    lane: usize,
+    /// The lane's metres inside the circle.
+    metres: f32,
+    /// The point indices of the lane somebody is put down after (on the segment to the next).
+    ks: Vec<usize>,
+    /// The way they walk it (true: forwards); None: either, at random.
+    toward: Option<bool>,
+    /// The strollers wanted there (walking `toward`, if set).
+    want: f32,
+    /// A source (a pavement out of sight feeding one in sight), not a pavement in sight.
+    source: bool,
+}
+
+/// The strollers each pavement within the circle wants, from the pavement graph. A pavement
+/// in sight (`in_reach` at the middle of its part inside the circle) wants the target
+/// density `rho` over its area. Any other is a source only: it holds the walkers who will
+/// walk into a pavement in sight - those of its walkers heading to a junction it shares with one,
+/// put down where it leaves the sight (its first point from that junction out of `in_reach`),
+/// over the stretch from there to the junction. In the steady state each pavement in
+/// sight at a junction of `deg` pavements sends out the flow q = k v per direction (the
+/// fundamental relation; half its density `rho` walks each way, as the walkers put down there
+/// are given either way at random) across its width `w`, spread evenly over the `deg - 1`
+/// pavements on (each walker taking any of them alike at the junction); the sources bring the
+/// same flow back, so a source walker's leg leads into the pavement in sight within T = d / v of
+/// the stretch `d`, and the source holds
+/// q T = rho / 2 * w * d / (deg - 1) per pavement in sight there (the pace cancels). A pavement
+/// that leaves the sight at the junction itself wants nobody (the one in sight is put down on
+/// out of sight there); one that leads into none, nobody either: what the player cannot see
+/// and nobody walks into sight from is not spawned. `candidates`: (lane, metres inside,
+/// point indices inside) as `populate_on_foot_with` finds them; `inside` whether a point lies
+/// in the circle.
+fn stroll_targets(
+    ped: &PedNet,
+    net: &Network,
+    candidates: &[(usize, f32, Vec<usize>)],
+    in_reach: &dyn Fn(DVec3) -> bool,
+    inside: &dyn Fn(DVec3) -> bool,
+    rho: f32,
+) -> Vec<StrollTarget> {
+    let width = |l: usize| net.lanes[l].width.max(PED_PATH_MIN_WIDTH);
+    let seen: Vec<bool> = candidates.iter().map(|(l, _, ks)| in_reach(net.lanes[*l].points[ks[ks.len() / 2]])).collect();
+    // (per junction, the pavements in sight there)
+    let mut seen_at: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (c, (l, _, _)) in candidates.iter().enumerate() {
+        if let (true, Some(&(a, b))) = (seen[c], ped.ends.get(l)) {
+            seen_at.entry(a).or_default().push(*l);
+            if b != a {
+                seen_at.entry(b).or_default().push(*l);
+            }
+        }
+    }
+    let degree = |n: usize| {
+        let mut ls: Vec<usize> = ped.out.get(n).map(|o| o.iter().map(|x| x.0).collect()).unwrap_or_default();
+        ls.sort_unstable();
+        ls.dedup();
+        ls.len()
+    };
+    let mut out = Vec::new();
+    for (c, (l, m, ks)) in candidates.iter().enumerate() {
+        if seen[c] {
+            out.push(StrollTarget { lane: *l, metres: *m, ks: ks.clone(), toward: None, want: rho * m * width(*l), source: false });
+            continue;
+        }
+        let Some(&(a, b)) = ped.ends.get(l) else { continue };
+        let lane = &net.lanes[*l];
+        let last = lane.points.len() - 1;
+        for (node, toward) in [(a, false), (b, true)] {
+            if toward && b == a {
+                continue;
+            }
+            let Some(there) = seen_at.get(&node) else { continue };
+            let deg = degree(node);
+            if deg < 2 {
+                continue;
+            }
+            let feed: f32 = there.iter().filter(|s| **s != *l).map(|&s| width(s)).sum::<f32>() / (deg - 1) as f32;
+            if feed <= 0.0 {
+                continue;
+            }
+            // (from the junction along the lane: its first point out of sight)
+            let order: Vec<usize> = if toward { (0..=last).rev().collect() } else { (0..=last).collect() };
+            let Some(&k) = order.iter().find(|&&k| !in_reach(lane.points[k])) else { continue };
+            if !inside(lane.points[k]) {
+                continue;
+            }
+            let d = if toward { lane.dist[last] - lane.dist[k] } else { lane.dist[k] };
+            if d <= 0.0 {
+                continue;
+            }
+            // (put down on the segment beyond that point, away from the junction)
+            let seg = if toward { k.saturating_sub(1) } else { k.min(last.saturating_sub(1)) };
+            out.push(StrollTarget { lane: *l, metres: *m, ks: vec![seg], toward: Some(toward), want: rho / 2.0 * feed * d, source: true });
+        }
+    }
+    out
+}
+
+/// What place `t` lacks of its target: its want less the strollers on its lane (a source:
+/// those walking it its way, into sight), none when at it or over.
+fn stroll_lacks(t: &StrollTarget, on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>) -> f32 {
+    let on = match t.toward {
+        None => on_path.get(&t.lane).copied().unwrap_or(0),
+        Some(fwd) => on_way.get(&(t.lane, fwd)).copied().unwrap_or(0),
+    };
+    (t.want - on as f32).max(0.0)
+}
+
+/// What the places lack in all, and how many strollers may be put down now: no more than
+/// they lack, nor than the `target` (all the places want, within the setting and the pool)
+/// leaves over the `have` strollers within the radius - a place over its target and the
+/// strollers on pavements wanting nobody count against the total as before.
+fn stroll_room(targets: &[StrollTarget], on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>, target: usize, have: usize) -> (f32, usize) {
+    let deficit: f32 = targets.iter().map(|t| stroll_lacks(t, on_path, on_way)).sum();
+    (deficit, target.saturating_sub(have).min(deficit.ceil() as usize))
 }
 
 /// The median gap (m) for `target` strollers on `pavement_m` metres of pavement
@@ -4445,6 +4617,9 @@ pub struct Humans {
     /// Where the time of this tick went (stage, ms since the one before), for the slow
     /// ticks OMSI_PROFILE reports.
     tick_stages: Vec<(&'static str, f64)>,
+    /// With OMSI_PROFILE: the stages' sums over the frames since the last profile line, the
+    /// frames and the people summed over them.
+    stage_sums: (Vec<(&'static str, f64)>, usize, usize),
     /// Speed, heading and floor acceleration of each bus last frame (for the riders' balance).
     bus_motion: HashMap<BusId, (f64, f64, DVec2)>,
     /// `types` has been cut down to the map's `humans.txt`.
@@ -4686,6 +4861,7 @@ impl Humans {
             inside_seen: HashSet::new(),
             moved_places: HashMap::new(),
             tick_stages: Vec::new(),
+            stage_sums: (Vec::new(), 0, 0),
             bus_motion: HashMap::new(),
             map_humans_done: false,
             last_sync: 0.0,
@@ -5803,8 +5979,9 @@ impl Humans {
     ) {
         let center = self.center;
         let radius = STROLL_RADIUS * 0.9;
-        // strollers: as many as the pavements' areas hold at the hour's target density
-        // (`stroll_density`, walkway level of service), never more than the `pedestrians`
+        // strollers: as many as the areas of the pavements in sight hold at the hour's target
+        // density (`stroll_density`, walkway level of service), and on the others only those on
+        // their way into sight (`stroll_targets`), never more than the `pedestrians`
         // setting asks for (an upper bound) nor past the people pool (`ai_max_humans`; OMSI lets
         // at most half of its pool walk, 0x62463c); put down on the paths below their target.
         // The pavements are those that pass within the radius (found
@@ -5856,32 +6033,31 @@ impl Humans {
         // each path's area inside the circle (its metres there times its width, a body
         // abreast at least) and the strollers on it now (by the leg they walk)
         let area = |l: usize, m: f32| m * net.lanes[l].width.max(PED_PATH_MIN_WIDTH);
+        // (the strollers on each path now by the leg they walk, and by the way they walk it)
         let mut on_path: HashMap<usize, usize> = HashMap::new();
+        let mut on_way: HashMap<(usize, bool), usize> = HashMap::new();
         for q in &self.people {
             if let State::Strolling(w) = &q.state {
                 if let Some(leg) = w.legs.get(w.leg) {
                     *on_path.entry(leg.lane).or_default() += 1;
+                    *on_way.entry((leg.lane, leg.b >= leg.a)).or_default() += 1;
                 }
             }
         }
         let (rho, cap) = stroll_density(self.density);
-        // (each path's own target: the full density where the player can see it - in
-        // frame or within a head turn of it, `in_sight_reach` - a source share elsewhere)
+        // (each path's own target: the target density where the player can see it - in
+        // frame or within a head turn of it, `in_sight_reach` - and elsewhere only the walkers
+        // on their way into sight, `stroll_targets`)
         let eye = self.eye;
-        let share = |l: usize, ks: &[usize]| -> f32 {
-            let mid = net.lanes[l].points[ks[ks.len() / 2]];
-            if in_sight_reach(eye, center, mid) {
-                1.0
-            } else {
-                PED_SOURCE_SHARE
-            }
-        };
-        let path_target: Vec<f32> = candidates.iter().map(|(l, m, ks)| area(*l, *m) * rho * share(*l, ks)).collect();
-        let wanted: f32 = path_target.iter().sum();
-        let target = (wanted.round() as usize).min(self.pedestrians);
-        // (never past the pool)
+        let in_reach = |p: DVec3| in_sight_reach(eye, center, p);
+        let in_circle = |p: DVec3| (p - center).truncate().length() < radius;
+        let targets = stroll_targets(ped, net, &candidates, &in_reach, &in_circle, rho);
+        let lacks = stroll_lacks;
+        let wanted: f32 = targets.iter().map(|t| t.want).sum();
+        // (the setting is an upper bound, and never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
-        let target = target.min((self.max_people + strolling).saturating_sub(self.pool_used()));
+        let limit = self.pedestrians.min((self.max_people + strolling).saturating_sub(self.pool_used()));
+        let target = (wanted.round() as usize).min(limit);
         // (around this player only: whoever walked off behind the bus no longer counts
         // against the people wanted about it)
         let have = self
@@ -5889,33 +6065,32 @@ impl Humans {
             .iter()
             .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
             .count();
+        let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
         let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-        if have < target && !candidates.is_empty() {
-            // weighted by the metres inside, and by lying ahead of the player: somebody put
-            // down beside or behind a moving bus never gets in front of it, and the street
-            // ahead looked empty until the bus stopped
-            // (by what each path lacks of its target: one at it or over gets nobody)
-            let weights: Vec<f32> = candidates
+        if room > 0 && !targets.is_empty() {
+            // weighted by lying ahead of the player: somebody put down beside or behind a
+            // moving bus never gets in front of it, and the street ahead looked empty until
+            // the bus stopped
+            // (by what each place lacks of its target: one at it or over gets nobody)
+            let weights: Vec<f32> = targets
                 .iter()
-                .zip(&path_target)
-                .map(|((l, _, ks), want)| {
-                    let mid = net.lanes[*l].points[ks[ks.len() / 2]];
+                .map(|t| {
+                    let mid = net.lanes[t.lane].points[t.ks[t.ks.len() / 2]];
                     let lead = ahead
                         .map(|a| ((mid - center).truncate().normalize_or_zero().extend(0.0)).dot(a).max(0.0) as f32)
                         .unwrap_or(0.0);
-                    let lacks = (want - on_path.get(l).copied().unwrap_or(0) as f32).max(0.0);
-                    lacks * (1.0 + 2.0 * lead)
+                    lacks(t, &on_path, &on_way) * (1.0 + 2.0 * lead)
                 })
                 .collect();
             let total: f32 = weights.iter().sum();
             // (12 a second at most, the members of a group counted)
-            let per_second = (target - have).min(12);
-            for _ in 0..((target - have) * 3).min(36) {
+            let per_second = room.min(12);
+            for _ in 0..(room * 3).min(36) {
                 if placed >= per_second || total <= 0.0 {
                     break;
                 }
                 let mut x = self.rand_f() as f32 * total;
-                let mut ci = candidates.len() - 1;
+                let mut ci = targets.len() - 1;
                 for (k, w) in weights.iter().enumerate() {
                     if x < *w {
                         ci = k;
@@ -5923,10 +6098,9 @@ impl Humans {
                     }
                     x -= *w;
                 }
-                let (lane, path_m, ks) = &candidates[ci];
-                let lane = *lane;
+                let (lane, path_m, ks, toward) = (targets[ci].lane, targets[ci].metres, &targets[ci].ks, targets[ci].toward);
                 // (never past LOS D on the path, the group counted as it is put down)
-                let path_cap = (area(lane, *path_m) * cap).floor() as usize;
+                let path_cap = (area(lane, path_m) * cap).floor() as usize;
                 let l = &net.lanes[lane];
                 let k = ks[(self.rand() as usize) % ks.len()];
                 let seg = if k + 1 < l.points.len() { l.dist[k + 1] - l.dist[k] } else { 0.0 };
@@ -5946,7 +6120,9 @@ impl Humans {
                     rej_ground += 1;
                     continue;
                 }
-                let fwd = self.rand_f() < 0.5;
+                // (a source's walkers walk into sight, the others either way)
+                let either = self.rand_f() < 0.5;
+                let fwd = toward.unwrap_or(either);
                 // spaced: not within a log-normal gap of another stroller on
                 // this lane walking the same way
                 let z = self.rand_normal();
@@ -6000,6 +6176,7 @@ impl Humans {
                         self.people[i].activity = Activity::Walk;
                         placed += 1;
                         *on_path.entry(lane).or_default() += 1;
+                        *on_way.entry((lane, fwd)).or_default() += 1;
                         match leader_pace {
                             None => leader_pace = Some(self.people[i].pace),
                             Some(lp) => {
@@ -6015,10 +6192,23 @@ impl Humans {
                 }
             }
         }
-        if debug_pax() && (have < target || placed > 0) {
+        // (and every 30 s with OMSI_PROFILE: the pavement within the circle and what it asks for)
+        let profile_line = omsi_cfg::env::var_os("OMSI_PROFILE").is_some() && (self.time / 30.0).floor() != ((self.time - 1.0) / 30.0).floor();
+        if (debug_pax() && (have < target || placed > 0)) || profile_line {
+            let all_m2: f32 = candidates.iter().map(|(l, m, _)| area(*l, *m)).sum();
+            let seen_m2: f32 = targets.iter().filter(|t| !t.source).map(|t| area(t.lane, t.metres)).sum();
+            let sources: f32 = targets.iter().filter(|t| t.source).map(|t| t.want).sum();
+            // (the strollers past the radius: in sight, standing still, waiting behind a standing
+            // box with no way past (the jam clock running), looking for a path, past twice it)
+            let past: Vec<&Person> = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_) | State::Standing) && (p.position - center).length() >= STROLL_RADIUS).collect();
+            let past_seen = past.iter().filter(|p| self.seen(p.position)).count();
+            let past_still = past.iter().filter(|p| p.vel.length() < 0.1).count();
+            let past_box = past.iter().filter(|p| p.vel.length() < 0.1 && p.boxes.jam > 0.0).count();
+            let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
+            let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2 on {:.0} m2 of {:.0} m on {} paths), {placed} put down; refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
-                self.time, self.pedestrians, self.density, candidates.iter().map(|(l, m, _)| area(*l, *m)).sum::<f32>(), metres, candidates.len()
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, no figure {rej_spawn}",
+                self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len()
             );
         }
         // OMSI_PAX_CROSS=x,y: a few pedestrians sent across the signalised crossing nearest that point
@@ -7248,6 +7438,27 @@ impl Humans {
                 self.tick_stages.iter().filter(|s| s.1 >= 1.0).map(|(n, t)| format!("{n} {t:.1}")).collect::<Vec<_>>().join(", ")
             );
         }
+        // (and with OMSI_PROFILE, every 900 frames: each stage's mean, and per person)
+        if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            let sums = &mut self.stage_sums;
+            for (n, t) in &self.tick_stages {
+                match sums.0.iter_mut().find(|s| s.0 == *n) {
+                    Some(s) => s.1 += t,
+                    None => sums.0.push((n, *t)),
+                }
+            }
+            sums.1 += 1;
+            sums.2 += self.people.len();
+            if sums.1 >= 900 {
+                let (f, people) = (sums.1 as f64, sums.2 as f64 / sums.1 as f64);
+                log::info!(
+                    "humans profile over {} frames, {people:.0} people: {}",
+                    sums.1,
+                    sums.0.iter().map(|(n, t)| format!("{n} {:.2} ms ({:.2} us/person)", t / f, t / f * 1000.0 / people.max(1.0))).collect::<Vec<_>>().join(", ")
+                );
+                *sums = (Vec::new(), 0, 0);
+            }
+        }
         if omsi_cfg::env::var_os("OMSI_CHECK_WALLS").is_some() {
             self.check_walls();
         }
@@ -7444,7 +7655,7 @@ impl Humans {
             blocks.extend(bodies);
         }
         // the boxes by where they are, for the walkers' tests of the ones near them
-        let block_grid = crowd::BlockGrid::new(&blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
+        let block_grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
         // somebody waiting at a stop whose place a standing vehicle's body now covers (a
         // bus pulled into a bay over another stop's waiting places, waiters 0.1 m inside
         // its flank) steps out of it, to a body clear of
@@ -7529,6 +7740,7 @@ impl Humans {
             }
             self.streams = streams;
         }
+        stage!("ped.prep");
         // what everybody on foot wants: decided side by side from the frame's state
         // (the read phase), then taken over in index order (the apply phase); a decision that
         // needs the yields to standing vehicles, which the decisions before it in the frame
@@ -7537,7 +7749,7 @@ impl Humans {
             p.t_state += dt;
         }
         let decided: Vec<Option<Decision>> = {
-            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
             let people = &self.people;
             let cars = &cars;
             let lights = traffic.map(LightsOf::of);
@@ -7557,6 +7769,7 @@ impl Humans {
                 })
                 .collect()
         };
+        stage!("ped.decide");
         let mut wants: Vec<Want> = Vec::with_capacity(self.people.len());
         for (i, d) in decided.into_iter().enumerate() {
             let p = &self.people[i];
@@ -7568,7 +7781,7 @@ impl Humans {
                 let d = match d {
                     Some(d) => d,
                     None => {
-                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
                         ctx.decide(&self.people[i], dt, world, net, traffic.map(LightsOf::of).as_ref(), &cars, &mut YieldBook::Book(&mut self.yields))
                     }
                 };
@@ -7576,6 +7789,7 @@ impl Humans {
             };
             wants.push(w);
         }
+        stage!("ped.take");
         // a standing vehicle in the way: wait, then go round it - on a pavement only inside the
         // path () - or, jammed, squeeze past it () (`past_boxes`)
         for i in 0..self.people.len() {
@@ -7607,6 +7821,7 @@ impl Humans {
                 p.detour = p.detour.max(4.0);
             }
         }
+        stage!("ped.boxes");
         // nobody stands frozen with "go" on a crossing: released from the path's
         // corridor for a moment, the crowd takes them round what holds them (not on a
         // pavement: there they keep to the path, and the jam rule lets them on)
@@ -7642,6 +7857,7 @@ impl Humans {
             }
             p.want_dir = dir;
         }
+        stage!("ped.turns");
         // the crowd of the pavements (passengers outside stand in it as they are)
         let mut walkers: Vec<Walker> = Vec::with_capacity(self.people.len());
         let mut who: Vec<usize> = Vec::with_capacity(self.people.len());
@@ -7686,8 +7902,10 @@ impl Humans {
         let near = crowd::near_any(&blocks, &places, CROWD_BLOCK_REACH);
         let near_idx: Vec<usize> = near.iter().enumerate().filter(|(_, n)| **n).map(|(k, _)| k).collect();
         let near_blocks: Vec<Block> = near_idx.iter().map(|&k| blocks[k]).collect();
+        stage!("ped.walkers");
         let mut g = walkers.clone();
         crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
+        stage!("ped.crowd");
         // (the gate's counts: jammed strollers, and anybody inside a moving vehicle's box)
         {
             let moving: Vec<(Block, Option<u64>)> = near_blocks.iter().zip(&near_idx).filter(|(b, _)| b.vel.length() >= 0.5).map(|(b, &k)| (*b, block_car[k].map(|c| cars[c].id))).collect();
@@ -7724,6 +7942,7 @@ impl Humans {
                 }
             }
         }
+        stage!("ped.count");
         let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
         let mut moved = vec![false; self.people.len()];
         for (k, w) in ground {
@@ -7744,6 +7963,7 @@ impl Humans {
                 self.carry(i, dt, &buses, &bus_ix, wants[i].face);
             }
         }
+        stage!("ped.apply");
         self.animate(dt, world, &buses, &bus_ix);
         remove.sort_unstable();
         remove.dedup();
@@ -7756,7 +7976,7 @@ impl Humans {
             self.retire(&p);
         }
         self.give_ticket = false;
-        stage!("pedestrians");
+        stage!("ped.animate");
         taken_ticket
     }
 
@@ -10989,6 +11209,104 @@ mod ped_tests {
     }
 
     #[test]
+    fn p3c_a_pavement_out_of_sight_holds_only_the_walkers_on_their_way_into_sight() {
+        // a T at the origin: A from the west (x -100..0), B to the east, C to the south, all
+        // 2.5 m wide, points every 10 m; a path D far off, E on from A's west end; the player
+        // sees x > -30
+        let mut net = Network::default();
+        let line = |a: (f64, f64), b: (f64, f64)| (0..=10).map(|k| p(a.0 + (b.0 - a.0) * k as f64 / 10.0, a.1 + (b.1 - a.1) * k as f64 / 10.0)).collect::<Vec<_>>();
+        net.lanes.push(lane(line((-100.0, 0.0), (0.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((0.0, 0.0), (100.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((0.0, 0.0), (0.0, -100.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((-100.0, 300.0), (0.0, 300.0)), LaneKind::Sidewalk, 2.5));
+        net.lanes.push(lane(line((-200.0, 0.0), (-100.0, 0.0)), LaneKind::Sidewalk, 2.5));
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let all: Vec<(usize, f32, Vec<usize>)> = (0..5).map(|l| (l, 100.0, (0..=10).collect())).collect();
+        let in_reach = |q: DVec3| q.x > -30.0 && q.y < 200.0;
+        let rho = 0.3;
+        let t = stroll_targets(&ped, &net, &all, &in_reach, &|_| true, rho);
+        // B and C in sight: their area at the target density, either way
+        for l in [1, 2] {
+            let x = t.iter().find(|x| x.lane == l).unwrap();
+            assert!(!x.source && x.toward.is_none() && (x.want - rho * 250.0).abs() < 1e-3, "{x:?}");
+        }
+        // A: only a source, its walkers heading east into sight, put down 30 m out (where it
+        // leaves the sight), as many as walk that stretch at the flow B and C send out
+        // west: rho/2 x (2.5 + 2.5)/(3 - 1) x 30 m
+        let a: Vec<_> = t.iter().filter(|x| x.lane == 0).collect();
+        assert_eq!(a.len(), 1);
+        assert!(a[0].source && a[0].toward == Some(true) && a[0].ks == vec![6], "{:?}", a[0]);
+        assert!((a[0].want - rho / 2.0 * 2.5 * 30.0).abs() < 1e-3, "{:?}", a[0]);
+        // far less than the half density over its area the free share gave it
+        assert!(a[0].want < 0.5 * rho * 250.0 / 2.0);
+        // D (seen by nobody, joined to nothing in sight) and E (on from A, out of sight): nobody
+        assert!(t.iter().all(|x| x.lane != 3 && x.lane != 4), "{t:?}");
+        // the junction itself out of sight: A has nothing to feed from (B is put down on out of
+        // sight there)
+        let t = stroll_targets(&ped, &net, &all, &|q: DVec3| q.x > 30.0, &|_| true, rho);
+        assert!(t.iter().all(|x| x.lane == 1), "{t:?}");
+        // a source point outside the circle: none
+        let t = stroll_targets(&ped, &net, &all, &in_reach, &|q: DVec3| q.x > -25.0, rho);
+        assert!(t.iter().all(|x| !x.source), "{t:?}");
+    }
+
+    #[test]
+    fn p3c_a_place_over_its_target_counts_against_the_total() {
+        // two pavements in sight wanting 10 each: one holds 18, the other 2 (it lacks 8); 20
+        // in the circle of 20 wanted: nobody is put down though one lacks; with 4 more on a
+        // pavement wanting nobody, still nobody; with 14 in the circle, 6 (not the 8 it lacks)
+        let place = |lane: usize| StrollTarget { lane, metres: 10.0, ks: vec![0], toward: None, want: 10.0, source: false };
+        let targets = [place(1), place(2)];
+        let on_path: HashMap<usize, usize> = [(1, 18), (2, 2)].into_iter().collect();
+        let on_way = HashMap::new();
+        let (deficit, room) = stroll_room(&targets, &on_path, &on_way, 20, 20);
+        assert_eq!((deficit, room), (8.0, 0));
+        assert_eq!(stroll_room(&targets, &on_path, &on_way, 20, 24).1, 0);
+        assert_eq!(stroll_room(&targets, &on_path, &on_way, 20, 14).1, 6);
+        // a source counts the walkers heading its way only
+        let src = StrollTarget { toward: Some(true), want: 3.0, source: true, ..place(3) };
+        let on_way: HashMap<(usize, bool), usize> = [((3, false), 5), ((3, true), 1)].into_iter().collect();
+        assert_eq!(stroll_lacks(&src, &HashMap::new(), &on_way), 2.0);
+    }
+
+    #[test]
+    fn p3c_a_stroller_goes_out_of_sight_past_the_stroll_radius() {
+        // looking north from the origin: behind the player past the radius, gone; in sight past
+        // it, kept; within it, kept; near another player, kept
+        let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
+        let behind = DVec3::new(0.0, -(STROLL_RADIUS + 5.0), 0.0);
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], behind));
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0)), "short of twice the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0)), "in sight");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0)), "within the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind), "near another player");
+        // with the traffic's picture (900 lines, 60 degrees: a 1.8 m figure is two pixels at
+        // 1.8 x 900 / (2 x 2 tan 30) = 701 m): in frame at 300 m, kept; at 800 m, gone; behind
+        // at 300 m, gone; the vehicles' lamps lit change nothing for a person
+        let v = crate::traffic::Viewer {
+            pos: DVec3::ZERO,
+            forward: DVec3::Y,
+            tan_x: (30f64).to_radians().tan() * 16.0 / 9.0,
+            tan_y: (30f64).to_radians().tan(),
+            range: 5000.0,
+            min_size: 0.0,
+            max_dist: 0.0,
+            fov: (60f64).to_radians(),
+            px_height: 900.0,
+            horizon_fov: 0.0,
+            lamps_lit: false,
+        };
+        let ahead = |d: f64| DVec3::new(0.0, d, 0.0);
+        assert!(!stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(300.0)), "in frame at 300 m");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(800.0)), "past the horizon");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(-300.0)), "behind");
+        let lit = v.with_lamps(true);
+        assert!(stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(800.0)), "lamps lit");
+        assert!(!stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(300.0)));
+    }
+
+    #[test]
     fn p3b_pavements_in_frame_or_a_head_turn_away_are_in_sight_those_behind_are_not() {
         let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
         let at = |deg: f64, d: f64| DVec3::new(d * deg.to_radians().sin(), d * deg.to_radians().cos(), 0.0);
@@ -10996,7 +11314,6 @@ mod ped_tests {
         assert!(in_sight_reach(Some(e), DVec3::ZERO, at(110.0, 50.0)), "beside, a head turn away");
         assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(170.0, 50.0)), "behind");
         assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(0.0, PEOPLE_SIGHT + 10.0)), "beyond sight");
-        assert!(PED_SOURCE_SHARE > 0.0 && PED_SOURCE_SHARE < 1.0);
     }
 
     #[test]
@@ -11558,7 +11875,7 @@ mod ped_tests {
     /// the walker's positions, moved by what `past_boxes` leaves them and held to the corridor
     /// as the crowd step holds them (widened by ALONG_FIT on a way past a box).
     fn walk_past(from: DVec2, blocks: &[Block], block_car: &[Option<usize>], cars: &[SeenCar], frames: usize) -> Vec<DVec2> {
-        let grid = crowd::BlockGrid::new(blocks, IN_WAY_REACH.max(TURN_BOX_REACH), crowd::BLOCK_CELL);
+        let grid = crowd::BlockGrid::new(blocks, box_grid_margin(), crowd::BLOCK_CELL);
         let (mut bw, mut detour, mut pos) = (BoxWait::default(), 0.0f32, from);
         let corridor = Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 0.75));
         let mut out = Vec::new();
@@ -11618,6 +11935,33 @@ mod ped_tests {
         // the lane too close for a body beside the car: no room
         let tight = |q: DVec2| q.y > -1.2 + 1.25 + 0.28;
         assert_eq!(along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.0)), &tight), Along::NoRoom);
+    }
+
+    #[test]
+    fn p4_the_way_round_a_box_on_a_pavement_keeps_off_the_street_lanes_with_no_corridor_too() {
+        // Jiangzhaikou 3054: a walker at the kerb (their want holds no corridor) walking north
+        // into a box lying across the way, the path between street lanes past |x| = 3 (their
+        // footprints and a body); round either end of the box leads over one: no way round, they
+        // wait (the jam clock runs); with the street lanes away, round it as before
+        let across = Block { center: DVec2::new(0.0, 2.5), half: DVec2::new(1.2, 5.4), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let blocks = [across];
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let run = |off: &dyn Fn(DVec2) -> bool| {
+            let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
+            let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
+            (bw, want)
+        };
+        let (bw, want) = run(&|q: DVec2| q.x.abs() < 3.0);
+        assert!(bw.around.is_none() && want.vel == DVec2::ZERO && bw.jam > 0.0, "{bw:?} {:?}", want.vel);
+        // (Jiangzhaikou: both corners off the lane, the way between them across it - the 1 m
+        // street lane the bus stands in, along its axis y = 2.5: footprint and a body 1.53 m, the
+        // corners 2 m off it)
+        let off = |q: DVec2| (q.y - 2.5).abs() > 1.53 || q.x.abs() < 3.0;
+        let (bw, _) = run(&off);
+        assert!(bw.around.is_none(), "{bw:?}");
+        let (bw, _) = run(&|_| true);
+        assert!(bw.around.is_some(), "{bw:?}");
     }
 
     #[test]
