@@ -2313,9 +2313,11 @@ struct StrollTarget {
 /// put down where it leaves the sight (its first point from that junction out of `in_reach`),
 /// over the stretch from there to the junction. In the steady state each pavement in
 /// sight at a junction of `deg` pavements sends out the flow q = k v per direction (the
-/// fundamental relation; half its density `rho` walks each way) across its width `w`, spread over
-/// the `deg - 1` pavements on; the sources bring the same flow back, so a source walker's leg
-/// leads into sight within T = d / v of the stretch `d`, and the source holds
+/// fundamental relation; half its density `rho` walks each way, as the walkers put down there
+/// are given either way at random) across its width `w`, spread evenly over the `deg - 1`
+/// pavements on (each walker taking any of them alike at the junction); the sources bring the
+/// same flow back, so a source walker's leg leads into the pavement in sight within T = d / v of
+/// the stretch `d`, and the source holds
 /// q T = rho / 2 * w * d / (deg - 1) per pavement in sight there (the pace cancels). A pavement
 /// that leaves the sight at the junction itself wants nobody (the one in sight is put down on
 /// out of sight there); one that leads into none, nobody either: what the player cannot see

@@ -369,8 +369,8 @@ session starts, like *People*) is the most people who stroll the
 pavements about you. How many do is what the pavements you can see (in front of you or a
 head turn away, within 180 m) hold at a walkway level of service - 0.3 people per m² at the
 map's passenger curve 1, scaled by the curve for the hour, never past 0.7 - plus the few
-walking into sight on the pavements out of it; nobody strolls where you cannot see and
-nobody walks into sight from. They come out of the AI people pool, *People (AI humans)*
+walking into sight on the pavements out of it; nobody is put down where you cannot see
+and nobody walks into sight from. They come out of the AI people pool, *People (AI humans)*
 (`ai_max_humans`, the second line of OMSI's `[AIMaxCountRandom]`, 200 by default) - everybody
 waiting at a stop, on the pavements or riding from them - so for many pedestrians raise that
 too. An older `ped_density` per cent in the file is read as that many (100 % = 100).
