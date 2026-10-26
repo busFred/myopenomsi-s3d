@@ -3943,6 +3943,9 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                             walk.held = 0.0;
                             walk.spot = None;
                             walk.kerb_go = None;
+                            // (the way on is decided as at a kerb: a crossing piece next is not
+                            // stepped onto without the verdict)
+                            walk.kerb_hold = true;
                             return Want::stand(None, Activity::Stand);
                         }
                     }
@@ -3964,7 +3967,7 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
             }
             let (pos, row) = place.unwrap_or_else(|| {
                 let spot = kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK);
-                let near = || ped.and_then(|p| nearest_free_place(p, net, at.queues, spot.extend(here.z), KERB_SPOT_REACH, me.id));
+                let near = || ped.and_then(|p| nearest_free_place(p, net, at.queues, spot.extend(here.z), me.pos, KERB_SPOT_REACH, me.id));
                 (stay.or_else(near).unwrap_or(spot), BEHIND_THE_QUEUE)
             });
             KerbPlace { leg: walk.leg, next: next.lane, pos, row, key, stripes }
@@ -4585,11 +4588,12 @@ const KERB_SPOT_REACH: f64 = 15.0;
 
 /// The point nearest `at` (within `reach`, at its height) on a footpath, across its width in
 /// stripes (`STRIPE_WIDTH`), clear for waiting at least as loosely as an island stop's places
-/// (`clear_for_waiting`) and free of every other waiter's place (`Queues::free`): where somebody
-/// with no place in a kerb's queue waits.
-fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, reach: f64, id: u32) -> Option<DVec2> {
+/// (`clear_for_waiting`), free of every other waiter's place (`Queues::free`) and reached from
+/// `from` along a line off every street lane's footprint and a body (nobody walks across a lane
+/// to it): where somebody with no place in a kerb's queue waits.
+fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, from: DVec2, reach: f64, id: u32) -> Option<DVec2> {
     let (cx, cy) = ((at.x / 50.0).floor() as i32, (at.y / 50.0).floor() as i32);
-    let mut best: Option<(f64, DVec2)> = None;
+    let mut found: Vec<(f64, DVec2)> = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
     for dx in -1..=1 {
         for dy in -1..=1 {
@@ -4609,8 +4613,8 @@ fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, r
                     for j in 0..cols {
                         let q = c + (right * ((j as f64 - (cols as f64 - 1.0) * 0.5) * STRIPE_WIDTH)).extend(0.0);
                         let d = (q - at).truncate().length();
-                        if d <= reach && (q.z - at.z).abs() < 2.0 && best.is_none_or(|b| d < b.0) && queues.free(q.truncate(), id) && clear_for_waiting(net, q, true) {
-                            best = Some((d, q.truncate()));
+                        if d <= reach && (q.z - at.z).abs() < 2.0 && queues.free(q.truncate(), id) && clear_for_waiting(net, q, true) {
+                            found.push((d, q.truncate()));
                         }
                     }
                     s += QUEUE_ROW as f32;
@@ -4618,7 +4622,9 @@ fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, r
             }
         }
     }
-    best.map(|b| b.1)
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let off = |q: DVec2| !within_lanes(net, q.extend(at.z), &footprint_reach);
+    found.into_iter().map(|f| f.1).find(|q| way_off_lanes(&[from, *q], &off))
 }
 
 /// The point of a footpath within `reach` of `at` (and at its height) nearest to
