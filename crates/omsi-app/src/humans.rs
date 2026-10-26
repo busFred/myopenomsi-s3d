@@ -7092,7 +7092,7 @@ impl Humans {
                 }
                 let (lane, path_m, ks, toward) = (targets[ci].lane, targets[ci].metres, &targets[ci].ks, targets[ci].toward);
                 // (never onto a path a map-parked car closes: a dead end of the stroll network)
-                if !stroll_path_open(self.ped.as_ref(), lane) {
+                if !stroll_path_open(Some(&*ped), lane) {
                     rej_wall += 1;
                     continue;
                 }
@@ -7217,7 +7217,7 @@ impl Humans {
                     cells.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
                     cells.iter().take(4).map(|((x, y), n)| format!("{n} at ({:.0}, {:.0})", (*x as f64 + 0.5) * WALL_TURN_CELL, (*y as f64 + 0.5) * WALL_TURN_CELL)).collect::<Vec<_>>().join(", ")
                 },
-                self.ped.as_ref().map(|pn| pn.walls.len()).unwrap_or(0),
+                ped.walls.len(),
                 self.people.iter().filter(|p| matches!(&p.state, State::Strolling(w) if w.pocket)).count()
             );
         }
