@@ -121,6 +121,10 @@ pub struct Claim {
     /// Distance from the origin to where the front will have to stop for people, a zebra or
     /// a standing lead ahead (INFINITY: nothing seen).
     pub clear_ahead: f32,
+    /// Held for a stop it serves (`External::at_stop`, a timetable bus's dwell, or the bus
+    /// service's stop hold, `Why::Service`): standing there it has no request at any link until
+    /// its stop ends (`will_pass`).
+    pub serving: bool,
     /// The brake (m/s²) its committed test reckons with (`Simulation::tick`: the vehicle's
     /// own `decel * 1.5` inside the object, `plan::HARD_BRAKE` before it).
     pub brake: f32,
@@ -1103,6 +1107,12 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
             }
         }
     }
+    // a foe standing outside the meeting place at a stop it serves (`Claim::serving`) is not
+    // approaching the link (SUMO: a vehicle stopped at a stop has no request until its stop
+    // ends; its dwell's end is not known to the claim, so it comes, from rest, once it moves)
+    if !their_inside && !o.committed && o.standing() && o.serving {
+        return Pass::Not("at_stop");
+    }
     // a foe standing outside the meeting place, held there by people, a zebra or a lead that
     // stands too, or standing refused for one so held (`held_off`), is not coming while that
     // holds, however near it stands; when it moves off it is a competitor again. Not when I am
@@ -1511,7 +1521,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2102,6 +2112,23 @@ mod tests {
         claims[1].speed = 6.0;
         let g = resolve(&js, &claims);
         assert_eq!(grant_of(&g, 1).wait_for, Some(2), "{g:?}");
+    }
+
+    /// J11-9: a bus standing at a stop it serves, 1 m out (from rest it would be there before
+    /// I am out), is not approaching the link (SUMO: no request until its stop ends); once it
+    /// moves, it counts again.
+    #[test]
+    fn will_pass_a_bus_serving_its_stop_short_of_the_meeting_place_is_not_coming() {
+        let (_, js, mut claims) = held_main_road_foe(1.0, 3.0, true);
+        claims[1].serving = true;
+        assert!(grant_of(&resolve(&js, &claims), 1).go);
+        claims[1].serving = false;
+        assert_eq!(grant_of(&resolve(&js, &claims), 1).wait_for, Some(2));
+        claims[1].serving = true;
+        claims[1].speed = 2.0;
+        claims[1].held = false;
+        claims[1].blocked = false;
+        assert_eq!(grant_of(&resolve(&js, &claims), 1).wait_for, Some(2));
     }
 
     #[test]

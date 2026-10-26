@@ -1381,6 +1381,8 @@ impl Simulation {
                     id: v.id,
                     yields_now: None,
                     // (where people, a zebra or a standing lead will stop the front)
+                    // (standing for its stop: the bus service's hold, `Why::Service`, or dwelling there)
+                    serving: v.external.at_stop || v.last.why == Why::Service,
                     clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                     brake,
                 };
@@ -1588,6 +1590,7 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
+                serving: false,
                 brake: plan::HARD_BRAKE,
             });
         }

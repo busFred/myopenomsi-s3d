@@ -39,6 +39,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
     let claim = Claim {
         yields_now: None,
         clear_ahead: f32::INFINITY,
+        serving: false,
         brake: 5.6,
         vehicle: 0,
         junction: 0,
