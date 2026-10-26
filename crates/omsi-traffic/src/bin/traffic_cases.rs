@@ -4293,14 +4293,20 @@ struct Extra {
     /// ahead at a merge caps the speed, or the queue-entry stop behind it).
     zipper_capped_s: f64,
     /// Vehicle-seconds within the radius standing with its start capped to `CAPPED_START` or less
-    /// by a zipper foe (not the queue-entry stop) that stands short of the merge at its own red
-    /// (`Claim::light_red`): a partner held at red whose green comes after my arrival is not
-    /// ahead (`reservation::zipper_cap`), so this is 0 when the rule holds.
+    /// by a zipper foe (not the queue-entry stop, not one in the stretch) that stands at or rolls
+    /// up to its own red (`Claim::light_red`): a partner held at red whose green comes after my
+    /// arrival is not ahead (`reservation::zipper_cap`), so this is 0 when the rule holds.
     capped_by_red_s: f64,
     /// Vehicle-seconds within the radius standing refused for a full exit (`Hold::ExitFull`) with
     /// no lead on its way (`Plan::lead`): nothing ahead of its front closes the exit, so this is 0
     /// when the exit room counts only what is ahead of the car (`perception::junction_ahead`).
     exitfull_nolead_s: f64,
+    /// Vehicle-seconds within the radius with a zipper cap from a foe short of the stretch (not
+    /// the queue-entry stop, not a foe in the stretch, not a body across its way - a physical
+    /// lead at any distance) while farther from the stretch than its
+    /// zipper reach (`reservation::zipper_reach`, SUMO's max(visibility, brakeGap)): 0 when the
+    /// cap applies only inside the reach.
+    zip_outside_reach_s: f64,
     /// [round 7 R7-1] With `--pedtouch`: frames a moving vehicle's body is severely over a
     /// person (the PEDTOUCH lines with `severe true`, the replay artefact of a car letting a
     /// player's passengers out not counted).
@@ -4473,6 +4479,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut pass_seen: HashMap<u64, bool> = r.vehicles.iter().filter(|v| v.passing.is_some()).map(|v| (v.id, true)).collect();
     let (mut waited60, mut waited120): (HashSet<u64>, HashSet<u64>) = (HashSet::new(), HashSet::new());
     let mut on_cut_ids: HashSet<u64> = HashSet::new();
+    // (vehicles already listed as `EXIT-NOLEAD` events)
+    let mut exitfull_seen: HashSet<u64> = HashSet::new();
     // (`--pedtouch`: last frame's people, each with when it came into the replay)
     let mut prev_people: Vec<(glam::DVec3, f64)> = Vec::new();
     // (pairs already listed as `CAPRED` events)
@@ -4540,10 +4548,13 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.follower_go_s += g.follower_go as f64 * fdt;
                     ex.leader_go_s += g.leader_go as f64 * fdt;
                     ex.zipper_capped_s += g.zipper.is_some() as u8 as f64 * fdt;
+                    if g.zipper.is_some_and(|z| !z.stop && !z.inside && z.dist > omsi_traffic::reservation::zipper_reach(c) && c.body_block != r.vehicles.get(z.foe).map(|o| o.id)) {
+                        ex.zip_outside_reach_s += fdt;
+                    }
                     // (J9-1's symptom, round 10 analysis: the start capped to nothing, 0.05 m/s^2 or
-                    // less, by a partner short of the merge standing at its red - not one standing
-                    // in the merged way ahead, a lead to follow)
-                    let partner = g.zipper.filter(|z| !z.stop && !z.inside).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe)).filter(|(o, _)| o.light_red && o.speed < 0.3);
+                    // less, by a partner short of the merge standing at or rolling up to its red -
+                    // not one in the merged way ahead, a lead to follow)
+                    let partner = g.zipper.filter(|z| !z.stop && !z.inside).and_then(|z| r.sim.claims.iter().find(|(o, _)| o.vehicle == z.foe)).filter(|(o, _)| o.light_red);
                     let tiny = r.vehicles.get(c.vehicle).and_then(|v| v.state.accel_cap).is_some_and(|cap| cap <= CAPPED_START);
                     if let (Some((o, _)), true) = (partner, c.speed < 0.3 && tiny) {
                         ex.capped_by_red_s += fdt;
@@ -4573,6 +4584,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             for v in r.vehicles.iter().filter(|v| v.state.speed < 0.3 && near(v.pos)) {
                 if v.last.hold == Some(Hold::ExitFull) && v.last.lead.is_none() {
                     ex.exitfull_nolead_s += fdt;
+                    if exitfull_seen.insert(v.id) {
+                        ex.events.push(format!("EXIT-NOLEAD {} t={now:.1} #{} lane {} s {:.1} stopped {:.1}", sc.name, v.id, v.state.lane, v.state.s, v.stopped));
+                    }
                 }
                 let st = &v.state;
                 let over = r.net.walks.get(st.lane).is_some_and(|ws| ws.iter().any(|&(_, sa, _)| sa >= st.s - st.rear && sa <= st.s + st.front));
@@ -4995,6 +5009,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("zipper_capped", format!("{:.0}", e.zipper_capped_s)),
         ("capped_by_red", format!("{:.0}", e.capped_by_red_s)),
         ("exitfull_nolead", format!("{:.0}", e.exitfull_nolead_s)),
+        ("zip_capped_outside_reach", format!("{:.0}", e.zip_outside_reach_s)),
         ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
         ("removed_far", e.removed_far.to_string()),
     ]
@@ -5042,6 +5057,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.zipper_capped_s += e.zipper_capped_s;
     t.capped_by_red_s += e.capped_by_red_s;
     t.exitfull_nolead_s += e.exitfull_nolead_s;
+    t.zip_outside_reach_s += e.zip_outside_reach_s;
 }
 
 /// `ab <fixture>... [--radius 200] [--json out.json] [--min-head 10]
@@ -6055,13 +6071,21 @@ fn lights(fixture: &Path, args: &[String]) -> Res<()> {
 /// `foes <fixture> <lane>...`: the foes of each lane's movement on the network the replay runs
 /// (the other lane, the kind, who yields, the stretches), whether the meeting place is
 /// one of two converging lanes (`Network::add_converging`), and whether it is a side-by-side
-/// merge (`Foe::side`, which the exit room of `perception::junction_ahead` leaves out).
+/// merge (`Foe::side`, which the exit room of `perception::junction_ahead` leaves out); for a
+/// footpath piece of a junction's crossing, the crossing and the light that governs the piece.
 fn foes(fixture: &Path, args: &[String]) -> Res<()> {
     let (r, _) = grown(fixture, true)?;
     let js = &r.sim.junctions;
     for a in args {
         let Ok(l) = a.parse::<usize>() else { continue };
         let Some(&(j, m)) = js.of_lane.get(&l) else {
+            // (a footpath piece of a junction's crossing: the light that governs it,
+            // `Junctions::crossing_light`)
+            if let Some(&(j, c)) = js.of_foot_lane.get(&l) {
+                let pc = &js.nodes[j].crossings[c];
+                println!("lane {l}: footpath of j{j} crossing {c} pieces {:?} governed by light {:?} (own {:?}) cuts {:?}", pc.foot_lanes, js.crossing_light(&r.net, l), r.net.lanes[l].traffic_light, pc.cuts.iter().map(|q| (js.nodes[j].movements[q.movement].lane, (q.at * 10.0).round() / 10.0)).collect::<Vec<_>>());
+                continue;
+            }
             println!("lane {l}: no junction movement (entries {:?})", js.entries.get(&l));
             continue;
         };

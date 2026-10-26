@@ -1710,6 +1710,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
         // the position bound: short of the stretch until the foe's rear has been past
         // its start `tau`, the car waits at the start (`ZipCap::hold`), at a waiting position
+        // (the resolver gives a cap from a foe short of the stretch only within the car's zipper
+        // reach, `reservation::zipper_reach`: farther off there is no hold)
         if let (Some(d), Some(j)) = (z.hold, p.junction.as_ref()) {
             if let Some(at) = legal_before(&wait_bands(net, sim, j), me, st.front + d) {
                 min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3)), Why::Junction);

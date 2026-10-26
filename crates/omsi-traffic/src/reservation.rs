@@ -8,7 +8,7 @@
 
 use crate::driver::{Impatience, STANDING_SPEED};
 use crate::junction::{FoeKind, Junctions};
-use omsi_sim::traffic::{arrival_time, MAX_BRAKE};
+use omsi_sim::traffic::{arrival_time, APPROACH_WINDOW, MAX_BRAKE};
 
 /// A vehicle asking for its way through a junction this frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -239,11 +239,14 @@ pub struct ZipCap {
     pub stop: bool,
     /// The distance from my front to the stretch's start while the foe's rear
     /// has not been past it `tau` (`getZipperSpeed`'s target): a position bound, I do not enter
-    /// before my turn (a constant-deceleration bound would let the follower creep in).
+    /// before my turn (a constant-deceleration bound would let the follower creep in). None for a
+    /// car with the right of way over the foe's stream: it follows its link leader in.
     pub hold: Option<f32>,
     /// The foe is in the stretch already (its front past the start): a cap
     /// that brings me to rest behind it puts me at a waiting position (`plan`).
     pub inside: bool,
+    /// From my front to the stretch's start (m; negative past it): against `zipper_reach`.
+    pub dist: f32,
 }
 
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
@@ -431,6 +434,29 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
     FoeTimes { my_in, my_out, their_in, their_out, their_in_impatient, case }
 }
 
+/// The room (m) the car-following model (IDM) needs behind a lead at `lead_speed` to follow it
+/// braking no harder than comfortably: its braking a (s*/s)² is within the comfortable brake b
+/// for s >= s* sqrt(a/b), s* = s0 + v T + v Δv / (2 sqrt(a b)) (SUMO's `couldBrakeForLeader` asks
+/// the same of its Krauss model).
+fn follow_room(x: &Claim, lead_speed: f32) -> f32 {
+    let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
+    let s_star = x.min_gap + (x.speed * x.tau + x.speed * (x.speed - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
+    s_star * (a / b).sqrt()
+}
+
+/// The zipper reach of the claimant `c` (m, from its front to the merge stretch's start): SUMO's
+/// `getZipperSpeed` adapts nothing while ego is farther from the link than max(visibility,
+/// brakeGap) (sumo.md 1.5). The brake gap is the room the car-following model needs to come to
+/// rest comfortably behind a car standing at the stretch's start (`follow_room`, the measure the
+/// zipper's "can brake" reads: farther off it can still stop behind whoever is there first, and
+/// need not adapt yet); the visibility
+/// is the approach the junction compile reads a meeting place's right of way over
+/// (`omsi_sim::traffic::APPROACH_WINDOW`, the last metres of each way to it,
+/// `Network::approach_to`): OMSI maps carry no connection `visibility`.
+pub fn zipper_reach(c: &Claim) -> f32 {
+    APPROACH_WINDOW.max(follow_room(c, 0.0))
+}
+
 /// SUMO's zipper (`MSLink::getZipperSpeed`, sumo.md 1.5) for the claimant `c` against `o`
 /// at the merge `foe` of two ways that cross nowhere else: the foe ahead caps my speed, a foe
 /// behind is none of mine. Aligned at the stretch's start (where two abreast would touch), one
@@ -442,9 +468,20 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
 /// and the one with the right of way takes an earlier yielding foe as ahead only when it could
 /// stop behind it so (the same pair from the other side: exactly one of the two is ahead);
 /// between equals the order of arrival alone (SUMO: a later foe that can brake for me is
-/// ignored). A foe standing short of the stretch can always brake (SUMO's `couldBrakeForLeader`
-/// of a stopped vehicle), so it is ahead only when it arrives first: one standing at its red is
-/// ahead of me only when its green and its start from rest bring it there before me. For the foe
+/// ignored). A car the table gives the right of way over the foe's stream (`yields_to_me`) is
+/// not capped by a foe of that stream that can still stop short of the stretch: its link is open
+/// (SUMO's `havePriority`, sumo.md 1.5); a foe already in the stretch ahead of it, or there first
+/// and too close to stop short of it, is its link leader when it can brake for it (one it cannot
+/// brake for gives way to it, as above), which it follows with no position hold at the stretch's
+/// start (SUMO's `jmAdvance`, sumo.md 1.6). A foe
+/// standing short of the stretch, or one whose own plan stops at its red short of it, can always
+/// brake (SUMO's `couldBrakeForLeader` of a stopped vehicle; a car stopping for its red brakes
+/// whatever I do), so it is ahead only when it arrives first: one at its red is ahead of me only
+/// when its green and its start bring it there before me; and one whose plan stops behind a
+/// standing lead short of the stretch (`Claim::lead_rest`) is no foe ahead at all (SUMO's
+/// `willPass`: its planned stop is before the link). Outside its zipper reach
+/// (`zipper_reach`) a car is capped by no foe short of the stretch (SUMO adapts nothing there);
+/// a foe in the stretch, or standing at the join, is followed at any distance. For the foe
 /// ahead: the queue-entry stop when it stands at the join (`ZipCap::stop`,
 /// my lead), else the gentler of following it where it stands along the merged way and the
 /// acceleration that brings my front to the start `tau` after its rear (`arrive`; inside the
@@ -457,6 +494,16 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     let p_f = (o.s + o.front) - foe.theirs.0;
     let t_e = window(c, foe.mine.0, foe.mine.1).0;
     let t_f = their_in;
+    // (short of the stretch, its plan stops it before it: at its red, or behind a standing lead,
+    // `Claim::lead_rest`)
+    let red_short = p_f < 0.0 && o.light_red && o.red_at <= foe.theirs.0;
+    if p_f < 0.0 && o.lead_rest() <= foe.theirs.0 && c.body_block != Some(o.id) {
+        return None;
+    }
+    // (outside my zipper reach, a foe short of the stretch adapts nothing of mine)
+    if p_f < 0.0 && -p_e > zipper_reach(c) && c.body_block != Some(o.id) {
+        return None;
+    }
     // `x`, `behind` m further from the start than `y`, could follow `y` as its lead there
     // braking no harder than comfortably: the car-following model's (IDM's) braking for a lead
     // at that gap, a (s*/s)², is within its comfortable brake b - s >= s* sqrt(a/b), s* = s0 + v T
@@ -467,13 +514,11 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // `couldBrakeForLeader` finds for a stopped vehicle - so a foe standing at its red is ahead
     // only when it arrives first, its arrival counted from its green (`their_in`).
     let can_brake = |x: &Claim, x_at: f32, y: &Claim, behind: f32| -> bool {
-        if x.speed < STANDING_SPEED && x_at < 0.0 {
+        if (x.speed < STANDING_SPEED || (x.vehicle == o.vehicle && red_short)) && x_at < 0.0 {
             return true;
         }
         let room = behind - (y.front + y.rear);
-        let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
-        let s_star = x.min_gap + (x.speed * x.tau + x.speed * (x.speed - y.speed) / (2.0 * (a * b).sqrt())).max(0.0);
-        room > 0.0 && room >= s_star * (a / b).sqrt()
+        room > 0.0 && room >= follow_room(x, y.speed)
     };
     // (level: the table's, then the lower index)
     let tie_theirs = i_yield || (!yields_to_me && o.vehicle < c.vehicle);
@@ -486,8 +531,9 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // no rule of its own (it is arriving first): a flip there would put a fast car
     // under an emergency cap
     // (engaged: the foe on its way or in the stretch - a foe standing short of the stretch, held
-    // elsewhere, keeps no order: a car would wait at the start behind one stalled at its red)
-    let engaged = o.speed >= STANDING_SPEED || p_f >= 0.0;
+    // elsewhere, or rolling up to its red short of it, keeps no order: a car would wait at the
+    // start behind one stalled at its red)
+    let engaged = (o.speed >= STANDING_SPEED && !red_short) || p_f >= 0.0;
     // (a body across the other's way is ahead of it, whatever the arrival rule says: the one
     // it holds cannot go first; held by its body, a car the cap put behind it stood with it
     // in a ring - the same rule as `negotiate`'s, where the
@@ -503,7 +549,12 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     } else if i_yield {
         first || !can_brake(o, p_f, c, p_e - p_f)
     } else if yields_to_me {
-        first && can_brake(c, p_e, o, p_f - p_e)
+        // (my link is open: a foe of the yielding stream is ahead only when it is in the stretch
+        // further along than I am, or there first and past stopping short of it (its committed
+        // test, `plan::cannot_stop` at `Claim::brake`: SUMO's minor already on its link) - and
+        // only when I can brake for it: one I cannot brake for gives way to me, the `i_yield` side)
+        let on_link = (p_f >= 0.0 && p_f > p_e) || (first && crate::plan::cannot_stop(o.speed, -p_f, o.brake));
+        on_link && can_brake(c, p_e, o, p_f - p_e)
     } else if first {
         // (unless I cannot brake for it and it can for me: then I go first)
         !(!can_brake(c, p_e, o, p_f - p_e) && can_brake(o, p_f, c, p_e - p_f))
@@ -516,7 +567,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     }
     let gap = (p_f - o_len) - p_e;
     if o.speed < STANDING_SPEED && p_f >= 0.0 {
-        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true });
+        return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e });
     }
     let d_e = -p_e;
     let t_target = arrival_time(o_len - p_f, o.speed, o.accel, o.v_max) + red_shift + c.tau;
@@ -530,9 +581,11 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     };
     let w = (t_e / ZIPPER_BLEND_TIME).min(1.0);
     let floor = -(w * c.decel + (1.0 - w) * MAX_BRAKE);
-    // (short of the start while the foe's rear has not been past it for `tau`: wait at the start)
-    let hold = (d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
-    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0 })
+    // (short of the start while the foe's rear has not been past it for `tau`: wait at the start;
+    // not with the right of way over its stream: the foe is my link leader, and I advance behind
+    // it, SUMO's `jmAdvance` - waiting at the start, a car with priority let a whole minor stream by)
+    let hold = (!yields_to_me && d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
+    Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0, dist: -p_e })
 }
 
 /// The car-following model's (IDM's) acceleration for the claimant behind a lead `gap` m
@@ -2529,11 +2582,69 @@ mod tests {
         assert!(grant_of(&g, 1).zipper.is_none() && z.foe == 1 && z.arrive < 0.0 && !z.stop, "{g:?}");
     }
 
+    /// J11-5 (SUMO's zipper reach and open priority link, `getZipperSpeed`, `havePriority`,
+    /// `willPass`): a car with the right of way over the foe's stream, standing short of the
+    /// merge, is not capped by a creeping foe of that stream that arrives first; a foe rolling up
+    /// to its own red short of the stretch caps nobody before its green; a foe whose plan stops
+    /// behind a standing lead short of the stretch caps nobody; and outside its zipper reach
+    /// (`zipper_reach`) a car is capped by no foe short of the stretch.
+    #[test]
+    fn j115_the_zipper_caps_only_within_reach_never_a_priority_car_nor_for_a_foe_that_stops_short() {
+        let (_, js) = merge_a_gives_way();
+        let f = *js.nodes[0].movements[0].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap();
+        assert!(f.yields);
+        let len = f.mine.1 - f.mine.0;
+        // (a) the main road car (way 1) stands 3 m short of the stretch; the merger (way 0)
+        // creeps at 1 m/s 1 m short and arrives first: the merger is no cap of the main road car
+        let main = zip_claim(&js, 1, 1, len + 3.0, 0.0);
+        let creeper = zip_claim(&js, 2, 0, len + 1.0, 1.0);
+        let g = resolve(&js, &[main.clone(), creeper.clone()]);
+        assert!(!capped_by(&g, 1, 2), "{g:?}");
+        // ... the merger in the stretch, rolling: the main road car's link leader - followed,
+        // with no position hold at the start (SUMO's `jmAdvance`); between equals it holds
+        let inside = zip_claim(&js, 2, 0, len - 2.0, 3.0);
+        let g = resolve(&js, &[main.clone(), inside]);
+        assert!(capped_by(&g, 1, 2) && grant_of(&g, 1).zipper.unwrap().hold.is_none(), "{g:?}");
+        // ... the same pair between equals: the creeper, first, caps the standing car
+        let (_, eq) = zipper_object();
+        let leq = eq.nodes[0].movements[0].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap().mine;
+        let g = resolve(&eq, &[zip_claim(&eq, 1, 1, leq.1 - leq.0 + 3.0, 0.0), zip_claim(&eq, 2, 0, leq.1 - leq.0 + 1.0, 1.0)]);
+        assert!(capped_by(&g, 1, 2), "{g:?}");
+        let g = resolve(&eq, &[zip_claim(&eq, 1, 1, leq.1 - leq.0 + 3.0, 0.0), zip_claim(&eq, 2, 0, leq.1 - leq.0 - 2.0, 3.0)]);
+        assert!(grant_of(&g, 1).zipper.is_some_and(|z| z.foe == 2 && z.hold.is_some()), "{g:?}");
+        // (b) between equals, a foe rolling at 6 m/s up to its red 0.5 m short of the stretch,
+        // green in 60 s, caps nobody; green in 0.5 s and nearer, it does
+        let me = zip_claim(&eq, 1, 1, leq.1 - leq.0 + 8.0, 0.0);
+        let mut red = zip_claim(&eq, 2, 0, leq.1 - leq.0 + 6.0, 6.0);
+        red.light_red = true;
+        red.until_go = Some(60.0);
+        red.red_at = red.s + red.front + 5.5;
+        assert!(!capped_by(&resolve(&eq, &[me.clone(), red.clone()]), 1, 2));
+        red.until_go = Some(0.5);
+        assert!(capped_by(&resolve(&eq, &[me.clone(), red.clone()]), 1, 2));
+        // (d) a foe rolling at 6 m/s up to a standing lead whose rear lies 1 m ahead of its
+        // front, short of the stretch: no cap; the lead 10 m on, past the start: it caps me
+        let mut queued = zip_claim(&eq, 2, 0, leq.1 - leq.0 + 6.0, 6.0);
+        queued.lead_gap = Some((1.0, 0.0));
+        assert!(!capped_by(&resolve(&eq, &[me.clone(), queued.clone()]), 1, 2));
+        queued.lead_gap = Some((10.0, 0.0));
+        assert!(capped_by(&resolve(&eq, &[me.clone(), queued.clone()]), 1, 2));
+        // (c) standing 26 m short of the stretch (reach `APPROACH_WINDOW` at rest), a foe
+        // rolling up nearer caps nothing of mine; 15 m short it does
+        let far = zip_claim(&eq, 1, 1, leq.1 - leq.0 + 26.0, 0.0);
+        assert!(zipper_reach(&far) < 26.0);
+        let near_foe = zip_claim(&eq, 2, 0, leq.1 - leq.0 + 3.0, 5.0);
+        assert!(!capped_by(&resolve(&eq, &[far, near_foe.clone()]), 1, 2));
+        let near = zip_claim(&eq, 1, 1, leq.1 - leq.0 + 15.0, 0.0);
+        assert!(capped_by(&resolve(&eq, &[near, near_foe]), 1, 2));
+    }
+
     /// A zipper partner standing at its red is ahead only when its green and its
     /// start from rest bring it to the merge before me (SUMO's zipper ignores a later foe that can
     /// brake, and a stopped one can): a minute from green it caps nobody, whichever way the table
     /// orders the pair and however close to the merge it stands; half a second from green and
-    /// nearer the merge, it is ahead; moving foes keep the full zipper.
+    /// nearer the merge, it is ahead - unless I have the right of way over its stream (my link is
+    /// open, SUMO's `havePriority`); moving foes not stopping at a red keep the full zipper.
     #[test]
     fn j91_a_zipper_partner_standing_at_its_red_caps_me_only_when_its_green_brings_it_first() {
         // (equal ways, and a merge where the way on piece 0 gives way)
@@ -2553,12 +2664,13 @@ mod tests {
                     // (its green before I can be there, and it nearer: it is ahead)
                     b.until_go = Some(0.5);
                     let g = resolve(&js, &[a.clone(), b.clone()]);
+                    let my_priority = js.nodes[0].movements[them].foes.iter().any(|f| f.movement == me && f.yields);
                     if their_d + 1.0 < my_d {
-                        assert!(capped_by(&g, 1, 2), "me {my_d} m, foe {their_d} m green in 0.5 s: {g:?}");
+                        assert_eq!(capped_by(&g, 1, 2), !my_priority, "me {my_d} m, foe {their_d} m green in 0.5 s: {g:?}");
                     }
                 }
             }
-            // (a moving foe keeps the full zipper: the nearer moving one is ahead)
+            // (a moving foe not held by a red keeps the full zipper: the nearer moving one is ahead)
             let a = zip_claim(&js, 1, 0, len + 6.0, 0.0);
             let b = zip_claim(&js, 2, 1, len + 3.0, 5.0);
             assert!(capped_by(&resolve(&js, &[a, b]), 1, 2));
@@ -2771,8 +2883,17 @@ mod tests {
         // 12 m behind: B arrives later but needs (14² - 4²)/(2·2) = 45 m to come down to 4 m/s
         let g = resolve(&js, &near_end(20.0));
         assert!(capped_by(&g, 1, 2) && !capped_by(&g, 2, 1), "{g:?}");
-        // 80 m behind: it can, the merger goes first and B is capped
+        // 80 m behind: it can, the merger goes first; B is outside its zipper reach (it can still
+        // come to rest behind a car at the start, `zipper_reach`) and adapts nothing yet
         let g = resolve(&js, &near_end(88.0));
+        assert!(!capped_by(&g, 2, 1) && !capped_by(&g, 1, 2), "{g:?}");
+        // within its reach and still able to brake for it: the merger (too close to stop short of
+        // the stretch: on its link) is ahead and B is capped; in the stretch already, the same
+        let len = { let f = js.nodes[0].movements[1].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap(); f.mine.1 - f.mine.0 };
+        let g = resolve(&js, &near_end(len + 64.0));
+        assert!(capped_by(&g, 2, 1) && !capped_by(&g, 1, 2), "{g:?}");
+        let inside = [zip_claim(&js, 1, 0, 0.0, 4.0), zip_claim(&js, 2, 1, 88.0, 14.0)];
+        let g = resolve(&js, &inside);
         assert!(capped_by(&g, 2, 1) && !capped_by(&g, 1, 2), "{g:?}");
     }
 
@@ -3331,13 +3452,14 @@ mod tests {
         let g = resolve(&js, &[merger.clone(), through(68.0, 9.4)]);
         assert!(grant_of(&g, 1).go, "refused with the through car 5.5 s off (the end rule's 2.9 + 4 > 5.5): {g:?}");
         // people, a zebra or a standing lead stopping it inside the stretch (its front 10 m
-        // on, the stretch's end 18.6 m + its length): (at a zipper it is the foe ahead,
-        // and the through car, able to follow it, queues behind it - before, refused, it stood
-        // at the stretch)
+        // on, the stretch's end 18.6 m + its length): at a zipper it goes in (it arrives first
+        // and the through car can brake for it), and the through car, with the right of way,
+        // is not capped by it while it is short of the stretch (its link is open); it follows
+        // it once it is in the stretch
         let mut blocked_ahead = merger.clone();
         blocked_ahead.clear_ahead = 10.0;
         let g = resolve(&js, &[blocked_ahead, through(68.0, 9.4)]);
-        assert!(gives_way(&g, 2, 1) && !gives_way(&g, 1, 2), "{g:?}");
+        assert!(!gives_way(&g, 2, 1) && !gives_way(&g, 1, 2), "{g:?}");
         // 2-3 s off: it gives way still (the turner against the player; capped by it
         // at the zipper)
         let g = resolve(&js, &[merger.clone(), through(25.0, 9.4)]);
