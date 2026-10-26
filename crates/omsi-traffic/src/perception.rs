@@ -1613,10 +1613,17 @@ pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, u
     net.lanes.get(l)?.traffic_light.filter(|&(ctl, li)| !detector_light(sim, ctl, li))
 }
 
-/// The next light on the way within 150 m. A second light of the same junction object on a
-/// straight run holds nobody: the car has passed its line.
+/// The next light on the way within 150 m. A second line of the same junction object on a
+/// straight run that shows the same light (controller and index) holds nobody: the car has
+/// passed that light's line, and the repeated head is no new link. A line further on carrying
+/// another light is its own link and is read (SUMO: each link has its own signal index) - a
+/// left-turn waiting area entered on one light and left on another (viz case04, object 3433:
+/// lane 603 light 2.2, then lane 901 light 2.3 11 m on). Of the lines ahead, the first that does
+/// not let the car go is the one it reads (SUMO checks every link of its look-ahead, not the
+/// first): a green line before a red one holds nobody; with every line letting it go, the first.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
-    let mut seen_object: Option<(((i32, i32), i64), f32)> = None;
+    let mut seen_object: Option<(((i32, i32), i64), f32, (usize, usize))> = None;
+    let mut first: Option<SignalView> = None;
     for &(l, d0) in way {
         if d0 > 150.0 {
             break;
@@ -1624,14 +1631,14 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
         let lane = &net.lanes[l];
         let Some((ctl, li)) = stop_light(net, sim, l) else { continue };
         let key = lane.key.map(|k| (k.tile, k.id));
-        if let (Some(k), Some((sk, sh))) = (key, seen_object) {
-            if k == sk && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
+        if let (Some(k), Some((sk, sh, sl))) = (key, seen_object) {
+            if k == sk && sl == (ctl, li) && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
                 continue;
             }
         }
         if let Some(k) = key {
             if seen_object.is_none() {
-                seen_object = Some((k, lane.start_heading()));
+                seen_object = Some((k, lane.start_heading(), (ctl, li)));
             }
         }
         if d0 < -(rear + 0.5) {
@@ -1640,9 +1647,13 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
             continue;
         }
         let Some(c) = sim.lights.get(ctl) else { continue };
-        return Some(SignalView { dist: d0, ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) });
+        let view = SignalView { dist: d0, ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) };
+        if !matches!(view.aspect, Aspect::Green | Aspect::GreenYellow | Aspect::Dark) {
+            return Some(view);
+        }
+        first.get_or_insert(view);
     }
-    None
+    first
 }
 
 /// A vehicle slower than this (m/s) past the junction's conflicts is standing there as far
@@ -2255,5 +2266,50 @@ mod crossing_tests {
             self.pos.y = y;
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::signal_ahead;
+    use crate::sim::Simulation;
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
+
+    /// One crossing object (id 9) with two lit lines on one straight run: the first light
+    /// green, the one 11 m on red (a left-turn waiting area). The car reads the second line's
+    /// own light once past the first; the same light repeated further on is the line it passed.
+    fn waiting_area(second: (usize, usize)) -> (Network, Simulation) {
+        let piece = |x0: f64, x1: f64, path: u16, light: Option<(usize, usize)>| {
+            let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)], LaneKind::Street, 3.5);
+            l.source = 2;
+            l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+            l.traffic_light = light;
+            l
+        };
+        let net = Network { lanes: vec![piece(0.0, 1.0, 0, Some((0, 0))), piece(1.0, 12.0, 1, None), piece(12.0, 13.0, 2, Some(second))], ..Default::default() };
+        let ctl = TrafficLightController::new(vec![vec![(6, 50.0), (0, 10.0)], vec![(0, 60.0)]], 60.0);
+        let sim = Simulation::new(&net, vec![ctl]);
+        (net, sim)
+    }
+
+    #[test]
+    fn a_second_line_of_the_object_with_its_own_light_is_read() {
+        let (net, sim) = waiting_area((0, 1));
+        // short of both: the green first line holds nobody, the red one beyond is read
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        assert_eq!((s.light, s.dist), (1, 17.0));
+        // past the first line: the second, red, is the car's
+        let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("the second light");
+        assert_eq!((s.light, s.dist), (1, 3.0));
+        // the same light repeated on the second line: the car has passed its line
+        let (net, sim) = waiting_area((0, 0));
+        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        // short of the first, every line green: the first
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        assert_eq!((s.light, s.dist), (0, 5.0));
     }
 }

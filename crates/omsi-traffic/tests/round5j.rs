@@ -136,11 +136,13 @@ fn j1_a_multi_phase_light_held_green_by_a_stop_point_is_a_stop_line_not_a_detect
     // a dark lane (state 12, one phase) is no detector either: it is reported as before
     let dark = Simulation::new(&net, vec![TrafficLightController::new(vec![vec![(12, 1.0)], vec![(0, 100.0)]], 100.0)]);
     assert!(!omsi_traffic::perception::detector_light(&dark, 0, 0));
-    // and the car under a two-phase green first line runs up to the second as before: the
-    // second light of the same object on a straight run is the line it has passed (leftarrow-1)
+    // and under a two-phase green first line the second line, carrying another light, is its
+    // own link (a BeijingCity lead-in line and its arrow line, CHANGELOG leftarrow-1): its red is
+    // the one seen from 60 m out (a green line before a red one holds nobody), and the car
+    // stops at it
     let (front, _, seen) = runs_up_to(vec![(6, 10.0), (0, 90.0)]);
-    assert_eq!(seen, Some((0, 0)), "a real first light is the one seen");
-    assert!(front > -10.0, "with a real green first line it drives on past the second (same object, straight): front {front:.1}");
+    assert_eq!(seen, Some((0, 1)), "the red second line is the one seen");
+    assert!(front <= -10.0 + 0.3 && front > -16.0, "stops at the second line's red: front {front:.1}");
 }
 
 // ---- J2: a parked player beside the lane makes no junction claim ----
