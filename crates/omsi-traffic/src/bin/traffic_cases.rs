@@ -6100,6 +6100,10 @@ const BODY_ELLIPSE_DEPTH: f64 = 0.4572;
 /// not counted to the horizon, and a cell of a queue at 0.56 m^2 a person (half-diagonal
 /// 0.54 m) is left whole.
 const KERB_CELL_REACH: f64 = 1.0;
+/// A waiter counts as standing at their place (`kerb_overlap` settled) after this long still (s):
+/// SUMO's `blockedAtDist` takes a pedestrian waiting 2 s as standing (`perception::CROSSING_STANDING_WAIT`);
+/// a walker paused for a frame on the way to their place is not.
+const KERB_SETTLED: f32 = 2.0;
 /// Sides of the polygon the cell starts from (the disc of `KERB_CELL_REACH`).
 const KERB_CELL_SIDES: usize = 32;
 
@@ -6370,6 +6374,7 @@ struct PeopleAcc {
     // most in one frame (pairs, time, where), the densest kerb group (density, n, time, where)
     kerb_over_ps: f64,
     kerb_over_still_ps: f64,
+    kerb_over_settled_ps: f64,
     kerb_over_max: (usize, f64, DVec3),
     /// The standing pairs of the frame with the most of them: (time, [(id, pos, leg, decision) x 2]).
     kerb_over_pairs: (usize, f64, Vec<String>),
@@ -6418,6 +6423,7 @@ impl PeopleAcc {
             cross_nn: Vec::new(),
             kerb_over_ps: 0.0,
             kerb_over_still_ps: 0.0,
+            kerb_over_settled_ps: 0.0,
             kerb_over_max: (0, 0.0, DVec3::ZERO),
             kerb_over_pairs: (0, 0.0, Vec::new()),
             kerb_dens_max: (0.0, 0, 0.0, DVec3::ZERO),
@@ -6563,6 +6569,7 @@ impl PeopleAcc {
         let mut crossers: Vec<glam::DVec2> = Vec::new();
         // (waiters at a kerb by the end of the path they wait on: position, standing)
         let mut waiters: HashMap<(usize, bool), Vec<(DVec3, bool)>> = HashMap::new();
+        let mut settled: Vec<bool> = Vec::new();
         let mut who: Vec<String> = Vec::new();
         for p in &f.people {
             if !self.near(p.pos) {
@@ -6576,6 +6583,7 @@ impl PeopleAcc {
             if p.at_kerb {
                 if let Some((lane, s, len)) = p.leg {
                     waiters.entry((lane, s > len * 0.5)).or_default().push((p.pos, p.still > 0.0));
+                    settled.push(p.still >= KERB_SETTLED);
                     who.push(format!("#{} ({:.2}, {:.2}) leg {lane} s {s:.1}/{len:.1} still {:.1} {:?}", p.id.unwrap_or(0), p.pos.x, p.pos.y, p.still, p.decision.as_deref().unwrap_or("-")));
                 }
             }
@@ -6673,13 +6681,16 @@ impl PeopleAcc {
             let all: Vec<(DVec3, bool)> = keyed.iter().map(|k| k.1).collect();
             let mut pair_text: Vec<String> = Vec::new();
             let pts: Vec<glam::DVec2> = all.iter().map(|w| w.0.truncate()).collect();
-            let (mut pairs, mut still_pairs) = (0usize, 0usize);
+            let (mut pairs, mut still_pairs, mut settled_pairs) = (0usize, 0usize, 0usize);
             let mut at = DVec3::ZERO;
             for i in 0..all.len() {
                 for j in i + 1..all.len() {
                     if (pts[i] - pts[j]).length() < BODY_ELLIPSE_DEPTH && (all[i].0.z - all[j].0.z).abs() < 2.0 {
                         pairs += 1;
                         at = all[i].0;
+                        if settled[i] && settled[j] {
+                            settled_pairs += 1;
+                        }
                         if all[i].1 && all[j].1 {
                             still_pairs += 1;
                             if pair_text.len() < 6 {
@@ -6691,6 +6702,7 @@ impl PeopleAcc {
             }
             self.kerb_over_ps += pairs as f64 * w;
             self.kerb_over_still_ps += still_pairs as f64 * w;
+            self.kerb_over_settled_ps += settled_pairs as f64 * w;
             if pairs > self.kerb_over_max.0 {
                 self.kerb_over_max = (pairs, f.time, at);
             }
@@ -6926,6 +6938,7 @@ impl PeopleAcc {
         for t in &self.kerb_over_pairs.2 {
             let _ = writeln!(out, "  kerb_overlap_standing    at {:.1} s: {t}", self.kerb_over_pairs.1);
         }
+        kv!("kerb_overlap_settled", format!("{:.1} pair-s (both still {KERB_SETTLED} s or more)", self.kerb_over_settled_ps), json!(r1(self.kerb_over_settled_ps)));
         kv!("kerb_overlap", format!("{:.1} pair-s ({:.1} both standing); most in a frame {} at {:.1} s at ({:.1}, {:.1}) (waiters at a kerb closer than {BODY_ELLIPSE_DEPTH} m)", self.kerb_over_ps, self.kerb_over_still_ps, o.0, o.1, o.2.x, o.2.y), json!({"pair_s": r1(self.kerb_over_ps), "standing_pair_s": r1(self.kerb_over_still_ps), "max": o.0, "t": r1(o.1)}));
         (out, Value::Object(js))
     }

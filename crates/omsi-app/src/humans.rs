@@ -3447,7 +3447,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                             me.decision = Some(why);
                             me.on_crossing = false;
                             me.approach = None;
-                            return wait_at_kerb(Some(p), at, me, walk, Some(&c), &next);
+                            return wait_at_kerb(Some(p), at, me, walk, Some(&c), &next, rng);
                         }
                     }
                 }
@@ -3546,7 +3546,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                                     return Want::stand(None, Activity::Stand);
                                 }
                                 me.on_crossing = false;
-                                return wait_at_kerb(ped, at, me, walk, Some(&c), &next);
+                                return wait_at_kerb(ped, at, me, walk, Some(&c), &next, rng);
                             }
                         }
                     }
@@ -3846,9 +3846,11 @@ fn kerb_look(pace: f64) -> f32 {
 /// the kerb's queue: a free place of its waiting area (`KerbArea`, `KerbArea::pick`), or, with it
 /// full, behind it on the pavement they came along (`behind_the_queue`); a place once taken is
 /// kept, but for one in an earlier row of the area that is free (the queue moves up). Behind the
-/// legs they walked the queue goes on along the paths that continue them straight on. A kerb
-/// with no place found (the whole way in a lane's reach) has the one spot of `kerb_spot`.
-fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, c: Option<&Cross>, next: &Leg) -> Want {
+/// legs they walked the queue goes on along the paths that continue them straight on. A stroller
+/// who finds no place at all goes another way on from the node they stand at; anybody else waits
+/// where they stand when that is clear and free, else at the one spot of `kerb_spot`.
+#[allow(clippy::too_many_arguments)]
+fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, c: Option<&Cross>, next: &Leg, rng: &mut u64) -> Want {
     let net = at.net;
     let (_, h) = next.at(net, 0.3);
     // (the queue stands before the crossing's first piece proper: on an island's or a corner's
@@ -3857,6 +3859,7 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
         (Some(p), Some(c)) => kerb_of(p, net, at.lights, &walk.legs, c),
         _ => (*next, Vec::new()),
     };
+    let planned = *next;
     let next = &kerb;
     let key = kerb_key(next);
     let kept = walk.spot.filter(|s| s.leg == walk.leg && s.next == next.lane);
@@ -3926,8 +3929,44 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
             // (no place anywhere - arrived off a crossing at a corner whose places are all taken -
             // they wait where they are when that is off the lanes' reach, else at `kerb_spot`)
             let here = me.pos.extend(next.at(net, 0.0).0.z);
-            let stay = (!in_waiter_reach(net, here) && at.queues.free(me.pos, me.id)).then_some(me.pos);
-            let (pos, row) = place.unwrap_or_else(|| (stay.unwrap_or_else(|| kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK)), BEHIND_THE_QUEUE));
+            let stay = (clear_for_waiting(net, here, area.is_none_or(|a| a.loose)) && at.queues.free(me.pos, me.id)).then_some(me.pos);
+            // (a stroller with no place at this kerb - a junction's corner of crossing pieces, full -
+            // goes another way on from here, as a stroll picks one at a node, `PedNet::next_leg`)
+            if let (None, true, Some(p)) = (place, walk.roam, ped) {
+                let here = walk.legs[walk.leg];
+                if let Some(node) = p.end_node(net, &here) {
+                    for _ in 0..p.out.get(node).map(|v| v.len()).unwrap_or(0) {
+                        let pick = xorshift(rng);
+                        if let Some(n) = p.next_leg(net, node, here.lane, pick).filter(|n| n.lane != planned.lane && n.lane != next.lane) {
+                            walk.legs.truncate(walk.leg + 1);
+                            walk.legs.push(n);
+                            walk.held = 0.0;
+                            walk.spot = None;
+                            walk.kerb_go = None;
+                            return Want::stand(None, Activity::Stand);
+                        }
+                    }
+                }
+            }
+            if place.is_none() && debug_pax() {
+                log::info!(
+                    "t={:.1} pax #{} kerb queue: no place at kerb {:?} (leg {} next {}), area {} places, lead {:?}, way {:?}, stays {}",
+                    at.time,
+                    me.id,
+                    key,
+                    walk.legs[walk.leg].lane,
+                    walk.legs.get(walk.leg + 1).map(|l| l.lane).unwrap_or(0),
+                    area.map(|a| a.places.len()).unwrap_or(0),
+                    lead.iter().map(|l| l.lane).collect::<Vec<_>>(),
+                    way.iter().map(|l| l.lane).collect::<Vec<_>>(),
+                    stay.is_some()
+                );
+            }
+            let (pos, row) = place.unwrap_or_else(|| {
+                let spot = kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK);
+                let near = || ped.and_then(|p| nearest_free_place(p, net, at.queues, spot.extend(here.z), KERB_SPOT_REACH, me.id));
+                (stay.or_else(near).unwrap_or(spot), BEHIND_THE_QUEUE)
+            });
             KerbPlace { leg: walk.leg, next: next.lane, pos, row, key, stripes }
         }
     };
@@ -3989,6 +4028,9 @@ struct KerbArea {
     right: DVec2,
     /// The widest pavement path meeting the crossing there (m): how deep the area may reach.
     deep: f64,
+    /// Its places only clear the lanes' footprints (`clear_for_waiting`): none cleared their
+    /// waiter reach.
+    loose: bool,
 }
 
 impl KerbArea {
@@ -4044,7 +4086,7 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
     let (_, h) = next.at(net, 0.3_f32.min(next.len()));
     let hr = h.to_radians();
     let (fwd, right) = (DVec2::new(hr.sin(), hr.cos()), DVec2::new(hr.cos(), -hr.sin()));
-    let mut area = KerbArea { places: Vec::new(), start: on.truncate(), fwd, right, deep: 0.0 };
+    let mut area = KerbArea { places: Vec::new(), start: on.truncate(), fwd, right, deep: 0.0, loose: false };
     // (the pavement paths meeting the crossing at the kerb: the node it is stepped onto from)
     let Some(&(na, nb)) = ped.ends.get(&next.lane) else { return area };
     let node = if next.b >= next.a { na } else { nb };
@@ -4065,29 +4107,48 @@ fn kerb_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, next: 
     area.start = start.truncate();
     let deep = paths.iter().map(|&l| net.lanes[l].width as f64).fold(0.0, f64::max);
     area.deep = deep;
-    let mut row = 0u32;
-    loop {
-        let d = KERB_STEP_BACK + row as f64 * QUEUE_ROW;
-        if d + QUEUE_ROW * 0.5 > deep {
+    // (off every street lane's waiter reach; a kerb with no place so - a junction's corner made of
+    // crossing pieces beside a turning lane - off the lanes' footprints and a body, as an island
+    // stop's waiting places, `clear_of_lanes`)
+    for loose in [false, true] {
+        let mut row = 0u32;
+        loop {
+            let d = KERB_STEP_BACK + row as f64 * QUEUE_ROW;
+            if d + QUEUE_ROW * 0.5 > deep {
+                break;
+            }
+            for i in st.own() {
+                let off = st.offset(i);
+                let q = start + (right * off - fwd * d).extend(0.0);
+                if paths.iter().any(|&l| on_footprint(&net.lanes[l], q)) && clear_for_waiting(net, q, loose) {
+                    area.places.push((q.truncate(), row, off));
+                }
+            }
+            row += 1;
+        }
+        area.loose = loose;
+        if !area.places.is_empty() {
             break;
         }
-        for i in st.own() {
-            let off = st.offset(i);
-            let q = start + (right * off - fwd * d).extend(0.0);
-            if paths.iter().any(|&l| on_footprint(&net.lanes[l], q)) && !in_waiter_reach(net, q) {
-                area.places.push((q.truncate(), row, off));
-            }
-        }
-        row += 1;
     }
     area
+}
+
+/// Whether somebody may wait at `q`: outside every street lane's waiter reach
+/// (`in_waiter_reach`), or, `loose`, outside every lane's footprint and a body (`footprint_reach`).
+fn clear_for_waiting(net: &Network, q: DVec3, loose: bool) -> bool {
+    if loose {
+        !within_lanes(net, q, &footprint_reach)
+    } else {
+        !in_waiter_reach(net, q)
+    }
 }
 
 /// A free place behind a full (or missing) kerb waiting area, on the pavement the walker came
 /// along (`way`, the legs walked up to the kerb, the last first): rows `QUEUE_ROW` apart back
 /// from the kerb along them, each across the path's width in stripes (`STRIPE_WIDTH`, at least
-/// one), off every street lane's waiter reach and outside the waiting area; the nearest the kerb
-/// first, in a row the one nearest the walker's own offset.
+/// one), clear for waiting (`clear_for_waiting`, as loose as the area) and outside the waiting
+/// area; the nearest the kerb first, in a row the one nearest the walker's own offset.
 fn behind_the_queue(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &[Leg], id: u32, pos: DVec2) -> Option<DVec2> {
     let mut found = None;
     behind_places(net, queues, area, way, id, pos, &mut |q| {
@@ -4100,6 +4161,8 @@ fn behind_the_queue(net: &Network, queues: &Queues, area: Option<&KerbArea>, way
 /// The free places of `behind_the_queue` in its order, each handed to `each` until it says
 /// stop (false).
 fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &[Leg], id: u32, pos: DVec2, each: &mut dyn FnMut(DVec2) -> bool) {
+    // (as loose as the area: a kerb whose area clears only the lanes' footprints, or has none)
+    let loose = area.is_none_or(|a| a.loose);
     let mut from_kerb = KERB_STEP_BACK as f32;
     for l in way {
         let len = l.len();
@@ -4115,7 +4178,7 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
             offs.sort_by(|a, b| (a - lat).abs().total_cmp(&(b - lat).abs()));
             for off in offs {
                 let q = c + (right * off).extend(0.0);
-                if queues.free(q.truncate(), id) && !area.is_some_and(|a| a.contains(q.truncate())) && !in_waiter_reach(net, q) && !each(q.truncate()) {
+                if queues.free(q.truncate(), id) && !area.is_some_and(|a| a.contains(q.truncate())) && clear_for_waiting(net, q, loose) && !each(q.truncate()) {
                     return;
                 }
             }
@@ -4176,6 +4239,9 @@ fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) ->
             free += 1;
             free <= ahead_of_me
         });
+    }
+    if debug_pax() {
+        log::info!("t={:.1} pax #{} room beyond crossing {} at kerb {:?}: {} places, {} free, {} on the crossing", at.time, me.id, c.key, kerb_key(&next), area.places.len(), free, ahead_of_me);
     }
     if free > ahead_of_me {
         Ok(())
@@ -4509,7 +4575,50 @@ fn kerb_spot(ped: Option<&PedNet>, net: &Network, way: &[Leg], next: &Leg, sprea
         d -= len;
     }
     // the whole way in a lane: the nearest point of a footpath outside them
-    ped.and_then(|p| nearest_off_carriageway(p, net, end, 15.0)).unwrap_or(last.truncate())
+    ped.and_then(|p| nearest_off_carriageway(p, net, end, KERB_SPOT_REACH)).unwrap_or(last.truncate())
+}
+
+/// How far from a kerb (m) `kerb_spot` looks for a footpath point off the lanes when the whole
+/// way lies in their reach, and a waiter with no place in the queue for a free one
+/// (`nearest_free_place`).
+const KERB_SPOT_REACH: f64 = 15.0;
+
+/// The point nearest `at` (within `reach`, at its height) on a footpath, across its width in
+/// stripes (`STRIPE_WIDTH`), clear for waiting at least as loosely as an island stop's places
+/// (`clear_for_waiting`) and free of every other waiter's place (`Queues::free`): where somebody
+/// with no place in a kerb's queue waits.
+fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, reach: f64, id: u32) -> Option<DVec2> {
+    let (cx, cy) = ((at.x / 50.0).floor() as i32, (at.y / 50.0).floor() as i32);
+    let mut best: Option<(f64, DVec2)> = None;
+    let mut seen: Vec<usize> = Vec::new();
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for &i in ped.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if seen.contains(&i) {
+                    continue;
+                }
+                seen.push(i);
+                let l = &net.lanes[i];
+                let cols = ((l.width as f64).max(0.0) / STRIPE_WIDTH).floor().max(1.0) as usize;
+                let len = l.length();
+                let mut s = 0.0f32;
+                while s <= len {
+                    let (c, h) = l.at(s);
+                    let hr = (h as f64).to_radians();
+                    let right = DVec2::new(hr.cos(), -hr.sin());
+                    for j in 0..cols {
+                        let q = c + (right * ((j as f64 - (cols as f64 - 1.0) * 0.5) * STRIPE_WIDTH)).extend(0.0);
+                        let d = (q - at).truncate().length();
+                        if d <= reach && (q.z - at.z).abs() < 2.0 && best.is_none_or(|b| d < b.0) && queues.free(q.truncate(), id) && clear_for_waiting(net, q, true) {
+                            best = Some((d, q.truncate()));
+                        }
+                    }
+                    s += QUEUE_ROW as f32;
+                }
+            }
+        }
+    }
+    best.map(|b| b.1)
 }
 
 /// The point of a footpath within `reach` of `at` (and at its height) nearest to
