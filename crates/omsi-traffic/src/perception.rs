@@ -2477,3 +2477,62 @@ mod signal_tests {
         assert_eq!(signal_ahead(&net, &sim, &way, 2.0).map(|s| s.light), Some(1));
     }
 }
+
+#[cfg(test)]
+mod walk_ahead_tests {
+    use super::*;
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind};
+
+    /// `n` diamonds of 1 m pieces in a row (each forks into two pieces that rejoin: 2^n ways),
+    /// the lanes linked by hand: lane 0 the start; diamond k is lanes 3k+1, 3k+2 (the branches)
+    /// and 3k+3 (the join).
+    fn diamonds(n: usize) -> Network {
+        let mut net = Network::default();
+        let piece = |x: f64| LaneBuilder::polyline(vec![DVec3::new(x, 0.0, 0.0), DVec3::new(x + 1.0, 0.0, 0.0)], LaneKind::Street, 3.0);
+        net.lanes.push(piece(0.0));
+        for k in 0..n {
+            let x = 1.0 + 2.0 * k as f64;
+            net.lanes.push(piece(x));
+            net.lanes.push(piece(x));
+            net.lanes.push(piece(x + 1.0));
+            let (a, b, j, prev) = (3 * k + 1, 3 * k + 2, 3 * k + 3, if k == 0 { 0 } else { 3 * k });
+            net.lanes[prev].next = vec![a, b];
+            net.lanes[a].next = vec![j];
+            net.lanes[b].next = vec![j];
+        }
+        net
+    }
+
+    /// `walk_ahead` visits each lane at most once per number of lanes walked, never more than
+    /// `depth` lanes on, and with the furthest entry: on 20 diamonds (2^20 ways) and depth 24 it
+    /// makes at most (lanes) x (depth + 1) visits, the last layer marked `last`, and the join of
+    /// diamond k is entered 2k + 2 m on.
+    #[test]
+    fn walk_ahead_is_bounded_by_lanes_and_depth() {
+        let net = diamonds(20);
+        let depth = 24;
+        let mut visits: Vec<(usize, f32, bool)> = Vec::new();
+        walk_ahead(&net, &[(0, 0.0)], depth, |l, at, last| {
+            visits.push((l, at, last));
+            true
+        });
+        assert!(visits.len() <= net.lanes.len() * (depth + 1), "{} visits", visits.len());
+        // (layer by layer: the start, then branches and joins alternate - the join of diamond k
+        // is layer 2k + 2 - so depth 24 ends at the twelfth join, lane 36, marked last)
+        assert_eq!(visits.len(), 1 + 2 * 12 + 12, "{visits:?}");
+        assert!(visits.iter().all(|&(l, _, last)| last == (l == 3 * 11 + 3)), "{visits:?}");
+        for k in 0..12 {
+            let j = 3 * k + 3;
+            let at = visits.iter().find(|v| v.0 == j).expect("join visited").1;
+            assert!((at - (2.0 * k as f32 + 2.0)).abs() < 1e-3, "join {j} at {at}");
+        }
+        // (a visit that returns false stops that way: nothing past the first diamond)
+        let mut n = 0;
+        walk_ahead(&net, &[(0, 0.0)], depth, |l, _, _| {
+            n += 1;
+            l == 0
+        });
+        assert_eq!(n, 3);
+    }
+}

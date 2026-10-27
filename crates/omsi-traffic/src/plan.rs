@@ -1265,10 +1265,11 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     let clears = |gap: f32| {
         let lead_box = Obb::vehicle(DVec2::new(dir as f64 * lead.lateral as f64, (st.front + gap) as f64 + lead.length as f64 * 0.5), 0.0, lead.length as f64 * 0.5, lead.length as f64 * 0.5, lead.half_width as f64);
         let mut d = 0.0f64;
+        let mut prev = None;
         while d <= len as f64 + c {
             let slope = (at(d + c) - at(d - c)) / (2.0 * c);
             let b = Obb::vehicle(DVec2::new(at(d), d), slope.atan().to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
-            if b.separation(&lead_box) < SQUEEZE_CLEARANCE as f64 {
+            if !sample_clear(&mut prev, b, b.separation(&lead_box), SQUEEZE_CLEARANCE as f64) {
                 return false;
             }
             d += 0.1;
@@ -1529,6 +1530,11 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if !need.is_finite() || l.gap >= need {
         return None;
     }
+    // (nor where the bypass already clears from here: the room is found by halving and the
+    // backing lands on it to the float, so the bypass itself decides, `bypass_start`)
+    if [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, sim, me, &nb, &l) && bypass_start(net, sim, vehicles, me, p, &nb, &l).is_some()) {
+        return None;
+    }
     let back = need - l.gap;
     // (the body stays on its own lane, and rests where it may wait)
     if st.s - st.rear - back < 0.0 || !rest_clear_of_bands(net, sim, me, st.s - back) {
@@ -1660,6 +1666,25 @@ enum Profile {
     FullLock { pre: f32 },
 }
 
+/// One more sample of a swept move (`body_sweep_clear`, `bypass_room`): the body's pose `b`, its
+/// least separation `sep` from what is swept, after the sample `prev` (updated). Between two
+/// samples no point of the body moves further than the largest corner displacement `shift`
+/// between the two poses (a rigid move displaces a box's points most at a corner), so a pose a
+/// share u of the way is at least `psep - u shift` and `sep - (1 - u) shift` clear: the poses
+/// between keep `clearance` where `(psep + sep - shift) / 2` does. A sweep sampled every few
+/// centimetres holds between its samples too.
+fn sample_clear(prev: &mut Option<(Obb, f64)>, b: Obb, sep: f64, clearance: f64) -> bool {
+    let ok = match *prev {
+        Some((pb, psep)) => {
+            let shift = pb.corners().iter().zip(b.corners().iter()).map(|(a, c)| a.distance(*c)).fold(0.0f64, f64::max);
+            0.5 * (psep + sep - shift) >= clearance
+        }
+        None => sep >= clearance,
+    };
+    *prev = Some((b, sep));
+    ok
+}
+
 /// Which vehicles and players a swept move is checked against (`body_sweep_clear`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Bodies {
@@ -1679,6 +1704,8 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     let counts = |speed: f32| bodies == Bodies::All || speed.abs() < STANDING_SPEED;
     let near: Vec<usize> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter(|&j| counts(vehicles[j].state.speed)).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
+    // (the last sample's pose and its least separation)
+    let mut prev: Option<(Obb, f64)> = None;
     let mut d = 0.0f32;
     while d <= level {
         let (lat, slope) = match profile {
@@ -1702,16 +1729,21 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let right = DVec2::new(f.y, -f.x);
         let dir = (f + right * slope as f64).normalize();
         let b = Obb::vehicle(p + right * lat as f64, dir.x.atan2(dir.y).to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+        // (the least separation of this pose from what is swept)
+        let mut sep = f64::INFINITY;
         for &j in &near {
             let o = &vehicles[j];
-            if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 && o.obb().separation(&b) < clearance {
-                return false;
+            if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
+                sep = sep.min(o.obb().separation(&b));
             }
         }
-        if sim.players.iter().any(|pl| counts(pl.speed) && (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
-            return false;
+        for pl in sim.players.iter().filter(|pl| counts(pl.speed) && (pl.pos.z - me.pos.z).abs() <= 3.0) {
+            sep = sep.min(pl.obb(0.0, 0.0).separation(&b));
         }
-        if parked.iter().chain(people).any(|o| o.separation(&b) < clearance) {
+        for o in parked.iter().chain(people) {
+            sep = sep.min(o.separation(&b));
+        }
+        if !sample_clear(&mut prev, b, sep, clearance) {
             return false;
         }
         // (the arcs' bends turn the body fast: sampled finer)
@@ -2186,12 +2218,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // backing up out of a packed queue (`queue_escape`): to the place fixed when
     // it began, the speed braking to it (`AiState::reverse_step`); every frame the strip behind is
     // swept again (`rear_clear`) and the queue looked at: any change and the car stops, a committed
-    // stop over its brake distance from where it is, kept to the end
+    // stop over its brake distance from where it is (never past the place fixed), kept to the end
     if let Some((target, stopping)) = me.reversing {
         let left = st.odometer - target;
         let queue_stands = p.leader.is_none_or(|l| l.speed.abs() < STANDING_SPEED);
         let go_on = !stopping && left > 0.0 && queue_stands && rear_clear(net, sim, vehicles, me, left);
-        out.reverse = Some(if stopping || go_on { (target, stopping) } else { (st.odometer - st.speed * st.speed / (2.0 * st.decel.max(0.5)), true) });
+        // (the committed stop is never past the place fixed: backing stops there at the latest)
+        out.reverse = Some(if stopping || go_on { (target, stopping) } else { ((st.odometer - st.speed * st.speed / (2.0 * st.decel.max(0.5))).max(target), true) });
         out.held = true;
         out.why = if out.why == Why::None { Why::Lead } else { out.why };
         return out;

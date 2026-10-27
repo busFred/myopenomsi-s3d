@@ -274,6 +274,35 @@ fn removal_rule(why: &str) -> RemoveRule {
     }
 }
 
+/// Asks every entry of `pending` once (`advance`: whether it is still pending), in order, and
+/// keeps those still pending: one that cannot go holds back none after it (SUMO retries every
+/// parked vehicle each step, `MSVehicleTransfer::checkInsertions`).
+fn retry_each<T>(pending: Vec<T>, mut advance: impl FnMut(&T) -> bool) -> Vec<T> {
+    pending.into_iter().filter(|p| advance(p)).collect()
+}
+
+#[cfg(test)]
+mod retry_each_tests {
+    use super::retry_each;
+
+    /// H9-1: every pending pull-out is asked on every call, in order; one whose way out does
+    /// not clear stays pending and holds back nobody after it; the ones that went are dropped.
+    #[test]
+    fn every_pending_pull_out_is_asked_each_call() {
+        let mut asked = Vec::new();
+        // (1 and 3 cannot go yet, 2 and 4 go)
+        let keep = retry_each(vec![1, 2, 3, 4], |&k| {
+            asked.push(k);
+            k % 2 == 1
+        });
+        assert_eq!(asked, vec![1, 2, 3, 4], "every entry asked, the blocked first one too");
+        assert_eq!(keep, vec![1, 3]);
+        // (next call: 1 still blocked, 3 goes)
+        let keep = retry_each(keep, |&k| k == 1);
+        assert_eq!(keep, vec![1]);
+    }
+}
+
 /// A parked object that signals to pull out: which, its AI type, the
 /// lane point it leaves onto and its offset there, its body's extents, when its signalling time
 /// has run (`Traffic::time`), its seed.
@@ -2561,8 +2590,9 @@ impl Traffic {
         }
     }
 
-    /// The parked object that signals to pull out (`pending_pull_out`): once its signalling
-    /// time has run and the one pull-out rule passes (`plan::pull_out_clear`: every vehicle
+    /// Asks one parked object of `pending_pull_out` (`pp`) whether it pulls out now, and
+    /// returns whether it is still pending (false: it pulled out, or its object is gone). Once
+    /// its signalling time has run and the one pull-out rule passes (`plan::pull_out_clear`: every vehicle
     /// driving up the lane, the players too, beyond its own secure gap; nobody on the strip its
     /// body sweeps from its offset onto the lane) and its lane point is clear (`spawn_clear`),
     /// it leaves the kerb: the parked object goes (its space stays empty), the AI car of the
@@ -2572,8 +2602,6 @@ impl Traffic {
     /// waits at the offset. The parked object is scenery and shows no indicator, a limit of the
     /// scenery objects: the signalling is only the time that runs before the rule is asked, and
     /// the lamp lights (left indicator) from the frame the AI car replaces the object.
-    /// Whether `pp` is still pending after this call (false: it pulled out, or its object is
-    /// gone).
     fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, pp: &PendingPullOut) -> bool {
         let pp = pp.clone();
         let parked = world.parked_objects.lock().get(&pp.key).map(|p| p.pos);
@@ -2622,22 +2650,17 @@ impl Traffic {
         false
     }
 
-    /// Every parked object signalling to pull out is asked again on every call (SUMO retries
-    /// every parked vehicle each step, `MSVehicleTransfer::checkInsertions`): one whose way out
-    /// does not clear holds back nobody else's. Now and then (`PULL_OUT_CHANCE` per call,
+    /// Every parked object signalling to pull out is asked again on every call (`retry_each`;
+    /// SUMO retries every parked vehicle each step, `MSVehicleTransfer::checkInsertions`): one
+    /// whose way out does not clear holds back nobody else's. Now and then (`PULL_OUT_CHANCE` per call,
     /// called with every population pass, about every two seconds) another car parked at the
     /// kerb 25-180 m from the player is chosen to drive off: it joins `pending_pull_out`
     /// (`advance_pull_out`).
     pub fn pull_out_parked(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
         let pending = std::mem::take(&mut self.pending_pull_out);
-        let mut keep = Vec::with_capacity(pending.len());
-        for pp in pending {
-            if self.advance_pull_out(world, renderer, scene, center, &pp) {
-                keep.push(pp);
-            }
-        }
-        keep.append(&mut self.pending_pull_out);
-        self.pending_pull_out = keep;
+        let keep = retry_each(pending, |pp| self.advance_pull_out(world, renderer, scene, center, pp));
+        let mut added = std::mem::replace(&mut self.pending_pull_out, keep);
+        self.pending_pull_out.append(&mut added);
         if self.rand_f() >= PULL_OUT_CHANCE {
             return;
         }

@@ -87,3 +87,86 @@ fn follower_two_lanes_back_aborts_a_signalled_change() {
     let (dropped, done) = signalled_change(50.0);
     assert!(dropped.is_none() && done, "with the follower far back the change is carried out (dropped at {dropped:?}, done {done})");
 }
+
+/// Two eastbound lanes of one road to x 600: 0 the left at y 0, 1 the right at y -3.5.
+fn two_lanes() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (600.0, 0.0)], 1, 0, 0.0));
+    net.lanes.push(road(&[(0.0, -3.5), (600.0, -3.5)], 1, 1, 3.5));
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net
+}
+
+/// A car standing for good (its own plan never moves it off).
+fn standing(id: u64, lane: usize, s: f32) -> Vehicle {
+    let mut o = car(id, lane, s, 0.0);
+    o.pull_out = 1000.0;
+    o.state.change_cooldown = 1000.0;
+    o
+}
+
+/// Car 1 at rest on the right lane 6.5 m (front to rear: 2.5 m, just over the full-lock room of
+/// about 2.3-2.4 m for a 4 m car over 3.5 m, `plan::bypass_room`) behind car 2 standing, with
+/// `beside` standing on the left lane if given; runs `secs`: (when its speed-gain wish to the left
+/// first passed `SPEED_GAIN_THRESHOLD`, the change it started - (t, full lock) -, the least gap of
+/// its body to any other, whether it ended on the left lane).
+fn from_rest(beside: Option<f32>, secs: f32) -> (Option<f32>, Option<(f32, bool)>, f32, bool) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change_cooldown = 0.0;
+    let mut cars = vec![me, standing(2, 1, 106.5)];
+    if let Some(s) = beside {
+        cars.push(standing(3, 0, s));
+    }
+    let (mut wished, mut started, mut least) = (None, None, f32::INFINITY);
+    let mut t = 0.0f32;
+    while t < secs {
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if wished.is_none() && me.speed_gain[0] > omsi_traffic::plan::SPEED_GAIN_THRESHOLD {
+            wished = Some(t);
+        }
+        if started.is_none() {
+            if let Some(c) = me.state.change {
+                started = Some((t, c.full_lock));
+            }
+        }
+        for o in cars.iter().filter(|o| o.id != 1) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        t += DT;
+    }
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    (wished, started, least, me.state.lane == 0)
+}
+
+/// SUMO LC2013's speed-gain wish accumulates from rest: standing behind a standing car with the
+/// left lane empty, the relative gain is about 1 per second (the safe speed beside over
+/// `RELGAIN_NORMALIZATION_MIN_SPEED`, its own 0), so the wish passes its threshold within half
+/// a second, well before the obstacle motive's 4 s of standing; the car then steps out from 2.5 m
+/// behind at full lock and ends on the left lane without coming within `SQUEEZE_CLEARANCE` of a
+/// body.
+#[test]
+fn the_speed_gain_wish_accumulates_from_rest_and_the_car_steps_out_at_full_lock() {
+    let (wished, started, least, left) = from_rest(None, 12.0);
+    let t = wished.expect("the speed-gain wish never passed its threshold");
+    assert!(t < 0.5, "the wish passed its threshold only at {t:.2} s");
+    let (ts, full_lock) = started.expect("never stepped out");
+    assert!(ts < 4.0 && full_lock, "stepped out at {ts:.2} s, full lock {full_lock}");
+    assert!(least > 0.3 && left, "least {least:.2}, on the left lane {left}");
+}
+
+/// The step-out from rest at full lock sweeps its turned body past the bodies near: with a car
+/// standing on the left lane level with it, a metre or three ahead, it does not set out (and
+/// touches nothing).
+#[test]
+fn no_step_out_from_rest_into_a_car_standing_in_the_target_lane() {
+    for s in [100.0f32, 103.0, 106.0] {
+        let (_, started, least, left) = from_rest(Some(s), 12.0);
+        assert!(started.is_none() && !left, "car beside at s {s}: set out {started:?}");
+        assert!(least > 0.3, "car beside at s {s}: least {least:.2}");
+    }
+}

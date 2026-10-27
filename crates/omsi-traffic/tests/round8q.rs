@@ -135,9 +135,9 @@ fn packed_queue(net: &Network, n: u64, gap: f32, stood: f32) -> Vec<Vehicle> {
     cars
 }
 
-/// The gap the queues stand packed at (m): closer than the room a bypass needs even at full
-/// lock (`plan::full_lock_len`; 2.0 m behind a car on 3.5 m lanes now steers out, about 2.3 m
-/// needed), so that the car must back up first.
+/// The gap the queues stand packed at (m): more than a metre closer than the room the bypass
+/// needs even at full lock (`plan::bypass_room` for these 4 m cars on 3.5 m lanes: about
+/// 2.3-2.4 m), so that each car must back up first and the queue dissolves from the back.
 const PACKED: f32 = 1.2;
 
 /// What a run did: per car id 1..=n when it was on the left lane, its least gap to any body, the
@@ -185,9 +185,7 @@ fn q81_a_packed_queue_behind_a_vehicle_standing_for_good_dissolves_from_the_back
     let cars = packed_queue(&net, 3, PACKED, 30.0);
     let e = escape(&net, cars, vec![], 3, 60.0);
     eprintln!("packed: round {:?} backed {:?} least {:.2}", e.round, e.backed, e.least);
-    // (the full-lock move, `plan::full_lock_len`, is swept at `SQUEEZE_CLEARANCE` 0.3 with the
-    // body's heading modelled as the simulation turns it; it comes 0.295 m)
-    assert!(e.least > 0.25, "came {:.2} m to a body", e.least);
+    assert!(e.least > 0.3, "came {:.2} m to a body", e.least);
     for (k, r) in e.round.iter().enumerate() {
         assert!(r.is_some_and(|t| t < 60.0), "car {} never got round: {:?}", k + 1, e.round);
     }
@@ -325,8 +323,7 @@ fn q81_fix1_a_backing_car_stops_when_the_queue_moves_and_never_backs_past_the_pl
         cars.retain(|c| c.id != 5);
     }, 25.0);
     eprintln!("head gone: over {over:.2} least {least:.2}");
-    // (a stop from walking pace lands within 5 cm: the 1.1 m backing to the full-lock room)
-    assert!(backed && over <= 0.05, "backed {over:.2} m past the place fixed");
+    assert!(backed && over <= 0.0, "backed {over:.2} m past the place fixed");
 }
 
 #[test]
@@ -346,7 +343,7 @@ fn q81_fix1_followers_rolling_up_during_the_whole_backing_are_not_backed_into() 
             cars.push(f);
         }, 30.0);
         eprintln!("{class:?} {len} m follower: backed {backed} over {over:.2} least {least:.2}");
-        assert!(least > 0.25, "{class:?} {len} m: touched {least:.2}");
+        assert!(least > 0.3, "{class:?} {len} m: touched {least:.2}");
         assert!(over <= 0.0);
     }
 }
