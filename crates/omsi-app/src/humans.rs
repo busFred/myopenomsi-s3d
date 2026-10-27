@@ -1722,8 +1722,8 @@ impl PedWalk {
     }
 
     /// Round where they stand on a pavement leg (`BoxOutcome::Wall`): back along it to the end
-    /// it came from, and on from there as a stroll goes on (`plan_next_leg`, never straight back,
-    /// never onto a walled path); a closed end counted (`closed_ends`, `pocket`).
+    /// it came from, and on from there as a stroll goes on (`plan_next_leg`: never onto a walled path,
+    /// straight back along the path only at a dead end); a closed end counted (`closed_ends`, `pocket`).
     fn turn_round(&mut self, net: &Network) {
         let Some(&cur) = self.legs.get(self.leg) else { return };
         let here = cur.dist(self.s.min(cur.len()));
@@ -3021,8 +3021,9 @@ impl PedNet {
         self.walled_beside(node, lane) && self.next_leg(net, node, lane, 0).is_some_and(|l| l.lane == lane)
     }
 
-    /// A leg leaving junction `node`, not back along `came`. At a dead end: on over a one-way
-    /// crossing piece ending there against its way (), else back along `came`.
+    /// A leg leaving junction `node`, not back along `came` and never a walled path
+    /// (`walls`). At a dead end (no other way, or all walled): on over a one-way
+    /// crossing piece ending there against its way, else back along `came`.
     fn next_leg(&self, net: &Network, node: usize, came: usize, pick: u64) -> Option<Leg> {
         let back = self.ends.get(&came).copied();
         let twin = |l: usize| -> bool {
