@@ -370,11 +370,13 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
         route = near_big.iter().find_map(|b| around_box(b, here, dir));
         // (on a pavement only round it inside the path: never out over the kerb into a
         // street lane, SUMO's stripes of the own lane; and, as the way along a box, off every
-        // street lane's footprint and a body from corner to corner, not at the corners only:
-        // where the want holds no corridor, at the kerb, the way round a bus pulling in led
-        // behind its end across the lane it stood in, both corners off it)
+        // street lane's footprint and a body all the way - from where they stand to the first
+        // corner and on to the second, not at the corners only: where the want holds no corridor,
+        // at the kerb, the way round a bus pulling in led behind its end across the lane it stood
+        // in, both corners off it; a side street's lane ending at the path lay between the walker
+        // and the first corner)
         if on_pavement {
-            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_off_lanes(wp, off_lanes));
+            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_off_lanes(&[here, wp[0], wp[1]], off_lanes));
         }
     }
     // (a map-parked car in the way, of any size: past it beside it within the path and off the
@@ -382,7 +384,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     let parked = on_pavement && blocker.is_some_and(|k| block_car.get(k) == Some(&None));
     if route.is_none() && parked {
         if let Some(Along::Route(wp)) = blocker.map(|k| along_box_off(&blocks[k], here, dir, want.corridor, off_lanes)) {
-            route = way_off_lanes(&wp, off_lanes).then_some(wp);
+            route = way_off_lanes(&[here, wp[0], wp[1]], off_lanes).then_some(wp);
         }
     }
     if let Some(wp) = route {
@@ -13368,6 +13370,35 @@ mod ped_tests {
         assert!(bw.around.is_none(), "{bw:?}");
         let (bw, _) = run(&|_| true);
         assert!(bw.around.is_some(), "{bw:?}");
+    }
+
+    #[test]
+    fn p11_5_the_way_round_a_box_on_a_pavement_keeps_off_the_lanes_from_the_walker_to_the_first_corner() {
+        // the box of p4_the_way_round... lying across the way at (0, 2.5); its corners lie at
+        // x = +-6.2, y 0.5 and 4.5. Two street lanes of 1 m end at the path beside the walker,
+        // at (+-3, 0) (a side street's stub: footprint and a body 0.78 m round the axis): both
+        // corners and the way between them lie off them, the way from the walker at (0, 0) to
+        // either first corner passes 0.24 m from a lane's end, inside its footprint
+        let across = Block { center: DVec2::new(0.0, 2.5), half: DVec2::new(1.2, 5.4), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let blocks = [across];
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let run = |off: &dyn Fn(DVec2) -> bool| {
+            let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
+            let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, false, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
+            (bw, want)
+        };
+        let stub = |q: DVec2, x: f64| {
+            let c = DVec2::new(x, q.y.clamp(-30.0, 0.0));
+            (q - c).length() > 0.5 + BODY_OUTSIDE
+        };
+        let off = |q: DVec2| stub(q, 3.0) && stub(q, -3.0);
+        let (bw, _) = run(&|_| true);
+        let wp = bw.around.expect("round it with no lanes").0;
+        assert!(off(wp[0]) && off(wp[1]) && way_off_lanes(&wp, &off), "the corners and the way between them are off the stubs: {wp:?}");
+        assert!(!way_off_lanes(&[DVec2::ZERO, wp[0]], &off), "the first leg is not");
+        let (bw, want) = run(&off);
+        assert!(bw.around.is_none() && want.vel == DVec2::ZERO && bw.jam > 0.0, "no way round: {bw:?} {:?}", want.vel);
     }
 
     #[test]
