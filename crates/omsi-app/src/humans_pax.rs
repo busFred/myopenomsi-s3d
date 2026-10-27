@@ -622,6 +622,9 @@ pub(super) struct PaxStop {
     /// once it is), and how far its point moved for those who wait at it with no place.
     pub cleared: bool,
     pub kerb_shift: DVec3,
+    /// The waiting places nobody is given (`humans::clear_stop_of_lanes`: inside the people
+    /// strip of a street lane's vehicles with no room clear of it), by place.
+    pub refused: Vec<bool>,
 }
 
 impl PaxStop {
@@ -2608,7 +2611,7 @@ impl Humans {
             .iter()
             .enumerate()
             .filter(|(k, t)| {
-                !**t && !elsewhere
+                !**t && !s.refused.get(*k).copied().unwrap_or(false) && !elsewhere
                     .iter()
                     .any(|q| (*q - s.spots[*k].pos).truncate().length() < 0.4)
             })
@@ -3814,6 +3817,7 @@ mod tests {
             lines: Vec::new(),
             cleared: false,
             kerb_shift: DVec3::ZERO,
+            refused: Vec::new(),
         }
     }
 
@@ -4138,6 +4142,7 @@ mod tests {
             lines: Vec::new(),
             cleared: false,
             kerb_shift: DVec3::ZERO,
+            refused: Vec::new(),
         }
     }
 

@@ -503,6 +503,11 @@ pub fn draw_reach(max_dist: f64, loaded: f64) -> f64 {
     }
 }
 
+/// The cars' people test's strip beside a vehicle's body (m): anybody not on a crossing and not
+/// waiting for that bus whose centre lies within the body's half width and this holds the
+/// vehicle (omsi-traffic perception.rs `people_ahead`: `me.half_width + 0.3`).
+pub(crate) const PEOPLE_STRIP: f64 = 0.3;
+
 /// A car further away than this is below two pixels on a 900-line screen (m).
 const VISIBLE_RANGE: f64 = 900.0;
 

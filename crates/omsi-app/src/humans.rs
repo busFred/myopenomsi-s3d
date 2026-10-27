@@ -4691,7 +4691,8 @@ const WAITER_VEHICLE_WIDTH: f64 = 2.6;
 /// hw+0.28).
 const WAITER_BODY: f64 = 0.28;
 /// A waiting place is moved at most this far (m) to clear the lanes; one that
-/// needs more (a platform between two lanes) stays where the map has it.
+/// needs more stays where the map has it where it lies outside every vehicle's people strip (a
+/// platform between two lanes), and is refused where it does not (`clear_of_lanes`).
 const WAITER_PUSH_MAX: f64 = 1.0;
 
 /// How far from the axis of street lane `l` somebody waiting for a bus keeps.
@@ -4701,17 +4702,28 @@ fn waiter_reach(l: &omsi_sim::traffic::Lane) -> f64 {
 
 /// `q`, moved straight away from the axes of the street lanes it is closer to
 /// than `waiter_reach` (at its height); `q` itself when nothing is that close, or when
-/// clearing them would take it more than `WAITER_PUSH_MAX` or into another lane. Where
-/// that leaves it inside a lane's footprint (an island stop between two lanes narrower than two
-/// waiter reaches: BeijingCity's stop between lanes 410 and 411, 3.1 m apart, whose waiters
-/// stood 0.95 m off 411's axis and held its cars 290-295 s), it is cleared of the lanes'
-/// footprints and a body instead (`footprint_reach`): the cars of the lane pass them.
-pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> DVec3 {
+/// clearing them would take it more than `WAITER_PUSH_MAX` or into another lane and it lies
+/// outside every vehicle's people strip already (`strip_reach`: a place between two lanes 3.5 m
+/// apart). Where it lies inside one, it is cleared of the strips instead; None where that too
+/// fails: no vehicle of the lane could pass somebody waiting there, so nobody waits there
+/// (SUMO's waiting persons stand on the stop's platform beside the stop lane, never in a
+/// vehicle's path). BeijingCity's stop 2296737 has places on the line between two lanes of one
+/// carriageway 3.1 m apart with no footpath (two strips need 3.2 m): its waiters, cleared of the
+/// lanes' footprints only, held a 2.58 m timetable bus and a lorry on either lane 175-290 s.
+pub(crate) fn clear_of_lanes(net: &Network, q: DVec3) -> Option<DVec3> {
     let p = clear_of_lanes_by(net, q, &waiter_reach);
-    if p != q || !within_lanes(net, q, &footprint_reach) {
-        return p;
+    if p != q || !within_lanes(net, q, &strip_reach) {
+        return Some(p);
     }
-    clear_of_lanes_by(net, q, &footprint_reach)
+    let p = clear_of_lanes_by(net, q, &strip_reach);
+    (p != q).then_some(p)
+}
+
+/// How far from the axis of street lane `l` the people strip of every vehicle that drives it
+/// reaches: half the lane's width or half the widest vehicle's (`WAITER_VEHICLE_WIDTH`), and the
+/// strip (`traffic::PEOPLE_STRIP`). Somebody standing farther off holds none of them.
+fn strip_reach(l: &omsi_sim::traffic::Lane) -> f64 {
+    (l.width as f64).max(WAITER_VEHICLE_WIDTH) * 0.5 + crate::traffic::PEOPLE_STRIP
 }
 
 /// Past the touching point (m), so that the float rounding of the separation test does not
@@ -4757,6 +4769,31 @@ const WAITER_SQUARE_REACH: f64 = BODY_OUTSIDE * std::f64::consts::SQRT_2;
 /// `LANE_MIN_WIDTH` at least, and `WAITER_BODY`.
 fn footprint_reach(l: &omsi_sim::traffic::Lane) -> f64 {
     (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY
+}
+
+/// How far apart (m) the bodies of a bus on its way to its stop are laid (`bus_way_bodies`): the
+/// spacing at which the cars' people test samples a car's way (omsi-traffic perception.rs
+/// `WAY_STEP`, private there).
+const BUS_WAY_STEP: f32 = 1.5;
+
+/// The body of bus `v` at every `BUS_WAY_STEP` of its way (`AiState::way_points`: along
+/// its lanes, and out into the bay once it pulls in) from where it is to where it comes to rest
+/// for its stop, `stop_at` metres ahead of its origin to its front (`External::stop_at`, which
+/// the bus service sets within its `STOP_REACH` of the stop): the path the cars' people test
+/// holds it by, sampled as that test samples it (SUMO: persons waiting at a stop stand on its
+/// platform, never in the vehicle's path).
+fn bus_way_bodies(net: &Network, v: &omsi_traffic::Vehicle, stop_at: f32) -> Vec<omsi_sim::collision::Obb> {
+    let st = &v.state;
+    let to = (stop_at - st.front).max(0.0);
+    let n = (to / BUS_WAY_STEP).ceil() as usize;
+    let ds: Vec<f32> = (0..=n).map(|k| (k as f32 * BUS_WAY_STEP).min(to)).collect();
+    let pts = st.way_points(net, std::iter::once(-BUS_WAY_STEP).chain(ds.iter().copied()));
+    pts.windows(2)
+        .filter_map(|w| {
+            let fwd = (w[1] - w[0]).truncate();
+            (fwd.length_squared() > 1e-12).then(|| omsi_sim::collision::Obb::vehicle(w[1].truncate(), fwd.x.atan2(fwd.y).to_degrees(), st.front as f64, st.rear as f64, v.half_width as f64))
+        })
+        .collect()
 }
 
 /// `clear_of_lanes` by the lanes' `reach`.
@@ -4816,22 +4853,30 @@ fn clear_of_lanes_by(net: &Network, q: DVec3, reach_of: &dyn Fn(&omsi_sim::traff
 }
 
 /// The waiting places of `stop` (not the seats: a bench stays where it is)
-/// and its point, cleared of the street lanes (`clear_of_lanes`): the places that moved.
-fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> Vec<usize> {
-    let mut moved = Vec::new();
+/// and its point, cleared of the street lanes (`clear_of_lanes`): the places that moved, and
+/// the places that cannot be cleared, refused (`PaxStop::refused`: nobody is given them). A
+/// point that cannot be cleared stays where the map has it.
+fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> (Vec<usize>, Vec<usize>) {
+    let (mut moved, mut refused) = (Vec::new(), Vec::new());
     for (k, sp) in stop.spots.iter_mut().enumerate() {
         if sp.height != 0.0 {
             continue;
         }
-        let to = clear_of_lanes(net, sp.pos);
-        if (to - sp.pos).length() > 1e-3 {
-            sp.pos = to;
-            moved.push(k);
+        match clear_of_lanes(net, sp.pos) {
+            Some(to) if (to - sp.pos).length() > 1e-3 => {
+                sp.pos = to;
+                moved.push(k);
+            }
+            Some(_) => {}
+            None => {
+                stop.refused[k] = true;
+                refused.push(k);
+            }
         }
     }
-    stop.kerb_shift = clear_of_lanes(net, stop.pos) - stop.pos;
+    stop.kerb_shift = clear_of_lanes(net, stop.pos).map_or(DVec3::ZERO, |p| p - stop.pos);
     stop.cleared = true;
-    moved
+    (moved, refused)
 }
 
 /// Where somebody waits before stepping onto `next` at the end of `way` (the
@@ -5676,6 +5721,9 @@ pub struct Humans {
     /// Counted for the gate (`summary`): person-seconds of strollers jammed, and of
     /// people on foot inside the box of a vehicle moving at 0.5 m/s or more (none should be).
     jam_stats: (f64, f64),
+    /// Counted for the gate (`summary`): the stops' waiting places refused because no vehicle
+    /// of a lane could pass somebody waiting there (`clear_stop_of_lanes`).
+    places_refused: usize,
     /// The stops' waiting places moved out of a standing vehicle's body, with where they
     /// were (they go back once no standing body covers that).
     moved_places: HashMap<(i64, usize), DVec3>,
@@ -5929,6 +5977,7 @@ impl Humans {
             message: None,
             tick_stats: (0, 0.0, 0.0),
             jam_stats: (0.0, 0.0),
+            places_refused: 0,
             inside_seen: HashSet::new(),
             moved_places: HashMap::new(),
             tick_stages: Vec::new(),
@@ -6632,22 +6681,34 @@ impl Humans {
             let mut ids: Vec<i64> = self.stops.iter().filter(|(_, s)| !s.cleared).map(|(&id, _)| id).collect();
             ids.sort_unstable();
             for id in ids {
-                let moved = clear_stop_of_lanes(self.stops.get_mut(&id).unwrap(), net);
-                if moved.is_empty() {
+                let (moved, refused) = clear_stop_of_lanes(self.stops.get_mut(&id).unwrap(), net);
+                self.note_refused(id, &refused);
+                if moved.is_empty() && refused.is_empty() {
                     continue;
                 }
-                let spots: Vec<DVec3> = self.stops[&id].spots.iter().map(|sp| sp.pos).collect();
+                let stop = &self.stops[&id];
+                let spots: Vec<DVec3> = stop.spots.iter().map(|sp| sp.pos).collect();
+                let point = stop.pos + stop.kerb_shift;
+                let mut freed = Vec::new();
                 for p in self.people.iter_mut() {
                     if let State::Pax(x) = &mut p.state {
-                        let Some(k) = x.spot.filter(|k| moved.contains(k)) else { continue };
+                        let Some(k) = x.spot.filter(|k| moved.contains(k) || refused.contains(k)) else { continue };
                         if x.stop == Some(id) && x.inside.is_none() && matches!(x.task, Task::WaitingForBus | Task::WalkingToBusstop) && x.st <= 1 {
-                            // (the few steps there, as to any waiting place)
+                            // (the few steps there, as to any waiting place; from a refused
+                            // place to the stop's point, as somebody with no place)
                             x.task = Task::WalkingToBusstop;
-                            x.target = spots[k];
+                            x.target = if refused.contains(&k) { point } else { spots[k] };
+                            if refused.contains(&k) {
+                                x.spot = None;
+                                freed.push(k);
+                            }
                             x.target_bus = false;
                             x.st = 1;
                         }
                     }
+                }
+                for k in freed {
+                    self.free_spot(id, k);
                 }
             }
         }
@@ -6748,6 +6809,7 @@ impl Humans {
             gather,
             spots,
             taken: vec![false; n],
+            refused: vec![false; n],
             enter_max,
             enter_min,
             length,
@@ -6764,9 +6826,19 @@ impl Humans {
             kerb_shift: DVec3::ZERO,
         };
         if let Some(net) = net {
-            clear_stop_of_lanes(&mut stop, net);
+            let (_, refused) = clear_stop_of_lanes(&mut stop, net);
+            self.note_refused(id, &refused);
         }
         stop
+    }
+
+    /// Counts the waiting places of stop `id` that `clear_stop_of_lanes` refused (`summary`).
+    fn note_refused(&mut self, id: i64, refused: &[usize]) {
+        if refused.is_empty() {
+            return;
+        }
+        self.places_refused += refused.len();
+        log::info!("stop {id}: waiting places {refused:?} refused: inside the people strip of a street lane's vehicles with no room clear of it within {WAITER_PUSH_MAX} m");
     }
 
     /// The stops near the player fill with people (sub_61bf94, every frame): a stop coming
@@ -6949,7 +7021,7 @@ impl Humans {
     /// A person put at a free waiting place of stop `id` (sub_626044) with a destination
     /// drawn from the stop's (sub_61baa8); they settle there as task 6 does.
     fn spawn_waiting(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, id: i64) -> Option<usize> {
-        if self.stops.get(&id)?.taken.iter().all(|t| *t) || !self.pool_room() || self.nothing_soon(id) {
+        if self.stops.get(&id)?.taken.iter().enumerate().all(|(k, t)| *t || self.stops[&id].refused.get(k).copied().unwrap_or(false)) || !self.pool_room() || self.nothing_soon(id) {
             return None;
         }
         let k = self.take_spot(id)?;
@@ -8565,6 +8637,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
+        out.push_str(&format!("; waiting places refused {}", self.places_refused));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -8826,12 +8899,23 @@ impl Humans {
         let block_grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
         // somebody waiting at a stop whose place a standing vehicle's body now covers (a
         // bus pulled into a bay over another stop's waiting places, waiters 0.1 m inside
-        // its flank) steps out of it, to a body clear of
-        // its side: a waiter never stands inside a vehicle (SUMO's waiting persons are on the
-        // platform), and the vehicle can then leave. The body is the one the cars' people test
-        // holds them by (`omsi_traffic::Vehicle::obb`; the drawn bounding box is smaller)
+        // its flank), or the way of a bus to the stop point it brakes for (`bus_way_bodies`),
+        // steps out of it, to a body clear of its side: a waiter never stands inside a vehicle
+        // nor in its path (SUMO's waiting persons are on the stop's platform beside the stop
+        // lane), and the vehicle can then leave or come in. The body is the one the cars'
+        // people test holds them by (`omsi_traffic::Vehicle::obb`; the drawn bounding box is
+        // smaller)
         let bodies: Vec<omsi_sim::collision::Obb> = traffic
-            .map(|t| t.cars.iter().filter(|c| c.ai.state.speed < 0.5 && (c.vehicle.position - self.center).length() < 320.0).map(|c| c.ai.obb()).collect())
+            .map(|t| {
+                let near = |c: &&crate::traffic::AiCar| (c.vehicle.position - self.center).length() < 320.0;
+                let mut v: Vec<omsi_sim::collision::Obb> = t.cars.iter().filter(near).filter(|c| c.ai.state.speed < 0.5).map(|c| c.ai.obb()).collect();
+                for c in t.cars.iter().filter(near) {
+                    if let Some(stop_at) = c.ai.external.stop_at {
+                        v.extend(bus_way_bodies(&t.net, &c.ai, stop_at));
+                    }
+                }
+                v
+            })
             .unwrap_or_default();
         let standing: Vec<Block> = bodies.iter().map(|o| Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }).collect();
         let standing_grid = crowd::BlockGrid::new(&standing, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
@@ -13202,22 +13286,62 @@ mod ped_tests {
     }
 
     #[test]
-    fn p2b2_waiters_on_an_island_stop_between_two_lanes_stand_off_both_footprints() {
-        // BeijingCity d24: the stop between lanes 411 and 410, 3.1 m apart: two waiter reaches
-        // (1.88 m each) do not fit, so the places stayed 0.95 m off 411's axis and its cars stood
-        // for them 290-295 s; cleared of the footprints and a body (1.53 m) they fit
+    fn p11_1_a_waiting_place_between_two_lanes_with_no_room_clear_of_their_vehicles_is_refused() {
+        // BeijingCity d24, stop 2296737: places on the line between lanes 669 (2.3 m) and 670
+        // (2.36 m) of one carriageway, 3.1 m apart, no footpath. Cleared of the lanes'
+        // footprints and a body (1.53 m each) they stood 1.54-1.56 m off both axes and held a
+        // 2.58 m bus on 669 and a lorry on 670 175-290 s; the people strips of the widest
+        // vehicle (1.3 + 0.3 m each) need 3.2 m: refused
         let mut net = Network::default();
-        net.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.36));
-        net.lanes.push(lane(vec![p(-50.0, -3.1), p(50.0, -3.1)], LaneKind::Street, 2.3));
+        net.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.3));
+        net.lanes.push(lane(vec![p(-50.0, 3.1), p(50.0, 3.1)], LaneKind::Street, 2.36));
         net.build_grid();
-        let q = clear_of_lanes(&net, p(0.0, -0.95));
-        assert!(q.y < -1.53 + 1e-6 && q.y > -3.1 + 1.53 - 1e-6, "{q:?}");
+        for y in [1.0, 1.55, 2.0] {
+            assert_eq!(clear_of_lanes(&net, p(0.0, y)), None, "{y}");
+        }
         // a kerb stop with room: the waiter reach as before
         let mut wide = Network::default();
         wide.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.36));
         wide.build_grid();
-        let q = clear_of_lanes(&wide, p(0.0, -0.95));
-        assert!((q.y + waiter_reach(&wide.lanes[0]) + 0.01).abs() < 1e-6, "{q:?}");
+        let q = clear_of_lanes(&wide, p(0.0, 0.95)).unwrap();
+        assert!((q.y - waiter_reach(&wide.lanes[0]) - 0.01).abs() < 1e-6, "{q:?}");
+        // lanes 3.4 m apart: no room for the waiter reaches (1.88 m), the middle 1.7 m off both
+        // axes is outside both strips: it stays
+        let mut apart = Network::default();
+        apart.lanes.push(lane(vec![p(-50.0, 0.0), p(50.0, 0.0)], LaneKind::Street, 2.3));
+        apart.lanes.push(lane(vec![p(-50.0, 3.4), p(50.0, 3.4)], LaneKind::Street, 2.3));
+        apart.build_grid();
+        assert_eq!(clear_of_lanes(&apart, p(0.0, 1.7)), Some(p(0.0, 1.7)));
+        // and moved there from inside a strip
+        let q = clear_of_lanes(&apart, p(0.0, 1.0)).unwrap();
+        assert!(q.y >= 1.6 && q.y <= 3.4 - 1.6, "{q:?}");
+    }
+
+    #[test]
+    fn p11_1_waiters_step_out_of_the_way_of_a_bus_into_its_bay() {
+        // a kerb stop: a timetable bus 2.58 m wide on a 3 m lane pulls 0.83 m out to the kerb
+        // side (right, -y here) over 8 m from 10 m ahead, braking for its stop 30 m ahead; a
+        // waiter 2.2 m off the axis (clear of the lane's waiter reach) stands in its way into the
+        // bay: they step out of it, to the pavement side; a waiter beside the bay is in nobody's way
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(200.0, 0.0)], LaneKind::Street, 3.0));
+        net.build_grid();
+        let mut st = omsi_sim::traffic::AiState::new(0, 52.0, 1);
+        (st.front, st.rear) = (5.68, 6.3);
+        st.lateral_ramp = (0.0, 0.83, 10.0, 8.0);
+        let bus = omsi_traffic::Vehicle::new(1, omsi_traffic::VehicleClass::ScheduledBus, st, 1.29, 1);
+        let bodies = bus_way_bodies(&net, &bus, 30.0);
+        let last = bodies.last().expect("its way");
+        assert!((last.center.x + last.half.y - (52.0 + 30.0)).abs() < 0.2 && (last.center.y + 0.83).abs() < 0.01, "to its front's rest point in the bay: {last:?}");
+        let blocks: Vec<Block> = bodies.iter().map(|o| Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO }).collect();
+        let grid = crowd::BlockGrid::new(&blocks, WAITER_SQUARE_REACH, crowd::BLOCK_CELL);
+        let free = |q: DVec2| !within_lanes(&net, q.extend(0.0), &footprint_reach);
+        let to = waiter_step_out(DVec2::new(75.0, -2.2), 0.0, &bodies, &blocks, &grid, &free).expect("in its way");
+        // (the cars' people test for its own waiter: outside its half width and a person's radius)
+        assert!(to.y < -(0.83 + 1.29 + omsi_traffic::plan::PERSON_RADIUS as f64) && free(to), "{to:?}");
+        assert!(waiter_step_out(DVec2::new(75.0, -2.8), 0.0, &bodies, &blocks, &grid, &free).is_none());
+        // not past where it comes to rest
+        assert!(waiter_step_out(DVec2::new(52.0 + 30.0 + 1.0, -2.2), 0.0, &bodies, &blocks, &grid, &free).is_none());
     }
 
     #[test]
@@ -13518,15 +13642,16 @@ mod ped_tests {
         let net = road(1.0, false);
         let reach = 1.3 + 0.28 + 0.3;
         for y in [1.46, 1.5, 1.55, -1.5] {
-            let q = clear_of_lanes(&net, p(3.0, y));
+            let q = clear_of_lanes(&net, p(3.0, y)).unwrap();
             assert!((q.y.abs() - reach).abs() < 0.02 && q.y.signum() == f64::signum(y) && (q.x - 3.0).abs() < 1e-6, "{y} -> {q:?}");
         }
-        assert_eq!(clear_of_lanes(&net, p(3.0, 2.2)), p(3.0, 2.2), "clear already");
-        assert_eq!(clear_of_lanes(&net, DVec3::new(3.0, 1.5, 6.0)), DVec3::new(3.0, 1.5, 6.0), "on a bridge above");
+        assert_eq!(clear_of_lanes(&net, p(3.0, 2.2)), Some(p(3.0, 2.2)), "clear already");
+        assert_eq!(clear_of_lanes(&net, DVec3::new(3.0, 1.5, 6.0)), Some(DVec3::new(3.0, 1.5, 6.0)), "on a bridge above");
         // a wide lane: its own half width counts
-        assert!((clear_of_lanes(&road(3.5, false), p(0.0, 2.0)).y - (1.75 + 0.58)).abs() < 0.02);
-        // between two lanes 3.5 m apart there is no clear place within a metre: it stays
-        assert_eq!(clear_of_lanes(&road(1.0, true), p(0.0, 1.75)), p(0.0, 1.75));
+        assert!((clear_of_lanes(&road(3.5, false), p(0.0, 2.0)).unwrap().y - (1.75 + 0.58)).abs() < 0.02);
+        // between two lanes 3.5 m apart there is no place clear of both waiter reaches within a
+        // metre, and the middle is outside both lanes' people strips (1.6 m): it stays
+        assert_eq!(clear_of_lanes(&road(1.0, true), p(0.0, 1.75)), Some(p(0.0, 1.75)));
         // a stop's places: the standing one moves, the bench does not
         let mut stop = PaxStop {
             name: String::new(),
@@ -13550,8 +13675,9 @@ mod ped_tests {
             lines: Vec::new(),
             cleared: false,
             kerb_shift: DVec3::ZERO,
+            refused: vec![false; 3],
         };
-        assert_eq!(clear_stop_of_lanes(&mut stop, &net), vec![0]);
+        assert_eq!(clear_stop_of_lanes(&mut stop, &net), (vec![0], vec![]));
         assert!(stop.cleared && (stop.spots[0].pos.y - reach).abs() < 0.02 && stop.spots[1].pos.y == 1.5 && stop.spots[2].pos.y == 3.0);
         assert!((stop.kerb_shift.y - (reach - 1.5)).abs() < 0.02);
     }
