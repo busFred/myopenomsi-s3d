@@ -1895,8 +1895,9 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     }
     // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
     // beside me (SUMO's anticipated speed there sees a queue standing 50 m on: no change of
-    // speed gain or keep-right into it); at a fork the branch with the most room, the one a
-    // car with no route takes (`omsi_sim::traffic::AiState::choose_after`'s free run)
+    // speed gain or keep-right into it); at a fork the branch with the most room (the branch
+    // the car will take there is not chosen yet: the lane counts as standing only where every
+    // branch does)
     if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
         let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
             let mut best: Option<(f32, f32)> = None;

@@ -3649,10 +3649,12 @@ impl AiState {
     /// network just ahead (`Network::reach`) is taken like any other; one whose road ends at the
     /// loaded tiles' edge (`Network::ends_at_loaded_edge`) only when no other way of its tier is
     /// left (OMSI geometry: the edge is not a place on the map).
-    /// The ways on from the end of `lane` this vehicle chooses among (`choose_after`'s best
-    /// tier, the loaded-tile edge left out where another way of it leads on), with that tier
-    /// (0 open and leading on ... 6 none), leaving out `avoid`.
-    pub fn branch_choices(&self, net: &Network, lane: usize, avoid: &dyn Fn(usize) -> bool) -> (usize, Vec<usize>) {
+    fn choose_after(
+        &mut self,
+        net: &Network,
+        lane: usize,
+        avoid: &dyn Fn(usize) -> bool,
+    ) -> Option<usize> {
         let l = &net.lanes[lane];
         // the ways that lead back round a loop of short lanes are not
         // among the choices (the others are: a street goes on where it has a way on)
@@ -3707,19 +3709,8 @@ impl AiState {
                 choices = open;
             }
         }
-        (best, choices)
-    }
-
-    fn choose_after(
-        &mut self,
-        net: &Network,
-        lane: usize,
-        avoid: &dyn Fn(usize) -> bool,
-    ) -> Option<usize> {
-        let next_len = net.lanes[lane].next.iter().filter(|&&n| !avoid(n)).count();
-        let (best, choices) = self.branch_choices(net, lane, avoid);
         let weighted = best == 0 && self.traffic_pool.is_some();
-        if best > 0 && next_len > 0 {
+        if best > 0 && !next.is_empty() {
             FORK_FALLBACKS[best.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if choices.is_empty() {
@@ -4039,37 +4030,6 @@ impl AiState {
             c.wait = 0.0;
             c.length = c.length.min(left * 0.7).max(6.0);
         }
-    }
-
-    /// Take `branch` after `fork` (the current lane or one of the plan, `upcoming`) and plan
-    /// the way on from there afresh (`extend_plan`). Nothing changes where `fork` is not on the
-    /// plan or `branch` does not follow it, nor for a route.
-    pub fn take_branch(&mut self, net: &Network, fork: usize, branch: usize) {
-        if !self.route.is_empty() || !net.lanes.get(fork).is_some_and(|l| l.next.contains(&branch)) {
-            return;
-        }
-        let mut plan: Vec<usize> = Vec::new();
-        let mut from = None;
-        if fork == self.lane {
-            from = Some(self.lane);
-        } else {
-            for l in self.upcoming() {
-                plan.push(l);
-                if l == fork {
-                    from = Some(l);
-                    break;
-                }
-            }
-        }
-        if from.is_none() {
-            return;
-        }
-        plan.push(branch);
-        let rest = net.lanes[self.lane].length() - self.s;
-        let lane = self.lane;
-        self.extend_plan(net, lane, rest, &mut plan);
-        self.planned_next = plan.first().copied();
-        self.ahead = plan.into_iter().skip(1).collect();
     }
 
     /// The lane sequence the car is driving along: where it came from, where it is, the plan.

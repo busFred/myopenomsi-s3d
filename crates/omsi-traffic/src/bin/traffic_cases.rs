@@ -5219,7 +5219,6 @@ fn ab(args: &[String]) -> Res<()> {
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
         println!("(in-lane offset, whole map: lane_offset_s {:.0})", omsi_traffic::sim::LANE_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
         println!("(changes for speed or keep side into a standing lane, whole map: {})", omsi_traffic::sim::CHANGES_INTO_STANDING.load(std::sync::atomic::Ordering::Relaxed));
-        println!("(fork picks by free run, whole map: {})", omsi_traffic::sim::FORK_FREE_PICKS.load(std::sync::atomic::Ordering::Relaxed));
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting

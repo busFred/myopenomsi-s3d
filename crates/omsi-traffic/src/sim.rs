@@ -697,10 +697,6 @@ pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// anticipated speed there is nil), every simulation of the process (`traffic_cases ab`).
 pub static CHANGES_INTO_STANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Forks where a car took the branch with more room than its planned one (`Plan::take_branch`),
-/// every simulation of the process (`traffic_cases ab`).
-pub static FORK_FREE_PICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
@@ -1887,10 +1883,6 @@ impl Simulation {
         // the last-resort stop's latch: dropped with a start or standing (the plan places it
         // afresh only while the wish is blocked)
         v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
-        if let Some((fork, branch)) = plan.take_branch.filter(|_| plan.start.is_none()) {
-            v.state.take_branch(net, fork, branch);
-            FORK_FREE_PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         // held out of its lane on the way back in: the ramp back begins where
         // the body would first feel it once let go - its start kept a heading chord ahead of
         // the standing body, so the body is not drawn turned into the lane while it waits
