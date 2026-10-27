@@ -95,6 +95,12 @@ pub struct Plan {
     pub help: Option<(usize, f32, f32, f32)>,
     /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
+    /// The lane change it starts goes, for speed or to keep to the side, into a lane whose
+    /// leader within `REACT_TO_STOPPED_DISTANCE` stands (counted, `sim::CHANGES_INTO_STANDING`).
+    pub into_standing: bool,
+    /// At the fork ahead, the branch to take instead of the planned one (fork lane, branch):
+    /// the one with the most room (`fork_pick`).
+    pub take_branch: Option<(usize, usize)>,
     /// The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
@@ -814,6 +820,69 @@ fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool
         Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).is_none_or(|o| o.passing.is_none() && (o.state.speed < STANDING_SPEED || (o.state.lateral - o.state.lateral_target).abs() <= 0.05)),
         Seen::Player(_) | Seen::Parked => true,
     }
+}
+
+/// The free run of `branch` (m, at most `REACT_TO_STOPPED_DISTANCE`): how far from its start
+/// to the rear of the first vehicle standing on it or on the lanes it runs into (at a fork the
+/// branch with the most room).
+fn free_run(net: &Network, sim: &Simulation, vehicles: &[Vehicle], branch: usize) -> f32 {
+    let reach = crate::perception::REACT_TO_STOPPED_DISTANCE;
+    fn walk(net: &Network, sim: &Simulation, vehicles: &[Vehicle], l: usize, d0: f32, reach: f32, depth: usize) -> f32 {
+        let mut near = f32::INFINITY;
+        for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let o = &vehicles[occ.vehicle];
+            if o.state.speed < STANDING_SPEED {
+                near = near.min(d0 + occ.s - o.state.rear);
+            }
+        }
+        for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(pl) = sim.players.get(k).filter(|pl| pl.speed < STANDING_SPEED) {
+                near = near.min(d0 + ps - pl.half_len);
+            }
+        }
+        let end = d0 + net.lanes[l].length();
+        if near.is_finite() || end >= reach || depth == 0 {
+            return near.min(reach).max(0.0);
+        }
+        // (at a fork the branch with the most room; a way that ends: its end)
+        net.lanes[l].next.iter().map(|&n| walk(net, sim, vehicles, n, end, reach, depth - 1)).reduce(f32::max).unwrap_or(end).min(reach)
+    }
+    walk(net, sim, vehicles, branch, 0.0, reach, FORK_LOOK_LANES)
+}
+
+/// Lanes deep a branch's free run is looked along (`free_run`: junction pieces of a metre come in
+/// chains).
+const FORK_LOOK_LANES: usize = 24;
+
+/// At the first fork on my way within `REACT_TO_STOPPED_DISTANCE` of my front: where the
+/// planned branch has a vehicle standing on it within that distance, the branch of the ones I
+/// may take there (`AiState::branch_choices`' best tier) with the most room (`free_run`), when
+/// it has more. SUMO's car with no route has no such choice (its route decides); the free run
+/// is what SUMO's `departLane="free"` reads for the lane it puts a vehicle on (sumo.md 5.1),
+/// and a stopped leader within `REACT_TO_STOPPED_DISTANCE` is what LC2013 reacts to.
+fn fork_pick(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception) -> Option<(usize, usize)> {
+    let st = &me.state;
+    let reach = crate::perception::REACT_TO_STOPPED_DISTANCE;
+    for w in p.way.windows(2) {
+        let ((l, d0), (planned, _)) = (w[0], w[1]);
+        if d0 + net.lanes[l].length() - st.front > reach {
+            return None;
+        }
+        if net.lanes[l].next.len() < 2 {
+            continue;
+        }
+        let (_, choices) = st.branch_choices(net, l, &|_| false);
+        if choices.len() < 2 || !choices.contains(&planned) {
+            return None;
+        }
+        let mine = free_run(net, sim, vehicles, planned);
+        if mine >= reach {
+            return None;
+        }
+        let (best, room) = choices.iter().map(|&b| (b, free_run(net, sim, vehicles, b))).fold((planned, mine), |a, b| if b.1 > a.1 { b } else { a });
+        return (room > mine && best != planned).then_some((l, best));
+    }
+    None
 }
 
 /// The lateral gap (m) an in-lane squeeze keeps from the body it passes, measured from that
@@ -2074,6 +2143,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
+    // the fork ahead: the branch with the most room (`fork_pick`)
+    if st.route.is_empty() && st.change.is_none() {
+        out.take_branch = fork_pick(net, sim, vehicles, me, p);
+    }
+
     // a bypass signalling stands where it is until it moves over (the room it was started
     // with is the room it has: rolled on meanwhile, the lead stayed in its corridor and held it
     // half out)
@@ -2113,6 +2187,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 None => Some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
+            out.into_standing = matches!(why, ChangeWhy::SpeedGain | ChangeWhy::KeepSide) && nb.ahead.is_some_and(|(g, va)| va < STANDING_SPEED && g + st.front < crate::perception::REACT_TO_STOPPED_DISTANCE);
         } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
             // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
             // when only it is in the way (room ahead there), is asked to make room

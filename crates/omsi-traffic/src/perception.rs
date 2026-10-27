@@ -232,7 +232,9 @@ pub struct NeighbourView {
     pub lane: usize,
     /// 1 left, 2 right.
     pub dir: i32,
-    /// Nearest vehicle ahead there: (gap from my front, its speed).
+    /// Nearest vehicle ahead there: (gap from my front, its speed) - on that lane, or on the
+    /// lanes it runs into within `REACT_TO_STOPPED_DISTANCE` past the place beside me (at a fork
+    /// the branch with the most room).
     pub ahead: Option<(f32, f32)>,
     /// Nearest vehicle behind there: (gap to my rear, its speed).
     pub behind: Option<(f32, f32)>,
@@ -1891,9 +1893,73 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
         lane_users(p, -net.lanes[p].length(), &mut note);
     }
-    // ahead, on the first lane after
-    if let Some(&n) = lane.next.first() {
-        lane_users(n, lane.length(), &mut note);
+    // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
+    // beside me (SUMO's anticipated speed there sees a queue standing 50 m on: no change of
+    // speed gain or keep-right into it); at a fork the branch with the most room, the one a
+    // car with no route takes (`omsi_sim::traffic::AiState::choose_after`'s free run)
+    if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
+        let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
+            let mut best: Option<(f32, f32)> = None;
+            let mut put = |d_rel: f32, rear: f32, speed: f32| {
+                if d_rel >= 0.0 {
+                    let gap = d_rel - rear - st.front;
+                    if best.is_none_or(|b| gap < b.0) {
+                        best = Some((gap, speed));
+                    }
+                }
+            };
+            for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if occ.vehicle != i {
+                    let o = &vehicles[occ.vehicle];
+                    put(occ.s + offset - s_b, o.state.rear, o.state.speed);
+                }
+            }
+            for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let pl = &sim.players[k];
+                put(ps + offset - s_b, pl.half_len, pl.speed);
+            }
+            best
+        };
+        // (the nearest one on a branch, or None where it is free to the distance)
+        fn walk(net: &Network, first: &dyn Fn(usize, f32) -> Option<(f32, f32)>, l: usize, offset: f32, reach: f32, depth: usize) -> Option<(f32, f32)> {
+            if let Some(a) = first(l, offset) {
+                return Some(a);
+            }
+            let end = offset + net.lanes[l].length();
+            if end >= reach || depth == 0 {
+                return None;
+            }
+            let mut best: Option<Option<(f32, f32)>> = None;
+            for &n in &net.lanes[l].next {
+                let a = walk(net, first, n, end, reach, depth - 1);
+                // (the branch with the most room: free beats any vehicle)
+                if best.is_none_or(|b| match (b, a) {
+                    (Some(x), Some(y)) => y.0 > x.0,
+                    (Some(_), None) => true,
+                    _ => false,
+                }) {
+                    best = Some(a);
+                }
+            }
+            best.flatten()
+        }
+        let reach = s_b + REACT_TO_STOPPED_DISTANCE;
+        let mut far: Option<Option<(f32, f32)>> = None;
+        for &n in &lane.next {
+            let a = walk(net, &first, n, lane.length(), reach, NEIGHBOUR_AHEAD_LANES);
+            if far.is_none_or(|b| match (b, a) {
+                (Some(x), Some(y)) => y.0 > x.0,
+                (Some(_), None) => true,
+                _ => false,
+            }) {
+                far = Some(a);
+            }
+        }
+        if let Some(Some(a)) = far {
+            if ahead.is_none_or(|x| a.0 < x.0) {
+                ahead = Some(a);
+            }
+        }
     }
     let runs_on = net.reach.get(nb).copied().unwrap_or(lane.length()) - s_b;
     // a turn the lane leads into within 150 m
@@ -1908,6 +1974,14 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     }
     Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
+
+/// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): a stopped leader this near on a lane is
+/// reacted to; the lane beside is looked along this far past the place beside me for its
+/// leader (`NeighbourView::ahead`).
+pub const REACT_TO_STOPPED_DISTANCE: f32 = 100.0;
+/// The lanes beside looked along for their leader (`NeighbourView::ahead`) are at most this
+/// many deep (junction pieces of a metre each come in chains).
+const NEIGHBOUR_AHEAD_LANES: usize = 24;
 
 /// Why my lane ends for me (`LaneEnd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

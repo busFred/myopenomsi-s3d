@@ -445,6 +445,9 @@ fn j5_the_room_past_the_crossing_counts_a_car_just_past_it_not_the_side_stretch_
         let mut mine = car(1, 0, 120.0, 8.0);
         mine.state.planned_next = Some(1);
         mine.state.ahead = vec![2, 3, 4, 5];
+        // (its way is this chain: a route, not a random pick the free run may change at the
+        // fork into the twin chains, `plan::fork_pick`)
+        mine.state.route = vec![0, 1, 2, 3, 4, 5];
         let mut cars = vec![blocker, mine];
         let mut held_exit = false;
         run(&net, &mut sim, &mut cars, 20.0, |_, _, cars| {
