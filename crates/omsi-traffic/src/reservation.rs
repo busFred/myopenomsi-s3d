@@ -2198,8 +2198,8 @@ mod tests {
         claims[2].until_go = Some(0.5);
         let g = resolve(&js, &claims);
         assert!(!grant_of(&g, 1).go, "{g:?}");
-        // a lead standing for people (stuck): not while that holds (the 08:19 class: a foe
-        // labelled Junction behind a head held by walkers)
+        // a lead standing for people (stuck): not while that holds (the foe queued behind a
+        // head held by walkers on its way, labelled Junction)
         claims[2].until_go = None;
         claims[2].light_red = false;
         claims[2].stuck = true;

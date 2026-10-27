@@ -4560,7 +4560,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     // less, by a partner short of the merge standing at or rolling up to its red -
                     // not one in the merged way ahead, a lead to follow)
                     let tiny = r.vehicles.get(c.vehicle).and_then(|v| v.state.accel_cap).is_some_and(|cap| cap <= CAPPED_START);
-                    let body = g.zipper.is_some_and(|z| r.vehicles.get(z.foe).map(|o| o.id) == c.body_block);
+                    let body = g.zipper.is_some_and(|z| r.vehicles.get(z.foe).is_some_and(|o| c.body_block == Some(o.id)));
                     if c.speed < 0.3 && tiny && body {
                         ex.capped_by_body_s += fdt;
                     }
