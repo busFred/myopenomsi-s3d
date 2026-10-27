@@ -2821,10 +2821,10 @@ struct PedNet {
     /// How many lanes of the traffic network are in (the network only grows: tiles bring
     /// their lanes and the indices stay).
     built: usize,
-    /// The paths a map-parked car closes for strollers (`BoxOutcome::Wall`), with where along
-    /// them it was met: dead ends of the stroll network, as a walking area edge SUMO leaves
-    /// unconnected; the way on (`next_leg`) and the strollers' placer never take them.
-    walls: HashMap<usize, Vec<f32>>,
+    /// The paths a map-parked car closes (`BoxOutcome::Wall`): dead ends of the stroll network,
+    /// as a walking area edge SUMO leaves unconnected; the way on (`next_leg`) and the
+    /// strollers' placer never take them.
+    walls: HashSet<usize>,
 }
 
 impl PedNet {
@@ -2840,7 +2840,7 @@ impl PedNet {
             nodes: Vec::new(),
             cells: HashMap::new(),
             built: 0,
-            walls: HashMap::new(),
+            walls: HashSet::new(),
         };
         p.extend(net);
         log::info!(
@@ -3023,7 +3023,7 @@ impl PedNet {
             .get(node)?
             .iter()
             .copied()
-            .filter(|(l, _)| !twin(*l) && !self.walls.contains_key(l))
+            .filter(|(l, _)| !twin(*l) && !self.walls.contains(l))
             .collect();
         // the way on rather than back: a path leaving the junction within 110° of the way
         // the walker came (there usually is one - a pavement goes on past a side street),
@@ -3392,7 +3392,7 @@ fn plan_next_leg(ped: Option<&PedNet>, net: &Network, walk: &mut PedWalk, rng: &
     let node = ped.and_then(|p| p.end_node(net, &leg));
     let uturn = next.lane == leg.lane;
     let walled_here = match (ped, node) {
-        (Some(p), Some(n)) => p.out.get(n).is_some_and(|v| v.iter().any(|(l, _)| *l != leg.lane && p.walls.contains_key(l))),
+        (Some(p), Some(n)) => p.out.get(n).is_some_and(|v| v.iter().any(|(l, _)| *l != leg.lane && p.walls.contains(l))),
         _ => false,
     };
     if uturn && (walled_here || walk.from_wall) {
@@ -4308,7 +4308,7 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
 /// Whether strollers may be put down on or routed onto path `lane`: no map-parked car closes it
 /// (`PedNet::walls`).
 fn stroll_path_open(ped: Option<&PedNet>, lane: usize) -> bool {
-    !ped.is_some_and(|p| p.walls.contains_key(&lane))
+    !ped.is_some_and(|p| p.walls.contains(&lane))
 }
 
 /// Where the people waiting for crossing `c` (its pieces among `legs`) stand: before its first
@@ -8834,7 +8834,7 @@ impl Humans {
             if outcome == BoxOutcome::Wall {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
                     if let (Some(pn), Some(l)) = (self.ped.as_mut(), walk.legs.get(walk.leg)) {
-                        pn.walls.entry(l.lane).or_default().push(l.dist(walk.s.min(l.len())));
+                        pn.walls.insert(l.lane);
                     }
                     walk.turn_round(net);
                     p.last_decision = Some(TURNS_AT_A_WALL);
@@ -13861,13 +13861,13 @@ mod ped_tests {
         let node = ped.ends[&0].1;
         let open: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
         assert!(open.contains(&1) && open.contains(&2));
-        ped.walls.entry(1).or_default().push(10.0);
+        ped.walls.insert(1);
         assert!(!stroll_path_open(Some(&ped), 1) && stroll_path_open(Some(&ped), 2));
         let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
         assert!(!on.contains(&1), "{on:?}");
         // the other way closed too: the dead end turns them round (a closed end), and a walker who
         // turned at a wall and meets a closed end again is in a pocket: idle, not walking or jammed
-        ped.walls.entry(2).or_default().push(10.0);
+        ped.walls.insert(2);
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 15.0, b: 5.0 }], true, 0.0);
         walk.s = 2.0;
         walk.turn_round(&net);
