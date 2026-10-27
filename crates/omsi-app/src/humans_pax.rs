@@ -54,6 +54,16 @@ use super::*;
 /// rear doors (door-6.osc:372 opens them 0.6 s after the stop, then about 2 s to open).
 const DOOR_PATIENCE: f32 = 12.0;
 const ELDERLY_AGE: f32 = 65.0;
+/// Those with no place at a stop stand spread along it by who they are (`no_place_along`): one of
+/// this many slots a step apart (m), centred on the point - 2.1 m either way - or everybody without
+/// a place stood in one another there.
+pub(super) const NO_PLACE_SLOTS: u32 = 7;
+pub(super) const NO_PLACE_STEP: f64 = 0.7;
+
+/// Where along the stop (m from its point, along its heading) person `id` with no place stands.
+pub(super) fn no_place_along(id: u32) -> f64 {
+    ((id % NO_PLACE_SLOTS) as f64 - (NO_PLACE_SLOTS / 2) as f64) * NO_PLACE_STEP
+}
 /// Seconds before a passenger who changed places changes again.
 const SEAT_MOVE_PAUSE: f64 = 60.0;
 /// How far (m) a standing passenger goes for a freed seat.
@@ -617,11 +627,17 @@ pub(super) struct PaxStop {
     /// stop name and the termini of the buses that go there.
     pub dests: Vec<(String, f32)>,
     pub lines: Vec<(String, HashSet<String>)>,
-    /// [round 6 B3] Its waiting places have been moved clear of the street lanes
-    /// (`humans::clear_of_lanes`; a stop set up before the network was there is cleared
-    /// once it is), and how far its point moved for those who wait at it with no place.
+    /// Its waiting places have been moved clear of the street lanes (`humans::clear_of_lanes`;
+    /// a stop set up before the network was there is cleared once it is).
     pub cleared: bool,
-    pub kerb_shift: DVec3,
+    /// Where those with no place wait, from its point (`humans::clear_stop_of_lanes`): its point
+    /// cleared of the lanes, else the nearest place that is not refused, else its pavement's
+    /// point cleared of the lanes; None when there is none of them (refused, counted: nobody
+    /// waits there without a place).
+    pub kerb_shift: Option<DVec3>,
+    /// Whether the spread of those with no place along the stop (`NO_PLACE_SPREAD`) keeps every
+    /// one of them outside the vehicles' people strips; else they stand at the point itself.
+    pub kerb_spread: bool,
     /// The waiting places nobody is given (`humans::clear_stop_of_lanes`: inside the people
     /// strip of a street lane's vehicles with no room clear of it), by place.
     pub refused: Vec<bool>,
@@ -2442,11 +2458,14 @@ impl Humans {
                 let sp = stop
                     .zip(spot)
                     .and_then(|(s, k)| self.stops.get(&s).and_then(|s| s.spots.get(k)).cloned());
-                // ([round 6 B3] the stop's point as cleared of the street lanes)
-                let stop_pos = stop.and_then(|s| self.stops.get(&s)).map(|s| s.pos + s.kerb_shift);
-                // (no place free: at the stop's point - spread along the kerb by who they
-                // are, or everybody without a place stood in one another there)
-                let along = ((self.people[i].id % 7) as f64 - 3.0) * 0.7;
+                // (no place free: where those with no place wait, `PaxStop::kerb_shift` - spread
+                // along the kerb by who they are where that keeps them out of the strips, or
+                // everybody without a place stood in one another there; with no such point they
+                // stay where they are: a stop without one has every place refused, and nobody is
+                // sent to wait there)
+                let stop_pos = stop.and_then(|s| self.stops.get(&s)).and_then(|s| s.kerb_shift.map(|k| s.pos + k));
+                let spread = stop.and_then(|s| self.stops.get(&s)).is_some_and(|s| s.kerb_spread);
+                let along = if spread { no_place_along(self.people[i].id) } else { 0.0 };
                 let fwd = stop
                     .and_then(|s| self.stops.get(&s))
                     .map(|s| {
@@ -3816,7 +3835,8 @@ mod tests {
             dests: Vec::new(),
             lines: Vec::new(),
             cleared: false,
-            kerb_shift: DVec3::ZERO,
+            kerb_shift: Some(DVec3::ZERO),
+            kerb_spread: true,
             refused: Vec::new(),
         }
     }
@@ -4141,7 +4161,8 @@ mod tests {
             dests: Vec::new(),
             lines: Vec::new(),
             cleared: false,
-            kerb_shift: DVec3::ZERO,
+            kerb_shift: Some(DVec3::ZERO),
+            kerb_spread: true,
             refused: Vec::new(),
         }
     }
