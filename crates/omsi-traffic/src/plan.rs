@@ -1180,7 +1180,7 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
         let parked = parked_boxes(net, sim, me, level + st.front);
         let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-        if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, true) {
+        if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All) {
             return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock });
         }
     }
@@ -1189,10 +1189,11 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
 
 /// Does a lane change into `nb` started now, at speed, clear what is near: the body turned
 /// along the change's smoothstep (`change_length`) after the signalling (`SIGNAL_BEFORE_CHANGE`
-/// at this speed), swept by `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars and
-/// people near, and with a `lead` standing within the move past every body (with none, the
-/// vehicles are the gap rule's). OMSI geometry: the body turns as it moves over, its rear
-/// swinging out the other way, where SUMO's change is a jump.
+/// at this speed), swept by `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars, the
+/// people and the standing vehicles and players near, and with a `lead` standing within the move
+/// past every body (the moving ones are otherwise the gap rule's). OMSI geometry: the body turns
+/// as it moves over, its rear swinging out the other way - into a car standing on the lane or
+/// piece on that side - where SUMO's change is a jump.
 fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: Option<&crate::perception::Headway>) -> bool {
     let st = &me.state;
     let v = st.speed.max(0.0);
@@ -1208,7 +1209,7 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
     let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, lead.is_some())
+    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, if lead.is_some() { Bodies::All } else { Bodies::Standing })
 }
 
 /// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
@@ -1659,13 +1660,24 @@ enum Profile {
     FullLock { pre: f32 },
 }
 
+/// Which vehicles and players a swept move is checked against (`body_sweep_clear`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Bodies {
+    /// Every one near, where it is now.
+    All,
+    /// Only those standing (under `STANDING_SPEED`): where they are now is where they will be
+    /// while the move is made; the moving ones are the gap rule's.
+    Standing,
+}
+
 /// Does my body, turned along a move `side` metres over `out_len` metres (`profile`), clear
-/// every vehicle and player near (with `bodies`; without, they are the gap rule's), the parked
-/// cars (`parked`) and people's discs (`people`) by `SQUEEZE_CLEARANCE`, up to `level` metres on?
+/// the vehicles and players near that `bodies` names, the parked cars (`parked`) and people's
+/// discs (`people`) by `SQUEEZE_CLEARANCE`, up to `level` metres on?
 #[allow(clippy::too_many_arguments)]
-fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32, profile: Profile, bodies: bool) -> bool {
+fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32, profile: Profile, bodies: Bodies) -> bool {
     let st = &me.state;
-    let near = if bodies { sim.vehicles_near(me.pos, (level + 20.0) as f64) } else { Vec::new() };
+    let counts = |speed: f32| bodies == Bodies::All || speed.abs() < STANDING_SPEED;
+    let near: Vec<usize> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter(|&j| counts(vehicles[j].state.speed)).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
     let mut d = 0.0f32;
     while d <= level {
@@ -1696,7 +1708,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
                 return false;
             }
         }
-        if bodies && sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+        if sim.players.iter().any(|pl| counts(pl.speed) && (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
             return false;
         }
         if parked.iter().chain(people).any(|o| o.separation(&b) < clearance) {
@@ -2571,7 +2583,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let level = real + obstacle_len + st.front + st.rear + 2.0;
             let parked = parked_boxes(net, sim, me, level + st.front);
             let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level, Profile::Smooth { pre: 0.0 }, true)
+            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level, Profile::Smooth { pre: 0.0 }, Bodies::All)
         };
         if pass_possible && ready && pass_swept() {
             let out_len = pass_out_len;
