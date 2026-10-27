@@ -5217,6 +5217,7 @@ fn ab(args: &[String]) -> Res<()> {
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
+        println!("(in-lane offset, whole map: lane_offset_s {:.0})", omsi_traffic::sim::LANE_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting

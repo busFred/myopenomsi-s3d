@@ -574,7 +574,11 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     if !ahead {
         return None;
     }
-    let gap = (p_f - o_len) - p_e;
+    // (body to body along the merged way: each front measured to the place both ways share,
+    // the stretches' end - the meeting point of the merge, `Crossing::at` + its half metre;
+    // their starts lie where each way first comes within `MEET_DIST`, metres apart along the
+    // road where one way runs in at an angle, and measured from them the gap came out short)
+    let gap = ((o.s + o.front - foe.theirs.1) - o_len) - (c.s + c.front - foe.mine.1);
     if o.speed < STANDING_SPEED && p_f >= 0.0 {
         return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e, red_short });
     }

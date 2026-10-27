@@ -792,6 +792,44 @@ fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool
     }
 }
 
+/// The lateral gap (m) an in-lane squeeze keeps from the body it passes, measured from that
+/// body's corners (`body_across`): the round-5 squeeze's gap (Sobol's squeeze past the
+/// player's bus; the tests of `round5l`), at least the corridor's `SQUEEZE_CLEARANCE`. SUMO's
+/// sublane `minGapLat` (0.6, SL2015 `updateGaps`) was tried as this gap: every squeeze past a
+/// car standing 1.7 m out on a 1.5 m road became a wait for the oncoming lane.
+pub const SQUEEZE_GAP: f32 = 0.35;
+
+/// Where the body of the thing ahead, `l`, lies across my way (m from my lane's axis, + right):
+/// the least and greatest lateral of its box's corners in the way's frame where it is met
+/// (a parked car: its middle and half width).
+fn body_across(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, l: &crate::perception::Headway) -> (f32, f32) {
+    let st = &me.state;
+    let obb = match l.what {
+        Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.obb()),
+        Seen::Player(id) => sim.players.iter().find(|p| p.id == id).map(|p| p.obb(0.0, 0.0)),
+        Seen::Parked => None,
+    };
+    let Some(b) = obb else { return (l.lateral - l.half_width, l.lateral + l.half_width) };
+    let d = l.gap + st.front;
+    let q = st.way_point(net, d).truncate();
+    let f = (st.way_point(net, d + 1.0).truncate() - q).normalize_or_zero();
+    let hr = (me.heading as f64).to_radians();
+    let f = if f.length_squared() < 0.5 { DVec2::new(hr.sin(), hr.cos()) } else { f };
+    let right = DVec2::new(f.y, -f.x);
+    // (the way's point carries my own planned offset: back to the lane's axis)
+    let base = st.lateral_ahead(d);
+    b.corners().iter().map(|&c| (c - q).dot(right) as f32 + base).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, z), x| (a.min(x), z.max(x)))
+}
+
+/// The out length of an in-lane squeeze `side` metres over past `l`: the usual move
+/// (`Passing::out_len_for`), or from nearer than that the shortest move the body can steer
+/// (`bypass_min_len`) within the gap less `BYPASS_GAP_MARGIN`.
+fn squeeze_out(me: &Vehicle, l: &crate::perception::Headway, side: f32) -> f32 {
+    let usual = Passing::out_len_for(side);
+    let lateral = side - me.state.lateral;
+    (l.gap - BYPASS_GAP_MARGIN).clamp(bypass_min_len(me.length(), lateral).min(usual), usual)
+}
+
 /// My body on my way `d` metres from the origin, shifted `side` metres sideways.
 fn shifted_body(net: &Network, me: &Vehicle, d: f32, side: f32) -> Obb {
     let st = &me.state;
@@ -2077,10 +2115,22 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // leaves room beside where it stands (the lane's drivable extent on that side, L1:
         // to the kerb, the pavement or the next lane's painted edge), else onto the
         // oncoming lane
-        let need = me.half_width + l.half_width + 0.35;
+        // (my body keeps `SQUEEZE_GAP` from the thing's body where it really is - its corners
+        // across my way, `body_across`, SUMO's sublane model: a body standing askew or reaching
+        // only its corner into my width is passed by that much, not by its middle)
         let towards_middle = sim.oncoming_sign();
-        let squeeze_side = if l.lateral * towards_middle > 0.3 { l.lateral - towards_middle * need } else { l.lateral + towards_middle * need };
-        let (drivable_left, drivable_right) = lane.drivable();
+        let (lo, hi) = body_across(net, sim, vehicles, me, &l);
+        let away = if l.lateral * towards_middle > 0.3 { -towards_middle } else { towards_middle };
+        let squeeze_side = if away < 0.0 { lo - SQUEEZE_GAP - me.half_width } else { hi + SQUEEZE_GAP + me.half_width };
+        // (a junction object's piece has no edge data: its lane reaches halfway to the piece
+        // laid beside it, `Network::piece_beside` - the paths tile the carriageway - and no
+        // further than its half width where none lies beside)
+        let (drivable_left, drivable_right) = if lane.source == 2 {
+            let half = |nb: Option<NeighbourView>| nb.and_then(|nb| net.lanes[nb.lane].nearest_point(me.pos)).map_or(lane.width * 0.5, |(_, d)| (d as f32 * 0.5).max(lane.width * 0.5));
+            (half(p.left), half(p.right))
+        } else {
+            lane.drivable()
+        };
         // (and never into the traffic of the lane beside or the oncoming lane: a car's half
         // width and 0.3 off their axes, whatever the stored extent says - a recording or a
         // piece without edge data; beyond that it is the wheels over
@@ -2106,7 +2156,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // the line into the neighbour lane on that side when it is the car's to drive, nobody
         // passes on it the wrong way, no solid line, and it is free for the squeeze's length
         // (ahead past what is passed and the way back in, behind the gap the driver accepts)
-        let squeeze_out_len = Passing::out_len_for(squeeze_side);
+        // (the move the squeeze starts with: the usual one, or from nearer than that the
+        // shortest the body can steer, `bypass_min_len` - the out length the start uses below)
+        let squeeze_out_len = squeeze_out(me, &l, squeeze_side);
         let (squeeze_obstacle_len, _) = obstacle_run(p, &l, me.length() + squeeze_out_len + PASS_ROOM);
         let over_line = if reach > extent && reach <= extent + WHEELS_OVER_LINE && !solid {
             let nb = if squeeze_side < 0.0 { p.left } else { p.right };
@@ -2143,9 +2195,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if matches!(l.what, Seen::Parked) {
                 return false;
             }
-            // (a junction object's pieces carry no edge data - their extent is their half
-            // width - so a squeeze inside a junction needs the obstacle mostly off the piece;
-            // in practice this branch waits for pieces with real extents)
+            // (inside a junction a squeeze keeps off the stretch where the ways meet: its
+            // body out of its lane's middle there would be where the junction's foes are
+            // not reckoned to be)
             if squeeze && j.inside {
                 return squeeze_run > j.conflict_start && j.conflict_end > -st.rear;
             }
@@ -2200,7 +2252,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // car close up and later start where it should not), and not the
         // squeeze's linear corridor (`squeeze_clear`: from a queue gap behind a parked car its
         // straight ramp cuts the car passed and the pass never comes).
-        let pass_out_len = if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
+        let pass_out_len = if squeeze { squeeze_out(me, &l, side) } else if too_close { (l.gap - 0.3).clamp(2.0, out_len) } else { out_len };
         // (and the parked cars along the way and the people near it, as the
         // squeeze's corridor has them)
         let pass_swept = || {

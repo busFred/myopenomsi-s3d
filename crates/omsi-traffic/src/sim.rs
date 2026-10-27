@@ -681,6 +681,11 @@ fn cell(p: DVec3) -> (i32, i32) {
 /// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
 pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Milliseconds driven (moving) out of the lane's middle on an in-lane squeeze (`Passing`
+/// with no lane: the lateral offset within the lane, SUMO's sublane `posLat`), every simulation
+/// of the process (diagnostics, `traffic_cases ab`'s `lane_offset_s`).
+pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
@@ -1807,6 +1812,9 @@ impl Simulation {
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
+        if vehicles[i].passing.is_some_and(|p| p.lane.is_none() && !p.aborted && p.wait <= 0.0) && vehicles[i].state.speed >= crate::driver::STANDING_SPEED {
+            LANE_OFFSET_MS.fetch_add((dt * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let now = self.time;
         let sidestep = self.sidestep(vehicles, i, dt);
         let creep = self.settle_creep(vehicles, i, dt);
