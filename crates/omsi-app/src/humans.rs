@@ -3010,6 +3010,17 @@ impl PedNet {
         }
     }
 
+    /// Whether a path other than `lane` leaving junction `node` is walled.
+    fn walled_beside(&self, node: usize, lane: usize) -> bool {
+        self.out.get(node).is_some_and(|v| v.iter().any(|(l, _)| *l != lane && self.walls.contains(l)))
+    }
+
+    /// Whether `lane` ends at junction `node` in a closed end: a walled path leaves the node and
+    /// the way on from `lane` is straight back along it (`next_leg`).
+    fn closed_end(&self, net: &Network, node: usize, lane: usize) -> bool {
+        self.walled_beside(node, lane) && self.next_leg(net, node, lane, 0).is_some_and(|l| l.lane == lane)
+    }
+
     /// A leg leaving junction `node`, not back along `came`. At a dead end: on over a one-way
     /// crossing piece ending there against its way (), else back along `came`.
     fn next_leg(&self, net: &Network, node: usize, came: usize, pick: u64) -> Option<Leg> {
@@ -3391,10 +3402,7 @@ fn plan_next_leg(ped: Option<&PedNet>, net: &Network, walk: &mut PedWalk, rng: &
     // by walls, or right after a wall: another closed end; any other way on opens the pocket)
     let node = ped.and_then(|p| p.end_node(net, &leg));
     let uturn = next.lane == leg.lane;
-    let walled_here = match (ped, node) {
-        (Some(p), Some(n)) => p.out.get(n).is_some_and(|v| v.iter().any(|(l, _)| *l != leg.lane && p.walls.contains(l))),
-        _ => false,
-    };
+    let walled_here = matches!((ped, node), (Some(p), Some(n)) if p.walled_beside(n, leg.lane));
     if uturn && (walled_here || walk.from_wall) {
         walk.closed_ends += 1;
         walk.pocket = walk.closed_ends >= 2;
@@ -4305,10 +4313,14 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
     }
 }
 
-/// Whether strollers may be put down on or routed onto path `lane`: no map-parked car closes it
-/// (`PedNet::walls`).
-fn stroll_path_open(ped: Option<&PedNet>, lane: usize) -> bool {
-    !ped.is_some_and(|p| p.walls.contains(&lane))
+/// Whether strollers may be put down on path `lane`: no map-parked car closes it, and it is not
+/// a pocket (both its ends closed, `PedNet::closed_end`; `PedNet::walls`).
+fn stroll_path_open(ped: Option<&PedNet>, net: &Network, lane: usize) -> bool {
+    let Some(p) = ped else { return true };
+    if p.walls.contains(&lane) {
+        return false;
+    }
+    !p.ends.get(&lane).is_some_and(|&(a, b)| p.closed_end(net, a, lane) && p.closed_end(net, b, lane))
 }
 
 /// Where the people waiting for crossing `c` (its pieces among `legs`) stand: before its first
@@ -7092,7 +7104,7 @@ impl Humans {
                 }
                 let (lane, path_m, ks, toward) = (targets[ci].lane, targets[ci].metres, &targets[ci].ks, targets[ci].toward);
                 // (never onto a path a map-parked car closes: a dead end of the stroll network)
-                if !stroll_path_open(Some(&*ped), lane) {
+                if !stroll_path_open(Some(&*ped), net, lane) {
                     rej_wall += 1;
                     continue;
                 }
@@ -13862,7 +13874,7 @@ mod ped_tests {
         let open: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
         assert!(open.contains(&1) && open.contains(&2));
         ped.walls.insert(1);
-        assert!(!stroll_path_open(Some(&ped), 1) && stroll_path_open(Some(&ped), 2));
+        assert!(!stroll_path_open(Some(&ped), &net, 1) && stroll_path_open(Some(&ped), &net, 2));
         let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
         assert!(!on.contains(&1), "{on:?}");
         // the other way closed too: the dead end turns them round (a closed end), and a walker who
@@ -13883,6 +13895,25 @@ mod ped_tests {
         let mut m = me(9, DVec2::new(0.0, 0.0), 1.2);
         let w = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
         assert_eq!(w.vel, DVec2::ZERO);
+    }
+
+    #[test]
+    fn p4_d0_the_placer_refuses_an_unwalled_path_inside_a_pocket() {
+        // wall, inner path, wall: the inner path is not walled but both its ends lead only onto
+        // walled paths
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(20.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(20.0, 0.0), p(40.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.link(1.5);
+        let mut ped = PedNet::build(&net);
+        assert!((0..3).all(|l| stroll_path_open(Some(&ped), &net, l)));
+        ped.walls.insert(0);
+        assert!(stroll_path_open(Some(&ped), &net, 1), "one end still leads on");
+        ped.walls.insert(2);
+        assert!(!stroll_path_open(Some(&ped), &net, 0) && !stroll_path_open(Some(&ped), &net, 2));
+        assert!(!stroll_path_open(Some(&ped), &net, 1), "the pocket");
+        assert!(stroll_path_open(None, &net, 1));
     }
 }
 
