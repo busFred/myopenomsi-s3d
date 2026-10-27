@@ -1731,8 +1731,10 @@ struct PedWalk {
     held: f32,
     /// The crossing being walked: its pieces among `legs`, from kerb to kerb.
     cross: Option<Cross>,
-    /// Back at the near kerb after turning round on a crossing put down on
-    /// (no pavement leg to stand on): the next leg is decided as at a kerb.
+    /// At the end of the current leg with the way on decided as at a kerb (`stroll`), every frame
+    /// until they step on: after walking a crossing to its end (its far kerb, an island, a
+    /// junction's corner of crossing pieces), and after going another way from a kerb with no
+    /// place (`wait_at_kerb`).
     kerb_hold: bool,
     /// Where they wait at this kerb (`wait_at_kerb`): their place in the kerb's queue.
     spot: Option<KerbPlace>,
@@ -3550,12 +3552,8 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                         }
                         Err(why) => {
                             walk.kerb_go = None;
-                            walk.held += dt;
-                            me.why = why;
-                            me.decision = Some(why);
-                            me.on_crossing = false;
                             me.approach = None;
-                            return wait_at_kerb(Some(p), at, me, walk, Some(&c), &next, rng, dt);
+                            return refused_at_kerb(Some(p), at, me, walk, &c, &next, why, rng, dt);
                         }
                     }
                 }
@@ -3575,7 +3573,9 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         }
         _ => None,
     };
-    if walk.s >= leg.len() - KERB_AT || walk.held > 0.0 {
+    // (at the leg's end - or held there, or arrived there and deciding the way on, `kerb_hold`,
+    // whatever the projection of their position along the leg says from frame to frame)
+    if walk.s >= leg.len() - KERB_AT || walk.held > 0.0 || walk.kerb_hold {
         match walk.cross {
             // between two pieces of the crossing: on, no decision on the carriageway
             Some(c) if walk.leg >= c.from && walk.leg < c.to => walk.step_on(),
@@ -3636,13 +3636,12 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                                 walk.step_on();
                             }
                             Err(why) => {
-                                walk.held += dt;
-                                me.why = why;
-                                me.decision = Some(why);
                                 // a light that stays red (nobody crosses on red any more): a
                                 // stroller gives up after three minutes and walks back the way
                                 // they came
-                                if walk.roam && why == "red light" && walk.held > 180.0 {
+                                if walk.roam && why == "red light" && walk.held + dt > 180.0 {
+                                    me.why = why;
+                                    me.decision = Some(why);
                                     if debug_pax() {
                                         log::info!("t={:.1} pax #{} gives up waiting at the red light and turns back", at.time, me.id);
                                     }
@@ -3653,8 +3652,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                                     walk.kerb_hold = false;
                                     return Want::stand(None, Activity::Stand);
                                 }
-                                me.on_crossing = false;
-                                return wait_at_kerb(ped, at, me, walk, Some(&c), &next, rng, dt);
+                                return refused_at_kerb(ped, at, me, walk, &c, &next, why, rng, dt);
                             }
                         }
                     }
@@ -3951,6 +3949,27 @@ fn kerb_stop(pace: f64) -> f32 {
 /// refused stands at their place without having stepped to the kerb.
 fn kerb_look(pace: f64) -> f32 {
     KERB_BACK_MAX + kerb_stop(pace)
+}
+
+/// Refused (`why`) at the kerb of crossing `c` whose first piece is `next`: they wait in its queue
+/// (`wait_at_kerb`), off the crossing (SUMO: a waiting pedestrian stands on the walking area, not
+/// on the crossing). A stroller with no place there who goes another way at once (`wait_at_kerb`
+/// gives them a new next leg) waits for nothing: the decision and the crossing flag they had
+/// stay, so that one stepping on from the last piece of a crossing straight onto another keeps
+/// the flag through the frame (as `stroll` keeps it on the first step of a crossing begun from
+/// the last piece of another).
+#[allow(clippy::too_many_arguments)]
+fn refused_at_kerb(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, c: &Cross, next: &Leg, why: &'static str, rng: &mut u64, dt: f32) -> Want {
+    let had = (me.decision, me.why, me.on_crossing);
+    walk.held += dt;
+    me.why = why;
+    me.decision = Some(why);
+    me.on_crossing = false;
+    let want = wait_at_kerb(ped, at, me, walk, Some(c), next, rng, dt);
+    if walk.legs.get(walk.leg + 1).map(|l| l.lane) != Some(next.lane) {
+        (me.decision, me.why, me.on_crossing) = had;
+    }
+    want
 }
 
 /// Waiting at the kerb before `next` (the first piece of crossing `c`), facing the way across, in
@@ -14172,6 +14191,54 @@ mod ped_tests {
         assert!(room_for(&net, &ped, &lights, &full(1), kerb, 1, 0, 0.0), "those coming back leave");
         assert!(!room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, 0.0), "those bound elsewhere stay");
         assert!(room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, PED_JAM_TIME), "refused the jam time: on");
+    }
+
+    #[test]
+    fn p11_2_a_stroller_going_another_way_from_a_full_corner_keeps_the_crossing_flag() {
+        // BeijingCity d24 (539.3, -4549.2): strollers off a lit crossing's last piece at a
+        // junction's corner of crossing pieces, the next crossing red and the corner's places all
+        // taken: they go another way on at once (`wait_at_kerb`), onto the corner's other crossing,
+        // and stood a frame with "red light" and the flag dropped between the two (20 flips a run)
+        let (mut net, _, _, corner) = corner_after_crossing();
+        net.lanes.push(lane(vec![p(0.0, 10.0), p(0.0, 20.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes[3].traffic_light = Some((0, 0));
+        // (the street the first crossing crosses: its pieces are on the carriageway, no queue
+        // behind the corner on them)
+        net.lanes.push(lane((0..=12).map(|k| p(-30.0 + 5.0 * k as f64, 5.0)).collect(), LaneKind::Street, 3.5));
+        net.build_grid();
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let lights = FakeLights::new(GREEN, 60.0);
+        lights.second.set(RED);
+        let area = node_area(&ped, &net, Some(&lights), corner);
+        let ps: Vec<(u32, KerbPlace)> = area.places.iter().enumerate().map(|(k, q)| (100 + k as u32, KerbPlace { leg: 0, next: 2, pos: *q, row: 0, lat: 0.0, key: corner })).collect();
+        let mut full = Queues::default();
+        full.rebuild(ps.iter().map(|(i, p)| (*i, p)), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
+        let empty = Queues::default();
+        let streams: Streams = HashMap::new();
+        let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 5.0, b: 10.0 }, Leg { lane: 1, a: 0.0, b: 10.0 }, Leg { lane: 2, a: 0.0, b: 10.0 }], true, 0.0);
+        let mut m = me(1, DVec2::new(-5.0, 0.0), 1.2);
+        let mut rng = 11u64;
+        let (mut was_on, mut drops, mut red, mut top) = (false, 0, 0, f64::MIN);
+        for k in 0..600 {
+            // (the corner fills once they are on the crossing)
+            let queues = if m.pos.y > 2.0 { &full } else { &empty };
+            let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues, time: k as f64 * 0.05 };
+            let w = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+            m.pos += w.vel * 0.05;
+            if let Some(leg) = walk.legs.get(walk.leg) {
+                walk.s = leg.project(&net, m.pos.extend(0.0), walk.s).max(walk.s - 0.3);
+            }
+            // (up to the far end of the other crossing, a dead end they turn round at)
+            top = top.max(m.pos.y);
+            if m.pos.y > 1.0 && top < 19.0 {
+                drops += (was_on && !m.on_crossing) as u32;
+                red += (m.decision == Some("red light")) as u32;
+                was_on = m.on_crossing;
+            }
+        }
+        assert!(walk.legs.iter().any(|l| l.lane == 3) && top > 19.0, "on over the other crossing: {top} {:?}", walk.legs);
+        assert_eq!((drops, red), (0, 0), "the flag dropped / a red light they never waited for");
     }
 
     #[test]
