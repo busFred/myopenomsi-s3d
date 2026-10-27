@@ -199,6 +199,10 @@ pub struct PersonRecord {
     /// Walking up to a crossing to step onto it (`Person::approach`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approach: Option<(DVec2, f32, f32)>,
+    /// Waiting at a kerb where they stand, with no place in its queue (the app's last fallback,
+    /// off the queue grid).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kerb_fallback: bool,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -218,7 +222,7 @@ impl PersonRecord {
 
     /// A record of somebody the game told nothing more about.
     pub fn from_person(p: &Person) -> PersonRecord {
-        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at, id: p.id, approach: p.approach }
+        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at, id: p.id, approach: p.approach, kerb_fallback: false }
     }
 
     /// Take the frame's own values over (the extras stay).
