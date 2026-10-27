@@ -2182,15 +2182,18 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
         p.letting_out = letting_out(sim, me);
         if lane.kind == LaneKind::Street && !me.is_rail() {
-            if let Some(l) = lane.left {
+            // (a junction object's piece has no `left`/`right`: the piece of the object laid
+            // beside it there, `Network::piece_beside`)
+            let (left, right) = if lane.source == 2 { (net.piece_beside(st.lane, st.s, 1), net.piece_beside(st.lane, st.s, 2)) } else { (lane.left, lane.right) };
+            if let Some(l) = left {
                 p.left = neighbour(net, sim, vehicles, i, l, 1);
             }
-            if let Some(r) = lane.right {
+            if let Some(r) = right {
                 p.right = neighbour(net, sim, vehicles, i, r, 2);
             }
             // the oncoming lane matters behind something standing, or while out on it
             let standing = p.leader.map(|l| l.standing_obstacle() && l.gap < 45.0).unwrap_or(false);
-            if (standing || me.passing.is_some()) && lane.left.is_none() && lane.right.is_none() {
+            if (standing || me.passing.is_some()) && left.is_none() && right.is_none() {
                 let obstacle = p.leader.map(|l| l.gap + l.length).unwrap_or(10.0);
                 let pass_len = obstacle + st.front + st.rear + 6.0;
                 p.oncoming = oncoming(net, sim, vehicles, i, pass_len);

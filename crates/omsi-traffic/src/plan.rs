@@ -415,7 +415,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // lands either side of a stop, `REST_SHORT`: the last-resort stop leaves the space from rest)
     let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel) <= e.dist + REST_SHORT);
     let end_ok = |ok: bool| ok && !(end > 0.0 && (people_on_move(net, sim, me, nb) || !fits));
-    if !may_change_to(net, me, nb) {
+    if !may_change_to(net, sim, me, nb) {
         return (end, end > 0.0 && end_ok(gap_accepted(me, nb)), ChangeWhy::LaneEnd);
     }
     let (mut desire, mut why) = (end, ChangeWhy::LaneEnd);
@@ -472,17 +472,55 @@ const CHANGE_RUNS_ON: f32 = 40.0;
 
 /// May the driver change onto `nb` of its own accord (a change for a reason of
 /// its own, a bypass; `change_desire` and `could_bypass` ask the same): the path's rules
-/// allow it there; no solid line (`[rule] overtaking_prohib`) on either lane, not on a
-/// junction object's piece; a turn lane is never left within `TURN_LANE_KEEP` of its
-/// junction, a turn ahead is taken from the lane that leads into it, and a turn lane is not
-/// taken for a turn the driver does not take; and `nb` runs on `CHANGE_RUNS_ON` at least.
-fn may_change_to(net: &Network, me: &Vehicle, nb: &NeighbourView) -> bool {
+/// allow it there; no solid line (`[rule] overtaking_prohib`) on either lane; on a junction
+/// object's piece only where the move is clear of the junction (`piece_change_clear`); a turn
+/// lane is never left within `TURN_LANE_KEEP` of its junction, a turn ahead is taken from the
+/// lane that leads into it, and a turn lane is not taken for a turn the driver does not take;
+/// and `nb` runs on `CHANGE_RUNS_ON` at least.
+fn may_change_to(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView) -> bool {
     let lane = &net.lanes[me.state.lane];
-    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || lane.source == 2 || nb.runs_on < CHANGE_RUNS_ON {
+    if !nb.allowed || lane.no_overtaking || net.lanes[nb.lane].no_overtaking || nb.runs_on < CHANGE_RUNS_ON {
+        return false;
+    }
+    if lane.source == 2 && !piece_change_clear(net, sim, me, nb) {
         return false;
     }
     let my_turn = me.state.turn_ahead(net, TURN_LANE_KEEP).map(|t| t.0).unwrap_or(0);
     !((my_turn != 0 && nb.turn != my_turn) || (nb.turn != 0 && my_turn == 0 && nb.runs_on < TURN_LANE_KEEP))
+}
+
+/// A change of the driver's own from a junction object's piece onto the piece beside it
+/// (`Network::piece_beside`) is a change on a road: SUMO changes lanes on an edge and never on
+/// an internal lane, whose stretch is where the ways of the junction meet (`mayChange`, sumo.md
+/// 3.1). An OMSI object also lays plain road as paths (BeijingCity's Jiangzhaikou: 128 m of
+/// parallel paths), so the move - from beside my rear to the change's length
+/// (`change_length`) past my front - must stay on both pieces, touch no stretch where either
+/// piece meets another way of the junction (a foe's stretch, `Foe::mine`, or one converging
+/// with a third way, `Movement::converge`), and `nb` must still lie beside where the move ends (parallel for the
+/// move's length).
+fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView) -> bool {
+    let st = &me.state;
+    let (Some(&(j, m)), Some(&(j2, m2))) = (sim.junctions.of_lane.get(&st.lane), sim.junctions.of_lane.get(&nb.lane)) else { return false };
+    if j != j2 {
+        return false;
+    }
+    let mv = omsi_sim::traffic::change_length(st.speed);
+    let s_b = net.beside_s(st.lane, nb.lane, st.s);
+    let mine = (st.s - st.rear, st.s + st.front + mv);
+    let theirs = (s_b - st.rear, s_b + st.front + mv);
+    if mine.0 < 0.0 || mine.1 > net.lanes[st.lane].length() || theirs.0 < 0.0 || theirs.1 > net.lanes[nb.lane].length() {
+        return false;
+    }
+    // (the two pieces' own nearness is the lane beside, not a meeting: narrow parallel lanes,
+    // 2.3-2.6 m apart at Jiangzhaikou, come within `MEET_DIST` of each other)
+    let meets = |mi: usize, other: usize, (a, b): (f32, f32)| {
+        let mm = &sim.junctions.nodes[j].movements[mi];
+        mm.foes.iter().any(|f| f.mine.0 < b && f.mine.1 > a) || mm.converge.iter().zip(&mm.converge_with).any(|(c, &w)| w != other && c.0 < b && c.1 > a)
+    };
+    if meets(m, m2, mine) || meets(m2, m, theirs) {
+        return false;
+    }
+    net.piece_beside(st.lane, mine.1, nb.dir) == Some(nb.lane)
 }
 
 /// A keep-to-the-side change needs the lanes the target runs into (one after the other, while
@@ -861,10 +899,11 @@ fn pausing_player(l: &crate::perception::Headway) -> bool {
 
 /// Could the car get round the standing `lead` into the lane beside, `nb` (`Start::Bypass`,
 /// the lane-change rules of `change_desire` but for having stood a while): a lane it may take,
-/// no solid line, not a junction's piece, a turn ahead that stays its own, room there past
+/// no solid line, on a junction's piece a move clear of the junction (`may_change_to`), a turn
+/// ahead that stays its own, room there past
 /// the thing standing and nobody passing on it the wrong way. (What the keep-back asks.)
-fn could_bypass(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
-    if !may_change_to(net, me, nb) {
+fn could_bypass(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+    if !may_change_to(net, sim, me, nb) {
         return false;
     }
     // (the gap there is the start's to accept, `change_desire`, and a car driving on ahead
@@ -1185,7 +1224,7 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if queue_head(net, sim, vehicles, &l) != Some(QueueHead::ForGood) {
         return None;
     }
-    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l)).fold(f32::INFINITY, f32::min);
+    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l)).fold(f32::INFINITY, f32::min);
     if !need.is_finite() || l.gap >= need - BYPASS_HOLD_SLACK {
         return None;
     }
@@ -1847,7 +1886,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // onto
     if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
         // (a strategic stay comes first and leaves the wish as it is)
-        if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, me, nb) && !stays_on_best(net, sim, me, nb)) {
+        if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, sim, me, nb) && !stays_on_best(net, sim, me, nb)) {
             out.keep_right_rate = Some(keep_right_rate(net, vehicles, me, p, &nb));
         }
     }
@@ -2019,7 +2058,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let can_pass = !me.is_rail() && me.class != VehicleClass::Air && st.change.is_none() && out.start.is_none();
         // (the oncoming lane is used only on a road with one lane each way; not across a
         // solid line: a pass there stays a squeeze within the drawn road)
-        let two_lane = lane.left.is_none() && lane.right.is_none();
+        let two_lane = p.left.is_none() && p.right.is_none();
         let solid = lane.no_overtaking;
         let player = matches!(l.what, Seen::Player(_));
         let player_out = player && sim.players.iter().any(|pl| pl.blinker as i32 == out_side && pl.signalling < 1.0);
@@ -2124,7 +2163,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         });
         let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
-        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, me, nb, &l));
+        let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, sim, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {

@@ -146,6 +146,10 @@ pub const DEFAULT_PRIORITY: f32 = 128.0;
 
 /// At most this much between the painted edges of two lanes that are next to each other (m).
 pub const NEIGHBOUR_EDGE_GAP: f32 = 2.0;
+/// Two lanes run the same way beside each other when their headings there differ by less
+/// than this (degrees; `Network::parallel`'s test for a route's lane beside, and
+/// `Network::piece_beside`).
+pub const BESIDE_HEADING_DEG: f32 = 30.0;
 
 /// How much of `unsched_vehgroups.txt` group `pool`'s traffic a path carries: its `[rule]
 /// trafficdensity` for the group (`rules`, see `Lane::group_density`: the last rule of a
@@ -247,8 +251,14 @@ impl Lane {
     /// strip between the edges (BeijingCity). The strip itself is only drawn, by a spline
     /// without paths, so the edge gap is the one cue the path data gives.
     pub fn beside_each_other(a: &Lane, b: &Lane) -> bool {
-        let gap = (b.offset - a.offset).abs();
-        let edge = gap - (a.width.max(2.0) + b.width.max(2.0)) * 0.5;
+        Self::edges_beside((b.offset - a.offset).abs(), a.width, b.width)
+    }
+
+    /// The edge rule of [`Lane::beside_each_other`] for two lanes `a_width` and `b_width` wide
+    /// whose middles lie `gap` m apart: more than a metre apart, their painted edges (each at
+    /// least 2 m wide) within `NEIGHBOUR_EDGE_GAP`.
+    pub fn edges_beside(gap: f32, a_width: f32, b_width: f32) -> bool {
+        let edge = gap - (a_width.max(2.0) + b_width.max(2.0)) * 0.5;
         gap > 1.0 && edge <= NEIGHBOUR_EDGE_GAP
     }
 
@@ -858,11 +868,59 @@ impl Network {
             // too, and a train "changed lanes" down onto the line under its viaduct)
             let (q, hb) = lb.at(sb);
             let level = (q.z - p.z).abs() < 1.0;
-            if inside && level && d > 0.8 && d < 5.5 && wrap_deg(hb - h).abs() < 30.0 {
+            if inside && level && d > 0.8 && d < 5.5 && wrap_deg(hb - h).abs() < BESIDE_HEADING_DEG {
                 along += step;
             }
         }
         along >= 8.0 - 1e-3
+    }
+
+    /// The piece of the same junction object running beside junction-object piece `lane` at
+    /// distance `s` on side `dir` (1 left, 2 right): the nearest street piece of the object whose
+    /// axis there lies the way `Lane::edges_beside` puts two lanes of one spline side by side, at
+    /// a heading within `BESIDE_HEADING_DEG`. `Network::link` pairs the paths of one spline only,
+    /// so a junction object's pieces have no `left`/`right` (OMSI geometry: an object's paths are
+    /// separate polylines with no lane order); this finds the lane beside where the object lays
+    /// its paths side by side (BeijingCity's Jiangzhaikou object: 128 m of parallel paths). It
+    /// says nothing about crossings: whether a change may be made there is the caller's.
+    pub fn piece_beside(&self, lane: usize, s: f32, dir: i32) -> Option<usize> {
+        let l = self.lanes.get(lane)?;
+        let key = l.key.filter(|_| l.source == 2)?;
+        let (p, h) = l.at(s.clamp(0.0, l.length()));
+        let hr = (h as f64).to_radians();
+        let right = DVec3::new(hr.cos(), -hr.sin(), 0.0);
+        let want = if dir == 2 { 1.0 } else { -1.0 };
+        let (cx, cy) = Self::grid_cell(p);
+        let mut best: Option<(usize, f64)> = None;
+        let mut seen: Vec<usize> = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &i in self.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if i == lane || seen.contains(&i) {
+                        continue;
+                    }
+                    seen.push(i);
+                    let o = &self.lanes[i];
+                    if o.source != 2 || o.kind != LaneKind::Street || o.key.is_none_or(|k| k.tile != key.tile || k.id != key.id) {
+                        continue;
+                    }
+                    let Some((os, d)) = o.nearest_point(p) else { continue };
+                    // (beside, not before or after it: the nearest point inside the piece)
+                    if os <= 0.0 || os >= o.length() {
+                        continue;
+                    }
+                    let (q, oh) = o.at(os);
+                    let side = (q - p).dot(right) * want;
+                    if side <= 0.0 || (q.z - p.z).abs() >= 1.0 || wrap_deg(oh - h).abs() >= BESIDE_HEADING_DEG || !Lane::edges_beside(d as f32, l.width, o.width) {
+                        continue;
+                    }
+                    if best.is_none_or(|b| d < b.1) {
+                        best = Some((i, d));
+                    }
+                }
+            }
+        }
+        best.map(|b| b.0)
     }
 
     /// Where on lane `b`, beside `a` (see `parallel`), the car at distance `s` along `a` is:
@@ -5208,5 +5266,38 @@ mod aurora_pool_tests {
         assert_eq!(lane.pool_density(&defaults, 2), 1.0);
         lane.group_density.push((1, 0.1));
         assert_eq!(lane.pool_density(&defaults, 2), 0.1);
+    }
+}
+
+#[cfg(test)]
+mod piece_beside_tests {
+    use super::*;
+
+    /// A 1 m wide path of junction object `id` from (x0, y0) to (x1, y1).
+    fn path(x0: f64, y0: f64, x1: f64, y1: f64, id: i64, n: u16) -> Lane {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, y0, 0.0), DVec3::new(x1, y1, 0.0)], LaneKind::Street, 1.0);
+        l.key = Some(LaneKey { tile: (0, 0), id, path: n });
+        l.source = 2;
+        l
+    }
+
+    /// Jiangzhaikou's object: two paths running south 2.6 m apart are beside each other, the
+    /// one on the driver's left (east) is its left piece; a path crossing them, a path of
+    /// another object and one 6 m out are not.
+    #[test]
+    fn parallel_paths_of_one_object_are_beside() {
+        let lanes = vec![
+            path(0.0, 0.0, 0.0, -80.0, 1, 0),
+            path(2.6, 5.0, 2.6, -75.0, 1, 1),
+            path(-20.0, -40.0, 20.0, -40.0, 1, 2),
+            path(-2.6, 0.0, -2.6, -80.0, 2, 0),
+            path(-6.0, 0.0, -6.0, -80.0, 1, 3),
+        ];
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        assert_eq!(net.piece_beside(0, 30.0, 1), Some(1));
+        assert_eq!(net.piece_beside(1, 30.0, 2), Some(0));
+        assert_eq!(net.piece_beside(0, 30.0, 2), None);
+        assert_eq!(net.piece_beside(0, 30.0, 1).and_then(|_| net.lanes[0].left), None);
     }
 }
