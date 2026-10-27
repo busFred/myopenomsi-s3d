@@ -4297,7 +4297,7 @@ struct Extra {
     /// way) whose plan stops at its own red short of the stretch (`ZipCap::red_short`): such a
     /// partner is ahead only when its green brings it there first and a foe behind a standing
     /// lead short of the stretch gives no cap at all (`reservation::zipper_cap`), so this is 0
-    /// when the rule holds. (Round 10's column counted any partner standing at its red.)
+    /// when the rule holds.
     capped_by_red_s: f64,
     /// The same start capped to nothing by the vehicle whose body lies across the car's way
     /// (`Claim::body_block`): a physical lead, no red cap.
