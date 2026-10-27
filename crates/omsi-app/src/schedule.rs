@@ -2720,7 +2720,11 @@ impl Schedule {
                 if !track_is_air(traffic, section[k]) && !world.has_ground(p.x, p.y) {
                     return Err("tile unloaded");
                 }
-                if !traffic.spawn_clear(&ty, p, h as f64) {
+                let by_people = traffic.spawn_refused_people.iter().sum::<usize>();
+                if !traffic.spawn_clear(&ty, p, h as f64, (section[k], at_s), crate::traffic::Spawn::Timetable) {
+                    if traffic.spawn_refused_people.iter().sum::<usize>() > by_people {
+                        log::info!("timetable: trip {trip_name}: people stand where the bus would be put back (lane {}, {at_s:.0} m)", section[k]);
+                    }
                     return Err("no free lane");
                 }
                 if !traffic.may_appear(world, p) {
@@ -2753,8 +2757,12 @@ impl Schedule {
         // not into a vehicle that happens to be there (the player's bus at its stop, a car),
         // nor just in front of one driving up to that place: try again in a moment
         let at_heading = traffic.net.lanes[section[start_index]].at(s).1 as f64;
-        if !traffic.spawn_clear(&ty, at_pos, at_heading)
+        let by_people = traffic.spawn_refused_people.iter().sum::<usize>();
+        if !traffic.spawn_clear(&ty, at_pos, at_heading, (section[start_index], s), crate::traffic::Spawn::Timetable)
         {
+            if traffic.spawn_refused_people.iter().sum::<usize>() > by_people {
+                log::info!("timetable: trip {trip_name}: people stand where the bus would appear (lane {}, {s:.0} m)", section[start_index]);
+            }
             log::debug!("trip {trip_name}: a vehicle stands where the bus would appear");
             self.fail_reason = Some("no free lane");
             return Placed::Busy;

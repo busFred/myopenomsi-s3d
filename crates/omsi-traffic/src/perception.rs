@@ -1580,6 +1580,26 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     (stop, shifted)
 }
 
+/// Whether the people test holds vehicle `me` standing where it is (`people_ahead` at speed 0):
+/// somebody whose body (`PERSON_RADIUS`) is over its body (`Vehicle::obb`), now or where their
+/// step takes them, or who is in its strip (half width and 0.3 m; 1.5 m on a crossing) on its way
+/// ahead within `people_reach(0)` past its front, with the test's own exemptions (level with the
+/// body outside its footprint, a kerb waiter, somebody standing at the edge, the shift past people
+/// beside the lane). A hold farther ahead (a crossing the way reaches later) is a stop it brakes
+/// for, not a hold where it stands. The insertion check for persons: SUMO inserts a vehicle only
+/// where its `pedestrian` insertion check passes (`insertionChecks`, sumo.md 5.2). `sim`'s people
+/// must be indexed (`Simulation::index_people`).
+pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle) -> bool {
+    let mut me = me.clone();
+    me.state.speed = 0.0;
+    let st = &me.state;
+    let reach = st.front + people_reach(0.0);
+    let lanes = way_lanes(net, st, reach);
+    let way = WayPts::sample(net, st, reach);
+    let (stop, shifted) = people_ahead(net, sim, &me, &lanes, &way, None);
+    shifted.map_or(stop, |s| s.1).is_some_and(|s| s <= reach)
+}
+
 /// How far ahead (m from the origin) the farthest person within the car's strip stands:
 /// what a shift past them has to cover.
 fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {

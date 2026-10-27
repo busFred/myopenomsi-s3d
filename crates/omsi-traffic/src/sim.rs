@@ -920,11 +920,18 @@ impl Simulation {
         }
     }
 
+    /// The people's grid (`people_near`) for `people` as they are now.
+    pub fn index_people(&mut self) {
+        self.people_grid.clear();
+        for (k, p) in self.people.iter().enumerate() {
+            self.people_grid.entry(cell(p.pos)).or_default().push(k);
+        }
+    }
+
     /// Which vehicle is where on which lane, and the grids.
     pub fn build_occupancy(&mut self, net: &Network, vehicles: &[Vehicle]) {
         self.occupancy.clear();
         self.vehicle_grid.clear();
-        self.people_grid.clear();
         for (i, v) in vehicles.iter().enumerate() {
             let st = &v.state;
             if net.lanes.get(st.lane).is_none() {
@@ -970,9 +977,7 @@ impl Simulation {
         for occ in self.occupancy.values_mut() {
             occ.sort_by(|a, b| a.s.total_cmp(&b.s));
         }
-        for (k, p) in self.people.iter().enumerate() {
-            self.people_grid.entry(cell(p.pos)).or_default().push(k);
-        }
+        self.index_people();
         self.player_occupancy.clear();
         for k in 0..self.players.len() {
             let p = self.players[k];

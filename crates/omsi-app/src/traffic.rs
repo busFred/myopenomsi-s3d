@@ -503,29 +503,61 @@ pub fn draw_reach(max_dist: f64, loaded: f64) -> f64 {
     }
 }
 
-/// The cars' people test's strip beside a vehicle's body (m): anybody not on a crossing and not
-/// waiting for that bus whose centre lies within the body's half width and this holds the
-/// vehicle (omsi-traffic perception.rs `people_ahead`: `me.half_width + 0.3`).
+/// The cars' people test's strip on a vehicle's way (m): anybody not on a crossing and not
+/// waiting for that bus whose centre lies within the vehicle's half width and this of its way
+/// ahead holds it (omsi-traffic perception.rs `people_ahead`: `me.half_width + 0.3`); what a
+/// person waiting beside a lane keeps clear of (`humans::strip_reach`).
 pub(crate) const PEOPLE_STRIP: f64 = 0.3;
 
-/// Whether any of `people` (positions on foot) stands where a vehicle put down with the bodies
-/// `bodies` (as drawn) at height `z` would be held by them at once: the cars' people test holds a
-/// car for a person whose centre lies within its half width and `PEOPLE_STRIP` beside it, so each
-/// body widened by the strip, a person's centre inside one, at its level (within the body's own
-/// height of `z`).
-fn people_in_strip(bodies: &[omsi_sim::collision::Obb], z: f64, people: impl Iterator<Item = DVec3>) -> bool {
-    let strips: Vec<omsi_sim::collision::Obb> = bodies
-        .iter()
-        .map(|b| {
-            let mut s = *b;
-            s.half.x += PEOPLE_STRIP;
-            s
-        })
-        .collect();
-    people.into_iter().any(|p| {
-        let me = omsi_sim::collision::Obb::point(p, 0.0);
-        strips.iter().any(|s| (p.z - z).abs() < s.z1 - s.z0 && s.separation(&me) < 0.0)
-    })
+/// Who asks for a place on the road (`Traffic::spawn_clear`): the places refused because of
+/// people are counted by it (`Traffic::spawn_refused_people`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spawn {
+    /// The population putting a car or an aircraft down.
+    Population,
+    /// A dormant car woken where it drives.
+    Woken,
+    /// A timetable bus starting its trip (or taken off and put back before its stop).
+    Timetable,
+    /// A bus taken off the road coming back on its route (`respawn_at`).
+    Respawn,
+    /// A parked object pulling out as an AI car.
+    PullOut,
+    /// A car parking in a space beside its lane.
+    ParkIn,
+    /// A car asked for by the tools.
+    Tool,
+}
+
+impl Spawn {
+    const ALL: [Spawn; 7] = [Spawn::Population, Spawn::Woken, Spawn::Timetable, Spawn::Respawn, Spawn::PullOut, Spawn::ParkIn, Spawn::Tool];
+
+    fn name(self) -> &'static str {
+        match self {
+            Spawn::Population => "population",
+            Spawn::Woken => "woken",
+            Spawn::Timetable => "timetable",
+            Spawn::Respawn => "respawn",
+            Spawn::PullOut => "pull-out",
+            Spawn::ParkIn => "park-in",
+            Spawn::Tool => "tool",
+        }
+    }
+}
+
+/// The AI vehicle of `class` with `(front, rear, half width)` as it would be made at `pos` facing
+/// `heading` (deg), at distance `at.1` along lane `at.0`, standing: its way the lane and the next
+/// one it plans (`AiState::plan_next`), as `spawn`'s.
+fn spawn_probe(net: &Network, class: VehicleClass, size: (f32, f32, f32), pos: DVec3, heading: f64, at: (usize, f32)) -> AiVehicle {
+    let mut state = AiState::new(at.0, at.1, 0);
+    state.front = size.0;
+    state.rear = size.1;
+    state.length = size.0 + size.1;
+    state.plan_next(net);
+    let mut probe = AiVehicle::new(0, class, state, size.2, 0);
+    probe.pos = pos;
+    probe.heading = heading as f32;
+    probe
 }
 
 /// A car further away than this is below two pixels on a 900-line screen (m).
@@ -1079,9 +1111,10 @@ pub struct Traffic {
     /// The people on foot the humans took away in their last tick, and whether the player could
     /// see them (`humans::Humans::gone`): written with the next recorded frame.
     pub people_gone: Vec<(u32, bool)>,
-    /// Counted for the gate: places a vehicle was refused at because somebody stood in its body
-    /// or its people strip (`spawn_clear_except`), every asking (the population asks again).
-    pub spawn_refused_people: usize,
+    /// Counted for the gate: places a vehicle was refused at because the cars' people test would
+    /// hold it standing there (`spawn_clear_except`), by who asked (`Spawn::ALL`'s order), every
+    /// asking (the population asks again).
+    pub spawn_refused_people: [usize; 7],
     /// The map's folder name: recordings and network dumps are named after it.
     pub map_name: String,
     /// Cars whose standing too long has been saved already (each once).
@@ -1756,7 +1789,7 @@ impl Traffic {
             recorder: omsi_traffic::record::Recorder::new(),
             people_records: Vec::new(),
             people_gone: Vec::new(),
-            spawn_refused_people: 0,
+            spawn_refused_people: [0; 7],
             map_name: world.map_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "map".into()),
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
@@ -2636,7 +2669,7 @@ impl Traffic {
             return;
         }
         let (q, h) = self.net.lanes[pp.lane].at(pp.s);
-        if !self.spawn_clear(&pp.ty, q, h as f64) {
+        if !self.spawn_clear(&pp.ty, q, h as f64, (pp.lane, pp.s), Spawn::PullOut) {
             return;
         }
         self.pending_pull_out = None;
@@ -2733,7 +2766,7 @@ impl Traffic {
                 continue;
             }
             // nobody close by on the road
-            if self.cars.iter().any(|c| (c.vehicle.position - p.pos).length() < 30.0) || !self.spawn_clear(&ty, q, h as f64) {
+            if self.cars.iter().any(|c| (c.vehicle.position - p.pos).length() < 30.0) || !self.spawn_clear(&ty, q, h as f64, (l, s), Spawn::ParkIn) {
                 why.push("road not clear".into());
                 continue;
             }
@@ -2897,7 +2930,7 @@ impl Traffic {
                 continue;
             };
             // (nor onto the rear section of an articulated bus, nor the player's bus)
-            if kind != LaneKind::Air && !self.spawn_clear(&ty, p, heading) {
+            if kind != LaneKind::Air && !self.spawn_clear(&ty, p, heading, (lane, s), Spawn::Population) {
                 continue;
             }
             let seed = self.rand();
@@ -3042,7 +3075,7 @@ impl Traffic {
                 && !self.behind_a_queue(lane, s, speed)
                 && !self.in_front_of_someone(p)
                 && !self.cars.iter().any(|c| (c.vehicle.position - p).length() < 14.0)
-                && self.spawn_clear(&ty, p, h);
+                && self.spawn_clear(&ty, p, h, (lane, s), Spawn::Woken);
             if ok {
                 let d = self.dormant.swap_remove(i);
                 self.create_car(world, renderer, scene, center, d.kind, d.lane, d.s, d.ty, d.seed, Some(d.scheme), Some(d.id), Some(d.speed), None);
@@ -3471,7 +3504,7 @@ impl Traffic {
         let Some(ty) = self.pick_type(LaneKind::Street, Some(lane)) else {
             return Err(format!("no vehicle drives on lane {lane}"));
         };
-        if !self.spawn_clear(&ty, pos, h as f64) {
+        if !self.spawn_clear(&ty, pos, h as f64, (lane, s), Spawn::Tool) {
             return Err("another vehicle stands there".into());
         }
         let seed = self.rand();
@@ -3533,21 +3566,44 @@ impl Traffic {
         out
     }
 
-    /// May a vehicle of `ty` be put on the road at `pos` facing `heading` (deg)? Not onto
-    /// (or right up against) another vehicle or the player's: the bodies are
-    /// compared, not origins (see `spawn_clear_except`).
-    pub fn spawn_clear(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64) -> bool {
-        self.spawn_clear_except(ty, pos, heading, None)
+    /// `spawn_refused_people` by who asked, for the logs: "population 3, timetable 1" (the kinds
+    /// with none left out).
+    pub fn spawn_refused_by(&self) -> String {
+        Spawn::ALL.iter().zip(self.spawn_refused_people).filter(|(_, n)| *n > 0).map(|(w, n)| format!("{} {n}", w.name())).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Whether the cars' people test holds a vehicle of `ty` standing at `pos` facing `heading`
+    /// (deg), at distance `at.1` along lane `at.0` (`omsi_traffic::perception::people_hold_at_rest`):
+    /// the AI vehicle as it would be made there (`spawn`'s front, consist rear and half width, the
+    /// way on its lane and the next one it would plan, a bus's class for a timetable bus) against
+    /// the people as the traffic sees them (`Simulation::people`).
+    fn people_hold_here(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn) -> bool {
+        if self.sim.people.is_empty() || self.net.lanes.get(at.0).is_none() {
+            return false;
+        }
+        let bus = matches!(who, Spawn::Timetable | Spawn::Respawn);
+        let (front, rear, half_width) = extents(ty, if bus { 12.0 } else { 4.5 });
+        let rear = self.consist_rear(ty).max(rear);
+        let class = if bus { VehicleClass::ScheduledBus } else { VehicleClass::from_code(ty.def.ai_veh_type, self.net.lanes[at.0].kind) };
+        let probe = spawn_probe(&self.net, class, (front, rear, half_width), pos, heading, at);
+        omsi_traffic::perception::people_hold_at_rest(&self.net, &self.sim, &probe)
+    }
+
+    /// May a vehicle of `ty` be put on the road at `pos` facing `heading` (deg), at distance `at.1`
+    /// along lane `at.0`, for `who`? Not onto (or right up against) another vehicle or the
+    /// player's: the bodies are compared, not origins (see `spawn_clear_except`).
+    pub fn spawn_clear(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn) -> bool {
+        self.spawn_clear_except(ty, pos, heading, at, who, None)
     }
 
     /// `spawn_clear`, leaving out car `except` (a vehicle asking whether it could be put
     /// back where it stands). The bodies of the vehicle and of the parts coupled to it are
     /// compared with `SPAWN_BODY_CLEAR` to spare (not centres: an articulated bus reaches
     /// 6 m ahead of its origin and 12 m behind it, and one put down 9.3 m from the player's
-    /// bus stood 1.8 m inside it) with every other vehicle's and `keep_clear`; nobody on foot
-    /// may stand in them or the people strip beside them (`people_in_strip`; counted,
+    /// bus stood 1.8 m inside it) with every other vehicle's and `keep_clear`; and the cars'
+    /// people test must not hold it standing there (`people_hold_here`; counted by `who`,
     /// `spawn_refused_people`).
-    pub fn spawn_clear_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
+    pub fn spawn_clear_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn, except: Option<usize>) -> bool {
         let bodies = self.consist_bodies(ty, pos, heading);
         let reach = bodies.iter().map(|b| (b.center - pos.truncate()).length() + b.half.length()).fold(0.0, f64::max) + 40.0;
         let touches = |o: &omsi_sim::collision::Obb| bodies.iter().any(|b| b.overlaps(o));
@@ -3561,19 +3617,11 @@ impl Traffic {
         if taken {
             return false;
         }
-        // nor where somebody stands in its body or the people strip beside it (`people_in_strip`;
-        // put down over them it stood for them, a car among Wuluju's walkers 475 s; SUMO's
-        // insertion checks the lane for persons in the insertion gap)
-        let drawn: Vec<omsi_sim::collision::Obb> = bodies
-            .iter()
-            .map(|b| {
-                let mut d = *b;
-                d.half -= glam::DVec2::splat(SPAWN_BODY_CLEAR);
-                d
-            })
-            .collect();
-        if people_in_strip(&drawn, pos.z, self.people.iter().map(|p| p.0)) {
-            self.spawn_refused_people += 1;
+        // nor where the people test would hold it at once (put down over them it stood for them,
+        // a car among Wuluju's walkers 475 s; SUMO inserts only where its `pedestrian` insertion
+        // check passes)
+        if self.people_hold_here(ty, pos, heading, at, who) {
+            self.spawn_refused_people[Spawn::ALL.iter().position(|w| *w == who).unwrap_or(0)] += 1;
             return false;
         }
         let (front, rear, half_w) = extents(ty, 12.0);
@@ -3846,7 +3894,7 @@ impl Traffic {
                 why.get_or_insert("every place to come back at is in the player's sight");
                 return false;
             }
-            if !self.spawn_clear_except(&ty, q, h as f64, Some(i)) {
+            if !self.spawn_clear_except(&ty, q, h as f64, (route[k], at_s), Spawn::Respawn, Some(i)) {
                 why.get_or_insert("no place to come back at is free");
                 return false;
             }
@@ -3951,6 +3999,8 @@ impl Traffic {
         self.others_still.retain(|id, _| others.iter().any(|o| o.0 == *id));
         self.sim.players = views;
         self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb, waits_at, id, approach)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb, waits_at, id: Some(id), approach }).collect();
+        // (indexed now: a bus put back on its route below asks the people test, `people_hold_here`)
+        self.sim.index_people();
         self.sim.walkers = self.walkers.clone();
         self.sim.parked = self.parked.clone();
         self.sim.day_time = self.day_time;
@@ -6437,20 +6487,6 @@ mod density_semantics_tests {
     /// (0.001) weigh nothing for a fleet of normal cars; a lane of 0.1 a tenth; a lane of
     /// no rules the full 1. Another group with types brings its own share.
     #[test]
-    fn a11_1_no_car_is_put_down_where_somebody_stands_in_its_body_or_people_strip() {
-        // a car 1.8 m wide, 4.6 m long facing north at the origin: inside its body, or beside it
-        // within the strip (0.9 + 0.3 m), refused; farther off, ahead of its front, or on a level
-        // above, put down
-        let body = omsi_sim::collision::Obb::from_box([1.8, 4.6, 1.5, 0.0, 0.0, 0.75], DVec3::ZERO, 0.0);
-        let refused = |p: DVec3| people_in_strip(&[body], 0.0, std::iter::once(p));
-        assert!(refused(DVec3::new(0.3, 1.0, 0.0)), "in its body");
-        assert!(refused(DVec3::new(1.15, -2.0, 0.0)), "in the strip");
-        assert!(!refused(DVec3::new(1.25, 0.0, 0.0)), "beside the strip");
-        assert!(!refused(DVec3::new(0.0, 2.5, 0.0)), "ahead of its front");
-        assert!(!refused(DVec3::new(0.0, 0.0, 6.0)), "on a bridge above");
-    }
-
-    #[test]
     fn b9_1_the_spawn_weight_is_the_groups_own_density() {
         let defaults = [1, 2, 1];
         let normal = SpawnGroup { uvg: Some(0), weight: 1.0, by_type: vec![(0, 1.0)] };
@@ -6470,5 +6506,34 @@ mod density_semantics_tests {
         // a type the lane's rules keep off (a bus type on a plain lane) takes no share
         let buses = SpawnShares { groups: vec![SpawnGroup { uvg: Some(0), weight: 1.0, by_type: vec![(0, 0.5), (2, 0.5)] }], total: 1.0 };
         assert!((buses.lane_weight(&lane(1.0, &[]), &defaults) - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod spawn_people_tests {
+    use super::*;
+
+    /// A11-1: a place is refused where the cars' people test would hold the vehicle standing there
+    /// (`people_hold_at_rest` on `spawn_probe`): somebody just ahead of its front or in its body; not
+    /// somebody level with the body outside its footprint (inside the old drawn-box-and-strip
+    /// test), nor one ahead beyond the test's reach at rest, nor one on a level above.
+    #[test]
+    fn a11_1_a_place_is_refused_where_the_people_test_holds_the_car_standing() {
+        let mut net = Network::default();
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -50.0, 0.0), DVec3::new(0.0, 50.0, 0.0)], LaneKind::Street, 3.5));
+        // a car 1.8 m wide, 2.3 m front and rear of its origin at (0, 0), facing north (heading 0)
+        let probe = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0));
+        let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
+        let mut refused = |p: DVec3| {
+            sim.people = vec![Person { pos: p, vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+            sim.index_people();
+            omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe)
+        };
+        assert!(refused(DVec3::new(0.0, 2.5, 0.0)), "0.2 m ahead of its front");
+        assert!(refused(DVec3::new(0.3, 1.0, 0.0)), "in its body");
+        assert!(refused(DVec3::new(0.0, 8.0, 0.0)), "on its way within the reach at rest");
+        assert!(!refused(DVec3::new(1.19, -1.0, 0.0)), "beside the body, outside its footprint");
+        assert!(!refused(DVec3::new(0.0, 12.0, 0.0)), "ahead beyond the reach at rest: a stop it brakes for");
+        assert!(!refused(DVec3::new(0.0, 2.5, 6.0)), "on a bridge above");
     }
 }
