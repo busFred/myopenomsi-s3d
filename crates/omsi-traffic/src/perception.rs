@@ -1624,13 +1624,21 @@ pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, u
     net.lanes.get(l)?.traffic_light.filter(|&(ctl, li)| !detector_light(sim, ctl, li))
 }
 
+/// A later lit line of the object this far (degrees) round from the first line is on another
+/// street's path (CHANGELOG leftarrow-1: the way between the two turned by over 45 degrees).
+const TURNED_LINE_DEG: f32 = 45.0;
+
 /// The next light on the way within 150 m. A second line of the same junction object on a
 /// straight run that shows the same light (controller and index) holds nobody: the car has
 /// passed that light's line, and the repeated head is no new link. A line further on carrying
 /// another light is its own link and is read (SUMO: each link has its own signal index), because
-/// a left-turn waiting area is entered on one light and left on another. Of the lines ahead, the first that does
-/// not let the car go is the one it reads (SUMO checks every link of its look-ahead, not the
-/// first): a green line before a red one holds nobody; with every line letting it go, the first.
+/// a left-turn waiting area is entered on one light and left on another. A later line of the
+/// object reached after the way turned by 45 degrees or more from the first line holds nobody
+/// either: in OMSI's crossing objects that is the cross street's own lit path, joined mid-object
+/// by a turner, and its line stops the cross street's traffic, not the turner (which passed its
+/// own light at the first line). Of the lines ahead, the first that does not let the car go is
+/// the one it reads (SUMO checks every link of its look-ahead, not the first): a green line
+/// before a red one holds nobody; with every line letting it go, the first.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
     let mut seen_object: Option<(((i32, i32), i64), f32, (usize, usize))> = None;
     let mut first: Option<SignalView> = None;
@@ -1642,7 +1650,7 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
         let Some((ctl, li)) = stop_light(net, sim, l) else { continue };
         let key = lane.key.map(|k| (k.tile, k.id));
         if let (Some(k), Some((sk, sh, sl))) = (key, seen_object) {
-            if k == sk && sl == (ctl, li) && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
+            if k == sk && (sl == (ctl, li) || omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() >= TURNED_LINE_DEG) {
                 continue;
             }
         }
@@ -2310,8 +2318,15 @@ mod signal_tests {
     /// green, the one 11 m on red (a left-turn waiting area). The car reads the second line's
     /// own light once past the first; the same light repeated further on is the line it passed.
     fn waiting_area(second: (usize, usize)) -> (Network, Simulation) {
+        object(second, false)
+    }
+
+    /// The same object, the second line on a straight run or (`turned`) on a path at right angles
+    /// to the first: the cross street's lit path a turner joins mid-object.
+    fn object(second: (usize, usize), turned: bool) -> (Network, Simulation) {
         let piece = |x0: f64, x1: f64, path: u16, light: Option<(usize, usize)>| {
-            let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)], LaneKind::Street, 3.5);
+            let (a, b) = if turned && path == 2 { (DVec3::new(12.0, 0.0, 0.0), DVec3::new(12.0, 1.0, 0.0)) } else { (DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)) };
+            let mut l = LaneBuilder::polyline(vec![a, b], LaneKind::Street, 3.5);
             l.source = 2;
             l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
             l.traffic_light = light;
@@ -2341,5 +2356,20 @@ mod signal_tests {
         let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
         let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
         assert_eq!((s.light, s.dist), (0, 5.0));
+    }
+
+    #[test]
+    fn a_later_line_of_the_object_after_a_turn_holds_nobody() {
+        // the turner's own line green, the cross street's line 11 m on (turned 90 degrees) red:
+        // the cross street's line is not the turner's, short of its own line or past it
+        let (net, sim) = object((0, 1), true);
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("its own light");
+        assert_eq!((s.light, s.dist), (0, 5.0));
+        let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
+        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        // the same red line on the straight run holds it (the left-turn waiting area)
+        let (net, sim) = object((0, 1), false);
+        assert_eq!(signal_ahead(&net, &sim, &way, 2.0).map(|s| s.light), Some(1));
     }
 }
