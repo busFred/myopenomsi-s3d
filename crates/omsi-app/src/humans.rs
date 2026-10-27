@@ -2255,40 +2255,36 @@ struct Me {
     approach: Option<(DVec2, f32, f32)>,
 }
 
-/// How far (m) the player sees people at all (`seen_from`).
-const PEOPLE_SIGHT: f64 = 230.0;
+/// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
+/// adult's; the eye aims at its middle.
+const FIGURE_HEIGHT: f64 = 1.8;
 
-/// Whether the player, with eyes `eye` (none: about `center`), could see somebody standing at `p`.
-fn seen_from(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
-    match eye {
-        None => (p - center).length() < 150.0,
-        Some(e) => {
-            let d = p + DVec3::Z * 0.9 - e.pos;
-            let dist = d.length();
-            if dist > PEOPLE_SIGHT {
-                return false;
-            }
-            dist < 3.0 || d.dot(e.fwd) / dist > e.cos_half
-        }
+/// Whether a figure standing `dist` m from the eye is past the player's sight: beyond the
+/// vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its two-pixel
+/// distance and the renderer's reach, never within `NEAR_HIDE`), reckoned without the vehicles'
+/// lamps, which a person does not carry; with no picture known (no traffic), past the traffic's
+/// horizon for it without one (`traffic::horizon_without_picture`).
+fn past_sight(viewer: Option<&crate::traffic::Viewer>, dist: f64) -> bool {
+    match viewer {
+        Some(v) => v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_HEIGHT * 0.5),
+        None => dist > crate::traffic::horizon_without_picture(FIGURE_HEIGHT),
     }
 }
 
-/// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
-/// adult's, as `seen_from` aims at its middle 0.9 m up.
-const FIGURE_HEIGHT: f64 = 1.8;
-
-/// Whether the player could see a figure standing at `p`: in the view cone (`Eye`) and not
-/// beyond the vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its
-/// two-pixel distance and the renderer's reach, never within `NEAR_HIDE`), reckoned without
-/// the vehicles' lamps, which a person does not carry; with no viewer, `seen_from`.
+/// Whether the player could see a figure standing at `p`: in the view cone (`Eye`) and not past
+/// their sight (`past_sight`); with no eye, within `traffic::NEVER_VANISH_WITHIN` of `center` (the
+/// traffic's reach of the mirrors and a turn of the head, where no car appears or vanishes seen or
+/// not). The one measure for everything about people the player may see: who appears
+/// (`may_appear`), who is taken away (`stroller_goes`, the pool, standing people), where the density
+/// is wanted (`in_sight_reach`, with a head turn).
 fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
-    match (eye, viewer) {
-        (Some(e), Some(v)) => {
+    match eye {
+        None => (p - center).length() < crate::traffic::NEVER_VANISH_WITHIN,
+        Some(e) => {
             let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
             let dist = d.length();
-            dist < 3.0 || (d.dot(e.fwd) / dist > e.cos_half && !v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_HEIGHT * 0.5))
+            dist < 3.0 || (d.dot(e.fwd) / dist > e.cos_half && !past_sight(viewer, dist))
         }
-        _ => seen_from(eye, center, p),
     }
 }
 
@@ -2480,7 +2476,7 @@ impl DecideCtx<'_> {
                 // as in OMSI 2, somebody who finds no pavement is respawned
                 // (taken away; the spawner puts a pedestrian where one belongs): at once when out
                 // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
-                let gone = !seen_from(self.eye, self.center, p.position) && far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS);
+                let gone = !figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position) && far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS);
                 if gone || t >= STANDING_GIVE_UP {
                     d.gone = true;
                 }
@@ -2585,17 +2581,20 @@ const PED_PATH_MIN_WIDTH: f32 = 2.0 * BODY_OUTSIDE as f32;
 /// pavement within it is in sight for the density (a driver looks out of the side windows).
 const PED_HEAD_TURN: f64 = 90.0;
 
-/// Whether the point `p` is in the player's sight for the density: within the people's
-/// sight distance (`seen_from`'s) and in frame or within `PED_HEAD_TURN` of it; with no eye,
-/// near the centre as `seen_from`.
-fn in_sight_reach(eye: Option<Eye>, center: DVec3, p: DVec3) -> bool {
+/// Whether the point `p` is in the player's sight for the density: not past their sight
+/// (`past_sight`, as `figure_in_sight`) and in frame or within `PED_HEAD_TURN` of it; with no
+/// eye, as `figure_in_sight`.
+fn in_sight_reach(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
     match eye {
-        None => seen_from(None, center, p),
+        None => figure_in_sight(None, viewer, center, p),
         Some(e) => {
-            let d = p + DVec3::Z * 0.9 - e.pos;
+            let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
             let dist = d.length();
-            if dist > PEOPLE_SIGHT || dist < 3.0 {
-                return dist <= PEOPLE_SIGHT;
+            if dist < 3.0 {
+                return true;
+            }
+            if past_sight(viewer, dist) {
+                return false;
             }
             let half = e.cos_half.clamp(-1.0, 1.0).acos().to_degrees() + PED_HEAD_TURN;
             half >= 180.0 || d.dot(e.fwd) / dist > half.to_radians().cos()
@@ -5731,6 +5730,8 @@ pub struct Humans {
     pub ticket_key: String,
     /// Where the player looks from (set by the app every frame).
     pub eye: Option<Eye>,
+    /// The traffic's picture of the player's view (`figure_in_sight`), as of the last tick.
+    viewer: Option<crate::traffic::Viewer>,
     /// Around where people are kept (the player's bus, else the camera).
     center: DVec3,
     /// A line for the HUD about something that just happened.
@@ -5992,6 +5993,7 @@ impl Humans {
             give_change_all: false,
             ticket_key: "T".into(),
             eye: None,
+            viewer: None,
             center: DVec3::ZERO,
             message: None,
             tick_stats: (0, 0.0, 0.0),
@@ -6185,7 +6187,7 @@ impl Humans {
 
     /// Whether the player could see somebody standing at `p`.
     fn seen(&self, p: DVec3) -> bool {
-        seen_from(self.eye, self.center, p)
+        figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p)
     }
 
     /// The people of OMSI's pool there are now (everybody but avatars and other players'
@@ -7212,7 +7214,8 @@ impl Humans {
         // frame or within a head turn of it, `in_sight_reach` - and elsewhere only the walkers
         // on their way into sight, `stroll_targets`)
         let eye = self.eye;
-        let in_reach = |p: DVec3| in_sight_reach(eye, center, p);
+        let viewer = self.viewer;
+        let in_reach = |p: DVec3| in_sight_reach(eye, viewer.as_ref(), center, p);
         let in_circle = |p: DVec3| (p - center).truncate().length() < radius;
         let targets = stroll_targets(ped, net, &candidates, &in_reach, &in_circle, rho);
         let lacks = stroll_lacks;
@@ -8763,6 +8766,7 @@ impl Humans {
         }
         self.use_map_humans(world);
         self.time += dt as f64;
+        self.viewer = traffic.and_then(|t| t.viewer);
         let net = traffic.map(|t| &t.net);
         if let Some(b) = bus {
             self.center = b.position;
@@ -9027,7 +9031,7 @@ impl Humans {
             p.t_state += dt;
         }
         let decided: Vec<Option<Decision>> = {
-            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
+            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time };
             let people = &self.people;
             let cars = &cars;
             let lights = traffic.map(LightsOf::of);
@@ -9061,7 +9065,7 @@ impl Humans {
                 let mut d = match d {
                     Some(d) => d,
                     None => {
-                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: traffic.and_then(|t| t.viewer), center: self.center, lan_centers: &self.lan_centers, time: self.time };
+                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time };
                         ctx.decide(&self.people[i], dt, world, net, traffic.map(LightsOf::of).as_ref(), &cars, &mut YieldBook::Book(&mut self.yields))
                     }
                 };
@@ -12647,13 +12651,48 @@ mod ped_tests {
     }
 
     #[test]
+    fn p11_3_who_sees_people_is_the_vehicles_horizon_for_a_figure() {
+        // one measure: in frame up to the figure's two-pixel distance (900 lines, 60 degrees: 701 m),
+        // never past it; with no picture known, the traffic's horizon without one; with no eye,
+        // the traffic's never-vanish reach round the centre
+        let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
+        let v = crate::traffic::Viewer {
+            pos: DVec3::ZERO,
+            forward: DVec3::Y,
+            tan_x: (30f64).to_radians().tan() * 16.0 / 9.0,
+            tan_y: (30f64).to_radians().tan(),
+            range: 5000.0,
+            min_size: 0.0,
+            max_dist: 0.0,
+            fov: (60f64).to_radians(),
+            px_height: 900.0,
+            horizon_fov: 0.0,
+            lamps_lit: false,
+            loaded: 0.0,
+        };
+        let ahead = |d: f64| DVec3::new(0.0, d, 0.0);
+        for d in [100.0, 300.0, 650.0] {
+            assert!(figure_in_sight(Some(e), Some(&v), DVec3::ZERO, ahead(d)), "{d}");
+            assert!(in_sight_reach(Some(e), Some(&v), DVec3::ZERO, ahead(d)), "{d}");
+        }
+        assert!(!figure_in_sight(Some(e), Some(&v), DVec3::ZERO, ahead(750.0)));
+        assert!(!in_sight_reach(Some(e), Some(&v), DVec3::ZERO, ahead(750.0)));
+        let unknown = crate::traffic::horizon_without_picture(FIGURE_HEIGHT);
+        assert!(figure_in_sight(Some(e), None, DVec3::ZERO, ahead(unknown - 1.0)) && !figure_in_sight(Some(e), None, DVec3::ZERO, ahead(unknown + 1.0)));
+        assert!(figure_in_sight(None, None, DVec3::ZERO, ahead(crate::traffic::NEVER_VANISH_WITHIN - 1.0)));
+        assert!(!figure_in_sight(None, Some(&v), DVec3::ZERO, ahead(crate::traffic::NEVER_VANISH_WITHIN + 1.0)));
+    }
+
+    #[test]
     fn p3b_pavements_in_frame_or_a_head_turn_away_are_in_sight_those_behind_are_not() {
         let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
         let at = |deg: f64, d: f64| DVec3::new(d * deg.to_radians().sin(), d * deg.to_radians().cos(), 0.0);
-        assert!(in_sight_reach(Some(e), DVec3::ZERO, at(0.0, 50.0)), "ahead");
-        assert!(in_sight_reach(Some(e), DVec3::ZERO, at(110.0, 50.0)), "beside, a head turn away");
-        assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(170.0, 50.0)), "behind");
-        assert!(!in_sight_reach(Some(e), DVec3::ZERO, at(0.0, PEOPLE_SIGHT + 10.0)), "beyond sight");
+        assert!(in_sight_reach(Some(e), None, DVec3::ZERO, at(0.0, 50.0)), "ahead");
+        assert!(in_sight_reach(Some(e), None, DVec3::ZERO, at(110.0, 50.0)), "beside, a head turn away");
+        assert!(!in_sight_reach(Some(e), None, DVec3::ZERO, at(170.0, 50.0)), "behind");
+        let sight = crate::traffic::horizon_without_picture(FIGURE_HEIGHT);
+        assert!(in_sight_reach(Some(e), None, DVec3::ZERO, at(0.0, sight - 10.0)), "short of the horizon");
+        assert!(!in_sight_reach(Some(e), None, DVec3::ZERO, at(0.0, sight + 10.0)), "beyond sight");
     }
 
     #[test]

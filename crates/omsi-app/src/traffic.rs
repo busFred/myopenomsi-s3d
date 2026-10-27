@@ -511,6 +511,18 @@ pub(crate) const PEOPLE_STRIP: f64 = 0.3;
 /// A car further away than this is below two pixels on a 900-line screen (m).
 const VISIBLE_RANGE: f64 = 900.0;
 
+/// The two-pixel distance (m) of a body `height` (m) high with the picture unknown: the documented
+/// `VISIBLE_RANGE` scaled from a car's height (`Viewer::two_pixels`).
+fn two_pixels_without_picture(height: f64) -> f64 {
+    VISIBLE_RANGE * height / CAR_HEIGHT
+}
+
+/// The horizon (m) of a body `height` (m) high where no picture is known at all (no `Viewer`):
+/// its two-pixel distance without one, never within `NEAR_HIDE` (as `Viewer::beyond_horizon`).
+pub(crate) fn horizon_without_picture(height: f64) -> f64 {
+    two_pixels_without_picture(height).max(NEAR_HIDE)
+}
+
 /// Fewer pixel rows than this and a car is a dot the eye cannot tell from nothing
 /// (VISIBLE_RANGE's "two pixels").
 const DOT_PIXELS: f64 = 2.0;
@@ -528,7 +540,7 @@ const DRIVER_NEAR: f64 = 70.0;
 
 /// Within this distance of the camera no car appears or vanishes, seen or not: the mirrors
 /// and a turn of the head see what is near (see [`Traffic::may_appear`]).
-const NEVER_VANISH_WITHIN: f64 = 150.0;
+pub(crate) const NEVER_VANISH_WITHIN: f64 = 150.0;
 
 /// Lane ends within this distance (m) of a lane start are linked (`Network::link`, the value
 /// the network has always been linked with).
@@ -610,7 +622,7 @@ impl Viewer {
         if self.lamps_lit {
             f64::INFINITY
         } else if self.px_height <= 0.0 {
-            VISIBLE_RANGE * height / CAR_HEIGHT
+            two_pixels_without_picture(height)
         } else {
             let fov = if self.horizon_fov > 0.0 { self.horizon_fov } else { self.fov };
             height * self.px_height / (DOT_PIXELS * 2.0 * (fov * 0.5).tan().max(1e-3))
