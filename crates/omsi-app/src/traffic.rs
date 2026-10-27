@@ -3024,8 +3024,9 @@ impl Traffic {
                     guard += 1;
                     let l = &self.net.lanes[d.lane];
                     // the ways a car on the road would take (`AiState::choose_after`): those
-                    // of its group, else those open to cars, else any - only where the
-                    // network ends does it leave the map (filtering by its group alone, the
+                    // of its group, else those open to cars, else any, one of them at random (a
+                    // car out of range has no trip end, `AiState::goal`: nobody sees its way) -
+                    // only where the network ends does it leave the map (filtering by its group alone, the
                     // trucks of Spandau were gone at the first junction whose turn has no
                     // `trucks` rule, and hardly one of them ever came into range)
                     let pool = self.types.iter().find(|t| Arc::ptr_eq(&t.0, &d.ty)).and_then(|t| self.group_uvg[t.3]);

@@ -715,8 +715,11 @@ fn stays_on_best(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// How far (m, at most `cap`) a car at `s` on `lane` can drive on along it and the lanes it
 /// runs into while they are open to it (`access::is_open`; a junction object's piece is the
 /// junction's): SUMO's best-lane length (`neighDist`, `currentDist`) for a car with no route -
-/// at a fork the way on that runs furthest. (`NeighbourView::runs_on` is the network's reach,
-/// which counts no closed lane out and stops counting at `REACH_MAX`.)
+/// at a fork the way on that runs furthest. A random car's trip end (`AiState::goal`) is not
+/// looked at here: the way it takes at the fork is chosen when its plan reaches it
+/// (`AiState::choose_after`), from whichever lane it is on then, the shortest way to the trip
+/// end from there. (`NeighbourView::runs_on` is the network's reach, which counts no closed lane
+/// out and stops counting at `REACH_MAX`.)
 fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
     // (at most `OPEN_RUN_LANES` lanes looked at: past that the way is taken to run on)
     fn walk(net: &Network, me: &Vehicle, lane: usize, d: f32, cap: f32, budget: &mut usize) -> f32 {
