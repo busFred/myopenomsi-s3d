@@ -2297,8 +2297,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let exit = j.entry + j.way_len;
             if rest > line + 0.5 && rest < exit {
                 let hold = pulled_back(&walk_bands(net, sim, j), me, line);
-                out.stop = Some(hold);
-                out.why = Why::KeepClear;
+                // (the hold replaces a stop further on - a refusal, people at a waiting place
+                // inside - never one nearer: a person already under the front keeps the car
+                // standing, it is not pulled on to the line)
+                if out.stop.is_none_or(|s| s >= hold) {
+                    out.stop = Some(hold);
+                    out.why = Why::KeepClear;
+                }
             }
         }
     }
