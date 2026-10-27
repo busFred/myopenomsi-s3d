@@ -488,7 +488,9 @@ pub fn zipper_reach(c: &Claim) -> f32 {
 /// standing lead short of the stretch (`Claim::lead_rest`) is no foe ahead at all (SUMO's
 /// `willPass`: its planned stop is before the link). Outside its zipper reach
 /// (`zipper_reach`) a car is capped by no foe short of the stretch (SUMO adapts nothing there);
-/// a foe in the stretch, or standing at the join, is followed at any distance. For the foe
+/// a foe in the stretch, or standing at the join, is followed at any distance. Neither of these
+/// two drops a foe whose body lies across my way (`Claim::body_block`): that is a physical lead,
+/// followed whatever its plan or distance. For the foe
 /// ahead: the queue-entry stop when it stands at the join (`ZipCap::stop`,
 /// my lead), else the gentler of following it where it stands along the merged way and the
 /// acceleration that brings my front to the start `tau` after its rear (`arrive`; inside the
