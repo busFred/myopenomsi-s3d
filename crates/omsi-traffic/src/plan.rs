@@ -558,32 +558,37 @@ fn may_change_to(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// A change of the driver's own from a junction object's piece onto the piece beside it
 /// (`Network::piece_beside`) is a change on a road: SUMO changes lanes on an edge and never on
 /// an internal lane, whose stretch is where the ways of the junction meet (`mayChange`, sumo.md
-/// 3.1). An OMSI object also lays plain road as paths (BeijingCity's Jiangzhaikou: 128 m of
-/// parallel paths), so the move - from beside my rear to the change's length
-/// (`change_length`) past my front - must stay on both pieces, touch no stretch where either
-/// piece meets another way of the junction (a foe's stretch, `Foe::mine`, or one converging
-/// with a third way, `Movement::converge`), and `nb` must still lie beside where the move ends (parallel for the
-/// move's length).
+/// 3.1). An OMSI object also lays plain road as paths, so the move is allowed where it touches no
+/// meeting place: the stretch the body covers - from beside my rear to my front, plus what the car
+/// drives while it signals (`SIGNAL_BEFORE_CHANGE` at its speed, as `change_clear` lays it) and the
+/// move's length (`change_length`) - must stay on both pieces and touch, on either piece, no foe's
+/// stretch (`Foe::mine`), no stretch converging with a third way (`Movement::converge`) and no
+/// people's crossing (`Network::walks`, the cuts the perception's zebra rule reads; SUMO's
+/// crossings are internal lanes too), and `nb` must still lie beside where the move ends
+/// (parallel for the move's length).
 fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourView) -> bool {
     let st = &me.state;
     let (Some(&(j, m)), Some(&(j2, m2))) = (sim.junctions.of_lane.get(&st.lane), sim.junctions.of_lane.get(&nb.lane)) else { return false };
     if j != j2 {
         return false;
     }
+    let pre = st.speed.max(0.0) * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
     let mv = omsi_sim::traffic::change_length(st.speed);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
-    let mine = (st.s - st.rear, st.s + st.front + mv);
-    let theirs = (s_b - st.rear, s_b + st.front + mv);
+    let mine = (st.s - st.rear, st.s + st.front + pre + mv);
+    let theirs = (s_b - st.rear, s_b + st.front + pre + mv);
     if mine.0 < 0.0 || mine.1 > net.lanes[st.lane].length() || theirs.0 < 0.0 || theirs.1 > net.lanes[nb.lane].length() {
         return false;
     }
-    // (the two pieces' own nearness is the lane beside, not a meeting: narrow parallel lanes,
-    // 2.3-2.6 m apart at Jiangzhaikou, come within `MEET_DIST` of each other)
-    let meets = |mi: usize, other: usize, (a, b): (f32, f32)| {
+    // (the two pieces' own nearness is the lane beside, not a meeting: narrow parallel pieces
+    // come within `MEET_DIST` of each other)
+    let meets = |mi: usize, other: usize, lane: usize, (a, b): (f32, f32)| {
         let mm = &sim.junctions.nodes[j].movements[mi];
-        mm.foes.iter().any(|f| f.mine.0 < b && f.mine.1 > a) || mm.converge.iter().zip(&mm.converge_with).any(|(c, &w)| w != other && c.0 < b && c.1 > a)
+        mm.foes.iter().any(|f| f.mine.0 < b && f.mine.1 > a)
+            || mm.converge.iter().zip(&mm.converge_with).any(|(c, &w)| w != other && c.0 < b && c.1 > a)
+            || net.walks.get(lane).is_some_and(|w| w.iter().any(|&(_, sa, _)| sa > a && sa < b))
     };
-    if meets(m, m2, mine) || meets(m2, m, theirs) {
+    if meets(m, m2, st.lane, mine) || meets(m2, m, nb.lane, theirs) {
         return false;
     }
     net.piece_beside(st.lane, mine.1, nb.dir) == Some(nb.lane)
@@ -2688,4 +2693,86 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         out.why = Why::Lead;
     }
     out
+}
+
+#[cfg(test)]
+mod piece_change_tests {
+    use super::*;
+    use glam::DVec3;
+    use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind};
+
+    /// A path of junction object 9, `kind`, from `a` to `b`.
+    fn path(a: (f64, f64), b: (f64, f64), n: u16, kind: LaneKind) -> omsi_sim::traffic::Lane {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(a.0, a.1, 0.0), DVec3::new(b.0, b.1, 0.0)], kind, 3.0);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path: n });
+        l
+    }
+
+    /// Two 150 m pieces of one object 3 m apart running east (0 at y 0, 1 at y -3) and, at x 120,
+    /// what crosses both: a street path (a foe) or a footpath (a people's crossing).
+    fn object(cross: LaneKind) -> Network {
+        let mut net = Network::default();
+        net.lanes.push(path((0.0, 0.0), (150.0, 0.0), 0, LaneKind::Street));
+        net.lanes.push(path((0.0, -3.0), (150.0, -3.0), 1, LaneKind::Street));
+        net.lanes.push(path((120.0, -20.0), (120.0, 20.0), 2, cross));
+        net.link(1.5);
+        net.compute_conflicts();
+        net
+    }
+
+    fn car_at(s: f32, speed: f32) -> Vehicle {
+        let mut st = AiState::new(0, s, 1);
+        st.speed = speed;
+        st.front = 2.0;
+        st.rear = 2.0;
+        st.length = 4.0;
+        Vehicle::new(1, VehicleClass::Car, st, 0.9, 7919)
+    }
+
+    fn beside(net: &Network) -> NeighbourView {
+        let dir = [1, 2].into_iter().find(|&d| net.piece_beside(0, 50.0, d) == Some(1)).expect("piece 1 lies beside piece 0");
+        NeighbourView { lane: 1, dir, ahead: None, behind: None, behind_id: None, behind_min_gap: 2.0, runs_on: 150.0, turn: 0, foreign: false, allowed: true }
+    }
+
+    /// Where the crossing first touches piece 0 (m), whatever crosses it.
+    fn first_meeting(net: &Network, sim: &Simulation) -> f32 {
+        let (j, m) = sim.junctions.of_lane[&0];
+        let foe = sim.junctions.nodes[j].movements[m].foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+        let walk = net.walks[0].iter().map(|w| w.1).fold(f32::INFINITY, f32::min);
+        foe.min(walk)
+    }
+
+    /// The window runs past my front by what the car drives while it signals and the move's
+    /// length: at 10 m/s (20 m of signal, a 36 m move) a meeting 50 m past the car's middle bars
+    /// the change, one 70 m on does not; the move alone (38 m past the middle) would have missed it.
+    fn signal_run_counts(cross: LaneKind) {
+        let net = object(cross);
+        let sim = Simulation::new(&net, vec![]);
+        let nb = beside(&net);
+        let meet = first_meeting(&net, &sim);
+        assert!(meet.is_finite() && meet > 100.0, "the crossing meets piece 0 near x 120 ({meet})");
+        let v = 10.0;
+        let reach = 2.0 + v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE + omsi_sim::traffic::change_length(v);
+        assert!(reach > 50.0 && 2.0 + omsi_sim::traffic::change_length(v) < 50.0 - 1.0);
+        assert!(!piece_change_clear(&net, &sim, &car_at(meet - 50.0, v), &nb), "the meeting within the signal's run bars the change");
+        assert!(piece_change_clear(&net, &sim, &car_at(meet - reach - 2.0, v), &nb), "past the move's end it does not");
+    }
+
+    /// S2: the window counts the signal's run (a crossing street path, a foe of both pieces).
+    #[test]
+    fn a_foe_within_the_signal_run_bars_a_piece_change() {
+        signal_run_counts(LaneKind::Street);
+    }
+
+    /// S3: a people's crossing on the pieces bars the change like a foe (`Network::walks`).
+    #[test]
+    fn a_people_crossing_within_the_move_bars_a_piece_change() {
+        let net = object(LaneKind::Sidewalk);
+        assert!(net.walks[0].iter().any(|w| w.0 == 2) && net.walks[1].iter().any(|w| w.0 == 2), "the footpath cuts both pieces");
+        let sim = Simulation::new(&net, vec![]);
+        let (j, m) = sim.junctions.of_lane[&0];
+        assert!(sim.junctions.nodes[j].movements[m].foes.is_empty(), "a footpath is no foe of the pieces");
+        signal_run_counts(LaneKind::Sidewalk);
+    }
 }
