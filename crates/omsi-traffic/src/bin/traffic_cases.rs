@@ -6423,6 +6423,13 @@ struct PeopleAcc {
     kerb_over_settled_ps: f64,
     kerb_fallback_s: f64,
     kerb_fallback_pair_s: f64,
+    /// The people on foot the game took away (`Frame::people_gone`), those of them the player
+    /// could see then, the first few of those (time, id, where they were last), and everybody's
+    /// position in the frame before, by id (where a removed person was).
+    removed: usize,
+    removed_in_sight: usize,
+    removed_in_sight_ev: Vec<(f64, u32, DVec3)>,
+    last_pos: HashMap<u32, DVec3>,
     kerb_over_max: (usize, f64, DVec3),
     /// The standing pairs of the frame with the most of them: (time, [(id, pos, leg, decision) x 2]).
     kerb_over_pairs: (usize, f64, Vec<String>),
@@ -6475,6 +6482,10 @@ impl PeopleAcc {
             kerb_over_settled_ps: 0.0,
             kerb_fallback_s: 0.0,
             kerb_fallback_pair_s: 0.0,
+            removed: 0,
+            removed_in_sight: 0,
+            removed_in_sight_ev: Vec::new(),
+            last_pos: HashMap::new(),
             kerb_over_max: (0, 0.0, DVec3::ZERO),
             kerb_over_pairs: (0, 0.0, Vec::new()),
             kerb_dens_max: (0.0, 0, 0.0, DVec3::ZERO),
@@ -6543,6 +6554,18 @@ impl PeopleAcc {
         if let Some(p) = f.players.first() {
             self.ppos = Some(p.pos);
         }
+        // (taken away since the frame before, every frame: where they were is the frame before's)
+        for &(id, seen) in &f.people_gone {
+            self.removed += 1;
+            if seen {
+                self.removed_in_sight += 1;
+                if self.removed_in_sight_ev.len() < 10 {
+                    self.removed_in_sight_ev.push((t, id, self.last_pos.get(&id).copied().unwrap_or(DVec3::NAN)));
+                }
+            }
+        }
+        self.last_pos.clear();
+        self.last_pos.extend(f.people.iter().filter_map(|p| p.id.map(|id| (id, p.pos))));
         // 2. flips, every frame
         let mut tracks: Vec<PTrack> = Vec::with_capacity(f.people.len());
         let mut idless: Vec<(DVec3, u8, bool)> = Vec::new();
@@ -7027,6 +7050,14 @@ impl PeopleAcc {
         kv!("kerb_overlap_settled", format!("{:.1} pair-s (both still {KERB_SETTLED} s or more)", self.kerb_over_settled_ps), json!(r1(self.kerb_over_settled_ps)));
         kv!("kerb_fallback", format!("{:.1} person-s waiting where they stand with no queue place ({:.1} standing pair-s with one of them in kerb_overlap's standing count)", self.kerb_fallback_s, self.kerb_fallback_pair_s), json!({"person_s": r1(self.kerb_fallback_s), "standing_pair_s": r1(self.kerb_fallback_pair_s)}));
         kv!("kerb_overlap", format!("{:.1} pair-s ({:.1} both standing); most in a frame {} at {:.1} s at ({:.1}, {:.1}) (waiters at a kerb closer than {BODY_ELLIPSE_DEPTH} m)", self.kerb_over_ps, self.kerb_over_still_ps, o.0, o.1, o.2.x, o.2.y), json!({"pair_s": r1(self.kerb_over_ps), "standing_pair_s": r1(self.kerb_over_still_ps), "max": o.0, "t": r1(o.1)}));
+        kv!("removed_in_sight", format!("{} of {} people on foot taken away (the game's figure_in_sight when it took them; a recording from before the count reads 0 of 0)", self.removed_in_sight, self.removed), json!({"in_sight": self.removed_in_sight, "removed": self.removed}));
+        for (t, id, at) in &self.removed_in_sight_ev {
+            let _ = writeln!(out, "  removed_in_sight       id {id} at {t:.1} s at ({:.1}, {:.1})", at.x, at.y);
+        }
+        // (the people gate in one line: carriageway person-seconds, flips, holds of 60 s and more,
+        // the longest hold, removals in sight)
+        let hold_max = self.runs.iter().map(dur).fold(0.0, f64::max);
+        let _ = writeln!(out, "GATE street_ps {:.1} flip_tft {} hold_ge60 {} hold_max_s {:.0} removed_in_sight {}", self.street_ps, self.flipped.len(), ge60(&self.runs), hold_max, self.removed_in_sight);
         (out, Value::Object(js))
     }
 }

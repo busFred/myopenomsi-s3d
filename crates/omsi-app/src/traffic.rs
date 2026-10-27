@@ -1056,6 +1056,9 @@ pub struct Traffic {
     /// What the people on foot do, in the order of `people` (set with it every frame), for
     /// the recording.
     pub people_records: Vec<omsi_traffic::record::PersonRecord>,
+    /// The people on foot the humans took away in their last tick, and whether the player could
+    /// see them (`humans::Humans::gone`): written with the next recorded frame.
+    pub people_gone: Vec<(u32, bool)>,
     /// The map's folder name: recordings and network dumps are named after it.
     pub map_name: String,
     /// Cars whose standing too long has been saved already (each once).
@@ -1729,6 +1732,7 @@ impl Traffic {
             clock_seen: f64::NAN,
             recorder: omsi_traffic::record::Recorder::new(),
             people_records: Vec::new(),
+            people_gone: Vec::new(),
             map_name: world.map_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "map".into()),
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
@@ -4132,6 +4136,7 @@ impl Traffic {
         }
         let t_rec = std::time::Instant::now();
         let cars = &self.cars;
+        self.recorder.note_people_gone(&std::mem::take(&mut self.people_gone));
         self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &|i| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default());
         let t_sim = std::time::Instant::now();
         self.sim.tick(&self.net, dt, &mut drivers);

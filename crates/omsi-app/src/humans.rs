@@ -5744,6 +5744,13 @@ pub struct Humans {
     /// Counted for the gate (`summary`): the stops' waiting places refused because no vehicle
     /// of a lane could pass somebody waiting there (`clear_stop_of_lanes`).
     places_refused: usize,
+    /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
+    /// could see then (`figure_in_sight`; every removal rule asks for out of sight, so none).
+    removed: (usize, usize),
+    /// The people on foot taken away since the start of this tick (`retire`), with whether the
+    /// player could see them: the traffic's recording writes them with its next frame
+    /// (`traffic_link::traffic_inputs`, `Frame::people_gone`).
+    gone: Vec<(u32, bool)>,
     /// The stops' waiting places moved out of a standing vehicle's body, with where they
     /// were (they go back once no standing body covers that).
     moved_places: HashMap<(i64, usize), DVec3>,
@@ -5999,6 +6006,8 @@ impl Humans {
             tick_stats: (0, 0.0, 0.0),
             jam_stats: (0.0, 0.0),
             places_refused: 0,
+            removed: (0, 0),
+            gone: Vec::new(),
             inside_seen: HashSet::new(),
             moved_places: HashMap::new(),
             tick_stages: Vec::new(),
@@ -6266,6 +6275,12 @@ impl Humans {
             .iter()
             .filter(|p| p.inside(BusId::Player))
             .count()
+    }
+
+    /// The people on foot taken away during the last tick, and whether the player could see
+    /// them (`retire`).
+    pub fn gone(&self) -> &[(u32, bool)] {
+        &self.gone
     }
 
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
@@ -6593,6 +6608,17 @@ impl Humans {
 
     /// Someone has gone: hidden, and their meshes kept for the next person of the type.
     fn retire(&mut self, p: &Person) {
+        // (the gate's count, `summary`, and the recording's, `gone`: everybody on foot taken
+        // away, and whether the player could see it - nobody should go in sight)
+        if p.place == Place::Ground && p.puppet.is_none() && !p.remote {
+            let seen = figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
+            self.removed.0 += 1;
+            if seen {
+                self.removed.1 += 1;
+                log::info!("t={:.1} pax {} ({}) taken away IN SIGHT at ({:.1}, {:.1}), {:.0} m from the eye", self.time, p.label(), p.state.name(), p.position.x, p.position.y, self.eye.map_or(f64::NAN, |e| (p.position - e.pos).length()));
+            }
+            self.gone.push((p.id, seen));
+        }
         // (what is kept per person goes with them)
         self.seat_moved.remove(&p.id);
         let tkey = Arc::as_ptr(&p.ty) as usize;
@@ -8659,7 +8685,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
-        out.push_str(&format!("; waiting places refused {}", self.places_refused));
+        out.push_str(&format!("; waiting places refused {}; taken away on foot {} ({} in sight)", self.places_refused, self.removed.0, self.removed.1));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -8767,6 +8793,7 @@ impl Humans {
         self.use_map_humans(world);
         self.time += dt as f64;
         self.viewer = traffic.and_then(|t| t.viewer);
+        self.gone.clear();
         let net = traffic.map(|t| &t.net);
         if let Some(b) = bus {
             self.center = b.position;

@@ -1977,6 +1977,10 @@ pub(crate) fn run_offscreen(
             .map(|p| p.vehicle.position)
             .unwrap_or(camera.position);
         h.sync(&renderer, &mut scene, center);
+        // (the people's gate counters ride in `Humans::summary`: jammed and inside-a-moving-
+        // vehicle person-seconds, waiting places refused, people on foot taken away and those of
+        // them taken in the player's sight - the last should be 0; `traffic_cases people` reads
+        // the same removals from the recording's `Frame::people_gone`)
         log::info!(
             "passengers: {} people ({}), request {:?}, paid {:?}, change due {:?}",
             h.people.len(),
