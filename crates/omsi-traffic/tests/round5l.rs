@@ -120,7 +120,11 @@ fn squeeze_past(net: &Network, lane: usize, player: PlayerView, others: Vec<Vehi
 fn squeeze_past_from(net: &Network, lane: usize, start: (f32, f32), player: PlayerView, others: Vec<Vehicle>, still_ramps: bool) -> Squeezed {
     let mut sim = Simulation::new(net, vec![]);
     sim.players = vec![player];
-    let mut cars = vec![car(1, lane, start.0, start.1)];
+    // (a driver who does not change lanes for speed: the squeeze, not a change into the free
+    // lane beside, is what is watched)
+    let mut me = car(1, lane, start.0, start.1);
+    me.params.lc_speed_gain = 0.0;
+    let mut cars = vec![me];
     cars.extend(others);
     let mut r = Squeezed { pass: None, least: f32::INFINITY, on_lanes: Vec::new(), x_end: 0.0, stopped_at_start: 0.0, still_at_start: 0.0, blinker_lead: 0.0 };
     let mut out_at: Option<f32> = None;

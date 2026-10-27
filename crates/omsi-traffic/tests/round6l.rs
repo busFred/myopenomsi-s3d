@@ -365,7 +365,7 @@ fn settled_beside() -> (Network, Vec<Vehicle>) {
     net.lanes.push(b);
     let net = finish(net);
     let mut me = car(1, 1, 100.0, 0.0);
-    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 0, t: 0.55, length: 12.0, s_to: 100.0, dir: 1, wait: 0.0, bypass: false });
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 0, t: 0.55, length: 12.0, s_to: 100.0, dir: 1, wait: 0.0, bypass: false, full_lock: false });
     me.state.change_cooldown = 0.0;
     let mut ahead = car(2, 1, 105.5, 0.0);
     ahead.pull_out = 1000.0;

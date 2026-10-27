@@ -1894,11 +1894,14 @@ impl Simulation {
                     }
                 }
             }
-            Some(Start::Bypass { to, dir, out_len }) => {
+            Some(Start::Bypass { to, dir, out_len, full_lock }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
-                    v.state.start_bypass(net, to, dir, out_len);
+                    v.state.start_bypass(net, to, dir, out_len, full_lock);
                     v.keep_right = 0.0;
                     v.stopped = 0.0;
+                    if let Some(w) = plan.change_why {
+                        CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             Some(Start::RouteChange { to, dir }) => {

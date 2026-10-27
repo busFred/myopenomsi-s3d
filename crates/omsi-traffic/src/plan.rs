@@ -61,8 +61,9 @@ impl Why {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Start {
     Change { to: usize, dir: i32 },
-    /// Round something standing closer than the usual 8 m move: over `out_len` m.
-    Bypass { to: usize, dir: i32, out_len: f32 },
+    /// Round something standing closer than the usual 8 m move: over `out_len` m, at full lock
+    /// (`full_lock_len`) where the smoothstep cannot steer it (`bypass_min_len`).
+    Bypass { to: usize, dir: i32, out_len: f32, full_lock: bool },
     RouteChange { to: usize, dir: i32 },
     Pass(Passing),
     AbortPass { hold: f32 },
@@ -435,11 +436,20 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
         if standing && me.stopped >= 4.0 && nb.ahead.map(|a| a.0 > l.gap + l.length + 6.0).unwrap_or(true) {
             wish(0.8, ChangeWhy::Obstacle);
         }
-        // a faster lane
-        let slow = l.speed < 0.7 * p.v_want && l.gap < 45.0 && l.gap > 8.0 && l.speed < st.speed + 1.0;
-        if slow && !near_junction && st.speed >= 4.0 && nb.ahead.map(|a| a.0 > 50.0).unwrap_or(true) && open_on(net, me, nb.lane, st.s) {
-            wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
-        }
+    }
+    // a faster lane: SUMO LC2013's speed gain - the lane beside where the speed the driver can
+    // anticipate (`anticipated_speeds`: the safe speed behind each lane's leader, capped by the
+    // lane's limit at its desire) is higher than on its own by LC2013's 5 km/h
+    // (`KEEP_RIGHT_FASTER`, the margin it asks of a lane on the right; this wish has no
+    // accumulator to let a smaller gain build up), whatever its own speed: a car standing in a
+    // queue beside an open lane has the gain too
+    // (and not into a gap behind its leader there shorter than my secure gap, SUMO's
+    // `LCA_BLOCKED_BY_LEFT/RIGHT_LEADER`: standing gap, headway, the braking to its speed)
+    let (this_safe, nb_safe) = anticipated_speeds(net, me, p, nb);
+    let secure = |vl: f32| st.min_gap + st.speed.max(0.0) * dp.tau + (st.speed.max(0.0).powi(2) - vl.max(0.0).powi(2)).max(0.0) / (2.0 * dp.comfort_brake.max(0.1));
+    let blocked = nb.ahead.is_some_and(|(g, vl)| g < secure(vl));
+    if nb_safe > this_safe + KEEP_RIGHT_FASTER && !blocked && !near_junction && open_on(net, me, nb.lane, st.s) {
+        wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
     // (`Vehicle::keep_right`, `keep_right_rate`) past its threshold, unless SUMO's strategic stays
@@ -623,6 +633,29 @@ fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
     -b * tau + ((b * tau).powi(2) + 2.0 * b * room).sqrt()
 }
 
+/// The speeds (m/s) the driver can anticipate on its own lane and on the lane beside, `nb`
+/// (SUMO LC2013's `thisLaneVSafe` / `neighLaneVSafe`, `anticipateFollowSpeed`): the safe speed
+/// behind each lane's leader (none: before the end of the lanes open to it there, `open_run`,
+/// up to `LC_STRATEGIC_LOOKAHEAD`), capped by its desired speed and on the lane beside by that
+/// lane's limit at its desire.
+fn anticipated_speeds(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, f32) {
+    let st = &me.state;
+    let (b, tau) = (me.params.comfort_brake, me.params.tau);
+    let v_max = p.v_want.max(0.1);
+    let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
+    let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
+    let this_safe = v_max.min(match p.leader {
+        Some(l) => safe_speed(l.gap, l.speed, b, tau),
+        None => safe_speed(mine, 0.0, b, tau),
+    });
+    let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
+    let nb_safe = nb_max.min(match nb.ahead {
+        Some((g, vl)) => safe_speed(g, vl, b, tau),
+        None => safe_speed(runs, 0.0, b, tau),
+    });
+    (this_safe, nb_safe)
+}
+
 /// SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
 /// side, `nb` (`MSLCM_LC2013::_wantsChange`, "honor the obligation to keep right"): 0 while my
 /// lane is faster than that one by `KEEP_RIGHT_FASTER` (the anticipated safe speeds behind each
@@ -638,17 +671,8 @@ pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Pe
     let v_max = p.v_want.max(0.1);
     // (SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
     // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
-    let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
     let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
-    let this_safe = v_max.min(match p.leader {
-        Some(l) => safe_speed(l.gap, l.speed, b, tau),
-        None => safe_speed(mine, 0.0, b, tau),
-    });
-    let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
-    let nb_safe = nb_max.min(match nb.ahead {
-        Some((g, vl)) => safe_speed(g, vl, b, tau),
-        None => safe_speed(runs, 0.0, b, tau),
-    });
+    let (this_safe, nb_safe) = anticipated_speeds(net, me, p, nb);
     if this_safe - KEEP_RIGHT_FASTER > nb_safe {
         return 0.0;
     }
@@ -960,24 +984,46 @@ pub const WHEELBASE_SHARE: f32 = 0.6;
 /// passenger car's full lock is about 35-40, its turning circle about 10.5-11 m).
 pub const MAX_STEER_DEG: f32 = 35.0;
 
-/// The shortest move over `side` metres the body can drive (m): the S-curve's tightest
-/// bends, at its ends, have a radius of length² / (6 |side|), no tighter than the turning
-/// radius `wheelbase / tan(MAX_STEER_DEG)`. (A 2 m move over 3.5 m
-/// would pivot the car 40-70 degrees on the spot; for a 4.6 m car over 3.5 m this is 9.1 m,
-/// its steepest yaw 30 degrees.)
+/// The turning radius (m) of a body `length` long at `MAX_STEER_DEG`: its wheelbase
+/// (`WHEELBASE_SHARE`) over the tangent of the lock.
+pub fn turn_radius(length: f32) -> f32 {
+    WHEELBASE_SHARE * length / MAX_STEER_DEG.to_radians().tan()
+}
+
+/// The shortest smoothstep move over `side` metres the body can drive (m, a ramp back into the
+/// lane, `AiState::lateral_ramp`): its tightest bends, at its ends, have a radius of length² /
+/// (6 |side|), no tighter than `turn_radius`. (For a 4.6 m car over 3.5 m this is 9.1 m, its
+/// steepest yaw 30 degrees.)
 pub fn bypass_min_len(length: f32, side: f32) -> f32 {
-    let radius = WHEELBASE_SHARE * length / MAX_STEER_DEG.to_radians().tan();
-    (6.0 * side.abs() * radius).sqrt()
+    (6.0 * side.abs() * turn_radius(length)).sqrt()
+}
+
+/// The shortest move over `side` metres a body `length` long can steer from rest (m): two arcs
+/// of its `turn_radius`, out at full lock and back at full lock the other way
+/// (`omsi_sim::traffic::full_lock01`, the bypass's move). For a 4.5 m car over 3.05 m: 6.1 m,
+/// against the smoothstep's 8.4 m (`bypass_min_len`), whose bends ease off from full lock.
+pub fn full_lock_len(length: f32, side: f32) -> f32 {
+    let r = turn_radius(length);
+    let h = (side.abs() * 0.5).min(r);
+    2.0 * (r * r - (r - h) * (r - h)).max(0.0).sqrt()
+}
+
+/// The bypass's move at `d` metres along it (`full_lock01` over `out_len`, `side` across):
+/// (the lateral, its slope).
+fn full_lock_at(d: f32, out_len: f32, side: f32) -> (f32, f32) {
+    let f = |x: f32| side * omsi_sim::traffic::full_lock01(x / out_len.max(0.1), out_len, side);
+    let e = 0.05;
+    (f(d), (f(d + e) - f(d - e)) / (2.0 * e))
 }
 
 /// The bypass round the standing `lead` into `nb`, from rest: the move ends `BYPASS_GAP_MARGIN`
 /// short of its rear, no longer than `BYPASS_LENGTH` and no shorter than the body can steer
-/// (`bypass_min_len`), and it starts only when that move clears the obstacle and every other
-/// body: `squeeze_clear` (a car standing in the lane beside level or just ahead, people)
-/// and `bypass_sweep_clear` (the body turned along the curve, the obstacle's corner too);
-/// where the gap is too short for it, the car does not set out (an 8 m move from 1.5 m
-/// behind a bus runs its way into the bus's corner; a car does not reverse out). Not round a bus indicating out of its stop or a vehicle
-/// moving off (it is let out).
+/// (`bypass_min_len` on the smoothstep; where that move does not clear, `full_lock_len` on the
+/// two arcs at full lock), and it starts only when that move - the body
+/// turned along it - clears the thing passed and every other vehicle, player, parked car and
+/// person by `SQUEEZE_CLEARANCE` (`body_sweep_clear`); where the gap is too short for it, the
+/// car does not set out (a car does not reverse out). Not round a bus indicating out of its
+/// stop or a vehicle moving off (it is let out).
 fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> Option<Start> {
     let st = &me.state;
     let obstacle = match lead.what {
@@ -993,40 +1039,126 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     let hr = (me.heading as f64).to_radians();
     let right = DVec2::new(hr.cos(), -hr.sin());
     let side = (target.at(ts).0 - me.pos).truncate().dot(right) as f32;
-    let shortest = bypass_min_len(me.length(), side);
-    let out_len = (lead.gap - BYPASS_GAP_MARGIN).clamp(shortest.min(BYPASS_LENGTH), BYPASS_LENGTH).max(shortest);
-    let (obstacle_len, _) = obstacle_run(p, lead, me.length() + out_len + PASS_ROOM);
-    let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
-    (squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, level, 0.0) && bypass_sweep_clear(net, sim, vehicles, me, side, out_len, level)).then_some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len })
+    // (the gentle smoothstep first; the two arcs at full lock only where it does not clear;
+    // the move begins after the signalling, `BYPASS_SIGNAL`, the car stopping meanwhile where it
+    // can, `pre` on; its way must take the lead out of my corridor before my front is there,
+    // `bypass_need`, and the body turned along it must clear every body)
+    let pre = st.speed.max(0.0).powi(2) / (2.0 * me.params.comfort_brake.max(0.1));
+    let need = bypass_need(me, lead, side.signum());
+    let moves = [(bypass_min_len(me.length(), side), false), (full_lock_len(me.length(), side), true)];
+    for (shortest, full_lock) in moves {
+        let out_len = (lead.gap - pre - BYPASS_GAP_MARGIN).clamp(shortest.min(BYPASS_LENGTH), BYPASS_LENGTH).max(shortest);
+        if bypass_lateral(lead.gap + st.front - pre, out_len, side.abs(), full_lock) < need {
+            continue;
+        }
+        let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
+        let (obstacle_len, _) = obstacle_run(p, lead, me.length() + out_len + PASS_ROOM);
+        let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
+        let parked = parked_boxes(net, sim, me, level + st.front);
+        let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+        if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile) {
+            return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock });
+        }
+    }
+    None
 }
 
-/// The gap (m) behind the standing `lead` from which a bypass into `nb` clears it as the body
-/// can steer (`bypass_min_len`): the S-curve has moved the body off the obstacle by both half
-/// widths and `SQUEEZE_CLEARANCE`, and `BYPASS_TURN_MARGIN` for the corner of a turned body,
-/// by the time the front is level with its rear. A car that closes up nearer cannot get out
-/// without reversing.
-fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway) -> Option<f32> {
+/// Does a lane change into `nb` started now, at speed, clear the `lead` within its move and
+/// every other body near: the body turned along the change's smoothstep (`change_length`)
+/// after the signalling (`SIGNAL_BEFORE_CHANGE` at this speed), swept past the lead by
+/// `SQUEEZE_CLEARANCE` (`body_sweep_clear`)?
+fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+    let st = &me.state;
+    let v = st.speed.max(0.0);
+    let Some((ts, _)) = net.lanes[nb.lane].nearest_point(me.pos) else { return false };
+    let hr = (me.heading as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    let side = (net.lanes[nb.lane].at(ts).0 - me.pos).truncate().dot(right) as f32;
+    let pre = v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
+    let (obstacle_len, _) = obstacle_run(p, lead, me.length() + PASS_ROOM);
+    let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
+    let parked = parked_boxes(net, sim, me, level + st.front);
+    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, omsi_sim::traffic::change_length(v), level, Profile::Smooth { pre })
+}
+
+/// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
+/// it: the two arcs at full lock (`full_lock01`) or the smoothstep.
+fn bypass_lateral(x: f32, len: f32, side: f32, full_lock: bool) -> f32 {
+    let t = (x / len.max(0.1)).clamp(0.0, 1.0);
+    side * if full_lock { omsi_sim::traffic::full_lock01(t, len, side) } else { t * t * (3.0 - 2.0 * t) }
+}
+
+/// The lateral (m, towards the move) the way of a bypass must have reached where the standing
+/// `lead`'s rear is for that lead to be out of my corridor (`perception::lead_by_bodies`: my half
+/// width and `LEAD_MARGIN` round my way) with `SQUEEZE_CLEARANCE` to spare for the corridor's
+/// straight slices between its samples: the lead's near edge towards the move, my half width,
+/// both.
+fn bypass_need(me: &Vehicle, lead: &crate::perception::Headway, dir: f32) -> f32 {
+    dir * lead.lateral + lead.half_width + me.half_width + crate::perception::LEAD_MARGIN as f32 + SQUEEZE_CLEARANCE
+}
+
+/// The gap (m) behind the standing `lead` from which a bypass into `nb` - the shortest move of
+/// its kind, the smoothstep (`bypass_min_len`) or with `full_lock` the two arcs
+/// (`full_lock_len`) - takes the lead out of my corridor before my front gets there (where its
+/// way reaches `bypass_need` across, less my front) and my body's front corners, turned along
+/// it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than the
+/// full-lock room cannot get out without reversing.
+fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool) -> Option<f32> {
+    let st = &me.state;
     let target = &net.lanes[nb.lane];
     let (ts, _) = target.nearest_point(me.pos)?;
     let hr = (me.heading as f64).to_radians();
     let right = DVec2::new(hr.cos(), -hr.sin());
     let side = ((target.at(ts).0 - me.pos).truncate().dot(right) as f32).abs();
-    let need = me.half_width + lead.half_width + SQUEEZE_CLEARANCE + BYPASS_TURN_MARGIN;
+    let dir = ((target.at(ts).0 - me.pos).truncate().dot(right) as f32).signum();
+    let need = bypass_need(me, lead, dir);
     if side <= need {
         return None;
     }
-    // (smoothstep inverted by halving: the share of the move at which it is `need` across)
-    let frac = need / side;
-    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let len = if full_lock { full_lock_len(me.length(), side) } else { bypass_min_len(me.length(), side) };
+    // (the profile rises: halving finds where it is `need` across)
+    let (mut lo, mut hi) = (0.0f32, len);
     for _ in 0..24 {
-        let t = 0.5 * (lo + hi);
-        if t * t * (3.0 - 2.0 * t) < frac {
-            lo = t;
+        let x = 0.5 * (lo + hi);
+        if bypass_lateral(x, len, side, full_lock) < need {
+            lo = x;
         } else {
-            hi = t;
+            hi = x;
         }
     }
-    Some(hi * bypass_min_len(me.length(), side))
+    // (and the body turned along the move - its heading the chord of its way
+    // `HEADING_CHORD` behind and ahead, as the simulation turns it - keeps `SQUEEZE_CLEARANCE`
+    // from the lead's box standing straight at its lateral: the least gap that does, halved for)
+    let c = omsi_sim::traffic::HEADING_CHORD as f64;
+    let at = |x: f64| bypass_lateral(x as f32, len, side, full_lock) as f64;
+    let clears = |gap: f32| {
+        let lead_box = Obb::vehicle(DVec2::new(dir as f64 * lead.lateral as f64, (st.front + gap) as f64 + lead.length as f64 * 0.5), 0.0, lead.length as f64 * 0.5, lead.length as f64 * 0.5, lead.half_width as f64);
+        let mut d = 0.0f64;
+        while d <= len as f64 + c {
+            let slope = (at(d + c) - at(d - c)) / (2.0 * c);
+            let b = Obb::vehicle(DVec2::new(at(d), d), slope.atan().to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+            if b.separation(&lead_box) < SQUEEZE_CLEARANCE as f64 {
+                return false;
+            }
+            d += 0.1;
+        }
+        true
+    };
+    let (mut lo, mut hi2) = (0.0f32, len + st.front);
+    if !clears(hi2) {
+        return None;
+    }
+    for _ in 0..16 {
+        let g = 0.5 * (lo + hi2);
+        if clears(g) {
+            hi2 = g;
+        } else {
+            lo = g;
+        }
+    }
+    let corner = hi2 + st.front;
+    Some((hi.max(corner) - st.front).max(0.0))
 }
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
@@ -1262,8 +1394,9 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if queue_head(net, sim, vehicles, &l) != Some(QueueHead::ForGood) {
         return None;
     }
-    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l)).fold(f32::INFINITY, f32::min);
-    if !need.is_finite() || l.gap >= need - BYPASS_HOLD_SLACK {
+    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l, true)).fold(f32::INFINITY, f32::min);
+    // (any short of the room: the bypass starts from the room, `bypass_start`, not from inside it)
+    if !need.is_finite() || l.gap >= need {
         return None;
     }
     let back = need - l.gap;
@@ -1274,8 +1407,8 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     rear_clear(net, sim, vehicles, me, back).then_some(back)
 }
 
-/// The pull-back into the lane is sampled at this spacing (m), as the bypass's sweep
-/// (`bypass_sweep_clear`).
+/// The pull-back into the lane is sampled at this spacing (m), as the swept moves
+/// (`body_sweep_clear`).
 const REENTRY_STEP: f32 = 0.5;
 
 /// The way back into the lane of a vehicle out of it, as a sideways
@@ -1367,17 +1500,6 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     })
 }
 
-/// What the corner of a body turned on the bypass's curve reaches beyond its shifted box (m):
-/// half a metre at 30 degrees for a 2 m front overhang.
-pub const BYPASS_TURN_MARGIN: f32 = 0.5;
-
-/// Does the body clear every other body by `SQUEEZE_CLEARANCE` on the bypass's S-curve
-/// (`AiState::start_bypass`'s move: `side` metres over `out_len`, the body turned along the
-/// curve, not only shifted as `squeeze_clear` has it), up to `level` metres on?
-fn bypass_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, side: f32, out_len: f32, level: f32) -> bool {
-    body_sweep_clear(net, sim, vehicles, me, &[], &[], side, out_len, level)
-}
-
 /// The parked cars within `reach` metres of my origin as boxes, on any lane
 /// (one parked at the far kerb of the oncoming lane is in a pass's path), as `squeeze_clear`
 /// lays them.
@@ -1398,17 +1520,39 @@ fn parked_boxes(net: &Network, sim: &Simulation, me: &Vehicle, reach: f32) -> Ve
     out
 }
 
-/// `bypass_sweep_clear` against parked cars (`parked`) and people's discs (`people`) as well.
+/// The lateral profile a swept move follows (`body_sweep_clear`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Profile {
+    /// A smoothstep over the out length after `pre` metres straight on (a pass's, a lane
+    /// change's after its signalling).
+    Smooth { pre: f32 },
+    /// Two arcs at one lock (`full_lock01`, a bypass's) after `pre` metres straight on.
+    FullLock { pre: f32 },
+}
+
+/// Does my body, turned along a move `side` metres over `out_len` metres (`profile`), clear
+/// every vehicle and player near, the parked cars (`parked`) and people's discs (`people`) by
+/// `SQUEEZE_CLEARANCE`, up to `level` metres on?
 #[allow(clippy::too_many_arguments)]
-fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32) -> bool {
+fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32, profile: Profile) -> bool {
     let st = &me.state;
     let near = sim.vehicles_near(me.pos, (level + 20.0) as f64);
     let clearance = SQUEEZE_CLEARANCE as f64;
     let mut d = 0.0f32;
     while d <= level {
-        let t = (d / out_len.max(0.1)).clamp(0.0, 1.0);
-        let lat = side * t * t * (3.0 - 2.0 * t);
-        let slope = side * 6.0 * t * (1.0 - t) / out_len.max(0.1);
+        let (lat, slope) = match profile {
+            Profile::Smooth { pre } => {
+                let t = ((d - pre) / out_len.max(0.1)).clamp(0.0, 1.0);
+                (side * t * t * (3.0 - 2.0 * t), side * 6.0 * t * (1.0 - t) / out_len.max(0.1))
+            }
+            // (the body's heading as the simulation gives it, the chord of its way
+            // `HEADING_CHORD` behind and ahead: on the arcs' tight bends it lags the tangent)
+            Profile::FullLock { pre } => {
+                let c = omsi_sim::traffic::HEADING_CHORD;
+                let at = |x: f32| full_lock_at((x - pre).clamp(0.0, out_len), out_len, side).0;
+                (at(d), (at(d + c) - at(d - c)) / (2.0 * c))
+            }
+        };
         let p = st.way_point(net, d).truncate();
         let p2 = st.way_point(net, d + 1.0).truncate();
         let f = (p2 - p).normalize_or_zero();
@@ -1429,7 +1573,8 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         if parked.iter().chain(people).any(|o| o.separation(&b) < clearance) {
             return false;
         }
-        d += 0.5;
+        // (the arcs' bends turn the body fast: sampled finer)
+        d += if matches!(profile, Profile::FullLock { .. }) { 0.05 } else { 0.5 };
     }
     true
 }
@@ -1929,6 +2074,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
+    // a bypass signalling stands where it is until it moves over (the room it was started
+    // with is the room it has: rolled on meanwhile, the lead stayed in its corridor and held it
+    // half out)
+    if st.change.is_some_and(|c| c.bypass && c.wait > 0.0) {
+        min_stop(&mut out.stop, &mut out.why, Some(st.front + v * v / (2.0 * dp.comfort_brake.max(0.1))), Why::Lead);
+    }
+
     // 7. a lane change of the driver's own: round something standing, for speed, to keep
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
@@ -1949,10 +2101,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
         let threshold = 0.4 - 0.2 * me.impatience.value;
         if let Some((_, nb, why)) = best.filter(|b| b.0 >= threshold) {
-            let standing = p.leader.filter(|l| l.standing_obstacle() && l.gap < 25.0);
-            out.start = match standing {
+            // (from rest behind a lead within a change's move - an obstacle or a queue - the car
+            // pulls out at full lock, `bypass_start`: SUMO's change is instantaneous, an OMSI
+            // body steers out round the one in front)
+            // (under way with a lead standing within the move, the move itself must clear it
+            // and every body near, `change_clear`; one moving on is followed during the change)
+            let near = p.leader.filter(|l| l.speed < STANDING_SPEED && l.gap < omsi_sim::traffic::change_length(v.max(0.0)) + v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
+            out.start = match near {
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, p, &nb, &l),
-                _ => Some(Start::Change { to: nb.lane, dir: nb.dir }),
+                Some(l) => change_clear(net, sim, vehicles, me, p, &nb, &l).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
+                None => Some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
         } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
@@ -2219,7 +2377,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {
-            Some(nb) => bypass_room(net, me, &nb, &l).unwrap_or(room),
+            Some(nb) => bypass_room(net, me, &nb, &l, false).unwrap_or(room),
             None => room,
         };
         // keep back: room to pull out again, where the car can still stop there gently - only
@@ -2245,7 +2403,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let early = squeeze && player && v < SQUEEZE_START_SPEED;
         let ready = (me.stopped >= 3.0 || early || matches!(l.what, Seen::Parked)) && (!too_close || me.stopped >= 10.0) && l.gap >= 1.5;
         // a pass on the oncoming lane starts only when its path is swept as the
-        // bypass's is (`bypass_sweep_clear`): the body turned along its S-curve (the out
+        // bypass's is (`body_sweep_clear`): the body turned along its S-curve (the out
         // length it will drive) out and level with what it passes, clear of every vehicle's
         // and player's body by `SQUEEZE_CLEARANCE` - not on the oncoming lane's gap alone.
         // Only the start: the keep-back still reads the pass as possible (gating it too makes a
@@ -2262,7 +2420,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let level = real + obstacle_len + st.front + st.rear + 2.0;
             let parked = parked_boxes(net, sim, me, level + st.front);
             let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level)
+            body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level, Profile::Smooth { pre: 0.0 })
         };
         if pass_possible && ready && pass_swept() {
             let out_len = pass_out_len;

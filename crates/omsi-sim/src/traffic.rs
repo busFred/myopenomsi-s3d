@@ -3484,11 +3484,48 @@ pub struct LaneChange {
     /// Pulling out from behind something standing: the car moves off sideways from a
     /// standstill, and what it leaves behind in its lane no longer holds it.
     pub bypass: bool,
+    /// The move is the two arcs at full lock (`full_lock01`), not the smoothstep: a bypass
+    /// from nearer than the smoothstep can steer.
+    #[serde(default)]
+    pub full_lock: bool,
 }
 
 /// A vehicle's heading is that of the chord of its way this far behind and ahead of it (m,
 /// `Simulation::update_positions`).
 pub const HEADING_CHORD: f32 = 1.5;
+
+/// The share of the way across (0..1) of a move `side` metres over along `length` metres
+/// driven at `t` (0..1) of it, laid as two circular arcs of one radius, out and back (the
+/// wheels at one lock, then the other): what a driver pulling out from behind something
+/// standing steers. Its radius is `((length/2)² + (side/2)²) / side`; a move as short as the
+/// body can steer has the turning radius (`omsi_traffic::plan::full_lock_len`).
+pub fn full_lock01(t: f32, length: f32, side: f32) -> f32 {
+    let w = side.abs().max(1e-3);
+    let h = (length * 0.5).max(1e-3);
+    let r = (h * h + w * w * 0.25) / w;
+    let arc = |x: f32| r - (r * r - x * x).max(0.0).sqrt();
+    let x = t.clamp(0.0, 1.0) * 2.0 * h;
+    if x <= h {
+        arc(x) / w
+    } else {
+        1.0 - arc(2.0 * h - x) / w
+    }
+}
+
+/// How far across a lane change has got at `t` (0..1) of its move: on its two arcs
+/// (`LaneChange::full_lock`, `full_lock01`, `side` the distance between the lanes there), or on
+/// the smoothstep.
+pub fn change_share(c: &LaneChange, t: f32, side: f32) -> f32 {
+    if c.full_lock {
+        full_lock01(t, c.length, side)
+    } else {
+        smooth01(t)
+    }
+}
+
+/// Seconds a bypass signals before it moves (`AiState::start_bypass`; pulling out round
+/// something: the signal time of the first lane changes).
+pub const BYPASS_SIGNAL: f32 = 1.2;
 
 /// Smoothstep 0..1.
 pub fn smooth01(t: f32) -> f32 {
@@ -3843,7 +3880,7 @@ impl AiState {
         // (the same share of a lane that starts beside this one, else the point beside the car)
         let s_to = net.beside_s(self.lane, to, self.s.min(l.length()));
         let rest = t.length() - s_to;
-        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false });
+        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false, full_lock: false });
         self.blinker = dir;
         let mut plan = Vec::new();
         if self.route.is_empty() {
@@ -3921,7 +3958,7 @@ impl AiState {
         }
         let (ps, hs) = self.seq().point(net, self.s, 0.0);
         let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, 0.0);
-        let k = smooth01(c.t - c.wait * self.speed.max(2.0) / c.length);
+        let k = change_share(&c, c.t - c.wait * self.speed.max(2.0) / c.length, (pt - ps).truncate().length() as f32);
         let p = ps.lerp(pt, k as f64);
         let off = |q: DVec3, h: f32| {
             let hr = (h as f64).to_radians();
@@ -3974,13 +4011,13 @@ impl AiState {
 
     /// Pull out into `to` from behind a standing obstacle: a short, steep move over
     /// `length` metres (8, less from close behind it).
-    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32) {
+    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32, full_lock: bool) {
         self.start_change(net, to, dir);
         if let Some(c) = self.change.as_mut() {
             c.length = length;
             c.bypass = true;
-            // (pulling out round something: the old signal time)
-            c.wait = c.wait.min(1.2);
+            c.full_lock = full_lock;
+            c.wait = c.wait.min(BYPASS_SIGNAL);
         }
     }
 
@@ -4053,7 +4090,7 @@ impl AiState {
             let (pt, ht) = cs.point_with(net, c.s_to, d, &mut cache[1]);
             // how far the change will have got by the time the car is `d` metres on
             let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
-            let k = smooth01(c.t + tau);
+            let k = change_share(&c, c.t + tau, (pt - p).truncate().length() as f32);
             p = p.lerp(pt, k as f64);
             h += wrap_deg(ht - h) * k;
         }
@@ -4075,6 +4112,16 @@ impl AiState {
         if let Some(c) = self.change {
             if c.to < net.lanes.len() {
                 best = best.min(self.curve_speed_on(net, &self.change_seq(c.to), c.s_to));
+            }
+            // (a bypass's two arcs are a bend of their own: their radius, `full_lock01`, at
+            // the same lateral acceleration, until the move is over)
+            if let Some(((p, _), (q, _))) = self.change_anchors(net).filter(|_| c.full_lock && c.t < 1.0) {
+                let w = (q - p).truncate().length() as f32;
+                if w > 1e-3 {
+                    let h = c.length * 0.5;
+                    let r = (h * h + w * w * 0.25) / w;
+                    best = best.min((self.lat_accel * r).sqrt().max(2.5));
+                }
             }
         }
         best
@@ -4566,14 +4613,18 @@ mod tests {
         car.speed = 3.0;
         car.plan_next(&net);
         assert_eq!(car.planned_next, Some(2));
-        car.start_bypass(&net, 1, 1, 8.0);
+        car.start_bypass(&net, 1, 1, 8.0, true);
         let dt = 1.0 / 30.0;
         let mut at = car.way_point(&net, 0.0);
         for _ in 0..300 {
             assert!(car.drive(&net, dt, None, None));
             let p = car.way_point(&net, 0.0);
             let step = (p - at).length();
-            assert!(step < car.speed as f64 * dt as f64 + 0.05, "a jump of {step:.2} m on lane {} s {:.1} change {:?}", car.lane, car.s, car.change);
+            // (no jump: no further than the arcs' path takes it, their steepest slope h / sqrt(r² - h²))
+            let (h, w) = (4.0f64, 3.5f64);
+            let r = (h * h + w * w / 4.0) / w;
+            let slope = h / (r * r - h * h).sqrt();
+            assert!(step < car.speed as f64 * dt as f64 * (1.0 + slope * slope).sqrt() + 0.05, "a jump of {step:.2} m on lane {} s {:.1} change {:?}", car.lane, car.s, car.change);
             at = p;
             if car.change.is_none() {
                 break;
