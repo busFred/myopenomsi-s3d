@@ -761,18 +761,41 @@ fn held_by(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain:
 }
 
 /// The standing claim `k` is refused (the first pass's `wait_for`) for a vehicle that itself waits
-/// for `me` through its lead chain (`held_by` of that one, or its lead is me): what `k` waits for
-/// cannot move before I go, so `k` cannot come before I go either (a ring of three: I wait for
-/// `k`, `k` for one standing in its way, that one behind me). Second pass only.
-fn waits_through(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
+/// for `me`: through its lead chain (`held_by` of that one, or its lead is me), or refused for me
+/// while my body stands in one of its meeting places (`in_way_of`: it cannot move before I have
+/// left, whatever the order). What `k` waits for cannot move before I go, so `k` cannot come
+/// before I go either (SUMO's `willPass`: a vehicle that cannot pass before me registers no
+/// competing request) - a ring of three: I wait for `k`, `k` for one standing in its way, that
+/// one behind me or held by my body. A refusal of that one for me with my body clear of its way
+/// is an order, not a block, and is not followed: three such refusals closing at me would all be
+/// dropped from both sides. Second pass only.
+fn waits_through(js: &Junctions, claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, plain: Option<&[Grant]>, k: usize, me: usize) -> bool {
     let Some(w) = plain.and_then(|p| p[k].wait_for) else { return false };
     if w == me {
         return false;
     }
     match claim_of.get(&w) {
-        Some(&next) if next != k => claims[next].standing() && (claims[next].lead == Some(me) || held_by(claims, claim_of, plain, next, me)),
+        Some(&next) if next != k => {
+            claims[next].standing()
+                && (claims[next].lead == Some(me)
+                    || held_by(claims, claim_of, plain, next, me)
+                    || (plain.is_some_and(|p| p[next].wait_for == Some(me)) && claim_of.get(&me).is_some_and(|&mine| in_way_of(js, &claims[mine], &claims[next]))))
+        }
         _ => false,
     }
+}
+
+/// Claim `a`'s body is inside a meeting place of `b`'s way at their junction (its front past the
+/// stretch's start on `a`'s own piece, its rear not past the end): `b` cannot pass before `a`
+/// has left it, as `will_pass` counts a foe in the meeting place (`their_inside`).
+fn in_way_of(js: &Junctions, a: &Claim, b: &Claim) -> bool {
+    a.junction == b.junction
+        && js.foes_along(b.junction, &b.chain).iter().any(|f| {
+            a.chain.iter().any(|&(m, off)| {
+                let s = a.s - off;
+                m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
+            })
+        })
 }
 
 /// A rolling foe `k` is no competitor when it rolls up to a queue that waits for me: its lead
@@ -1074,7 +1097,7 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     let stops_short = |g: &Grant| rests_short(js, claims, ok, g, foe.theirs.0 + (claims[ok].s - o.s));
     let refused_here = !their_inside && o.standing() && !is_player(o.vehicle) && !(o.blocked && !o.stuck) && decided[ok].is_some_and(|g| !g.go && stops_short(&g));
     let fresh_green = |a: &Claim, b: &Claim| matches!((a.light, b.light), (Some(x), Some(y)) if ctx.exclusive(x, y));
-    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && (held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(claims, claim_of, plain, ok, c.vehicle))) {
+    if (o.clearing || (o.in_box_at_turn && fresh_green(c, o) && !refused_here)) && !(o.stuck && !their_inside) && !(o.speed < STANDING_SPEED && !their_inside && (held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(js, claims, claim_of, plain, ok, c.vehicle))) {
         o.committed = true;
     }
     // in the box at the end of my green, a foe on the fresh green across my way that is neither
@@ -1109,7 +1132,7 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     // refuse me while it follows me in and the two bodies lock; a lead is one frame's
     // perception, so one rolling faster is not taken on it - or rolling up to a queue whose lead
     // chain reaches me through a standing vehicle (`held_by_standing`)
-    if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
+    if !their_inside && !o.committed && ((o.standing() && (claims[ok].lead == Some(c.vehicle) || held_by(claims, claim_of, plain, ok, c.vehicle) || waits_through(js, claims, claim_of, plain, ok, c.vehicle))) || held_by_standing(claims, claim_of, ok, c.vehicle)) {
         return Pass::Not("waits_for_me");
     }
     // a foe at its red is not coming before its light goes (SUMO's foe arrival is its planned
@@ -1738,6 +1761,36 @@ mod tests {
         };
         let (a, b, c) = (way(90.0), way(210.0), way(330.0));
         object(&[(&a, 0), (&b, 0), (&c, 0)])
+    }
+
+    /// Three standing at one object, each held by the next: A gives way to B by the table (B
+    /// comes from its right), B is refused for C whose body stands in B's meeting place with it,
+    /// C is refused for A whose body stands in C's meeting place with it. B cannot move before C,
+    /// C not before A has left: B is not coming before A goes (`waits_through`), A goes, and B
+    /// still waits for the body in its way.
+    #[test]
+    fn a_ring_closed_by_bodies_in_the_way_lets_the_one_in_the_way_go() {
+        let a: Vec<(f64, f64)> = vec![(-25.0, 0.0), (25.0, 0.0)];
+        let b: Vec<(f64, f64)> = vec![(-15.0, -25.0), (25.0, 15.0)];
+        let cc: Vec<(f64, f64)> = vec![(0.0, -25.0), (0.0, 25.0)];
+        let (_, js) = object(&[(&a, 0), (&b, 0), (&cc, 0)]);
+        // (A on piece 0 with its front inside its stretch with C, 22..28, its stretch with B,
+        // where it gives way, at 31; B on piece 1 short of its stretch with C, 17.2; C on piece 2
+        // with its front inside its stretch with B, 11..19, its stretch with A at 22)
+        // (all three in the box at the turn of the light, `Claim::clearing`: committed to one
+        // another unless one cannot come before the other goes)
+        let at = |v: usize, m: usize, s: f32| Claim { clearing: true, ..claim(v, m, s, 0.0) };
+        let claims = vec![at(10, 0, 24.0), at(11, 1, 14.0), at(12, 2, 14.0)];
+        assert!(js.nodes[0].movements[0].foes.iter().any(|f| f.movement == 1 && f.yields), "A gives way to B");
+        let g = resolve(&js, &claims);
+        assert!(grant_of(&g, 10).go, "{g:?}");
+        // (B still waits for C's body; C may follow A out of its way)
+        assert_eq!(grant_of(&g, 11).wait_for, Some(12), "{g:?}");
+        // C's body clear of B's way (C short of it, waiting for A): B is not held by a body, and
+        // A gives way to B as the table says
+        let claims = vec![at(10, 0, 24.0), at(11, 1, 14.0), at(12, 2, 6.0)];
+        let g = resolve(&js, &claims);
+        assert_eq!(grant_of(&g, 10).wait_for, Some(11), "{g:?}");
     }
 
     #[test]
