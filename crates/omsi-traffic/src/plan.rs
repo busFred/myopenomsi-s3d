@@ -406,6 +406,16 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
     }
 }
 
+/// The leader of the lane beside, `nb`, within `REACT_TO_STOPPED_DISTANCE` of my front
+/// (`NeighbourView::ahead`, looked along that far) stands: that lane is no target of speed gain
+/// or keeping to the side. SUMO LC2013 (`_wantsChange`) takes the lane beside as the way round a
+/// stopped leader within `REACT_TO_STOPPED_DISTANCE` only where that lane's own leader is not
+/// stopped or stands beyond the overtaking distance; the same distance bounds the wishes of
+/// speed and side here, so a car does not move from one queue into another.
+fn stands_ahead(me: &Vehicle, nb: &NeighbourView) -> bool {
+    nb.ahead.is_some_and(|(g, va)| va < STANDING_SPEED && g + me.state.front < crate::perception::REACT_TO_STOPPED_DISTANCE)
+}
+
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
 /// accepted (LMRS: the route, a standing obstacle, speed gain, keeping to the side).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
@@ -454,7 +464,11 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let (this_safe, nb_safe) = anticipated_speeds(net, me, p, nb);
     let secure = |vl: f32| st.min_gap + st.speed.max(0.0) * dp.tau + (st.speed.max(0.0).powi(2) - vl.max(0.0).powi(2)).max(0.0) / (2.0 * dp.comfort_brake.max(0.1));
     let blocked = nb.ahead.is_some_and(|(g, vl)| g < secure(vl));
-    if nb_safe > this_safe + KEEP_RIGHT_FASTER && !blocked && !near_junction && open_on(net, me, nb.lane, st.s) {
+    // (nor into a lane whose leader stands within `REACT_TO_STOPPED_DISTANCE`, `stands_ahead`:
+    // LC2013 takes a lane as a way round a stopped leader only where the lane's own leader is
+    // not stopped there; a queue standing ahead on it is no gain)
+    let stands = stands_ahead(me, nb);
+    if nb_safe > this_safe + KEEP_RIGHT_FASTER && !blocked && !stands && !near_junction && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
@@ -462,7 +476,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // hold (`stays_on_best`, over the lanes open to me: no `open_on` window); a speed-
     // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (how long the driver could keep
     // its speed there is the accumulator's rate)
-    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) {
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stands && !stays_on_best(net, sim, me, nb) {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -827,7 +841,12 @@ fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool
 /// branch with the most room).
 fn free_run(net: &Network, sim: &Simulation, vehicles: &[Vehicle], branch: usize) -> f32 {
     let reach = crate::perception::REACT_TO_STOPPED_DISTANCE;
-    fn walk(net: &Network, sim: &Simulation, vehicles: &[Vehicle], l: usize, d0: f32, reach: f32, depth: usize) -> f32 {
+    // (at a fork the branch with the most room; a way that ends: its end)
+    let mut most = 0.0f32;
+    crate::perception::walk_ahead(net, &[(branch, 0.0)], FORK_LOOK_LANES, |l, d0, last| {
+        if most >= reach {
+            return false;
+        }
         let mut near = f32::INFINITY;
         for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let o = &vehicles[occ.vehicle];
@@ -841,13 +860,17 @@ fn free_run(net: &Network, sim: &Simulation, vehicles: &[Vehicle], branch: usize
             }
         }
         let end = d0 + net.lanes[l].length();
-        if near.is_finite() || end >= reach || depth == 0 {
-            return near.min(reach).max(0.0);
+        if near.is_finite() || end >= reach || last {
+            most = most.max(near.min(reach).max(0.0));
+            return false;
         }
-        // (at a fork the branch with the most room; a way that ends: its end)
-        net.lanes[l].next.iter().map(|&n| walk(net, sim, vehicles, n, end, reach, depth - 1)).reduce(f32::max).unwrap_or(end).min(reach)
-    }
-    walk(net, sim, vehicles, branch, 0.0, reach, FORK_LOOK_LANES)
+        if net.lanes[l].next.is_empty() {
+            most = most.max(end.min(reach));
+            return false;
+        }
+        true
+    });
+    most
 }
 
 /// Lanes deep a branch's free run is looked along (`free_run`: junction pieces of a metre come in
@@ -2187,7 +2210,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 None => Some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
-            out.into_standing = matches!(why, ChangeWhy::SpeedGain | ChangeWhy::KeepSide) && nb.ahead.is_some_and(|(g, va)| va < STANDING_SPEED && g + st.front < crate::perception::REACT_TO_STOPPED_DISTANCE);
+            out.into_standing = matches!(why, ChangeWhy::SpeedGain | ChangeWhy::KeepSide) && stands_ahead(me, &nb);
         } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
             // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
             // when only it is in the way (room ahead there), is asked to make room

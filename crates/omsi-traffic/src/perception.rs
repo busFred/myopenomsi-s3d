@@ -1920,42 +1920,28 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             }
             best
         };
-        // (the nearest one on a branch, or None where it is free to the distance)
-        fn walk(net: &Network, first: &dyn Fn(usize, f32) -> Option<(f32, f32)>, l: usize, offset: f32, reach: f32, depth: usize) -> Option<(f32, f32)> {
-            if let Some(a) = first(l, offset) {
-                return Some(a);
-            }
-            let end = offset + net.lanes[l].length();
-            if end >= reach || depth == 0 {
-                return None;
-            }
-            let mut best: Option<Option<(f32, f32)>> = None;
-            for &n in &net.lanes[l].next {
-                let a = walk(net, first, n, end, reach, depth - 1);
-                // (the branch with the most room: free beats any vehicle)
-                if best.is_none_or(|b| match (b, a) {
-                    (Some(x), Some(y)) => y.0 > x.0,
-                    (Some(_), None) => true,
-                    _ => false,
-                }) {
-                    best = Some(a);
-                }
-            }
-            best.flatten()
-        }
+        // (the branch with the most room: a way free to the distance, or ending, beats any
+        // vehicle; else the furthest vehicle)
         let reach = s_b + REACT_TO_STOPPED_DISTANCE;
-        let mut far: Option<Option<(f32, f32)>> = None;
-        for &n in &lane.next {
-            let a = walk(net, &first, n, lane.length(), reach, NEIGHBOUR_AHEAD_LANES);
-            if far.is_none_or(|b| match (b, a) {
-                (Some(x), Some(y)) => y.0 > x.0,
-                (Some(_), None) => true,
-                _ => false,
-            }) {
-                far = Some(a);
+        let starts: Vec<(usize, f32)> = lane.next.iter().map(|&n| (n, lane.length())).collect();
+        let (mut free, mut most) = (false, None::<(f32, f32)>);
+        walk_ahead(net, &starts, NEIGHBOUR_AHEAD_LANES, |l, at, last| {
+            if free {
+                return false;
             }
-        }
-        if let Some(Some(a)) = far {
+            if let Some(a) = first(l, at) {
+                if most.is_none_or(|m| a.0 > m.0) {
+                    most = Some(a);
+                }
+                return false;
+            }
+            if at + net.lanes[l].length() >= reach || last || net.lanes[l].next.is_empty() {
+                free = true;
+                return false;
+            }
+            true
+        });
+        if let Some(a) = most.filter(|_| !free) {
             if ahead.is_none_or(|x| a.0 < x.0) {
                 ahead = Some(a);
             }
@@ -1973,6 +1959,38 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         cur = n;
     }
     Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+}
+
+/// Walks every way on from the lanes `starts` (each a lane and the metres to its start), at
+/// most `depth` lanes further: `visit(lane, at, last)` is called once per lane and number of
+/// lanes walked, with the furthest `at` any way enters that lane there (`last`: the walk may go no
+/// lane further), and the walk goes on into the lane's next ones where it returns true. What a
+/// way finds ahead (the gap to a vehicle, a free run) grows with how far on it enters a lane, so
+/// the furthest entry stands for every nearer one: the walk is the lanes times `depth`, not the
+/// ways, whose number doubles at every fork (a junction object's pieces fork and rejoin metre by
+/// metre).
+pub(crate) fn walk_ahead(net: &Network, starts: &[(usize, f32)], depth: usize, mut visit: impl FnMut(usize, f32, bool) -> bool) {
+    let mut layer: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
+    for &(l, at) in starts {
+        let e = layer.entry(l).or_insert(at);
+        *e = e.max(at);
+    }
+    for k in 0..=depth {
+        let mut next: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
+        for (&l, &at) in &layer {
+            if visit(l, at, k == depth) {
+                let end = at + net.lanes[l].length();
+                for &n in &net.lanes[l].next {
+                    let e = next.entry(n).or_insert(end);
+                    *e = e.max(end);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        layer = next;
+    }
 }
 
 /// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): a stopped leader this near on a lane is
