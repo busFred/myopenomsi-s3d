@@ -112,6 +112,9 @@ pub struct Plan {
     /// `Vehicle::keep_right` grows by it; None where no lane beside on the keep side is one the
     /// driver may change onto (the wish is left as it is).
     pub keep_right_rate: Option<f32>,
+    /// SUMO LC2013's speed-gain step this frame per side ([0] left, [1] right; `speed_gain_step`):
+    /// how `Vehicle::speed_gain` changes; None where no lane lies beside on that side.
+    pub speed_gain_step: [Option<SpeedGainStep>; 2],
     /// A car leaving a parking space is held where it is parked because its
     /// lane has no room behind it: its `pull_out` clock waits.
     pub pull_out_held: bool,
@@ -453,22 +456,26 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
             wish(0.8, ChangeWhy::Obstacle);
         }
     }
-    // a faster lane: SUMO LC2013's speed gain - the lane beside where the speed the driver can
-    // anticipate (`anticipated_speeds`: the safe speed behind each lane's leader, capped by the
-    // lane's limit at its desire) is higher than on its own by LC2013's 5 km/h
-    // (`KEEP_RIGHT_FASTER`, the margin it asks of a lane on the right; this wish has no
-    // accumulator to let a smaller gain build up), whatever its own speed: a car standing in a
-    // queue beside an open lane has the gain too
+    // a faster lane: SUMO LC2013's speed gain - the accumulated wish (`Vehicle::speed_gain`,
+    // `speed_gain_step`: the relative gain of the speeds the driver can anticipate on each lane,
+    // `anticipated_speeds`) past its threshold (`SPEED_GAIN_THRESHOLD`, towards the keep side
+    // over `SPEED_GAIN_RIGHT`), away from the keep side only while the lane beside is still the
+    // faster, onto a lane the car can stay on `SPEED_GAIN_REMAIN_TIME` at its speed - whatever
+    // its own speed: a car standing in a queue beside an open lane has the gain too
     // (and not into a gap behind its leader there shorter than my secure gap, SUMO's
     // `LCA_BLOCKED_BY_LEFT/RIGHT_LEADER`: standing gap, headway, the braking to its speed)
-    let (this_safe, nb_safe) = anticipated_speeds(net, me, p, nb);
+    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
     let secure = |vl: f32| st.min_gap + st.speed.max(0.0) * dp.tau + (st.speed.max(0.0).powi(2) - vl.max(0.0).powi(2)).max(0.0) / (2.0 * dp.comfort_brake.max(0.1));
     let blocked = nb.ahead.is_some_and(|(g, vl)| g < secure(vl));
     // (nor into a lane whose leader stands within `REACT_TO_STOPPED_DISTANCE`, `stands_ahead`:
     // LC2013 takes a lane as a way round a stopped leader only where the lane's own leader is
     // not stopped there; a queue standing ahead on it is no gain)
     let stands = stands_ahead(me, nb);
-    if nb_safe > this_safe + KEEP_RIGHT_FASTER && !blocked && !stands && !near_junction && open_on(net, me, nb.lane, st.s) {
+    let towards_keep = nb.dir == keep_side(sim);
+    let threshold = if towards_keep { SPEED_GAIN_THRESHOLD / SPEED_GAIN_RIGHT } else { SPEED_GAIN_THRESHOLD };
+    let gained = me.speed_gain[(nb.dir as usize).clamp(1, 2) - 1] > threshold && (towards_keep || nb_safe > this_safe);
+    let remains = nb.runs_on / st.speed.max(0.1) > SPEED_GAIN_REMAIN_TIME;
+    if gained && remains && !blocked && !stands && !near_junction && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
@@ -570,6 +577,53 @@ pub const KEEP_RIGHT_THRESHOLD: f32 = 1.0;
 /// SUMO LC2013's legacy acceptance time (`lcKeepRightAcceptanceTime` -1, its default):
 /// `7 * roadSpeedFactor * max(1, v)` seconds.
 pub const KEEP_RIGHT_ACCEPTANCE: f32 = 7.0;
+/// SUMO LC2013's `RELGAIN_NORMALIZATION_MIN_SPEED` (m/s): the speed gain is relative to the
+/// faster of the anticipated speed beside and this.
+pub const RELGAIN_NORMALIZATION_MIN_SPEED: f32 = 10.0;
+/// SUMO LC2013's speed-gain threshold away from the keep side (`myChangeProbThresholdLeft`,
+/// `0.2 / lcSpeedGain` with the default `lcSpeedGain` 1), in seconds of full relative gain.
+pub const SPEED_GAIN_THRESHOLD: f32 = 0.2;
+/// SUMO's `lcSpeedGainRight` (default 0.1): towards the keep side the threshold is
+/// `SPEED_GAIN_THRESHOLD / SPEED_GAIN_RIGHT` (2.0), so a car does not swing back and forth.
+pub const SPEED_GAIN_RIGHT: f32 = 0.1;
+/// SUMO's `lcSpeedGainRemainTime` (s): a change for speed only onto a lane the car can stay on
+/// this long at its speed (`neighDist / max(0.1, v)`).
+pub const SPEED_GAIN_REMAIN_TIME: f32 = 20.0;
+
+/// How SUMO LC2013 moves a speed-gain wish (`Vehicle::speed_gain`) per second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpeedGainStep {
+    /// Grows by this relative gain per second (negative: shrinks).
+    Grow(f32),
+    /// Fades by this factor per second (0.5 where the own lane is better, 0.8 where they are
+    /// equal).
+    Fade(f32),
+}
+
+/// SUMO LC2013's speed-gain step towards the lane beside, `nb` (`_wantsChange`): the relative
+/// gain of the speeds the driver can anticipate (`anticipated_speeds`), `(beside - mine) /
+/// max(beside, RELGAIN_NORMALIZATION_MIN_SPEED)`. Towards the keep side (SUMO's right): faded by
+/// half a second while the own lane is faster by `KEEP_RIGHT_FASTER`, else grown by the gain;
+/// away from it (SUMO's left): faded by half while the own lane is faster, by 0.8 while equal,
+/// else grown.
+pub fn speed_gain_step(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> SpeedGainStep {
+    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
+    let rel = (nb_safe - this_safe) / nb_safe.max(RELGAIN_NORMALIZATION_MIN_SPEED);
+    if nb.dir == keep_side(sim) {
+        if this_safe - KEEP_RIGHT_FASTER > nb_safe {
+            SpeedGainStep::Fade(0.5)
+        } else {
+            SpeedGainStep::Grow(rel)
+        }
+    } else if this_safe > nb_safe {
+        SpeedGainStep::Fade(0.5)
+    } else if this_safe == nb_safe {
+        SpeedGainStep::Fade(0.8)
+    } else {
+        SpeedGainStep::Grow(rel)
+    }
+}
+
 /// SUMO LC2013 accumulates the keep-right wish only while the current lane is not faster
 /// than the lane beside by more than this (m/s: `thisLaneVSafe - 5 / 3.6 > neighLaneVSafe`).
 pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
@@ -657,23 +711,57 @@ fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
 /// (SUMO LC2013's `thisLaneVSafe` / `neighLaneVSafe`, `anticipateFollowSpeed`): the safe speed
 /// behind each lane's leader (none: before the end of the lanes open to it there, `open_run`,
 /// up to `LC_STRATEGIC_LOOKAHEAD`), capped by its desired speed and on the lane beside by that
-/// lane's limit at its desire.
-fn anticipated_speeds(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, f32) {
+/// lane's limit at its desire; and on each lane by the stop before the nearest person ahead in
+/// the car's width there (`person_ahead`; LC2013's `adaptSpeedToPedestrians`).
+fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, f32) {
     let st = &me.state;
     let (b, tau) = (me.params.comfort_brake, me.params.tau);
     let v_max = p.v_want.max(0.1);
+    let s_b = net.beside_s(st.lane, nb.lane, st.s);
     let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
-    let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
-    let this_safe = v_max.min(match p.leader {
+    let runs = open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD);
+    // (SUMO's `stopSpeed` before the person less the driver's standing gap)
+    let person_cap = |lane: usize, s: f32| person_ahead(net, sim, me, lane, s).map_or(f32::INFINITY, |d| safe_speed(d - st.min_gap, 0.0, b, tau));
+    let this_safe = v_max.min(person_cap(st.lane, st.s)).min(match p.leader {
         Some(l) => safe_speed(l.gap, l.speed, b, tau),
         None => safe_speed(mine, 0.0, b, tau),
     });
     let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
-    let nb_safe = nb_max.min(match nb.ahead {
+    let nb_safe = nb_max.min(person_cap(nb.lane, s_b)).min(match nb.ahead {
         Some((g, vl)) => safe_speed(g, vl, b, tau),
         None => safe_speed(runs, 0.0, b, tau),
     });
     (this_safe, nb_safe)
+}
+
+/// The distance (m) from my front to the nearest person on `lane` from beside my rear past `s`
+/// to `REACT_TO_STOPPED_DISTANCE` ahead (its own stretch) whose body reaches into the width I
+/// would have there (my half width and `PERSON_RADIUS` round the lane's axis; one beside my body:
+/// 0): SUMO's `MSLane::nextBlocking` over the vehicle's width, which LC2013's
+/// `adaptSpeedToPedestrians` reads for the speed it anticipates on each lane.
+fn person_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lane: usize, s: f32) -> Option<f32> {
+    let l = net.lanes.get(lane)?;
+    let reach = (l.length() - s).min(crate::perception::REACT_TO_STOPPED_DISTANCE);
+    if reach <= 0.0 {
+        return None;
+    }
+    let mut best: Option<f32> = None;
+    for k in sim.people_near(me.pos, (reach + me.state.front) as f64) {
+        let q = &sim.people[k];
+        if (q.pos.z - me.pos.z).abs() > 2.5 {
+            continue;
+        }
+        let Some((qs, d)) = l.nearest_point(q.pos) else { continue };
+        // (one beside my body counts as at my front: a change sweeps the body over it)
+        if qs - s < -me.state.rear || qs - s > reach || d as f32 > me.half_width + PERSON_RADIUS {
+            continue;
+        }
+        let ahead = (qs - s - me.state.front).max(0.0);
+        if best.is_none_or(|x| ahead < x) {
+            best = Some(ahead);
+        }
+    }
+    best
 }
 
 /// SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
@@ -684,7 +772,7 @@ fn anticipated_speeds(net: &Network, me: &Vehicle, p: &Perception, nb: &Neighbou
 /// the lane runs on less its braking distance, by closing on a slower leader there to its secure
 /// gap, and above `CONGESTED_SPEED` by catching up with my own slower leader (no overtaking on the
 /// keep side) - over `KEEP_RIGHT_TIME`.
-pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
+pub fn keep_right_rate(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
     let st = &me.state;
     let dp = &me.params;
     let (b, tau) = (dp.comfort_brake, dp.tau);
@@ -692,7 +780,7 @@ pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Pe
     // (SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
     // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
     let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
-    let (this_safe, nb_safe) = anticipated_speeds(net, me, p, nb);
+    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
     if this_safe - KEEP_RIGHT_FASTER > nb_safe {
         return 0.0;
     }
@@ -1155,11 +1243,13 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     None
 }
 
-/// Does a lane change into `nb` started now, at speed, clear the `lead` within its move and
-/// every other body near: the body turned along the change's smoothstep (`change_length`)
-/// after the signalling (`SIGNAL_BEFORE_CHANGE` at this speed), swept past the lead by
-/// `SQUEEZE_CLEARANCE` (`body_sweep_clear`)?
-fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> bool {
+/// Does a lane change into `nb` started now, at speed, clear what is near: the body turned
+/// along the change's smoothstep (`change_length`) after the signalling (`SIGNAL_BEFORE_CHANGE`
+/// at this speed), swept by `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars and
+/// people near, and with a `lead` standing within the move past it and every other body as well
+/// (with none, the bodies under way are the gap rule's: they move on). OMSI geometry: the body
+/// turns as it moves over, its rear swinging out the other way, where SUMO's change is a jump.
+fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: Option<&crate::perception::Headway>) -> bool {
     let st = &me.state;
     let v = st.speed.max(0.0);
     let Some((ts, _)) = net.lanes[nb.lane].nearest_point(me.pos) else { return false };
@@ -1167,11 +1257,14 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     let right = DVec2::new(hr.cos(), -hr.sin());
     let side = (net.lanes[nb.lane].at(ts).0 - me.pos).truncate().dot(right) as f32;
     let pre = v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
-    let (obstacle_len, _) = obstacle_run(p, lead, me.length() + PASS_ROOM);
-    let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
+    let out_len = omsi_sim::traffic::change_length(v);
+    let level = match lead {
+        Some(lead) => lead.gap + obstacle_run(p, lead, me.length() + PASS_ROOM).0 + st.front + st.rear + 2.0,
+        None => pre + out_len,
+    };
     let parked = parked_boxes(net, sim, me, level + st.front);
     let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, omsi_sim::traffic::change_length(v), level, Profile::Smooth { pre })
+    body_sweep_clear(net, sim, if lead.is_some() { vehicles } else { &[] }, me, &parked, &people, side, out_len, level, Profile::Smooth { pre })
 }
 
 /// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
@@ -1434,7 +1527,7 @@ fn rear_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicl
         if others.iter().chain(parked.iter()).any(|o| o.separation(&b) < clearance) {
             return false;
         }
-        if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
+        if !vehicles.is_empty() && sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
             return false;
         }
         if people.iter().any(|&k| (sim.people[k].pos.z - me.pos.z).abs() <= 2.5 && Obb::point(sim.people[k].pos, PERSON_RADIUS as f64).separation(&b) < clearance) {
@@ -1623,12 +1716,12 @@ enum Profile {
 }
 
 /// Does my body, turned along a move `side` metres over `out_len` metres (`profile`), clear
-/// every vehicle and player near, the parked cars (`parked`) and people's discs (`people`) by
-/// `SQUEEZE_CLEARANCE`, up to `level` metres on?
+/// every vehicle and player near (none asked with no `vehicles`), the parked cars (`parked`) and
+/// people's discs (`people`) by `SQUEEZE_CLEARANCE`, up to `level` metres on?
 #[allow(clippy::too_many_arguments)]
 fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32, profile: Profile) -> bool {
     let st = &me.state;
-    let near = sim.vehicles_near(me.pos, (level + 20.0) as f64);
+    let near = if vehicles.is_empty() { Vec::new() } else { sim.vehicles_near(me.pos, (level + 20.0) as f64) };
     let clearance = SQUEEZE_CLEARANCE as f64;
     let mut d = 0.0f32;
     while d <= level {
@@ -2162,7 +2255,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
         // (a strategic stay comes first and leaves the wish as it is)
         if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, sim, me, nb) && !stays_on_best(net, sim, me, nb)) {
-            out.keep_right_rate = Some(keep_right_rate(net, vehicles, me, p, &nb));
+            out.keep_right_rate = Some(keep_right_rate(net, sim, vehicles, me, p, &nb));
+        }
+        // (and the speed-gain wishes towards each lane beside, `speed_gain_step`)
+        for nb in [p.left, p.right].into_iter().flatten() {
+            out.speed_gain_step[(nb.dir as usize).clamp(1, 2) - 1] = Some(speed_gain_step(net, sim, me, p, &nb));
         }
     }
 
@@ -2201,13 +2298,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (from rest behind a lead within a change's move - an obstacle or a queue - the car
             // pulls out at full lock, `bypass_start`: SUMO's change is instantaneous, an OMSI
             // body steers out round the one in front)
-            // (under way with a lead standing within the move, the move itself must clear it
-            // and every body near, `change_clear`; one moving on is followed during the change)
+            // (under way the move itself must clear the parked cars and people near and a lead
+            // standing within it and every body near, `change_clear`; one moving on is followed
+            // during the change)
             let near = p.leader.filter(|l| l.speed < STANDING_SPEED && l.gap < omsi_sim::traffic::change_length(v.max(0.0)) + v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
             out.start = match near {
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, p, &nb, &l),
-                Some(l) => change_clear(net, sim, vehicles, me, p, &nb, &l).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
-                None => Some(Start::Change { to: nb.lane, dir: nb.dir }),
+                Some(l) => change_clear(net, sim, vehicles, me, p, &nb, Some(&l)).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
+                None => change_clear(net, sim, vehicles, me, p, &nb, None).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
             out.into_standing = matches!(why, ChangeWhy::SpeedGain | ChangeWhy::KeepSide) && stands_ahead(me, &nb);

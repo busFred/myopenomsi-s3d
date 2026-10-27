@@ -357,6 +357,11 @@ pub struct Vehicle {
     /// change starts (LC2013's `changed`); kept with the vehicle, so a keyframe carries it.
     #[serde(default)]
     pub keep_right: f32,
+    /// SUMO LC2013's speed-gain wishes (`mySpeedGainProbabilityLeft/Right`, per side: [0] the
+    /// lane on the left, [1] the one on the right): each grows by `Plan::speed_gain_step`, back
+    /// to 0 when a lane change starts (LC2013's `changed`); kept with the vehicle.
+    #[serde(default)]
+    pub speed_gain: [f32; 2],
     /// Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
     /// (the odometer where it is to stand, fixed when it began or when it was told to
     /// stop; stopping); kept with the vehicle.
@@ -583,6 +588,7 @@ impl Vehicle {
             help_for: None,
             look_ahead_speed: 0.0,
             keep_right: 0.0,
+            speed_gain: [0.0; 2],
             reversing: None,
             lane_end_stop: None,
             unheld_for: 0.0,
@@ -1860,6 +1866,14 @@ impl Simulation {
             if let Some(r) = plan.keep_right_rate {
                 v.keep_right += r * dt;
             }
+            // (and the speed-gain wishes, `plan::SpeedGainStep`)
+            for (k, step) in plan.speed_gain_step.iter().enumerate() {
+                match *step {
+                    Some(plan::SpeedGainStep::Grow(r)) => v.speed_gain[k] += r * dt,
+                    Some(plan::SpeedGainStep::Fade(f)) => v.speed_gain[k] *= f.powf(dt),
+                    None => {}
+                }
+            }
         }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
@@ -1902,6 +1916,7 @@ impl Simulation {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1914,6 +1929,7 @@ impl Simulation {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_bypass(net, to, dir, out_len, full_lock);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                     v.stopped = 0.0;
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1924,6 +1940,7 @@ impl Simulation {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_route_change(net, to, dir);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                 }
             }
             Some(Start::Pass(p)) => {
