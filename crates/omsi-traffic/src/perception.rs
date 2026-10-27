@@ -1072,6 +1072,9 @@ struct ZebraCut {
     at: DVec2,
     right: DVec2,
     half: f32,
+    /// The lanes of my way round the cut (the one cut, the one before and the one after): the
+    /// axis my body sweeps there, which a person must be within the band of to stand in my way.
+    axis: [Option<usize>; 3],
 }
 
 impl ZebraCut {
@@ -1112,7 +1115,9 @@ impl ZebraCut {
     /// whose band (its width and `CROSSING_SAFETY_GAP`, centred `lat` off the lane's axis) they
     /// have not completely passed, when they are inside it, or walk towards it from at most
     /// `JM_CROSSING_GAP` and have not stood `CROSSING_STANDING_WAIT`. Their walking direction is
-    /// their step across my lane; somebody without one (standing) holds only from inside.
+    /// their step across my lane; somebody without one (standing) holds only from inside. Inside
+    /// is in the band across my lane at the cut and within it of the axis my body sweeps there
+    /// (`ZebraCut::axis`): standing clear of every lane axis of my way is outside the band.
     fn blocked_by(&self, net: &Network, p: &crate::sim::Person, half_width: f32, lat: f32) -> bool {
         let Some(walk) = net.lanes.get(self.walk) else { return false };
         if !walk.nearest_point(p.pos).is_some_and(|(_, d)| (d as f32) < walk.width * 0.5 + crate::plan::PERSON_RADIUS) {
@@ -1123,7 +1128,12 @@ impl ZebraCut {
         // (across my lane: where they are from the band's middle, and their step)
         let off = (p.pos.truncate() - self.at).dot(self.right) as f32 - lat;
         let step = p.vel.dot(self.right) as f32;
-        if off.abs() < band + r {
+        // (inside: in the band across my lane at the cut, and within it of the axis my body
+        // sweeps there - on an oblique crossing of a curving way, people metres along the walk at
+        // its kerb project into the band at the cut while they stand clear of every lane axis;
+        // SUMO's `blockedAtDist` measures along the crossing against the vehicle's own extent)
+        let swept = self.axis.iter().flatten().filter_map(|&l| net.lanes.get(l)).filter_map(|l| l.nearest_point(p.pos)).map(|(_, d)| d as f32).fold(f32::INFINITY, f32::min);
+        if off.abs() < band + r && (swept.is_infinite() || swept < band + r + lat.abs()) {
             return true;
         }
         // (approaching: only somebody already on the crossing - the game's crossing flag, SUMO's
@@ -1145,11 +1155,12 @@ impl ZebraCut {
 fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraCut> {
     let st = &me.state;
     let mut out = Vec::new();
-    for &(l, d0) in lanes {
+    for (k, &(l, d0)) in lanes.iter().enumerate() {
         if d0 > ZEBRA_WAY {
             break;
         }
         let Some(lane) = net.lanes.get(l) else { continue };
+        let axis = [k.checked_sub(1).map(|i| lanes[i].0), Some(l), lanes.get(k + 1).map(|x| x.0)];
         let half = (lane.width * 0.5).max(me.half_width) + ZEBRA_BESIDE;
         for &(w, sa, _) in net.walks.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let point = d0 + sa;
@@ -1158,7 +1169,7 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
             }
             let (q, h) = lane.at(sa);
             let hr = (h as f64).to_radians();
-            out.push(ZebraCut { walk: w, along: point, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half });
+            out.push(ZebraCut { walk: w, along: point, at: q.truncate(), right: DVec2::new(hr.cos(), -hr.sin()), half, axis });
         }
     }
     out
@@ -1613,10 +1624,24 @@ pub fn stop_light(net: &Network, sim: &Simulation, l: usize) -> Option<(usize, u
     net.lanes.get(l)?.traffic_light.filter(|&(ctl, li)| !detector_light(sim, ctl, li))
 }
 
-/// The next light on the way within 150 m. A second light of the same junction object on a
-/// straight run holds nobody: the car has passed its line.
+/// A later lit line of the object this far (degrees) round from the first line is on another
+/// street's path (CHANGELOG leftarrow-1: the way between the two turned by over 45 degrees).
+const TURNED_LINE_DEG: f32 = 45.0;
+
+/// The next light on the way within 150 m. A second line of the same junction object on a
+/// straight run that shows the same light (controller and index) holds nobody: the car has
+/// passed that light's line, and the repeated head is no new link. A line further on carrying
+/// another light is its own link and is read (SUMO: each link has its own signal index), because
+/// a left-turn waiting area is entered on one light and left on another. A later line of the
+/// object reached after the way turned by 45 degrees or more from the first line holds nobody
+/// either: in OMSI's crossing objects that is the cross street's own lit path, joined mid-object
+/// by a turner, and its line stops the cross street's traffic, not the turner (which passed its
+/// own light at the first line). Of the lines ahead, the first that does not let the car go is
+/// the one it reads (SUMO checks every link of its look-ahead, not the first): a green line
+/// before a red one holds nobody; with every line letting it go, the first.
 fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
-    let mut seen_object: Option<(((i32, i32), i64), f32)> = None;
+    let mut seen_object: Option<(((i32, i32), i64), f32, (usize, usize))> = None;
+    let mut first: Option<SignalView> = None;
     for &(l, d0) in way {
         if d0 > 150.0 {
             break;
@@ -1624,14 +1649,14 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
         let lane = &net.lanes[l];
         let Some((ctl, li)) = stop_light(net, sim, l) else { continue };
         let key = lane.key.map(|k| (k.tile, k.id));
-        if let (Some(k), Some((sk, sh))) = (key, seen_object) {
-            if k == sk && omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() < 45.0 {
+        if let (Some(k), Some((sk, sh, sl))) = (key, seen_object) {
+            if k == sk && (sl == (ctl, li) || omsi_sim::traffic::wrap_deg(lane.start_heading() - sh).abs() >= TURNED_LINE_DEG) {
                 continue;
             }
         }
         if let Some(k) = key {
             if seen_object.is_none() {
-                seen_object = Some((k, lane.start_heading()));
+                seen_object = Some((k, lane.start_heading(), (ctl, li)));
             }
         }
         if d0 < -(rear + 0.5) {
@@ -1640,9 +1665,13 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
             continue;
         }
         let Some(c) = sim.lights.get(ctl) else { continue };
-        return Some(SignalView { dist: d0, ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) });
+        let view = SignalView { dist: d0, ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) };
+        if !matches!(view.aspect, Aspect::Green | Aspect::GreenYellow | Aspect::Dark) {
+            return Some(view);
+        }
+        first.get_or_insert(view);
     }
-    None
+    first
 }
 
 /// A vehicle slower than this (m/s) past the junction's conflicts is standing there as far
@@ -1656,8 +1685,11 @@ const EXIT_NEAR: f32 = 15.0;
 
 /// The next junction on the way (or the one the car is in), up to the claim horizon
 /// (`sim::claim_horizon`: eight seconds of speed), with the room past its conflicts measured
-/// along the car's own way: a vehicle standing inside the piece past the
-/// meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear").
+/// along the car's own way: a vehicle standing ahead of the car's front inside the piece past
+/// the meeting place, or on the lanes after it within 40 m, leaves no room ("keep clear"). The
+/// room is the space from the end of the last crossing (`clear_from`) to that vehicle's tail,
+/// which the car's whole body needs; a vehicle whose tail is behind the car's own front is
+/// behind it and never counts (SUMO's junction blocking judges the exit lane ahead of the link).
 fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<JunctionView> {
     let me = &vehicles[i];
     let js: &Junctions = &sim.junctions;
@@ -1706,6 +1738,13 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                 }
                 let o = &vehicles[occ.vehicle];
                 let tail = wd + occ.s - o.state.rear;
+                // (only what stands ahead of my own front is in the exit I would enter: on a way
+                // whose side merges lie behind my front, `clear_from` lies behind it too, and my
+                // follower's tail would count. SUMO's junction-blocking test judges the space on
+                // the exit lane ahead of the link; a vehicle behind ego never counts)
+                if tail <= me.state.front {
+                    continue;
+                }
                 if o.state.speed < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
@@ -1733,6 +1772,9 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
                     continue;
                 }
                 let tail = wd + s - p.half_len;
+                if tail <= me.state.front {
+                    continue;
+                }
                 if p.speed.abs() < EXIT_SLOW && tail > clear_from - 0.5 {
                     room = room.min(tail - clear_from);
                 }
@@ -2218,7 +2260,7 @@ mod crossing_tests {
     #[test]
     fn a_walker_on_the_crossing_holds_the_car_until_past_its_band() {
         let net = Network { lanes: vec![LaneBuilder::polyline(vec![DVec3::new(-12.0, 0.0, 0.0), DVec3::new(12.0, 0.0, 0.0)], LaneKind::Sidewalk, 3.0)], ..Default::default() };
-        let z = ZebraCut { walk: 0, along: 20.0, at: DVec2::ZERO, right: DVec2::X, half: 2.5 };
+        let z = ZebraCut { walk: 0, along: 20.0, at: DVec2::ZERO, right: DVec2::X, half: 2.5, axis: [None; 3] };
         let p = |x: f64, vx: f64, on: bool, still: f32| Person { pos: DVec3::new(x, 0.0, 0.0), vel: DVec2::new(vx, 0.0), on_crossing: on, still, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None };
         // coming in from 4 m at 1.8 m/s: held (2.3 m from the band, within 10 m)
         assert!(z.blocked_by(&net, &p(4.0, -1.8, true, 0.0), 0.9, 0.0));
@@ -2234,6 +2276,26 @@ mod crossing_tests {
         assert!(!z.blocked_by(&net, &p(0.0, 0.0, true, 0.0).with_y(5.0), 0.9, 0.0));
     }
 
+    /// J11-10 (the 08:17 corner, lane 2833 -> 2835, walks 2978/2979): on an oblique walk across
+    /// a way that curves away, somebody standing 3 m along the walk at its kerb is within the
+    /// band across my lane at the cut (1.2 m off) but 3 m from the axis my body sweeps: not in my
+    /// way. Without the axis (the projection alone) they held the car.
+    #[test]
+    fn a_kerb_waiter_clear_of_the_swept_axis_does_not_hold_the_car() {
+        let walk = LaneBuilder::polyline(vec![DVec3::new(-2.0, 4.0, 0.0), DVec3::new(3.0, 9.0, 0.0)], LaneKind::Sidewalk, 3.0);
+        let way = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 5.0, 0.0), DVec3::new(-3.0, 8.0, 0.0), DVec3::new(-8.0, 9.0, 0.0)], LaneKind::Street, 3.5);
+        let net = Network { lanes: vec![walk, way], ..Default::default() };
+        let waiter = Person { pos: DVec3::new(1.2, 8.0, 0.0), vel: DVec2::ZERO, on_crossing: true, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None };
+        let mut z = ZebraCut { walk: 0, along: 20.0, at: DVec2::new(0.0, 5.0), right: DVec2::X, half: 2.5, axis: [None; 3] };
+        assert!(z.blocked_by(&net, &waiter, 0.9, 0.0), "the projection alone puts them in the band");
+        z.axis = [None, Some(1), None];
+        assert!(!z.blocked_by(&net, &waiter, 0.9, 0.0));
+        // on the walk where my body goes: held
+        let mut inside = waiter.clone();
+        inside.pos = DVec3::new(0.3, 5.3, 0.0);
+        assert!(z.blocked_by(&net, &inside, 0.9, 0.0));
+    }
+
     trait WithY {
         fn with_y(self, y: f64) -> Self;
     }
@@ -2242,5 +2304,72 @@ mod crossing_tests {
             self.pos.y = y;
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::signal_ahead;
+    use crate::sim::Simulation;
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
+
+    /// One crossing object (id 9) with two lit lines on one straight run: the first light
+    /// green, the one 11 m on red (a left-turn waiting area). The car reads the second line's
+    /// own light once past the first; the same light repeated further on is the line it passed.
+    fn waiting_area(second: (usize, usize)) -> (Network, Simulation) {
+        object(second, false)
+    }
+
+    /// The same object, the second line on a straight run or (`turned`) on a path at right angles
+    /// to the first: the cross street's lit path a turner joins mid-object.
+    fn object(second: (usize, usize), turned: bool) -> (Network, Simulation) {
+        let piece = |x0: f64, x1: f64, path: u16, light: Option<(usize, usize)>| {
+            let (a, b) = if turned && path == 2 { (DVec3::new(12.0, 0.0, 0.0), DVec3::new(12.0, 1.0, 0.0)) } else { (DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)) };
+            let mut l = LaneBuilder::polyline(vec![a, b], LaneKind::Street, 3.5);
+            l.source = 2;
+            l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+            l.traffic_light = light;
+            l
+        };
+        let net = Network { lanes: vec![piece(0.0, 1.0, 0, Some((0, 0))), piece(1.0, 12.0, 1, None), piece(12.0, 13.0, 2, Some(second))], ..Default::default() };
+        let ctl = TrafficLightController::new(vec![vec![(6, 50.0), (0, 10.0)], vec![(0, 60.0)]], 60.0);
+        let sim = Simulation::new(&net, vec![ctl]);
+        (net, sim)
+    }
+
+    #[test]
+    fn a_second_line_of_the_object_with_its_own_light_is_read() {
+        let (net, sim) = waiting_area((0, 1));
+        // short of both: the green first line holds nobody, the red one beyond is read
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        assert_eq!((s.light, s.dist), (1, 17.0));
+        // past the first line: the second, red, is the car's
+        let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("the second light");
+        assert_eq!((s.light, s.dist), (1, 3.0));
+        // the same light repeated on the second line: the car has passed its line
+        let (net, sim) = waiting_area((0, 0));
+        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        // short of the first, every line green: the first
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        assert_eq!((s.light, s.dist), (0, 5.0));
+    }
+
+    #[test]
+    fn a_later_line_of_the_object_after_a_turn_holds_nobody() {
+        // the turner's own line green, the cross street's line 11 m on (turned 90 degrees) red:
+        // the cross street's line is not the turner's, short of its own line or past it
+        let (net, sim) = object((0, 1), true);
+        let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
+        let s = signal_ahead(&net, &sim, &way, 2.0).expect("its own light");
+        assert_eq!((s.light, s.dist), (0, 5.0));
+        let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
+        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        // the same red line on the straight run holds it (the left-turn waiting area)
+        let (net, sim) = object((0, 1), false);
+        assert_eq!(signal_ahead(&net, &sim, &way, 2.0).map(|s| s.light), Some(1));
     }
 }

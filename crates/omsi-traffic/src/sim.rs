@@ -1362,11 +1362,14 @@ impl Simulation {
                     // (held by its lead, people, a zebra, a light, ... rather than by a junction's
                     // answer or a full exit)
                     blocked: v.is_held() && !matches!(v.last.why, Why::None | Why::Junction | Why::ExitFull | Why::KeepClear),
-                    // (people or a zebra in front of it, or a lead that stands too: nothing that
-                    // lets it go on a schedule, as a light or a lead moving off does)
                     // in the box when its light turned: it clears it (rule F)
                     clearing: j.clearing && !light_red,
                     in_box_at_turn: j.in_box_at_turn && !light_red,
+                    // (people or a zebra in front of it, or a lead that stands too: nothing that
+                    // lets it go on a schedule, as a light or a lead moving off does. A car whose
+                    // why names its junction - its zipper waiting place - is not stuck by this,
+                    // but its standing lead still tells its foes where it comes to rest,
+                    // `Claim::lead_rest`, `will_pass`)
                     stuck: v.is_held()
                         && match v.last.why {
                             Why::People | Why::Zebra => true,
@@ -1377,6 +1380,8 @@ impl Simulation {
                     light: j.light.map(|(c, l, _)| (c, l)),
                     id: v.id,
                     yields_now: None,
+                    // (standing for its stop: the bus service's hold, `Why::Service`, or dwelling there)
+                    serving: v.external.at_stop || v.last.why == Why::Service,
                     // (where people, a zebra or a standing lead will stop the front)
                     clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                     brake,
@@ -1585,6 +1590,7 @@ impl Simulation {
                 id: PLAYER_ID_BASE + p.id as u64,
                 yields_now: None,
                 clear_ahead: f32::INFINITY,
+                serving: false,
                 brake: plan::HARD_BRAKE,
             });
         }
