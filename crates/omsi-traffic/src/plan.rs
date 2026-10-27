@@ -95,9 +95,6 @@ pub struct Plan {
     pub help: Option<(usize, f32, f32, f32)>,
     /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
-    /// The lane change it starts goes, for speed or to keep to the side, into a lane whose
-    /// leader within `REACT_TO_STOPPED_DISTANCE` stands (counted, `sim::CHANGES_INTO_STANDING`).
-    pub into_standing: bool,
     /// The lane change of the driver's own that signals is dropped before it moves over: its
     /// gap rule fails again (`gap_accepted` against `change_target_view`; counted, `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
@@ -438,16 +435,6 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
     }
 }
 
-/// The leader of the lane beside, `nb`, within `REACT_TO_STOPPED_DISTANCE` of my front
-/// (`NeighbourView::ahead`, looked along that far) stands: that lane is no target of speed gain
-/// or keeping to the side. SUMO LC2013 (`_wantsChange`) takes the lane beside as the way round a
-/// stopped leader within `REACT_TO_STOPPED_DISTANCE` only where that lane's own leader is not
-/// stopped or stands beyond the overtaking distance; the same distance bounds the wishes of
-/// speed and side here, so a car does not move from one queue into another.
-fn stands_ahead(me: &Vehicle, nb: &NeighbourView) -> bool {
-    nb.ahead.is_some_and(|(g, va)| va < STANDING_SPEED && g + me.state.front < crate::perception::REACT_TO_STOPPED_DISTANCE)
-}
-
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
 /// accepted (LMRS: the route, a standing obstacle, speed gain, keeping to the side).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
@@ -496,15 +483,11 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
     let secure = |vl: f32| st.min_gap + st.speed.max(0.0) * dp.tau + (st.speed.max(0.0).powi(2) - vl.max(0.0).powi(2)).max(0.0) / (2.0 * dp.comfort_brake.max(0.1));
     let blocked = nb.ahead.is_some_and(|(g, vl)| g < secure(vl));
-    // (nor into a lane whose leader stands within `REACT_TO_STOPPED_DISTANCE`, `stands_ahead`:
-    // LC2013 takes a lane as a way round a stopped leader only where the lane's own leader is
-    // not stopped there; a queue standing ahead on it is no gain)
-    let stands = stands_ahead(me, nb);
     let towards_keep = nb.dir == keep_side(sim);
     let threshold = if towards_keep { SPEED_GAIN_THRESHOLD / SPEED_GAIN_RIGHT } else { SPEED_GAIN_THRESHOLD };
     let gained = me.speed_gain[(nb.dir as usize).clamp(1, 2) - 1] > threshold && (towards_keep || nb_safe > this_safe);
     let remains = nb.runs_on / st.speed.max(0.1) > SPEED_GAIN_REMAIN_TIME;
-    if gained && remains && !blocked && !stands && !near_junction && open_on(net, me, nb.lane, st.s) {
+    if gained && remains && !blocked && !near_junction && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
@@ -512,7 +495,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // hold (`stays_on_best`, over the lanes open to me: no `open_on` window); a speed-
     // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (how long the driver could keep
     // its speed there is the accumulator's rate)
-    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stands && !stays_on_best(net, sim, me, nb) {
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -2281,7 +2264,6 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 None => change_clear(net, sim, vehicles, me, p, &nb, None).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
-            out.into_standing = matches!(why, ChangeWhy::SpeedGain | ChangeWhy::KeepSide) && stands_ahead(me, &nb);
         } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
             // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
             // when only it is in the way (room ahead there), is asked to make room

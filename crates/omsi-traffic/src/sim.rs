@@ -697,11 +697,6 @@ pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// (`traffic_cases ab`'s `change_aborted`).
 pub static CHANGES_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Lane changes of the drivers' own for speed or to keep to the side started into a lane whose
-/// leader within `perception::REACT_TO_STOPPED_DISTANCE` stands (`Plan::into_standing`; SUMO's
-/// anticipated speed there is nil), every simulation of the process (`traffic_cases ab`).
-pub static CHANGES_INTO_STANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
@@ -1920,9 +1915,6 @@ impl Simulation {
                     v.speed_gain = [0.0; 2];
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if plan.into_standing {
-                        CHANGES_INTO_STANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
