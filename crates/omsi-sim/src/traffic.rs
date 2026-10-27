@@ -593,6 +593,55 @@ pub struct Network {
     /// `piece_beside` measures. Static geometry, built with the grid, as SUMO fixes a lane's
     /// neighbours when it loads the network.
     pub beside_pieces: Vec<Vec<usize>>,
+    /// The way lengths to the random cars' trip ends (`AiState::goal_field`), one per trip end
+    /// and access, kept while a car uses it.
+    pub goal_fields: GoalFields,
+}
+
+/// What a `GoalField` is computed for: the trip end, the network's size (it only grows: a
+/// field of a smaller one may miss links), and what decides which lanes are open to the car
+/// (`AiState::closed_for`): its `[ai_veh_type]`, its traffic group with that group's defaults,
+/// and the body a closed run is measured against (`Network::closed_marker`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GoalKey {
+    pub goal: usize,
+    pub lanes: usize,
+    veh_type: i32,
+    pool: Option<(usize, Vec<i32>)>,
+    body: u32,
+}
+
+/// The way lengths to a trip end: per lane, the shortest way (m) from its start to the end of
+/// the trip end over lanes open to the car (SUMO's router: duarouter computes a trip's route
+/// as the shortest path, Dijkstra by default, over the lanes the vehicle class may use);
+/// infinite where the trip end cannot be reached.
+pub struct GoalField {
+    pub key: GoalKey,
+    pub dist: Vec<f32>,
+}
+
+impl GoalField {
+    /// The shortest way (m) from the start of `lane` to the end of the trip end.
+    pub fn to_goal(&self, lane: usize) -> f32 {
+        self.dist.get(lane).copied().unwrap_or(f32::INFINITY)
+    }
+}
+
+impl std::fmt::Debug for GoalField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GoalField({:?})", self.key)
+    }
+}
+
+/// The fields in use (`Network::goal_fields`), held weakly: a field goes with the last car that
+/// uses it. A copy of the network starts empty.
+#[derive(Default)]
+pub struct GoalFields(std::sync::Mutex<HashMap<GoalKey, std::sync::Weak<GoalField>>>);
+
+impl Clone for GoalFields {
+    fn clone(&self) -> GoalFields {
+        GoalFields::default()
+    }
 }
 
 /// Lit stubs: an approach lane is not linked past its short lit stub into the lane after
@@ -777,6 +826,64 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
+    /// The way lengths to trip end `key.goal` over the lanes `open` admits (`GoalField`): the
+    /// one in use by another car with the same key, else computed - a Dijkstra backwards from
+    /// the trip end over the links (`prev`), each lane's length its cost.
+    pub fn goal_field(&self, key: GoalKey, open: impl Fn(usize) -> bool) -> std::sync::Arc<GoalField> {
+        if let Some(f) = self.goal_fields.0.lock().ok().and_then(|m| m.get(&key).and_then(|w| w.upgrade())) {
+            return f;
+        }
+        let n = self.lanes.len();
+        let mut dist = vec![f32::INFINITY; n];
+        let goal = key.goal;
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
+        if goal < n && open(goal) {
+            dist[goal] = self.lanes[goal].length();
+            // (a length is never negative: its bits order as the numbers do)
+            heap.push(std::cmp::Reverse((dist[goal].to_bits(), goal)));
+        }
+        // (the reverse links: the network's own once linked, else from `next`)
+        let built: Vec<Vec<usize>>;
+        let prev: &Vec<Vec<usize>> = if self.prev.len() == n {
+            &self.prev
+        } else {
+            let mut p = vec![Vec::new(); n];
+            for (i, l) in self.lanes.iter().enumerate() {
+                for &m in &l.next {
+                    if m < n {
+                        p[m].push(i);
+                    }
+                }
+            }
+            built = p;
+            &built
+        };
+        let mut is_open: Vec<Option<bool>> = vec![None; n];
+        while let Some(std::cmp::Reverse((d, x))) = heap.pop() {
+            let d = f32::from_bits(d);
+            if d > dist[x] {
+                continue;
+            }
+            for &p in &prev[x] {
+                if p >= n || !self.lanes[p].next.contains(&x) {
+                    continue;
+                }
+                let ok = *is_open[p].get_or_insert_with(|| open(p));
+                let nd = d + self.lanes[p].length();
+                if ok && nd < dist[p] {
+                    dist[p] = nd;
+                    heap.push(std::cmp::Reverse((nd.to_bits(), p)));
+                }
+            }
+        }
+        let f = std::sync::Arc::new(GoalField { key: key.clone(), dist });
+        if let Ok(mut m) = self.goal_fields.0.lock() {
+            m.retain(|_, w| w.strong_count() > 0);
+            m.insert(key, std::sync::Arc::downgrade(&f));
+        }
+        f
+    }
+
     /// Does the road from lane `n` on end at the edge of the loaded tiles within the
     /// player's sight: followed along every way on (within `EDGE_LOOKAHEAD`), it reaches only
     /// lanes with `loaded_edge` and `edge_in_sight` and no way on (at a fork, when every branch
@@ -3324,10 +3431,22 @@ pub struct AiState {
     pub change_plan: Vec<usize>,
     /// The lane the car came from (the way behind it, for the rear axle).
     pub prev_lane: Option<usize>,
-    /// Fixed lane sequence (timetable track); empty = wander randomly.
+    /// Fixed lane sequence (timetable track); empty: a random car, which drives towards its
+    /// trip end (`goal`).
     pub route: Vec<usize>,
     /// Position in `route` of the current lane.
     pub route_index: usize,
+    /// A random car's trip end: a street lane with no way on (SUMO's fringe edge, an edge
+    /// without successors, where `randomTrips` starts and ends trips), open to the car and not
+    /// a loaded-tile edge in sight (`Network::ends_at_loaded_edge`). Drawn at random among the
+    /// ends reachable from the fork where the car's plan first meets a choice
+    /// (`AiState::goal_way`), drawn again where it is gone or out of reach (`GOAL_REPICKED`).
+    /// None: no fork met yet, a timetable route, or no end reachable.
+    pub goal: Option<usize>,
+    /// The way lengths to `goal` (`GoalField`), shared with the cars of the same goal and
+    /// access (`Network::goal_fields`); not recorded, computed again on need.
+    #[serde(skip)]
+    pub goal_field: Option<std::sync::Arc<GoalField>>,
     /// Lane change in progress.
     pub change: Option<LaneChange>,
     /// Seconds until the next lane change may start.
@@ -3494,6 +3613,14 @@ pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 /// not cars (a plan is extended frame after frame). A diagnostic for `traffic_cases ab` (whole
 /// process).
 pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Random cars' trip ends (`AiState::goal`), whole process: drawn at a car's first fork, drawn
+/// again because the trip end was gone (its tile linked on, its edge come into sight) or out of
+/// reach from the fork, and entered (the car drove onto its trip end lane). A diagnostic for
+/// `traffic_cases ab` and the game's metrics.
+pub static GOAL_PICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GOAL_REPICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GOAL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// At most this many single-continuation lanes `choose_after` follows to find where a way on leads
 /// (past it the way is taken to lead on; the plan's own length, `PLAN_LANES`).
@@ -3669,7 +3796,7 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3711,11 +3838,9 @@ impl AiState {
         // among the choices (the others are: a street goes on where it has a way on)
         let next: Vec<usize> = l.next.iter().copied().filter(|&n| !avoid(n)).collect();
         let kind = l.kind;
-        // (a closed marker is no closed lane for the way on, `Network::closed_marker`)
-        let closed = |n: usize| match open_to(&net.lanes[n], self, kind).err() {
-            Some(Closed::Density) if net.lanes[n].source != 2 && net.closed_marker(n, self) => None,
-            c => c,
-        };
+        // a random car draws its trip end at its first fork (`goal_way`)
+        let _field = if self.route.is_empty() && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, &next) } else { None };
+        let closed = |n: usize| self.closed_for(net, n, kind);
         // (SUMO's bestLanes looks along the route until a lane with a choice: a lane whose way on
         // is a chain of single continuations that ends in a closed lane leads nowhere for me - a car
         // entered X10's 20754 and 20737, whose only continuation is no_cars, and group 0's cars the
@@ -3746,12 +3871,12 @@ impl AiState {
         };
         let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
         let mut choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
-        // not into the edge of the loaded tiles when another way of the same tier
-        // leads on: a random car has no trip, and the loaded-tile edge is not a place on the map,
-        // only where what is loaded ends - a car turning in there stood in a queue that reached
-        // back 400 m towards the player. (OMSI geometry, not SUMO: SUMO's vehicles have
-        // routes to real destinations and never aim at the network's edge.) With no other way it
-        // drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
+        // not into the edge of the loaded tiles in sight when another way of the same tier
+        // leads on: the loaded-tile edge in sight is not a place on the map, only where what is
+        // loaded ends - a car turning in there stood in a queue that reached back 400 m towards
+        // the player - and no trip end (`is_trip_end`). (OMSI geometry, not SUMO: SUMO's
+        // vehicles have routes to real destinations and never aim at the network's edge.) With
+        // no other way it drives on as before. The flag follows the tiles (`Lane::loaded_edge`, set by the game
         // as they load) and the eye (`Lane::edge_in_sight`): a branch opens again once its tile
         // is loaded or its edge lies beyond the horizon, where the trip ends out of sight.
         if choices.len() > 1 {
@@ -3790,6 +3915,80 @@ impl AiState {
                 choices.last().copied()
             } else { Some(choices[(self.rand() % choices.len() as u64) as usize]) }
         }
+    }
+
+    /// Why `n` is closed to this car driving on lanes of `kind` (`open_to`), None when it is open:
+    /// a closed marker (`Network::closed_marker`) is no closed lane for the way on.
+    fn closed_for(&self, net: &Network, n: usize, kind: LaneKind) -> Option<Closed> {
+        match open_to(&net.lanes[n], self, kind).err() {
+            Some(Closed::Density) if net.lanes[n].source != 2 && net.closed_marker(n, self) => None,
+            c => c,
+        }
+    }
+
+    /// Is `n` a trip end for this car: a street lane with no way on (SUMO's fringe edge), open
+    /// to it, and not a loaded-tile edge in sight (one the car is routed away from,
+    /// `Network::ends_at_loaded_edge`: it would stand there in view)?
+    fn is_trip_end(&self, net: &Network, n: usize) -> bool {
+        net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.closed_for(net, n, LaneKind::Street).is_none()
+    }
+
+    /// The trip end's way lengths for a choice among the ways on `next` of a fork: the car's
+    /// own while its trip end still is one and one of `next` leads to it; else a trip end
+    /// drawn at random among those reachable over open lanes from `next` (SUMO's
+    /// `randomTrips`: a trip from or to the fringe, a trip whose end cannot be reached is
+    /// dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`). None: no trip end reachable.
+    fn goal_way(&mut self, net: &Network, next: &[usize]) -> Option<std::sync::Arc<GoalField>> {
+        if let Some(g) = self.goal.filter(|&g| self.is_trip_end(net, g)) {
+            let key = self.goal_key(net, g);
+            let f = match self.goal_field.take().filter(|f| f.key == key) {
+                Some(f) => f,
+                None => net.goal_field(key, |n| self.closed_for(net, n, LaneKind::Street).is_none()),
+            };
+            if next.iter().any(|&n| f.to_goal(n).is_finite()) {
+                self.goal_field = Some(f.clone());
+                return Some(f);
+            }
+        }
+        let had = self.goal.take().is_some();
+        self.goal_field = None;
+        // (the trip ends reachable from the ways on, nearest first as met)
+        let mut seen = vec![false; net.lanes.len()];
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for &n in next {
+            if n < seen.len() && !seen[n] && self.closed_for(net, n, LaneKind::Street).is_none() {
+                seen[n] = true;
+                queue.push_back(n);
+            }
+        }
+        let mut ends = Vec::new();
+        while let Some(x) = queue.pop_front() {
+            if self.is_trip_end(net, x) {
+                ends.push(x);
+            }
+            for &m in &net.lanes[x].next {
+                if m < seen.len() && !seen[m] && self.closed_for(net, m, LaneKind::Street).is_none() {
+                    seen[m] = true;
+                    queue.push_back(m);
+                }
+            }
+        }
+        if ends.is_empty() {
+            return None;
+        }
+        let g = ends[(self.rand() % ends.len() as u64) as usize];
+        if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = self.goal_key(net, g);
+        let f = net.goal_field(key, |n| self.closed_for(net, n, LaneKind::Street).is_none());
+        self.goal = Some(g);
+        self.goal_field = Some(f.clone());
+        Some(f)
+    }
+
+    /// The `GoalKey` of trip end `goal` for this car.
+    fn goal_key(&self, net: &Network, goal: usize) -> GoalKey {
+        let body = self.traffic_pool.as_ref().and_then(|(p, _)| net.group_body.get(*p)).copied().unwrap_or(0.0).max(self.length);
+        GoalKey { goal, lanes: net.lanes.len(), veh_type: self.veh_type, pool: self.traffic_pool.as_ref().map(|(p, d)| (*p, d.to_vec())), body: body.to_bits() }
     }
 
     /// How far ahead (m) the way is planned: `PLAN_AHEAD`, or the claim horizon at this speed.
@@ -4537,6 +4736,9 @@ impl AiState {
             self.s -= l.length();
             self.prev_lane = Some(self.lane);
             self.lane = next;
+            if self.goal == Some(next) {
+                GOAL_REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if self.route.is_empty() {
                 self.planned_next = if self.ahead.is_empty() { None } else { Some(self.ahead.remove(0)) };
             } else {
@@ -5167,6 +5369,40 @@ mod tests {
         assert!(square.before <= 3.0 && square.after <= 3.0, "{square:?}");
         // at 20° the centre lines stay within 2.6 m for 2.6 / sin 20° ≈ 7.6 m either side
         assert!(shallow.before >= 7.0 && shallow.after >= 7.0, "{shallow:?}");
+    }
+
+    /// A four-arm roundabout as X10's ring at lane 1637 (78 m round, radius 12.5 m, four arms):
+    /// ring lanes `R0..R3` (a quarter each), `Ri` from arm i to arm i+1; at arm i an entry `Ei`
+    /// (50 m) into `Ri` and an exit `Xi` (50 m, no way on: a trip end) out of the end of
+    /// `R(i-1)`, so the end of each ring lane is a fork: on round, or out. Lanes: R0..R3 are
+    /// 0..3, E0..E3 4..7, X0..X3 8..11.
+    fn four_arm_ring() -> Network {
+        let st = LaneKind::Street;
+        let quarter = std::f64::consts::PI * 12.5 / 2.0;
+        let lane = |len: f64| LaneBuilder::arc(DVec3::ZERO, 0.0, len, 0.0, 0.0, st, 3.0);
+        let mut lanes: Vec<Lane> = (0..4).map(|_| lane(quarter)).chain((0..8).map(|_| lane(50.0))).collect();
+        for i in 0..4 {
+            lanes[i].next = vec![(i + 1) % 4, 8 + (i + 1) % 4];
+            lanes[4 + i].next = vec![i];
+        }
+        Network { lanes, ..Default::default() }
+    }
+
+    #[test]
+    fn a_trip_end_gone_is_drawn_again() {
+        // the trip end X3 linked on (its tile came): it is no trip end any more, the car draws
+        // another at its next fork, counted
+        let mut net = four_arm_ring();
+        let mut car = AiState::new(4, 0.0, 5);
+        car.goal = Some(11);
+        car.plan_next(&net);
+        net.lanes[11].next = vec![7];
+        let before = GOAL_REPICKED.load(std::sync::atomic::Ordering::Relaxed);
+        car.planned_next = None;
+        car.ahead.clear();
+        car.plan_next(&net);
+        assert!(GOAL_REPICKED.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(car.goal.is_some_and(|g| g != 11 && (8..11).contains(&g)), "{:?}", car.goal);
     }
 
     #[test]
