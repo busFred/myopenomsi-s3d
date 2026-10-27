@@ -189,6 +189,14 @@ fn way_off_lanes(points: &[DVec2], off_lanes: &dyn Fn(DVec2) -> bool) -> bool {
     })
 }
 
+/// Whether the way round a box by its corners `wp` from `here` keeps off the street lanes
+/// (`off_lanes`, `way_off_lanes`): from corner to corner, and from where they stand to the first
+/// corner unless they stand inside a lane's footprint already (a kerb-side walker): from inside
+/// it the way out is not held to it, as for the kerb places (`nearest_free_place`, `wait_at_kerb`).
+fn way_round_off_lanes(here: DVec2, wp: &[DVec2; 2], off_lanes: &dyn Fn(DVec2) -> bool) -> bool {
+    way_off_lanes(wp, off_lanes) && (!off_lanes(here) || way_off_lanes(&[here, wp[0]], off_lanes))
+}
+
 /// How far beside a box's flank (m) a walker passes it where the usual half metre would
 /// take them into a street lane: their body (BODY_OUTSIDE).
 const PASS_BY: f64 = BODY_OUTSIDE;
@@ -370,13 +378,13 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
         route = near_big.iter().find_map(|b| around_box(b, here, dir));
         // (on a pavement only round it inside the path: never out over the kerb into a
         // street lane, SUMO's stripes of the own lane; and, as the way along a box, off every
-        // street lane's footprint and a body all the way - from where they stand to the first
-        // corner and on to the second, not at the corners only: where the want holds no corridor,
-        // at the kerb, the way round a bus pulling in led behind its end across the lane it stood
-        // in, both corners off it; a side street's lane ending at the path lay between the walker
-        // and the first corner)
+        // street lane's footprint and a body all the way (`way_round_off_lanes`) - from where
+        // they stand to the first corner and on to the second, not at the corners only: where the
+        // want holds no corridor, at the kerb, the way round a bus pulling in led behind its end
+        // across the lane it stood in, both corners off it; a side street's lane ending at the
+        // path lay between the walker and the first corner)
         if on_pavement {
-            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_off_lanes(&[here, wp[0], wp[1]], off_lanes));
+            route = route.filter(|wp| wp.iter().all(|q| in_corridor(*q, want.corridor)) && way_round_off_lanes(here, wp, off_lanes));
         }
     }
     // (a map-parked car in the way, of any size: past it beside it within the path and off the
@@ -384,7 +392,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     let parked = on_pavement && blocker.is_some_and(|k| block_car.get(k) == Some(&None));
     if route.is_none() && parked {
         if let Some(Along::Route(wp)) = blocker.map(|k| along_box_off(&blocks[k], here, dir, want.corridor, off_lanes)) {
-            route = way_off_lanes(&[here, wp[0], wp[1]], off_lanes).then_some(wp);
+            route = way_round_off_lanes(here, &wp, off_lanes).then_some(wp);
         }
     }
     if let Some(wp) = route {
@@ -13586,6 +13594,15 @@ mod ped_tests {
         assert!(!way_off_lanes(&[DVec2::ZERO, wp[0]], &off), "the first leg is not");
         let (bw, want) = run(&off);
         assert!(bw.around.is_none() && want.vel == DVec2::ZERO && bw.jam > 0.0, "no way round: {bw:?} {:?}", want.vel);
+        // a kerb-side walker standing inside the stub's footprint already (0.5 m from its end at
+        // (3, 0)): the way out of it is not held to it, the corners and the way between them are
+        assert!(!off(DVec2::new(2.5, 0.0)));
+        let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
+        let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+        past_boxes(&mut bw, &mut detour, DVec2::new(2.5, 0.0), false, true, false, &mut want, &blocks, &grid, &[None], &[], &off, 0.1);
+        let wp = bw.around.expect("round it from the kerb side").0;
+        assert!(off(wp[0]) && off(wp[1]) && way_off_lanes(&wp, &off), "{wp:?}");
+        assert!(way_round_off_lanes(DVec2::new(2.5, 0.0), &wp, &off) && !way_round_off_lanes(DVec2::ZERO, &wp, &off));
     }
 
     #[test]
