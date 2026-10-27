@@ -2240,26 +2240,20 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     //     car to a waiting place), or its own stop (a refusal, people) with its body on a band (a
     //     crossing meeting place, a walk, a convergence: `wait_bands`), where it would block a
     //     foe's way or a crossing. Its own stop at a waiting place inside (the body on no band:
-    //     `refused_stop`'s waiting place, the zebra stop short of a walk, or a later line's red -
-    //     a left-turn waiting area - with the body clear of every band) is a legal place:
+    //     `refused_stop`'s waiting place, or the zebra stop short of a walk) is a legal place:
     //     SUMO's vehicle enters on green and waits at the internal junction (sumo.md 1.2), or
     //     before the crossing on its internal lane (sumo.md 4.3), and at the end of its green it
     //     clears first (`reservation::will_pass`). Held, it waits at the line,
     //     pulled back before a walk there. A way through that crosses
     //     nothing has no box to keep clear (`perception::junction_ahead`).
     if let (Some(j), Some(sig)) = (p.junction.as_ref(), p.signal.as_ref()) {
-        // (the junction's own lit line, `JunctionView::light`: the light read may be a later line
-        // of the way - a waiting area's - and the box begins at the first)
-        let line = j.light.map(|(_, _, d)| d).unwrap_or(sig.dist);
-        // (short of that line: a car standing on a lead-in piece of the object, its lit line still
-        // ahead, is before the box as much as one on the approach)
-        let short_of_line = !j.inside || j.light.is_some_and(|(_, _, d)| d - st.front > 0.3);
-        let bands = if short_of_line && line <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 { wait_bands(net, sim, j) } else { Vec::new() };
+        let line = sig.dist;
+        let bands = if !j.inside && sig.dist <= j.light_line.max(j.conflict_start) + 1.0 && line - st.front > 0.3 { wait_bands(net, sim, j) } else { Vec::new() };
         if !bands.is_empty() {
             let lead_rest = p.leader.filter(|l| l.speed < QUEUE_SPEED || l.rest.is_some()).map(|l| st.front + l.gap.min(l.rest.map(|r| r - st.front).unwrap_or(f32::INFINITY)));
             let len = me.length();
             let waiting_place = |r: f32| !bands.iter().any(|b| b.0 < r && b.1 > r - len - REST_SHORT);
-            let own = out.stop.filter(|&r| !(matches!(out.why, Why::Junction | Why::People | Why::Light) && waiting_place(r)));
+            let own = out.stop.filter(|&r| !(matches!(out.why, Why::Junction | Why::People) && waiting_place(r)));
             let rest = [own, lead_rest].into_iter().flatten().fold(f32::INFINITY, f32::min);
             let exit = j.entry + j.way_len;
             if rest > line + 0.5 && rest < exit {
