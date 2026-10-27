@@ -4924,10 +4924,9 @@ fn footprint_reach(l: &omsi_sim::traffic::Lane) -> f64 {
     (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY
 }
 
-/// How far apart (m) the bodies of a bus on its way to its stop are laid (`bus_way_bodies`): the
-/// spacing at which the cars' people test samples a car's way (omsi-traffic perception.rs
-/// `WAY_STEP`, private there).
-const BUS_WAY_STEP: f32 = 1.5;
+/// How far apart (m) the bodies of a vehicle on its way to where it comes to rest are laid
+/// (`bus_way_bodies`): the spacing at which the cars' people test samples a car's way.
+const BUS_WAY_STEP: f32 = omsi_traffic::perception::WAY_STEP;
 
 /// The body of vehicle `v` at every `BUS_WAY_STEP` of its way (`AiState::way_points`: along
 /// its lanes, and out into the bay or the space once it pulls in) from where it is to where it

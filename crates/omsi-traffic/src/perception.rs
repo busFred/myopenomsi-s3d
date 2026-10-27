@@ -352,7 +352,7 @@ const WAY_CHUNK: usize = 8;
 const SAMPLE_OVERLAP: f64 = 0.05;
 
 /// Sample spacing of the way (m) ...
-const WAY_STEP: f32 = 1.5;
+pub const WAY_STEP: f32 = 1.5;
 /// ... over this many metres, twice that beyond (a lead far ahead).
 const WAY_FINE: f32 = 60.0;
 
