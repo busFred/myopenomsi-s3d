@@ -2424,10 +2424,26 @@ impl DecideCtx<'_> {
     fn decide(&self, p: &Person, dt: f32, world: &World, net: Option<&Network>, lights: Option<&LightsOf>, cars: &[SeenCar], yields: &mut YieldBook) -> Decision {
         let mut d = Decision::of(p);
         let pos2 = p.position.truncate();
-        // somebody walking on towards ground that is not loaded goes
-        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
-            d.gone = true;
-            return d;
+        // somebody walking on towards ground that is not loaded goes - out of the player's
+        // sight; a stroller in sight turns round at the loaded ground's edge, the first look
+        // point of their way (`BOX_LOOK`) on unloaded ground, as at a wall (`PedWalk::turn_round`):
+        // nobody is taken away in view (the vehicles' trips end at the loaded edge only beyond
+        // the horizon); Wuluju: strollers vanished at x 300 (a tile's edge) 349 m off in frame
+        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 {
+            let ahead = pos2 + p.vel.normalize() * BOX_LOOK[0];
+            if let (State::Strolling(walk), Some(net)) = (&p.state, net) {
+                if (!world.has_ground(ahead.x, ahead.y) || !world.has_ground(pos2.x, pos2.y)) && figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position) {
+                    let mut walk = walk.clone();
+                    walk.turn_round(net);
+                    d.state = Some(State::Strolling(walk));
+                    d.want = Want::stand(None, Activity::Stand);
+                    return d;
+                }
+            }
+            if !world.has_ground(pos2.x, pos2.y) {
+                d.gone = true;
+                return d;
+            }
         }
         match &p.state {
             State::Strolling(walk) => {
