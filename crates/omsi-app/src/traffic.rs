@@ -508,6 +508,26 @@ pub fn draw_reach(max_dist: f64, loaded: f64) -> f64 {
 /// vehicle (omsi-traffic perception.rs `people_ahead`: `me.half_width + 0.3`).
 pub(crate) const PEOPLE_STRIP: f64 = 0.3;
 
+/// Whether any of `people` (positions on foot) stands where a vehicle put down with the bodies
+/// `bodies` (as drawn) at height `z` would be held by them at once: the cars' people test holds a
+/// car for a person whose centre lies within its half width and `PEOPLE_STRIP` beside it, so each
+/// body widened by the strip, a person's centre inside one, at its level (within the body's own
+/// height of `z`).
+fn people_in_strip(bodies: &[omsi_sim::collision::Obb], z: f64, people: impl Iterator<Item = DVec3>) -> bool {
+    let strips: Vec<omsi_sim::collision::Obb> = bodies
+        .iter()
+        .map(|b| {
+            let mut s = *b;
+            s.half.x += PEOPLE_STRIP;
+            s
+        })
+        .collect();
+    people.into_iter().any(|p| {
+        let me = omsi_sim::collision::Obb::point(p, 0.0);
+        strips.iter().any(|s| (p.z - z).abs() < s.z1 - s.z0 && s.separation(&me) < 0.0)
+    })
+}
+
 /// A car further away than this is below two pixels on a 900-line screen (m).
 const VISIBLE_RANGE: f64 = 900.0;
 
@@ -1059,6 +1079,9 @@ pub struct Traffic {
     /// The people on foot the humans took away in their last tick, and whether the player could
     /// see them (`humans::Humans::gone`): written with the next recorded frame.
     pub people_gone: Vec<(u32, bool)>,
+    /// Counted for the gate: places a vehicle was refused at because somebody stood in its body
+    /// or its people strip (`spawn_clear_except`), every asking (the population asks again).
+    pub spawn_refused_people: usize,
     /// The map's folder name: recordings and network dumps are named after it.
     pub map_name: String,
     /// Cars whose standing too long has been saved already (each once).
@@ -1733,6 +1756,7 @@ impl Traffic {
             recorder: omsi_traffic::record::Recorder::new(),
             people_records: Vec::new(),
             people_gone: Vec::new(),
+            spawn_refused_people: 0,
             map_name: world.map_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "map".into()),
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
@@ -3520,7 +3544,9 @@ impl Traffic {
     /// back where it stands). The bodies of the vehicle and of the parts coupled to it are
     /// compared with `SPAWN_BODY_CLEAR` to spare (not centres: an articulated bus reaches
     /// 6 m ahead of its origin and 12 m behind it, and one put down 9.3 m from the player's
-    /// bus stood 1.8 m inside it) with every other vehicle's and `keep_clear`.
+    /// bus stood 1.8 m inside it) with every other vehicle's and `keep_clear`; nobody on foot
+    /// may stand in them or the people strip beside them (`people_in_strip`; counted,
+    /// `spawn_refused_people`).
     pub fn spawn_clear_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, except: Option<usize>) -> bool {
         let bodies = self.consist_bodies(ty, pos, heading);
         let reach = bodies.iter().map(|b| (b.center - pos.truncate()).length() + b.half.length()).fold(0.0, f64::max) + 40.0;
@@ -3533,6 +3559,21 @@ impl Traffic {
                 .filter(|(i, c)| Some(*i) != except && (c.vehicle.position - pos).length() < reach)
                 .any(|(_, c)| vehicle_bodies(&c.vehicle).iter().any(|o| touches(o)));
         if taken {
+            return false;
+        }
+        // nor where somebody stands in its body or the people strip beside it (`people_in_strip`;
+        // put down over them it stood for them, a car among Wuluju's walkers 475 s; SUMO's
+        // insertion checks the lane for persons in the insertion gap)
+        let drawn: Vec<omsi_sim::collision::Obb> = bodies
+            .iter()
+            .map(|b| {
+                let mut d = *b;
+                d.half -= glam::DVec2::splat(SPAWN_BODY_CLEAR);
+                d
+            })
+            .collect();
+        if people_in_strip(&drawn, pos.z, self.people.iter().map(|p| p.0)) {
+            self.spawn_refused_people += 1;
             return false;
         }
         let (front, rear, half_w) = extents(ty, 12.0);
@@ -6395,6 +6436,20 @@ mod density_semantics_tests {
     /// greatest any group has: BeijingCity's bus path (normal cars 0, buses 1) and its feeder
     /// (0.001) weigh nothing for a fleet of normal cars; a lane of 0.1 a tenth; a lane of
     /// no rules the full 1. Another group with types brings its own share.
+    #[test]
+    fn a11_1_no_car_is_put_down_where_somebody_stands_in_its_body_or_people_strip() {
+        // a car 1.8 m wide, 4.6 m long facing north at the origin: inside its body, or beside it
+        // within the strip (0.9 + 0.3 m), refused; farther off, ahead of its front, or on a level
+        // above, put down
+        let body = omsi_sim::collision::Obb::from_box([1.8, 4.6, 1.5, 0.0, 0.0, 0.75], DVec3::ZERO, 0.0);
+        let refused = |p: DVec3| people_in_strip(&[body], 0.0, std::iter::once(p));
+        assert!(refused(DVec3::new(0.3, 1.0, 0.0)), "in its body");
+        assert!(refused(DVec3::new(1.15, -2.0, 0.0)), "in the strip");
+        assert!(!refused(DVec3::new(1.25, 0.0, 0.0)), "beside the strip");
+        assert!(!refused(DVec3::new(0.0, 2.5, 0.0)), "ahead of its front");
+        assert!(!refused(DVec3::new(0.0, 0.0, 6.0)), "on a bridge above");
+    }
+
     #[test]
     fn b9_1_the_spawn_weight_is_the_groups_own_density() {
         let defaults = [1, 2, 1];
