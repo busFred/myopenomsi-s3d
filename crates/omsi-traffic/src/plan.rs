@@ -1443,14 +1443,14 @@ fn rest_clear_of_bands(net: &Network, sim: &Simulation, me: &Vehicle, s: f32) ->
 /// The packed-queue escape: a car that has stood `QUEUE_ESCAPE_STAND` behind a queue whose
 /// head stands for good (`queue_head`: `ForGood`, the same head the keep-back and the bypass
 /// read), held by nothing but its lead, with a lane beside it may bypass into (`could_bypass`) but
-/// nearer its lead than the room the bypass needs (`bypass_room`), backs up to that room when the
+/// nearer its lead than the room the bypass at full lock needs (`bypass_room`), backs up to that room when the
 /// strip behind holds the move and its standing gap (`rear_clear`; so the rearmost goes first and
 /// the queue dissolves from the back), then pulls out with the bypass. Only
 /// on a lane of a road (not a junction object's piece), its body staying on its own lane, and
 /// to a place where it may wait (`rest_clear_of_bands`). The metres to back up. (SUMO has no
 /// reversing: its vehicles are points on a lane that change lanes from any gap; an OMSI car's
 /// body must steer round the car in front, so a queue packed to its standing gap behind a
-/// vehicle standing for good would stand for ever.)
+/// vehicle standing for good closer than the full-lock room would stand for ever.)
 fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception) -> Option<f32> {
     let st = &me.state;
     if st.speed.abs() >= STANDING_SPEED || me.stopped < QUEUE_ESCAPE_STAND || st.change.is_some() || me.passing.is_some() || !st.route.is_empty() || me.is_rail() || me.class == VehicleClass::Air || me.serves_stops() {
