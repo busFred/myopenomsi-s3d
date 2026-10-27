@@ -24,7 +24,9 @@ pub const QUEUE_LEAD: f32 = 10.0;
 /// Why the game took a vehicle off the road (`Record::Remove::rule`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RemoveRule {
-    /// The traffic's own: the network's end, no way on (`Simulation::removed`).
+    /// The traffic's own: the network's end, no way on (`Simulation::removed`). A random car
+    /// whose trip end (`AiState::goal`) is a map's end, not a loaded-tile edge, goes by this
+    /// rule when it drives off it.
     NetworkEnd,
     /// The tile under it was unloaded.
     GroundUnloaded,
@@ -40,7 +42,10 @@ pub enum RemoveRule {
     DeadEnd,
     /// A random car's trip ends beyond the perceptual horizon, in frame, a dot nobody can tell
     /// from nothing: at the loaded tiles' edge, the first in line ([`goes_far`]), or standing at a
-    /// dead end. Not counted as removed in view (`ab`'s `removed_far`).
+    /// dead end. Not counted as removed in view (`ab`'s `removed_far`). A random car's trip end
+    /// (`AiState::goal`) at a loaded-tile edge is beyond the horizon when drawn (an edge in sight
+    /// is no trip end), so a car reaching it goes by this rule, driving off the edge
+    /// (`External::edge_trip_end`); there is no removal rule of the goal's own.
     FarDeadEnd,
     /// A timetable bus standing where the loaded part of its route ends, beyond the perceptual
     /// horizon: its trip comes back with the tiles. Not counted as removed in view (`ab`'s
