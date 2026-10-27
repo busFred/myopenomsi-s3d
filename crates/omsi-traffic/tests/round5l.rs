@@ -1,8 +1,8 @@
-//! Headless scenarios for round 5 area L: the drawn road's drivable extent as the room for an
-//! in-lane squeeze (L2: Sobol's squeeze past the player's bus on any road, the wheels over
-//! the line into a free neighbour lane, an early start, no squeeze across a lit stub or into
-//! a junction's foe stretch) and the shift inside the drawn road past people on a kerbless
-//! pavement (L3).
+//! Headless scenarios: the drawn road's drivable extent as the room for an in-lane squeeze
+//! that keeps SUMO's `minGapLat` from the body it passes (past the player's bus on any road,
+//! the wheels over the line into a free neighbour lane, an early start, no squeeze across a
+//! lit stub or into a junction's foe stretch) and the shift inside the drawn road past people
+//! on a kerbless pavement.
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
@@ -162,17 +162,25 @@ fn squeeze_past_from(net: &Network, lane: usize, start: (f32, f32), player: Play
 #[test]
 fn l2_a_car_squeezes_past_the_players_bus_half_out_of_its_lane_on_a_road_with_a_neighbour_lane() {
     // the right lane's drawn road reaches 2.0 m to the left (the left lane's traffic keeps
-    // it to 3.5 - 1.5 - 0.3 = 1.7 m) and a kerb at its own right edge; the bus stands 1.8 m
-    // right of the axis (half on the kerb): the squeeze needs 0.7 m to the left, 1.6 m of
-    // road from the axis - inside the drawn road, no wheels over the line
+    // it to 3.5 - 1.5 - 0.3 = 1.7 m) and a kerb at its own right edge; the bus stands 2.05 m
+    // right of the axis (half on the kerb): keeping SUMO's minGapLat (0.6) from the bus's
+    // corner the squeeze needs 0.7 m to the left, 1.6 m of road from the axis - inside the drawn
+    // road, no wheels over the line
     let net = two_lanes((2.0, 1.5), false);
-    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 1.8, 30.0), vec![], false);
+    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 2.05, 30.0), vec![], false);
     let pass = r.pass.expect("no squeeze on a road with a neighbour lane");
     assert!(pass.lane.is_none() && pass.beside.is_none(), "{pass:?}");
     assert!((pass.side + 0.7).abs() < 0.05, "squeeze side {}", pass.side);
     assert!(r.least > 0.25, "came within {:.2} m of the bus", r.least);
     assert!(r.x_end > 215.0, "never got past the bus: x {:.1}", r.x_end);
     assert_eq!(r.on_lanes, vec![1], "registered on {:?}", r.on_lanes);
+    // the bus 1.8 m out: minGapLat from its corner asks 0.95 m to the left, 1.85 m of road from
+    // the axis, more than the 1.7 m the drawn road leaves: the squeeze puts the driver-side
+    // wheels over the line into the free lane beside and keeps the gap
+    let r = squeeze_past(&net, 1, bus(200.0, -3.5, 1.8, 30.0), vec![], false);
+    let pass = r.pass.expect("no squeeze with the wheels over the line");
+    assert!(pass.lane.is_none() && pass.beside == Some(0) && (pass.side + 0.95).abs() < 0.05, "{pass:?}");
+    assert!(r.least > 0.55 && r.x_end > 215.0, "least {:.2} x {:.1}", r.least, r.x_end);
 }
 
 #[test]
@@ -280,18 +288,19 @@ fn two_way(right: f32, lit: Option<f64>) -> Network {
 
 #[test]
 fn l2_the_players_bus_is_squeezed_past_as_soon_as_it_has_paused_with_half_a_second_of_indicator() {
-    // the bus pulls in 2.0 m right of the axis onto the parking strip; the squeeze needs
-    // 0.5 m to the left (1.4 m of road from the axis, inside the 1.5 m). The bus's standing
+    // the bus pulls in 2.25 m right of the axis onto the parking strip; keeping minGapLat (0.6)
+    // from its corner the squeeze needs 0.5 m to the left (1.4 m of road from the axis, inside
+    // the 1.5 m). The bus's standing
     // clock starts with the car already closed up 8 m behind it: the car goes round it
     // after the bus has paused 1.5 s, not the 4 s a pass waits, and without standing 3 s
     let net = two_way(3.0, None);
-    let r = squeeze_past_from(&net, 0, (184.0, 0.0), bus(200.0, 0.0, 2.0, 0.0), vec![], true);
+    let r = squeeze_past_from(&net, 0, (184.0, 0.0), bus(200.0, 0.0, 2.25, 0.0), vec![], true);
     let pass = r.pass.expect("no squeeze past the pausing bus");
     assert!(pass.lane.is_none() && pass.beside.is_none(), "{pass:?}");
     assert!(r.stopped_at_start < 3.0, "it stood {:.1} s before the squeeze", r.stopped_at_start);
     assert!(r.still_at_start > 1.5 && r.still_at_start < 2.5, "the bus had paused {:.1} s", r.still_at_start);
     // (and rolling up from 50 m back it goes round the bus as soon as it has closed up)
-    let r = squeeze_past(&net, 0, bus(200.0, 0.0, 2.0, 30.0), vec![], false);
+    let r = squeeze_past(&net, 0, bus(200.0, 0.0, 2.25, 30.0), vec![], false);
     assert!(r.pass.is_some() && r.stopped_at_start < 3.0 && r.x_end > 215.0, "{:?} stood {:.1} x {:.1}", r.pass, r.stopped_at_start, r.x_end);
     assert!(r.blinker_lead > 0.45, "signalled {:.2} s before pulling out", r.blinker_lead);
     assert!(r.least > 0.25 && r.x_end > 215.0, "least {:.2} x {:.1}", r.least, r.x_end);
@@ -299,11 +308,13 @@ fn l2_the_players_bus_is_squeezed_past_as_soon_as_it_has_paused_with_half_a_seco
 
 #[test]
 fn l2_no_squeeze_across_a_lit_stub_or_into_a_junction() {
+    // (the bus 2.25 m right of the axis: past it the squeeze keeps minGapLat, 0.6, and fits the
+    // drawn road where nothing else forbids it)
     // a lit stub 19 m past the bus's front (within the 25 m zone): no squeeze
     let net = two_way(3.0, Some(225.0));
     let red = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 60.0)]], 60.0);
     let mut sim = Simulation::new(&net, vec![red]);
-    let player = bus(200.0, 0.0, 2.0, 30.0);
+    let player = bus(200.0, 0.0, 2.25, 30.0);
     sim.players = vec![player];
     let mut cars = vec![car(1, 0, 150.0, 8.0)];
     let mut started = false;
@@ -327,7 +338,7 @@ fn l2_no_squeeze_across_a_lit_stub_or_into_a_junction() {
         net.lanes.push(main); // 4
         net.lanes.push(road(&[(jx + 10.0, 15.0), (jx + 10.0, 300.0)], 6)); // 5
         let net = finish(net);
-        let r = squeeze_past(&net, 0, bus(200.0, 0.0, 2.0, 30.0), vec![], false);
+        let r = squeeze_past(&net, 0, bus(200.0, 0.0, 2.25, 30.0), vec![], false);
         assert_eq!(r.pass.is_some(), expect, "junction at {jx}: {:?}", r.pass);
     }
 }
@@ -349,13 +360,14 @@ fn inside_junction(mx: f64) -> Network {
 
 #[test]
 fn l2_inside_a_junction_the_squeeze_keeps_clear_of_the_foe_stretch() {
-    // the bus pauses on the junction's piece 2 m right of its axis, the car behind it on the
+    // the bus pauses on the junction's piece 2.25 m right of its axis (the squeeze past it keeps
+    // minGapLat, 0.6, inside the piece's room), the car behind it on the
     // piece too (`JUNCTION_KEEP` moot inside): with the main road 60 m on the squeeze ends
     // well before the foe stretch and goes; 20 m on, it would run into it and does not
     for (mx, expect) in [(190.0f64, true), (150.0, false)] {
         let net = inside_junction(mx);
         let mut sim = Simulation::new(&net, vec![]);
-        let player = bus(130.0, 0.0, 2.0, 30.0);
+        let player = bus(130.0, 0.0, 2.25, 30.0);
         sim.players = vec![player];
         let mut me = car(1, 1, 5.0, 3.0);
         me.state.max_speed_kmh = 30.0;

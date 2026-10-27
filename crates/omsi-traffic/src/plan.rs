@@ -958,12 +958,11 @@ fn lateral_settled(vehicles: &[Vehicle], l: &crate::perception::Headway) -> bool
     }
 }
 
-/// The lateral gap (m) an in-lane squeeze keeps from the body it passes, measured from that
-/// body's corners (`body_across`): the round-5 squeeze's gap (Sobol's squeeze past the
-/// player's bus; the tests of `round5l`), at least the corridor's `SQUEEZE_CLEARANCE`. SUMO's
-/// sublane `minGapLat` (0.6, SL2015 `updateGaps`) was tried as this gap: every squeeze past a
-/// car standing 1.7 m out on a 1.5 m road became a wait for the oncoming lane.
-pub const SQUEEZE_GAP: f32 = 0.35;
+/// SUMO's sublane `minGapLat` default (m, sumo.md 3.4; SL2015 `updateGaps`): the lateral gap an
+/// in-lane squeeze keeps from the body it passes, measured from that body's corners
+/// (`body_across`). SUMO keeps it to a body beside; where the drawn road leaves less room the car
+/// does not squeeze and passes on the oncoming lane or waits.
+pub const MIN_GAP_LAT: f32 = 0.6;
 
 /// Where the body of the thing ahead, `l`, lies across my way (m from my lane's axis, + right):
 /// the least and greatest lateral of its box's corners in the way's frame where it is met
@@ -2443,13 +2442,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // leaves room beside where it stands (the lane's drivable extent on that side, L1:
         // to the kerb, the pavement or the next lane's painted edge), else onto the
         // oncoming lane
-        // (my body keeps `SQUEEZE_GAP` from the thing's body where it really is - its corners
+        // (my body keeps `MIN_GAP_LAT` from the thing's body where it really is - its corners
         // across my way, `body_across`, SUMO's sublane model: a body standing askew or reaching
         // only its corner into my width is passed by that much, not by its middle)
         let towards_middle = sim.oncoming_sign();
         let (lo, hi) = body_across(net, sim, vehicles, me, &l);
         let away = if l.lateral * towards_middle > 0.3 { -towards_middle } else { towards_middle };
-        let squeeze_side = if away < 0.0 { lo - SQUEEZE_GAP - me.half_width } else { hi + SQUEEZE_GAP + me.half_width };
+        let squeeze_side = if away < 0.0 { lo - MIN_GAP_LAT - me.half_width } else { hi + MIN_GAP_LAT + me.half_width };
         // (a junction object's piece has no edge data: its lane reaches halfway to the piece
         // laid beside it, `Network::piece_beside` - the paths tile the carriageway - and no
         // further than its half width where none lies beside)
