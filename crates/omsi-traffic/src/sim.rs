@@ -692,6 +692,11 @@ pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::syn
 /// of the process (diagnostics, `traffic_cases ab`'s `lane_offset_s`).
 pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Lane changes of the drivers' own dropped while signalling because their gap check failed
+/// again (`Plan::abort_change`; SUMO's `checkChange` every step), every simulation of the process
+/// (`traffic_cases ab`'s `change_aborted`).
+pub static CHANGES_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Lane changes of the drivers' own for speed or to keep to the side started into a lane whose
 /// leader within `perception::REACT_TO_STOPPED_DISTANCE` stands (`Plan::into_standing`; SUMO's
 /// anticipated speed there is nil), every simulation of the process (`traffic_cases ab`).
@@ -1903,6 +1908,10 @@ impl Simulation {
             self.changes_started.push((to, s_to));
             true
         };
+        if plan.abort_change && v.state.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
+            v.state.drop_change();
+            CHANGES_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match plan.start {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {

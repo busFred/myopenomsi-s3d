@@ -1874,13 +1874,15 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             }
         }
     };
-    let lane_users = |l: usize, offset: f32, note: &mut dyn FnMut(f32, f32, f32, f32, bool, Option<usize>)| {
+    // (`passers`: a vehicle passing against the lane's direction there marks the lane
+    // `foreign`; only on the lane and the lanes leading straight into it, where one is still near)
+    let lane_users = |l: usize, offset: f32, passers: bool, note: &mut dyn FnMut(f32, f32, f32, f32, bool, Option<usize>)| {
         for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             if occ.vehicle == i {
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign, Some(occ.vehicle));
+            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign && passers, Some(occ.vehicle));
         }
         // the players' vehicles are there like anybody else
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -1888,11 +1890,17 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             note(s + offset - s_b, p.half_len, p.half_len, p.speed, false, None);
         }
     };
-    lane_users(nb, 0.0, &mut note);
-    // behind, on the lanes leading in (within 80 m)
-    for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
-        lane_users(p, -net.lanes[p].length(), &mut note);
-    }
+    lane_users(nb, 0.0, true, &mut note);
+    // behind, back over the lanes leading in as far as a follower can matter (SUMO's
+    // `getFollowersOnConsecutive` to the lane's `getMaximumBrakeDist`: `plan::walk_back` to
+    // `plan::follower_reach`); a junction object's pieces are a few metres each, and a follower
+    // two pieces back at the lane's speed is the change's follower
+    crate::plan::walk_back(net, nb, s_b, crate::plan::follower_reach(net, nb), |l, start| {
+        if l != nb {
+            let passers = net.prev.get(nb).is_some_and(|v| v.contains(&l));
+            lane_users(l, start + s_b, passers, &mut note);
+        }
+    });
     // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
     // beside me (SUMO's anticipated speed there sees a queue standing 50 m on: no change of
     // speed gain or keep-right into it); at a fork the branch with the most room (the branch

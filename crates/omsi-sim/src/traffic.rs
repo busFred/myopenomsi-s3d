@@ -4009,6 +4009,17 @@ impl AiState {
         self.settled_offset = true;
     }
 
+    /// Drop a lane change that still signals, before the car has moved over (the traffic's
+    /// gap check during the signal failed): no change, and the way beyond the lane beside
+    /// (`change_plan`) is forgotten; the car's own way (`planned_next`, `ahead`) and its
+    /// lateral offset were never touched by the change.
+    pub fn drop_change(&mut self) {
+        if self.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
+            self.change = None;
+            self.change_plan.clear();
+        }
+    }
+
     /// Pull out into `to` from behind a standing obstacle: a short, steep move over
     /// `length` metres (8, less from close behind it).
     pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32, full_lock: bool) {

@@ -98,6 +98,9 @@ pub struct Plan {
     /// The lane change it starts goes, for speed or to keep to the side, into a lane whose
     /// leader within `REACT_TO_STOPPED_DISTANCE` stands (counted, `sim::CHANGES_INTO_STANDING`).
     pub into_standing: bool,
+    /// The lane change of the driver's own that signals is dropped before it moves over: its
+    /// gap rule fails again (`gap_accepted` against `change_target_view`; counted, `sim::CHANGES_ABORTED`).
+    pub abort_change: bool,
     /// The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
@@ -154,6 +157,16 @@ fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
 }
 
+/// The lane beside that a signalling change of my own onto `to` (side `dir`) is checked
+/// against (`gap_accepted`, the follower looked up back over the lanes leading in,
+/// `perception::neighbour`): the one the change goes to, or where the move has carried on past a
+/// joint (`AiState::change_plan`) the one on its side; None where no lane beside is seen there
+/// (nothing to check against: the change stands).
+fn change_target_view(p: &Perception, to: usize, dir: i32) -> Option<NeighbourView> {
+    let views = [p.left, p.right];
+    views.iter().flatten().find(|n| n.lane == to).or_else(|| views.iter().flatten().find(|n| n.dir == dir)).copied()
+}
+
 /// [`gap_accepted`]'s two halves: (the follower there need not brake hard, there is room ahead).
 fn gap_parts(me: &Vehicle, nb: &NeighbourView) -> (bool, bool) {
     let v = me.state.speed;
@@ -179,20 +192,48 @@ pub fn secure_gap_behind(f: &PullOutFollower) -> f32 {
     f.params.min_gap + f.speed * f.params.tau + f.speed * f.speed / (2.0 * f.params.comfort_brake.max(0.1))
 }
 
-/// The vehicles behind lane `lane` at `s` (the pull-out's origin, `rear` behind it to its
-/// rear): on that lane and back over the lanes leading into it as far as the slowest-braking
-/// preset at the lane's limit needs (`secure_gap_behind`), the players too (their preset's
-/// driver). `on_lane(l)` gives the AI vehicles on lane `l`: (s, front, speed, driver).
-pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, rear: f32, on_lane: &dyn Fn(usize) -> Vec<(f32, f32, f32, DriverParams)>) -> Vec<PullOutFollower> {
-    let Some(l) = net.lanes.get(lane) else { return Vec::new() };
-    let v_lim = l.speed_limit_kmh.max(0.0) / 3.6;
-    let reach = secure_gap_behind(&PullOutFollower { gap: 0.0, speed: v_lim, params: DriverParams::preset(VehicleClass::ScheduledBus) });
-    let player = DriverParams::preset(crate::sim::PLAYER_PRESET);
-    let mut out = Vec::new();
-    // (lane, how far its start lies behind the pull-out's origin)
+/// How far back (m) a follower can matter behind a place on lane `lane`: the secure gap
+/// (`secure_gap_behind`) of the slowest-braking preset coming at the lane's limit. SUMO bounds its
+/// follower search the same way, by the braking distance of the fastest, weakest-braking vehicle
+/// at the lane's limit plus the largest minGap (`MSLane::getMaximumBrakeDist`, used by
+/// `getFollowersOnConsecutive`).
+pub fn follower_reach(net: &Network, lane: usize) -> f32 {
+    let v_lim = net.lanes.get(lane).map_or(0.0, |l| l.speed_limit_kmh.max(0.0) / 3.6);
+    secure_gap_behind(&PullOutFollower { gap: 0.0, speed: v_lim, params: DriverParams::preset(VehicleClass::ScheduledBus) })
+}
+
+/// Walks back from lane `lane` at `s` over the lanes leading into it, as SUMO's
+/// `MSLane::getFollowersOnConsecutive` does, while a lane's start lies within `reach` m behind
+/// `s`: `visit(l, start)` once per lane, `start` the lane's start relative to `s` (negative;
+/// `-s` for `lane` itself).
+pub fn walk_back(net: &Network, lane: usize, s: f32, reach: f32, mut visit: impl FnMut(usize, f32)) {
+    if lane >= net.lanes.len() {
+        return;
+    }
     let mut frontier: Vec<(usize, f32)> = vec![(lane, -s)];
     let mut seen: Vec<usize> = vec![lane];
     while let Some((cur, start)) = frontier.pop() {
+        visit(cur, start);
+        if -start > reach {
+            continue;
+        }
+        for &pl in net.prev.get(cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if !seen.contains(&pl) {
+                seen.push(pl);
+                frontier.push((pl, start - net.lanes[pl].length()));
+            }
+        }
+    }
+}
+
+/// The vehicles behind lane `lane` at `s` (the pull-out's origin, `rear` behind it to its
+/// rear): on that lane and back over the lanes leading into it as far as a follower can matter
+/// (`walk_back` to `follower_reach`), the players too (their preset's driver). `on_lane(l)` gives
+/// the AI vehicles on lane `l`: (s, front, speed, driver).
+pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, rear: f32, on_lane: &dyn Fn(usize) -> Vec<(f32, f32, f32, DriverParams)>) -> Vec<PullOutFollower> {
+    let player = DriverParams::preset(crate::sim::PLAYER_PRESET);
+    let mut out = Vec::new();
+    walk_back(net, lane, s, follower_reach(net, lane), |cur, start| {
         let mut add = |os: f32, front: f32, speed: f32, params: DriverParams| {
             let at = start + os;
             if cur == lane && at >= 0.0 {
@@ -208,16 +249,7 @@ pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, 
                 add(ps, p.half_len, p.speed, player);
             }
         }
-        if -start > reach {
-            continue;
-        }
-        for &pl in net.prev.get(cur).map(|v| v.as_slice()).unwrap_or(&[]) {
-            if !seen.contains(&pl) {
-                seen.push(pl);
-                frontier.push((pl, start - net.lanes[pl].length()));
-            }
-        }
-    }
+    });
     out
 }
 
@@ -2185,6 +2217,23 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // (and the speed-gain wishes towards each lane beside, `speed_gain_step`)
         for nb in [p.left, p.right].into_iter().flatten() {
             out.speed_gain_step[(nb.dir as usize).clamp(1, 2) - 1] = Some(speed_gain_step(net, sim, me, p, &nb));
+        }
+    }
+
+    // a lane change of the driver's own (a bypass too) checks its gap again on every frame of
+    // its signal and is dropped if it fails before the car moves over (SUMO's `checkChange` runs
+    // every step until the change is carried out); a change the lane's end asks for keeps
+    // informing the follower there (LC2013's `informFollower`, every step the strategic change
+    // is wanted and not yet carried out: SUMO carries it out in the step it is accepted, the
+    // OMSI driver signals first, and the follower that made room is not let go meanwhile)
+    if let Some(c) = st.change.filter(|c| c.wait > 0.0 && c.t <= 0.0 && st.route.is_empty()) {
+        if let Some(nb) = change_target_view(p, c.to, c.dir) {
+            if let (true, Some(f), Some((gap, vb))) = (lane_end_desire(net, sim, me, p, &nb) > 0.0, nb.behind_id, nb.behind) {
+                if gap > 0.0 {
+                    out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
+                }
+            }
+            out.abort_change = !gap_accepted(me, &nb);
         }
     }
 
