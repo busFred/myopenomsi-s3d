@@ -547,13 +547,24 @@ impl Spawn {
 
 /// The AI vehicle of `class` with `(front, rear, half width)` as it would be made at `pos` facing
 /// `heading` (deg), at distance `at.1` along lane `at.0`, standing: its way the lane and the next
-/// one it plans (`AiState::plan_next`), as `spawn`'s.
-fn spawn_probe(net: &Network, class: VehicleClass, size: (f32, f32, f32), pos: DVec3, heading: f64, at: (usize, f32)) -> AiVehicle {
+/// one it plans (`AiState::plan_next`), as `spawn`'s. A car pulling out (`lateral`: its offset
+/// from the lane and the ramp back onto it, as `advance_pull_out` makes it) stands at that offset,
+/// its way easing back onto the lane (`AiState::lateral_ramp`).
+fn spawn_probe(net: &Network, class: VehicleClass, size: (f32, f32, f32), pos: DVec3, heading: f64, at: (usize, f32), lateral: Option<(f32, f32)>) -> AiVehicle {
     let mut state = AiState::new(at.0, at.1, 0);
     state.front = size.0;
     state.rear = size.1;
     state.length = size.0 + size.1;
     state.plan_next(net);
+    let pos = match lateral {
+        Some((lat, ramp)) => {
+            state.lateral = lat;
+            state.lateral_target = 0.0;
+            state.lateral_ramp = (lat, 0.0, state.odometer, ramp);
+            state.way_point(net, 0.0)
+        }
+        None => pos,
+    };
     let mut probe = AiVehicle::new(0, class, state, size.2, 0);
     probe.pos = pos;
     probe.heading = heading as f32;
@@ -2669,7 +2680,8 @@ impl Traffic {
             return;
         }
         let (q, h) = self.net.lanes[pp.lane].at(pp.s);
-        if !self.spawn_clear(&pp.ty, q, h as f64, (pp.lane, pp.s), Spawn::PullOut) {
+        // (the people test asks the car where it is made: at the parked offset, easing back)
+        if !self.spawn_clear_with(&pp.ty, q, h as f64, (pp.lane, pp.s), Spawn::PullOut, None, Some((pp.lat, ramp))) {
             return;
         }
         self.pending_pull_out = None;
@@ -3575,9 +3587,11 @@ impl Traffic {
     /// Whether the cars' people test holds a vehicle of `ty` standing at `pos` facing `heading`
     /// (deg), at distance `at.1` along lane `at.0` (`omsi_traffic::perception::people_hold_at_rest`):
     /// the AI vehicle as it would be made there (`spawn`'s front, consist rear and half width, the
-    /// way on its lane and the next one it would plan, a bus's class for a timetable bus) against
-    /// the people as the traffic sees them (`Simulation::people`).
-    fn people_hold_here(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn) -> bool {
+    /// way on its lane and the next one it would plan, a bus's class for a timetable bus; a car
+    /// pulling out at its offset, `lateral`, `spawn_probe`) against the people as the traffic sees
+    /// them (`Simulation::people`), its shift past people only where the oncoming lane lets it (the
+    /// vehicles on a lane: the cars whose front is on it).
+    fn people_hold_here(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn, lateral: Option<(f32, f32)>) -> bool {
         if self.sim.people.is_empty() || self.net.lanes.get(at.0).is_none() {
             return false;
         }
@@ -3585,8 +3599,14 @@ impl Traffic {
         let (front, rear, half_width) = extents(ty, if bus { 12.0 } else { 4.5 });
         let rear = self.consist_rear(ty).max(rear);
         let class = if bus { VehicleClass::ScheduledBus } else { VehicleClass::from_code(ty.def.ai_veh_type, self.net.lanes[at.0].kind) };
-        let probe = spawn_probe(&self.net, class, (front, rear, half_width), pos, heading, at);
-        omsi_traffic::perception::people_hold_at_rest(&self.net, &self.sim, &probe)
+        let probe = spawn_probe(&self.net, class, (front, rear, half_width), pos, heading, at, lateral);
+        let cars = &self.cars;
+        let occupants = |lane: usize, f: &mut dyn FnMut(f32, &AiVehicle)| {
+            for c in cars.iter().filter(|c| c.ai.state.lane == lane) {
+                f(c.ai.state.s, &c.ai);
+            }
+        };
+        omsi_traffic::perception::people_hold_at_rest(&self.net, &self.sim, &probe, &occupants)
     }
 
     /// May a vehicle of `ty` be put on the road at `pos` facing `heading` (deg), at distance `at.1`
@@ -3604,6 +3624,14 @@ impl Traffic {
     /// people test must not hold it standing there (`people_hold_here`; counted by `who`,
     /// `spawn_refused_people`).
     pub fn spawn_clear_except(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn, except: Option<usize>) -> bool {
+        self.spawn_clear_with(ty, pos, heading, at, who, except, None)
+    }
+
+    /// `spawn_clear_except` for a vehicle made at an offset from its lane (`lateral`: the offset
+    /// and the ramp back onto the lane, a car pulling out): the people test asks it there
+    /// (`people_hold_here`); the bodies are compared at `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_clear_with(&mut self, ty: &Arc<VehicleType>, pos: DVec3, heading: f64, at: (usize, f32), who: Spawn, except: Option<usize>, lateral: Option<(f32, f32)>) -> bool {
         let bodies = self.consist_bodies(ty, pos, heading);
         let reach = bodies.iter().map(|b| (b.center - pos.truncate()).length() + b.half.length()).fold(0.0, f64::max) + 40.0;
         let touches = |o: &omsi_sim::collision::Obb| bodies.iter().any(|b| b.overlaps(o));
@@ -3620,7 +3648,7 @@ impl Traffic {
         // nor where the people test would hold it at once (put down over them it stood for them,
         // a car among Wuluju's walkers 475 s; SUMO inserts only where its `pedestrian` insertion
         // check passes)
-        if self.people_hold_here(ty, pos, heading, at, who) {
+        if self.people_hold_here(ty, pos, heading, at, who, lateral) {
             self.spawn_refused_people[Spawn::ALL.iter().position(|w| *w == who).unwrap_or(0)] += 1;
             return false;
         }
@@ -6522,12 +6550,12 @@ mod spawn_people_tests {
         let mut net = Network::default();
         net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -50.0, 0.0), DVec3::new(0.0, 50.0, 0.0)], LaneKind::Street, 3.5));
         // a car 1.8 m wide, 2.3 m front and rear of its origin at (0, 0), facing north (heading 0)
-        let probe = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0));
+        let probe = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), None);
         let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
         let mut refused = |p: DVec3| {
             sim.people = vec![Person { pos: p, vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
             sim.index_people();
-            omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe)
+            omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe, &|_, _| {})
         };
         assert!(refused(DVec3::new(0.0, 2.5, 0.0)), "0.2 m ahead of its front");
         assert!(refused(DVec3::new(0.3, 1.0, 0.0)), "in its body");
@@ -6535,5 +6563,59 @@ mod spawn_people_tests {
         assert!(!refused(DVec3::new(1.19, -1.0, 0.0)), "beside the body, outside its footprint");
         assert!(!refused(DVec3::new(0.0, 12.0, 0.0)), "ahead beyond the reach at rest: a stop it brakes for");
         assert!(!refused(DVec3::new(0.0, 2.5, 6.0)), "on a bridge above");
+    }
+
+    /// A pull-out is asked where it is made: at the parked offset (`spawn_probe`'s `lateral`), not at
+    /// the lane point - somebody just ahead of its front at the kerb refuses it.
+    #[test]
+    fn a11_1_a_pull_out_is_probed_at_its_parked_offset() {
+        let mut net = Network::default();
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -50.0, 0.0), DVec3::new(0.0, 50.0, 0.0)], LaneKind::Street, 3.5));
+        net.build_grid();
+        let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
+        // 2.6 m right of the lane (+x facing north), 0.3 m ahead of the front of a car parked there
+        sim.people = vec![Person { pos: DVec3::new(2.6, 2.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+        sim.index_people();
+        let at_lane = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), None);
+        let parked = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), Some((2.6, 30.0)));
+        assert!((parked.pos - DVec3::new(2.6, 0.0, 0.0)).length() < 1e-3, "{:?}", parked.pos);
+        assert!(!omsi_traffic::perception::people_hold_at_rest(&net, &sim, &at_lane, &|_, _| {}));
+        assert!(omsi_traffic::perception::people_hold_at_rest(&net, &sim, &parked, &|_, _| {}));
+    }
+
+    /// The shift past somebody beside the lane is taken at rest only where the live car could
+    /// take it: towards the oncoming lane only while that is clear (`people_shift_clear`).
+    #[test]
+    fn a11_1_the_shift_past_people_at_rest_gets_the_oncoming_check() {
+        let mut net = Network::default();
+        // northbound lane 0 at x 0, the southbound lane 1 beside it at x -3.5 (right-hand traffic)
+        // (lane 0 painted 2 m wide with 2.5 m drivable either side of its axis: room to shift past
+        // somebody standing just off its paint)
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -100.0, 0.0), DVec3::new(0.0, 100.0, 0.0)], LaneKind::Street, 2.0));
+        net.lanes[0].drivable = (2.5, 2.5);
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(-3.5, 100.0, 0.0), DVec3::new(-3.5, -100.0, 0.0)], LaneKind::Street, 3.5));
+        net.build_grid();
+        let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
+        assert!(net.opposite(0, 100.0).is_some_and(|o| o.0 == 1));
+        let probe = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 100.0), None);
+        // somebody just off the lane's paint on its right, outside the car's body and in its strip
+        // (1.18 m off the axis: half width 0.9 m and PERSON_RADIUS outside, within 0.9 + 0.3 m), ahead
+        // of its front: a 0.5 m shift left, towards the oncoming lane, clears them
+        let person = |x: f64| Person { pos: DVec3::new(x, 4.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None };
+        sim.people = vec![person(1.18)];
+        sim.index_people();
+        let free = omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe, &|_, _| {});
+        // an oncoming car standing in the stretch the shift uses (lane 1, level with the probe)
+        let mut st = AiState::new(1, 95.0, 0);
+        st.front = 2.3;
+        st.rear = 2.3;
+        st.length = 4.6;
+        let oncoming = AiVehicle::new(9, VehicleClass::Car, st, 0.9, 0);
+        let blocked = omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe, &|l, f| {
+            if l == 1 {
+                f(95.0, &oncoming);
+            }
+        });
+        assert!(!free && blocked, "free {free} blocked {blocked}");
     }
 }

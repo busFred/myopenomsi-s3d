@@ -1585,11 +1585,13 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
 /// step takes them, or who is in its strip (half width and 0.3 m; 1.5 m on a crossing) on its way
 /// ahead within `people_reach(0)` past its front, with the test's own exemptions (level with the
 /// body outside its footprint, a kerb waiter, somebody standing at the edge, the shift past people
-/// beside the lane). A hold farther ahead (a crossing the way reaches later) is a stop it brakes
-/// for, not a hold where it stands. The insertion check for persons: SUMO inserts a vehicle only
-/// where its `pedestrian` insertion check passes (`insertionChecks`, sumo.md 5.2). `sim`'s people
-/// must be indexed (`Simulation::index_people`).
-pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle) -> bool {
+/// beside the lane, taken only where the live car could take it: towards the middle only while
+/// the oncoming lane is clear for it, `people_shift_clear`, with the vehicles on a lane given by
+/// `occupants(lane, f)`, `f(s, vehicle)`). A hold farther ahead (a crossing the way reaches later)
+/// is a stop it brakes for, not a hold where it stands. The insertion check for persons: SUMO
+/// inserts a vehicle only where its `pedestrian` insertion check passes (`insertionChecks`,
+/// sumo.md 5.2). `sim`'s people must be indexed (`Simulation::index_people`).
+pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle, occupants: &dyn Fn(usize, &mut dyn FnMut(f32, &Vehicle))) -> bool {
     let mut me = me.clone();
     me.state.speed = 0.0;
     let st = &me.state;
@@ -1597,6 +1599,8 @@ pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle) -> boo
     let lanes = way_lanes(net, st, reach);
     let way = WayPts::sample(net, st, reach);
     let (stop, shifted) = people_ahead(net, sim, &me, &lanes, &way, None);
+    let v_want = net.lanes.get(st.lane).map_or(0.0, |l| wanted_speed(l, st));
+    let shifted = shifted.filter(|&(sw, _)| people_shift_clear(net, sim, &me, occupants, &way, v_want, sw));
     shifted.map_or(stop, |s| s.1).is_some_and(|s| s <= reach)
 }
 
@@ -2028,9 +2032,10 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
 /// The oncoming lane runs the other way: along it, travel goes from small distances to
 /// large ones, `os` is level with me, so an oncoming vehicle still to come is at a distance
 /// *below* `os` (physically ahead of me) and one past me above it. The stretch a pass uses
-/// lies ahead of me: oncoming distances `os - pass_len .. os`.
-fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pass_len: f32) -> Option<OncomingView> {
-    let me = &vehicles[i];
+/// lies ahead of me: oncoming distances `os - pass_len .. os`. The vehicles on a lane are
+/// `occupants(lane, f)`: `f(s, vehicle)` for each but me (`sim_occupants` for a vehicle of the
+/// simulation).
+fn oncoming(net: &Network, sim: &Simulation, me: &Vehicle, occupants: &dyn Fn(usize, &mut dyn FnMut(f32, &Vehicle)), pass_len: f32) -> Option<OncomingView> {
     let st = &me.state;
     let (opp, os, side) = net.opposite(st.lane, st.s)?;
     let ol = &net.lanes[opp];
@@ -2074,14 +2079,10 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
         clear_for = clear_for.min(t);
     };
     for (l, off, _) in net.upstream(opp, os, look, 48) {
-        for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
-            if occ.vehicle == i {
-                continue;
-            }
-            let o = &vehicles[occ.vehicle];
+        occupants(l, &mut |s, o| {
             let red_for = (o.last.why == crate::plan::Why::Light).then(|| signal_ahead(net, sim, &way_lanes(net, &o.state, 160.0), o.state.rear).and_then(|s| s.until_go).unwrap_or(f32::INFINITY));
-            note(occ.s + off, o.state.speed, o.state.accel, red_for);
-        }
+            note(s + off, o.state.speed, o.state.accel, red_for);
+        });
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let p = &sim.players[k];
             note(s + off, p.speed.max(0.0), sim.player_accel(p.id), None);
@@ -2092,6 +2093,44 @@ fn oncoming(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, pas
     }
     let side = side * sim.oncoming_sign();
     Some(OncomingView { lane: opp, s: os, side, clear_for, blocked })
+}
+
+/// The vehicles of the simulation on `lane` but vehicle `i` (`Simulation::occupancy`), for
+/// `oncoming`.
+fn sim_occupants<'a>(sim: &'a Simulation, vehicles: &'a [Vehicle], i: usize) -> impl Fn(usize, &mut dyn FnMut(f32, &Vehicle)) + 'a {
+    move |lane, f| {
+        for occ in sim.occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if occ.vehicle != i {
+                f(occ.s, &vehicles[occ.vehicle]);
+            }
+        }
+    }
+}
+
+/// Whether vehicle `me` may take the shift `sw` past people beside its lane
+/// (`people_ahead`'s shifted stop): away from the oncoming side always; towards the middle only
+/// while the oncoming lane is clear for the pass (`oncoming`: no vehicle standing in the stretch,
+/// none arriving before `me` covers it at `v_want`, capped 4-14 m/s, and 1.5 s), as the shifted
+/// body may touch the oncoming lane's painted edge. The vehicles on a lane are `occupants`.
+fn people_shift_clear(net: &Network, sim: &Simulation, me: &Vehicle, occupants: &dyn Fn(usize, &mut dyn FnMut(f32, &Vehicle)), way: &WayPts, v_want: f32, sw: f32) -> bool {
+    if sw.signum() != sim.oncoming_sign() {
+        return true;
+    }
+    let st = &me.state;
+    let pass_len = reach_of_people(sim, me, way) + me.length() + 6.0;
+    match oncoming(net, sim, me, occupants, pass_len) {
+        None => true,
+        Some(o) => {
+            let v_cap = v_want.clamp(4.0, 14.0);
+            !o.blocked && o.clear_for > arrival_time(pass_len, st.speed, st.accel, v_cap) + 1.5
+        }
+    }
+}
+
+/// The speed vehicle state `st` wants on `lane` (m/s): the lane's limit times its desire, its own
+/// top speed at most, 3 km/h at least (`Perception::v_want`).
+fn wanted_speed(lane: &omsi_sim::traffic::Lane, st: &AiState) -> f32 {
+    (lane.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6
 }
 
 /// A player's vehicle ahead on my side of the road, indicating to pull out.
@@ -2131,7 +2170,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     let st = &me.state;
     let mut p = Perception::default();
     let Some(lane) = net.lanes.get(st.lane) else { return p };
-    p.v_want = (lane.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6;
+    p.v_want = wanted_speed(lane, st);
     let look = look_ahead(st.speed);
     p.way = way_lanes(net, st, 220.0);
     p.road_left = net.reach.get(st.lane).copied().unwrap_or(lane.length()) - st.s;
@@ -2172,22 +2211,10 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.leader = Headway::nearer(p.leader, parked);
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
-        // the shift past people beside the lane, towards the middle only while
-        // the oncoming lane is clear for its length (the shifted body may touch the oncoming
-        // lane's painted edge)
-        let shifted = shifted.filter(|&(sw, _)| {
-            if sw.signum() != sim.oncoming_sign() {
-                return true;
-            }
-            let pass_len = reach_of_people(sim, me, &way) + me.length() + 6.0;
-            match oncoming(net, sim, vehicles, i, pass_len) {
-                None => true,
-                Some(o) => {
-                    let v_cap = p.v_want.clamp(4.0, 14.0);
-                    !o.blocked && o.clear_for > arrival_time(pass_len, st.speed, st.accel, v_cap) + 1.5
-                }
-            }
-        });
+        // the shift past people beside the lane, towards the middle only while the oncoming lane
+        // is clear for it (`people_shift_clear`)
+        let occupants = sim_occupants(sim, vehicles, i);
+        let shifted = shifted.filter(|&(sw, _)| people_shift_clear(net, sim, me, &occupants, &way, p.v_want, sw));
         p.kerb_swerve = match (swerve, shifted) {
             (Some(a), Some((b, _))) => Some(if b.abs() > a.abs() { b } else { a }),
             (a, b) => a.or(b.map(|s| s.0)),
@@ -2213,7 +2240,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             if (standing || me.passing.is_some()) && lane.left.is_none() && lane.right.is_none() {
                 let obstacle = p.leader.map(|l| l.gap + l.length).unwrap_or(10.0);
                 let pass_len = obstacle + st.front + st.rear + 6.0;
-                p.oncoming = oncoming(net, sim, vehicles, i, pass_len);
+                p.oncoming = oncoming(net, sim, me, &sim_occupants(sim, vehicles, i), pass_len);
             }
         }
     }
