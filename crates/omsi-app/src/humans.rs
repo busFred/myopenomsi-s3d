@@ -2440,8 +2440,9 @@ impl DecideCtx<'_> {
         let pos2 = p.position.truncate();
         // somebody walking on towards ground that is not loaded goes; a stroller in the player's
         // sight is never taken away there: the stroll network ends at the loaded ground's edge
-        // (`edge_turn`, `PedNet::unloaded`), so only a step past it or a crossing walked to its end
-        // brings one onto unloaded ground, and their walk goes on from there
+        // (`edge_turn`, `PedNet::unloaded`; out of sight they leave at it, below), so only a step
+        // past it or a crossing walked to its end brings one onto unloaded ground, and their walk
+        // goes on from there
         if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
             let seen_stroller = matches!(p.state, State::Strolling(_)) && figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
             if !seen_stroller {
@@ -2476,6 +2477,14 @@ impl DecideCtx<'_> {
                 }
                 d.want = self.walk_want(p, &mut d, &mut walk, net, lights, cars, dt, yields);
                 d.state = Some(State::Strolling(walk));
+                // (at the loaded ground's edge out of the player's sight they leave, as a vehicle
+                // at the loaded tiles' edge out of sight does (`removal::RemoveRule::DeadEnd`;
+                // SUMO: a person arriving at the network's fringe leaves it): turned back, the
+                // strollers of a whole edge walked back into the first junction's kerbs -
+                // Jiangzhaikou's queues of 107-139 waiters against 36-38)
+                if d.edge_turn && !figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position) {
+                    d.gone = true;
+                }
                 d
             }
             State::Standing => {
@@ -4509,7 +4518,8 @@ fn unloaded_stretches(lane: &omsi_sim::traffic::Lane, tile: f64, loaded: &dyn Fn
 /// from a closed end, `from_wall`, so the stretch they may stand in does not count), which never
 /// turns them again. Never on a crossing: somebody on one walks it to its end (the light-change
 /// rule keeps applying), and the way on from there never leads onto unloaded ground
-/// (`PedNet::next_leg`). True when they turned.
+/// (`PedNet::next_leg`). True when they turned (out of the player's sight they leave there
+/// instead, `DecideCtx::decide`).
 fn edge_turn(ped: &PedNet, net: &Network, walk: &mut PedWalk, tile: f64, loaded: &dyn Fn(f64, f64) -> bool) -> bool {
     let Some(&leg) = walk.legs.get(walk.leg) else { return false };
     if walk.pocket || !ped.unloaded.contains(&leg.lane) || walk.cross.is_some_and(|c| c.on(walk.leg)) {
@@ -5721,10 +5731,12 @@ pub struct Humans {
     /// How many strollers turned round at a map-parked car (`BoxOutcome::Wall`), by
     /// `WALL_TURN_CELL` cell of where they stood (the strollers profile line reports them).
     wall_turns: HashMap<(i64, i64), u32>,
-    /// How many times a stroller turned round at the loaded ground's edge (`edge_turn`, and a
-    /// dead end that a path onto unloaded ground makes, `plan_next_leg`); the strollers profile
-    /// line reports it.
+    /// How many times a stroller in the player's sight turned round at the loaded ground's edge
+    /// (`edge_turn`, and a dead end that a path onto unloaded ground makes, `plan_next_leg`), and
+    /// how many out of sight left there instead (`DecideCtx::decide`); the strollers profile line
+    /// reports both.
     edge_turns: u64,
+    edge_gone: u64,
     hidden: Vec<usize>,
     /// GPU side of the human types, shared by everyone of a type: textures by file and the
     /// materials of every (type, mesh) - each person used to upload its own copies - and
@@ -6089,6 +6101,7 @@ impl Humans {
             queues: Queues::default(),
             wall_turns: HashMap::new(),
             edge_turns: 0,
+            edge_gone: 0,
             hidden: Vec::new(),
             gpu_textures: HashMap::new(),
             gpu_materials: HashMap::new(),
@@ -7590,7 +7603,7 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a walled path or one onto unloaded ground {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, turned at the loaded ground's edge {} (paths onto unloaded ground {})",
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a walled path or one onto unloaded ground {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, turned at the loaded ground's edge {} in sight, left there {} (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
@@ -7601,6 +7614,7 @@ impl Humans {
                 ped.walls.len(),
                 self.people.iter().filter(|p| matches!(&p.state, State::Strolling(w) if w.pocket)).count(),
                 self.edge_turns,
+                self.edge_gone,
                 ped.unloaded.len()
             );
         }
@@ -9515,7 +9529,13 @@ impl Humans {
         p.walk_pace = d.walk_pace;
         p.walk_rng = d.walk_rng;
         p.approach = d.approach;
-        self.edge_turns += d.edge_turn as u64;
+        if d.edge_turn {
+            if d.gone {
+                self.edge_gone += 1;
+            } else {
+                self.edge_turns += 1;
+            }
+        }
         if d.gone {
             remove.push(i);
         }
