@@ -440,8 +440,9 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
 /// accepted: SUMO LC2013's motivations (the lane's end and the turn - strategic -, speed gain,
 /// keeping to the side) and an obstacle motive of ours (a standing obstacle).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
-/// and only the turn lane and a standing obstacle are reasons to move over.
-fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool) -> (f32, bool, ChangeWhy) {
+/// and only the turn lane and a standing obstacle are reasons to move over. `ant`: (mine, beside)
+/// from `anticipated_speeds`.
+fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool, ant: (f32, f32)) -> (f32, bool, ChangeWhy) {
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
@@ -486,7 +487,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // (`anticipateFollowSpeed`), as in SUMO, no bar
     // (and not into a gap behind its leader there shorter than my secure gap, SUMO's
     // `LCA_BLOCKED_BY_LEFT/RIGHT_LEADER`: standing gap, headway, the braking to its speed)
-    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
+    let (this_safe, nb_safe) = ant;
     let secure = |vl: f32| st.min_gap + st.speed.max(0.0) * dp.tau + (st.speed.max(0.0).powi(2) - vl.max(0.0).powi(2)).max(0.0) / (2.0 * dp.comfort_brake.max(0.1));
     let blocked = nb.ahead.is_some_and(|(g, vl)| g < secure(vl));
     let towards_keep = nb.dir == keep_side(sim);
@@ -628,9 +629,9 @@ pub enum SpeedGainStep {
 /// max(beside, RELGAIN_NORMALIZATION_MIN_SPEED)`. Towards the keep side (SUMO's right): faded by
 /// half a second while the own lane is faster by `KEEP_RIGHT_FASTER`, else grown by the gain;
 /// away from it (SUMO's left): faded by half while the own lane is faster, by 0.8 while equal,
-/// else grown.
-pub fn speed_gain_step(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> SpeedGainStep {
-    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
+/// else grown. `ant`: (mine, beside) from `anticipated_speeds`.
+pub fn speed_gain_step(sim: &Simulation, nb: &NeighbourView, ant: (f32, f32)) -> SpeedGainStep {
+    let (this_safe, nb_safe) = ant;
     let rel = (nb_safe - this_safe) / nb_safe.max(RELGAIN_NORMALIZATION_MIN_SPEED);
     if nb.dir == keep_side(sim) {
         if this_safe - KEEP_RIGHT_FASTER > nb_safe {
@@ -794,8 +795,8 @@ fn person_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lane: usize, s: f
 /// (`KEEP_RIGHT_ACCEPTANCE`) the driver could drive at its desired speed there - bounded by how far
 /// the lane runs on less its braking distance, by closing on a slower leader there to its secure
 /// gap, and above `CONGESTED_SPEED` by catching up with my own slower leader (no overtaking on the
-/// keep side) - over `KEEP_RIGHT_TIME`.
-pub fn keep_right_rate(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView) -> f32 {
+/// keep side) - over `KEEP_RIGHT_TIME`. `ant`: (mine, beside) from `anticipated_speeds`.
+pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, ant: (f32, f32)) -> f32 {
     let st = &me.state;
     let dp = &me.params;
     let (b, tau) = (dp.comfort_brake, dp.tau);
@@ -803,7 +804,7 @@ pub fn keep_right_rate(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me
     // (SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
     // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
     let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
-    let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);
+    let (this_safe, nb_safe) = ant;
     if this_safe - KEEP_RIGHT_FASTER > nb_safe {
         return 0.0;
     }
@@ -2247,14 +2248,28 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // SUMO LC2013's keep-right wish accumulates every step the driver is not changing
     // lanes (`wantsChange` runs each step), towards a lane beside on the keep side it may change
     // onto
+    // (the speeds anticipated on my lane and each lane beside, `anticipated_speeds`, are worked
+    // out once a frame: the keep-right rate, the speed-gain step and the desire read the same)
+    let mut ant_memo: [Option<(usize, (f32, f32))>; 2] = [None, None];
+    let mut ant = |nb: &NeighbourView| -> (f32, f32) {
+        let k = (nb.dir as usize).clamp(1, 2) - 1;
+        match ant_memo[k] {
+            Some((l, a)) if l == nb.lane => a,
+            _ => {
+                let a = anticipated_speeds(net, sim, me, p, nb);
+                ant_memo[k] = Some((nb.lane, a));
+                a
+            }
+        }
+    };
     if st.change.is_none() && me.passing.is_none() && !me.is_rail() && st.route.is_empty() {
         // (a strategic stay comes first and leaves the wish as it is)
         if let Some(nb) = [p.left, p.right].into_iter().flatten().find(|nb| nb.dir == keep_side(sim) && may_change_to(net, sim, me, nb) && !stays_on_best(net, sim, me, nb)) {
-            out.keep_right_rate = Some(keep_right_rate(net, sim, vehicles, me, p, &nb));
+            out.keep_right_rate = Some(keep_right_rate(net, vehicles, me, p, &nb, ant(&nb)));
         }
         // (and the speed-gain wishes towards each lane beside, `speed_gain_step`)
         for nb in [p.left, p.right].into_iter().flatten() {
-            out.speed_gain_step[(nb.dir as usize).clamp(1, 2) - 1] = Some(speed_gain_step(net, sim, me, p, &nb));
+            out.speed_gain_step[(nb.dir as usize).clamp(1, 2) - 1] = Some(speed_gain_step(sim, &nb, ant(&nb)));
         }
     }
 
@@ -2293,7 +2308,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // the strongest lane-end wish whose gap is not there
         let mut blocked_end: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
-            let (d, ok, why) = change_desire(net, sim, me, p, &nb, near_junction);
+            let (d, ok, why) = change_desire(net, sim, me, p, &nb, near_junction, ant(&nb));
             if ok && d > 0.0 && best.map(|b| d > b.0).unwrap_or(true) {
                 best = Some((d, nb, why));
             }
