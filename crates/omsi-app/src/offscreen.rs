@@ -1434,7 +1434,10 @@ pub(crate) fn run_offscreen(
         }
         log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h, spawn_refused_people {} ({})", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6, t.spawn_refused_people.iter().sum::<usize>(), t.spawn_refused_by());
         // the random cars' trip ends (`AiState::goal`) and the AI's lane revisits
-        // (`LaneRevisits`), the whole run
+        // (`LaneRevisits`), the whole run. A car put to sleep out of range (`Traffic::dormant`)
+        // and woken under its id keeps the lanes it entered before: driving onto them again
+        // after its round trip out of range counts as revisits too, no loop it drove (the
+        // regression review's 600 s X10 run: #631, dormant 220 s, all of that run's revisits)
         {
             use omsi_sim::traffic::{GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);

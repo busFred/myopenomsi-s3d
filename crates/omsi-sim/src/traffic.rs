@@ -5741,7 +5741,7 @@ mod tests {
     fn a_lap_of_the_ring_is_a_lane_revisit_a_short_loop_and_a_lane_change_are_not() {
         let mut m = LaneRevisits::default();
         let mut car = AiState::new(4, 0.0, 1);
-        let mut at = |m: &mut LaneRevisits, car: &mut AiState, lane: usize, odo: f32, by_link: bool| {
+        let at = |m: &mut LaneRevisits, car: &mut AiState, lane: usize, odo: f32, by_link: bool| {
             car.prev_lane = by_link.then_some(car.lane);
             car.lane = lane;
             car.odometer = odo;
