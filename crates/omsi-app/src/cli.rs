@@ -92,9 +92,13 @@ pub(crate) struct Args {
     pub(crate) drive: Option<f32>,
     /// Offscreen, with --drive: the player's bus drives its duty's trip (--line/--tour, or a
     /// situation's) as an AI timetable bus drives one, instead of the --drive test profile
-    /// (`follow_line::LineFollower`).
+    /// (`follow_line::LineFollower`); implies --watch-player.
     #[arg(long)]
     pub(crate) follow_line: bool,
+    /// Offscreen: watch what appears, vanishes and holds round the player while the run goes
+    /// on, and print it in the summary (`follow_line::PlayerWatch`).
+    #[arg(long)]
+    pub(crate) watch_player: bool,
     /// Number of AI traffic vehicles to keep around the camera (0 = none).
     #[arg(long, default_value_t = 0)]
     pub(crate) traffic: usize,

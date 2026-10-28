@@ -7,7 +7,9 @@
 //! `OMSI_AUTOPILOT`) on its own physics - a gate run holds the brake from 0 s and the bus
 //! stands where it starts; with `--follow-line` it drives its duty's trip as an AI timetable
 //! bus drives one (`follow_line::LineFollower`: an AI bus of its type on the trip, the player's
-//! vehicle put where that bus's body is every frame, its own physics not run).
+//! vehicle put where that bus's body is every frame, its own physics not run). With
+//! `--watch-player` (and `--follow-line`) the summary tells what appeared, vanished and held
+//! round the player (`follow_line::PlayerWatch`).
 
 use super::*;
 
@@ -415,11 +417,13 @@ pub(crate) fn run_offscreen(
     // (the tyres' grip takes the same water: `DriveGround::surface`)
     world.road_wetness.store(spray_wet.to_bits(), std::sync::atomic::Ordering::Relaxed);
     let spray_wind = Vec3::new(weather.wind.0.to_radians().sin(), weather.wind.0.to_radians().cos(), 0.0) * weather.wind.1 * puddles::GROUND_WIND;
-    // `--follow-line`: the player's bus driven along its trip by an AI timetable bus
+    // `--follow-line`: the player's bus driven along its trip by an AI timetable bus;
+    // `--watch-player` (and `--follow-line`): what happens round the player (`follow_line`)
     let mut follower = args.follow_line.then(crate::follow_line::LineFollower::default);
     if follower.is_some() && (duty.is_none() || drive_frames == 0 || traffic.is_none()) {
         log::warn!("--follow-line needs --drive, --schedule with traffic and a duty (--line/--tour or a situation's): the player's bus stands");
     }
+    let mut watch = (args.follow_line || args.watch_player).then(crate::follow_line::PlayerWatch::default);
     for i in 0..total_frames {
         let t_s = i as f32 * dt;
         if server {
@@ -1184,6 +1188,11 @@ pub(crate) fn run_offscreen(
                 }
             }
         }
+        // `--watch-player`: what appeared, vanished and held round the player this frame
+        if let (Some(w), Some(t), Some(p)) = (watch.as_mut(), traffic.as_ref(), player.as_ref()) {
+            let car = follower.as_ref().filter(|f| f.driving()).and_then(|f| f.car);
+            w.frame(t_s, dt, t, humans_off.as_ref(), &world, &p.vehicle, car, streamer.as_ref().map_or(0.0, |s| s.load_radius));
+        }
         if let Some(l) = lan_off.as_mut() {
             let listener = if args.cam.is_some() {
                 Some(camera.position)
@@ -1409,8 +1418,10 @@ pub(crate) fn run_offscreen(
             None => log::warn!("--follow: car {id} not found"),
         }
     }
-    if let Some(f) = follower.as_ref() {
-        log::info!("follow line: AI bus {:?}{}{}", f.car, f.lost.map(|(t, why)| format!(", lost at {t:.1} s ({why})")).unwrap_or_default(), f.refused.as_ref().filter(|_| f.car.is_none()).map(|e| format!(", never put on the trip: {e}")).unwrap_or_default());
+    if let Some(w) = watch.as_mut() {
+        for line in w.report(total_frames as f32 * dt, follower.as_ref()) {
+            log::info!("{line}");
+        }
     }
     if let Some(g) = ground_gap.take() {
         g.report();

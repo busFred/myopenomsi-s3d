@@ -476,7 +476,7 @@ const STROLL_RADIUS: f64 = 200.0;
 /// the street ahead of the bus keeps a quarter of its strollers (Jiangzhaikou 473 of 3652 wanted at
 /// 270 s, against 1444-1484). Kept at 120 m by the user's decision (P2-D1, 2026-10-28): tying it to
 /// the sight test would leave the street ahead of the bus with about a quarter of its strollers.
-const APPEAR_IN_VIEW_BEYOND: f64 = 120.0;
+pub(crate) const APPEAR_IN_VIEW_BEYOND: f64 = 120.0;
 /// How far in front of a seat's hip point somebody stands to sit down - where the feet
 /// stay while seated (m).
 const SEAT_FRONT: f32 = 0.34;
@@ -2274,7 +2274,7 @@ struct Me {
 
 /// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
 /// adult's; the eye aims at its middle.
-const FIGURE_HEIGHT: f64 = 1.8;
+pub(crate) const FIGURE_HEIGHT: f64 = 1.8;
 
 /// Whether a figure standing `dist` m from the eye is past the player's sight: beyond the
 /// vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its two-pixel
@@ -6547,6 +6547,13 @@ impl Humans {
     /// them (`retire`).
     pub fn gone(&self) -> &[(u32, bool)] {
         &self.gone
+    }
+
+    /// Everybody of this game (not a LAN player's people): id, position and whether on the
+    /// ground (else aboard a bus), for the offscreen harness's watch of who appears and
+    /// vanishes (`follow_line::PlayerWatch`).
+    pub fn everyone(&self) -> impl Iterator<Item = (u32, DVec3, bool)> + '_ {
+        self.people.iter().filter(|p| !p.remote).map(|p| (p.id, p.position, p.place == Place::Ground))
     }
 
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
