@@ -469,8 +469,6 @@ fn covers_path(b: &Block, from: DVec2, dir: DVec2, ahead: f64) -> bool {
 const STOP_RANGE: f64 = 450.0;
 /// Pedestrians stroll within this distance of the player (m).
 const STROLL_RADIUS: f64 = 200.0;
-/// Further off than this (m) somebody may be put down in plain view.
-const APPEAR_IN_VIEW_BEYOND: f64 = 120.0;
 /// How far in front of a seat's hip point somebody stands to sit down - where the feet
 /// stay while seated (m).
 const SEAT_FRONT: f32 = 0.34;
@@ -6388,22 +6386,18 @@ impl Humans {
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
-    /// May somebody be put down at `p` without the player seeing it:
-    /// out of the view (`seen`), or far enough off that a figure is a few pixels (over
-    /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (a ray from the eye to the person's
-    /// head blocked by a collision box, as the traffic asks for its cars). Until now only
-    /// the view cone counted, with no building ever hiding anybody: while the bus drove,
-    /// nobody could appear on the street ahead, and people were put down only beside and
-    /// behind it, where walkers never catch a bus up.
+    /// May somebody be put down at `p` without the player seeing it: out of the player's sight
+    /// (`seen`: the view cone and the vehicles' horizon for a figure, `figure_in_sight`, the one
+    /// measure for everything about people the player may see), or behind a building (a ray from
+    /// the eye to the person's head blocked by a collision box, as the traffic asks for its cars).
+    /// A figure in the cone short of its horizon is drawn, so nobody is put down there in plain
+    /// view; the buildings let people appear on the street ahead of a moving bus where they hide it.
     fn may_appear(&self, world: &World, p: DVec3) -> bool {
         if !self.seen(p) {
             return true;
         }
         let Some(e) = self.eye else { return false };
         let d = (p - e.pos).length();
-        if d > APPEAR_IN_VIEW_BEYOND {
-            return true;
-        }
         if d < 25.0 {
             return false;
         }
