@@ -806,6 +806,18 @@ impl FleetBounds {
     }
 }
 
+/// Where a vehicle with the way `st` stands (its lane must exist): its origin on the way, its
+/// heading that of the chord of its way `HEADING_CHORD` behind and ahead of it (the lane's
+/// where the chord has no length).
+pub fn way_pose(net: &Network, st: &AiState) -> (DVec3, f32) {
+    let p = st.way_point(net, 0.0);
+    let a = st.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
+    let b = st.way_point(net, omsi_sim::traffic::HEADING_CHORD);
+    let d = (b - a).truncate();
+    let heading = if d.length_squared() > 1e-6 { d.x.atan2(d.y).to_degrees() as f32 } else { net.lanes[st.lane].at(st.s).1 };
+    (p, heading)
+}
+
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
@@ -986,16 +998,7 @@ impl Simulation {
             if net.lanes.get(v.state.lane).is_none() {
                 continue;
             }
-            let p = v.state.way_point(net, 0.0);
-            let a = v.state.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
-            let b = v.state.way_point(net, omsi_sim::traffic::HEADING_CHORD);
-            let d = (b - a).truncate();
-            v.pos = p;
-            if d.length_squared() > 1e-6 {
-                v.heading = d.x.atan2(d.y).to_degrees() as f32;
-            } else {
-                v.heading = net.lanes[v.state.lane].at(v.state.s).1;
-            }
+            (v.pos, v.heading) = way_pose(net, &v.state);
         }
     }
 

@@ -2274,7 +2274,8 @@ fn corridor(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me:
 
 /// The thing the bypass `c` of vehicle `i` was started round (`LaneChange::round`: a vehicle
 /// or player by its id, a parked car as the nearest one blocking), where it is now along my
-/// lane's way without the change laid on it - the way the bypass was planned on
+/// lane's way without the change laid on it, from the pose the car has on that way
+/// (`sim::way_pose`) - the way and pose the bypass was planned on
 /// (`plan::bypass_start`) - by the same tests as the lead (`corridor`): `None` when it has gone
 /// from that way. With it, every body in the corridor of that way (what `Perception::ahead` was
 /// when the bypass started: what stands beyond the thing, `plan::obstacle_run`). While the bypass
@@ -2282,7 +2283,8 @@ fn corridor(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me:
 /// target lane's car.
 fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, c: &omsi_sim::traffic::LaneChange) -> Option<Bypassed> {
     let mut me = vehicles[i].clone();
-    me.state.change = None;
+    me.state.drop_change();
+    (me.pos, me.heading) = crate::sim::way_pose(net, &me.state);
     let st = &me.state;
     let look = look_ahead(st.speed);
     let lanes = way_lanes(net, st, 220.0);
