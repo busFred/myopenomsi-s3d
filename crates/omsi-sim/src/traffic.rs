@@ -588,6 +588,11 @@ pub struct Network {
     /// it from the vehicle types it loads); the yardstick of a closed run
     /// (`Network::closed_marker`). Empty (a replay): the vehicle's own length.
     pub group_body: Vec<f32>,
+    /// Per junction-object street piece (source 2): the other street pieces of its object that
+    /// can lie beside it anywhere along it (`Network::index_pieces_beside`), the only pieces
+    /// `piece_beside` measures. Static geometry, built with the grid, as SUMO fixes a lane's
+    /// neighbours when it loads the network.
+    pub beside_pieces: Vec<Vec<usize>>,
 }
 
 /// Lit stubs: an approach lane is not linked past its short lit stub into the lane after
@@ -882,45 +887,82 @@ impl Network {
     /// so a junction object's pieces have no `left`/`right` (OMSI geometry: an object's paths are
     /// separate polylines with no lane order); this finds the lane beside where the object lays
     /// its paths side by side (an object can lay a hundred metres and more of plain road as
-    /// parallel paths). It says nothing about crossings: whether a change may be made there is the caller's.
+    /// parallel paths). It measures only the pieces `beside_pieces` lists for `lane` (built with
+    /// the grid; SUMO's lane neighbours are fixed at load too) that the grid holds round the
+    /// point. It says nothing about crossings: whether a change may be made there is the caller's.
     pub fn piece_beside(&self, lane: usize, s: f32, dir: i32) -> Option<usize> {
         let l = self.lanes.get(lane)?;
-        let key = l.key.filter(|_| l.source == 2)?;
         let (p, h) = l.at(s.clamp(0.0, l.length()));
         let hr = (h as f64).to_radians();
         let right = DVec3::new(hr.cos(), -hr.sin(), 0.0);
         let want = if dir == 2 { 1.0 } else { -1.0 };
         let (cx, cy) = Self::grid_cell(p);
         let mut best: Option<(usize, f64)> = None;
-        let mut seen: Vec<usize> = Vec::new();
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for &i in self.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
-                    if i == lane || seen.contains(&i) {
-                        continue;
-                    }
-                    seen.push(i);
-                    let o = &self.lanes[i];
-                    if o.source != 2 || o.kind != LaneKind::Street || o.key.is_none_or(|k| k.tile != key.tile || k.id != key.id) {
-                        continue;
-                    }
-                    let Some((os, d)) = o.nearest_point(p) else { continue };
-                    // (beside, not before or after it: the nearest point inside the piece)
-                    if os <= 0.0 || os >= o.length() {
-                        continue;
-                    }
-                    let (q, oh) = o.at(os);
-                    let side = (q - p).dot(right) * want;
-                    if side <= 0.0 || (q.z - p.z).abs() >= 1.0 || wrap_deg(oh - h).abs() >= BESIDE_HEADING_DEG || !Lane::edges_beside(d as f32, l.width, o.width) {
-                        continue;
-                    }
-                    if best.is_none_or(|b| d < b.1) {
-                        best = Some((i, d));
-                    }
-                }
+        for &i in self.beside_pieces.get(lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let o = &self.lanes[i];
+            let Some((os, d)) = o.nearest_point(p) else { continue };
+            // (beside, not before or after it: the nearest point inside the piece)
+            if os <= 0.0 || os >= o.length() {
+                continue;
+            }
+            let (q, oh) = o.at(os);
+            let side = (q - p).dot(right) * want;
+            if side <= 0.0 || (q.z - p.z).abs() >= 1.0 || wrap_deg(oh - h).abs() >= BESIDE_HEADING_DEG || !Lane::edges_beside(d as f32, l.width, o.width) {
+                continue;
+            }
+            // (a piece the grid holds in the cells round `p`: the lanes a nearest-lane query sees)
+            let near = (-1..=1).any(|dx| (-1..=1).any(|dy| self.grid.get(&(cx + dx, cy + dy)).is_some_and(|v| v.contains(&i))));
+            if near && best.is_none_or(|b| d < b.1) {
+                best = Some((i, d));
             }
         }
         best.map(|b| b.0)
+    }
+
+    /// Fill `beside_pieces` for every junction object with a street piece from index `from` on
+    /// (all of them for 0): for each street piece of the object, the object's other street
+    /// pieces whose bounding box lies near enough that their edges can be beside it
+    /// (`Lane::edges_beside` on the gap between the two boxes, which is never more than the
+    /// distance `piece_beside` measures between the axes).
+    pub fn index_pieces_beside(&mut self, from: usize) {
+        let piece = |l: &Lane| l.source == 2 && l.kind == LaneKind::Street && l.points.len() >= 2;
+        let object = |l: &Lane| l.key.map(|k| (k.tile, k.id));
+        let objects: std::collections::HashSet<((i32, i32), i64)> = self.lanes[from.min(self.lanes.len())..].iter().filter(|l| piece(l)).filter_map(object).collect();
+        self.beside_pieces.resize(self.lanes.len(), Vec::new());
+        if objects.is_empty() {
+            return;
+        }
+        let mut members: HashMap<((i32, i32), i64), Vec<usize>> = HashMap::new();
+        for (i, l) in self.lanes.iter().enumerate() {
+            if let Some(k) = object(l).filter(|k| piece(l) && objects.contains(k)) {
+                members.entry(k).or_default().push(i);
+            }
+        }
+        let bbox = |l: &Lane| {
+            let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+            for q in &l.points {
+                lo = lo.min(q.truncate());
+                hi = hi.max(q.truncate());
+            }
+            (lo, hi)
+        };
+        for list in members.values() {
+            let boxes: Vec<(DVec2, DVec2)> = list.iter().map(|&i| bbox(&self.lanes[i])).collect();
+            for (a, &i) in list.iter().enumerate() {
+                let near: Vec<usize> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|&(b, _)| b != a)
+                    .filter(|&(b, &j)| {
+                        let gap = (boxes[b].0 - boxes[a].1).max(boxes[a].0 - boxes[b].1).max(DVec2::ZERO).length();
+                        let edge = gap as f32 - (self.lanes[i].width.max(2.0) + self.lanes[j].width.max(2.0)) * 0.5;
+                        edge <= NEIGHBOUR_EDGE_GAP
+                    })
+                    .map(|(_, &j)| j)
+                    .collect();
+                self.beside_pieces[i] = near;
+            }
+        }
     }
 
     /// Where on lane `b`, beside `a` (see `parallel`), the car at distance `s` along `a` is:
@@ -2160,6 +2202,8 @@ impl Network {
                 self.grid.entry(c).or_default().push(i);
             }
         }
+        self.beside_pieces.clear();
+        self.index_pieces_beside(0);
     }
 
     /// Lane indices whose starts lie in cells intersecting a circle around `p`.
@@ -2429,6 +2473,7 @@ impl Network {
                 self.grid.entry(c).or_default().push(i);
             }
         }
+        self.index_pieces_beside(first);
         // neighbouring lanes of the new splines
         let mut by_spline: HashMap<((i32, i32), i64, bool), Vec<usize>> = HashMap::new();
         for i in first..end {

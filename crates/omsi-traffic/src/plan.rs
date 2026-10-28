@@ -737,18 +737,22 @@ fn safe_speed(gap: f32, vl: f32, b: f32, tau: f32) -> f32 {
 /// up to `LC_STRATEGIC_LOOKAHEAD`), capped by its desired speed and on the lane beside by that
 /// lane's limit at its desire; and on each lane by the stop before the nearest person ahead in
 /// the car's width there (`person_ahead`; LC2013's `adaptSpeedToPedestrians`).
-fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> (f32, f32) {
+///
+/// `own` keeps the speed on my own lane between the calls for the two lanes beside (it does not
+/// depend on the lane beside).
+fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, own: &mut Option<f32>) -> (f32, f32) {
     let st = &me.state;
     let (b, tau) = (me.params.comfort_brake, me.params.tau);
     let v_max = p.v_want.max(0.1);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
-    let mine = open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD);
     let runs = open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD);
     // (SUMO's `stopSpeed` before the person less the driver's standing gap)
     let person_cap = |lane: usize, s: f32| person_ahead(net, sim, me, lane, s).map_or(f32::INFINITY, |d| safe_speed(d - st.min_gap, 0.0, b, tau));
-    let this_safe = v_max.min(person_cap(st.lane, st.s)).min(match p.leader {
-        Some(l) => safe_speed(l.gap, l.speed, b, tau),
-        None => safe_speed(mine, 0.0, b, tau),
+    let this_safe = *own.get_or_insert_with(|| {
+        v_max.min(person_cap(st.lane, st.s)).min(match p.leader {
+            Some(l) => safe_speed(l.gap, l.speed, b, tau),
+            None => safe_speed(open_run(net, me, st.lane, st.s, LC_STRATEGIC_LOOKAHEAD), 0.0, b, tau),
+        })
     });
     let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
     let nb_safe = nb_max.min(person_cap(nb.lane, s_b)).min(match nb.ahead {
@@ -762,22 +766,40 @@ fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Percept
 /// to `REACT_TO_STOPPED_DISTANCE` ahead (its own stretch) whose body reaches into the width I
 /// would have there (my half width and `PERSON_RADIUS` round the lane's axis; one beside my body:
 /// 0): SUMO's `MSLane::nextBlocking` over the vehicle's width, which LC2013's
-/// `adaptSpeedToPedestrians` reads for the speed it anticipates on each lane.
+/// `adaptSpeedToPedestrians` reads for the speed it anticipates on each lane. It looks only at
+/// the people in a box round that stretch of the lane, as `nextBlocking` loops only over the
+/// pedestrians of its lane.
 fn person_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lane: usize, s: f32) -> Option<f32> {
     let l = net.lanes.get(lane)?;
     let reach = (l.length() - s).min(crate::perception::REACT_TO_STOPPED_DISTANCE);
     if reach <= 0.0 {
         return None;
     }
+    let band = me.half_width + PERSON_RADIUS;
+    // (only somebody within the band of the lane's stretch from my rear to the reach can count:
+    // the box round that stretch's points, widened by the band and `BOX_ROUNDING`, holds them all)
+    let (from, to) = (s - me.state.rear - BOX_ROUNDING, s + reach + BOX_ROUNDING);
+    let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+    for k in 0..l.points.len().saturating_sub(1) {
+        if l.dist[k + 1] < from || l.dist[k] > to {
+            continue;
+        }
+        for q in [l.points[k], l.points[k + 1]] {
+            lo = lo.min(q.truncate());
+            hi = hi.max(q.truncate());
+        }
+    }
+    let widen = DVec2::splat((band + BOX_ROUNDING) as f64);
+    let (lo, hi) = (lo - widen, hi + widen);
     let mut best: Option<f32> = None;
-    for k in sim.people_near(me.pos, (reach + me.state.front) as f64) {
+    for k in sim.people_near_in_box(me.pos, (reach + me.state.front) as f64, lo, hi) {
         let q = &sim.people[k];
-        if (q.pos.z - me.pos.z).abs() > 2.5 {
+        if (q.pos.z - me.pos.z).abs() > 2.5 || q.pos.x < lo.x || q.pos.x > hi.x || q.pos.y < lo.y || q.pos.y > hi.y {
             continue;
         }
         let Some((qs, d)) = l.nearest_point(q.pos) else { continue };
         // (one beside my body counts as at my front: a change sweeps the body over it)
-        if qs - s < -me.state.rear || qs - s > reach || d as f32 > me.half_width + PERSON_RADIUS {
+        if qs - s < -me.state.rear || qs - s > reach || d as f32 > band {
             continue;
         }
         let ahead = (qs - s - me.state.front).max(0.0);
@@ -787,6 +809,11 @@ fn person_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lane: usize, s: f
     }
     best
 }
+
+/// `person_ahead`'s box round a stretch of lane is this much larger on every side (m) than the
+/// stretch and the band need, so that the f32 rounding of distances along the lane and across it
+/// never leaves out somebody the exact test keeps (the box only spares the exact test).
+const BOX_ROUNDING: f32 = 0.01;
 
 /// SUMO LC2013's keep-right accumulation per second towards the lane beside on the keep
 /// side, `nb` (`MSLCM_LC2013::_wantsChange`, "honor the obligation to keep right"): 0 while my
@@ -2251,12 +2278,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // (the speeds anticipated on my lane and each lane beside, `anticipated_speeds`, are worked
     // out once a frame: the keep-right rate, the speed-gain step and the desire read the same)
     let mut ant_memo: [Option<(usize, (f32, f32))>; 2] = [None, None];
+    let mut ant_own: Option<f32> = None;
     let mut ant = |nb: &NeighbourView| -> (f32, f32) {
         let k = (nb.dir as usize).clamp(1, 2) - 1;
         match ant_memo[k] {
             Some((l, a)) if l == nb.lane => a,
             _ => {
-                let a = anticipated_speeds(net, sim, me, p, nb);
+                let a = anticipated_speeds(net, sim, me, p, nb, &mut ant_own);
                 ant_memo[k] = Some((nb.lane, a));
                 a
             }

@@ -917,6 +917,18 @@ impl Simulation {
         out
     }
 
+    /// The people of `people_near(p, r)` in the cells that also meet the box `lo`..`hi` (x, y),
+    /// for a caller that wants only somebody inside that box: the same people a filter by the
+    /// box would keep from `people_near`, without walking the cells beside it.
+    pub fn people_near_in_box(&self, p: DVec3, r: f64, lo: DVec2, hi: DVec2) -> impl Iterator<Item = usize> + '_ {
+        let (cx, cy) = cell(p);
+        let n = (r / GRID).ceil() as i32;
+        let (bx0, by0) = cell(lo.extend(0.0));
+        let (bx1, by1) = cell(hi.extend(0.0));
+        let (x0, x1, y0, y1) = ((cx - n).max(bx0), (cx + n).min(bx1), (cy - n).max(by0), (cy + n).min(by1));
+        (x0..=x1).flat_map(move |x| (y0..=y1).map(move |y| (x, y))).flat_map(|c| self.people_grid.get(&c).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied())
+    }
+
     /// Place every vehicle on the ground from its way.
     pub fn update_positions(&self, net: &Network, vehicles: &mut [Vehicle]) {
         for v in vehicles.iter_mut() {
