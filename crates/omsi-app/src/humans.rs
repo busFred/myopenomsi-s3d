@@ -2450,17 +2450,15 @@ impl DecideCtx<'_> {
     fn decide(&self, p: &Person, dt: f32, world: &World, net: Option<&Network>, lights: Option<&LightsOf>, cars: &[SeenCar], yields: &mut YieldBook) -> Decision {
         let mut d = Decision::of(p);
         let pos2 = p.position.truncate();
-        // somebody walking on towards ground that is not loaded goes; a stroller in the player's
-        // sight is never taken away there: the stroll network ends at the loaded ground's edge
-        // itself (`edge_turn`, `PedNet::unloaded`; out of sight and reach they leave at it,
-        // `leaves_at_edge`, below), so only a step past it, or a crossing begun before the tile
-        // beyond it went, brings one onto unloaded ground, and their walk goes on from there
-        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
-            let seen_stroller = matches!(p.state, State::Strolling(_)) && figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
-            if !seen_stroller {
-                d.gone = true;
-                return d;
-            }
+        // somebody walking on onto ground that is not loaded goes only as a vehicle at the loaded
+        // tiles' edge does: out of the player's sight and beyond the distance within which no car
+        // vanishes seen or not (`leaves_at_edge`). The stroll network ends at the edge itself
+        // (`edge_turn`, `PedNet::unloaded`), so only a step past it, or a crossing begun before
+        // the tile beyond it went, brings one onto unloaded ground; within that distance, or in
+        // sight, their walk goes on from there
+        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) && leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
+            d.gone = true;
+            return d;
         }
         match &p.state {
             State::Strolling(walk) => {
