@@ -9,7 +9,9 @@
 //! So the player's bus stops at its stops for a dwell with the doors open, obeys the lights
 //! and gives way as an AI timetable bus does (`bus_service`, `omsi_traffic`), and moves as
 //! the AI's bodies move (`ai_motion`). The physics and scripts of the player's vehicle do not
-//! run meanwhile; its doors stay shut (the people board the AI bus in its place). The other
+//! run meanwhile; its doors stay shut, and the people see the AI bus in its place, not the
+//! player's bus nor the duty (`Humans::tick` gets no player's bus while it drives): they
+//! board it and wait for it at its stops as for any timetable bus. The other
 //! drivers see the AI bus, not a player's outline (`Traffic::tick` gets no player box while
 //! it drives): what they do round the player's bus is what they do round a timetable bus.
 //! When the bus is lost (taken off the road, its trip over and let go) the player's bus

@@ -1112,12 +1112,18 @@ pub(crate) fn run_offscreen(
             };
             h.eye = Some(humans::Eye::of(&eye_cam, view_aspect).widened(triple_extent(&settings, &eye_cam, size.0, size.1)));
             h.set_remote_buses(remotes_off.remotes.iter().map(|(id, r)| (*id, r.vehicle())));
-            h.set_duty(duty.as_ref());
-            h.set_player_next_stop(duty.as_ref().and_then(|d| d.trip().stops.get(d.next_stop)));
+            // (`--follow-line`: while the AI bus drives the player's trip it is the bus the people
+            // see and board there; the player's bus, its doors shut in the same place, is none
+            // of theirs, nor is the duty - else its waiters held the AI bus at its doors to the
+            // boarding cap, waiting to board the player's)
+            let driven = follower.as_ref().is_some_and(|f| f.driving());
+            let duty_seen = duty.as_ref().filter(|_| !driven);
+            h.set_duty(duty_seen);
+            h.set_player_next_stop(duty_seen.and_then(|d| d.trip().stops.get(d.next_stop)));
             let took = h.tick(
                 dt,
                 &world,
-                player.as_ref().map(|p| &p.vehicle),
+                player.as_ref().filter(|_| !driven).map(|p| &p.vehicle),
                 traffic.as_ref(),
                 &renderer,
                 &mut scene,
