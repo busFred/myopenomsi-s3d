@@ -468,6 +468,46 @@ pub fn mutual_jitter(id: u64) -> f32 {
 /// An eased-off car takes part again after this long (s) whatever the other does.
 pub const EASE_MAX: f32 = 30.0;
 
+/// The claim `k` cannot move off before the vehicle with index `to` has: it stands held by
+/// something physical - its standing lead (`Claim::stuck` with a `Claim::lead`) or a body across
+/// its way (`Claim::body_block`) - and that one is `to`, or stands held so itself, or stands
+/// eased off (`ease`: the index of the vehicle it is eased off for) for one that is, within
+/// `reservation::LEAD_CHAIN` links. The first link is a physical one: an ease or a refusal of
+/// `k` itself is a decision, not a hold. A plain refusal further on is not followed: the
+/// resolver re-decides it every frame through the same chain (`reservation::will_pass`'s
+/// `held_by`); an ease it does not. SUMO's `willPass`: a vehicle that cannot pass before me
+/// registers no competing request, so I do not wait for it.
+pub fn held_back<'a>(claim: &dyn Fn(usize) -> &'a Claim, claim_of: &[Option<usize>], index_of: &dyn Fn(u64) -> Option<usize>, ease: &dyn Fn(usize) -> Option<usize>, k: usize, to: usize) -> bool {
+    let mut at = vec![k];
+    let mut seen = vec![k];
+    for depth in 0..reservation::LEAD_CHAIN {
+        let mut next: Vec<usize> = Vec::new();
+        for &c in &at {
+            let cl = claim(c);
+            if !cl.standing() {
+                continue;
+            }
+            let lead = cl.lead.filter(|_| cl.stuck);
+            let body = cl.body_block.and_then(index_of);
+            let eased = if depth == 0 { None } else { ease(cl.vehicle) };
+            for v in [lead, body, eased].into_iter().flatten() {
+                if v == to {
+                    return true;
+                }
+                if let Some(n) = claim_of.get(v).copied().flatten().filter(|n| !seen.contains(n)) {
+                    seen.push(n);
+                    next.push(n);
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        at = next;
+    }
+    false
+}
+
 /// Which of two vehicles (ids `a`, `b`) in a mutual hold at junction `j` eases off: a hash of
 /// the lower id, the higher and the junction, the same in every run.
 pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
@@ -1771,16 +1811,28 @@ impl Simulation {
     /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
     /// `yields_now` for the other while it has not left the meeting places of the two; the
     /// ease ends when it has, when either is gone or no longer claims the junction, when either
-    /// is held by a red light, or after `EASE_MAX`.
+    /// is held by a red light, after `EASE_MAX`, or when the other cannot move off before this
+    /// one (`held_back`: its standing lead or a body holds it, and that chain comes back to this
+    /// one, through a third car eased off for this one, say) while nothing physical holds this
+    /// one back for the other: such an ease closes a ring and lets nobody go, and without it the
+    /// resolver drops the other as a foe that waits for this one (`reservation::will_pass`).
     fn eased_claims(&self, vehicles: &mut [Vehicle], claims: &mut [Claim], claim_of: &[Option<usize>], dt: f32) {
+        let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         for i in 0..vehicles.len() {
             let Some((oid, j, since)) = vehicles[i].ease_for else { continue };
             let keep = (|| {
                 let k = claim_of[i]?;
-                let o = vehicles.iter().position(|v| v.id == oid)?;
+                let o = *by_id.get(&oid)?;
                 let ko = claim_of[o]?;
                 let (mine, theirs) = (&claims[k], &claims[ko]);
                 if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
+                    return None;
+                }
+                // (the eases as they stand: one ended earlier in this loop is no link)
+                let index_of = |id: u64| by_id.get(&id).copied();
+                let ease = |v: usize| vehicles[v].ease_for.and_then(|(p, _, _)| by_id.get(&p).copied());
+                let claim = |c: usize| &claims[c];
+                if held_back(&claim, claim_of, &index_of, &ease, ko, i) && !held_back(&claim, claim_of, &index_of, &ease, k, o) {
                     return None;
                 }
                 // (the other still short of, or in, the first meeting place of the two beyond
@@ -1814,8 +1866,10 @@ impl Simulation {
     /// itself), else, one of them held by the other's
     /// body only, after `MUTUAL_HOLD` times the lower id's `mutual_jitter`; a hold not seen
     /// for less than `MUTUAL_GAP` keeps its clock. The one that eases off: of two where only
-    /// one is body-blocked by the other, that one (it cannot go anyway; the other waits for it
-    /// at the junction); else by `eases_off`, the same in every run.
+    /// one is held back for the other - the other's body or the other as its lead, or a chain
+    /// of standing leads, bodies and eases that comes back to the other (`held_back`) - that one
+    /// (it cannot go anyway; the other waits for it at the junction); else by `eases_off`, the
+    /// same in every run.
     pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
         let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
@@ -1869,12 +1923,17 @@ impl Simulation {
             if !meet {
                 continue;
             }
-            // (behind the other: held by its body, or following it as its lead - that one
+            // (behind the other: held by its body, or following it as its lead, or held back for
+            // it through a chain of standing leads, bodies and eases (`held_back`) - that one
             // cannot go anyway; easing the one in front of a nose-to-tail pair would leave it
-            // standing `EASE_MAX` for the one behind it)
+            // standing `EASE_MAX` for the one behind it, and easing the one a chain comes back
+            // to closes a ring)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].last.lead_id == Some(idb);
-            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].last.lead_id == Some(ida);
+            let index_of = |id: u64| by_id.get(&id).copied();
+            let eased = |v: usize| vehicles[v].ease_for.and_then(|(p, _, _)| by_id.get(&p).copied());
+            let claim = |c: usize| &self.claims[c].0;
+            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].last.lead_id == Some(idb) || held_back(&claim, claim_of, &index_of, &eased, ka, b);
+            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].last.lead_id == Some(ida) || held_back(&claim, claim_of, &index_of, &eased, kb, a);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a
@@ -2365,5 +2424,68 @@ impl Simulation {
 
     pub fn light_until_go(&self, ctl: usize, li: usize) -> Option<f32> {
         self.lights.get(ctl)?.time_until_go(li)
+    }
+}
+
+#[cfg(test)]
+mod ease_ring_tests {
+    use super::*;
+
+    fn claim(vehicle: usize) -> Claim {
+        Claim { yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+    }
+
+    /// The ring of viz5 case02 j0: A (0) eased off for B (1), B standing 2 m behind its lead C (2),
+    /// C eased off for A. B cannot move off before A (lead C, C's ease to A); A is held back for B
+    /// by nothing physical, so A's ease is the one that closes the ring; C's stays (A's own first
+    /// link is an ease, a decision, not a hold).
+    #[test]
+    fn j11_1_an_ease_whose_partner_waits_for_me_through_a_lead_and_a_second_ease_closes_a_ring() {
+        let mut claims = vec![claim(0), claim(1), claim(2)];
+        claims[1].lead = Some(2);
+        claims[1].stuck = true;
+        let claim_of = vec![Some(0), Some(1), Some(2)];
+        let index_of = |id: u64| (id >= 100 && id < 103).then(|| (id - 100) as usize);
+        let eases = [Some(1usize), None, Some(0)];
+        let ease = |v: usize| eases[v];
+        let get = |c: usize| &claims[c];
+        assert!(held_back(&get, &claim_of, &index_of, &ease, 1, 0), "B is held back for A through its lead C and C's ease");
+        assert!(!held_back(&get, &claim_of, &index_of, &ease, 0, 1), "A's only link is its own ease");
+        assert!(!held_back(&get, &claim_of, &index_of, &ease, 0, 2), "A is not held back for C either");
+        // (B's lead rolling: no hold - one that moves is no link)
+        let mut rolling = claims.clone();
+        rolling[1].speed = 2.0;
+        let get = |c: usize| &rolling[c];
+        assert!(!held_back(&get, &claim_of, &index_of, &ease, 1, 0));
+        // (a lead that is not stuck - standing further off than the claim's stuck reach - is no hold)
+        let mut far = claims.clone();
+        far[1].stuck = false;
+        let get = |c: usize| &far[c];
+        assert!(!held_back(&get, &claim_of, &index_of, &ease, 1, 0));
+        // (a body across the way is a hold whatever the lead)
+        let mut body = far.clone();
+        body[1].body_block = Some(102);
+        let get = |c: usize| &body[c];
+        assert!(held_back(&get, &claim_of, &index_of, &ease, 1, 0));
+        // (a plain refusal of C for A is not followed: the resolver re-decides it)
+        let no_ease = |_: usize| None;
+        let get = |c: usize| &claims[c];
+        assert!(!held_back(&get, &claim_of, &index_of, &no_ease, 1, 0));
+    }
+
+    /// Two bodies each across the other's way (each the other's body block): each is held back
+    /// for the other, so neither ease is ended for a ring (the ease of a body interlock is the
+    /// counted last resort, `negotiate`).
+    #[test]
+    fn j11_1_a_body_interlock_holds_both_ways() {
+        let mut claims = vec![claim(0), claim(1)];
+        claims[0].body_block = Some(101);
+        claims[1].body_block = Some(100);
+        let claim_of = vec![Some(0), Some(1)];
+        let index_of = |id: u64| (id >= 100 && id < 102).then(|| (id - 100) as usize);
+        let ease = |v: usize| (v == 0).then_some(1);
+        let get = |c: usize| &claims[c];
+        assert!(held_back(&get, &claim_of, &index_of, &ease, 1, 0));
+        assert!(held_back(&get, &claim_of, &index_of, &ease, 0, 1));
     }
 }

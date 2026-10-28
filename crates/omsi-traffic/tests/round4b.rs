@@ -916,11 +916,15 @@ fn x7_the_one_eased_off_waits_and_the_other_goes_keeping_off_its_body() {
     assert!(min_gap > 0.3, "bodies {min_gap:.2} m apart");
     assert!(ease.is_none(), "still eased off once the other has left: {ease:?}");
     // with its nose in the side road car's corridor (its front 0.7 m short of the side road's
-    // middle line, 0.2 m inside the corridor): the side road car is let go by the junction
-    // but not by the body, and stops short of it
-    let (min_gap, a_front, _, _) = eased_main(0.7, 12.0, true);
+    // middle line, 0.2 m inside the corridor): the side road car cannot move off before the main
+    // road car's body has (`sim::held_back`) while nothing holds the main road car back, so the
+    // ease ends (it would let nobody go), the main road car goes first and the side road car
+    // follows it across, never into its body
+    let (min_gap, a_front, ease, moved) = eased_main(0.7, 12.0, true);
     assert!(min_gap > 0.2, "it drove into the body: {min_gap:.2} m");
-    assert!(a_front < -0.9, "front at y = {a_front:.1}, past the body's edge");
+    assert!(ease.is_none(), "the ease of the car in the other's way stayed: {ease:?}");
+    assert!(moved > 3.0, "the main road car did not go first: it moved {moved:.1} m before the side road car was across");
+    assert!(a_front > 10.0, "the side road car did not follow across: front at y = {a_front:.1}");
 }
 
 #[test]
