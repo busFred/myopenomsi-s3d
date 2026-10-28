@@ -2513,6 +2513,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             Seen::Parked => None,
         };
         let bus_out = obstacle_id.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, _)| bus && signals);
+        // and no AI vehicle whose indicator shows the side the pass would take (`side` m, + right):
+        // it has announced a move into that way - a step-out, a change or a turn - and is not
+        // overtaken there (SUMO: a vehicle does not overtake within the lane one that has
+        // announced a change into its path, the sublane model's blinker; as the bus and the
+        // player above)
+        let vehicle_out = |side: f32| match l.what {
+            Seen::Vehicle(j) | Seen::Body(j) => side != 0.0 && vehicles.get(j).is_some_and(|o| o.blinker_shown.0 == if side < 0.0 { 1 } else { 2 }),
+            Seen::Player(_) | Seen::Parked => false,
+        };
         // a bus does not pass what stands at its own next stop
         let own_stop = me.external.stop_at.map(|s| s < l.gap + l.length + st.front + 15.0).unwrap_or(false);
         let real = l.gap + if player { 0.5 } else { 0.0 };
@@ -2576,6 +2585,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let squeeze_end = real + squeeze_obstacle_len + st.front + st.rear + 2.0;
         let squeeze = (reach <= extent || over_line.is_some())
             && !player_out
+            && !vehicle_out(squeeze_side)
             && lateral_settled(vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
             && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
@@ -2618,7 +2628,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let v_cap = (p.v_want).clamp(4.0, 14.0);
             o.clear_for > arrival_time(pass_len + Passing::back_len_for(side), v, st.accel, v_cap) + 1.5
         });
-        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
+        let pass_possible = !queue_only && can_pass && !own_stop && !player_out && !bus_out && !vehicle_out(side) && room_beyond && real >= 0.3 && !light_near && !junction_near && road_ok && (squeeze || (two_lane && standing && oncoming_free));
         // (or round it into the lane beside, `Start::Bypass`)
         let bypass_nb = [p.left, p.right].into_iter().flatten().find(|nb| could_bypass(net, sim, me, nb, &l));
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();

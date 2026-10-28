@@ -170,3 +170,85 @@ fn no_step_out_from_rest_into_a_car_standing_in_the_target_lane() {
         assert!(least > 0.3, "car beside at s {s}: least {least:.2}");
     }
 }
+
+/// Two eastbound lanes 4 m wide, 6 m apart (0 the left at y 0, 1 the right at y -6): the right
+/// lane's drawn road reaches 3.7 m to its left (to the left lane's traffic, 6 - 2 - 0.3), so a car
+/// squeezes past a car standing in its middle inside the lane (it needs 0.9 + 0.6 + 0.9 + 0.9 =
+/// 3.3 m).
+fn wide_lanes() -> Network {
+    let mut net = Network::default();
+    let mut l0 = road(&[(0.0, 0.0), (600.0, 0.0)], 1, 0, 0.0);
+    l0.width = 4.0;
+    net.lanes.push(l0);
+    let mut l1 = road(&[(0.0, -6.0), (600.0, -6.0)], 1, 1, 6.0);
+    l1.width = 4.0;
+    l1.drivable = (3.7, 2.0);
+    net.lanes.push(l1);
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net
+}
+
+/// Car 1 (no lane changes of its own) rolls up at 8 m/s from x 120 on the right lane behind car 3,
+/// standing for good at x 193.5, 2.5 m behind car 2 standing for good: car 3 is a standing
+/// obstacle, and car 1 squeezes past it on the left inside the lane. Car 3's own changes start
+/// once `step_out_after` s have passed (its change cooldown); with `indicator` it shows its left
+/// indicator throughout. Runs 40 s: (when car 1 started its squeeze, when car 3 started a change
+/// and whether at full lock, the least gap between the two bodies).
+fn squeezer_and_step_out(step_out_after: f32, indicator: bool) -> (Option<f32>, Option<(f32, bool)>, f32) {
+    let net = wide_lanes();
+    assert_eq!(net.lanes[1].left, Some(0), "lane 0 lies left of lane 1");
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut o = standing(2, 1, 200.0);
+    o.stopped = 30.0;
+    let mut a = standing(3, 1, 193.5);
+    a.stopped = 30.0;
+    a.state.change_cooldown = step_out_after;
+    let mut b = car(1, 1, 120.0, 8.0);
+    b.params.lc_speed_gain = 0.0;
+    b.state.change_cooldown = 1000.0;
+    let mut cars = vec![b, a, o];
+    let (mut squeezed, mut stepped, mut least) = (None, None, f32::INFINITY);
+    let mut t = 0.0f32;
+    while t < 40.0 {
+        if indicator {
+            let a = cars.iter_mut().find(|c| c.id == 3).unwrap();
+            a.state.signal = 1;
+            a.state.signal_time = 0.25;
+        }
+        sim.tick(&net, DT, &mut cars);
+        let b = cars.iter().find(|c| c.id == 1).unwrap();
+        let a = cars.iter().find(|c| c.id == 3).unwrap();
+        least = least.min(b.obb().separation(&a.obb()) as f32);
+        if squeezed.is_none() && b.passing.is_some() {
+            squeezed = Some(t);
+        }
+        if stepped.is_none() {
+            stepped = a.state.change.map(|c| (t, c.full_lock));
+        }
+        t += DT;
+    }
+    (squeezed, stepped, least)
+}
+
+/// A car does not squeeze past an AI car whose indicator shows the side it would pass on (SUMO: no
+/// overtaking within the lane of one that has announced a move into that path), as it does not
+/// past a bus or the player signalling out; with no indicator shown it squeezes past. And a
+/// squeezer and a full-lock step-out from rest of the car it squeezes past never touch, whichever
+/// starts first.
+#[test]
+fn no_squeeze_past_a_car_indicating_to_that_side_and_a_squeezer_never_touches_a_step_out() {
+    let (squeezed, _, least) = squeezer_and_step_out(1000.0, false);
+    assert!(squeezed.is_some() && least > 0.55, "no indicator: squeezed {squeezed:?}, least {least:.2}");
+    let (squeezed, _, least) = squeezer_and_step_out(1000.0, true);
+    assert!(squeezed.is_none() && least > 0.3, "left indicator: squeezed {squeezed:?}, least {least:.2}");
+    let mut full_lock = 0;
+    for k in 0..=12 {
+        let after = 11.0 + 0.5 * k as f32;
+        let (squeezed, stepped, least) = squeezer_and_step_out(after, false);
+        full_lock += stepped.is_some_and(|s| s.1) as usize;
+        assert!(least > 0.0, "step-out after {after} s: squeezed {squeezed:?}, stepped {stepped:?}, least {least:.2}");
+    }
+    assert!(full_lock > 0, "no full-lock step-out among the runs");
+}
