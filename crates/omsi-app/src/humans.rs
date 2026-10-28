@@ -2808,11 +2808,15 @@ fn stroll_candidate(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>,
         && !core_piece(ped, net, lights, l)
 }
 
+/// The longest piece (m) that lies between two pieces proper of one crossing without ending it: a
+/// median (`crossing_span`, `PedNet::crossing_chain`).
+const CROSSING_MEDIAN_MAX: f32 = 6.0;
+
 /// The crossing starting with `walk.legs[start]`: the pieces on from it that
 /// cut a carriageway or carry a light, with short pieces between them (a median); a stroll
 /// is planned on straight across where its legs run out. None when no such piece follows.
 fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &mut PedWalk, start: usize) -> Option<Cross> {
-    const SHORT: f32 = 6.0;
+    const SHORT: f32 = CROSSING_MEDIAN_MAX;
     if start >= walk.legs.len() {
         return None;
     }
@@ -2942,7 +2946,8 @@ struct PedNet {
     /// and a stroller on it turns or leaves at the edge itself (`edge_turn`). Marked again when
     /// the tiles or the network change (`mark_unloaded`, `unloaded_at`).
     unloaded: HashMap<usize, Vec<(f32, f32)>>,
-    /// The crossing pieces among `unloaded` (`core_piece`): closed ends of the stroll network as
+    /// The crossing pieces among `unloaded` (`core_piece`) and the pieces of their crossings
+    /// (`crossing_chain`): closed ends of the stroll network as
     /// `walls` are, at their kerb, because somebody on a crossing walks it to its end and is never
     /// turned on it (`edge_turn`), so a crossing onto unloaded ground is never begun.
     unloaded_crossings: HashSet<usize>,
@@ -3159,8 +3164,46 @@ impl PedNet {
         let mut keys: Vec<usize> = self.ends.keys().copied().filter(|&l| l < net.lanes.len()).collect();
         keys.sort_unstable();
         self.unloaded = keys.into_iter().filter_map(|l| Some((l, unloaded_stretches(&net.lanes[l], tile, loaded))).filter(|(_, v)| !v.is_empty())).collect();
-        let crossings: HashSet<usize> = self.unloaded.keys().copied().filter(|&l| core_piece(self, net, lights, l)).collect();
+        // a crossing is begun at its kerb and walked as one chain (`crossing_span`): when any piece
+        // of the chain runs onto unloaded ground the whole chain is closed at its kerb, so nobody
+        // is left standing mid-road on a loaded first piece
+        let mut crossings: HashSet<usize> = HashSet::new();
+        for l in self.unloaded.keys().copied().filter(|&l| core_piece(self, net, lights, l)).collect::<Vec<_>>() {
+            if crossings.insert(l) {
+                crossings.extend(self.crossing_chain(net, lights, l));
+            }
+        }
         self.unloaded_crossings = crossings;
+    }
+
+    /// The pieces proper of the crossing that `lane` belongs to, either way along it: those that
+    /// `crossing_span` strings together, a piece that goes on straight (`PED_STRAIGHT_ON_TURN`) from
+    /// the end of another, with pieces of at most `CROSSING_MEDIAN_MAX` m (a median) between.
+    fn crossing_chain(&self, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> HashSet<usize> {
+        let mut seen: HashSet<usize> = HashSet::from([lane]);
+        let mut chain: HashSet<usize> = HashSet::new();
+        let mut todo: Vec<(usize, f32)> = vec![(lane, 0.0)];
+        while let Some((l, pending)) = todo.pop() {
+            let Some(&(a, b)) = self.ends.get(&l) else { continue };
+            for (node, h_in) in [(b, net.lanes[l].end_heading() as f64), (a, wrap_heading(net.lanes[l].start_heading() as f64 + 180.0))] {
+                let leaving = self.out.get(node).into_iter().flatten().copied().chain(self.against.get(node).into_iter().flatten().map(|&c| (c, false)));
+                for (c, fwd) in leaving {
+                    let cl = &net.lanes[c];
+                    let h = if fwd { cl.start_heading() as f64 } else { wrap_heading(cl.end_heading() as f64 + 180.0) };
+                    if !seen.contains(&c) && angle_between(h_in, h) <= PED_STRAIGHT_ON_TURN {
+                        if core_piece(self, net, lights, c) {
+                            seen.insert(c);
+                            chain.insert(c);
+                            todo.push((c, 0.0));
+                        } else if pending + cl.length() <= CROSSING_MEDIAN_MAX {
+                            seen.insert(c);
+                            todo.push((c, pending + cl.length()));
+                        }
+                    }
+                }
+            }
+        }
+        chain
     }
 
     /// Whether `lane` ends at junction `node` in a closed end: a closed path leaves the node
@@ -14848,8 +14891,9 @@ mod ped_tests {
     #[test]
     fn p11_4_a_crossing_onto_unloaded_ground_is_never_begun() {
         // lit crossing pieces: path 1 (0..5 m, loaded) and path 3 straight on (5..20 m, onto the
-        // unloaded tile at x 10); path 2 a pavement. Path 3 is a closed end at its kerb, and a
-        // crossing span over path 1 is never planned on over it
+        // unloaded tile at x 10); path 2 a pavement turning off at their joint. The chain is closed
+        // at its kerb, path 1 as well as path 3: nobody steps onto path 1 to be left on it, and a
+        // crossing span over path 1 is never planned on over path 3
         let mut net = Network::default();
         net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
         net.lanes.push(lane(vec![p(0.0, 0.0), p(5.0, 0.0)], LaneKind::Sidewalk, 2.0));
@@ -14861,11 +14905,13 @@ mod ped_tests {
         let loaded = |x: f64, _y: f64| x < 10.0;
         let mut ped = PedNet::build(&net);
         ped.mark_unloaded(&net, 1, 10.0, &loaded, None);
-        assert_eq!(ped.unloaded_crossings, HashSet::from([3]));
-        assert!(ped.closed(3) && !ped.closed(1) && !ped.closed(2));
-        let node = ped.ends[&1].1;
-        let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, node, 1, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
-        assert!(!on.is_empty() && on.iter().all(|&l| l == 2), "{on:?}");
+        assert_eq!(ped.unloaded_crossings, HashSet::from([1, 3]));
+        assert!(ped.closed(3) && ped.closed(1) && !ped.closed(2) && !ped.closed(0));
+        // at the kerb (the end of path 0) the way on is never the closed first piece: back along the pavement
+        let kerb = ped.ends[&0].1;
+        let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, kerb, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
+        assert!(!on.is_empty() && on.iter().all(|&l| l != 1 && l != 3), "{on:?}");
+        // (a span planned from path 1 never runs on over path 3 either)
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }, Leg { lane: 1, a: 0.0, b: 5.0 }], true, 0.0);
         let c = crossing_span(&ped, &net, None, &mut walk, 1).expect("the loaded piece is a crossing");
         assert!(walk.legs.iter().all(|l| l.lane != 3) && c.to == 1, "{:?} {c:?}", walk.legs);
