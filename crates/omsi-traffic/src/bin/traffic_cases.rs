@@ -5311,7 +5311,7 @@ fn ab(args: &[String]) -> Res<()> {
     {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
         let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
-        println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
+        println!("(fork fallbacks, whole map, per call: open but closed beyond {}, own group below the floor {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5), n(6));
         // [X11-1] the random cars' trip ends (`AiState::goal`), whole map, all fixtures, and the
         // lane revisits (column `lane_revisits`)
         let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);

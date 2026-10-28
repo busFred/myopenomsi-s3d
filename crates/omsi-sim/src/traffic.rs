@@ -3640,11 +3640,12 @@ pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 
 /// Ways on chosen by a tier below "open to me and leading on" (`AiState::choose_after`: a car
 /// whose only way on is closed to it drives on, counted here), per tier: [open but every way on
-/// from it closed, closed by my group's density but driven by another group, driven by no group,
-/// closed by the rules but not `no_cars`, `no_cars`, none at all]. Per call: plan extensions,
+/// from it closed, closed by my group's density but driven by my group above 0, closed by my
+/// group's density (0 for it) but driven by another group, driven by no group, closed by the
+/// rules but not `no_cars`, `no_cars`, none at all]. Per call: plan extensions,
 /// not cars (a plan is extended frame after frame). A diagnostic for `traffic_cases ab` (whole
 /// process).
-pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Random cars' trip ends (`AiState::goal`), whole process: drawn at a car's first fork, drawn
 /// again because the trip end was gone (its tile linked on, its edge come into sight) or out of
@@ -3900,8 +3901,10 @@ impl AiState {
     /// its pool's density. The ways on are ranked and the best tier taken (the lower ones are
     /// counted, `FORK_FALLBACKS`): open to me and leading on (a dead end too); open to me but
     /// every way on from it closed (SUMO's bestLanes look-ahead, one step); closed by my
-    /// group's density but driven by another group; driven by no group; closed by the rules
-    /// but not `no_cars`; `no_cars`. A car whose only continuation is closed drives on through
+    /// group's density but with a density above 0 for my group (the editor's 0.001); at 0 for
+    /// my group but driven by another group; driven by no group; closed by the rules but not
+    /// `no_cars`; `no_cars`. So a way at 0 for my group is never taken while one with density
+    /// for it exists, with or without a trip end (user decision X-D3). A car whose only continuation is closed drives on through
     /// it and is never taken off moving (a vehicle already on the network has to go somewhere);
     /// only a lane with no way of its kind at all ends the network for it. A way that ends the
     /// network just ahead (`Network::reach`) is taken like any other; one whose road ends at the
@@ -3974,16 +3977,21 @@ impl AiState {
             match closed(n, ranked) {
                 None if leads_on(n, ranked) => 0,
                 None => 1,
-                Some(Closed::Density) if density_is_open(net.lanes[n].density) => 2,
-                Some(Closed::Density) => 3,
-                Some(Closed::Rules) if !net.lanes[n].no_cars => 4,
-                Some(Closed::Rules) => 5,
-                Some(Closed::Kind) => 6,
+                // (closed by my group's density: first those my group drives at all, above 0 -
+                // the editor's 0.001 "almost none" - then those only another group drives, then
+                // those no group drives: a way at 0 for my group is never taken while one with
+                // density for it exists, user decision X-D3, with or without a trip end)
+                Some(Closed::Density) if self.density_of(net, n) > 0.0 => 2,
+                Some(Closed::Density) if density_is_open(net.lanes[n].density) => 3,
+                Some(Closed::Density) => 4,
+                Some(Closed::Rules) if !net.lanes[n].no_cars => 5,
+                Some(Closed::Rules) => 6,
+                Some(Closed::Kind) => 7,
             }
         };
         let tier = |n: usize| tier_by(n, true);
-        let best = next.iter().map(|&n| tier(n)).min().unwrap_or(6);
-        let mut choices: Vec<usize> = if best < 6 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
+        let best = next.iter().map(|&n| tier(n)).min().unwrap_or(7);
+        let mut choices: Vec<usize> = if best < 7 { next.iter().copied().filter(|&n| tier(n) == best).collect() } else { Vec::new() };
         // the trip end chooses among the best tier present (X-D3): the ways on of it that lead
         // there. (Where one of `next` leads there, one of the best tier does: the field routes
         // only over lanes that rank as open, so a way on that reaches the trip end is open, or
@@ -4012,7 +4020,7 @@ impl AiState {
         }
         let weighted = best == 0 && self.traffic_pool.is_some();
         if best > 0 && !next.is_empty() && !(driven && aim.is_some()) {
-            FORK_FALLBACKS[best.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FORK_FALLBACKS[best.min(7) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if choices.is_empty() {
             None
@@ -4024,19 +4032,22 @@ impl AiState {
             let own: Vec<usize> = if driven { tied.iter().map(|&n| tier_by(n, false)).collect() } else { Vec::new() };
             let k = (self.rand() % tied.len() as u64) as usize;
             if let Some(&t) = own.get(k).filter(|&&t| t > 0) {
-                FORK_FALLBACKS[t.min(6) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                FORK_FALLBACKS[t.min(7) - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Some(tied[k])
-        } else if best == 2 {
-            // (lanes another group drives: by how much traffic they carry, a
-            // lane at 0.001 not as likely as one at 1.0)
-            let total: f32 = choices.iter().map(|&n| net.lanes[n].density).sum();
-            let mut pick = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0) * total;
+        } else if best == 2 || best == 3 {
+            // (lanes my group drives below the floor: by its density on them; lanes another
+            // group drives: by how much traffic they carry, a lane at 0.001 not as likely as one
+            // at 1.0)
+            let draw = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0);
+            let weight = |n: usize| if best == 2 { self.density_of(net, n) } else { net.lanes[n].density };
+            let total: f32 = choices.iter().map(|&n| weight(n)).sum();
+            let mut pick = draw * total;
             for &n in &choices {
-                if pick < net.lanes[n].density {
+                if pick < weight(n) {
                     return Some(n);
                 }
-                pick -= net.lanes[n].density;
+                pick -= weight(n);
             }
             choices.last().copied()
         } else {
@@ -5815,6 +5826,31 @@ mod tests {
             let way = lanes_driven(&mut car, &net, 10);
             assert_eq!(way, vec![0, 2, 5, 4], "seed {seed}: the way {way:?}");
             assert_eq!(car.goal, Some(4), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn without_a_trip_end_a_way_at_density_zero_for_the_group_is_not_taken_while_one_above_zero_exists() {
+        // group 0 (default 1, medium) and group 1 (default none). From the fork A: B at 0 for
+        // group 0 but 1.0 for group 1 (another group's road), or C at 0.001 for group 0 ("almost
+        // none"). A car of group 0 choosing without a trip end (a throwaway probe chooses as a
+        // pocket car does) always takes C (X-D3: the density tier of its own group first)
+        let st = LaneKind::Street;
+        let lane = |len: f64| LaneBuilder::arc(DVec3::ZERO, 0.0, len, 0.0, 0.0, st, 3.0);
+        let mut lanes = vec![lane(20.0), lane(30.0), lane(30.0)];
+        lanes[0].next = vec![1, 2];
+        lanes[1].group_density = vec![(0, 0.0), (1, 1.0)];
+        lanes[1].density = 1.0;
+        lanes[2].group_density = vec![(0, 0.001)];
+        lanes[2].density = 0.001;
+        let net = Network { lanes, ..Default::default() };
+        let defaults = std::sync::Arc::new(vec![1, 0]);
+        for seed in 1..60u64 {
+            let mut car = AiState::new(0, 0.0, seed);
+            car.traffic_pool = Some((0, defaults.clone()));
+            car.probe = true;
+            car.plan_next(&net);
+            assert_eq!(car.planned_next, Some(2), "seed {seed}");
         }
     }
 
