@@ -96,7 +96,8 @@ pub struct Plan {
     /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
     /// The lane change of the driver's own that signals is dropped before it moves over: its
-    /// gap rule fails again (`gap_accepted` against `change_target_view`; counted, `sim::CHANGES_ABORTED`).
+    /// gap rule fails again (`gap_accepted` against `change_target_view`) or somebody is on the
+    /// move (`people_on_move`; counted, `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
     /// The last-resort stop before a lane's end placed this frame (the odometer where the
     /// front stops, `Vehicle::lane_end_stop`).
@@ -2253,8 +2254,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // a lane change of the driver's own (a bypass too) checks its gap again on every frame of
-    // its signal and is dropped if it fails before the car moves over (SUMO's `checkChange` runs
-    // every step until the change is carried out); a change the lane's end asks for keeps
+    // its signal, and that nobody is on the target lane over the move (`people_on_move`), and is
+    // dropped if either fails before the car moves over (SUMO's `checkChange` runs every step
+    // until the change is carried out, and blocks it for a pedestrian on the target lane within
+    // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end asks for keeps
     // informing the follower there (LC2013's `informFollower`, every step the strategic change
     // is wanted and not yet carried out: SUMO carries it out in the step it is accepted, the
     // OMSI driver signals first, and the follower that made room is not let go meanwhile)
@@ -2265,7 +2268,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
                 }
             }
-            out.abort_change = !gap_accepted(me, &nb);
+            out.abort_change = !gap_accepted(me, &nb) || people_on_move(net, sim, me, &nb);
         }
     }
 
