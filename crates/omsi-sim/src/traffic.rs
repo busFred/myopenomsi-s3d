@@ -881,8 +881,8 @@ impl Network {
     /// a heading within `BESIDE_HEADING_DEG`. `Network::link` pairs the paths of one spline only,
     /// so a junction object's pieces have no `left`/`right` (OMSI geometry: an object's paths are
     /// separate polylines with no lane order); this finds the lane beside where the object lays
-    /// its paths side by side (BeijingCity's Jiangzhaikou object: 128 m of parallel paths). It
-    /// says nothing about crossings: whether a change may be made there is the caller's.
+    /// its paths side by side (an object can lay a hundred metres and more of plain road as
+    /// parallel paths). It says nothing about crossings: whether a change may be made there is the caller's.
     pub fn piece_beside(&self, lane: usize, s: f32, dir: i32) -> Option<usize> {
         let l = self.lanes.get(lane)?;
         let key = l.key.filter(|_| l.source == 2)?;
@@ -5343,7 +5343,7 @@ mod piece_beside_tests {
         l
     }
 
-    /// Jiangzhaikou's object: two paths running south 2.6 m apart are beside each other, the
+    /// Two paths of one object running south 2.6 m apart are beside each other, the
     /// one on the driver's left (east) is its left piece; a path crossing them, a path of
     /// another object and one 6 m out are not.
     #[test]

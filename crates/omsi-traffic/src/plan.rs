@@ -437,7 +437,8 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
 }
 
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
-/// accepted (LMRS: the route, a standing obstacle, speed gain, keeping to the side).
+/// accepted: SUMO LC2013's motivations (the lane's end and the turn - strategic -, speed gain,
+/// keeping to the side) and an obstacle motive of ours (a standing obstacle).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
 /// and only the turn lane and a standing obstacle are reasons to move over.
 fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool) -> (f32, bool, ChangeWhy) {
@@ -466,7 +467,9 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     if lane.turn == 0 && my_turn != 0 && nb.turn == my_turn && lane.turn != my_turn {
         wish(1.0 * dp.lc_strategic, ChangeWhy::Turn);
     }
-    // behind something standing: round it
+    // behind something standing: round it (ours: SUMO LC2013's nearest rule, the strategic
+    // change round a leader stopped at a stop within `REACT_TO_STOPPED_DISTANCE`, MSLCM_LC2013.cpp
+    // l.1400, takes only vehicles at a stop; here any standing obstacle near, stood behind a while)
     if let Some(l) = p.leader {
         let standing = l.standing_obstacle() && l.gap < 25.0;
         if standing && me.stopped >= 4.0 && nb.ahead.map(|a| a.0 > l.gap + l.length + 6.0).unwrap_or(true) {
@@ -478,7 +481,9 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // `anticipated_speeds`) past its threshold (`SPEED_GAIN_THRESHOLD`, towards the keep side
     // over `SPEED_GAIN_RIGHT`), away from the keep side only while the lane beside is still the
     // faster, onto a lane the car can stay on `SPEED_GAIN_REMAIN_TIME` at its speed - whatever
-    // its own speed: a car standing in a queue beside an open lane has the gain too
+    // its own speed: a car standing in a queue beside an open lane has the gain too; a queue
+    // standing ahead on the lane beside counts only through the safe speed behind it
+    // (`anticipateFollowSpeed`), as in SUMO, no bar
     // (and not into a gap behind its leader there shorter than my secure gap, SUMO's
     // `LCA_BLOCKED_BY_LEFT/RIGHT_LEADER`: standing gap, headway, the braking to its speed)
     let (this_safe, nb_safe) = anticipated_speeds(net, sim, me, p, nb);

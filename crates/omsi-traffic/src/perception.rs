@@ -234,9 +234,15 @@ pub struct NeighbourView {
     pub dir: i32,
     /// Nearest vehicle ahead there: (gap from my front, its speed) - on that lane, or on the
     /// lanes it runs into within `REACT_TO_STOPPED_DISTANCE` past the place beside me (at a fork
-    /// the branch with the most room).
+    /// the branch with the most room). SUMO looks for the neighbour's leader past the end of
+    /// the lane beside only within the brake gap and minGap (`MSLaneChanger::getRealLeader`); the
+    /// longer look here is ours, so that the speed anticipated there (`plan::anticipated_speeds`)
+    /// sees a queue standing further on.
     pub ahead: Option<(f32, f32)>,
-    /// Nearest vehicle behind there: (gap to my rear, its speed).
+    /// Nearest vehicle behind there: (gap to my rear, its speed) - on that lane, or back over
+    /// the lanes leading into it as far as a follower can matter (`plan::walk_back` to
+    /// `plan::follower_reach`, SUMO's `getFollowersOnConsecutive`); the nearest, where SUMO takes
+    /// the one needing the largest gap (`MSCriticalFollowerDistanceInfo`).
     pub behind: Option<(f32, f32)>,
     /// That vehicle's index, when it is an AI vehicle (the one asked to make room,
     /// `plan`'s cooperation).
@@ -1902,10 +1908,10 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         }
     });
     // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
-    // beside me (SUMO's anticipated speed there sees a queue standing 50 m on: no change of
-    // speed gain or keep-right into it); at a fork the branch with the most room (the branch
-    // the car will take there is not chosen yet: the lane counts as standing only where every
-    // branch does)
+    // beside me (a look of our own beyond SUMO's brake gap, `NeighbourView::ahead`: the speed
+    // anticipated there is the safe speed behind a queue standing 50 m on, which speed gain and
+    // keep right compare); at a fork the branch with the most room (the branch the car will take
+    // there is not chosen yet)
     if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
         let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
             let mut best: Option<(f32, f32)> = None;
@@ -2002,9 +2008,10 @@ pub(crate) fn walk_ahead(net: &Network, starts: &[(usize, f32)], depth: usize, m
     }
 }
 
-/// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): a stopped leader this near on a lane is
-/// reacted to; the lane beside is looked along this far past the place beside me for its
-/// leader (`NeighbourView::ahead`).
+/// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): there it bounds the strategic change round a
+/// stopped leader on the car's own lane; here the lane beside is looked along this far past the
+/// place beside me for its leader (`NeighbourView::ahead`, a distance of our own taken from it)
+/// and the people in a lane's width are looked for this far (`plan::person_ahead`).
 pub const REACT_TO_STOPPED_DISTANCE: f32 = 100.0;
 /// The lanes beside looked along for their leader (`NeighbourView::ahead`) are at most this
 /// many deep (junction pieces of a metre each come in chains).
