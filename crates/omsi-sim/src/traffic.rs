@@ -593,8 +593,8 @@ pub struct Network {
     /// `piece_beside` measures. Static geometry, built with the grid, as SUMO fixes a lane's
     /// neighbours when it loads the network.
     pub beside_pieces: Vec<Vec<usize>>,
-    /// The way lengths to the random cars' trip ends (`AiState::goal_field`), one per trip end
-    /// and access, kept while a car uses it.
+    /// The travel times to the random cars' trip ends (`AiState::goal_field`), one per trip end,
+    /// access and driver, kept while a car uses it.
     pub goal_fields: GoalFields,
 }
 
@@ -609,10 +609,11 @@ pub enum GoalAccess {
 }
 
 /// What a `GoalField` is computed for: the trip end, the network's size (it only grows: a
-/// field of a smaller one may miss links), the access (`GoalAccess`) and what decides which
+/// field of a smaller one may miss links), the access (`GoalAccess`), what decides which
 /// lanes are open to the car (`AiState::closed_for`): its `[ai_veh_type]`, its traffic group
 /// with that group's defaults, and the body a closed run is measured against
-/// (`Network::closed_marker`).
+/// (`Network::closed_marker`), and what decides the speed it drives on each lane
+/// (`AiState::lane_speed`): its speed factor and top speed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GoalKey {
     pub goal: usize,
@@ -621,19 +622,22 @@ pub struct GoalKey {
     veh_type: i32,
     pool: Option<(usize, Vec<i32>)>,
     body: u32,
+    speed: (u32, u32),
 }
 
-/// The way lengths to a trip end: per lane, the shortest way (m) from its start to the end of
-/// the trip end over lanes open to the car (SUMO's router: duarouter computes a trip's route
-/// as the shortest path, Dijkstra by default, over the lanes the vehicle class may use);
-/// infinite where the trip end cannot be reached.
+/// The travel times to a trip end: per lane, the least time (s) from its start to the end of
+/// the trip end over lanes open to the car, each lane driven at the speed the car drives there
+/// (`AiState::lane_speed`) (SUMO's router: duarouter computes a trip's fastest route, Dijkstra
+/// by default with the weight `traveltime`, an edge's length over the speed the vehicle can
+/// drive on it, over the lanes the vehicle class may use); infinite where the trip end cannot
+/// be reached.
 pub struct GoalField {
     pub key: GoalKey,
     pub dist: Vec<f32>,
 }
 
 impl GoalField {
-    /// The shortest way (m) from the start of `lane` to the end of the trip end.
+    /// The least travel time (s) from the start of `lane` to the end of the trip end.
     pub fn to_goal(&self, lane: usize) -> f32 {
         self.dist.get(lane).copied().unwrap_or(f32::INFINITY)
     }
@@ -838,10 +842,11 @@ fn polyline_crossing(a: &Lane, b: &Lane) -> Option<(f32, f32)> {
 pub const GRID_CELL: f64 = 50.0;
 
 impl Network {
-    /// The way lengths to trip end `key.goal` over the lanes `open` admits (`GoalField`): the
+    /// The travel times to trip end `key.goal` over the lanes `open` admits (`GoalField`): the
     /// one in use by another car with the same key, else computed - a Dijkstra backwards from
-    /// the trip end over the links (`prev`), each lane's length its cost.
-    pub fn goal_field(&self, key: GoalKey, open: impl Fn(usize) -> bool) -> std::sync::Arc<GoalField> {
+    /// the trip end over the links (`prev`), each lane's cost its length over the speed `speed`
+    /// gives for it (m/s, above 0).
+    pub fn goal_field(&self, key: GoalKey, open: impl Fn(usize) -> bool, speed: impl Fn(&Lane) -> f32) -> std::sync::Arc<GoalField> {
         if let Some(f) = self.goal_fields.0.lock().ok().and_then(|m| m.get(&key).and_then(|w| w.upgrade())) {
             return f;
         }
@@ -850,8 +855,8 @@ impl Network {
         let goal = key.goal;
         let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
         if goal < n && open(goal) {
-            dist[goal] = self.lanes[goal].length();
-            // (a length is never negative: its bits order as the numbers do)
+            dist[goal] = self.lanes[goal].length() / speed(&self.lanes[goal]);
+            // (a time is never negative: its bits order as the numbers do)
             heap.push(std::cmp::Reverse((dist[goal].to_bits(), goal)));
         }
         // (the reverse links: the network's own once linked, else from `next`)
@@ -881,7 +886,7 @@ impl Network {
                     continue;
                 }
                 let ok = *is_open[p].get_or_insert_with(|| open(p));
-                let nd = d + self.lanes[p].length();
+                let nd = d + self.lanes[p].length() / speed(&self.lanes[p]);
                 if ok && nd < dist[p] {
                     dist[p] = nd;
                     heap.push(std::cmp::Reverse((nd.to_bits(), p)));
@@ -3455,12 +3460,12 @@ pub struct AiState {
     /// the fork where the car's plan first meets a choice, by the density its group has on each
     /// (`AiState::goal_way`), drawn again
     /// where it is gone or out of reach (`GOAL_REPICKED`). At a fork the car takes the way on
-    /// with the shortest way to it (`choose_after`, SUMO: the route the router computes to the
-    /// trip's end decides the way on). None: no fork met yet, a timetable route, or no end
+    /// with the least travel time to it (`choose_after`, SUMO: the route the router computes to
+    /// the trip's end decides the way on). None: no fork met yet, a timetable route, or no end
     /// reachable (the car chooses at random among the best tier).
     pub goal: Option<usize>,
-    /// The way lengths to `goal` (`GoalField`), shared with the cars of the same goal and
-    /// access (`Network::goal_fields`); not recorded, computed again on need.
+    /// The travel times to `goal` (`GoalField`), shared with the cars of the same goal, access
+    /// and speeds (`Network::goal_fields`); not recorded, computed again on need.
     #[serde(skip)]
     pub goal_field: Option<std::sync::Arc<GoalField>>,
     /// Lane change in progress.
@@ -3889,8 +3894,8 @@ impl AiState {
     /// A random car (no `route`) on a street chooses among the ways on that lead to its trip end
     /// (`goal_way`; SUMO: the vehicle's route decides which link it takes, a lane without a
     /// connection to the route's next edge is a dead lane, sumo.md 3 `lcStrategic`) and of the
-    /// best tier takes the one with the shortest way to it (SUMO's router: the route is the
-    /// shortest path), equal ones at random. A ring is left at the exit towards the trip end and
+    /// best tier takes the one with the least travel time to it (SUMO's router: the route is the
+    /// fastest path), equal ones at random. A ring is left at the exit towards the trip end and
     /// driven round only as far as that exit. Any other vehicle, or a random car with no trip end
     /// reachable, takes one of the best tier at random: a car of a traffic pool weighted by its
     /// pool's density on each, among ways only another group drives by their density.
@@ -3964,7 +3969,8 @@ impl AiState {
         if choices.is_empty() {
             None
         } else if let Some(f) = &field {
-            // (the way on with the shortest way to the trip end: the route; equal ones at random)
+            // (the way on with the least travel time to the trip end: the route; equal ones at
+            // random)
             let least = choices.iter().map(|&n| f.to_goal(n)).fold(f32::INFINITY, f32::min);
             let tied: Vec<usize> = choices.iter().copied().filter(|&n| f.to_goal(n) == least).collect();
             Some(tied[(self.rand() % tied.len() as u64) as usize])
@@ -4020,7 +4026,7 @@ impl AiState {
         net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.routable(net, n, access)
     }
 
-    /// The trip end's way lengths for a choice among the ways on `next` of a fork, over the open
+    /// The trip end's travel times for a choice among the ways on `next` of a fork, over the open
     /// lanes first (`GoalAccess::Open`): the car's own trip end while it still is one and one of
     /// `next` leads to it; else a trip end drawn at random among those reachable from `next`,
     /// weighted by the density the map gives the car's group on each (SUMO's `randomTrips`: a
@@ -4037,7 +4043,7 @@ impl AiState {
                 let key = self.goal_key(net, g, access);
                 let f = match self.goal_field.take().filter(|f| f.key == key) {
                     Some(f) => f,
-                    None => net.goal_field(key, |n| self.routable(net, n, access)),
+                    None => net.goal_field(key, |n| self.routable(net, n, access), |l| self.lane_speed(l)),
                 };
                 if next.iter().any(|&n| f.to_goal(n).is_finite()) {
                     self.goal_field = Some(f.clone());
@@ -4095,7 +4101,7 @@ impl AiState {
             };
             if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let key = self.goal_key(net, g, access);
-            let f = net.goal_field(key, |n| self.routable(net, n, access));
+            let f = net.goal_field(key, |n| self.routable(net, n, access), |l| self.lane_speed(l));
             self.goal = Some(g);
             self.goal_field = Some(f.clone());
             return Some(f);
@@ -4108,7 +4114,7 @@ impl AiState {
     /// The `GoalKey` of trip end `goal` for this car at `access`.
     fn goal_key(&self, net: &Network, goal: usize, access: GoalAccess) -> GoalKey {
         let body = self.traffic_pool.as_ref().and_then(|(p, _)| net.group_body.get(*p)).copied().unwrap_or(0.0).max(self.length);
-        GoalKey { goal, lanes: net.lanes.len(), access, veh_type: self.veh_type, pool: self.traffic_pool.as_ref().map(|(p, d)| (*p, d.to_vec())), body: body.to_bits() }
+        GoalKey { goal, lanes: net.lanes.len(), access, veh_type: self.veh_type, pool: self.traffic_pool.as_ref().map(|(p, d)| (*p, d.to_vec())), body: body.to_bits(), speed: (self.desire.to_bits(), self.max_speed_kmh.to_bits()) }
     }
 
     /// How far ahead (m) the way is planned: `PLAN_AHEAD`, or the claim horizon at this speed.
@@ -4653,6 +4659,14 @@ impl AiState {
         self.drive(net, dt, lead, stop_at)
     }
 
+    /// The speed (m/s) the driver wants on lane `l` on a free road: its limit times the driver's
+    /// speed factor (`desire`, SUMO's speedFactor), at most the vehicle's top speed, at least
+    /// 3 km/h. The car's free speed (`desired_accel`) and its travel times to its trip end
+    /// (`GoalField`).
+    pub fn lane_speed(&self, l: &Lane) -> f32 {
+        (l.speed_limit_kmh * self.desire).min(self.max_speed_kmh).max(3.0) / 3.6
+    }
+
     /// The acceleration the driver wants (the Intelligent Driver Model): towards the
     /// desired speed on a free road, and a braking term for what is ahead that is gentle
     /// (`decel`) while there is room and only as hard as it must be when there is not.
@@ -4662,7 +4676,7 @@ impl AiState {
         let Some(lane) = net.lanes.get(self.lane) else { return 0.0 };
         let (a, b) = (self.accel.max(0.1), self.decel.max(0.5));
         let v = self.speed;
-        let limit = |l: &Lane| (l.speed_limit_kmh * self.desire).min(self.max_speed_kmh).max(3.0) / 3.6;
+        let limit = |l: &Lane| self.lane_speed(l);
         let mut v0 = limit(lane);
         // a lower limit on the lanes ahead (a junction's turning lanes, a 30 zone) is
         // reached at that speed, slowing gently (1.2 m/s²) from where it has to: taken only
@@ -5588,6 +5602,26 @@ mod tests {
             assert_eq!(sorted.len(), way.len(), "seed {seed}: a lane driven twice: {way:?}");
             assert_eq!(car.goal, way.last().copied(), "seed {seed}: left by its trip end: {way:?}");
             assert!(car.goal.is_some_and(|g| (8..12).contains(&g)), "seed {seed}: {:?}", car.goal);
+        }
+    }
+
+    #[test]
+    fn the_way_to_the_trip_end_is_the_fastest_not_the_shortest() {
+        // from the fork A: B 100 m at 50 km/h (7.2 s) or C 60 m at 20 km/h (10.8 s), both into
+        // the trip end G (duarouter's default weight, travel time): B
+        let st = LaneKind::Street;
+        let lane = |len: f64| LaneBuilder::arc(DVec3::ZERO, 0.0, len, 0.0, 0.0, st, 3.0);
+        let mut lanes = vec![lane(20.0), lane(100.0), lane(60.0), lane(50.0)];
+        lanes[0].next = vec![1, 2];
+        lanes[1].next = vec![3];
+        lanes[2].next = vec![3];
+        lanes[2].speed_limit_kmh = 20.0;
+        let net = Network { lanes, ..Default::default() };
+        for seed in 1..20u64 {
+            let mut car = AiState::new(0, 0.0, seed);
+            car.goal = Some(3);
+            let way = lanes_driven(&mut car, &net, 10);
+            assert_eq!(way, vec![0, 1, 3], "seed {seed}: the way {way:?}");
         }
     }
 
