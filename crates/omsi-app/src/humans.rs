@@ -474,7 +474,8 @@ const STROLL_RADIUS: f64 = 200.0;
 /// one put down in the view cone between this and `STROLL_RADIUS` appears in sight; with the sight
 /// test alone nobody is put down in the cone short of the horizon unless a building hides them, and
 /// the street ahead of the bus keeps a quarter of its strollers (Jiangzhaikou 473 of 3652 wanted at
-/// 270 s, against 1444-1484). Open: the coordinator's decision.
+/// 270 s, against 1444-1484). Kept at 120 m by the user's decision (P2-D1, 2026-10-28): tying it to
+/// the sight test would leave the street ahead of the bus with about a quarter of its strollers.
 const APPEAR_IN_VIEW_BEYOND: f64 = 120.0;
 /// How far in front of a seat's hip point somebody stands to sit down - where the feet
 /// stay while seated (m).
