@@ -203,16 +203,15 @@ pub fn follower_reach(net: &Network, lane: usize) -> f32 {
 /// Walks back from lane `lane` at `s` over the lanes leading into it, as SUMO's
 /// `MSLane::getFollowersOnConsecutive` does, while a lane's start lies within `reach` m behind
 /// `s`: `visit(l, start)` once per lane, `start` the lane's start relative to `s` (negative;
-/// `-s` for `lane` itself).
-pub fn walk_back(net: &Network, lane: usize, s: f32, reach: f32, mut visit: impl FnMut(usize, f32)) {
+/// `-s` for `lane` itself), and the walk goes on behind that lane where it returns true.
+pub fn walk_back(net: &Network, lane: usize, s: f32, reach: f32, mut visit: impl FnMut(usize, f32) -> bool) {
     if lane >= net.lanes.len() {
         return;
     }
     let mut frontier: Vec<(usize, f32)> = vec![(lane, -s)];
     let mut seen: Vec<usize> = vec![lane];
     while let Some((cur, start)) = frontier.pop() {
-        visit(cur, start);
-        if -start > reach {
+        if !visit(cur, start) || -start > reach {
             continue;
         }
         for &pl in net.prev.get(cur).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -247,6 +246,7 @@ pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, 
                 add(ps, p.half_len, p.speed, player);
             }
         }
+        true
     });
     out
 }

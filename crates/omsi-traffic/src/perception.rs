@@ -1854,7 +1854,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let allowed = crate::access::is_open_at(net, nb, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
-    let mut behind: Option<(f32, f32)> = None;
+    let behind: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
     let mut behind_id: Option<usize> = None;
     let mut behind_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
     let mut foreign = false;
@@ -1871,8 +1871,8 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             }
         } else {
             let gap = -d_rel - front - st.rear;
-            if behind.map(|b| gap < b.0).unwrap_or(true) {
-                behind = Some((gap, speed));
+            if behind.get().map(|b| gap < b.0).unwrap_or(true) {
+                behind.set(Some((gap, speed)));
                 behind_id = who;
                 if let Some(o) = who.and_then(|k| vehicles.get(k)) {
                     behind_min_gap = o.params.min_gap;
@@ -1901,11 +1901,16 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     // `getFollowersOnConsecutive` to the lane's `getMaximumBrakeDist`: `plan::walk_back` to
     // `plan::follower_reach`); a junction object's pieces are a few metres each, and a follower
     // two pieces back at the lane's speed is the change's follower
+    // (only the nearest is kept, and a vehicle further back than a lane's start is behind every
+    // vehicle found there - bodies on one way do not overlap - so past the lanes leading straight
+    // in, whose passers mark the lane `foreign`, the walk goes on behind a lane only while nobody
+    // nearer than its start has been found)
     crate::plan::walk_back(net, nb, s_b, crate::plan::follower_reach(net, nb), |l, start| {
         if l != nb {
             let passers = net.prev.get(nb).is_some_and(|v| v.contains(&l));
             lane_users(l, start + s_b, passers, &mut note);
         }
+        l == nb || behind.get().is_none_or(|(g, _)| g > -start - st.rear)
     });
     // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
     // beside me (a look of our own beyond SUMO's brake gap, `NeighbourView::ahead`: the speed
@@ -1973,7 +1978,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         d += net.lanes[n].length();
         cur = n;
     }
-    Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+    Some(NeighbourView { lane: nb, dir, ahead, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
 
 /// Walks every way on from the lanes `starts` (each a lane and the metres to its start), at
