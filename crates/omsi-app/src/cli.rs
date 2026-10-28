@@ -85,9 +85,16 @@ pub(crate) struct Args {
     /// Set script variables after spawning: name=value[,name=value…].
     #[arg(long)]
     pub(crate) setvar: Option<String>,
-    /// Offscreen: simulate this many seconds with full throttle before rendering.
+    /// Offscreen: simulate this many seconds before rendering, the player's bus on the test
+    /// profile (full throttle unless --setvar drive_brake_at / OMSI_DRIVE_PROFILE say
+    /// otherwise), or along its trip with --follow-line.
     #[arg(long)]
     pub(crate) drive: Option<f32>,
+    /// Offscreen, with --drive: the player's bus drives its duty's trip (--line/--tour, or a
+    /// situation's) as an AI timetable bus drives one, instead of the --drive test profile
+    /// (`follow_line::LineFollower`).
+    #[arg(long)]
+    pub(crate) follow_line: bool,
     /// Number of AI traffic vehicles to keep around the camera (0 = none).
     #[arg(long, default_value_t = 0)]
     pub(crate) traffic: usize,

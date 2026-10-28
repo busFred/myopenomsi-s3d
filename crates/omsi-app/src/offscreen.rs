@@ -1,4 +1,13 @@
-//! The offscreen run: a scripted session rendered to pictures (`--offscreen`).
+//! The offscreen run: a scripted session rendered to pictures (`--offscreen`), and the headless
+//! same-seed run every game-side gate uses (`--drive SECS` with traffic, people and the
+//! timetable: people counts, removals in view, bus dwells, tile streaming).
+//!
+//! The player's bus during the `--drive` seconds: by default the test profile (full throttle,
+//! steering from `--setvar drive_steer`, the brake from `drive_brake_at`, `OMSI_DRIVE_PROFILE`,
+//! `OMSI_AUTOPILOT`) on its own physics - a gate run holds the brake from 0 s and the bus
+//! stands where it starts; with `--follow-line` it drives its duty's trip as an AI timetable
+//! bus drives one (`follow_line::LineFollower`: an AI bus of its type on the trip, the player's
+//! vehicle put where that bus's body is every frame, its own physics not run).
 
 use super::*;
 
@@ -406,6 +415,11 @@ pub(crate) fn run_offscreen(
     // (the tyres' grip takes the same water: `DriveGround::surface`)
     world.road_wetness.store(spray_wet.to_bits(), std::sync::atomic::Ordering::Relaxed);
     let spray_wind = Vec3::new(weather.wind.0.to_radians().sin(), weather.wind.0.to_radians().cos(), 0.0) * weather.wind.1 * puddles::GROUND_WIND;
+    // `--follow-line`: the player's bus driven along its trip by an AI timetable bus
+    let mut follower = args.follow_line.then(crate::follow_line::LineFollower::default);
+    if follower.is_some() && (duty.is_none() || drive_frames == 0 || traffic.is_none()) {
+        log::warn!("--follow-line needs --drive, --schedule with traffic and a duty (--line/--tour or a situation's): the player's bus stands");
+    }
     for i in 0..total_frames {
         let t_s = i as f32 * dt;
         if server {
@@ -677,11 +691,19 @@ pub(crate) fn run_offscreen(
                     );
                 }
             }
+            // `--follow-line`: the AI bus put on the player's trip once the timetable has run
+            // (its first tick took the player's tour off the road)
+            if let (Some(f), Some(s), Some(d), Some(p)) = (follower.as_mut(), schedule.as_mut(), duty.as_ref(), player.as_ref()) {
+                f.place(t_s, s, d, &world, t, &renderer, &mut scene, &p.vehicle);
+            }
             t.others = lan_outlines(&remotes_off);
-            t.others.extend(own_outlines(player.as_ref(), &[]));
+            // (the player's bus driven by an AI bus, `--follow-line`: the drivers see that bus
+            // in its place, not a player's outline over it)
+            let driven = follower.as_ref().is_some_and(|f| f.driving());
+            t.others.extend(own_outlines(player.as_ref().filter(|_| !driven), &[]));
             t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
             t.player_blinker = player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
-            t.tick(dt, player.as_ref().map(|p| player_outline(p)));
+            t.tick(dt, player.as_ref().filter(|_| !driven).map(|p| player_outline(p)));
             // the riders of the timetable buses taken off the road
             let out = std::mem::take(&mut t.riders_out);
             if let Some(h) = humans_off.as_mut() {
@@ -752,6 +774,12 @@ pub(crate) fn run_offscreen(
                         }
                     }
                 }
+                // `--follow-line`: the player's bus where the AI bus driving its trip is
+                // (`follow_line::LineFollower::pose`), its physics not run
+                let followed = match (follower.as_mut(), traffic.as_ref()) {
+                    (Some(f), Some(t)) => f.pose(t_s, t, &mut player.vehicle),
+                    _ => false,
+                };
                 player.axes.clutch = (player.axes.clutch - 0.7 * dt).max(0.0);
                 // --drive test profile: full throttle, steering from --setvar drive_steer, brake after drive_brake_at
                 let steer = args
@@ -862,16 +890,23 @@ pub(crate) fn run_offscreen(
                         controls.brake = ((speed - kmh - 3.0) / 10.0).clamp(0.0, 1.0);
                     }
                 }
-                player.tick_auto_shift(dt, controls.throttle, controls.brake);
-                player.auto_clutch_bite(controls.throttle);
-                controls.clutch = controls.clutch.max(player.axes.clutch);
-                player.vehicle.set_controls(controls);
-                if i == 0 {
-                    if let Some(v0) = drive_v0 {
-                        player.vehicle.set_speed(v0 / 3.6);
-                    }
+                // (`--follow-line` with the AI bus not driving it: not on its trip yet, or lost)
+                // the player's bus stands, the foot on the brake
+                if follower.is_some() && !followed {
+                    controls = omsi_sim::Controls { brake: 1.0, ..Default::default() };
                 }
-                player.vehicle.update(dt);
+                if !followed {
+                    player.tick_auto_shift(dt, controls.throttle, controls.brake);
+                    player.auto_clutch_bite(controls.throttle);
+                    controls.clutch = controls.clutch.max(player.axes.clutch);
+                    player.vehicle.set_controls(controls);
+                    if i == 0 {
+                        if let Some(v0) = drive_v0 {
+                            player.vehicle.set_speed(v0 / 3.6);
+                        }
+                    }
+                    player.vehicle.update(dt);
+                }
                 // OMSI_DEBUG_VARS with OMSI_DEBUG_VARS_EVERY=<s>: the variables through the drive
                 if let (Ok(list), Some(every)) = (omsi_cfg::env::var("OMSI_DEBUG_VARS"), omsi_cfg::env::var("OMSI_DEBUG_VARS_EVERY").ok().and_then(|v| v.parse::<f32>().ok())) {
                     if (t_s / every).floor() != ((t_s - dt) / every).floor() {
@@ -1373,6 +1408,9 @@ pub(crate) fn run_offscreen(
             }
             None => log::warn!("--follow: car {id} not found"),
         }
+    }
+    if let Some(f) = follower.as_ref() {
+        log::info!("follow line: AI bus {:?}{}{}", f.car, f.lost.map(|(t, why)| format!(", lost at {t:.1} s ({why})")).unwrap_or_default(), f.refused.as_ref().filter(|_| f.car.is_none()).map(|e| format!(", never put on the trip: {e}")).unwrap_or_default());
     }
     if let Some(g) = ground_gap.take() {
         g.report();
