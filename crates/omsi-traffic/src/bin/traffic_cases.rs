@@ -6150,6 +6150,9 @@ const KERB_CELL_REACH: f64 = 1.0;
 /// SUMO's `blockedAtDist` takes a pedestrian waiting 2 s as standing (`perception::CROSSING_STANDING_WAIT`);
 /// a walker paused for a frame on the way to their place is not.
 const KERB_SETTLED: f32 = 2.0;
+/// A waiter standing still `KERB_SETTLED` s farther than this (m) from the place they hold is off
+/// it (the game's `KERB_ARRIVE`).
+const KERB_OFF_PLACE: f64 = 0.1;
 /// Sides of the polygon the cell starts from (the disc of `KERB_CELL_REACH`).
 const KERB_CELL_SIDES: usize = 32;
 
@@ -6422,6 +6425,8 @@ struct PeopleAcc {
     kerb_over_still_ps: f64,
     kerb_over_settled_ps: f64,
     kerb_fallback_s: f64,
+    /// Person-s of kerb waiters standing still `KERB_SETTLED` s or more farther than `KERB_OFF_PLACE` from their place.
+    kerb_off_place_s: f64,
     kerb_fallback_pair_s: f64,
     /// The people on foot the game took away (`Frame::people_gone`), those of them the player
     /// could see then, the first few of those (time, id, where they were last), and everybody's
@@ -6481,6 +6486,7 @@ impl PeopleAcc {
             kerb_over_still_ps: 0.0,
             kerb_over_settled_ps: 0.0,
             kerb_fallback_s: 0.0,
+            kerb_off_place_s: 0.0,
             kerb_fallback_pair_s: 0.0,
             removed: 0,
             removed_in_sight: 0,
@@ -6646,6 +6652,7 @@ impl PeopleAcc {
         let mut waiters: HashMap<(usize, bool), Vec<(DVec3, bool)>> = HashMap::new();
         let mut settled: Vec<bool> = Vec::new();
         let mut fallback: Vec<bool> = Vec::new();
+        let mut off_place = 0usize;
         let mut settled_groups: HashMap<(usize, bool), Vec<glam::DVec2>> = HashMap::new();
         let mut who: Vec<String> = Vec::new();
         for p in &f.people {
@@ -6662,6 +6669,9 @@ impl PeopleAcc {
                     waiters.entry((lane, s > len * 0.5)).or_default().push((p.pos, p.still > 0.0));
                     settled.push(p.still >= KERB_SETTLED);
                     fallback.push(p.kerb_fallback);
+                    if p.still >= KERB_SETTLED && p.kerb_place.is_some_and(|q| (q - p.pos.truncate()).length() > KERB_OFF_PLACE) {
+                        off_place += 1;
+                    }
                     if p.still >= KERB_SETTLED {
                         settled_groups.entry((lane, s > len * 0.5)).or_default().push(p.pos.truncate());
                     }
@@ -6788,6 +6798,7 @@ impl PeopleAcc {
             self.kerb_over_still_ps += still_pairs as f64 * w;
             self.kerb_over_settled_ps += settled_pairs as f64 * w;
             self.kerb_fallback_s += fallback.iter().filter(|f| **f).count() as f64 * w;
+            self.kerb_off_place_s += off_place as f64 * w;
             if pairs > self.kerb_over_max.0 {
                 self.kerb_over_max = (pairs, f.time, at);
             }
@@ -7048,6 +7059,7 @@ impl PeopleAcc {
             let _ = writeln!(out, "  kerb_overlap_standing    at {:.1} s: {t}", self.kerb_over_pairs.1);
         }
         kv!("kerb_overlap_settled", format!("{:.1} pair-s (both still {KERB_SETTLED} s or more)", self.kerb_over_settled_ps), json!(r1(self.kerb_over_settled_ps)));
+        kv!("kerb_off_place", format!("{:.1} person-s (kerb waiters still {KERB_SETTLED} s or more, more than {KERB_OFF_PLACE} m off their place)", self.kerb_off_place_s), json!(r1(self.kerb_off_place_s)));
         kv!("kerb_fallback", format!("{:.1} person-s waiting where they stand with no queue place ({:.1} standing pair-s with one of them in kerb_overlap's standing count)", self.kerb_fallback_s, self.kerb_fallback_pair_s), json!({"person_s": r1(self.kerb_fallback_s), "standing_pair_s": r1(self.kerb_fallback_pair_s)}));
         kv!("kerb_overlap", format!("{:.1} pair-s ({:.1} both standing); most in a frame {} at {:.1} s at ({:.1}, {:.1}) (waiters at a kerb closer than {BODY_ELLIPSE_DEPTH} m)", self.kerb_over_ps, self.kerb_over_still_ps, o.0, o.1, o.2.x, o.2.y), json!({"pair_s": r1(self.kerb_over_ps), "standing_pair_s": r1(self.kerb_over_still_ps), "max": o.0, "t": r1(o.1)}));
         kv!("removed_in_sight", format!("{} of {} people on foot taken away (the game's figure_in_sight when it took them; a recording from before the count reads 0 of 0)", self.removed_in_sight, self.removed), json!({"in_sight": self.removed_in_sight, "removed": self.removed}));
