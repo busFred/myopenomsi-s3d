@@ -545,6 +545,20 @@ impl Spawn {
     }
 }
 
+/// The vehicles on a lane as the simulation's occupancy index has them (`Simulation::occupancy`: a
+/// car changing lanes or passing is on both lanes, with the place its body has on each): `f(s,
+/// vehicle)` for each. The index names a vehicle by its place in the frame's list, `ids` (the
+/// cars' ids in that order); `car` gives the car now by id, and a car gone since is no occupant.
+fn sim_occupants_now<'a>(sim: &'a omsi_traffic::Simulation, ids: &'a [u64], car: &'a dyn Fn(u64) -> Option<&'a AiVehicle>) -> impl Fn(usize, &mut dyn FnMut(f32, &AiVehicle)) + 'a {
+    move |lane, f| {
+        for occ in sim.occupancy.get(&lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(v) = ids.get(occ.vehicle).and_then(|&id| car(id)) {
+                f(occ.s, v);
+            }
+        }
+    }
+}
+
 /// The AI vehicle of `class` with `(front, rear, half width)` as it would be made at `pos` facing
 /// `heading` (deg), at distance `at.1` along lane `at.0`, standing: its way the lane and the next
 /// one it plans (`AiState::plan_next`), as `spawn`'s. A car pulling out (`lateral`: its offset
@@ -1076,6 +1090,10 @@ pub struct Traffic {
     /// The cars by id and by lead: valid for one frame only, built before the per-car loop of
     /// `tick` and cleared right after it (the indices go stale once cars are removed).
     links: CarLinks,
+    /// The ids of the cars in the order `Simulation::tick` indexed them (`Simulation::occupancy`
+    /// names a vehicle by its index in that frame), for `people_hold_here` between frames, when
+    /// cars have been removed and put down since.
+    occupancy_ids: Vec<u64>,
     tick_inner_sum: ([f64; 3], u32),
     /// Seconds each of them has stood still.
     others_still: HashMap<u32, f32>,
@@ -1783,6 +1801,7 @@ impl Traffic {
             tick_split: [0.0; 3],
             tick_inner: [0.0; 3],
             links: CarLinks::default(),
+            occupancy_ids: Vec::new(),
             tick_inner_sum: ([0.0; 3], 0),
             others_still: HashMap::new(),
             removed_scheduled: Vec::new(),
@@ -3600,12 +3619,9 @@ impl Traffic {
         let rear = self.consist_rear(ty).max(rear);
         let class = if bus { VehicleClass::ScheduledBus } else { VehicleClass::from_code(ty.def.ai_veh_type, self.net.lanes[at.0].kind) };
         let probe = spawn_probe(&self.net, class, (front, rear, half_width), pos, heading, at, lateral);
-        let cars = &self.cars;
-        let occupants = |lane: usize, f: &mut dyn FnMut(f32, &AiVehicle)| {
-            for c in cars.iter().filter(|c| c.ai.state.lane == lane) {
-                f(c.ai.state.s, &c.ai);
-            }
-        };
+        let by_id: HashMap<u64, &AiVehicle> = self.cars.iter().map(|c| (c.id, &c.ai)).collect();
+        let find = |id: u64| by_id.get(&id).copied();
+        let occupants = sim_occupants_now(&self.sim, &self.occupancy_ids, &find);
         omsi_traffic::perception::people_hold_at_rest(&self.net, &self.sim, &probe, &occupants)
     }
 
@@ -4253,6 +4269,7 @@ impl Traffic {
                 r.set_person(p);
             }
         }
+        self.occupancy_ids = self.cars.iter().map(|c| c.id).collect();
         let t_rec = std::time::Instant::now();
         let cars = &self.cars;
         self.recorder.note_people_gone(&std::mem::take(&mut self.people_gone));
@@ -6617,5 +6634,34 @@ mod spawn_people_tests {
             }
         });
         assert!(!free && blocked, "free {free} blocked {blocked}");
+    }
+
+    /// The occupancy the spawn probe reads has a car changing lanes on the lane it moves onto as
+    /// well, and names cars by their ids: one gone since the frame is no occupant.
+    #[test]
+    fn a11_1_the_probe_reads_the_simulations_occupancy() {
+        let mut net = Network::default();
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(0.0, -100.0, 0.0), DVec3::new(0.0, 100.0, 0.0)], LaneKind::Street, 3.5));
+        net.lanes.push(omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(-3.5, 100.0, 0.0), DVec3::new(-3.5, -100.0, 0.0)], LaneKind::Street, 3.5));
+        net.build_grid();
+        let mut st = AiState::new(0, 100.0, 0);
+        st.front = 2.3;
+        st.rear = 2.3;
+        st.length = 4.6;
+        st.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.5, length: 20.0, s_to: 95.0, dir: 1, wait: 0.0, bypass: false });
+        let car = AiVehicle::new(9, VehicleClass::Car, st, 0.9, 0);
+        let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
+        sim.build_occupancy(&net, std::slice::from_ref(&car));
+        let ids = [77u64];
+        let seen = |on: usize, alive: bool| {
+            let find = |id: u64| (alive && id == 77).then_some(&car);
+            let occ = sim_occupants_now(&sim, &ids, &find);
+            let mut n = Vec::new();
+            occ(on, &mut |s, _| n.push(s));
+            n
+        };
+        assert_eq!(seen(0, true).len(), 1, "on its own lane");
+        assert_eq!(seen(1, true), vec![95.0], "on the lane it moves onto, where its body is");
+        assert!(seen(1, false).is_empty() && seen(0, false).is_empty(), "gone since the frame");
     }
 }
