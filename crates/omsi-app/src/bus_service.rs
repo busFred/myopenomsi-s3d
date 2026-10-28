@@ -1392,9 +1392,9 @@ impl BusService {
             // stands out its wait there, not in the lane behind - only right behind another
             // bus at the stop, `close`, it serves it where it stands; and held short of the
             // berth by people for PEOPLE_SERVE_MAX, as any bus: they are its own waiters, who
-            // wait for it to come - d24 #194 stood 290 s before its first stop, its waiters on a
-            // 3.1 m island 0.03 m clear of its body on its lane and inside it on the way into the
-            // bay)
+            // wait for it to come. Both only within 45 m of the stop point: a bus held by
+            // people farther off stands until they clear its way - the waiters of a stop step
+            // out of the way of a bus braking for it, `humans::bus_way_bodies`)
             let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0 && !people_short && (!self.layover || self.short_by_people));
             if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 - pull && crept_past) {
                 self.near_d = f32::INFINITY;

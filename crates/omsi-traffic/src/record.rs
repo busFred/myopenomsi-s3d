@@ -203,6 +203,10 @@ pub struct PersonRecord {
     /// off the queue grid).
     #[serde(default, skip_serializing_if = "is_false")]
     pub kerb_fallback: bool,
+    /// The place in the kerb's queue a waiting stroller holds (`PedWalk::spot`), none with the
+    /// last fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kerb_place: Option<DVec2>,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -222,7 +226,7 @@ impl PersonRecord {
 
     /// A record of somebody the game told nothing more about.
     pub fn from_person(p: &Person) -> PersonRecord {
-        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at, id: p.id, approach: p.approach, kerb_fallback: false }
+        PersonRecord { pos: p.pos, vel: p.vel, state: Cow::Borrowed(""), still: p.still, on_crossing: p.on_crossing, waiting_for_bus: p.waiting_for_bus, leg: None, decision: None, pace: 0.0, at_kerb: p.at_kerb, waits_at: p.waits_at, id: p.id, approach: p.approach, kerb_fallback: false, kerb_place: None }
     }
 
     /// Take the frame's own values over (the extras stay).
@@ -284,6 +288,11 @@ pub struct Frame {
     /// order matters: the first of two cars to ask for a gap gets it).
     #[serde(default)]
     pub order: Option<Vec<u64>>,
+    /// The people on foot the game took away since the frame before (`Recorder::note_people_gone`):
+    /// their id, and whether the player could see them then (the game's `figure_in_sight`).
+    /// None written when nobody went; a recording from before it reads none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub people_gone: Vec<(u32, bool)>,
 }
 
 /// A timetable bus's stand at one of its stops, as the game saw it (format 5): what was
@@ -490,6 +499,8 @@ pub struct Recorder {
     /// lanes: saving the minute again does not write the whole map out again.
     net_cache: Option<(usize, std::sync::Arc<String>)>,
     externals: Vec<(u64, External)>,
+    /// The people taken away since the last frame (`note_people_gone`), for its `Frame::people_gone`.
+    people_gone: Vec<(u32, bool)>,
 }
 
 impl Default for Recorder {
@@ -514,6 +525,7 @@ impl Recorder {
             parked_print: None,
             net_cache: None,
             externals: Vec::new(),
+            people_gone: Vec::new(),
         }
     }
 
@@ -549,6 +561,14 @@ impl Recorder {
         if let Some(p) = self.full.take() {
             self.send(Msg::StopFull);
             log::info!("traffic: recording to {} ended", p.display());
+        }
+    }
+
+    /// The game took these people on foot away (id, whether the player could see them):
+    /// written with the next frame (`Frame::people_gone`).
+    pub fn note_people_gone(&mut self, gone: &[(u32, bool)]) {
+        if self.tx.is_some() {
+            self.people_gone.extend_from_slice(gone);
         }
     }
 
@@ -652,6 +672,7 @@ impl Recorder {
             steer: steer.to_vec(),
             light_clocks: sim.lights.iter().map(|c| (c.time, c.held, c.request.clone())).collect(),
             order: order_changed.then(|| self.order.clone()),
+            people_gone: std::mem::take(&mut self.people_gone),
         };
         self.send(Msg::Frame { time, frame: Box::new(frame) });
     }
@@ -999,6 +1020,7 @@ mod tests {
                 steer: steer.clone(),
                 light_clocks: lights.iter().map(|c| (c.time, c.held, c.request.clone())).collect(),
                 order,
+                people_gone: Vec::new(),
             };
             assert_eq!(finite::to_string(&Record::Frame(owned)).unwrap(), before);
         }
@@ -1009,6 +1031,19 @@ mod tests {
 mod remove_line_tests {
     use super::{Record, RecordRef};
     use crate::removal::RemoveRule;
+
+    /// The people the game took away ride on the next frame (id, seen); a frame line without
+    /// them (none went, or an older recording) reads none.
+    #[test]
+    fn people_gone_ride_on_the_frame() {
+        let line = r#"{"Frame":{"time":1.0,"dt":0.1,"day_time":2.0,"time_scale":1.0,"players":[],"people":[],"walkers":[],"externals":[],"light_clocks":[]}}"#;
+        let Record::Frame(mut f) = serde_json::from_str::<Record>(line).unwrap() else { panic!() };
+        assert!(f.people_gone.is_empty());
+        f.people_gone = vec![(7, true), (9, false)];
+        let again = serde_json::to_string(&Record::Frame(f)).unwrap();
+        let Record::Frame(g) = serde_json::from_str::<Record>(&again).unwrap() else { panic!() };
+        assert_eq!(g.people_gone, vec![(7, true), (9, false)]);
+    }
 
     /// A removal's line carries its rule, whether the eye saw it and its
     /// distance from the eye; one with no distance is written as before, and an older line (no

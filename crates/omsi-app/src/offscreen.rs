@@ -1427,7 +1427,7 @@ pub(crate) fn run_offscreen(
                 );
             }
         }
-        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6);
+        log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h, spawn_refused_people {} ({})", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6, t.spawn_refused_people.iter().sum::<usize>(), t.spawn_refused_by());
         for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
             if omsi_cfg::env::var_os("OMSI_DEBUG_PROPS").is_some() {
@@ -1977,6 +1977,10 @@ pub(crate) fn run_offscreen(
             .map(|p| p.vehicle.position)
             .unwrap_or(camera.position);
         h.sync(&renderer, &mut scene, center);
+        // (the people's gate counters ride in `Humans::summary`: jammed and inside-a-moving-
+        // vehicle person-seconds, waiting places refused, people on foot taken away and those of
+        // them taken in the player's sight - the last should be 0; `traffic_cases people` reads
+        // the same removals from the recording's `Frame::people_gone`)
         log::info!(
             "passengers: {} people ({}), request {:?}, paid {:?}, change due {:?}",
             h.people.len(),
