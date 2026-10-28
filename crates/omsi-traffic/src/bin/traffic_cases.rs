@@ -5315,8 +5315,8 @@ fn ab(args: &[String]) -> Res<()> {
         // [X11-1] the random cars' trip ends (`AiState::goal`), whole map, all fixtures, and the
         // lane revisits (column `lane_revisits`)
         let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-        use omsi_sim::traffic::{GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
-        println!("(trip ends, whole map: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {}; lane_revisits {} by {} vehicles)", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), total.extra.lane_revisits, total.extra.revisit_vehicles);
+        use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
+        println!("(trip ends, whole map: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles)", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), total.extra.lane_revisits, total.extra.revisit_vehicles);
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));

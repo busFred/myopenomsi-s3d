@@ -1439,9 +1439,9 @@ pub(crate) fn run_offscreen(
         // after its round trip out of range counts as revisits too, no loop it drove (the
         // regression review's 600 s X10 run: #631, dormant 220 s, all of that run's revisits)
         {
-            use omsi_sim::traffic::{GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
+            use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-            log::info!("trip ends: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {}; lane_revisits {} by {} vehicles", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), revisits.entries, revisits.vehicles.len());
+            log::info!("trip ends: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), revisits.entries, revisits.vehicles.len());
         }
         for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
