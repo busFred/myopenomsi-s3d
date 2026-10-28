@@ -3468,6 +3468,11 @@ pub struct AiState {
     /// and speeds (`Network::goal_fields`); not recorded, computed again on need.
     #[serde(skip)]
     pub goal_field: Option<std::sync::Arc<GoalField>>,
+    /// A throwaway copy of a car as it would be put down, for a test of where it would stand
+    /// (the game's `spawn_probe`): it plans its way without drawing a trip end (`goal_way`), so
+    /// `GOAL_PICKED` counts real cars only; it chooses at random among the best tier.
+    #[serde(skip)]
+    pub probe: bool,
     /// Lane change in progress.
     pub change: Option<LaneChange>,
     /// Seconds until the next lane change may start.
@@ -3859,7 +3864,7 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     fn rand(&mut self) -> u64 {
@@ -3919,7 +3924,7 @@ impl AiState {
         let kind = l.kind;
         // a random car's choice is the ways on that lead to its trip end (SUMO: a lane with no
         // connection to the route's next edge is a dead lane, no way on for the vehicle)
-        let field = if self.route.is_empty() && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, &next) } else { None };
+        let field = if self.route.is_empty() && !self.probe && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, &next) } else { None };
         let next: Vec<usize> = match &field {
             Some(f) => next.into_iter().filter(|&n| f.to_goal(n).is_finite()).collect(),
             None => next,
@@ -5645,6 +5650,20 @@ mod tests {
             let way = lanes_driven(&mut car, &net, 10);
             assert_eq!(way, vec![0, 1, 3], "seed {seed}: the way {way:?}");
         }
+    }
+
+    #[test]
+    fn a_probe_plans_its_way_without_a_trip_end() {
+        // the game's throwaway copy of a car to be put down (`spawn_probe`): a way on at the fork,
+        // no trip end drawn
+        let net = four_arm_ring();
+        let mut car = AiState::new(0, 0.0, 9);
+        car.probe = true;
+        car.plan_next(&net);
+        assert!(car.planned_next.is_some() && car.goal.is_none(), "{:?} {:?}", car.planned_next, car.goal);
+        let mut real = AiState::new(0, 0.0, 9);
+        real.plan_next(&net);
+        assert!(real.goal.is_some());
     }
 
     #[test]

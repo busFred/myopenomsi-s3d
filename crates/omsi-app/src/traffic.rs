@@ -590,11 +590,13 @@ fn sim_occupants_now<'a>(sim: &'a omsi_traffic::Simulation, ids: &'a [u64], car:
 
 /// The AI vehicle of `class` with `(front, rear, half width)` as it would be made at `pos` facing
 /// `heading` (deg), at distance `at.1` along lane `at.0`, standing: its way the lane and the next
-/// one it plans (`AiState::plan_next`), as `spawn`'s. A car pulling out (`lateral`: its offset
+/// one it plans (`AiState::plan_next`), as `spawn`'s, without a trip end (`AiState::probe`: the
+/// real car draws its own when it is made). A car pulling out (`lateral`: its offset
 /// from the lane and the ramp back onto it, as `advance_pull_out` makes it) stands at that offset,
 /// its way easing back onto the lane (`AiState::lateral_ramp`).
 fn spawn_probe(net: &Network, class: VehicleClass, size: (f32, f32, f32), pos: DVec3, heading: f64, at: (usize, f32), lateral: Option<(f32, f32)>) -> AiVehicle {
     let mut state = AiState::new(at.0, at.1, 0);
+    state.probe = true;
     state.front = size.0;
     state.rear = size.1;
     state.length = size.0 + size.1;
