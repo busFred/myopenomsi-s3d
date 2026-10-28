@@ -590,11 +590,13 @@ fn sim_occupants_now<'a>(sim: &'a omsi_traffic::Simulation, ids: &'a [u64], car:
 
 /// The AI vehicle of `class` with `(front, rear, half width)` as it would be made at `pos` facing
 /// `heading` (deg), at distance `at.1` along lane `at.0`, standing: its way the lane and the next
-/// one it plans (`AiState::plan_next`), as `spawn`'s. A car pulling out (`lateral`: its offset
+/// one it plans (`AiState::plan_next`), as `spawn`'s, without a trip end (`AiState::probe`: the
+/// real car draws its own when it is made). A car pulling out (`lateral`: its offset
 /// from the lane and the ramp back onto it, as `advance_pull_out` makes it) stands at that offset,
 /// its way easing back onto the lane (`AiState::lateral_ramp`).
 fn spawn_probe(net: &Network, class: VehicleClass, size: (f32, f32, f32), pos: DVec3, heading: f64, at: (usize, f32), lateral: Option<(f32, f32)>) -> AiVehicle {
     let mut state = AiState::new(at.0, at.1, 0);
+    state.probe = true;
     state.front = size.0;
     state.rear = size.1;
     state.length = size.0 + size.1;
@@ -3024,8 +3026,9 @@ impl Traffic {
                     guard += 1;
                     let l = &self.net.lanes[d.lane];
                     // the ways a car on the road would take (`AiState::choose_after`): those
-                    // of its group, else those open to cars, else any - only where the
-                    // network ends does it leave the map (filtering by its group alone, the
+                    // of its group, else those open to cars, else any, one of them at random (a
+                    // car out of range has no trip end, `AiState::goal`: nobody sees its way) -
+                    // only where the network ends does it leave the map (filtering by its group alone, the
                     // trucks of Spandau were gone at the first junction whose turn has no
                     // `trucks` rule, and hardly one of them ever came into range)
                     let pool = self.types.iter().find(|t| Arc::ptr_eq(&t.0, &d.ty)).and_then(|t| self.group_uvg[t.3]);

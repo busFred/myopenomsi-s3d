@@ -918,6 +918,8 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 json!(omsi_traffic::sim::Simulation::blinker(v).clamp(0, 3)),
                 // the planned way: filled in when written (clipped to the lane table)
                 Value::Null,
+                // a random car's trip end (`AiState::goal`)
+                v.state.goal.map(|g| json!(g)).unwrap_or(Value::Null),
             ];
             // the way ahead: a scheduled bus follows its route, the others their plan
             let st = &v.state;
@@ -1354,7 +1356,7 @@ fn trace(fixture: &Path, out: &Path, args: &[String]) -> Res<()> {
                 "end": samples.last().map(|s| s.t),
                 "notes": notes,
                 "fields": {
-                    "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null, blinker (0 off, 1 left, 2 right, 3 hazard as shown), intent [turn, lane, lane, ...]|null (the planned way: up to 6 lane ids after the current lane, cut at the first lane missing from \"lanes\"; turn = the turn flag of the first lane on the way, the current one included, that turns: 0 straight, 1 left, 2 right)], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
+                    "v": "full row [id, x, y, heading_deg, speed, why, stop_dist|null, lead_id|null (lead or body_block), wait_for|null (\"P<n>\" a player), impatience, passing, lane, s, held, hold|null, blinker (0 off, 1 left, 2 right, 3 hazard as shown), intent [turn, lane, lane, ...]|null (the planned way: up to 6 lane ids after the current lane, cut at the first lane missing from \"lanes\"; turn = the turn flag of the first lane on the way, the current one included, that turns: 0 straight, 1 left, 2 right), goal|null (a random car's trip end lane, AiState::goal)], sent as [id, mask, values of the fields f>=1 whose bit (f-1) is set] (only what changed since the vehicle's previous frame); k: ids unchanged",
                     "p": "[x, y, state(strs index), decision(strs index)|null, standing since (day time; still = t - since; 0 walking), on_crossing, pace (m/s, 0 not recorded), at_kerb]; the frame's people = previous frame's people at the indices pk, then p. Only people on a carriageway (0.5 m), on a crossing, or waiting at a kerb within 2 m of one (unless --all-people)",
                     "pl": "[x, y, heading_deg, speed, blinker]",
                     "l": "[ctl, light, state] when it changed (state: 0-2 red, 3-5 red+yellow, 6-8 green, 9-11 yellow)",
@@ -4328,6 +4330,11 @@ struct Extra {
     /// recording puts down where the free run has a car is the replay's, as `ovl_nospawn` leaves
     /// out vehicles touching within 3 s of coming on the road).
     pedtouch_nospawn: u64,
+    /// Whole map: a vehicle driving onto a lane by a link that it drove onto before in this
+    /// replay, round a loop of `SHORT_LOOP` m or more (its odometer between the two entries):
+    /// entries and distinct vehicles (a `REVISIT` event each).
+    lane_revisits: u64,
+    revisit_vehicles: u64,
     events: Vec<String>,
 }
 
@@ -4502,6 +4509,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
+    // (the vehicles' lane entries, for `lane_revisits`)
+    let mut revisits = omsi_sim::traffic::LaneRevisits::default();
     let close = |sc: &mut Score, run: Vec<HeadTally>| {
         if run.len() < min_head {
             return;
@@ -4531,6 +4540,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             let now = r.sim.time;
             let fdt = (now - last_frame).clamp(0.0, 1.0);
             last_frame = now;
+            // lane revisits (`LaneRevisits`)
+            for v in r.vehicles.iter() {
+                if let Some(lap) = revisits.see(v.id, &v.state) {
+                    ex.events.push(format!("REVISIT {} t={now:.1} #{} lane {} after {lap:.0} m, goal {:?}", sc.name, v.id, v.state.lane, v.state.goal));
+                }
+            }
+            ex.lane_revisits = revisits.entries;
+            ex.revisit_vehicles = revisits.vehicles.len() as u64;
             for (i, v) in r.vehicles.iter().enumerate() {
                 if v.ease_for.is_none() || v.state.speed >= 0.3 {
                     ease_still.remove(&v.id);
@@ -5102,10 +5119,13 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("zip_capped_outside_reach", format!("{:.0}", e.zip_outside_reach_s)),
         ("pedtouch_nospawn", e.pedtouch_nospawn.to_string()),
         ("removed_far", e.removed_far.to_string()),
+        ("lane_revisits v/n", format!("{}/{}", e.revisit_vehicles, e.lane_revisits)),
     ]
 }
 
 fn add_extra(t: &mut Extra, e: &Extra) {
+    t.lane_revisits += e.lane_revisits;
+    t.revisit_vehicles += e.revisit_vehicles;
     t.close_foe_s += e.close_foe_s;
     t.overlap_nospawn_s += e.overlap_nospawn_s;
     t.unjust_stream_s += e.unjust_stream_s;
@@ -5292,6 +5312,11 @@ fn ab(args: &[String]) -> Res<()> {
         // [round 7 A1] forks with no way open to the vehicle, whole map, all fixtures
         let n = |k: usize| omsi_sim::traffic::FORK_FALLBACKS[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(fork fallbacks, whole map, per call: open but closed beyond {}, another group's {}, no group's {}, rules but not no_cars {}, no_cars {}, none {})", n(0), n(1), n(2), n(3), n(4), n(5));
+        // [X11-1] the random cars' trip ends (`AiState::goal`), whole map, all fixtures, and the
+        // lane revisits (column `lane_revisits`)
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
+        println!("(trip ends, whole map: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles)", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), total.extra.lane_revisits, total.extra.revisit_vehicles);
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
