@@ -597,7 +597,9 @@ fn no_change_for_speed_in_the_last_forty_metres_before_a_junction() {
         let (mut frames, mut changed) = (0, false);
         let r = run(&net, &mut sim, &mut cars, if expect_change { 15.0 } else { 6.0 }, |t, _, cars| {
             probe(t, &mut frames, cars);
-            changed |= cars[1].state.change.is_some() || cars[1].state.lane == 0;
+            // (on the road before the junction: the junction's two pieces lie side by side and
+            // cross nothing, a road of their own, `plan::piece_change_clear`)
+            changed |= (cars[1].state.change.is_some() && cars[1].state.lane <= 1) || cars[1].state.lane == 0;
         });
         assert_eq!(changed, expect_change, "junction at {end} m: the car changed lane = {changed}");
         assert!(r.min_gap > 0.3 && r.hardest_brake < 4.5, "gap {:.2} brake {:.1}", r.min_gap, r.hardest_brake);

@@ -574,7 +574,11 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     if !ahead {
         return None;
     }
-    let gap = (p_f - o_len) - p_e;
+    // (body to body along the merged way: each front measured to the place both ways share,
+    // the stretches' end - the meeting point of the merge, `Crossing::at` + its half metre;
+    // their starts lie where each way first comes within `MEET_DIST`, metres apart along the
+    // road where one way runs in at an angle, and measured from them the gap came out short)
+    let gap = ((o.s + o.front - foe.theirs.1) - o_len) - (c.s + c.front - foe.mine.1);
     if o.speed < STANDING_SPEED && p_f >= 0.0 {
         return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e, red_short });
     }
@@ -2792,6 +2796,35 @@ mod tests {
         let g = resolve(&js, &claims);
         let z = grant_of(&g, 2).zipper.expect("B capped");
         assert!(grant_of(&g, 1).zipper.is_none() && z.foe == 1 && z.arrive < 0.0 && !z.stop, "{g:?}");
+    }
+
+    /// The zipper's gap is body to body along the merged way: both fronts measured to the
+    /// stretches' end (the merge's meeting point), less the leader's length. On the compiled
+    /// merges (a symmetric one and one at a right angle) A is 3 m and B 9 m before the end with
+    /// 4 m bodies: whichever is capped, the gap is its distance to the end less the other's less
+    /// 4 m (on the symmetric merge B is capped at 9 - 3 - 4 = 2 m). And where the two stretches
+    /// start at different distances before their shared end (one way first comes within
+    /// `MEET_DIST` further back), the gap is still 2 m - measured from the starts it was -2 m.
+    #[test]
+    fn the_zipper_gap_is_measured_body_to_body_to_the_merge() {
+        let right_angle = object(&[(&[(-3.0, -10.0), (0.0, 0.0)], 0), (&[(-10.0, 0.0), (0.0, 0.0)], 0), (&[(0.0, 0.0), (10.0, 0.0)], 0)]);
+        for (k, (_, js)) in [zipper_object(), right_angle].into_iter().enumerate() {
+            let to_end = [3.0f32, 9.0];
+            let claims = [zip_claim(&js, 1, 0, to_end[0], 6.0), zip_claim(&js, 2, 1, to_end[1], 6.0)];
+            let g = resolve(&js, &claims);
+            let (capped, z) = [1usize, 2].into_iter().find_map(|v| grant_of(&g, v).zipper.map(|z| (v, z))).expect("one of the pair capped");
+            if k == 0 {
+                assert_eq!(capped, 2, "{g:?}");
+            }
+            let (mine, theirs) = if capped == 1 { (to_end[0], to_end[1]) } else { (to_end[1], to_end[0]) };
+            assert!((z.gap - (mine - theirs - 4.0)).abs() < 1e-3, "merge {k}: gap {:.3}, body to body {:.3}", z.gap, mine - theirs - 4.0);
+        }
+        // (stretches of different lengths sharing their end at 20 m: mine from 12, theirs from 16;
+        // the foe 3 m before the end, in its stretch; I am 9 m before it)
+        let foe = crate::junction::Foe { movement: 1, kind: FoeKind::Merge, mine: (12.0, 20.0), theirs: (16.0, 20.0), yields: true, side: false };
+        let (c, o) = (claim(1, 0, 20.0 - 9.0 - 2.0, 6.0), claim(2, 1, 20.0 - 3.0 - 2.0, 6.0));
+        let z = zipper_cap(&c, &o, &foe, 0.0, 0.0, true, false).expect("capped behind the foe in the stretch");
+        assert!((z.gap - 2.0).abs() < 1e-3, "gap {:.3}, body to body 2.0", z.gap);
     }
 
     /// J11-5 (SUMO's zipper reach and open priority link, `getZipperSpeed`, `havePriority`,

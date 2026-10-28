@@ -357,6 +357,11 @@ pub struct Vehicle {
     /// change starts (LC2013's `changed`); kept with the vehicle, so a keyframe carries it.
     #[serde(default)]
     pub keep_right: f32,
+    /// SUMO LC2013's speed-gain wishes (`mySpeedGainProbabilityLeft/Right`, per side: [0] the
+    /// lane on the left, [1] the one on the right): each grows by `Plan::speed_gain_step`, back
+    /// to 0 when a lane change starts (LC2013's `changed`); kept with the vehicle.
+    #[serde(default)]
+    pub speed_gain: [f32; 2],
     /// Backing up out of a packed queue (`plan::queue_escape`, `AiState::reverse_step`):
     /// (the odometer where it is to stand, fixed when it began or when it was told to
     /// stop; stopping); kept with the vehicle.
@@ -583,6 +588,7 @@ impl Vehicle {
             help_for: None,
             look_ahead_speed: 0.0,
             keep_right: 0.0,
+            speed_gain: [0.0; 2],
             reversing: None,
             lane_end_stop: None,
             unheld_for: 0.0,
@@ -681,9 +687,21 @@ fn cell(p: DVec3) -> (i32, i32) {
 /// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
 pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Milliseconds driven (moving) out of the lane's middle on an in-lane squeeze (`Passing`
+/// with no lane: the lateral offset within the lane, SUMO's sublane `posLat`), every simulation
+/// of the process (diagnostics, `traffic_cases ab`'s `lane_offset_s`).
+pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lane changes of the drivers' own dropped while signalling because their gap check failed
+/// again (`Plan::abort_change`; SUMO's `checkChange` every step), every simulation of the process
+/// (`traffic_cases ab`'s `change_aborted`).
+pub static CHANGES_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
+    /// The bounds of the drivers on the road this frame (`FleetBounds::of`).
+    pub fleet: FleetBounds,
     pub junctions: Junctions,
     pub lights: Vec<TrafficLightController>,
     pub time: f64,
@@ -740,9 +758,71 @@ fn return_look(st: &AiState) -> f32 {
     (st.front + 0.5).max(2.0)
 }
 
+/// SUMO's fleet bounds, `MSVehicleControl`'s `myMaxSpeedFactor`, `myMinDeceleration` and
+/// `myMaxMinGap` (`vehicleDeparted`), that `MSLane::getMaximumBrakeDist` bounds a follower
+/// search by: over the drivers on the road (players with their preset, `PLAYER_PRESET`; rail
+/// vehicles and aircraft are left out of all four, where SUMO leaves rail out of the least
+/// deceleration only), their chosen values -
+/// the seeded jitter in them (`DriverParams::seeded`) - not their class's preset. SUMO keeps
+/// them as running maxima from each vehicle's departure; here they are taken once a frame over
+/// the vehicles there (`Simulation::tick`), which a replay from any keyframe gives alike.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FleetBounds {
+    /// The largest speed factor.
+    pub speed_factor: f32,
+    /// The least deceleration (m/s², `DriverParams::comfort_brake`, the car-following braking
+    /// as SUMO's `decel`).
+    pub decel: f32,
+    /// The largest standing gap (m).
+    pub min_gap: f32,
+    /// The largest time gap (s).
+    pub tau: f32,
+}
+
+impl Default for FleetBounds {
+    /// Nobody on the road: no speed, so no reach.
+    fn default() -> FleetBounds {
+        FleetBounds { speed_factor: 0.0, decel: f32::INFINITY, min_gap: 0.0, tau: 0.0 }
+    }
+}
+
+impl FleetBounds {
+    /// Over the road vehicles in `vehicles` and the `players`.
+    pub fn of(vehicles: &[Vehicle], players: &[PlayerView]) -> FleetBounds {
+        let player = (!players.is_empty()).then(|| DriverParams::preset(PLAYER_PRESET));
+        vehicles.iter().filter(|v| !matches!(v.class, VehicleClass::Rail | VehicleClass::Air)).map(|v| v.params).chain(player).fold(FleetBounds::default(), |b, p| FleetBounds {
+            speed_factor: b.speed_factor.max(p.speed_factor),
+            decel: b.decel.min(p.comfort_brake),
+            min_gap: b.min_gap.max(p.min_gap),
+            tau: b.tau.max(p.tau),
+        })
+    }
+
+    /// `MSLane::getMaximumBrakeDist` at a lane limit of `v_lim` (m/s): (that limit times the
+    /// largest speed factor)² over twice the least deceleration, plus the largest minGap (m;
+    /// SUMO's hard bound of 1000 m too).
+    pub fn max_brake_dist(&self, v_lim: f32) -> f32 {
+        let v = v_lim * self.speed_factor;
+        (v * v / (2.0 * self.decel.max(0.1)) + self.min_gap).min(1000.0)
+    }
+}
+
+/// Where a vehicle with the way `st` stands (its lane must exist): its origin on the way, its
+/// heading that of the chord of its way `HEADING_CHORD` behind and ahead of it (the lane's
+/// where the chord has no length).
+pub fn way_pose(net: &Network, st: &AiState) -> (DVec3, f32) {
+    let p = st.way_point(net, 0.0);
+    let a = st.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
+    let b = st.way_point(net, omsi_sim::traffic::HEADING_CHORD);
+    let d = (b - a).truncate();
+    let heading = if d.length_squared() > 1e-6 { d.x.atan2(d.y).to_degrees() as f32 } else { net.lanes[st.lane].at(st.s).1 };
+    (p, heading)
+}
+
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
+            fleet: FleetBounds::default(),
             junctions: Junctions::compile(net),
             lights,
             time: 0.0,
@@ -901,22 +981,25 @@ impl Simulation {
         out
     }
 
+    /// The people of `people_near(p, r)` in the cells that also meet the box `lo`..`hi` (x, y),
+    /// for a caller that wants only somebody inside that box: the same people a filter by the
+    /// box would keep from `people_near`, without walking the cells beside it.
+    pub fn people_near_in_box(&self, p: DVec3, r: f64, lo: DVec2, hi: DVec2) -> impl Iterator<Item = usize> + '_ {
+        let (cx, cy) = cell(p);
+        let n = (r / GRID).ceil() as i32;
+        let (bx0, by0) = cell(lo.extend(0.0));
+        let (bx1, by1) = cell(hi.extend(0.0));
+        let (x0, x1, y0, y1) = ((cx - n).max(bx0), (cx + n).min(bx1), (cy - n).max(by0), (cy + n).min(by1));
+        (x0..=x1).flat_map(move |x| (y0..=y1).map(move |y| (x, y))).flat_map(|c| self.people_grid.get(&c).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied())
+    }
+
     /// Place every vehicle on the ground from its way.
     pub fn update_positions(&self, net: &Network, vehicles: &mut [Vehicle]) {
         for v in vehicles.iter_mut() {
             if net.lanes.get(v.state.lane).is_none() {
                 continue;
             }
-            let p = v.state.way_point(net, 0.0);
-            let a = v.state.way_point(net, -omsi_sim::traffic::HEADING_CHORD);
-            let b = v.state.way_point(net, omsi_sim::traffic::HEADING_CHORD);
-            let d = (b - a).truncate();
-            v.pos = p;
-            if d.length_squared() > 1e-6 {
-                v.heading = d.x.atan2(d.y).to_degrees() as f32;
-            } else {
-                v.heading = net.lanes[v.state.lane].at(v.state.s).1;
-            }
+            (v.pos, v.heading) = way_pose(net, &v.state);
         }
     }
 
@@ -1206,6 +1289,7 @@ impl Simulation {
         self.changes_started.clear();
         self.held_at_red = 0;
         self.measure_players(dt);
+        self.fleet = FleetBounds::of(vehicles, &self.players);
         for v in vehicles.iter_mut() {
             v.external.apply(&mut v.state, &v.params);
         }
@@ -1807,6 +1891,9 @@ impl Simulation {
     }
 
     fn act(&mut self, net: &Network, vehicles: &mut [Vehicle], i: usize, plan: Plan, dt: f32) {
+        if vehicles[i].passing.is_some_and(|p| p.lane.is_none() && !p.aborted && p.wait <= 0.0) && vehicles[i].state.speed >= crate::driver::STANDING_SPEED {
+            LANE_OFFSET_MS.fetch_add((dt * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let now = self.time;
         let sidestep = self.sidestep(vehicles, i, dt);
         let creep = self.settle_creep(vehicles, i, dt);
@@ -1843,6 +1930,14 @@ impl Simulation {
             if let Some(r) = plan.keep_right_rate {
                 v.keep_right += r * dt;
             }
+            // (and the speed-gain wishes, `plan::SpeedGainStep`)
+            for (k, step) in plan.speed_gain_step.iter().enumerate() {
+                match *step {
+                    Some(plan::SpeedGainStep::Grow(r)) => v.speed_gain[k] += r * dt,
+                    Some(plan::SpeedGainStep::Fade(f)) => v.speed_gain[k] *= f.powf(dt),
+                    None => {}
+                }
+            }
         }
         let v = &mut vehicles[i];
         v.last = Decision { why: plan.why, lead: plan.lead, lead_seen: plan.lead_seen, lead_id, stop: plan.stop, held: plan.held, hold: plan.hold, wait_for, body_block: plan.body_block };
@@ -1876,27 +1971,37 @@ impl Simulation {
             self.changes_started.push((to, s_to));
             true
         };
+        if plan.abort_change && v.state.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
+            v.state.drop_change();
+            CHANGES_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match plan.start {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
-            Some(Start::Bypass { to, dir, out_len }) => {
+            Some(Start::Bypass { to, dir, out_len, full_lock, round }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
-                    v.state.start_bypass(net, to, dir, out_len);
+                    v.state.start_bypass(net, to, dir, out_len, full_lock, round);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                     v.stopped = 0.0;
+                    if let Some(w) = plan.change_why {
+                        CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             Some(Start::RouteChange { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_route_change(net, to, dir);
                     v.keep_right = 0.0;
+                    v.speed_gain = [0.0; 2];
                 }
             }
             Some(Start::Pass(p)) => {

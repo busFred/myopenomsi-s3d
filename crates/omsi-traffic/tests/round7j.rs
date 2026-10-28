@@ -263,6 +263,10 @@ fn j73_a_lane_ending_past_an_object_is_left_on_the_approach() {
 /// [Q8-4] The last-resort stop before a lane's end, with no gap in the lane beside (a queue
 /// standing there): once placed it is kept until the car stands - it flicked on and off frame by
 /// frame in the last metre (an 8 m/s² brake-light flicker) - and the car stands before the end.
+/// (The change it signals at once into the 25 m before the queue is dropped while it signals:
+/// at 12 m/s the queue is within the gap rule's room ahead before the move would begin. Beside the
+/// standing queue it then drops back behind each car there in turn, LC2013's `informLeader`
+/// follow speed, `drop_back`, and reaches the latch after about 130 s: the run is 150 s.)
 #[test]
 fn q84_the_last_resort_stop_at_a_lane_end_is_a_latch() {
     let net = lane_drop(&[3]);
@@ -276,7 +280,7 @@ fn q84_the_last_resort_stop_at_a_lane_end_is_a_latch() {
         cars.push(c);
     }
     let (mut placed, mut dropped, mut on_closed, mut hardest) = (false, 0usize, false, 0.0f32);
-    run(&net, &mut sim, &mut cars, 30.0, |_, cars| {
+    run(&net, &mut sim, &mut cars, 150.0, |_, cars| {
         let Some(me) = cars.iter().find(|c| c.id == 1) else { return };
         on_closed |= me.state.lane == 3;
         let stop = me.last.why == omsi_traffic::Why::Merge;

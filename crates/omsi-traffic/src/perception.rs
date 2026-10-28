@@ -232,9 +232,18 @@ pub struct NeighbourView {
     pub lane: usize,
     /// 1 left, 2 right.
     pub dir: i32,
-    /// Nearest vehicle ahead there: (gap from my front, its speed).
+    /// Nearest vehicle ahead there: (gap from my front, its speed) - on that lane, or on the
+    /// lanes it runs into within `REACT_TO_STOPPED_DISTANCE` past the place beside me (at a fork
+    /// the branch with the most room). SUMO looks for the neighbour's leader past the end of
+    /// the lane beside only within the brake gap and minGap (`MSLaneChanger::getRealLeader`); the
+    /// longer look here is ours, so that the speed anticipated there (`plan::anticipated_speeds`)
+    /// sees a queue standing further on.
     pub ahead: Option<(f32, f32)>,
-    /// Nearest vehicle behind there: (gap to my rear, its speed).
+    /// The vehicle behind there that misses the most of the gap my change accepts from it
+    /// (`plan::accepted_gap`, SUMO's `MSCriticalFollowerDistanceInfo`: the largest missing rear
+    /// gap): (gap to my rear, its speed) - on that lane, or back over the lanes leading into it as
+    /// far as a follower can matter (`plan::walk_back` to `plan::change_follower_reach`, SUMO's
+    /// `getFollowersOnConsecutive`).
     pub behind: Option<(f32, f32)>,
     /// That vehicle's index, when it is an AI vehicle (the one asked to make room,
     /// `plan`'s cooperation).
@@ -303,6 +312,19 @@ pub struct Perception {
     pub v_want: f32,
     /// Where my lane ends for me ahead (`lane_end`).
     pub lane_end: Option<LaneEnd>,
+    /// While a bypass from rest signals: the thing it was started round
+    /// (`LaneChange::round`), measured along my lane's way without the change laid on it
+    /// (`bypassed_on_way`); `None` once it is no longer on that way.
+    pub bypassed: Option<Bypassed>,
+}
+
+/// The thing a bypass signalling was started round, along the car's lane's way without the
+/// change (`Perception::bypassed`).
+#[derive(Debug, Clone)]
+pub struct Bypassed {
+    pub lead: Headway,
+    /// Every body in the corridor of that way, nearest first (as `Perception::ahead`).
+    pub ahead: Vec<(f32, f32, f32)>,
 }
 
 /// The lanes ahead along the car's way with the distance from the origin to each one's
@@ -585,8 +607,7 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
 /// way its middle is by those lanes, NaN if not known), once each; with how far along my way
 /// (m) the farthest one found there reaches, at most `look`: the way need be sampled no
 /// further than that, `body_look` and the people's and the players' reach.
-fn body_candidates(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], look: f32, body_look: f32) -> (Vec<(usize, bool, f32)>, f32) {
-    let me = &vehicles[i];
+fn body_candidates(sim: &Simulation, me: &Vehicle, lanes: &[(usize, f32)], look: f32, body_look: f32) -> (Vec<(usize, bool, f32)>, f32) {
     let st = &me.state;
     let mut far = 0.0f32;
     // (once each, the first found: on my way's lanes, nearest lane first, then the others near
@@ -634,9 +655,9 @@ fn body_candidates(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(u
 /// out, passing). A car changing lanes is where its body is, not on its target lane at its
 /// middle from the first frame. Not my lead: my follower that has me as its lead, the standing thing I am
 /// passing, and, of two bodies blocking each other, the one with the lower id's for the
-/// higher. (nearest of the lane kind, nearest body)
-fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], way: &WayPts, look: f32, body_look: f32, cand: Vec<(usize, bool, f32)>, ahead: &mut Vec<(f32, f32, f32)>) -> (Option<Headway>, Option<Headway>) {
-    let me = &vehicles[i];
+/// higher. (nearest of the lane kind, nearest body) `me` is vehicle `i` as it is, or as it
+/// would be without its lane change (`bypassed_on_way`).
+fn lead_by_bodies(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me: &Vehicle, lanes: &[(usize, f32)], way: &WayPts, look: f32, body_look: f32, cand: Vec<(usize, bool, f32)>, ahead: &mut Vec<(f32, f32, f32)>) -> (Option<Headway>, Option<Headway>) {
     let st = &me.state;
     // (once it pulls out: while it signals the thing is its lead)
     let passing = me.passing.filter(|p| !p.aborted && p.wait <= 0.0);
@@ -1846,9 +1867,13 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let allowed = crate::access::is_open_at(net, nb, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
-    let mut behind: Option<(f32, f32)> = None;
+    let behind: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
     let mut behind_id: Option<usize> = None;
-    let mut behind_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
+    let player_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
+    let mut behind_min_gap = player_min_gap;
+    // (the follower kept is the one missing the most of the gap my change accepts from it,
+    // `plan::accepted_gap`: SUMO's `MSCriticalFollowerDistanceInfo`, the largest missing rear gap)
+    let missing: std::cell::Cell<Option<f32>> = std::cell::Cell::new(None);
     let mut foreign = false;
     // (d_rel: the other's origin relative to the place beside me; front/rear its extents; the
     // vehicle's index, None for a player)
@@ -1863,22 +1888,25 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             }
         } else {
             let gap = -d_rel - front - st.rear;
-            if behind.map(|b| gap < b.0).unwrap_or(true) {
-                behind = Some((gap, speed));
+            let min_gap = who.and_then(|k| vehicles.get(k)).map_or(player_min_gap, |o| o.params.min_gap);
+            let miss = crate::plan::accepted_gap(me, min_gap, speed, st.speed) - gap;
+            if missing.get().is_none_or(|m| miss > m) {
+                missing.set(Some(miss));
+                behind.set(Some((gap, speed)));
                 behind_id = who;
-                if let Some(o) = who.and_then(|k| vehicles.get(k)) {
-                    behind_min_gap = o.params.min_gap;
-                }
+                behind_min_gap = min_gap;
             }
         }
     };
-    let lane_users = |l: usize, offset: f32, note: &mut dyn FnMut(f32, f32, f32, f32, bool, Option<usize>)| {
+    // (`passers`: a vehicle passing against the lane's direction there marks the lane
+    // `foreign`; only on the lane and the lanes leading straight into it, where one is still near)
+    let lane_users = |l: usize, offset: f32, passers: bool, note: &mut dyn FnMut(f32, f32, f32, f32, bool, Option<usize>)| {
         for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             if occ.vehicle == i {
                 continue;
             }
             let o = &vehicles[occ.vehicle];
-            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign, Some(occ.vehicle));
+            note(occ.s + offset - s_b, o.state.front, o.state.rear, o.state.speed, occ.foreign && passers, Some(occ.vehicle));
         }
         // the players' vehicles are there like anybody else
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -1886,14 +1914,74 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             note(s + offset - s_b, p.half_len, p.half_len, p.speed, false, None);
         }
     };
-    lane_users(nb, 0.0, &mut note);
-    // behind, on the lanes leading in (within 80 m)
-    for &p in net.prev.get(nb).map(|v| v.as_slice()).unwrap_or(&[]) {
-        lane_users(p, -net.lanes[p].length(), &mut note);
-    }
-    // ahead, on the first lane after
-    if let Some(&n) = lane.next.first() {
-        lane_users(n, lane.length(), &mut note);
+    lane_users(nb, 0.0, true, &mut note);
+    // behind, back over the lanes leading in as far as a follower can matter (SUMO's
+    // `getFollowersOnConsecutive` to the lane's `getMaximumBrakeDist`: `plan::walk_back` to
+    // `plan::change_follower_reach`); a junction object's pieces are a few metres each, and a
+    // follower two pieces back at the lane's speed is the change's follower (every lane leading in
+    // within the reach is read: a faster vehicle further back can miss more of its gap than a
+    // nearer one, so no branch is cut short)
+    crate::plan::walk_back(net, nb, s_b, crate::plan::change_follower_reach(net, sim, nb, me), |l, start| {
+        if l != nb {
+            let passers = net.prev.get(nb).is_some_and(|v| v.contains(&l));
+            lane_users(l, start + s_b, passers, &mut note);
+        }
+        true
+    });
+    // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
+    // beside me (a look of our own beyond SUMO's brake gap, `NeighbourView::ahead`: the speed
+    // anticipated there is the safe speed behind a queue standing 50 m on, which speed gain and
+    // keep right compare); at a fork the branch with the most room (the branch the car will take
+    // there is not chosen yet)
+    if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
+        let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
+            let mut best: Option<(f32, f32)> = None;
+            let mut put = |d_rel: f32, rear: f32, speed: f32| {
+                if d_rel >= 0.0 {
+                    let gap = d_rel - rear - st.front;
+                    if best.is_none_or(|b| gap < b.0) {
+                        best = Some((gap, speed));
+                    }
+                }
+            };
+            for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if occ.vehicle != i {
+                    let o = &vehicles[occ.vehicle];
+                    put(occ.s + offset - s_b, o.state.rear, o.state.speed);
+                }
+            }
+            for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let pl = &sim.players[k];
+                put(ps + offset - s_b, pl.half_len, pl.speed);
+            }
+            best
+        };
+        // (the branch with the most room: a way free to the distance, or ending, beats any
+        // vehicle; else the furthest vehicle)
+        let reach = s_b + REACT_TO_STOPPED_DISTANCE;
+        let starts: Vec<(usize, f32)> = lane.next.iter().map(|&n| (n, lane.length())).collect();
+        let (mut free, mut most) = (false, None::<(f32, f32)>);
+        walk_ahead(net, &starts, NEIGHBOUR_AHEAD_LANES, |l, at, last| {
+            if free {
+                return false;
+            }
+            if let Some(a) = first(l, at) {
+                if most.is_none_or(|m| a.0 > m.0) {
+                    most = Some(a);
+                }
+                return false;
+            }
+            if at + net.lanes[l].length() >= reach || last || net.lanes[l].next.is_empty() {
+                free = true;
+                return false;
+            }
+            true
+        });
+        if let Some(a) = most.filter(|_| !free) {
+            if ahead.is_none_or(|x| a.0 < x.0) {
+                ahead = Some(a);
+            }
+        }
     }
     let runs_on = net.reach.get(nb).copied().unwrap_or(lane.length()) - s_b;
     // a turn the lane leads into within 150 m
@@ -1906,8 +1994,49 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         d += net.lanes[n].length();
         cur = n;
     }
-    Some(NeighbourView { lane: nb, dir, ahead, behind, behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+    Some(NeighbourView { lane: nb, dir, ahead, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
+
+/// Walks every way on from the lanes `starts` (each a lane and the metres to its start), at
+/// most `depth` lanes further: `visit(lane, at, last)` is called once per lane and number of
+/// lanes walked, with the furthest `at` any way enters that lane there (`last`: the walk may go no
+/// lane further), and the walk goes on into the lane's next ones where it returns true. What a
+/// way finds ahead (the gap to a vehicle, a free run) grows with how far on it enters a lane, so
+/// the furthest entry stands for every nearer one: the walk is the lanes times `depth`, not the
+/// ways, whose number doubles at every fork (a junction object's pieces fork and rejoin metre by
+/// metre).
+pub(crate) fn walk_ahead(net: &Network, starts: &[(usize, f32)], depth: usize, mut visit: impl FnMut(usize, f32, bool) -> bool) {
+    let mut layer: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
+    for &(l, at) in starts {
+        let e = layer.entry(l).or_insert(at);
+        *e = e.max(at);
+    }
+    for k in 0..=depth {
+        let mut next: std::collections::BTreeMap<usize, f32> = std::collections::BTreeMap::new();
+        for (&l, &at) in &layer {
+            if visit(l, at, k == depth) {
+                let end = at + net.lanes[l].length();
+                for &n in &net.lanes[l].next {
+                    let e = next.entry(n).or_insert(end);
+                    *e = e.max(end);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        layer = next;
+    }
+}
+
+/// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): there it bounds the strategic change round a
+/// stopped leader on the car's own lane; here the lane beside is looked along this far past the
+/// place beside me for its leader (`NeighbourView::ahead`, a distance of our own taken from it)
+/// and the people in a lane's width are looked for this far (`plan::person_ahead`).
+pub const REACT_TO_STOPPED_DISTANCE: f32 = 100.0;
+/// The lanes beside looked along for their leader (`NeighbourView::ahead`) are at most this
+/// many deep (junction pieces of a metre each come in chains).
+const NEIGHBOUR_AHEAD_LANES: usize = 24;
 
 /// Why my lane ends for me (`LaneEnd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2105,6 +2234,75 @@ fn letting_out(sim: &Simulation, me: &Vehicle) -> Option<f32> {
     best
 }
 
+/// What lies along the way `lanes` of `me` (vehicle `i`, as it is or without its lane change):
+/// the way sampled once for the bodies, the players and the people (`way`); the nearest vehicle
+/// of the lane kind and the nearest body across it (`lead_by_bodies`), the nearest player's
+/// vehicle (`player_on_way`, only with one within 180 m), the parked car blocking and the swerve
+/// round one protruding (`parked_on_way`); and every body in the corridor, nearest first
+/// (`Perception::ahead`).
+struct Corridor {
+    way: WayPts,
+    on_lane: Option<Headway>,
+    body: Option<Headway>,
+    player: Option<Headway>,
+    parked: Option<Headway>,
+    swerve: Option<f32>,
+    ahead: Vec<(f32, f32, f32)>,
+}
+
+fn corridor(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me: &Vehicle, lanes: &[(usize, f32)], look: f32) -> Corridor {
+    let st = &me.state;
+    let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
+    let people_reach = people_reach(st.speed) + st.front;
+    let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
+    let (cand, far) = body_candidates(sim, me, lanes, look, body_look);
+    let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });
+    let way = WayPts::sample(net, st, upto);
+    let mut ahead = Vec::new();
+    let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, me, lanes, &way, look, body_look, cand, &mut ahead);
+    let player = if player_near { player_on_way(sim, me, &way, look) } else { None };
+    if let Some(h) = player {
+        ahead.push((h.gap, h.gap + h.length, h.speed));
+    }
+    let (parked, swerve) = parked_on_way(sim, me, lanes);
+    if let Some(h) = parked {
+        ahead.push((h.gap, h.gap + h.length, 0.0));
+    }
+    ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Corridor { way, on_lane, body, player, parked, swerve, ahead }
+}
+
+/// The thing the bypass `c` of vehicle `i` was started round (`LaneChange::round`: a vehicle
+/// or player by its id, a parked car as the nearest one blocking), where it is now along my
+/// lane's way without the change laid on it, from the pose the car has on that way
+/// (`sim::way_pose`) - the way and pose the bypass was planned on
+/// (`plan::bypass_start`) - by the same tests as the lead (`corridor`): `None` when it has gone
+/// from that way. With it, every body in the corridor of that way (what `Perception::ahead` was
+/// when the bypass started: what stands beyond the thing, `plan::obstacle_run`). While the bypass
+/// signals, the way with the change laid on it bends out past the thing, and its lead can be the
+/// target lane's car.
+fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, c: &omsi_sim::traffic::LaneChange) -> Option<Bypassed> {
+    let mut me = vehicles[i].clone();
+    me.state.drop_change();
+    (me.pos, me.heading) = crate::sim::way_pose(net, &me.state);
+    let st = &me.state;
+    let look = look_ahead(st.speed);
+    let lanes = way_lanes(net, st, 220.0);
+    let cor = corridor(net, sim, vehicles, i, &me, &lanes, look);
+    let lead = match c.round {
+        None => cor.parked,
+        Some(id) if id >= crate::sim::PLAYER_ID_BASE => cor.player.filter(|h| matches!(h.what, Seen::Player(p) if crate::sim::PLAYER_ID_BASE + p as u64 == id)),
+        Some(id) => {
+            // (that vehicle alone: another may have come nearer)
+            let j = vehicles.iter().position(|o| o.id == id)?;
+            let on_way = lanes.iter().any(|&(l, d0)| d0 <= look && sim.occupancy.get(&l).is_some_and(|v| v.iter().any(|o| o.vehicle == j)));
+            let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &me, &lanes, &cor.way, look, look, vec![(j, on_way, f32::NAN)], &mut Vec::new());
+            on_lane.or(body)
+        }
+    };
+    lead.map(|lead| Bypassed { lead, ahead: cor.ahead })
+}
+
 /// Everything vehicle `i` sees this frame.
 pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Perception {
     let me = &vehicles[i];
@@ -2120,22 +2318,9 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     if air {
         p.leader = leader_on_way(sim, vehicles, i, &p.way, look);
     } else {
-        // the way ahead, sampled once for the bodies, the players and the people
-        let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
-        let people_reach = people_reach(st.speed) + st.front;
-        let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
-        let (cand, far) = body_candidates(sim, vehicles, i, &p.way, look, body_look);
-        let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });
-        let way = WayPts::sample(net, st, upto);
-        let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &p.way, &way, look, body_look, cand, &mut p.ahead);
-        p.leader = on_lane;
-        if player_near {
-            let pl = player_on_way(sim, me, &way, look);
-            if let Some(h) = pl {
-                p.ahead.push((h.gap, h.gap + h.length, h.speed));
-            }
-            p.leader = Headway::nearer(p.leader, pl);
-        }
+        let Corridor { way, on_lane, body, player, parked, swerve, ahead } = corridor(net, sim, vehicles, i, me, &p.way, look);
+        p.ahead = ahead;
+        p.leader = Headway::nearer(on_lane, player);
         if let Some(h) = body {
             // a body across the way replaces the lead only when clearly nearer
             if p.leader.map(|l| h.gap < l.gap - 0.5).unwrap_or(true) {
@@ -2145,11 +2330,6 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
                 p.leader = Some(h);
             }
         }
-        let (parked, swerve) = parked_on_way(sim, me, &p.way);
-        if let Some(h) = parked {
-            p.ahead.push((h.gap, h.gap + h.length, 0.0));
-        }
-        p.ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.leader = Headway::nearer(p.leader, parked);
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
         // the shift past people beside the lane, towards the middle only while
@@ -2182,15 +2362,18 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
         p.letting_out = letting_out(sim, me);
         if lane.kind == LaneKind::Street && !me.is_rail() {
-            if let Some(l) = lane.left {
+            // (a junction object's piece has no `left`/`right`: the piece of the object laid
+            // beside it there, `Network::piece_beside`)
+            let (left, right) = if lane.source == 2 { (net.piece_beside(st.lane, st.s, 1), net.piece_beside(st.lane, st.s, 2)) } else { (lane.left, lane.right) };
+            if let Some(l) = left {
                 p.left = neighbour(net, sim, vehicles, i, l, 1);
             }
-            if let Some(r) = lane.right {
+            if let Some(r) = right {
                 p.right = neighbour(net, sim, vehicles, i, r, 2);
             }
             // the oncoming lane matters behind something standing, or while out on it
             let standing = p.leader.map(|l| l.standing_obstacle() && l.gap < 45.0).unwrap_or(false);
-            if (standing || me.passing.is_some()) && lane.left.is_none() && lane.right.is_none() {
+            if (standing || me.passing.is_some()) && left.is_none() && right.is_none() {
                 let obstacle = p.leader.map(|l| l.gap + l.length).unwrap_or(10.0);
                 let pass_len = obstacle + st.front + st.rear + 6.0;
                 p.oncoming = oncoming(net, sim, vehicles, i, pass_len);
@@ -2202,6 +2385,9 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     if lane.kind == LaneKind::Street && !me.is_rail() && (lane.left.is_some() || lane.right.is_some()) {
         let look = crate::plan::lane_end_look(me.look_ahead_speed.max(st.speed), true, me);
         p.lane_end = lane_end(net, sim, me, &p.way, look);
+    }
+    if let Some(c) = st.change.filter(|c| c.bypass && c.wait > 0.0 && c.t <= 0.0 && !air) {
+        p.bypassed = bypassed_on_way(net, sim, vehicles, i, &c);
     }
     p
 }
@@ -2371,5 +2557,64 @@ mod signal_tests {
         // the same red line on the straight run holds it (the left-turn waiting area)
         let (net, sim) = object((0, 1), false);
         assert_eq!(signal_ahead(&net, &sim, &way, 2.0).map(|s| s.light), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod walk_ahead_tests {
+    use super::*;
+    use glam::DVec3;
+    use omsi_sim::traffic::{LaneBuilder, LaneKind};
+
+    /// `n` diamonds of 1 m pieces in a row (each forks into two pieces that rejoin: 2^n ways),
+    /// the lanes linked by hand: lane 0 the start; diamond k is lanes 3k+1, 3k+2 (the branches)
+    /// and 3k+3 (the join).
+    fn diamonds(n: usize) -> Network {
+        let mut net = Network::default();
+        let piece = |x: f64| LaneBuilder::polyline(vec![DVec3::new(x, 0.0, 0.0), DVec3::new(x + 1.0, 0.0, 0.0)], LaneKind::Street, 3.0);
+        net.lanes.push(piece(0.0));
+        for k in 0..n {
+            let x = 1.0 + 2.0 * k as f64;
+            net.lanes.push(piece(x));
+            net.lanes.push(piece(x));
+            net.lanes.push(piece(x + 1.0));
+            let (a, b, j, prev) = (3 * k + 1, 3 * k + 2, 3 * k + 3, if k == 0 { 0 } else { 3 * k });
+            net.lanes[prev].next = vec![a, b];
+            net.lanes[a].next = vec![j];
+            net.lanes[b].next = vec![j];
+        }
+        net
+    }
+
+    /// `walk_ahead` visits each lane at most once per number of lanes walked, never more than
+    /// `depth` lanes on, and with the furthest entry: on 20 diamonds (2^20 ways) and depth 24 it
+    /// makes at most (lanes) x (depth + 1) visits, the last layer marked `last`, and the join of
+    /// diamond k is entered 2k + 2 m on.
+    #[test]
+    fn walk_ahead_is_bounded_by_lanes_and_depth() {
+        let net = diamonds(20);
+        let depth = 24;
+        let mut visits: Vec<(usize, f32, bool)> = Vec::new();
+        walk_ahead(&net, &[(0, 0.0)], depth, |l, at, last| {
+            visits.push((l, at, last));
+            true
+        });
+        assert!(visits.len() <= net.lanes.len() * (depth + 1), "{} visits", visits.len());
+        // (layer by layer: the start, then branches and joins alternate - the join of diamond k
+        // is layer 2k + 2 - so depth 24 ends at the twelfth join, lane 36, marked last)
+        assert_eq!(visits.len(), 1 + 2 * 12 + 12, "{visits:?}");
+        assert!(visits.iter().all(|&(l, _, last)| last == (l == 3 * 11 + 3)), "{visits:?}");
+        for k in 0..12 {
+            let j = 3 * k + 3;
+            let at = visits.iter().find(|v| v.0 == j).expect("join visited").1;
+            assert!((at - (2.0 * k as f32 + 2.0)).abs() < 1e-3, "join {j} at {at}");
+        }
+        // (a visit that returns false stops that way: nothing past the first diamond)
+        let mut n = 0;
+        walk_ahead(&net, &[(0, 0.0)], depth, |l, _, _| {
+            n += 1;
+            l == 0
+        });
+        assert_eq!(n, 3);
     }
 }

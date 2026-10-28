@@ -274,6 +274,35 @@ fn removal_rule(why: &str) -> RemoveRule {
     }
 }
 
+/// Asks every entry of `pending` once (`advance`: whether it is still pending), in order, and
+/// keeps those still pending: one that cannot go holds back none after it (SUMO retries every
+/// parked vehicle each step, `MSVehicleTransfer::checkInsertions`).
+fn retry_each<T>(pending: Vec<T>, mut advance: impl FnMut(&T) -> bool) -> Vec<T> {
+    pending.into_iter().filter(|p| advance(p)).collect()
+}
+
+#[cfg(test)]
+mod retry_each_tests {
+    use super::retry_each;
+
+    /// H9-1: every pending pull-out is asked on every call, in order; one whose way out does
+    /// not clear stays pending and holds back nobody after it; the ones that went are dropped.
+    #[test]
+    fn every_pending_pull_out_is_asked_each_call() {
+        let mut asked = Vec::new();
+        // (1 and 3 cannot go yet, 2 and 4 go)
+        let keep = retry_each(vec![1, 2, 3, 4], |&k| {
+            asked.push(k);
+            k % 2 == 1
+        });
+        assert_eq!(asked, vec![1, 2, 3, 4], "every entry asked, the blocked first one too");
+        assert_eq!(keep, vec![1, 3]);
+        // (next call: 1 still blocked, 3 goes)
+        let keep = retry_each(keep, |&k| k == 1);
+        assert_eq!(keep, vec![1]);
+    }
+}
+
 /// A parked object that signals to pull out: which, its AI type, the
 /// lane point it leaves onto and its offset there, its body's extents, when its signalling time
 /// has run (`Traffic::time`), its seed.
@@ -1048,8 +1077,8 @@ pub struct Traffic {
     auto_saves: (u32, f32),
     /// When the cars were last looked over for two inside each other (`time`).
     overlap_checked: f32,
-    /// A parked object signalling to pull out (`advance_pull_out`).
-    pending_pull_out: Option<PendingPullOut>,
+    /// The parked objects signalling to pull out (`advance_pull_out`), each asked every call.
+    pending_pull_out: Vec<PendingPullOut>,
 }
 
 /// At most this many minutes of traffic are saved by themselves in a session (a car stuck,
@@ -1716,7 +1745,7 @@ impl Traffic {
             stuck_saved: Default::default(),
             auto_saves: (0, 0.0),
             overlap_checked: 0.0,
-            pending_pull_out: None,
+            pending_pull_out: Vec::new(),
         };
         t.sort_parked(parked_cars, lanes);
         t.set_group_bodies();
@@ -2561,8 +2590,9 @@ impl Traffic {
         }
     }
 
-    /// The parked object that signals to pull out (`pending_pull_out`): once its signalling
-    /// time has run and the one pull-out rule passes (`plan::pull_out_clear`: every vehicle
+    /// Asks one parked object of `pending_pull_out` (`pp`) whether it pulls out now, and
+    /// returns whether it is still pending (false: it pulled out, or its object is gone). Once
+    /// its signalling time has run and the one pull-out rule passes (`plan::pull_out_clear`: every vehicle
     /// driving up the lane, the players too, beyond its own secure gap; nobody on the strip its
     /// body sweeps from its offset onto the lane) and its lane point is clear (`spawn_clear`),
     /// it leaves the kerb: the parked object goes (its space stays empty), the AI car of the
@@ -2572,15 +2602,14 @@ impl Traffic {
     /// waits at the offset. The parked object is scenery and shows no indicator, a limit of the
     /// scenery objects: the signalling is only the time that runs before the rule is asked, and
     /// the lamp lights (left indicator) from the frame the AI car replaces the object.
-    fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
-        let Some(pp) = self.pending_pull_out.clone() else { return };
+    fn advance_pull_out(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3, pp: &PendingPullOut) -> bool {
+        let pp = pp.clone();
         let parked = world.parked_objects.lock().get(&pp.key).map(|p| p.pos);
         let Some(ppos) = parked else {
-            self.pending_pull_out = None;
-            return;
+            return false;
         };
         if self.time < pp.ready_at {
-            return;
+            return true;
         }
         let ramp = omsi_traffic::plan::bypass_min_len(pp.front + pp.rear, pp.lat);
         let on_lane = |lane: usize| -> Vec<(f32, f32, f32, omsi_traffic::DriverParams)> {
@@ -2588,15 +2617,14 @@ impl Traffic {
         };
         let followers = omsi_traffic::plan::pull_out_followers(&self.net, &self.sim, pp.lane, pp.s, pp.rear, &on_lane);
         if !omsi_traffic::plan::pull_out_clear(&self.net, &self.sim, &followers, pp.lane, pp.s, pp.lat, pp.front, pp.rear, pp.half_w, ramp) {
-            return;
+            return true;
         }
         let (q, h) = self.net.lanes[pp.lane].at(pp.s);
         if !self.spawn_clear(&pp.ty, q, h as f64) {
-            return;
+            return true;
         }
-        self.pending_pull_out = None;
         if world.depart_parked(renderer, scene, pp.key).is_none() {
-            return;
+            return false;
         }
         if let Some(list) = self.parked.get_mut(&pp.lane) {
             if let Some(j) = (0..list.len()).min_by(|&a, &b| (list[a].s - pp.s).abs().total_cmp(&(list[b].s - pp.s).abs())) {
@@ -2619,16 +2647,20 @@ impl Traffic {
         if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
             log::info!("parked car {} ({}) at ({:.1}, {:.1}) pulls out as car {id}, {:.1} m right of lane {}", pp.key, pp.ty.def.path.display(), ppos.x, ppos.y, pp.lat, pp.lane);
         }
+        false
     }
 
-    /// Now and then (`PULL_OUT_CHANCE` per call, called with every population pass, about every
-    /// two seconds) a car parked at the kerb 25-180 m from the player is chosen to drive off: it
-    /// becomes `pending_pull_out` (`advance_pull_out`).
+    /// Every parked object signalling to pull out is asked again on every call (`retry_each`;
+    /// SUMO retries every parked vehicle each step, `MSVehicleTransfer::checkInsertions`): one
+    /// whose way out does not clear holds back nobody else's. Now and then (`PULL_OUT_CHANCE` per call,
+    /// called with every population pass, about every two seconds) another car parked at the
+    /// kerb 25-180 m from the player is chosen to drive off: it joins `pending_pull_out`
+    /// (`advance_pull_out`).
     pub fn pull_out_parked(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, center: DVec3) {
-        if self.pending_pull_out.is_some() {
-            self.advance_pull_out(world, renderer, scene, center);
-            return;
-        }
+        let pending = std::mem::take(&mut self.pending_pull_out);
+        let keep = retry_each(pending, |pp| self.advance_pull_out(world, renderer, scene, center, pp));
+        let mut added = std::mem::replace(&mut self.pending_pull_out, keep);
+        self.pending_pull_out.append(&mut added);
         if self.rand_f() >= PULL_OUT_CHANCE {
             return;
         }
@@ -2637,9 +2669,9 @@ impl Traffic {
             .parked_objects
             .lock()
             .iter()
-            .filter(|(_, p)| {
+            .filter(|(k, p)| {
                 let d = (p.pos - center).truncate().length();
-                (25.0..180.0).contains(&d)
+                (25.0..180.0).contains(&d) && !self.pending_pull_out.iter().any(|pp| pp.key == **k)
             })
             .map(|(k, p)| (*k, p.clone()))
             .collect();
@@ -2698,7 +2730,7 @@ impl Traffic {
             let (front, rear, half_w) = extents(&ty, 12.0);
             let seed = self.rand();
             let ready_at = self.time + 2.0 + (seed % 1000) as f32 / 400.0;
-            self.pending_pull_out = Some(PendingPullOut { key, ty, lane: l, s, lat, front, rear, half_w, ready_at, seed });
+            self.pending_pull_out.push(PendingPullOut { key, ty, lane: l, s, lat, front, rear, half_w, ready_at, seed });
             if debug {
                 log::info!("parked car {key} at ({:.1}, {:.1}) signals to pull out, {lat:.1} m right of lane {l}", p.pos.x, p.pos.y);
             }

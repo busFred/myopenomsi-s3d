@@ -146,6 +146,10 @@ pub const DEFAULT_PRIORITY: f32 = 128.0;
 
 /// At most this much between the painted edges of two lanes that are next to each other (m).
 pub const NEIGHBOUR_EDGE_GAP: f32 = 2.0;
+/// Two lanes run the same way beside each other when their headings there differ by less
+/// than this (degrees; `Network::parallel`'s test for a route's lane beside, and
+/// `Network::piece_beside`).
+pub const BESIDE_HEADING_DEG: f32 = 30.0;
 
 /// How much of `unsched_vehgroups.txt` group `pool`'s traffic a path carries: its `[rule]
 /// trafficdensity` for the group (`rules`, see `Lane::group_density`: the last rule of a
@@ -247,8 +251,14 @@ impl Lane {
     /// strip between the edges (BeijingCity). The strip itself is only drawn, by a spline
     /// without paths, so the edge gap is the one cue the path data gives.
     pub fn beside_each_other(a: &Lane, b: &Lane) -> bool {
-        let gap = (b.offset - a.offset).abs();
-        let edge = gap - (a.width.max(2.0) + b.width.max(2.0)) * 0.5;
+        Self::edges_beside((b.offset - a.offset).abs(), a.width, b.width)
+    }
+
+    /// The edge rule of [`Lane::beside_each_other`] for two lanes `a_width` and `b_width` wide
+    /// whose middles lie `gap` m apart: more than a metre apart, their painted edges (each at
+    /// least 2 m wide) within `NEIGHBOUR_EDGE_GAP`.
+    pub fn edges_beside(gap: f32, a_width: f32, b_width: f32) -> bool {
+        let edge = gap - (a_width.max(2.0) + b_width.max(2.0)) * 0.5;
         gap > 1.0 && edge <= NEIGHBOUR_EDGE_GAP
     }
 
@@ -578,6 +588,11 @@ pub struct Network {
     /// it from the vehicle types it loads); the yardstick of a closed run
     /// (`Network::closed_marker`). Empty (a replay): the vehicle's own length.
     pub group_body: Vec<f32>,
+    /// Per junction-object street piece (source 2): the other street pieces of its object that
+    /// can lie beside it anywhere along it (`Network::index_pieces_beside`), the only pieces
+    /// `piece_beside` measures. Static geometry, built with the grid, as SUMO fixes a lane's
+    /// neighbours when it loads the network.
+    pub beside_pieces: Vec<Vec<usize>>,
 }
 
 /// Lit stubs: an approach lane is not linked past its short lit stub into the lane after
@@ -858,11 +873,96 @@ impl Network {
             // too, and a train "changed lanes" down onto the line under its viaduct)
             let (q, hb) = lb.at(sb);
             let level = (q.z - p.z).abs() < 1.0;
-            if inside && level && d > 0.8 && d < 5.5 && wrap_deg(hb - h).abs() < 30.0 {
+            if inside && level && d > 0.8 && d < 5.5 && wrap_deg(hb - h).abs() < BESIDE_HEADING_DEG {
                 along += step;
             }
         }
         along >= 8.0 - 1e-3
+    }
+
+    /// The piece of the same junction object running beside junction-object piece `lane` at
+    /// distance `s` on side `dir` (1 left, 2 right): the nearest street piece of the object whose
+    /// axis there lies the way `Lane::edges_beside` puts two lanes of one spline side by side, at
+    /// a heading within `BESIDE_HEADING_DEG`. `Network::link` pairs the paths of one spline only,
+    /// so a junction object's pieces have no `left`/`right` (OMSI geometry: an object's paths are
+    /// separate polylines with no lane order); this finds the lane beside where the object lays
+    /// its paths side by side (an object can lay a hundred metres and more of plain road as
+    /// parallel paths). It measures only the pieces `beside_pieces` lists for `lane` (built with
+    /// the grid; SUMO's lane neighbours are fixed at load too) that the grid holds round the
+    /// point. It says nothing about crossings: whether a change may be made there is the caller's.
+    pub fn piece_beside(&self, lane: usize, s: f32, dir: i32) -> Option<usize> {
+        let l = self.lanes.get(lane)?;
+        let (p, h) = l.at(s.clamp(0.0, l.length()));
+        let hr = (h as f64).to_radians();
+        let right = DVec3::new(hr.cos(), -hr.sin(), 0.0);
+        let want = if dir == 2 { 1.0 } else { -1.0 };
+        let (cx, cy) = Self::grid_cell(p);
+        let mut best: Option<(usize, f64)> = None;
+        for &i in self.beside_pieces.get(lane).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let o = &self.lanes[i];
+            let Some((os, d)) = o.nearest_point(p) else { continue };
+            // (beside, not before or after it: the nearest point inside the piece)
+            if os <= 0.0 || os >= o.length() {
+                continue;
+            }
+            let (q, oh) = o.at(os);
+            let side = (q - p).dot(right) * want;
+            if side <= 0.0 || (q.z - p.z).abs() >= 1.0 || wrap_deg(oh - h).abs() >= BESIDE_HEADING_DEG || !Lane::edges_beside(d as f32, l.width, o.width) {
+                continue;
+            }
+            // (a piece the grid holds in the cells round `p`: the lanes a nearest-lane query sees)
+            let near = (-1..=1).any(|dx| (-1..=1).any(|dy| self.grid.get(&(cx + dx, cy + dy)).is_some_and(|v| v.contains(&i))));
+            if near && best.is_none_or(|b| d < b.1) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|b| b.0)
+    }
+
+    /// Fill `beside_pieces` for every junction object with a street piece from index `from` on
+    /// (all of them for 0): for each street piece of the object, the object's other street
+    /// pieces whose bounding box lies near enough that their edges can be beside it
+    /// (`Lane::edges_beside` on the gap between the two boxes, which is never more than the
+    /// distance `piece_beside` measures between the axes).
+    pub fn index_pieces_beside(&mut self, from: usize) {
+        let piece = |l: &Lane| l.source == 2 && l.kind == LaneKind::Street && l.points.len() >= 2;
+        let object = |l: &Lane| l.key.map(|k| (k.tile, k.id));
+        let objects: std::collections::HashSet<((i32, i32), i64)> = self.lanes[from.min(self.lanes.len())..].iter().filter(|l| piece(l)).filter_map(object).collect();
+        self.beside_pieces.resize(self.lanes.len(), Vec::new());
+        if objects.is_empty() {
+            return;
+        }
+        let mut members: HashMap<((i32, i32), i64), Vec<usize>> = HashMap::new();
+        for (i, l) in self.lanes.iter().enumerate() {
+            if let Some(k) = object(l).filter(|k| piece(l) && objects.contains(k)) {
+                members.entry(k).or_default().push(i);
+            }
+        }
+        let bbox = |l: &Lane| {
+            let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+            for q in &l.points {
+                lo = lo.min(q.truncate());
+                hi = hi.max(q.truncate());
+            }
+            (lo, hi)
+        };
+        for list in members.values() {
+            let boxes: Vec<(DVec2, DVec2)> = list.iter().map(|&i| bbox(&self.lanes[i])).collect();
+            for (a, &i) in list.iter().enumerate() {
+                let near: Vec<usize> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|&(b, _)| b != a)
+                    .filter(|&(b, &j)| {
+                        let gap = (boxes[b].0 - boxes[a].1).max(boxes[a].0 - boxes[b].1).max(DVec2::ZERO).length();
+                        let edge = gap as f32 - (self.lanes[i].width.max(2.0) + self.lanes[j].width.max(2.0)) * 0.5;
+                        edge <= NEIGHBOUR_EDGE_GAP
+                    })
+                    .map(|(_, &j)| j)
+                    .collect();
+                self.beside_pieces[i] = near;
+            }
+        }
     }
 
     /// Where on lane `b`, beside `a` (see `parallel`), the car at distance `s` along `a` is:
@@ -2102,6 +2202,8 @@ impl Network {
                 self.grid.entry(c).or_default().push(i);
             }
         }
+        self.beside_pieces.clear();
+        self.index_pieces_beside(0);
     }
 
     /// Lane indices whose starts lie in cells intersecting a circle around `p`.
@@ -2371,6 +2473,7 @@ impl Network {
                 self.grid.entry(c).or_default().push(i);
             }
         }
+        self.index_pieces_beside(first);
         // neighbouring lanes of the new splines
         let mut by_spline: HashMap<((i32, i32), i64, bool), Vec<usize>> = HashMap::new();
         for i in first..end {
@@ -3426,11 +3529,54 @@ pub struct LaneChange {
     /// Pulling out from behind something standing: the car moves off sideways from a
     /// standstill, and what it leaves behind in its lane no longer holds it.
     pub bypass: bool,
+    /// The move is the two arcs at full lock (`full_lock01`), not the smoothstep: a bypass
+    /// from nearer than the smoothstep can steer.
+    #[serde(default)]
+    pub full_lock: bool,
+    /// A bypass's: the vehicle it pulls out round (its id; a player's `PLAYER_ID_BASE` + its id,
+    /// as `omsi_traffic::sim::Decision::wait_for`), `None` round a parked car (which has no id
+    /// and does not move). Its move is swept again round that body on every frame of the
+    /// signal while that body stands (`omsi_traffic::plan`).
+    #[serde(default)]
+    pub round: Option<u64>,
 }
 
 /// A vehicle's heading is that of the chord of its way this far behind and ahead of it (m,
 /// `Simulation::update_positions`).
 pub const HEADING_CHORD: f32 = 1.5;
+
+/// The share of the way across (0..1) of a move `side` metres over along `length` metres
+/// driven at `t` (0..1) of it, laid as two circular arcs of one radius, out and back (the
+/// wheels at one lock, then the other): what a driver pulling out from behind something
+/// standing steers. Its radius is `((length/2)² + (side/2)²) / side`; a move as short as the
+/// body can steer has the turning radius (`omsi_traffic::plan::full_lock_len`).
+pub fn full_lock01(t: f32, length: f32, side: f32) -> f32 {
+    let w = side.abs().max(1e-3);
+    let h = (length * 0.5).max(1e-3);
+    let r = (h * h + w * w * 0.25) / w;
+    let arc = |x: f32| r - (r * r - x * x).max(0.0).sqrt();
+    let x = t.clamp(0.0, 1.0) * 2.0 * h;
+    if x <= h {
+        arc(x) / w
+    } else {
+        1.0 - arc(2.0 * h - x) / w
+    }
+}
+
+/// How far across a lane change has got at `t` (0..1) of its move: on its two arcs
+/// (`LaneChange::full_lock`, `full_lock01`, `side` the distance between the lanes there), or on
+/// the smoothstep.
+pub fn change_share(c: &LaneChange, t: f32, side: f32) -> f32 {
+    if c.full_lock {
+        full_lock01(t, c.length, side)
+    } else {
+        smooth01(t)
+    }
+}
+
+/// Seconds a bypass signals before it moves (`AiState::start_bypass`; pulling out round
+/// something: the signal time of the first lane changes).
+pub const BYPASS_SIGNAL: f32 = 1.2;
 
 /// Smoothstep 0..1.
 pub fn smooth01(t: f32) -> f32 {
@@ -3785,7 +3931,7 @@ impl AiState {
         // (the same share of a lane that starts beside this one, else the point beside the car)
         let s_to = net.beside_s(self.lane, to, self.s.min(l.length()));
         let rest = t.length() - s_to;
-        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false });
+        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false, full_lock: false, round: None });
         self.blinker = dir;
         let mut plan = Vec::new();
         if self.route.is_empty() {
@@ -3863,7 +4009,7 @@ impl AiState {
         }
         let (ps, hs) = self.seq().point(net, self.s, 0.0);
         let (pt, ht) = self.change_seq(c.to).point(net, c.s_to, 0.0);
-        let k = smooth01(c.t - c.wait * self.speed.max(2.0) / c.length);
+        let k = change_share(&c, c.t - c.wait * self.speed.max(2.0) / c.length, (pt - ps).truncate().length() as f32);
         let p = ps.lerp(pt, k as f64);
         let off = |q: DVec3, h: f32| {
             let hr = (h as f64).to_radians();
@@ -3914,15 +4060,28 @@ impl AiState {
         self.settled_offset = true;
     }
 
+    /// Drop a lane change that still signals, before the car has moved over (the traffic's
+    /// gap check during the signal failed): no change, and the way beyond the lane beside
+    /// (`change_plan`) is forgotten; the car's own way (`planned_next`, `ahead`) and its
+    /// lateral offset were never touched by the change.
+    pub fn drop_change(&mut self) {
+        if self.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
+            self.change = None;
+            self.change_plan.clear();
+        }
+    }
+
     /// Pull out into `to` from behind a standing obstacle: a short, steep move over
-    /// `length` metres (8, less from close behind it).
-    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32) {
+    /// `length` metres (8, less from close behind it), round the vehicle `round`
+    /// (`LaneChange::round`).
+    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32, full_lock: bool, round: Option<u64>) {
         self.start_change(net, to, dir);
         if let Some(c) = self.change.as_mut() {
             c.length = length;
             c.bypass = true;
-            // (pulling out round something: the old signal time)
-            c.wait = c.wait.min(1.2);
+            c.full_lock = full_lock;
+            c.round = round;
+            c.wait = c.wait.min(BYPASS_SIGNAL);
         }
     }
 
@@ -3995,7 +4154,7 @@ impl AiState {
             let (pt, ht) = cs.point_with(net, c.s_to, d, &mut cache[1]);
             // how far the change will have got by the time the car is `d` metres on
             let tau = (d - c.wait * self.speed.max(2.0)) / c.length;
-            let k = smooth01(c.t + tau);
+            let k = change_share(&c, c.t + tau, (pt - p).truncate().length() as f32);
             p = p.lerp(pt, k as f64);
             h += wrap_deg(ht - h) * k;
         }
@@ -4017,6 +4176,16 @@ impl AiState {
         if let Some(c) = self.change {
             if c.to < net.lanes.len() {
                 best = best.min(self.curve_speed_on(net, &self.change_seq(c.to), c.s_to));
+            }
+            // (a bypass's two arcs are a bend of their own: their radius, `full_lock01`, at
+            // the same lateral acceleration, until the move is over)
+            if let Some(((p, _), (q, _))) = self.change_anchors(net).filter(|_| c.full_lock && c.t < 1.0) {
+                let w = (q - p).truncate().length() as f32;
+                if w > 1e-3 {
+                    let h = c.length * 0.5;
+                    let r = (h * h + w * w * 0.25) / w;
+                    best = best.min((self.lat_accel * r).sqrt().max(2.5));
+                }
             }
         }
         best
@@ -4508,14 +4677,18 @@ mod tests {
         car.speed = 3.0;
         car.plan_next(&net);
         assert_eq!(car.planned_next, Some(2));
-        car.start_bypass(&net, 1, 1, 8.0);
+        car.start_bypass(&net, 1, 1, 8.0, true, None);
         let dt = 1.0 / 30.0;
         let mut at = car.way_point(&net, 0.0);
         for _ in 0..300 {
             assert!(car.drive(&net, dt, None, None));
             let p = car.way_point(&net, 0.0);
             let step = (p - at).length();
-            assert!(step < car.speed as f64 * dt as f64 + 0.05, "a jump of {step:.2} m on lane {} s {:.1} change {:?}", car.lane, car.s, car.change);
+            // (no jump: no further than the arcs' path takes it, their steepest slope h / sqrt(r² - h²))
+            let (h, w) = (4.0f64, 3.5f64);
+            let r = (h * h + w * w / 4.0) / w;
+            let slope = h / (r * r - h * h).sqrt();
+            assert!(step < car.speed as f64 * dt as f64 * (1.0 + slope * slope).sqrt() + 0.05, "a jump of {step:.2} m on lane {} s {:.1} change {:?}", car.lane, car.s, car.change);
             at = p;
             if car.change.is_none() {
                 break;
@@ -5208,5 +5381,38 @@ mod aurora_pool_tests {
         assert_eq!(lane.pool_density(&defaults, 2), 1.0);
         lane.group_density.push((1, 0.1));
         assert_eq!(lane.pool_density(&defaults, 2), 0.1);
+    }
+}
+
+#[cfg(test)]
+mod piece_beside_tests {
+    use super::*;
+
+    /// A 1 m wide path of junction object `id` from (x0, y0) to (x1, y1).
+    fn path(x0: f64, y0: f64, x1: f64, y1: f64, id: i64, n: u16) -> Lane {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(x0, y0, 0.0), DVec3::new(x1, y1, 0.0)], LaneKind::Street, 1.0);
+        l.key = Some(LaneKey { tile: (0, 0), id, path: n });
+        l.source = 2;
+        l
+    }
+
+    /// Two paths of one object running south 2.6 m apart are beside each other, the
+    /// one on the driver's left (east) is its left piece; a path crossing them, a path of
+    /// another object and one 6 m out are not.
+    #[test]
+    fn parallel_paths_of_one_object_are_beside() {
+        let lanes = vec![
+            path(0.0, 0.0, 0.0, -80.0, 1, 0),
+            path(2.6, 5.0, 2.6, -75.0, 1, 1),
+            path(-20.0, -40.0, 20.0, -40.0, 1, 2),
+            path(-2.6, 0.0, -2.6, -80.0, 2, 0),
+            path(-6.0, 0.0, -6.0, -80.0, 1, 3),
+        ];
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        assert_eq!(net.piece_beside(0, 30.0, 1), Some(1));
+        assert_eq!(net.piece_beside(1, 30.0, 2), Some(0));
+        assert_eq!(net.piece_beside(0, 30.0, 2), None);
+        assert_eq!(net.piece_beside(0, 30.0, 1).and_then(|_| net.lanes[0].left), None);
     }
 }

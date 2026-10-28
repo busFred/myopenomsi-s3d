@@ -4218,6 +4218,10 @@ struct Extra {
     /// Lane changes unchanged (progress) for more than 5 s while standing: runs, vehicles,
     /// vehicle-seconds.
     frozen_runs: u64,
+    /// Lane changes of the drivers' own (no route) whose target lane has a standing leader
+    /// (under `STANDING_SPEED`) within `TOWARD_STANDING_REACH` ahead of the place beside the
+    /// changer when the change starts, read from the replay's state (`toward_standing`), whole map.
+    toward_standing: u64,
     frozen_vehicles: u64,
     frozen_s: u64,
     /// Seconds a vehicle follows a lead whose box does not touch its corridor (its half
@@ -4476,6 +4480,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut close_pairs: HashSet<(u64, u64)> = HashSet::new();
     // (lane change: target, progress, since when unchanged; whether counted)
     let mut change_since: HashMap<u64, (usize, f32, f64, bool)> = HashMap::new();
+    // (the vehicles changing lanes last frame: a change that appears is a start)
+    let mut changing: HashSet<u64> = HashSet::new();
     let mut frozen_ids: HashSet<u64> = HashSet::new();
     let mut phantom_ids: HashSet<u64> = HashSet::new();
     let mut phantom_review_ids: HashSet<u64> = HashSet::new();
@@ -4627,6 +4633,20 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                     ex.removed_in_view_s += m.waiting as f64;
                     ex.events.push(format!("REMOVED-IN-VIEW {} t={:.1} #{} {:?} waiting {:.0} at ({:.0}, {:.0})", sc.name, m.time, m.id, m.rule, m.waiting, m.pos.x, m.pos.y));
                 }
+            }
+            {
+                let mut now_changing: HashSet<u64> = HashSet::new();
+                for v in &r.vehicles {
+                    let Some(c) = v.state.change else { continue };
+                    now_changing.insert(v.id);
+                    // (a change first seen in its signal: one the replay put down mid-change at a
+                    // keyframe has moved over or ends its signal already, and is not counted)
+                    let signalling = c.t <= 0.0 && c.wait > 0.0;
+                    if !changing.contains(&v.id) && signalling && v.state.route.is_empty() && toward_standing(&r.net, &r.sim, &r.vehicles, v.id, v.last.lead_id, c.to, c.s_to) {
+                        ex.toward_standing += 1;
+                    }
+                }
+                changing = now_changing;
             }
             for v in &r.vehicles {
                 let st = &v.state;
@@ -4994,6 +5014,62 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     Ok(sc)
 }
 
+/// SUMO LC2013's `REACT_TO_STOPPED_DISTANCE` (m): how far ahead `toward_standing` looks (a
+/// constant of its own so that a build without the crate's constant gives the measure too).
+const TOWARD_STANDING_REACH: f32 = 100.0;
+
+/// Whether lane `to` has, ahead of `s_to` (the place beside a changer) along it and the lanes it
+/// runs into (every way), a vehicle or player standing (under `STANDING_SPEED`) as the nearest
+/// one on that way within `TOWARD_STANDING_REACH` (rear to `s_to`): the measure behind
+/// `changes_toward_standing`, read from the state alone so that any build's replay gives it. The
+/// changer's own lead (`lead`, the one a step-out pulls out round, its body reaching into the
+/// target lane) is not counted.
+fn toward_standing(net: &Network, sim: &omsi_traffic::Simulation, vehicles: &[omsi_traffic::Vehicle], me: u64, lead: Option<u64>, to: usize, s_to: f32) -> bool {
+    let reach = TOWARD_STANDING_REACH;
+    let standing = omsi_traffic::driver::STANDING_SPEED;
+    // (lane, offset of its start from s_to)
+    let mut frontier: Vec<(usize, f32)> = vec![(to, -s_to)];
+    let mut seen: HashSet<usize> = HashSet::new();
+    while let Some((l, off)) = frontier.pop() {
+        if !seen.insert(l) || l >= net.lanes.len() {
+            continue;
+        }
+        // (the nearest one ahead on this lane)
+        let mut first: Option<(f32, f32)> = None;
+        for o in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let Some(veh) = vehicles.get(o.vehicle) else { continue };
+            if veh.id == me || Some(veh.id) == lead {
+                continue;
+            }
+            let d = off + o.s - veh.state.rear;
+            if d > 0.0 && first.is_none_or(|f| d < f.0) {
+                first = Some((d, veh.state.speed));
+            }
+        }
+        for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(p) = sim.players.get(k) {
+                let d = off + ps - p.half_len;
+                if d > 0.0 && first.is_none_or(|f| d < f.0) {
+                    first = Some((d, p.speed));
+                }
+            }
+        }
+        if let Some((d, v)) = first {
+            if d < reach && v.abs() < standing {
+                return true;
+            }
+            continue;
+        }
+        let end = off + net.lanes[l].length();
+        if end < reach {
+            for &n in &net.lanes[l].next {
+                frontier.push((n, end));
+            }
+        }
+    }
+    false
+}
+
 /// (header, value) of the round 4b counters.
 fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
     vec![
@@ -5002,6 +5078,7 @@ fn extra_columns(e: &Extra) -> Vec<(&'static str, String)> {
         ("close_foe", format!("{}/{}", e.close_foe_pairs, e.close_foe_s)),
         ("close_nofoe", format!("{}/{}", e.close_nofoe_pairs, e.close_nofoe_s)),
         ("frozen", format!("{}/{}/{}", e.frozen_runs, e.frozen_vehicles, e.frozen_s)),
+        ("changes_toward_standing", e.toward_standing.to_string()),
         ("phantom", format!("{}/{}", e.phantom_vehicles, e.phantom_s)),
         ("phantom_rv", format!("{}/{}", e.phantom_review_vehicles, e.phantom_review_s)),
         ("keepback", format!("{}/{}", e.keepback_blocked_s, e.keepback_s)),
@@ -5036,6 +5113,7 @@ fn add_extra(t: &mut Extra, e: &Extra) {
     t.close_foe_pairs += e.close_foe_pairs;
     t.close_nofoe_pairs += e.close_nofoe_pairs;
     t.frozen_runs += e.frozen_runs;
+    t.toward_standing += e.toward_standing;
     t.frozen_vehicles += e.frozen_vehicles;
     t.frozen_s += e.frozen_s;
     t.phantom_s += e.phantom_s;
@@ -5217,6 +5295,8 @@ fn ab(args: &[String]) -> Res<()> {
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
+        println!("(lane changes dropped while signalling, whole map: change_aborted {})", omsi_traffic::sim::CHANGES_ABORTED.load(std::sync::atomic::Ordering::Relaxed));
+        println!("(in-lane offset, whole map: lane_offset_s {:.0})", omsi_traffic::sim::LANE_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
     }
     {
         // round 4b counters: close pairs (pairs/pair-s, with and without a compiled meeting

@@ -367,8 +367,10 @@ fn s8_squeeze_onto_the_anding_strip_stopped_by_people_mid_ramp() {
 }
 
 
-/// Car 1 squeezes past a car standing 1.7 m right of the axis of a lane with 3 m of drawn road
-/// to its right (the obstacle half on the strip) and nothing on the left but the oncoming lane.
+/// Car 1 squeezes past a car standing `obstacle_lateral` m right of the axis of a lane with 3 m
+/// of drawn road to its right (the obstacle half on the strip) and nothing on the left but the
+/// oncoming lane. (1.95 m out the squeeze keeps SUMO's minGapLat, 0.6, from its corner within
+/// the 1.5 m of road on the left; 1.7 m out it does not fit and the car waits.)
 fn one_lane_strip(obstacle_lateral: f32) -> (Network, Vehicle) {
     let mut net = Network::default();
     let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
@@ -390,11 +392,11 @@ fn one_lane_strip(obstacle_lateral: f32) -> (Network, Vehicle) {
 
 #[test]
 fn r1_the_thing_passed_holds_the_car_until_the_bent_way_really_clears_it() {
-    // (fails with `shift_clears` off) a squeeze left round a car standing 1.7 m right; while
+    // (fails with `shift_clears` off) a squeeze left round a car standing 1.95 m right; while
     // the car is out, a second car is put down in the corridor 14 m past the obstacle, in the
     // lane's middle: the lateral arithmetic says "passed" (it is near the axis, the side is
     // left), the bodies say no: it stays the lead and the car stops behind it
-    let (net, o) = one_lane_strip(1.7);
+    let (net, o) = one_lane_strip(1.95);
     let mut sim = Simulation::new(&net, vec![]);
     let mut spare = car(999, 1, 10.0, 0.0);
     spare.pull_out = 1000.0;
@@ -429,7 +431,8 @@ fn r1_the_thing_passed_holds_the_car_until_the_bent_way_really_clears_it() {
 
 #[test]
 fn r2_a_squeeze_signals_half_a_second_not_two() {
-    // (fails with SQUEEZE_SIGNAL at 2 s) the player's bus 2 m right of the axis, the car
+    // (fails with SQUEEZE_SIGNAL at 2 s) the player's bus 2.25 m right of the axis (the
+    // squeeze keeps minGapLat, 0.6, from its corner), the car
     // closed up behind it: the indicator leads the pull-out by 0.5-1.0 s
     let mut net = Network::default();
     let mut a = road(&[(0.0, 0.0), (600.0, 0.0)], 1);
@@ -438,7 +441,7 @@ fn r2_a_squeeze_signals_half_a_second_not_two() {
     net.lanes.push(road(&[(600.0, 3.5), (0.0, 3.5)], 4));
     let net = finish(net);
     let mut sim = Simulation::new(&net, vec![]);
-    let player = bus(200.0, 0.0, 2.0, 30.0);
+    let player = bus(200.0, 0.0, 2.25, 30.0);
     sim.players = vec![player];
     let mut cars = vec![car(1, 0, 184.0, 0.0)];
     let (mut wait, mut started_at, mut out_at) = (None, None, None);
@@ -466,7 +469,8 @@ fn r2_a_squeeze_signals_half_a_second_not_two() {
 
 #[test]
 fn r3_a_squeeze_past_an_obstacle_within_25_m_is_not_kept_40_m_from_a_junction() {
-    // (fails with SQUEEZE_NEAR at 0) a car standing 1.7 m right of the axis, a junction
+    // (fails with SQUEEZE_NEAR at 0) a car standing 1.95 m right of the axis (the squeeze keeps
+    // minGapLat, 0.6, from its corner), a junction
     // piece 39 m from where the car stops behind it: JUNCTION_KEEP (40 m) would forbid the
     // pass, the squeeze's own zone (25 m past the obstacle) does not
     let mut net = Network::default();
@@ -490,15 +494,15 @@ fn r3_a_squeeze_past_an_obstacle_within_25_m_is_not_kept_40_m_from_a_junction() 
     let mut o = car(5, 0, 200.0, 0.0);
     o.stopped = 30.0;
     o.pull_out = 1000.0;
-    o.state.lateral = 1.7;
-    o.state.lateral_target = 1.7;
-    o.state.lateral_ramp = (1.7, 1.7, 0.0, 1.0);
-    o.external.bay = Some(1.7);
+    o.state.lateral = 1.95;
+    o.state.lateral_target = 1.95;
+    o.state.lateral_ramp = (1.95, 1.95, 0.0, 1.0);
+    o.external.bay = Some(1.95);
     let r = watch(&net, car(1, 0, 150.0, 8.0), None, vec![o], vec![], 25.0);
     eprintln!("R3: pass {:?} out_at {:?} least_other {:.2} x_end {:.1}", r.pass.map(|p| (p.side, p.lane)), r.out_at, r.least_other, r.x_end);
     let pass = r.pass.expect("no squeeze past the car standing 6 m before the 40 m junction keep");
     assert!(pass.lane.is_none(), "{pass:?}");
-    assert!(r.least_other > 0.25 && r.x_end > 210.0, "least {:.2} x {:.1}", r.least_other, r.x_end);
+    assert!(r.least_other > 0.55 && r.x_end > 210.0, "least {:.2} x {:.1}", r.least_other, r.x_end);
 }
 
 #[test]
@@ -531,13 +535,14 @@ fn r4_a_footpath_of_another_spline_alongside_cuts_the_extent_at_its_edge() {
 fn s10_a_car_standing_level_or_just_ahead_on_the_squeeze_side_stops_the_squeeze() {
     // BJ new3 08:21 #3878/#4203: a car stranded 1.96 m out stood 0.21 m beside #3878, which
     // started a squeeze to that side past a lead 19 m ahead and yawed into it. Here: the lead
-    // stands 1.7 m right of the axis 6 m ahead of the car's front (the squeeze goes left), and
+    // stands 1.95 m right of the axis (the squeeze keeps minGapLat, 0.6, from it) 6 m ahead of
+    // the car's front (the squeeze goes left), and
     // another car stands out on the left, 1.96 m from the axis, level with the car / 3 m / 6 m
     // ahead: no squeeze starts into it; without it (the control) the squeeze goes. (A car
     // stands on the oncoming lane 40 m on, so that no pass on the oncoming lane is possible:
     // that pass has no body sweep of its own - pre-existing, outside this review's ask.)
     for ahead in [Some(0.0f32), Some(3.0), Some(6.0), None] {
-        let (net, lead) = one_lane_strip(1.7);
+        let (net, lead) = one_lane_strip(1.95);
         let mut me = car(1, 0, 190.0, 0.0);
         me.stopped = 5.0;
         let mut oncoming = car(7, 1, 600.0 - 230.0, 0.0);
@@ -562,4 +567,17 @@ fn s10_a_car_standing_level_or_just_ahead_on_the_squeeze_side_stops_the_squeeze(
             None => assert!(r.pass.is_some_and(|p| p.lane.is_none() && p.side < 0.0) && r.x_end > 210.0, "control: {:?} x {:.1}", r.pass, r.x_end),
         }
     }
+}
+
+/// SUMO keeps `minGapLat` (0.6) to a body beside: past a car standing 1.7 m right of the axis
+/// on a lane with 1.5 m of drawn road to its left, the squeeze would need 0.7 m to the left, its
+/// body 1.6 m from the axis, so it does not squeeze within the lane; with nothing on the oncoming
+/// lane it passes on it (`Passing::lane` the oncoming lane) and keeps more than minGapLat.
+#[test]
+fn l2_no_in_lane_squeeze_nearer_than_min_gap_lat() {
+    let (net, o) = one_lane_strip(1.7);
+    let r = watch(&net, car(1, 0, 150.0, 8.0), None, vec![o], vec![], 25.0);
+    let pass = r.pass.expect("neither squeezed nor passed");
+    assert_eq!(pass.lane, Some(1), "squeezed within the lane: {pass:?}");
+    assert!(r.least_other > 0.6 && r.x_end > 215.0, "least {:.2} x {:.1}", r.least_other, r.x_end);
 }
