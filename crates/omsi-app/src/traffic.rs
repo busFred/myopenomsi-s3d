@@ -6680,7 +6680,7 @@ mod spawn_people_tests {
         st.front = 2.3;
         st.rear = 2.3;
         st.length = 4.6;
-        st.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.5, length: 20.0, s_to: 95.0, dir: 1, wait: 0.0, bypass: false });
+        st.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.5, length: 20.0, s_to: 95.0, dir: 1, wait: 0.0, bypass: false, full_lock: false, round: None });
         let car = AiVehicle::new(9, VehicleClass::Car, st, 0.9, 0);
         let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
         sim.build_occupancy(&net, std::slice::from_ref(&car));
