@@ -2,9 +2,10 @@
 //!
 //! `--follow-line` (`LineFollower`): the player's bus drives its duty's trip as a timetable
 //! bus of the AI drives one. The player's vehicle is a physics vehicle outside the traffic's
-//! cars, so the AI controller cannot drive it directly: a timetable bus of the player's own
-//! type takes the player's departure on where the player's bus stands
-//! (`Schedule::drive_player_trip`), and every frame the player's vehicle is put where that
+//! cars, so the AI controller cannot drive it directly: a timetable bus of the departure's AI
+//! group (a player's type may know no AI doors: the MAN A21 of the gate runs) takes the
+//! player's departure on where the player's bus stands (`Schedule::drive_player_trip`), and
+//! every frame the player's vehicle is put where that
 //! bus's body is (`pose_player`: the AI's own `AiBody` pose, its speed, its rear sections).
 //! So the player's bus stops at its stops for a dwell with the doors open, obeys the lights
 //! and gives way as an AI timetable bus does (`bus_service`, `omsi_traffic`), and moves as

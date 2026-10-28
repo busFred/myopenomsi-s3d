@@ -1632,8 +1632,8 @@ impl Schedule {
     }
 
     /// The player's trip driven by the AI (the offscreen harness's `--follow-line`,
-    /// `follow_line::LineFollower`): a timetable bus of the player's own type is put on the
-    /// lane of the trip's route nearest to the player's bus `bus` that runs its way (on the
+    /// `follow_line::LineFollower`): a timetable bus of the departure's own AI group (`choose`)
+    /// is put on the lane of the trip's route nearest to the player's bus `bus` that runs its way (on the
     /// lane's middle line: a bus standing in a stop's bay moves over onto it) and takes the
     /// player's departure on where it stands (`spawn_departure` with `here`), with
     /// the trip's stops from there on, its route carried on as the tiles come, as any
@@ -1667,8 +1667,12 @@ impl Schedule {
             .filter(|&(l, s, _)| ((net.lanes[l].at(s).1 as f64 - bus.heading + 540.0).rem_euclid(360.0) - 180.0).abs() < 90.0)
             .min_by(|a, b| a.2.total_cmp(&b.2))
             .ok_or_else(|| format!("trip {}: no lane of its route is loaded", planned.name))?;
+        // (the vehicle the departure's AI group runs it with: the player's own type, driven by
+        // the AI, opens no doors where its scripts know no `AI_Scheduled_AtStation` - the MAN
+        // A21 of the gate's runs - and its stop's waiters held it at the boarding cap)
+        let Choice { ty, number, hof, scheme, .. } = self.choose(i, world).ok_or_else(|| format!("trip {}: no vehicles for AI group '{}'", planned.name, self.departures[i].ai_group))?;
         let ci = traffic
-            .spawn_bus(world, renderer, scene, bus.ty.clone(), vec![lane], s, Vec::new(), None, bus.host.hof.clone(), None)
+            .spawn_bus(world, renderer, scene, ty, vec![lane], s, Vec::new(), number, hof, Some(scheme))
             .ok_or_else(|| "the timetable buses are at the options' [AIMaxCountScheduled]".to_string())?;
         // (standing, as the player's bus stands: a new car of the traffic starts at its lane's pace)
         traffic.cars[ci].ai.state.speed = bus.physics.speed.max(0.0);
@@ -1676,7 +1680,8 @@ impl Schedule {
         match self.spawn_departure(i, world, traffic, renderer, scene, day_time, Some(ci), true) {
             Placed::Spawned => {
                 self.departures[i].spawned = true;
-                log::info!("follow line: bus {id} drives trip {} of line {} tour {} from lane {lane} at {s:.1} m ({d:.1} m from the player's bus)", planned.name, duty.line, duty.tour);
+                let c = &traffic.cars.iter().find(|c| c.id == id).expect("just put on").vehicle;
+                log::info!("follow line: bus {id} ({}, {:.1} m long; the player's {:.1} m) drives trip {} of line {} tour {} from lane {lane} at {s:.1} m ({d:.1} m from the player's bus)", c.ty.def.type_name, c.ty.half_length().unwrap_or(0.0) * 2.0, bus.ty.half_length().unwrap_or(0.0) * 2.0, planned.name, duty.line, duty.tour);
                 Ok(id)
             }
             _ => {
