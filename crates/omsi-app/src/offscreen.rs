@@ -247,6 +247,8 @@ pub(crate) fn run_offscreen(
     let dt = 1.0 / 30.0;
     let drive_frames = args.drive.map(|s| (s / dt) as usize).unwrap_or(0);
     let mut wheel_worst: Option<(DVec3, f64)> = None;
+    // (the AI's lane entries, for the report's lane revisits)
+    let mut revisits = omsi_sim::traffic::LaneRevisits::default();
     let total_frames = drive_frames
         .max(if humans_off.is_some() { 30 } else { 0 })
         .max(if traffic.is_some() { 1 } else { 0 });
@@ -573,6 +575,9 @@ pub(crate) fn run_offscreen(
                 &renderer.options,
                 streamer.as_ref().map_or(0.0, |s| s.load_radius),
             );
+            for c in t.cars.iter() {
+                revisits.see(c.id, &c.ai.state);
+            }
             // the tiles round the eye and the bus, as the window streams them
             if let Some(st) = streamer.as_mut() {
                 let motion = player.as_ref().map(|p| (p.vehicle.position, p.vehicle.physics.speed as f64));
@@ -1428,11 +1433,12 @@ pub(crate) fn run_offscreen(
             }
         }
         log::info!("traffic: {} vehicles ({buses} of them buses), {} waiting at red lights, mean speed {:.1} km/h, spawn_refused_people {} ({})", t.cars.len(), t.sim.held_at_red, t.cars.iter().map(|c| c.ai.state.speed).sum::<f32>() / t.cars.len().max(1) as f32 * 3.6, t.spawn_refused_people.iter().sum::<usize>(), t.spawn_refused_by());
-        // the random cars' trip ends (`AiState::goal`), the whole run
+        // the random cars' trip ends (`AiState::goal`) and the AI's lane revisits
+        // (`LaneRevisits`), the whole run
         {
             use omsi_sim::traffic::{GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED};
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-            log::info!("trip ends: goal_picked {} goal_repicked {} goal_reached {}", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED));
+            log::info!("trip ends: goal_picked {} goal_repicked {} goal_reached {}; lane_revisits {} by {} vehicles", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), revisits.entries, revisits.vehicles.len());
         }
         for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));

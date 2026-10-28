@@ -4509,10 +4509,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
-    // (per vehicle: the lane it was on last frame, and the odometer at its entry into each lane
-    // it drove onto; the vehicles counted for `lane_revisits`)
-    let mut driven: HashMap<u64, (usize, HashMap<usize, f32>)> = HashMap::new();
-    let mut revisit_ids: HashSet<u64> = HashSet::new();
+    // (the vehicles' lane entries, for `lane_revisits`)
+    let mut revisits = omsi_sim::traffic::LaneRevisits::default();
     let close = |sc: &mut Score, run: Vec<HeadTally>| {
         if run.len() < min_head {
             return;
@@ -4542,29 +4540,14 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             let now = r.sim.time;
             let fdt = (now - last_frame).clamp(0.0, 1.0);
             last_frame = now;
-            // lane revisits: an entry by a link (`prev_lane` set; a lane change leaves it unset)
-            // into a lane entered before, a loop of `SHORT_LOOP` m or more since
+            // lane revisits (`LaneRevisits`)
             for v in r.vehicles.iter() {
-                let st = &v.state;
-                let e = driven.entry(v.id).or_insert_with(|| (st.lane, HashMap::new()));
-                if e.0 == st.lane {
-                    continue;
+                if let Some(lap) = revisits.see(v.id, &v.state) {
+                    ex.events.push(format!("REVISIT {} t={now:.1} #{} lane {} after {lap:.0} m, goal {:?}", sc.name, v.id, v.state.lane, v.state.goal));
                 }
-                e.0 = st.lane;
-                if st.prev_lane.is_some() {
-                    if let Some(&odo) = e.1.get(&st.lane) {
-                        let lap = st.odometer - odo;
-                        if lap >= omsi_sim::traffic::SHORT_LOOP {
-                            ex.lane_revisits += 1;
-                            if revisit_ids.insert(v.id) {
-                                ex.revisit_vehicles += 1;
-                            }
-                            ex.events.push(format!("REVISIT {} t={now:.1} #{} lane {} after {lap:.0} m, goal {:?}", sc.name, v.id, st.lane, st.goal));
-                        }
-                    }
-                }
-                e.1.insert(st.lane, st.odometer);
             }
+            ex.lane_revisits = revisits.entries;
+            ex.revisit_vehicles = revisits.vehicles.len() as u64;
             for (i, v) in r.vehicles.iter().enumerate() {
                 if v.ease_for.is_none() || v.state.speed >= 0.3 {
                     ease_still.remove(&v.id);

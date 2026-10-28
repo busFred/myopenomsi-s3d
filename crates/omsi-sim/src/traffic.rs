@@ -3630,9 +3630,42 @@ const LEADS_ON_LANES: usize = PLAN_LANES;
 
 /// A loop of lanes shorter than this (m) is not planned round (`AiState::extend_plan`'s
 /// `avoid`): two lanes of no length leading into each other made a plan of twenty. A loop of
-/// this length or longer driven by a car is a lane revisit (`traffic_cases ab`'s
-/// `lane_revisits`).
+/// this length or longer driven by a car is a lane revisit (`LaneRevisits`).
 pub const SHORT_LOOP: f32 = 20.0;
+
+/// Lane revisits, a metric (`traffic_cases ab`'s `lane_revisits`, the offscreen run's report):
+/// a vehicle driving onto a lane by a link (`prev_lane` set; a lane change leaves it unset)
+/// that it drove onto before, round a loop of `SHORT_LOOP` m or more by its odometer. Fed the
+/// vehicles each frame; nothing the traffic decides reads it.
+#[derive(Debug, Default)]
+pub struct LaneRevisits {
+    /// Per vehicle: the lane it was on when last seen, and the odometer at its entry into each
+    /// lane it drove onto.
+    driven: HashMap<u64, (usize, HashMap<usize, f32>)>,
+    /// The vehicles that revisited a lane.
+    pub vehicles: hashbrown::HashSet<u64>,
+    /// Revisits counted.
+    pub entries: u64,
+}
+
+impl LaneRevisits {
+    /// Vehicle `id` in state `st` this frame: the loop's length (m) when it has just driven
+    /// onto a lane it drove onto before (counted), else None.
+    pub fn see(&mut self, id: u64, st: &AiState) -> Option<f32> {
+        let e = self.driven.entry(id).or_insert_with(|| (st.lane, HashMap::new()));
+        if e.0 == st.lane {
+            return None;
+        }
+        e.0 = st.lane;
+        let lap = st.prev_lane.and_then(|_| e.1.get(&st.lane)).map(|&odo| st.odometer - odo).filter(|&lap| lap >= SHORT_LOOP);
+        e.1.insert(st.lane, st.odometer);
+        if lap.is_some() {
+            self.entries += 1;
+            self.vehicles.insert(id);
+        }
+        lap
+    }
+}
 
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
@@ -5475,6 +5508,32 @@ mod tests {
             out[last - 8] += 1;
         }
         assert!(out.iter().all(|&n| n > 0), "exits taken {out:?}");
+    }
+
+    #[test]
+    fn a_lap_of_the_ring_is_a_lane_revisit_a_short_loop_and_a_lane_change_are_not() {
+        let mut m = LaneRevisits::default();
+        let mut car = AiState::new(4, 0.0, 1);
+        let mut at = |m: &mut LaneRevisits, car: &mut AiState, lane: usize, odo: f32, by_link: bool| {
+            car.prev_lane = by_link.then_some(car.lane);
+            car.lane = lane;
+            car.odometer = odo;
+            m.see(7, car)
+        };
+        assert_eq!(m.see(7, &car), None);
+        for (k, lane) in [0, 1, 2, 3].into_iter().enumerate() {
+            assert_eq!(at(&mut m, &mut car, lane, 50.0 + 20.0 * k as f32, true), None);
+        }
+        // round once: R0 again 80 m after it was entered
+        assert_eq!(at(&mut m, &mut car, 0, 130.0, true), Some(80.0));
+        // two short lanes leading into each other (X1, X2), back onto X1 10 m after: a loop
+        // shorter than `SHORT_LOOP`
+        assert_eq!(at(&mut m, &mut car, 9, 140.0, true), None);
+        assert_eq!(at(&mut m, &mut car, 10, 145.0, true), None);
+        assert_eq!(at(&mut m, &mut car, 9, 150.0, true), None);
+        // onto R2 again by a lane change: no link entry
+        assert_eq!(at(&mut m, &mut car, 2, 190.0, false), None);
+        assert_eq!((m.entries, m.vehicles.len()), (1, 1));
     }
 
     #[test]
