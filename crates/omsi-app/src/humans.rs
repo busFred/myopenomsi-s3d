@@ -3162,9 +3162,9 @@ impl PedNet {
         let mut keys: Vec<usize> = self.ends.keys().copied().filter(|&l| l < net.lanes.len()).collect();
         keys.sort_unstable();
         self.unloaded = keys.into_iter().filter_map(|l| Some((l, unloaded_stretches(&net.lanes[l], tile, loaded))).filter(|(_, v)| !v.is_empty())).collect();
-        // a crossing is begun at its kerb and walked as one chain (`crossing_span`): when any piece
-        // of the chain runs onto unloaded ground the whole chain is closed at its kerb, so nobody
-        // is left standing mid-road on a loaded first piece
+        // a crossing is begun at its kerb and walked as one span (`crossing_span`): when any piece
+        // of its chain (`crossing_chain`, wider than the span) runs onto unloaded ground the whole
+        // chain is closed at its kerb, so nobody is left standing mid-road on a loaded first piece
         let mut crossings: HashSet<usize> = HashSet::new();
         for l in self.unloaded.keys().copied().filter(|&l| core_piece(self, net, lights, l)).collect::<Vec<_>>() {
             if crossings.insert(l) {
@@ -3174,9 +3174,12 @@ impl PedNet {
         self.unloaded_crossings = crossings;
     }
 
-    /// The pieces proper of the crossing that `lane` belongs to, either way along it: those that
-    /// `crossing_span` strings together, a piece that goes on straight (`PED_STRAIGHT_ON_TURN`) from
-    /// the end of another, with pieces of at most `CROSSING_MEDIAN_MAX` m (a median) between.
+    /// The pieces proper of the crossing that `lane` belongs to, either way along it: a piece that
+    /// goes on straight (`PED_STRAIGHT_ON_TURN`) from the end of another, with pieces of at most
+    /// `CROSSING_MEDIAN_MAX` m (a median) between, following every such branch. Wider than
+    /// `crossing_span`, which also stops where the governing light changes and at a lit stub: the
+    /// chain can take in a neighbouring loaded crossing, which is then closed too (its walkers turn
+    /// back at the kerb).
     fn crossing_chain(&self, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> HashSet<usize> {
         let mut seen: HashSet<usize> = HashSet::from([lane]);
         let mut chain: HashSet<usize> = HashSet::new();
