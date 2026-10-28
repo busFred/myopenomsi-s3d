@@ -239,10 +239,11 @@ pub struct NeighbourView {
     /// longer look here is ours, so that the speed anticipated there (`plan::anticipated_speeds`)
     /// sees a queue standing further on.
     pub ahead: Option<(f32, f32)>,
-    /// Nearest vehicle behind there: (gap to my rear, its speed) - on that lane, or back over
-    /// the lanes leading into it as far as a follower can matter (`plan::walk_back` to
-    /// `plan::follower_reach`, SUMO's `getFollowersOnConsecutive`); the nearest, where SUMO takes
-    /// the one needing the largest gap (`MSCriticalFollowerDistanceInfo`).
+    /// The vehicle behind there that misses the most of the gap my change accepts from it
+    /// (`plan::accepted_gap`, SUMO's `MSCriticalFollowerDistanceInfo`: the largest missing rear
+    /// gap): (gap to my rear, its speed) - on that lane, or back over the lanes leading into it as
+    /// far as a follower can matter (`plan::walk_back` to `plan::change_follower_reach`, SUMO's
+    /// `getFollowersOnConsecutive`).
     pub behind: Option<(f32, f32)>,
     /// That vehicle's index, when it is an AI vehicle (the one asked to make room,
     /// `plan`'s cooperation).
@@ -1856,7 +1857,11 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let mut ahead: Option<(f32, f32)> = None;
     let behind: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
     let mut behind_id: Option<usize> = None;
-    let mut behind_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
+    let player_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
+    let mut behind_min_gap = player_min_gap;
+    // (the follower kept is the one missing the most of the gap my change accepts from it,
+    // `plan::accepted_gap`: SUMO's `MSCriticalFollowerDistanceInfo`, the largest missing rear gap)
+    let missing: std::cell::Cell<Option<f32>> = std::cell::Cell::new(None);
     let mut foreign = false;
     // (d_rel: the other's origin relative to the place beside me; front/rear its extents; the
     // vehicle's index, None for a player)
@@ -1871,12 +1876,13 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             }
         } else {
             let gap = -d_rel - front - st.rear;
-            if behind.get().map(|b| gap < b.0).unwrap_or(true) {
+            let min_gap = who.and_then(|k| vehicles.get(k)).map_or(player_min_gap, |o| o.params.min_gap);
+            let miss = crate::plan::accepted_gap(me, min_gap, speed, st.speed) - gap;
+            if missing.get().is_none_or(|m| miss > m) {
+                missing.set(Some(miss));
                 behind.set(Some((gap, speed)));
                 behind_id = who;
-                if let Some(o) = who.and_then(|k| vehicles.get(k)) {
-                    behind_min_gap = o.params.min_gap;
-                }
+                behind_min_gap = min_gap;
             }
         }
     };
@@ -1899,18 +1905,16 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     lane_users(nb, 0.0, true, &mut note);
     // behind, back over the lanes leading in as far as a follower can matter (SUMO's
     // `getFollowersOnConsecutive` to the lane's `getMaximumBrakeDist`: `plan::walk_back` to
-    // `plan::follower_reach`); a junction object's pieces are a few metres each, and a follower
-    // two pieces back at the lane's speed is the change's follower
-    // (only the nearest is kept, and a vehicle further back than a lane's start is behind every
-    // vehicle found there - bodies on one way do not overlap - so past the lanes leading straight
-    // in, whose passers mark the lane `foreign`, the walk goes on behind a lane only while nobody
-    // nearer than its start has been found)
-    crate::plan::walk_back(net, nb, s_b, crate::plan::follower_reach(net, nb), |l, start| {
+    // `plan::change_follower_reach`); a junction object's pieces are a few metres each, and a
+    // follower two pieces back at the lane's speed is the change's follower (every lane leading in
+    // within the reach is read: a faster vehicle further back can miss more of its gap than a
+    // nearer one, so no branch is cut short)
+    crate::plan::walk_back(net, nb, s_b, crate::plan::change_follower_reach(net, nb, me), |l, start| {
         if l != nb {
             let passers = net.prev.get(nb).is_some_and(|v| v.contains(&l));
             lane_users(l, start + s_b, passers, &mut note);
         }
-        l == nb || behind.get().is_none_or(|(g, _)| g > -start - st.rear)
+        true
     });
     // ahead, along the lanes it runs into up to `REACT_TO_STOPPED_DISTANCE` past the place
     // beside me (a look of our own beyond SUMO's brake gap, `NeighbourView::ahead`: the speed

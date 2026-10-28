@@ -310,3 +310,45 @@ fn a_step_out_is_swept_again_on_every_frame_of_its_signal() {
         assert!(dropped.is_some_and(|d| d < started.unwrap().0 + 0.1) && !left && least > 0.3, "car 3 at {s3}: dropped {dropped:?}, least {least:.2}, on the left lane {left}");
     }
 }
+
+/// `pieces` with a second lane, 5, leading into the 4 m piece (lane 3): from (0, 30) to (300, 0),
+/// merging with lane 4 there.
+fn two_branches() -> Network {
+    let mut net = pieces();
+    net.lanes.push(road(&[(0.0, 30.0), (300.0, 0.0)], 5, 0, 0.0));
+    net.link(1.5);
+    net.compute_conflicts();
+    net
+}
+
+/// SUMO's `getFollowersOnConsecutive` keeps, over every lane leading in, the follower missing the
+/// most of its rear gap, not the nearest: with a slow car 21 m behind on lane 4 (it needs 5 m) and a
+/// fast one 40 m behind on the merging branch, lane 5 (at 14 m/s it needs 48 m), the signalled
+/// change onto lane 2 is dropped; with the fast one 90 m back it goes.
+#[test]
+fn the_follower_missing_most_of_its_gap_on_any_lane_leading_in_is_the_one_checked() {
+    for (fast_x, dropped_expected) in [(266.0f64, true), (216.0, false)] {
+        let net = two_branches();
+        assert!(net.prev[3].contains(&4) && net.prev[3].contains(&5), "lanes 4 and 5 lead into lane 3");
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut me = car(1, 0, 6.0, 4.0);
+        me.state.start_change(&net, 2, 1);
+        let mut slow = car(2, 4, 285.0, 2.0);
+        slow.state.change_cooldown = 1000.0;
+        let (fast_s, _) = net.lanes[5].nearest_point(DVec3::new(fast_x, 30.0 * (1.0 - fast_x / 300.0), 0.0)).unwrap();
+        let mut fast = car(3, 5, fast_s, 14.0);
+        fast.state.change_cooldown = 1000.0;
+        let mut cars = vec![me, slow, fast];
+        let (mut dropped, mut t) = (false, 0.0f32);
+        while t < 1.0 {
+            sim.tick(&net, DT, &mut cars);
+            let st = &cars[0].state;
+            if st.change.is_none() && st.lane == 0 {
+                dropped = true;
+                break;
+            }
+            t += DT;
+        }
+        assert_eq!(dropped, dropped_expected, "fast follower at x {fast_x}: dropped {dropped}");
+    }
+}
