@@ -252,3 +252,61 @@ fn no_squeeze_past_a_car_indicating_to_that_side_and_a_squeezer_never_touches_a_
     }
     assert!(full_lock > 0, "no full-lock step-out among the runs");
 }
+
+/// `from_rest`'s step-out, with car 3 standing beside car 1's rear on the kerb side, 2.2 m right of
+/// the right lane's axis at x `s3`, where the rear swings as the full-lock move turns the body
+/// left: (put there from the start, or in the frame after the change started) -> (the change
+/// started - when, full lock -, when it was dropped with the car still on its lane, the least gap
+/// between the bodies, whether it ended on the left lane).
+fn step_out_with_a_body_beside(s3: f32, from_start: bool) -> (Option<(f32, bool)>, Option<f32>, f32, bool) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change_cooldown = 0.0;
+    let mut cars = vec![me, standing(2, 1, 106.5)];
+    let lat = 2.2;
+    let mut c3 = standing(3, 1, s3);
+    c3.state.lateral = lat;
+    c3.state.lateral_target = lat;
+    c3.state.lateral_ramp = (lat, lat, 0.0, 1.0);
+    if from_start {
+        cars.push(c3.clone());
+    }
+    let (mut started, mut dropped, mut least, mut placed) = (None, None, f32::INFINITY, from_start);
+    let mut t = 0.0f32;
+    while t < 12.0 {
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        if started.is_none() {
+            started = me.state.change.map(|c| (t, c.full_lock));
+        }
+        if started.is_some() && dropped.is_none() && me.state.change.is_none() && me.state.lane == 1 {
+            dropped = Some(t);
+        }
+        if !placed && started.is_some() {
+            cars.push(c3.clone());
+            placed = true;
+        }
+        for o in cars.iter().filter(|o| o.id != 1) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        t += DT;
+    }
+    (started, dropped, least, cars.iter().find(|c| c.id == 1).unwrap().state.lane == 0)
+}
+
+/// A step-out from rest sweeps its move again on every frame of its signal (as `bypass_start`
+/// swept it at the start, SUMO checking each sublane it moves into every step): a car that comes
+/// to stand beside its rear, where the full-lock move swings it, once the signal has begun drops
+/// the step-out before the car moves (it would have swung its rear into it: least -0.16 m without
+/// the sweep); the same car there from the start keeps it from setting out at all.
+#[test]
+fn a_step_out_is_swept_again_on_every_frame_of_its_signal() {
+    let (started, _, least, left) = step_out_with_a_body_beside(99.5, true);
+    assert!(started.is_none() && !left && least > 0.3, "there from the start: started {started:?}, least {least:.2}");
+    for s3 in [98.0f32, 99.5, 100.0] {
+        let (started, dropped, least, left) = step_out_with_a_body_beside(s3, false);
+        assert!(started.is_some_and(|s| s.1), "car 3 at {s3}: no full-lock step-out {started:?}");
+        assert!(dropped.is_some_and(|d| d < started.unwrap().0 + 0.1) && !left && least > 0.3, "car 3 at {s3}: dropped {dropped:?}, least {least:.2}, on the left lane {left}");
+    }
+}

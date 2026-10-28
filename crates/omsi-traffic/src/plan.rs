@@ -2302,8 +2302,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // a lane change of the driver's own (a bypass too) checks its gap again on every frame of
-    // its signal, and that nobody is on the target lane over the move (`people_on_move`), and is
-    // dropped if either fails before the car moves over (SUMO's `checkChange` runs every step
+    // its signal, and that nobody is on the target lane over the move (`people_on_move`) - a
+    // bypass also that its move is still clear (below) - and is dropped if any fails before the
+    // car moves over (SUMO's `checkChange` runs every step
     // until the change is carried out, and blocks it for a pedestrian on the target lane within
     // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end asks for keeps
     // informing the follower there (LC2013's `informFollower`, every step the strategic change
@@ -2317,6 +2318,18 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
             out.abort_change = !gap_accepted(me, &nb) || people_on_move(net, sim, me, &nb);
+            // (a bypass from rest also sweeps its move again, as it did at its start,
+            // `bypass_start`: every body near, not only the target lane's follower - one that came
+            // to stand in the swept band or alongside since; SUMO checks every sublane it moves
+            // into on each step. The sweep runs on my own lane's way, without the change laid on
+            // it, round the standing lead that is still there)
+            if !out.abort_change && c.bypass {
+                if let Some(l) = p.leader.filter(|l| l.speed < STANDING_SPEED) {
+                    let mut before = me.clone();
+                    before.state.change = None;
+                    out.abort_change = bypass_start(net, sim, vehicles, &before, p, &nb, &l).is_none();
+                }
+            }
         }
     }
 
