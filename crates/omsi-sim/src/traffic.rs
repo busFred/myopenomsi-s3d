@@ -598,14 +598,26 @@ pub struct Network {
     pub goal_fields: GoalFields,
 }
 
+/// The lanes a random car's way to its trip end may use (`AiState::goal_way`): those open to it
+/// (`AiState::closed_for`), or, where no trip end is reachable over them, also those closed only
+/// by its group's density (`choose_after`'s fallback tiers; SUMO routes over every lane the
+/// vehicle class may use, and density is no permission).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GoalAccess {
+    Open,
+    Driven,
+}
+
 /// What a `GoalField` is computed for: the trip end, the network's size (it only grows: a
-/// field of a smaller one may miss links), and what decides which lanes are open to the car
-/// (`AiState::closed_for`): its `[ai_veh_type]`, its traffic group with that group's defaults,
-/// and the body a closed run is measured against (`Network::closed_marker`).
+/// field of a smaller one may miss links), the access (`GoalAccess`) and what decides which
+/// lanes are open to the car (`AiState::closed_for`): its `[ai_veh_type]`, its traffic group
+/// with that group's defaults, and the body a closed run is measured against
+/// (`Network::closed_marker`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GoalKey {
     pub goal: usize,
     pub lanes: usize,
+    pub access: GoalAccess,
     veh_type: i32,
     pool: Option<(usize, Vec<i32>)>,
     body: u32,
@@ -3437,13 +3449,14 @@ pub struct AiState {
     /// Position in `route` of the current lane.
     pub route_index: usize,
     /// A random car's trip end: a street lane with no way on (SUMO's fringe edge, an edge
-    /// without successors, where `randomTrips` starts and ends trips), open to the car and not
-    /// a loaded-tile edge in sight (`Network::ends_at_loaded_edge`). Drawn at random among the
-    /// ends reachable from the fork where the car's plan first meets a choice
-    /// (`AiState::goal_way`), drawn again where it is gone or out of reach (`GOAL_REPICKED`).
-    /// At a fork the car takes the way on with the shortest way to it (`choose_after`, SUMO:
-    /// the route the router computes to the trip's end decides the way on). None: no fork met
-    /// yet, a timetable route, or no end reachable (the car chooses at random, as before).
+    /// without successors, where `randomTrips` starts and ends trips), open to the car (closed
+    /// only by density where no open one is reachable, `GoalAccess`) and not a loaded-tile edge
+    /// in sight (`Network::ends_at_loaded_edge`). Drawn at random among the ends reachable from
+    /// the fork where the car's plan first meets a choice (`AiState::goal_way`), drawn again
+    /// where it is gone or out of reach (`GOAL_REPICKED`). At a fork the car takes the way on
+    /// with the shortest way to it (`choose_after`, SUMO: the route the router computes to the
+    /// trip's end decides the way on). None: no fork met yet, a timetable route, or no end
+    /// reachable (the car chooses at random among the best tier).
     pub goal: Option<usize>,
     /// The way lengths to `goal` (`GoalField`), shared with the cars of the same goal and
     /// access (`Network::goal_fields`); not recorded, computed again on need.
@@ -3986,69 +3999,87 @@ impl AiState {
         }
     }
 
-    /// Is `n` a trip end for this car: a street lane with no way on (SUMO's fringe edge), open
-    /// to it, and not a loaded-tile edge in sight (one the car is routed away from,
-    /// `Network::ends_at_loaded_edge`: it would stand there in view)?
-    fn is_trip_end(&self, net: &Network, n: usize) -> bool {
-        net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.closed_for(net, n, LaneKind::Street).is_none()
+    /// Is `n` a lane this car may route over at `access`: open to it (`closed_for`), or at
+    /// `GoalAccess::Driven` closed only by the density of its group.
+    fn routable(&self, net: &Network, n: usize, access: GoalAccess) -> bool {
+        match self.closed_for(net, n, LaneKind::Street) {
+            None => true,
+            Some(Closed::Density) => access == GoalAccess::Driven,
+            Some(_) => false,
+        }
     }
 
-    /// The trip end's way lengths for a choice among the ways on `next` of a fork: the car's
-    /// own while its trip end still is one and one of `next` leads to it; else a trip end
-    /// drawn at random among those reachable over open lanes from `next` (SUMO's
-    /// `randomTrips`: a trip from or to the fringe, a trip whose end cannot be reached is
-    /// dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`). None: no trip end reachable.
+    /// Is `n` a trip end for this car at `access`: a street lane with no way on (SUMO's fringe
+    /// edge), one it may route over (`routable`), and not a loaded-tile edge in sight (one the
+    /// car is routed away from, `Network::ends_at_loaded_edge`: it would stand there in view)?
+    fn is_trip_end(&self, net: &Network, n: usize, access: GoalAccess) -> bool {
+        net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.routable(net, n, access)
+    }
+
+    /// The trip end's way lengths for a choice among the ways on `next` of a fork, over the open
+    /// lanes first (`GoalAccess::Open`): the car's own trip end while it still is one and one of
+    /// `next` leads to it; else a trip end drawn at random among those reachable from `next`
+    /// (SUMO's `randomTrips`: a trip from or to the fringe, a trip whose end cannot be reached
+    /// is dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`). Only where no trip end is
+    /// reachable over open lanes, the same over the lanes closed only by density
+    /// (`GoalAccess::Driven`): `choose_after`'s own fallback for a car in a quarter its group
+    /// does not drive (density is OMSI's demand weight, no permission: SUMO's router routes
+    /// over every lane the vehicle class may use). None: no trip end reachable.
     fn goal_way(&mut self, net: &Network, next: &[usize]) -> Option<std::sync::Arc<GoalField>> {
-        if let Some(g) = self.goal.filter(|&g| self.is_trip_end(net, g)) {
-            let key = self.goal_key(net, g);
-            let f = match self.goal_field.take().filter(|f| f.key == key) {
-                Some(f) => f,
-                None => net.goal_field(key, |n| self.closed_for(net, n, LaneKind::Street).is_none()),
-            };
-            if next.iter().any(|&n| f.to_goal(n).is_finite()) {
-                self.goal_field = Some(f.clone());
-                return Some(f);
-            }
-        }
-        let had = self.goal.take().is_some();
-        self.goal_field = None;
-        // (the trip ends reachable from the ways on, nearest first as met)
-        let mut seen = vec![false; net.lanes.len()];
-        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-        for &n in next {
-            if n < seen.len() && !seen[n] && self.closed_for(net, n, LaneKind::Street).is_none() {
-                seen[n] = true;
-                queue.push_back(n);
-            }
-        }
-        let mut ends = Vec::new();
-        while let Some(x) = queue.pop_front() {
-            if self.is_trip_end(net, x) {
-                ends.push(x);
-            }
-            for &m in &net.lanes[x].next {
-                if m < seen.len() && !seen[m] && self.closed_for(net, m, LaneKind::Street).is_none() {
-                    seen[m] = true;
-                    queue.push_back(m);
+        let had = self.goal.is_some();
+        for access in [GoalAccess::Open, GoalAccess::Driven] {
+            if let Some(g) = self.goal.filter(|&g| self.is_trip_end(net, g, access)) {
+                let key = self.goal_key(net, g, access);
+                let f = match self.goal_field.take().filter(|f| f.key == key) {
+                    Some(f) => f,
+                    None => net.goal_field(key, |n| self.routable(net, n, access)),
+                };
+                if next.iter().any(|&n| f.to_goal(n).is_finite()) {
+                    self.goal_field = Some(f.clone());
+                    return Some(f);
                 }
             }
+            // (the trip ends reachable from the ways on, nearest first as met)
+            let mut seen = vec![false; net.lanes.len()];
+            let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+            for &n in next {
+                if n < seen.len() && !seen[n] && self.routable(net, n, access) {
+                    seen[n] = true;
+                    queue.push_back(n);
+                }
+            }
+            let mut ends = Vec::new();
+            while let Some(x) = queue.pop_front() {
+                if self.is_trip_end(net, x, access) {
+                    ends.push(x);
+                }
+                for &m in &net.lanes[x].next {
+                    if m < seen.len() && !seen[m] && self.routable(net, m, access) {
+                        seen[m] = true;
+                        queue.push_back(m);
+                    }
+                }
+            }
+            if ends.is_empty() {
+                continue;
+            }
+            let g = ends[(self.rand() % ends.len() as u64) as usize];
+            if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = self.goal_key(net, g, access);
+            let f = net.goal_field(key, |n| self.routable(net, n, access));
+            self.goal = Some(g);
+            self.goal_field = Some(f.clone());
+            return Some(f);
         }
-        if ends.is_empty() {
-            return None;
-        }
-        let g = ends[(self.rand() % ends.len() as u64) as usize];
-        if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let key = self.goal_key(net, g);
-        let f = net.goal_field(key, |n| self.closed_for(net, n, LaneKind::Street).is_none());
-        self.goal = Some(g);
-        self.goal_field = Some(f.clone());
-        Some(f)
+        self.goal = None;
+        self.goal_field = None;
+        None
     }
 
-    /// The `GoalKey` of trip end `goal` for this car.
-    fn goal_key(&self, net: &Network, goal: usize) -> GoalKey {
+    /// The `GoalKey` of trip end `goal` for this car at `access`.
+    fn goal_key(&self, net: &Network, goal: usize, access: GoalAccess) -> GoalKey {
         let body = self.traffic_pool.as_ref().and_then(|(p, _)| net.group_body.get(*p)).copied().unwrap_or(0.0).max(self.length);
-        GoalKey { goal, lanes: net.lanes.len(), veh_type: self.veh_type, pool: self.traffic_pool.as_ref().map(|(p, d)| (*p, d.to_vec())), body: body.to_bits() }
+        GoalKey { goal, lanes: net.lanes.len(), access, veh_type: self.veh_type, pool: self.traffic_pool.as_ref().map(|(p, d)| (*p, d.to_vec())), body: body.to_bits() }
     }
 
     /// How far ahead (m) the way is planned: `PLAN_AHEAD`, or the claim horizon at this speed.
@@ -5508,6 +5539,27 @@ mod tests {
             out[last - 8] += 1;
         }
         assert!(out.iter().all(|&n| n > 0), "exits taken {out:?}");
+    }
+
+    #[test]
+    fn a_car_in_a_quarter_its_group_does_not_drive_still_draws_a_trip_end_and_never_laps() {
+        // every lane below `OPEN_DENSITY_FLOOR` (X10's block loop round lane 3074 at 0.001): no
+        // trip end is reachable over open lanes, so the car draws one over the lanes closed only
+        // by density (`GoalAccess::Driven`) and leaves the ring by it
+        let mut net = four_arm_ring();
+        for l in net.lanes.iter_mut() {
+            l.density = 0.001;
+        }
+        for seed in 1..20u64 {
+            let mut car = AiState::new(4 + (seed % 4) as usize, 0.0, seed);
+            let way = lanes_driven(&mut car, &net, 30);
+            let mut sorted = way.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), way.len(), "seed {seed}: a lane driven twice: {way:?}");
+            assert_eq!(car.goal, way.last().copied(), "seed {seed}: left by its trip end: {way:?}");
+            assert!(car.goal.is_some_and(|g| (8..12).contains(&g)), "seed {seed}: {:?}", car.goal);
+        }
     }
 
     #[test]
