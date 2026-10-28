@@ -643,7 +643,33 @@ pub(super) struct PaxStop {
     pub refused: Vec<bool>,
 }
 
+/// Where a rider of a stop goes to wait (`PaxStop::wait_for`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum RiderWait {
+    /// At this point: their waiting place, or where those with no place wait.
+    At(DVec3),
+    /// Nowhere at this stop: no place and no point for those with none (`PaxStop::kerb_shift`
+    /// None, every place refused), so they go on on foot along the stop's pavement as those
+    /// getting off do (`Humans::send_on_from_stop`; SUMO's waiting persons stand on the stop's
+    /// platform, and a stop with none has nobody waiting).
+    SendOn,
+}
+
 impl PaxStop {
+    /// Where rider `who` with waiting place `spot` (if any) waits: at the place; with none, at
+    /// the point for those with no place (`kerb_shift`), spread along the stop by who they are
+    /// where that keeps every one outside the strips (`kerb_spread`, `no_place_along`); with no
+    /// such point, nowhere (`RiderWait::SendOn`).
+    pub(super) fn wait_for(&self, who: u32, spot: Option<usize>) -> RiderWait {
+        if let Some(sp) = spot.and_then(|k| self.spots.get(k)) {
+            return RiderWait::At(sp.pos);
+        }
+        let Some(k) = self.kerb_shift else { return RiderWait::SendOn };
+        let along = if self.kerb_spread { no_place_along(who) } else { 0.0 };
+        let h = self.heading.to_radians();
+        RiderWait::At(self.pos + k + DVec3::new(h.sin(), h.cos(), 0.0) * along)
+    }
+
     /// Whether a destination or a terminus `name` is this stop: its label, or its name in
     /// the timetable.
     pub(super) fn is_named(&self, name: &str) -> bool {
@@ -2458,22 +2484,16 @@ impl Humans {
                 let sp = stop
                     .zip(spot)
                     .and_then(|(s, k)| self.stops.get(&s).and_then(|s| s.spots.get(k)).cloned());
-                // (no place free: where those with no place wait, `PaxStop::kerb_shift` - spread
+                // (no place free: where those with no place wait, `PaxStop::wait_for` - spread
                 // along the kerb by who they are where that keeps them out of the strips, or
-                // everybody without a place stood in one another there; with no such point they
-                // stay where they are: a stop without one has every place refused, and nobody is
-                // sent to wait there)
-                let stop_pos = stop.and_then(|s| self.stops.get(&s)).and_then(|s| s.kerb_shift.map(|k| s.pos + k));
-                let spread = stop.and_then(|s| self.stops.get(&s)).is_some_and(|s| s.kerb_spread);
-                let along = if spread { no_place_along(self.people[i].id) } else { 0.0 };
-                let fwd = stop
-                    .and_then(|s| self.stops.get(&s))
-                    .map(|s| {
-                        let h = s.heading.to_radians();
-                        DVec3::new(h.sin(), h.cos(), 0.0)
-                    })
-                    .unwrap_or(DVec3::ZERO);
-                let stop_pos = stop_pos.map(|q| q + fwd * along);
+                // everybody without a place stood in one another there; at a stop with no such
+                // point they go on on foot, `send_on_from_stop`)
+                let wait = stop.and_then(|s| self.stops.get(&s)).map(|s| s.wait_for(self.people[i].id, None));
+                let stop_pos = match wait {
+                    Some(RiderWait::At(q)) => Some(q),
+                    _ => None,
+                };
+                let send_on = sp.is_none() && wait == Some(RiderWait::SendOn);
                 let p = self.pax_mut(i).unwrap();
                 p.spot = spot;
                 p.target_bus = false;
@@ -2498,6 +2518,9 @@ impl Humans {
                     }
                 }
                 p.st = 1;
+                if let (true, Some(s)) = (send_on, stop) {
+                    self.send_on_from_stop(i, s);
+                }
             }
             Task::SittingInBus => {
                 let bus = self.pax(i).unwrap().inside;
@@ -3211,6 +3234,17 @@ impl Humans {
         let lane = stop.and_then(|s| self.stops.get(&s)).and_then(|s| s.lane);
         let _ = &remove;
         self.walk_street_on(i, at, heading, lane)
+    }
+
+    /// Rider `i` of stop `stop`, with nowhere to wait there (`RiderWait::SendOn`): their place
+    /// and seat given up (`release`), on as a pedestrian from where they stand along the stop's
+    /// pavement (`PaxStop::lane`, as those getting off), counted (`riders_sent_on`).
+    pub(super) fn send_on_from_stop(&mut self, i: usize, stop: i64) {
+        self.release(i);
+        self.riders_sent_on += 1;
+        let (at, heading) = (self.people[i].position, self.people[i].heading);
+        let lane = self.stops.get(&stop).and_then(|s| s.lane);
+        self.walk_street_on(i, at, heading, lane);
     }
 
     /// On as a pedestrian from `at` along pavement `lane` (lane, distance along it) - or

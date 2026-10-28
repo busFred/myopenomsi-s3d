@@ -5954,6 +5954,8 @@ pub struct Humans {
     /// Counted for the gate (`summary`): the stops with no point for those with no place
     /// (`clear_stop_of_lanes`).
     points_refused: usize,
+    /// Riders sent on on foot from a stop with nowhere to wait (`send_on_from_stop`).
+    riders_sent_on: usize,
     /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
     /// could see then (`figure_in_sight`; every removal rule asks for out of sight, so none).
     removed: (usize, usize),
@@ -6219,6 +6221,7 @@ impl Humans {
             jam_stats: (0.0, 0.0),
             places_refused: 0,
             points_refused: 0,
+            riders_sent_on: 0,
             removed: (0, 0),
             gone: Vec::new(),
             inside_seen: HashSet::new(),
@@ -6948,11 +6951,11 @@ impl Humans {
                 }
                 let stop = &self.stops[&id];
                 let spots: Vec<DVec3> = stop.spots.iter().map(|sp| sp.pos).collect();
-                let point = stop.kerb_shift.map(|k| stop.pos + k);
                 // (whoever is at a place that moved walks to it; from a refused place to a free
                 // place that is not refused, `take_spot`, else to where those with no place wait,
-                // as somebody with no place; with neither they stay where they are - the stop's
-                // places are all refused and nobody else is sent there)
+                // as somebody with no place, `PaxStop::wait_for`; with neither - the stop's places
+                // all refused and no point for those with none - they go on on foot along the
+                // stop's pavement, `send_on_from_stop`: nobody keeps a target on a refused place)
                 let mut on_refused = Vec::new();
                 for (i, p) in self.people.iter_mut().enumerate() {
                     if let State::Pax(x) = &mut p.state {
@@ -6975,12 +6978,15 @@ impl Humans {
                 }
                 for (i, _) in on_refused {
                     let spot = self.take_spot(id);
-                    let target = spot.and_then(|k| self.stops.get(&id).and_then(|s| s.spots.get(k)).map(|sp| sp.pos)).or(point);
-                    if let State::Pax(x) = &mut self.people[i].state {
-                        x.spot = spot;
-                        if let Some(t) = target {
-                            x.target = t;
+                    let who = self.people[i].id;
+                    match self.stops.get(&id).map(|s| s.wait_for(who, spot)) {
+                        Some(pax::RiderWait::At(t)) => {
+                            if let State::Pax(x) = &mut self.people[i].state {
+                                x.spot = spot;
+                                x.target = t;
+                            }
                         }
+                        _ => self.send_on_from_stop(i, id),
                     }
                 }
             }
@@ -8934,7 +8940,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
-        out.push_str(&format!("; waiting places refused {} (stop points refused {}); taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.removed.0, self.removed.1));
+        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.riders_sent_on, self.removed.0, self.removed.1));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -14120,12 +14126,24 @@ mod ped_tests {
         let mut s = stop(vec![between()], None);
         let (_, refused, no_point) = clear_stop_of_lanes(&mut s, &net);
         assert!(refused == vec![0] && no_point && s.kerb_shift.is_none());
+        // ... and its riders with no place have nowhere to wait there: sent on along its pavement,
+        // none keeps a target on the refused place
+        for who in [0u32, 7, 123] {
+            assert_eq!(s.wait_for(who, None), pax::RiderWait::SendOn);
+        }
         // a place clear of the strips: there
         let mut s = stop(vec![between(), WaitSpot { pos: kerb, face: 0.0, height: 0.0 }], None);
         let (_, refused, no_point) = clear_stop_of_lanes(&mut s, &net);
         assert!(refused == vec![0] && !no_point, "{refused:?}");
         let at = s.pos + s.kerb_shift.unwrap();
         assert!((at - kerb).length() < 1e-6 && !within_lanes(&net, at, &strip_reach), "{at:?}");
+        // (a rider of it with no place waits there, spread along the stop only where every slot is
+        // outside the strips; one with the place at it)
+        for who in [0u32, 7, 123] {
+            let pax::RiderWait::At(q) = s.wait_for(who, None) else { panic!("nowhere to wait") };
+            assert!(!within_lanes(&net, q, &strip_reach), "{who} {q:?}");
+        }
+        assert_eq!(s.wait_for(1, Some(1)), pax::RiderWait::At(kerb));
         // none, but the stop's pavement: its point
         let mut s = stop(vec![between()], Some((2, 50.0)));
         let (_, _, no_point) = clear_stop_of_lanes(&mut s, &net);
