@@ -2348,12 +2348,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // `bypass_start`: every body near, not only the target lane's follower - one that came
             // to stand in the swept band or alongside since; SUMO checks every sublane it moves
             // into on each step. The sweep runs on my own lane's way, without the change laid on
-            // it, round the standing lead that is still there)
+            // it, round the standing lead that is still there; the move must still clear in the
+            // kind it was started with, the smoothstep or the two arcs at full lock, as the car
+            // drives that one and not whichever clears now)
             if !out.abort_change && c.bypass {
                 if let Some(l) = p.leader.filter(|l| l.speed < STANDING_SPEED) {
                     let mut before = me.clone();
                     before.state.change = None;
-                    out.abort_change = bypass_start(net, sim, vehicles, &before, p, &nb, &l).is_none();
+                    let same_move = matches!(bypass_start(net, sim, vehicles, &before, p, &nb, &l), Some(Start::Bypass { full_lock, .. }) if full_lock == c.full_lock);
+                    out.abort_change = !same_move;
                 }
             }
         }
