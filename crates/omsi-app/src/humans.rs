@@ -2306,6 +2306,14 @@ fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, cent
     far_from(center, others, p, STROLL_RADIUS) && !figure_in_sight(eye, viewer, center, p)
 }
 
+/// Whether a stroller at the loaded ground's edge at `p` leaves there rather than turning
+/// (`edge_turn`): out of the player's sight (`figure_in_sight`) and farther than
+/// `traffic::NEVER_VANISH_WITHIN` from every player (`center`, `others`), the distance within which
+/// no car vanishes seen or not (the mirrors, a turn of the head).
+fn leaves_at_edge(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
+    !figure_in_sight(eye, viewer, center, p) && far_from(center, others, p, crate::traffic::NEVER_VANISH_WITHIN)
+}
+
 /// Is `p` further than `r` from `center` and from every one of `others`?
 fn far_from(center: DVec3, others: &[DVec3], p: DVec3, r: f64) -> bool {
     (p - center).length() > r && others.iter().all(|c| (p - *c).length() > r)
@@ -2475,12 +2483,14 @@ impl DecideCtx<'_> {
                 }
                 d.want = self.walk_want(p, &mut d, &mut walk, net, lights, cars, dt, yields);
                 d.state = Some(State::Strolling(walk));
-                // (at the loaded ground's edge out of the player's sight they leave, as a vehicle
-                // at the loaded tiles' edge out of sight does (`removal::RemoveRule::DeadEnd`;
-                // SUMO: a person arriving at the network's fringe leaves it): turned back, the
-                // strollers of a whole edge walked back into the first junction's kerbs -
-                // Jiangzhaikou's queues of 107-139 waiters against 36-38)
-                if d.edge_turn && !figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position) {
+                // (at the loaded ground's edge out of the player's sight and beyond the distance
+                // within which no car vanishes seen or not (`traffic::NEVER_VANISH_WITHIN`: the
+                // mirrors and a turn of the head) they leave, as a vehicle at the loaded tiles'
+                // edge does (`removal::RemoveRule::DeadEnd`; SUMO: a person arriving at the
+                // network's fringe leaves it); within it they turn as in sight. Turned back
+                // everywhere, the strollers of a whole edge walked back into the first junction's
+                // kerbs - Jiangzhaikou's queues of 107-139 waiters against 36-38)
+                if d.edge_turn && leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
                     d.gone = true;
                 }
                 d
@@ -5762,8 +5772,8 @@ pub struct Humans {
     /// `WALL_TURN_CELL` cell of where they stood (the strollers profile line reports them).
     wall_turns: HashMap<(i64, i64), u32>,
     /// How many times a stroller turned round at the loaded ground's edge itself (`edge_turn`) in
-    /// the player's sight, and how many out of it left there instead (`DecideCtx::decide`); the
-    /// strollers profile line reports both.
+    /// the player's sight or within `traffic::NEVER_VANISH_WITHIN`, and how many out of both left
+    /// there instead (`DecideCtx::decide`); the strollers profile line reports both.
     edge_turns: u64,
     edge_gone: u64,
     hidden: Vec<usize>,
@@ -7645,7 +7655,7 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, turned at the loaded ground's edge {} in sight, left there {} (paths onto unloaded ground {})",
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, turned at the loaded ground's edge {} in sight or near, left there {} (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
@@ -14853,6 +14863,21 @@ mod ped_tests {
             assert!(!edge_turn(&ped, &net, &mut walk));
         }
         assert!(walk.cross.is_some() && walk.legs.len() == 1 && walk.legs[0].b == 20.0 && walk.closed_ends == 0);
+    }
+
+    #[test]
+    fn p11_4_nobody_leaves_at_the_edge_within_the_never_vanish_distance() {
+        // the eye at the origin looking north (+y): behind it, out of sight
+        let eye = Eye { pos: DVec3::ZERO, fwd: DVec3::Y, cos_half: 0.7 };
+        let r = crate::traffic::NEVER_VANISH_WITHIN;
+        let behind = |d: f64| DVec3::new(0.0, -d, 0.0);
+        assert!(!figure_in_sight(Some(eye), None, DVec3::ZERO, behind(r - 10.0)));
+        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], behind(r - 10.0)), "beside or behind the player (mirrors)");
+        assert!(leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], behind(r + 10.0)));
+        // near another player: stays
+        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[behind(r + 20.0)], behind(r + 10.0)));
+        // in sight far off: stays (turns)
+        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], DVec3::new(0.0, r + 10.0, 0.0)));
     }
 }
 
