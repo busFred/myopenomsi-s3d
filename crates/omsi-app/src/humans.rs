@@ -2270,8 +2270,6 @@ struct Me {
     /// Walking up to a crossing with the verdict "go": where they step onto it and the
     /// seconds until they do and until they are across (`Person::approach`).
     approach: Option<(DVec2, f32, f32)>,
-    /// Seconds standing still (`Person::still`).
-    still: f32,
 }
 
 /// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
@@ -2537,7 +2535,7 @@ impl DecideCtx<'_> {
     /// Where a walk along the pavement takes somebody next.
     #[allow(clippy::too_many_arguments)]
     fn walk_want(&self, p: &Person, d: &mut Decision, walk: &mut PedWalk, net: &Network, lights: Option<&LightsOf>, cars: &[SeenCar], dt: f32, yields: &mut YieldBook) -> Want {
-        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None, still: p.still };
+        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None };
         let at = Around { net, lights: lights.map(|t| t as &dyn PedLights), cars, streams: self.streams, queues: self.queues, time: self.time };
         let w = stroll(self.ped, &at, &mut me, walk, &mut d.walk_rng, yields, dt);
         d.on_crossing = me.on_crossing;
@@ -4132,13 +4130,9 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
     let frame = KerbFrame::of(net, next, &stripes);
     let key = ped.and_then(|p| kerb_node(p, next)).unwrap_or(usize::MAX);
     let kept = walk.spot.filter(|s| s.leg == walk.leg && s.next == next.lane);
-    // (a place they have stood off for `KERB_REPICK` s or more, farther than they stop from it, is
-    // not theirs: it is held by a body, or by another's claim; they pick another)
-    let given_up = kept.filter(|s| me.still >= KERB_REPICK && (s.pos - me.pos).length() > KERB_ARRIVE).map(|s| s.pos);
-    let kept = kept.filter(|_| given_up.is_none());
     let spot = match kept {
         Some(s) => {
-            let up = (s.row > 0).then(|| at.queues.areas.get(&key)).flatten().and_then(|a| a.pick(at.queues, me.id, me.pos, s.row, &frame, None));
+            let up = (s.row > 0).then(|| at.queues.areas.get(&key)).flatten().and_then(|a| a.pick(at.queues, me.id, me.pos, s.row, &frame));
             match up {
                 Some((q, row, lat)) => KerbPlace { pos: q, row, lat, ..s },
                 None => s,
@@ -4180,7 +4174,7 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                 _ => None,
             };
             let behind = |q: DVec2| (q, BEHIND_THE_QUEUE, frame.rank(q).1);
-            let mut place = area.and_then(|a| a.pick(at.queues, me.id, me.pos, BEHIND_THE_QUEUE, &frame, given_up)).or_else(|| behind_the_queue(net, at.queues, area, &way, me.id, me.pos).map(behind));
+            let mut place = area.and_then(|a| a.pick(at.queues, me.id, me.pos, BEHIND_THE_QUEUE, &frame)).or_else(|| behind_the_queue(net, at.queues, area, &way, me.id, me.pos).map(behind));
             // (the queue longer than the legs they walked: on back along the paths that continue
             // the way straight on, `PedNet::straight_on`, as far as the network goes)
             if let (None, Some(p), Some(_)) = (place, ped, way.last()) {
@@ -4266,11 +4260,6 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
 /// `arrive` stops within this of its target (m); a kerb waiter takes that last step at once, else
 /// they would stand up to this far off their point of the queue grid.
 const KERB_ARRIVE: f64 = 0.1;
-
-/// A kerb waiter standing still this long (s) farther than `KERB_ARRIVE` from their place gives it
-/// up and picks another (`wait_at_kerb`): one place to a waiter holds for where they stand, not
-/// only for the places they hold (two members of a group refused in one frame took one place).
-const KERB_REPICK: f32 = 1.0;
 
 /// HCM 2010 (p. 4-32, text): people waiting to cross at street corners queue at 3-6 ft^2 a person
 /// (0.28-0.56 m^2). Taken: the upper end, 6 ft^2, the roomier queue (the lower end is the HCM body
@@ -4397,15 +4386,14 @@ impl KerbArea {
     /// The free place (`Queues::free`) somebody at `pos` waiting for the crossing of `frame` takes,
     /// in a row before `before`: in the crossing's own strip first, then anywhere in the node's area;
     /// the front row first, in a row the one nearest them; places behind them (farther from the kerb
-    /// than they are) only when none ahead is free (nobody steps back while one is). Never `given_up`,
-    /// the place they stood too long without reaching (`wait_at_kerb`).
-    fn pick(&self, queues: &Queues, id: u32, pos: DVec2, before: u32, frame: &KerbFrame, given_up: Option<DVec2>) -> Option<(DVec2, u32, f64)> {
+    /// than they are) only when none ahead is free (nobody steps back while one is).
+    fn pick(&self, queues: &Queues, id: u32, pos: DVec2, before: u32, frame: &KerbFrame) -> Option<(DVec2, u32, f64)> {
         let depth = (frame.start - pos).dot(frame.fwd);
         let lat = (pos - frame.start).dot(frame.right);
         let mut best: Option<((bool, bool, u32, f64), DVec2, u32, f64)> = None;
         for &q in &self.places {
             let (row, off) = frame.rank(q);
-            if row >= before || !queues.free(q, id) || given_up.is_some_and(|g| (g - q).length() < 1e-6) {
+            if row >= before || !queues.free(q, id) {
                 continue;
             }
             let behind = (frame.start - q).dot(frame.fwd) > depth + 1e-6;
@@ -11902,7 +11890,7 @@ mod ped_tests {
     }
 
     pub(super) fn me(id: u32, pos: DVec2, pace: f64) -> Me {
-        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace, approach: None, still: 0.0 }
+        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace, approach: None }
     }
 
     /// One frame of the walk as the game moves them (the crowd left out): (velocity).
@@ -14389,9 +14377,7 @@ mod ped_tests {
     }
 
     /// Two members of one group arriving at the kerb in one frame (the same decision from the same
-    /// queues, the light red): they end on two places of the queue grid, each exactly on its own;
-    /// and a waiter standing still `KERB_REPICK` s off the place they hold (held off it by a body)
-    /// picks another.
+    /// queues, the light red): they end on two places of the queue grid, each exactly on its own.
     #[test]
     fn p11_7_two_group_members_refused_in_one_frame_get_two_places_and_stand_on_them() {
         let (net, ped) = kerb_both_sides();
@@ -14413,7 +14399,6 @@ mod ped_tests {
                 if !claim_spot(m.id, old, w, &queues, &mut claimed) {
                     want.vel = DVec2::ZERO;
                 }
-                m.still = if want.vel.length() < 0.05 { m.still + dt } else { 0.0 };
                 m.pos += want.vel * dt as f64;
                 if let Some(leg) = w.legs.get(w.leg) {
                     w.s = leg.project(&net, m.pos.extend(0.0), w.s).max(w.s - 0.3);
@@ -14425,18 +14410,6 @@ mod ped_tests {
         for ((m, _), q) in people.iter().zip(&spots) {
             assert!((m.pos - *q).length() <= KERB_ARRIVE, "{:?} off its place {q:?}", m.pos);
         }
-        // held off the place: standing still 1 s, 0.4 m from it, they pick another
-        let (m, w) = &mut people[0];
-        let held = w.spot.unwrap().pos;
-        m.pos = held + DVec2::new(0.0, -0.4);
-        m.still = KERB_REPICK;
-        let places: Vec<(u32, KerbPlace)> = [(m.id, w.spot.unwrap())].into_iter().collect();
-        queues.rebuild(places.iter().map(|(id, s)| (*id, s)), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
-        let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: 60.0 };
-        let mut rng = 7u64;
-        stroll(Some(&ped), &at, m, w, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), dt);
-        let now = w.spot.expect("a place").pos;
-        assert!((now - held).length() >= STRIPE_WIDTH - 1e-6, "kept {held:?} picked {now:?}");
     }
 
     #[test]
