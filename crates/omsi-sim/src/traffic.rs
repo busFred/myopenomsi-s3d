@@ -3536,7 +3536,7 @@ pub struct LaneChange {
     /// A bypass's: the vehicle it pulls out round (its id; a player's `PLAYER_ID_BASE` + its id,
     /// as `omsi_traffic::sim::Decision::wait_for`), `None` round a parked car (which has no id
     /// and does not move). Its move is swept again round that body on every frame of the
-    /// signal (`omsi_traffic::plan`).
+    /// signal while that body stands (`omsi_traffic::plan`).
     #[serde(default)]
     pub round: Option<u64>,
 }

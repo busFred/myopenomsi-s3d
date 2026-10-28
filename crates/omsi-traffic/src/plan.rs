@@ -2365,8 +2365,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // on the way can be the target lane's car), while it stands; it sweeps the kind of
             // move started, the smoothstep or the two arcs at full lock, as the car drives that one
             // and not whichever clears now. Once that thing has moved off or gone from my way, the
-            // change goes on as a plain one under the gap rule above, as it always did when its
-            // lead left)
+            // car still drives the bypass move it started, checked only by the gap and people
+            // rules above, as it always was when its lead left)
             if !out.abort_change && c.bypass {
                 if let Some(b) = p.bypassed.as_ref().filter(|b| b.lead.speed < STANDING_SPEED) {
                     let mut before = me.clone();

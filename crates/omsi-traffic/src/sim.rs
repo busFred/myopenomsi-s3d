@@ -760,8 +760,9 @@ fn return_look(st: &AiState) -> f32 {
 
 /// SUMO's fleet bounds, `MSVehicleControl`'s `myMaxSpeedFactor`, `myMinDeceleration` and
 /// `myMaxMinGap` (`vehicleDeparted`), that `MSLane::getMaximumBrakeDist` bounds a follower
-/// search by: over the drivers on the road (players with their preset, `PLAYER_PRESET`; not the
-/// rail vehicles or aircraft, which SUMO keeps apart from the road users), their chosen values -
+/// search by: over the drivers on the road (players with their preset, `PLAYER_PRESET`; rail
+/// vehicles and aircraft are left out of all four, where SUMO leaves rail out of the least
+/// deceleration only), their chosen values -
 /// the seeded jitter in them (`DriverParams::seeded`) - not their class's preset. SUMO keeps
 /// them as running maxima from each vehicle's departure; here they are taken once a frame over
 /// the vehicles there (`Simulation::tick`), which a replay from any keyframe gives alike.
