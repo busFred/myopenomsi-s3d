@@ -409,3 +409,28 @@ fn a_step_out_is_swept_round_its_own_obstacle_not_the_target_lanes_car_far_ahead
     let (starts, drops, least, left) = step_out_with_a_car_far_ahead_on_the_target(148.5, Some(0.9));
     assert!(starts.first().is_some_and(|s| s.1) && drops >= 1 && least > 0.3, "intruder late in the signal: starts {starts:?}, drops {drops}, on the left lane {left}, least {least:.2}");
 }
+
+/// SUMO's `getMaximumBrakeDist` takes the fleet's chosen values (`MSVehicleControl::vehicleDeparted`
+/// keeps each vehicle's chosen speed factor, its type's minGap and decel), not the type defaults:
+/// over seeded drivers of every street class (the jitter of `DriverParams::seeded`) the bound at
+/// 50 km/h lies above the presets' 78 m and no further than the jitter's extremes allow (1.08 x
+/// 1.1, 1.5 x 0.8 m/s², 3.0 x 1.25 m: 117.2 m); rail vehicles and aircraft are left out; a
+/// simulation's bounds are those of its vehicles.
+#[test]
+fn the_follower_reach_is_bounded_over_the_drivers_on_the_road() {
+    use omsi_traffic::sim::FleetBounds;
+    let classes = [VehicleClass::Car, VehicleClass::Taxi, VehicleClass::Bus, VehicleClass::Truck, VehicleClass::ScheduledBus];
+    let fleet: Vec<Vehicle> = (0..2000u64).map(|k| Vehicle::new(k, classes[k as usize % 5], AiState::new(0, 0.0, k), 0.9, k * 7919)).collect();
+    let b = FleetBounds::of(&fleet, &[]);
+    let d = b.max_brake_dist(50.0 / 3.6);
+    assert!(d > 78.0 && d <= 117.2, "bound at 50 km/h {d:.1} ({b:?})");
+    assert!(b.speed_factor > 1.08 && b.decel < 1.5 && b.min_gap > 3.0, "{b:?}");
+    let mut with_rail = fleet.clone();
+    with_rail.push(Vehicle::new(9999, VehicleClass::Rail, AiState::new(0, 0.0, 9999), 1.3, 1));
+    assert_eq!(FleetBounds::of(&with_rail, &[]), b, "a rail vehicle's 0.8 m/s² and 10 m are not the road's");
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![car(1, 1, 100.0, 0.0)];
+    sim.tick(&net, DT, &mut cars);
+    assert_eq!(sim.fleet, FleetBounds::of(&cars, &[]));
+}

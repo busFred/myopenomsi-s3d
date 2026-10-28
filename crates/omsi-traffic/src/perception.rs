@@ -1913,7 +1913,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     // follower two pieces back at the lane's speed is the change's follower (every lane leading in
     // within the reach is read: a faster vehicle further back can miss more of its gap than a
     // nearer one, so no branch is cut short)
-    crate::plan::walk_back(net, nb, s_b, crate::plan::change_follower_reach(net, nb, me), |l, start| {
+    crate::plan::walk_back(net, nb, s_b, crate::plan::change_follower_reach(net, sim, nb, me), |l, start| {
         if l != nb {
             let passers = net.prev.get(nb).is_some_and(|v| v.contains(&l));
             lane_users(l, start + s_b, passers, &mut note);

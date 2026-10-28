@@ -191,36 +191,37 @@ pub fn secure_gap_behind(f: &PullOutFollower) -> f32 {
     f.params.min_gap + f.speed * f.params.tau + f.speed * f.speed / (2.0 * f.params.comfort_brake.max(0.1))
 }
 
-/// The street presets: the fleet SUMO's `MSLane::getMaximumBrakeDist` bounds a follower search by.
-const STREET_PRESETS: [VehicleClass; 5] = [VehicleClass::Car, VehicleClass::Taxi, VehicleClass::Bus, VehicleClass::Truck, VehicleClass::ScheduledBus];
+/// The lane's limit (m/s).
+fn lane_limit(net: &Network, lane: usize) -> f32 {
+    net.lanes.get(lane).map_or(0.0, |l| l.speed_limit_kmh.max(0.0) / 3.6)
+}
 
-/// SUMO's `MSLane::getMaximumBrakeDist` over the street presets (m): the lane's limit times the
-/// largest speed factor (the taxi's 1.08), braking at the least deceleration (the bus's and the
-/// lorry's 1.5 m/s²), plus the largest minGap (the lorry's 3.0 m).
-pub fn max_brake_dist(net: &Network, lane: usize) -> f32 {
-    let presets = STREET_PRESETS.map(DriverParams::preset);
-    let v = net.lanes.get(lane).map_or(0.0, |l| l.speed_limit_kmh.max(0.0) / 3.6) * presets.iter().map(|p| p.speed_factor).fold(0.0, f32::max);
-    let b = presets.iter().map(|p| p.comfort_brake).fold(f32::INFINITY, f32::min);
-    v * v / (2.0 * b) + presets.iter().map(|p| p.min_gap).fold(0.0, f32::max)
+/// SUMO's `MSLane::getMaximumBrakeDist` on lane `lane` (m) over the drivers on the road
+/// (`FleetBounds`: the largest chosen speed factor, the least deceleration, the largest minGap).
+pub fn max_brake_dist(net: &Network, sim: &Simulation, lane: usize) -> f32 {
+    sim.fleet.max_brake_dist(lane_limit(net, lane))
 }
 
 /// How far back (m) a follower can matter behind a place on lane `lane` for a pull-out: SUMO's
 /// bound (`max_brake_dist`, which `getFollowersOnConsecutive` searches to), and no less than the
-/// secure gap a pull-out asks of a follower (`secure_gap_behind`) for any street preset coming at
-/// the lane's limit times its speed factor.
-pub fn follower_reach(net: &Network, lane: usize) -> f32 {
-    let v_lim = net.lanes.get(lane).map_or(0.0, |l| l.speed_limit_kmh.max(0.0) / 3.6);
-    STREET_PRESETS.map(DriverParams::preset).iter().map(|&params| secure_gap_behind(&PullOutFollower { gap: 0.0, speed: v_lim * params.speed_factor, params })).fold(max_brake_dist(net, lane), f32::max)
+/// secure gap a pull-out asks of a follower (`secure_gap_behind`) bounded over the drivers on the
+/// road (`FleetBounds`: the largest minGap and time gap, the least deceleration, coming at the
+/// lane's limit times the largest speed factor).
+pub fn follower_reach(net: &Network, sim: &Simulation, lane: usize) -> f32 {
+    let f = &sim.fleet;
+    let v = lane_limit(net, lane) * f.speed_factor;
+    // (the bounds as one driver: `secure_gap_behind` reads only these three)
+    let bound = DriverParams { tau: f.tau, min_gap: f.min_gap, comfort_brake: f.decel, ..DriverParams::preset(VehicleClass::Car) };
+    secure_gap_behind(&PullOutFollower { gap: 0.0, speed: v, params: bound }).max(max_brake_dist(net, sim, lane))
 }
 
 /// How far back (m) a follower can matter behind the place beside me on lane `lane` for a lane
 /// change of `me`'s: `follower_reach`, and no less than the gap my change accepts from rest
-/// (`accepted_gap`) from a follower with the largest minGap of the presets at the lane's limit
-/// times the largest speed factor (`max_brake_dist`'s quantities).
-pub fn change_follower_reach(net: &Network, lane: usize, me: &Vehicle) -> f32 {
-    let presets = STREET_PRESETS.map(DriverParams::preset);
-    let v = net.lanes.get(lane).map_or(0.0, |l| l.speed_limit_kmh.max(0.0) / 3.6) * presets.iter().map(|p| p.speed_factor).fold(0.0, f32::max);
-    follower_reach(net, lane).max(accepted_gap(me, presets.iter().map(|p| p.min_gap).fold(0.0, f32::max), v, 0.0))
+/// (`accepted_gap`) from a follower with the largest minGap on the road at the lane's limit times
+/// the largest speed factor (`FleetBounds`).
+pub fn change_follower_reach(net: &Network, sim: &Simulation, lane: usize, me: &Vehicle) -> f32 {
+    let f = &sim.fleet;
+    follower_reach(net, sim, lane).max(accepted_gap(me, f.min_gap, lane_limit(net, lane) * f.speed_factor, 0.0))
 }
 
 /// Walks back from lane `lane` at `s` over the lanes leading into it, as SUMO's
@@ -253,7 +254,7 @@ pub fn walk_back(net: &Network, lane: usize, s: f32, reach: f32, mut visit: impl
 pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, rear: f32, on_lane: &dyn Fn(usize) -> Vec<(f32, f32, f32, DriverParams)>) -> Vec<PullOutFollower> {
     let player = DriverParams::preset(crate::sim::PLAYER_PRESET);
     let mut out = Vec::new();
-    walk_back(net, lane, s, follower_reach(net, lane), |cur, start| {
+    walk_back(net, lane, s, follower_reach(net, sim, lane), |cur, start| {
         let mut add = |os: f32, front: f32, speed: f32, params: DriverParams| {
             let at = start + os;
             if cur == lane && at >= 0.0 {

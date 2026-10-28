@@ -700,6 +700,8 @@ pub static CHANGES_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// The traffic's shared state and this frame's inputs.
 #[derive(Debug, Clone)]
 pub struct Simulation {
+    /// The bounds of the drivers on the road this frame (`FleetBounds::of`).
+    pub fleet: FleetBounds,
     pub junctions: Junctions,
     pub lights: Vec<TrafficLightController>,
     pub time: f64,
@@ -756,9 +758,58 @@ fn return_look(st: &AiState) -> f32 {
     (st.front + 0.5).max(2.0)
 }
 
+/// SUMO's fleet bounds, `MSVehicleControl`'s `myMaxSpeedFactor`, `myMinDeceleration` and
+/// `myMaxMinGap` (`vehicleDeparted`), that `MSLane::getMaximumBrakeDist` bounds a follower
+/// search by: over the drivers on the road (players with their preset, `PLAYER_PRESET`; not the
+/// rail vehicles or aircraft, which SUMO keeps apart from the road users), their chosen values -
+/// the seeded jitter in them (`DriverParams::seeded`) - not their class's preset. SUMO keeps
+/// them as running maxima from each vehicle's departure; here they are taken once a frame over
+/// the vehicles there (`Simulation::tick`), which a replay from any keyframe gives alike.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FleetBounds {
+    /// The largest speed factor.
+    pub speed_factor: f32,
+    /// The least deceleration (m/s², `DriverParams::comfort_brake`, the car-following braking
+    /// as SUMO's `decel`).
+    pub decel: f32,
+    /// The largest standing gap (m).
+    pub min_gap: f32,
+    /// The largest time gap (s).
+    pub tau: f32,
+}
+
+impl Default for FleetBounds {
+    /// Nobody on the road: no speed, so no reach.
+    fn default() -> FleetBounds {
+        FleetBounds { speed_factor: 0.0, decel: f32::INFINITY, min_gap: 0.0, tau: 0.0 }
+    }
+}
+
+impl FleetBounds {
+    /// Over the road vehicles in `vehicles` and the `players`.
+    pub fn of(vehicles: &[Vehicle], players: &[PlayerView]) -> FleetBounds {
+        let player = (!players.is_empty()).then(|| DriverParams::preset(PLAYER_PRESET));
+        vehicles.iter().filter(|v| !matches!(v.class, VehicleClass::Rail | VehicleClass::Air)).map(|v| v.params).chain(player).fold(FleetBounds::default(), |b, p| FleetBounds {
+            speed_factor: b.speed_factor.max(p.speed_factor),
+            decel: b.decel.min(p.comfort_brake),
+            min_gap: b.min_gap.max(p.min_gap),
+            tau: b.tau.max(p.tau),
+        })
+    }
+
+    /// `MSLane::getMaximumBrakeDist` at a lane limit of `v_lim` (m/s): (that limit times the
+    /// largest speed factor)² over twice the least deceleration, plus the largest minGap (m;
+    /// SUMO's hard bound of 1000 m too).
+    pub fn max_brake_dist(&self, v_lim: f32) -> f32 {
+        let v = v_lim * self.speed_factor;
+        (v * v / (2.0 * self.decel.max(0.1)) + self.min_gap).min(1000.0)
+    }
+}
+
 impl Simulation {
     pub fn new(net: &Network, lights: Vec<TrafficLightController>) -> Simulation {
         Simulation {
+            fleet: FleetBounds::default(),
             junctions: Junctions::compile(net),
             lights,
             time: 0.0,
@@ -1234,6 +1285,7 @@ impl Simulation {
         self.changes_started.clear();
         self.held_at_red = 0;
         self.measure_players(dt);
+        self.fleet = FleetBounds::of(vehicles, &self.players);
         for v in vehicles.iter_mut() {
             v.external.apply(&mut v.state, &v.params);
         }
