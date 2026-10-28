@@ -923,8 +923,14 @@ pub const PASS_STRANDED: f32 = 8.0;
 /// 2 m/s) less than `need` beyond it, one after the other, at most `PASS_MAX_OBSTACLE` long;
 /// and whether there is `need` of free lane beyond that (`Perception::ahead`). (Its length, room.)
 fn obstacle_run(p: &Perception, lead: &crate::perception::Headway, need: f32) -> (f32, bool) {
+    obstacle_run_in(&p.ahead, p.road_left, lead, need)
+}
+
+/// `obstacle_run` over the bodies `ahead` in a corridor (nearest first) with `road_left` metres
+/// of way.
+fn obstacle_run_in(ahead: &[(f32, f32, f32)], road_left: f32, lead: &crate::perception::Headway, need: f32) -> (f32, bool) {
     let mut end = lead.gap + lead.length;
-    for &(near, far, speed) in &p.ahead {
+    for &(near, far, speed) in ahead {
         if near <= lead.gap + 0.5 || far <= end {
             continue;
         }
@@ -940,7 +946,7 @@ fn obstacle_run(p: &Perception, lead: &crate::perception::Headway, need: f32) ->
         end = far;
     }
     // (and the road goes on that far)
-    (end - lead.gap, p.road_left > end + need + 2.0)
+    (end - lead.gap, road_left > end + need + 2.0)
 }
 
 /// The vehicle `id` passed (a player's: `PLAYER_ID_BASE` + its id): (a bus, indicating out
@@ -1209,8 +1215,10 @@ fn full_lock_at(d: f32, out_len: f32, side: f32) -> (f32, f32) {
 /// turned along it - clears the thing passed and every other vehicle, player, parked car and
 /// person by `SQUEEZE_CLEARANCE` (`body_sweep_clear`); where the gap is too short for it, the
 /// car does not set out (a car does not reverse out). Not round a bus indicating out of its
-/// stop or a vehicle moving off (it is let out).
-fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: &crate::perception::Headway) -> Option<Start> {
+/// stop or a vehicle moving off (it is let out). What stands beyond the lead is read from the
+/// bodies `ahead` in my corridor (`Perception::ahead`, `obstacle_run`). With `kind` only that
+/// move is tried (`Some(true)` the two arcs at full lock, `Some(false)` the smoothstep).
+fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, ahead: &[(f32, f32, f32)], road_left: f32, nb: &NeighbourView, lead: &crate::perception::Headway, kind: Option<bool>) -> Option<Start> {
     let st = &me.state;
     let obstacle = match lead.what {
         Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.id),
@@ -1232,13 +1240,13 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     let pre = st.speed.max(0.0).powi(2) / (2.0 * me.params.comfort_brake.max(0.1));
     let need = bypass_need(me, lead, side.signum());
     let moves = [(bypass_min_len(me.length(), side), false), (full_lock_len(me.length(), side), true)];
-    for (shortest, full_lock) in moves {
+    for (shortest, full_lock) in moves.into_iter().filter(|m| kind.is_none_or(|k| k == m.1)) {
         let out_len = (lead.gap - pre - BYPASS_GAP_MARGIN).clamp(shortest.min(BYPASS_LENGTH), BYPASS_LENGTH).max(shortest);
         if bypass_lateral(lead.gap + st.front - pre, out_len, side.abs(), full_lock) < need {
             continue;
         }
         let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
-        let (obstacle_len, _) = obstacle_run(p, lead, me.length() + out_len + PASS_ROOM);
+        let (obstacle_len, _) = obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM);
         let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
         let parked = parked_boxes(net, sim, me, level + st.front);
         let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
@@ -1594,7 +1602,7 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     }
     // (nor where the bypass already clears from here: the room is found by halving and the
     // backing lands on it to the float, so the bypass itself decides, `bypass_start`)
-    if [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, sim, me, &nb, &l) && bypass_start(net, sim, vehicles, me, p, &nb, &l).is_some()) {
+    if [p.left, p.right].into_iter().flatten().any(|nb| could_bypass(net, sim, me, &nb, &l) && bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None).is_some()) {
         return None;
     }
     let back = need - l.gap;
@@ -2349,19 +2357,19 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (a bypass from rest also sweeps its move again, as it did at its start,
             // `bypass_start`: every body near, not only the target lane's follower - one that came
             // to stand in the swept band or alongside since; SUMO checks every sublane it moves
-            // into on each step. The sweep runs on my own lane's way, without the change laid on
-            // it, round the thing the bypass was started round (`Perception::bypassed`, not the
-            // lead, which with the change laid on the way can be the target lane's car) while it
-            // stands; the move must still clear in the kind it was started with, the smoothstep
-            // or the two arcs at full lock, as the car drives that one and not whichever clears
-            // now. Once that thing has moved off or gone from my way, the change goes on as a
-            // plain one under the gap rule above, as it always did when its lead left)
+            // into on each step. The sweep runs as at the start, on my own lane's way without the
+            // change laid on it, round the thing the bypass was started round with what stands
+            // beyond it there (`Perception::bypassed`; not the lead, which with the change laid
+            // on the way can be the target lane's car), while it stands; it sweeps the kind of
+            // move started, the smoothstep or the two arcs at full lock, as the car drives that one
+            // and not whichever clears now. Once that thing has moved off or gone from my way, the
+            // change goes on as a plain one under the gap rule above, as it always did when its
+            // lead left)
             if !out.abort_change && c.bypass {
-                if let Some(l) = p.bypassed.filter(|l| l.speed < STANDING_SPEED) {
+                if let Some(b) = p.bypassed.as_ref().filter(|b| b.lead.speed < STANDING_SPEED) {
                     let mut before = me.clone();
                     before.state.change = None;
-                    let same_move = matches!(bypass_start(net, sim, vehicles, &before, p, &nb, &l), Some(Start::Bypass { full_lock, .. }) if full_lock == c.full_lock);
-                    out.abort_change = !same_move;
+                    out.abort_change = bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none();
                 }
             }
         }
@@ -2402,7 +2410,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // during the change)
             let near = p.leader.filter(|l| l.speed < STANDING_SPEED && l.gap < omsi_sim::traffic::change_length(v.max(0.0)) + v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
             out.start = match near {
-                Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, p, &nb, &l),
+                Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None),
                 Some(l) => change_clear(net, sim, vehicles, me, p, &nb, Some(&l)).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
                 None => change_clear(net, sim, vehicles, me, p, &nb, None).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
             };

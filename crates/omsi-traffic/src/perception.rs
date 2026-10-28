@@ -315,7 +315,16 @@ pub struct Perception {
     /// While a bypass from rest signals: the thing it was started round
     /// (`LaneChange::round`), measured along my lane's way without the change laid on it
     /// (`bypassed_on_way`); `None` once it is no longer on that way.
-    pub bypassed: Option<Headway>,
+    pub bypassed: Option<Bypassed>,
+}
+
+/// The thing a bypass signalling was started round, along the car's lane's way without the
+/// change (`Perception::bypassed`).
+#[derive(Debug, Clone)]
+pub struct Bypassed {
+    pub lead: Headway,
+    /// Every body in the corridor of that way, nearest first (as `Perception::ahead`).
+    pub ahead: Vec<(f32, f32, f32)>,
 }
 
 /// The lanes ahead along the car's way with the distance from the origin to each one's
@@ -598,8 +607,7 @@ fn leader_on_way(sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize
 /// way its middle is by those lanes, NaN if not known), once each; with how far along my way
 /// (m) the farthest one found there reaches, at most `look`: the way need be sampled no
 /// further than that, `body_look` and the people's and the players' reach.
-fn body_candidates(sim: &Simulation, vehicles: &[Vehicle], i: usize, lanes: &[(usize, f32)], look: f32, body_look: f32) -> (Vec<(usize, bool, f32)>, f32) {
-    let me = &vehicles[i];
+fn body_candidates(sim: &Simulation, me: &Vehicle, lanes: &[(usize, f32)], look: f32, body_look: f32) -> (Vec<(usize, bool, f32)>, f32) {
     let st = &me.state;
     let mut far = 0.0f32;
     // (once each, the first found: on my way's lanes, nearest lane first, then the others near
@@ -2226,30 +2234,71 @@ fn letting_out(sim: &Simulation, me: &Vehicle) -> Option<f32> {
     best
 }
 
+/// What lies along the way `lanes` of `me` (vehicle `i`, as it is or without its lane change):
+/// the way sampled once for the bodies, the players and the people (`way`); the nearest vehicle
+/// of the lane kind and the nearest body across it (`lead_by_bodies`), the nearest player's
+/// vehicle (`player_on_way`, only with one within 180 m), the parked car blocking and the swerve
+/// round one protruding (`parked_on_way`); and every body in the corridor, nearest first
+/// (`Perception::ahead`).
+struct Corridor {
+    way: WayPts,
+    on_lane: Option<Headway>,
+    body: Option<Headway>,
+    player: Option<Headway>,
+    parked: Option<Headway>,
+    swerve: Option<f32>,
+    ahead: Vec<(f32, f32, f32)>,
+}
+
+fn corridor(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me: &Vehicle, lanes: &[(usize, f32)], look: f32) -> Corridor {
+    let st = &me.state;
+    let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
+    let people_reach = people_reach(st.speed) + st.front;
+    let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
+    let (cand, far) = body_candidates(sim, me, lanes, look, body_look);
+    let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });
+    let way = WayPts::sample(net, st, upto);
+    let mut ahead = Vec::new();
+    let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, me, lanes, &way, look, body_look, cand, &mut ahead);
+    let player = if player_near { player_on_way(sim, me, &way, look) } else { None };
+    if let Some(h) = player {
+        ahead.push((h.gap, h.gap + h.length, h.speed));
+    }
+    let (parked, swerve) = parked_on_way(sim, me, lanes);
+    if let Some(h) = parked {
+        ahead.push((h.gap, h.gap + h.length, 0.0));
+    }
+    ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Corridor { way, on_lane, body, player, parked, swerve, ahead }
+}
+
 /// The thing the bypass `c` of vehicle `i` was started round (`LaneChange::round`: a vehicle
 /// or player by its id, a parked car as the nearest one blocking), where it is now along my
 /// lane's way without the change laid on it - the way the bypass was planned on
-/// (`plan::bypass_start`) - by the same tests as the lead (`lead_by_bodies`, `player_on_way`,
-/// `parked_on_way`): `None` when it has gone from that way. While the bypass signals, the
-/// way with the change laid on it bends out past it, and its lead can be the target lane's car.
-fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, c: &omsi_sim::traffic::LaneChange) -> Option<Headway> {
+/// (`plan::bypass_start`) - by the same tests as the lead (`corridor`): `None` when it has gone
+/// from that way. With it, every body in the corridor of that way (what `Perception::ahead` was
+/// when the bypass started: what stands beyond the thing, `plan::obstacle_run`). While the bypass
+/// signals, the way with the change laid on it bends out past the thing, and its lead can be the
+/// target lane's car.
+fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, c: &omsi_sim::traffic::LaneChange) -> Option<Bypassed> {
     let mut me = vehicles[i].clone();
     me.state.change = None;
     let st = &me.state;
     let look = look_ahead(st.speed);
     let lanes = way_lanes(net, st, 220.0);
-    let Some(id) = c.round else {
-        return parked_on_way(sim, &me, &lanes).0;
+    let cor = corridor(net, sim, vehicles, i, &me, &lanes, look);
+    let lead = match c.round {
+        None => cor.parked,
+        Some(id) if id >= crate::sim::PLAYER_ID_BASE => cor.player.filter(|h| matches!(h.what, Seen::Player(p) if crate::sim::PLAYER_ID_BASE + p as u64 == id)),
+        Some(id) => {
+            // (that vehicle alone: another may have come nearer)
+            let j = vehicles.iter().position(|o| o.id == id)?;
+            let on_way = lanes.iter().any(|&(l, d0)| d0 <= look && sim.occupancy.get(&l).is_some_and(|v| v.iter().any(|o| o.vehicle == j)));
+            let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &me, &lanes, &cor.way, look, look, vec![(j, on_way, f32::NAN)], &mut Vec::new());
+            on_lane.or(body)
+        }
     };
-    let way = WayPts::sample(net, st, look);
-    if id >= crate::sim::PLAYER_ID_BASE {
-        return player_on_way(sim, &me, &way, look).filter(|h| matches!(h.what, Seen::Player(p) if crate::sim::PLAYER_ID_BASE + p as u64 == id));
-    }
-    let j = vehicles.iter().position(|o| o.id == id)?;
-    // (found on my way's lanes, a lead of the lane kind, as `body_candidates` has it)
-    let on_way = lanes.iter().any(|&(l, d0)| d0 <= look && sim.occupancy.get(&l).is_some_and(|v| v.iter().any(|o| o.vehicle == j)));
-    let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, &me, &lanes, &way, look, look, vec![(j, on_way, f32::NAN)], &mut Vec::new());
-    on_lane.or(body)
+    lead.map(|lead| Bypassed { lead, ahead: cor.ahead })
 }
 
 /// Everything vehicle `i` sees this frame.
@@ -2267,22 +2316,9 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
     if air {
         p.leader = leader_on_way(sim, vehicles, i, &p.way, look);
     } else {
-        // the way ahead, sampled once for the bodies, the players and the people
-        let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
-        let people_reach = people_reach(st.speed) + st.front;
-        let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
-        let (cand, far) = body_candidates(sim, vehicles, i, &p.way, look, body_look);
-        let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });
-        let way = WayPts::sample(net, st, upto);
-        let (on_lane, body) = lead_by_bodies(net, sim, vehicles, i, me, &p.way, &way, look, body_look, cand, &mut p.ahead);
-        p.leader = on_lane;
-        if player_near {
-            let pl = player_on_way(sim, me, &way, look);
-            if let Some(h) = pl {
-                p.ahead.push((h.gap, h.gap + h.length, h.speed));
-            }
-            p.leader = Headway::nearer(p.leader, pl);
-        }
+        let Corridor { way, on_lane, body, player, parked, swerve, ahead } = corridor(net, sim, vehicles, i, me, &p.way, look);
+        p.ahead = ahead;
+        p.leader = Headway::nearer(on_lane, player);
         if let Some(h) = body {
             // a body across the way replaces the lead only when clearly nearer
             if p.leader.map(|l| h.gap < l.gap - 0.5).unwrap_or(true) {
@@ -2292,11 +2328,6 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
                 p.leader = Some(h);
             }
         }
-        let (parked, swerve) = parked_on_way(sim, me, &p.way);
-        if let Some(h) = parked {
-            p.ahead.push((h.gap, h.gap + h.length, 0.0));
-        }
-        p.ahead.sort_by(|a, b| a.0.total_cmp(&b.0));
         p.leader = Headway::nearer(p.leader, parked);
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
         // the shift past people beside the lane, towards the middle only while
