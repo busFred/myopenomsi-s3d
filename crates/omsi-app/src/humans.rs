@@ -2444,9 +2444,9 @@ impl DecideCtx<'_> {
         let pos2 = p.position.truncate();
         // somebody walking on towards ground that is not loaded goes; a stroller in the player's
         // sight is never taken away there: the stroll network ends at the loaded ground's edge
-        // itself (`edge_turn`, `PedNet::unloaded`; out of sight they leave at it, below), so only
-        // a step past it, or a crossing begun before the tile beyond it went, brings one onto
-        // unloaded ground, and their walk goes on from there
+        // itself (`edge_turn`, `PedNet::unloaded`; out of sight and reach they leave at it,
+        // `leaves_at_edge`, below), so only a step past it, or a crossing begun before the tile
+        // beyond it went, brings one onto unloaded ground, and their walk goes on from there
         if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) {
             let seen_stroller = matches!(p.state, State::Strolling(_)) && figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
             if !seen_stroller {
