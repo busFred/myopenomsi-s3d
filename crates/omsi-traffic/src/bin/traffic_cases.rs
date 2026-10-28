@@ -4639,7 +4639,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 for v in &r.vehicles {
                     let Some(c) = v.state.change else { continue };
                     now_changing.insert(v.id);
-                    if !changing.contains(&v.id) && v.state.route.is_empty() && toward_standing(&r.net, &r.sim, &r.vehicles, v.id, c.to, c.s_to) {
+                    // (a change first seen in its signal: one the replay put down mid-change at a
+                    // keyframe has moved over or ends its signal already, and is not counted)
+                    let signalling = c.t <= 0.0 && c.wait > 0.0;
+                    if !changing.contains(&v.id) && signalling && v.state.route.is_empty() && toward_standing(&r.net, &r.sim, &r.vehicles, v.id, v.last.lead_id, c.to, c.s_to) {
                         ex.toward_standing += 1;
                     }
                 }
@@ -5018,8 +5021,10 @@ const TOWARD_STANDING_REACH: f32 = 100.0;
 /// Whether lane `to` has, ahead of `s_to` (the place beside a changer) along it and the lanes it
 /// runs into (every way), a vehicle or player standing (under `STANDING_SPEED`) as the nearest
 /// one on that way within `TOWARD_STANDING_REACH` (rear to `s_to`): the measure behind
-/// `changes_toward_standing`, read from the state alone so that any build's replay gives it.
-fn toward_standing(net: &Network, sim: &omsi_traffic::Simulation, vehicles: &[omsi_traffic::Vehicle], me: u64, to: usize, s_to: f32) -> bool {
+/// `changes_toward_standing`, read from the state alone so that any build's replay gives it. The
+/// changer's own lead (`lead`, the one a step-out pulls out round, its body reaching into the
+/// target lane) is not counted.
+fn toward_standing(net: &Network, sim: &omsi_traffic::Simulation, vehicles: &[omsi_traffic::Vehicle], me: u64, lead: Option<u64>, to: usize, s_to: f32) -> bool {
     let reach = TOWARD_STANDING_REACH;
     let standing = omsi_traffic::driver::STANDING_SPEED;
     // (lane, offset of its start from s_to)
@@ -5033,7 +5038,7 @@ fn toward_standing(net: &Network, sim: &omsi_traffic::Simulation, vehicles: &[om
         let mut first: Option<(f32, f32)> = None;
         for o in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
             let Some(veh) = vehicles.get(o.vehicle) else { continue };
-            if veh.id == me {
+            if veh.id == me || Some(veh.id) == lead {
                 continue;
             }
             let d = off + o.s - veh.state.rear;

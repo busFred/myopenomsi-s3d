@@ -502,7 +502,7 @@ fn r3_a_squeeze_past_an_obstacle_within_25_m_is_not_kept_40_m_from_a_junction() 
     eprintln!("R3: pass {:?} out_at {:?} least_other {:.2} x_end {:.1}", r.pass.map(|p| (p.side, p.lane)), r.out_at, r.least_other, r.x_end);
     let pass = r.pass.expect("no squeeze past the car standing 6 m before the 40 m junction keep");
     assert!(pass.lane.is_none(), "{pass:?}");
-    assert!(r.least_other > 0.25 && r.x_end > 210.0, "least {:.2} x {:.1}", r.least_other, r.x_end);
+    assert!(r.least_other > 0.55 && r.x_end > 210.0, "least {:.2} x {:.1}", r.least_other, r.x_end);
 }
 
 #[test]

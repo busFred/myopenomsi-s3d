@@ -171,7 +171,7 @@ fn l2_a_car_squeezes_past_the_players_bus_half_out_of_its_lane_on_a_road_with_a_
     let pass = r.pass.expect("no squeeze on a road with a neighbour lane");
     assert!(pass.lane.is_none() && pass.beside.is_none(), "{pass:?}");
     assert!((pass.side + 0.7).abs() < 0.05, "squeeze side {}", pass.side);
-    assert!(r.least > 0.25, "came within {:.2} m of the bus", r.least);
+    assert!(r.least > 0.55, "came within {:.2} m of the bus", r.least);
     assert!(r.x_end > 215.0, "never got past the bus: x {:.1}", r.x_end);
     assert_eq!(r.on_lanes, vec![1], "registered on {:?}", r.on_lanes);
     // the bus 1.8 m out: minGapLat from its corner asks 0.95 m to the left, 1.85 m of road from
@@ -303,7 +303,7 @@ fn l2_the_players_bus_is_squeezed_past_as_soon_as_it_has_paused_with_half_a_seco
     let r = squeeze_past(&net, 0, bus(200.0, 0.0, 2.25, 30.0), vec![], false);
     assert!(r.pass.is_some() && r.stopped_at_start < 3.0 && r.x_end > 215.0, "{:?} stood {:.1} x {:.1}", r.pass, r.stopped_at_start, r.x_end);
     assert!(r.blinker_lead > 0.45, "signalled {:.2} s before pulling out", r.blinker_lead);
-    assert!(r.least > 0.25 && r.x_end > 215.0, "least {:.2} x {:.1}", r.least, r.x_end);
+    assert!(r.least > 0.55 && r.x_end > 215.0, "least {:.2} x {:.1}", r.least, r.x_end);
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn l2_inside_a_junction_the_squeeze_keeps_clear_of_the_foe_stretch() {
         assert_eq!(pass.is_some(), expect, "main road at {mx}: {pass:?}");
         if expect {
             assert!(pass.unwrap().lane.is_none(), "{pass:?}");
-            assert!(least > 0.25, "least {least:.2}");
+            assert!(least > 0.55, "least {least:.2}");
             assert!(cars[0].pos.x > 140.0, "x {:.1}", cars[0].pos.x);
         } else {
             assert!(cars[0].pos.x < 124.0, "x {:.1}", cars[0].pos.x);

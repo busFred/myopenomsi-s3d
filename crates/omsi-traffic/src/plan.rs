@@ -598,7 +598,11 @@ fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &Neighb
         let mm = &sim.junctions.nodes[j].movements[mi];
         mm.foes.iter().any(|f| f.mine.0 < b && f.mine.1 > a)
             || mm.converge.iter().zip(&mm.converge_with).any(|(c, &w)| w != other && c.0 < b && c.1 > a)
-            || net.walks.get(lane).is_some_and(|w| w.iter().any(|&(_, sa, _)| sa > a && sa < b))
+            || net.walks.get(lane).is_some_and(|w| w.iter().any(|&(fp, sa, _)| {
+                // (the walk's band: its half width either side of where its axis cuts my lane)
+                let half = net.lanes.get(fp).map_or(0.0, |l| l.width * 0.5);
+                sa + half > a && sa - half < b
+            }))
     };
     if meets(m, m2, st.lane, mine) || meets(m2, m, nb.lane, theirs) {
         return false;
@@ -2896,5 +2900,21 @@ mod piece_change_tests {
         let (j, m) = sim.junctions.of_lane[&0];
         assert!(sim.junctions.nodes[j].movements[m].foes.is_empty(), "a footpath is no foe of the pieces");
         signal_run_counts(LaneKind::Sidewalk);
+    }
+
+    /// S3: the people's crossing counts with its width (3 m here): a window ending a metre short of
+    /// the walk's axis, or a car whose rear is a metre past it, has the walk's band in it.
+    #[test]
+    fn a_people_crossing_counts_with_its_width() {
+        let net = object(LaneKind::Sidewalk);
+        let sim = Simulation::new(&net, vec![]);
+        let nb = beside(&net);
+        let axis = net.walks[0].iter().find(|w| w.0 == 2).map(|w| w.1).unwrap();
+        let half = net.lanes[2].width * 0.5;
+        let reach = 2.0 + omsi_sim::traffic::change_length(0.0);
+        assert!(!piece_change_clear(&net, &sim, &car_at(axis - reach - 1.0, 0.0), &nb), "the band reaches into the window's end");
+        assert!(!piece_change_clear(&net, &sim, &car_at(axis + 2.0 + 1.0, 0.0), &nb), "the band reaches under the rear");
+        assert!(piece_change_clear(&net, &sim, &car_at(axis - reach - half - 1.0, 0.0), &nb), "a metre short of the band");
+        assert!(piece_change_clear(&net, &sim, &car_at(axis + 2.0 + half + 1.0, 0.0), &nb), "a metre past the band");
     }
 }
