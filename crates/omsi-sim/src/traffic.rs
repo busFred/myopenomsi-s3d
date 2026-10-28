@@ -3533,6 +3533,12 @@ pub struct LaneChange {
     /// from nearer than the smoothstep can steer.
     #[serde(default)]
     pub full_lock: bool,
+    /// A bypass's: the vehicle it pulls out round (its id; a player's `PLAYER_ID_BASE` + its id,
+    /// as `omsi_traffic::sim::Decision::wait_for`), `None` round a parked car (which has no id
+    /// and does not move). Its move is swept again round that body on every frame of the
+    /// signal (`omsi_traffic::plan`).
+    #[serde(default)]
+    pub round: Option<u64>,
 }
 
 /// A vehicle's heading is that of the chord of its way this far behind and ahead of it (m,
@@ -3925,7 +3931,7 @@ impl AiState {
         // (the same share of a lane that starts beside this one, else the point beside the car)
         let s_to = net.beside_s(self.lane, to, self.s.min(l.length()));
         let rest = t.length() - s_to;
-        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false, full_lock: false });
+        self.change = Some(LaneChange { to, t: 0.0, length, s_to, dir, wait: SIGNAL_BEFORE_CHANGE, bypass: false, full_lock: false, round: None });
         self.blinker = dir;
         let mut plan = Vec::new();
         if self.route.is_empty() {
@@ -4066,13 +4072,15 @@ impl AiState {
     }
 
     /// Pull out into `to` from behind a standing obstacle: a short, steep move over
-    /// `length` metres (8, less from close behind it).
-    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32, full_lock: bool) {
+    /// `length` metres (8, less from close behind it), round the vehicle `round`
+    /// (`LaneChange::round`).
+    pub fn start_bypass(&mut self, net: &Network, to: usize, dir: i32, length: f32, full_lock: bool, round: Option<u64>) {
         self.start_change(net, to, dir);
         if let Some(c) = self.change.as_mut() {
             c.length = length;
             c.bypass = true;
             c.full_lock = full_lock;
+            c.round = round;
             c.wait = c.wait.min(BYPASS_SIGNAL);
         }
     }
@@ -4669,7 +4677,7 @@ mod tests {
         car.speed = 3.0;
         car.plan_next(&net);
         assert_eq!(car.planned_next, Some(2));
-        car.start_bypass(&net, 1, 1, 8.0, true);
+        car.start_bypass(&net, 1, 1, 8.0, true, None);
         let dt = 1.0 / 30.0;
         let mut at = car.way_point(&net, 0.0);
         for _ in 0..300 {

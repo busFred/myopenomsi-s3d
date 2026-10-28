@@ -62,8 +62,9 @@ impl Why {
 pub enum Start {
     Change { to: usize, dir: i32 },
     /// Round something standing closer than the usual 8 m move: over `out_len` m, at full lock
-    /// (`full_lock_len`) where the smoothstep cannot steer it (`bypass_min_len`).
-    Bypass { to: usize, dir: i32, out_len: f32, full_lock: bool },
+    /// (`full_lock_len`) where the smoothstep cannot steer it (`bypass_min_len`); round the
+    /// vehicle `round` (`LaneChange::round`: `None` round a parked car).
+    Bypass { to: usize, dir: i32, out_len: f32, full_lock: bool, round: Option<u64> },
     RouteChange { to: usize, dir: i32 },
     Pass(Passing),
     AbortPass { hold: f32 },
@@ -1241,7 +1242,7 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         let parked = parked_boxes(net, sim, me, level + st.front);
         let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
         if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All) {
-            return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock });
+            return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock, round: obstacle });
         }
     }
     None
@@ -2348,11 +2349,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // `bypass_start`: every body near, not only the target lane's follower - one that came
             // to stand in the swept band or alongside since; SUMO checks every sublane it moves
             // into on each step. The sweep runs on my own lane's way, without the change laid on
-            // it, round the standing lead that is still there; the move must still clear in the
-            // kind it was started with, the smoothstep or the two arcs at full lock, as the car
-            // drives that one and not whichever clears now)
+            // it, round the thing the bypass was started round (`Perception::bypassed`, not the
+            // lead, which with the change laid on the way can be the target lane's car) while it
+            // stands; the move must still clear in the kind it was started with, the smoothstep
+            // or the two arcs at full lock, as the car drives that one and not whichever clears
+            // now. Once that thing has moved off or gone from my way, the change goes on as a
+            // plain one under the gap rule above, as it always did when its lead left)
             if !out.abort_change && c.bypass {
-                if let Some(l) = p.leader.filter(|l| l.speed < STANDING_SPEED) {
+                if let Some(l) = p.bypassed.filter(|l| l.speed < STANDING_SPEED) {
                     let mut before = me.clone();
                     before.state.change = None;
                     let same_move = matches!(bypass_start(net, sim, vehicles, &before, p, &nb, &l), Some(Start::Bypass { full_lock, .. }) if full_lock == c.full_lock);

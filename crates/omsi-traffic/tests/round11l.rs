@@ -352,3 +352,60 @@ fn the_follower_missing_most_of_its_gap_on_any_lane_leading_in_is_the_one_checke
         assert_eq!(dropped, dropped_expected, "fast follower at x {fast_x}: dropped {dropped}");
     }
 }
+
+/// `from_rest`'s step-out with car 4 standing on the left lane (the target) at `far`, and car 3
+/// put beside car 1's rear on the kerb side (as in `step_out_with_a_body_beside`, x 99.5, where
+/// the full-lock move swings the rear) `intruder_after` s into the signal if given; runs 12 s:
+/// (the changes started - (t, full lock) -, the changes dropped with the car still on its lane,
+/// the least gap of car 1's body to any other, whether it ended on the left lane).
+fn step_out_with_a_car_far_ahead_on_the_target(far: f32, intruder_after: Option<f32>) -> (Vec<(f32, bool)>, usize, f32, bool) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change_cooldown = 0.0;
+    let mut cars = vec![me, standing(2, 1, 106.5), standing(4, 0, far)];
+    let lat = 2.2;
+    let mut c3 = standing(3, 1, 99.5);
+    c3.state.lateral = lat;
+    c3.state.lateral_target = lat;
+    c3.state.lateral_ramp = (lat, lat, 0.0, 1.0);
+    let (mut starts, mut drops, mut least, mut placed) = (Vec::new(), 0, f32::INFINITY, false);
+    let mut was = false;
+    let mut t = 0.0f32;
+    while t < 12.0 {
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        let now = me.state.change.is_some();
+        if now && !was {
+            starts.push((t, me.state.change.unwrap().full_lock));
+        }
+        if was && !now && me.state.lane == 1 {
+            drops += 1;
+        }
+        was = now;
+        if let (Some(after), false, Some(&(t0, _))) = (intruder_after, placed, starts.first()) {
+            if t >= t0 + after {
+                cars.push(c3.clone());
+                placed = true;
+            }
+        }
+        for o in cars.iter().filter(|o| o.id != 1) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        t += DT;
+    }
+    (starts, drops, least, cars.iter().find(|c| c.id == 1).unwrap().state.lane == 0)
+}
+
+/// The step-out's sweep during its signal is round the car it pulls out round, not the lead
+/// perception has once the move is laid on the way (the target lane's car, 42 m ahead): with
+/// that car there the step-out starts once, is never dropped and ends on the left lane; a car
+/// put beside its rear late in the signal (0.9 of `BYPASS_SIGNAL`'s 1.2 s) drops it before the
+/// car moves, and nothing is touched.
+#[test]
+fn a_step_out_is_swept_round_its_own_obstacle_not_the_target_lanes_car_far_ahead() {
+    let (starts, drops, least, left) = step_out_with_a_car_far_ahead_on_the_target(148.5, None);
+    assert!(starts.len() == 1 && drops == 0 && left && least > 0.3, "far car only: starts {starts:?}, drops {drops}, on the left lane {left}, least {least:.2}");
+    let (starts, drops, least, left) = step_out_with_a_car_far_ahead_on_the_target(148.5, Some(0.9));
+    assert!(starts.first().is_some_and(|s| s.1) && drops >= 1 && least > 0.3, "intruder late in the signal: starts {starts:?}, drops {drops}, on the left lane {left}, least {least:.2}");
+}

@@ -1930,9 +1930,9 @@ impl Simulation {
                     }
                 }
             }
-            Some(Start::Bypass { to, dir, out_len, full_lock }) => {
+            Some(Start::Bypass { to, dir, out_len, full_lock, round }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
-                    v.state.start_bypass(net, to, dir, out_len, full_lock);
+                    v.state.start_bypass(net, to, dir, out_len, full_lock, round);
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
                     v.stopped = 0.0;

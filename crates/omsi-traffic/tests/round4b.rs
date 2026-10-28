@@ -307,13 +307,13 @@ fn x2_a_car_frozen_most_of_the_way_into_the_next_lane_is_not_the_lead_of_the_one
     follower.stopped = 10.0;
     // still registered on lane 0, its body 85 % over into lane 1 (3.3 m to the side)
     let mut changer = car(2, 0, 100.0, 0.0);
-    changer.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.85, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false });
+    changer.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.85, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false, round: None });
     let mut cars = vec![follower, changer];
     let p = seen(&net, &mut cars, 0);
     assert!((cars[1].pos.y + 3.3).abs() < 0.2, "the changer stands at y = {:.2}", cars[1].pos.y);
     assert!(p.leader.is_none(), "a phantom lead: {:?}", p.leader);
     // counter-case: one 30 % over is still in my corridor
-    cars[1].state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.3, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false });
+    cars[1].state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.3, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false, round: None });
     let p = seen(&net, &mut cars, 0);
     let l = p.leader.expect("the car half in my lane is my lead");
     assert!((l.gap - 16.0).abs() < 0.3, "gap {:.2}", l.gap);
@@ -394,7 +394,7 @@ fn x2_my_follower_that_has_me_as_its_lead_is_not_my_lead() {
 fn frozen_change(t: f32) -> (Network, Vec<Vehicle>) {
     let net = two_lanes();
     let mut me = car(1, 0, 100.0, 0.0);
-    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false });
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false, round: None });
     let mut ahead_target = car(2, 1, 105.5, 0.0);
     ahead_target.pull_out = 1000.0;
     let mut ahead_own = car(3, 0, 105.5, 0.0);
@@ -456,7 +456,7 @@ fn x3_a_frozen_change_is_not_done_into_a_car_standing_beside_it() {
     net.lanes.push(b);
     let net = finish(net);
     let mut me = car(1, 0, 100.0, 0.0);
-    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false });
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false, round: None });
     let mut beside = car(2, 1, 97.0, 0.0);
     beside.pull_out = 1000.0;
     let mut ahead_target = car(3, 1, 105.5, 0.0);
@@ -1194,7 +1194,7 @@ fn x3_a_frozen_change_with_both_lanes_taken_beside_it_waits_where_it_is() {
     net.lanes.push(b);
     let net = finish(net);
     let mut me = car(1, 0, 100.0, 0.0);
-    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false });
+    me.state.change = Some(omsi_sim::traffic::LaneChange { to: 1, t: 0.53, length: 12.0, s_to: 100.0, dir: 2, wait: 0.0, bypass: false, full_lock: false, round: None });
     let mut cars = vec![me];
     for (id, lane, s) in [(2u64, 1usize, 97.0f32), (3, 0, 103.0), (4, 1, 105.5)] {
         let mut o = car(id, lane, s, 0.0);
