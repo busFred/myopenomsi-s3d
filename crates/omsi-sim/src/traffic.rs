@@ -3452,7 +3452,8 @@ pub struct AiState {
     /// without successors, where `randomTrips` starts and ends trips), open to the car (closed
     /// only by density where no open one is reachable, `GoalAccess`) and not a loaded-tile edge
     /// in sight (`Network::ends_at_loaded_edge`). Drawn at random among the ends reachable from
-    /// the fork where the car's plan first meets a choice (`AiState::goal_way`), drawn again
+    /// the fork where the car's plan first meets a choice, by the density its group has on each
+    /// (`AiState::goal_way`), drawn again
     /// where it is gone or out of reach (`GOAL_REPICKED`). At a fork the car takes the way on
     /// with the shortest way to it (`choose_after`, SUMO: the route the router computes to the
     /// trip's end decides the way on). None: no fork met yet, a timetable route, or no end
@@ -3636,6 +3637,9 @@ pub static FORK_FALLBACKS: [std::sync::atomic::AtomicU64; 6] = [const { std::syn
 pub static GOAL_PICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GOAL_REPICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GOAL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Trip ends drawn uniformly because every reachable one carries density 0 for the car's group
+/// (`AiState::goal_way`; the others are drawn by that density), whole process.
+pub static GOAL_UNWEIGHTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// At most this many single-continuation lanes `choose_after` follows to find where a way on leads
 /// (past it the way is taken to lead on; the plan's own length, `PLAN_LANES`).
@@ -4018,9 +4022,10 @@ impl AiState {
 
     /// The trip end's way lengths for a choice among the ways on `next` of a fork, over the open
     /// lanes first (`GoalAccess::Open`): the car's own trip end while it still is one and one of
-    /// `next` leads to it; else a trip end drawn at random among those reachable from `next`
-    /// (SUMO's `randomTrips`: a trip from or to the fringe, a trip whose end cannot be reached
-    /// is dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`). Only where no trip end is
+    /// `next` leads to it; else a trip end drawn at random among those reachable from `next`,
+    /// weighted by the density the map gives the car's group on each (SUMO's `randomTrips`: a
+    /// trip from or to the fringe, edges drawn by custom weights, a trip whose end cannot be
+    /// reached is dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`, `GOAL_UNWEIGHTED`). Only where no trip end is
     /// reachable over open lanes, the same over the lanes closed only by density
     /// (`GoalAccess::Driven`): `choose_after`'s own fallback for a car in a quarter its group
     /// does not drive (density is OMSI's demand weight, no permission: SUMO's router routes
@@ -4063,7 +4068,31 @@ impl AiState {
             if ends.is_empty() {
                 continue;
             }
-            let g = ends[(self.rand() % ends.len() as u64) as usize];
+            // (drawn by the density the map gives the car's group on the trip end's lane, the one
+            // `open_to` and `choose_after` read, normalised: SUMO randomTrips' custom weights,
+            // `--weights-prefix`/`--edge-param`, the probability of an edge proportional to its
+            // weight; a lane at 0 is not drawn while another end weighs anything, all at 0
+            // uniform, counted)
+            let pool = self.traffic_pool.as_ref().map(|(p, d)| (d.as_slice(), *p));
+            let weights: Vec<f32> = ends.iter().map(|&e| net.lanes[e].density_for(pool).max(0.0)).collect();
+            let total: f32 = weights.iter().sum();
+            let g = if total > 0.0 {
+                let mut pick = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0) * total;
+                let mut g = None;
+                for (&e, &w) in ends.iter().zip(&weights) {
+                    if w > 0.0 {
+                        g = Some(e);
+                        if pick < w {
+                            break;
+                        }
+                        pick -= w;
+                    }
+                }
+                g.expect("an end of positive weight")
+            } else {
+                GOAL_UNWEIGHTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ends[(self.rand() % ends.len() as u64) as usize]
+            };
             if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let key = self.goal_key(net, g, access);
             let f = net.goal_field(key, |n| self.routable(net, n, access));
@@ -5560,6 +5589,55 @@ mod tests {
             assert_eq!(car.goal, way.last().copied(), "seed {seed}: left by its trip end: {way:?}");
             assert!(car.goal.is_some_and(|g| (8..12).contains(&g)), "seed {seed}: {:?}", car.goal);
         }
+    }
+
+    #[test]
+    fn a_trip_end_is_drawn_by_the_density_of_its_lane() {
+        // exits X1..X3 at 3.0, 1.0 and 0.1 (the editor's classes), X0 at 0.01 (open): drawn
+        // about 3 : 1 : 0.1 : 0.01 from arm 0
+        let mut net = four_arm_ring();
+        for (x, d) in [(8, 0.01), (9, 3.0), (10, 1.0), (11, 0.1)] {
+            net.lanes[x].density = d;
+        }
+        let mut drawn = [0usize; 4];
+        for seed in 1..4001u64 {
+            let mut car = AiState::new(4, 0.0, seed * 7919);
+            car.plan_next(&net);
+            drawn[car.goal.expect("a trip end") - 8] += 1;
+        }
+        let share = |k: usize| drawn[k] as f32 / 4000.0;
+        assert!((share(1) - 3.0 / 4.11).abs() < 0.03, "{drawn:?}");
+        assert!((share(2) - 1.0 / 4.11).abs() < 0.03, "{drawn:?}");
+        assert!(share(3) < 0.05 && share(0) < 0.01, "{drawn:?}");
+    }
+
+    #[test]
+    fn a_trip_end_at_density_zero_is_drawn_only_where_every_end_is_zero() {
+        // the whole map below `OPEN_DENSITY_FLOOR` (the ends drawn over the lanes closed only by
+        // density), X1 at 0, the others at 0.001: X1 never drawn; the whole map at 0: uniform
+        // among the ends, counted
+        let mut net = four_arm_ring();
+        for l in net.lanes.iter_mut() {
+            l.density = 0.001;
+        }
+        net.lanes[9].density = 0.0;
+        for seed in 1..200u64 {
+            let mut car = AiState::new(4, 0.0, seed * 104_729);
+            car.plan_next(&net);
+            assert!(car.goal.is_some_and(|g| g != 9), "seed {seed}: {:?}", car.goal);
+        }
+        for l in net.lanes.iter_mut() {
+            l.density = 0.0;
+        }
+        let before = GOAL_UNWEIGHTED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut drawn = [0usize; 4];
+        for seed in 1..400u64 {
+            let mut car = AiState::new(4, 0.0, seed * 104_729);
+            car.plan_next(&net);
+            drawn[car.goal.expect("a trip end") - 8] += 1;
+        }
+        assert!(drawn.iter().all(|&n| n > 50), "{drawn:?}");
+        assert!(GOAL_UNWEIGHTED.load(std::sync::atomic::Ordering::Relaxed) >= before + 399);
     }
 
     #[test]
