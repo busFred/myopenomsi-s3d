@@ -232,6 +232,21 @@ pub struct Decision {
 /// Ids of the players in `Decision::wait_for`, above any vehicle's.
 pub const PLAYER_ID_BASE: u64 = 1 << 62;
 
+/// An AI vehicle that drives a player's vehicle (the offscreen harness's `--follow-line`: a
+/// timetable bus drives the player's trip and the player's vehicle is put where it is): the
+/// others see it only as that player (`players`, its claim, its box) and not as a vehicle of
+/// the road - it is neither on the lanes nor in the grid (`build_occupancy`), files no claim of
+/// its own and drives by the grant of the player's claim (`tick`) - and it does not see that
+/// player, its own vehicle (`hide_player`). The player's claim is filed over the vehicle's own
+/// way (`stand_in_way`), not the way guessed from the indicator (`player_next`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandIn {
+    /// The vehicle's id (`Vehicle::id`).
+    pub vehicle: u64,
+    /// The player's id (`PlayerView::id`).
+    pub player: u32,
+}
+
 /// A player's claim names it as `Decision::wait_for` does, `PLAYER_ID_BASE` +
 /// its id (`Claim::vehicle`, `Grant::wait_for`; an AI vehicle's is its index).
 pub fn player_claim(id: u32) -> usize {
@@ -442,6 +457,21 @@ pub const UNHELD_SPEED: f32 = 0.1;
 /// `player_waiting` follows the lanes a player's vehicle stands on into this many
 /// lanes on (a count of lanes, as `plan::runs_past`'s 16) for the next lit one.
 pub const PLAYER_LIGHT_LOOK: usize = 16;
+/// A player's claim follows its way this many metres past its claim horizon
+/// (`claim_horizon`): the junction it meets first lies wholly within the lanes taken.
+pub const PLAYER_WAY_PAST: f32 = 40.0;
+/// ... over at most this many lanes on (a count of lanes, as `PLAYER_LIGHT_LOOK`).
+pub const PLAYER_WAY_LANES: usize = 16;
+
+/// A stand-in's way as its player's claim takes it (`StandIn`): its own lanes ahead
+/// (`perception::way_lanes`, the lane it changes onto once the move is under way), each with
+/// the distance from the player's centre (`PlayerView::pos`, where its claim measures from)
+/// to the lane's start, as far as `within` metres from it.
+fn stand_in_way(net: &Network, v: &Vehicle, p: &PlayerView, within: f32) -> Vec<(usize, f32)> {
+    // (how far the player's centre lies ahead of the vehicle's origin along its heading)
+    let ahead = (p.pos - v.pos).truncate().dot(p.fwd()) as f32;
+    perception::way_lanes(net, &v.state, within + ahead).into_iter().take(PLAYER_WAY_LANES + 1).map(|(l, d)| (l, d - ahead)).collect()
+}
 
 /// Two vehicles holding each other at a junction where they have a meeting place negotiate:
 /// one eases off (`Vehicle::ease_for`) at the first frame both stand refused for each other
@@ -787,6 +817,12 @@ pub struct Simulation {
     /// Wall seconds of each phase of `tick`, summed over the ticks (diagnostics, read by the
     /// game's `OMSI_PROFILE` line; the order is `PHASES`).
     pub phase_secs: [f64; PHASES.len()],
+    /// The AI vehicle that drives a player's vehicle, if one (`StandIn`; set by the caller
+    /// each frame, never by a recording).
+    pub stand_in: Option<StandIn>,
+    /// Frames in which the stand-in's player claim was about another junction than the one
+    /// its own way meets first, so that it had no grant to drive by (diagnostics).
+    pub stand_in_unmatched: u32,
 }
 
 /// The phases of `Simulation::tick` timed in `phase_secs`.
@@ -887,6 +923,8 @@ impl Simulation {
             trace_foes: false,
             foe_trace: Vec::new(),
             phase_secs: [0.0; PHASES.len()],
+            stand_in: None,
+            stand_in_unmatched: 0,
         }
     }
 
@@ -1051,13 +1089,15 @@ impl Simulation {
         }
     }
 
-    /// Which vehicle is where on which lane, and the grids.
+    /// Which vehicle is where on which lane, and the grids. A stand-in (`StandIn`) is on
+    /// neither: the others see it as its player (`player_occupancy`).
     pub fn build_occupancy(&mut self, net: &Network, vehicles: &[Vehicle]) {
         self.occupancy.clear();
         self.vehicle_grid.clear();
+        let stand_in = self.stand_in.map(|s| s.vehicle);
         for (i, v) in vehicles.iter().enumerate() {
             let st = &v.state;
-            if net.lanes.get(st.lane).is_none() {
+            if net.lanes.get(st.lane).is_none() || Some(v.id) == stand_in {
                 continue;
             }
             self.vehicle_grid.entry(cell(v.pos)).or_default().push(i);
@@ -1101,12 +1141,38 @@ impl Simulation {
             occ.sort_by(|a, b| a.s.total_cmp(&b.s));
         }
         self.index_people();
+        self.index_players(net);
+    }
+
+    /// The players on the lanes (`player_occupancy`) as `players` stand now.
+    fn index_players(&mut self, net: &Network) {
         self.player_occupancy.clear();
         for k in 0..self.players.len() {
             let p = self.players[k];
             let Some((lane, s)) = self.player_lane(net, &p) else { continue };
             self.player_occupancy.entry(lane).or_default().push((k, s, player_lateral(net, lane, s, &p)));
         }
+    }
+
+    /// The stand-in (`StandIn`) among `vehicles` this frame: its index and its player's id,
+    /// while both are there.
+    pub fn stand_in_of(&self, vehicles: &[Vehicle]) -> Option<(usize, u32)> {
+        let s = self.stand_in?;
+        let i = vehicles.iter().position(|v| v.id == s.vehicle)?;
+        self.players.iter().any(|p| p.id == s.player).then_some((i, s.player))
+    }
+
+    /// Run `f` on the simulation without player `id` (the stand-in's perception, plan and
+    /// act: it does not see its own vehicle; `StandIn`), then put the player back.
+    fn hide_player<R>(&mut self, net: &Network, id: u32, f: impl FnOnce(&mut Simulation) -> R) -> R {
+        let players = self.players.clone();
+        let occupancy = std::mem::take(&mut self.player_occupancy);
+        self.players.retain(|p| p.id != id);
+        self.index_players(net);
+        let out = f(self);
+        self.players = players;
+        self.player_occupancy = occupancy;
+        out
     }
 
     /// Measure each player's pulling away: the hardest acceleration it showed,
@@ -1346,11 +1412,17 @@ impl Simulation {
 
         // perception: read-only over everything, so every vehicle's in parallel (an indexed
         // collect keeps the vehicle order: the same Vec the serial map built)
-        let perceptions: Vec<Perception> = {
+        let mut perceptions: Vec<Perception> = {
             let sim: &Simulation = self;
             let vs: &[Vehicle] = vehicles;
             (0..vs.len()).into_par_iter().map(|i| perception::perceive(net, sim, vs, i)).collect()
         };
+        // (the stand-in sees everybody but its own player, `StandIn`)
+        let stand_in = self.stand_in_of(vehicles);
+        if let Some((si, pid)) = stand_in {
+            let vs: &[Vehicle] = vehicles;
+            perceptions[si] = self.hide_player(net, pid, |sim| perception::perceive(net, sim, vs, si));
+        }
 
         lap(&mut self.phase_secs[1]);
 
@@ -1522,6 +1594,10 @@ impl Simulation {
             if let Some(passed) = passed_change {
                 passed_now.push((i, passed));
             }
+            // (a stand-in files none of its own: its player's claim is the one, `StandIn`)
+            if stand_in.is_some_and(|(si, _)| si == i) {
+                continue;
+            }
             if let Some((standing, claim)) = filed {
                 standing_now.push((i, standing));
                 claim_of[i] = Some(claims.len());
@@ -1529,18 +1605,26 @@ impl Simulation {
             }
         }
         // the players' vehicles claim their way like anybody else (their grants are not
-        // read: the player drives): the junction on the way ahead of the lane under the
-        // vehicle (its `next` lanes, straight on at a fork unless the indicator says
-        // otherwise), the claim over every piece of it the way takes (`chain_along`, as for an
-        // AI vehicle: a claim of the first piece alone would not meet the oncoming left turner
-        // on the piece after it); off the lanes, the junction on the lanes
-        // starting ahead of it, on its first piece
+        // read: the player drives; a stand-in's is, `StandIn`): the junction on the way ahead
+        // of the lane under the vehicle (its `next` lanes, straight on at a fork unless the
+        // indicator says otherwise; a stand-in's own way, `stand_in_way`), the claim over every
+        // piece of it the way takes (`chain_along`, as for an AI vehicle: a claim of the first
+        // piece alone would not meet the oncoming left turner on the piece after it); off the
+        // lanes, the junction on the lanes starting ahead of it, on its first piece
+        let mut stand_in_claim: Option<usize> = None;
         for p in self.players.iter() {
             let v = p.speed.max(0.0);
             let horizon = claim_horizon(v);
             // the way: (lane, distance from the vehicle's origin to the lane's start)
             let mut way: Vec<(usize, f32)> = Vec::new();
-            if let Some((lane, s)) = self.player_lane(net, p) {
+            let own = stand_in.filter(|s| s.1 == p.id).map(|s| &vehicles[s.0]);
+            if let Some(sv) = own {
+                way = stand_in_way(net, sv, p, horizon + PLAYER_WAY_PAST);
+                // (parked beside the lane: no claim, `player_parked_beside`)
+                if way.first().is_some_and(|&(lane, d)| Self::player_parked_beside(net, lane, -d, p)) {
+                    continue;
+                }
+            } else if let Some((lane, s)) = self.player_lane(net, p) {
                 // (parked beside the lane: no claim, `player_parked_beside`)
                 if Self::player_parked_beside(net, lane, s, p) {
                     continue;
@@ -1548,8 +1632,8 @@ impl Simulation {
                 way.push((lane, -s));
                 let mut d = net.lanes[lane].length() - s;
                 let mut cur = lane;
-                for _ in 0..16 {
-                    if d > horizon + 40.0 {
+                for _ in 0..PLAYER_WAY_LANES {
+                    if d > horizon + PLAYER_WAY_PAST {
                         break;
                     }
                     let Some(n) = player_next(net, cur, p.blinker) else { break };
@@ -1679,6 +1763,9 @@ impl Simulation {
                         .map(|(k, _)| k)
                 })
                 .flatten();
+            if own.is_some() {
+                stand_in_claim = Some(claims.len());
+            }
             claims.push(Claim {
                 chain,
                 was_standing: false,
@@ -1722,6 +1809,17 @@ impl Simulation {
                 serving: false,
                 brake: plan::HARD_BRAKE,
             });
+        }
+        // the stand-in drives by its player's claim where that claim is about the junction its
+        // own way meets (the same chain: `stand_in_way`); the claim filed for another one -
+        // its way meets none within its horizon, the player's off its lanes - is no grant of its
+        if let (Some((si, _)), Some(k)) = (stand_in, stand_in_claim) {
+            let same = perceptions[si].junction.as_ref().is_some_and(|j| j.junction == claims[k].junction && j.chain.first().map(|c| c.0) == Some(claims[k].movement));
+            if same {
+                claim_of[si] = Some(k);
+            } else if perceptions[si].junction.is_some() {
+                self.stand_in_unmatched += 1;
+            }
         }
         for (i, standing) in standing_now {
             vehicles[i].claim_standing = standing;
@@ -1771,17 +1869,25 @@ impl Simulation {
         // update: all vehicles plan their step from the same state, then all move; no vehicle
         // sees another's move of this frame). A plan reads only the network, the simulation, the
         // vehicles and the perception, so the plans are made in parallel and kept in vehicle order
-        let plans: Vec<Plan> = {
+        let mut plans: Vec<Plan> = {
             let (sim, vs): (&Simulation, &[Vehicle]) = (&*self, &*vehicles);
             (0..vs.len()).into_par_iter().map(|i| plan::plan(net, sim, vs, i, &perceptions[i], claim_of[i].map(|k| grants[k]))).collect()
         };
+        if let Some((si, pid)) = stand_in {
+            let vs: &[Vehicle] = vehicles;
+            let grant = claim_of[si].map(|k| grants[k]);
+            plans[si] = self.hide_player(net, pid, |sim| plan::plan(net, sim, vs, si, &perceptions[si], grant));
+        }
         lap(&mut self.phase_secs[4]);
         // the requests the plans just read are used up; the acts below set the next frame's
         for v in vehicles.iter_mut() {
             v.help_for = None;
         }
         for (i, plan) in plans.into_iter().enumerate() {
-            self.act(net, vehicles, i, plan, dt);
+            match stand_in {
+                Some((si, pid)) if si == i => self.hide_player(net, pid, |sim| sim.act(net, vehicles, i, plan, dt)),
+                _ => self.act(net, vehicles, i, plan, dt),
+            }
         }
         lap(&mut self.phase_secs[5]);
         self.negotiate(vehicles, &claim_of, dt);

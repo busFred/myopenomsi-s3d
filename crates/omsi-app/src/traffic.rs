@@ -482,6 +482,10 @@ impl Footprint {
     }
 }
 
+/// The player's id among the drivers' views (`omsi_traffic::PlayerView::id`; the LAN
+/// players' are their session ids).
+pub(crate) const PLAYER_VIEW_ID: u32 = 0;
+
 /// The player's vehicle as the traffic sees it: centre, heading (deg), half length, half
 /// width, speed along the heading (m/s, negative when reversing).
 pub type PlayerBox = (DVec3, f64, f32, f32, f32);
@@ -1102,6 +1106,10 @@ pub struct Traffic {
     pub player_blinker: u8,
     /// How long the player's bus has been indicating towards the traffic (s).
     player_signalling: f32,
+    /// The timetable bus that drives the player's vehicle (the harness's `--follow-line`;
+    /// `traffic_link::player_seen`), set before each `tick`: the drivers see it as the player
+    /// (`omsi_traffic::StandIn`), and here it is neither behind nor in front of itself.
+    pub stand_in: Option<u64>,
     /// The LAN players' vehicles (their session ids and boxes as for the player), set
     /// before each `tick`: the cars stop behind them and go round them as round the
     /// player's bus.
@@ -1826,6 +1834,7 @@ impl Traffic {
             player_priority: false,
             player_blinker: 0,
             player_signalling: 0.0,
+            stand_in: None,
             others: Vec::new(),
             drivers: HashMap::new(),
             driver_pool: Vec::new(),
@@ -4073,7 +4082,7 @@ impl Traffic {
         self.player_signalling = if self.player_blinker == out_side || self.player_blinker == 3 { self.player_signalling + dt } else { 0.0 };
         let mut views: Vec<PlayerView> = Vec::new();
         if let Some((c, h, hl, hw, v)) = player {
-            views.push(PlayerView { id: 0, pos: c, heading: h as f32, half_len: hl, half_width: hw, speed: v, still: self.player_still, blinker: self.player_blinker, signalling: self.player_signalling, priority: self.player_priority });
+            views.push(PlayerView { id: PLAYER_VIEW_ID, pos: c, heading: h as f32, half_len: hl, half_width: hw, speed: v, still: self.player_still, blinker: self.player_blinker, signalling: self.player_signalling, priority: self.player_priority });
         }
         for &(id, (c, h, hl, hw, v)) in &others {
             let still = self.others_still.entry(id).or_insert(0.0);
@@ -4082,6 +4091,7 @@ impl Traffic {
         }
         self.others_still.retain(|id, _| others.iter().any(|o| o.0 == *id));
         self.sim.players = views;
+        self.sim.stand_in = self.stand_in.filter(|_| player.is_some()).map(|vehicle| omsi_traffic::StandIn { vehicle, player: PLAYER_VIEW_ID });
         self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb, waits_at, id, approach)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb, waits_at, id: Some(id), approach }).collect();
         // (indexed now: a bus put back on its route below asks the people test, `people_hold_here`)
         self.sim.index_people();
@@ -4097,6 +4107,8 @@ impl Traffic {
         let t_pre = std::time::Instant::now();
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
+            // (the player's bus as this bus sees it: none when this bus is the one driving it)
+            let player = player.filter(|_| self.stand_in != Some(self.cars[i].id));
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
             // how long somebody has stood right behind this bus (a roadside layover gives
             // way to the traffic it holds up)
@@ -4638,9 +4650,11 @@ impl Traffic {
 
     /// Every two bodies inside each other by more than `OVERLAP_DEPTH`: (car, other car or
     /// `usize::MAX` for the player box `Some(k)` of `player` then `others`, where). The AI
-    /// cars by their `footprints` (coupled parts too), the players by their boxes.
+    /// cars by their `footprints` (coupled parts too), the players by their boxes; the bus
+    /// that drives the player's vehicle (`stand_in`) by the player's box only.
     fn overlaps(&self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) -> Vec<(usize, usize, Option<usize>, DVec2)> {
-        let feet = self.footprints();
+        let stand_in = self.stand_in.filter(|_| player.is_some()).and_then(|id| self.cars.iter().position(|c| c.id == id));
+        let feet: Vec<Footprint> = self.footprints().into_iter().filter(|f| Some(f.car) != stand_in).collect();
         let boxes: Vec<Footprint> = player
             .iter()
             .chain(others.iter().map(|(_, b)| b))

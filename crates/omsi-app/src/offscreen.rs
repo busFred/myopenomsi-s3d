@@ -8,7 +8,8 @@
 //! stands where it starts; with `--follow-line` it drives its duty's trip as an AI timetable
 //! bus drives one (`follow_line::LineFollower`: the departure's own AI vehicle, of its AI
 //! group, takes the player's departure on where the player's bus stands, and the player's
-//! vehicle is put where that bus's body is every frame, its own physics not run). With
+//! vehicle is put where that bus's body is every frame, its own physics not run; the traffic
+//! sees the player's bus there, and that bus only as its driver). With
 //! `--watch-player` (and `--follow-line`) the summary tells what appeared, vanished and held
 //! round the player (`follow_line::PlayerWatch`).
 
@@ -702,13 +703,12 @@ pub(crate) fn run_offscreen(
                 f.place(t_s, s, d, &world, t, &renderer, &mut scene, &p.vehicle);
             }
             t.others = lan_outlines(&remotes_off);
-            // (the player's bus driven by an AI bus, `--follow-line`: the drivers see that bus
-            // in its place, not a player's outline over it)
-            let driven = follower.as_ref().is_some_and(|f| f.driving());
-            t.others.extend(own_outlines(player.as_ref().filter(|_| !driven), &[]));
-            t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
-            t.player_blinker = player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
-            t.tick(dt, player.as_ref().filter(|_| !driven).map(|p| player_outline(p)));
+            // (the player's bus driven by an AI bus, `--follow-line`: the drivers see the player
+            // there, and that bus only as the player, `traffic_link::player_seen`)
+            let stand_in = follower.as_ref().filter(|f| f.driving()).and_then(|f| f.car).and_then(|id| t.cars.iter().find(|c| c.id == id));
+            let seen = player_seen(player.as_ref().map(|p| &p.vehicle), &[], stand_in);
+            let player_box = show_player(t, seen);
+            t.tick(dt, player_box);
             // the riders of the timetable buses taken off the road
             let out = std::mem::take(&mut t.riders_out);
             if let Some(h) = humans_off.as_mut() {

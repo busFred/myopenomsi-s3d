@@ -12,9 +12,12 @@
 //! the AI's bodies move (`ai_motion`). The physics and scripts of the player's vehicle do not
 //! run meanwhile; its doors stay shut, and the people see the AI bus in its place, not the
 //! player's bus nor the duty (`Humans::tick` gets no player's bus while it drives): they
-//! board it and wait for it at its stops as for any timetable bus. The other
-//! drivers see the AI bus, not a player's outline (`Traffic::tick` gets no player box while
-//! it drives): what they do round the player's bus is what they do round a timetable bus.
+//! board it and wait for it at its stops as for any timetable bus. The other drivers see the
+//! player there as in a drive of the user's (`traffic_link::player_seen`: the player's box,
+//! the player's claim at the junctions, its right of way, the AI bus's indicator as the
+//! player's) and the AI bus only as the player (`omsi_traffic::StandIn`: it is on no lane for
+//! them and files no claim of its own; it drives by the grant of the player's claim and does
+//! not see the player's vehicle, itself).
 //! When the bus is lost (taken off the road, its trip over and let go) the player's bus
 //! stands where it was left.
 //!
@@ -269,6 +272,9 @@ struct Round {
     aboard: [HashSet<u32>; 2],
     boarded: [usize; 2],
     alighted: [usize; 2],
+    /// Frames in which the AI bus had no grant of its player's claim for the junction its own
+    /// way met (`Simulation::stand_in_unmatched`).
+    unmatched: u32,
     /// AI cars' bodies (`omsi_traffic::Vehicle::obb`) and people on the ground inside the
     /// player's bus's box by more than `traffic::OVERLAP_DEPTH`: seconds and who.
     cars_inside: (f64, HashSet<u64>),
@@ -276,7 +282,7 @@ struct Round {
 }
 
 /// The player's id in the traffic (`Traffic::tick`'s view of the player).
-const PLAYER_VIEW: u32 = 0;
+const PLAYER_VIEW: u32 = crate::traffic::PLAYER_VIEW_ID;
 
 impl PlayerWatch {
     /// One frame of `dt` s at run second `t_s`: `player` the player's vehicle, `car` the AI
@@ -490,6 +496,7 @@ impl PlayerWatch {
         use omsi_traffic::Seen;
         let dt = dt as f64;
         let r = &mut self.round;
+        r.unmatched = traffic.sim.stand_in_unmatched;
         let me = PLAYER_ID_BASE + PLAYER_VIEW as u64;
         let bus_id = bus.map(|c| c.id);
         let bus_ix = bus_id.and_then(|id| traffic.cars.iter().position(|c| c.id == id));
@@ -633,11 +640,12 @@ impl PlayerWatch {
             ));
         }
         out.push(format!(
-            "player watch: inside the player's bus's box: AI cars {:.1} car-s ({:?}), people on the ground {:.1} person-s ({} people)",
+            "player watch: inside the player's bus's box: AI cars {:.1} car-s ({:?}), people on the ground {:.1} person-s ({} people); frames the AI bus had no grant of the player's claim for its junction: {}",
             r.cars_inside.0,
             r.cars_inside.1,
             r.people_inside.0,
-            r.people_inside.1.len()
+            r.people_inside.1.len(),
+            r.unmatched
         ));
         if !self.holds_s.is_empty() {
             out.push(format!("player watch: the bus's holds (s by reason): {}", self.holds_s.iter().map(|(k, v)| format!("{k} {v:.1}")).collect::<Vec<_>>().join(", ")));
@@ -788,7 +796,9 @@ mod tests {
     /// from there on, the station behind it none of them); `Traffic::tick` drives it (its
     /// `BusService`, the light, its body) and `LineFollower::pose` puts the player's bus where
     /// it is: within its lane, at its stop with the doors open, at the red light, through the
-    /// bend after the green. The traffic's network, the light and the stop objects come from
+    /// bend after the green - with the traffic seeing the player's bus there and the AI bus as
+    /// the player (`traffic_link::player_seen`): it files no claim of its own and never waits
+    /// for the player, itself. The traffic's network, the light and the stop objects come from
     /// a world as its tiles bring them (`World::lanes`, `traffic_lights`, `object_positions`).
     #[test]
     fn the_follower_puts_the_players_trip_on_where_its_bus_stands_and_drives_it_to_its_stop_and_the_light() {
@@ -836,8 +846,17 @@ mod tests {
         let half_lane = 3.5 / 2.0;
         let (mut worst, mut served_at, mut stood_at_red, mut on_red) = (0.0f64, None, false, false);
         let mut t = 0.0f32;
+        let (mut own_claims, mut waits_for_itself) = (0usize, 0usize);
         loop {
-            traffic.tick(DT, None);
+            // (the traffic sees the player there and the AI bus as the player, as the harness
+            // gives it: `traffic_link::player_seen`)
+            let stand_in = traffic.cars.iter().find(|c| c.id == id);
+            let seen = crate::traffic_link::player_seen(Some(&player), &[], stand_in);
+            let player_box = crate::traffic_link::show_player(&mut traffic, seen);
+            traffic.tick(DT, player_box);
+            let k = traffic.cars.iter().position(|c| c.id == id).unwrap();
+            own_claims += usize::from(traffic.sim.claims.iter().any(|(c, _)| c.vehicle == k));
+            waits_for_itself += usize::from(traffic.cars[k].ai.last.wait_for == Some(omsi_traffic::sim::PLAYER_ID_BASE));
             assert!(follower.pose(t, &traffic, &mut player), "lost at {t:.1} s: {:?}", follower.lost);
             let c = traffic.cars.iter().find(|c| c.id == id).unwrap();
             let st = &c.ai.state;
@@ -866,5 +885,6 @@ mod tests {
         assert!((y - 60.0).abs() < 3.0, "served its stop at y {y:.1} ({when:.1} s)");
         assert!(stood_at_red, "never stood at the red light");
         assert!(!on_red, "drove past the red light");
+        assert_eq!((own_claims, waits_for_itself), (0, 0), "the AI bus filed a claim of its own or waited for the player, itself");
     }
 }
