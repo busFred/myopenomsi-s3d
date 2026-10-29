@@ -26,11 +26,11 @@
 //! cover (`Traffic::occluded`) or beyond its perceptual horizon
 //! (`traffic::Viewer::beyond_horizon`), the ones in sight logged with their id and time;
 //! the people taken in sight by the people's own test (`Humans::gone`); people held at a
-//! kerb in sight; the nearest unloaded ground along the AI bus's route ahead; and the bus's
-//! own holds by reason, with their times. People put down in plain view past
-//! `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted apart and not listed.
-//! A car that parks or pulls out of a parked space
-//! (its parked object put down or taken up where it stands) and anything while the map loads
+//! kerb in sight; the nearest unloaded ground (or end of the loaded lanes) along the AI
+//! bus's route ahead; and the bus's own holds by reason, with their times. People put down
+//! in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted
+//! apart and not listed. A car that parks or pulls out of a parked space (its parked object
+//! put down or taken up where it stands) and anything while the map loads
 //! (`Traffic::loading_phase`) is not counted.
 
 use crate::traffic::Traffic;
@@ -210,8 +210,10 @@ pub(crate) struct PlayerWatch {
     held_s: f64,
     held_ids: HashSet<u32>,
     /// The nearest unloaded ground along the route ahead (m), the least over the run, with
-    /// its run second and where; and how often it was probed.
-    tiles_min: Option<(f64, f32, DVec3)>,
+    /// its run second, where, and what it was (no ground, or the end of the lanes of the
+    /// route the network has so far: its next steps' tiles have not brought their lanes);
+    /// and how often it was probed.
+    tiles_min: Option<(f64, f32, DVec3, &'static str)>,
     tiles_probes: usize,
     tiles_next: f32,
     /// The AI bus's holds: seconds by reason, the episodes, and the one going on.
@@ -364,7 +366,7 @@ impl PlayerWatch {
                 self.tiles_probes += 1;
                 let net = &traffic.net;
                 let way = omsi_traffic::perception::way_lanes(net, &c.ai.state, load_radius as f32);
-                let mut edge: Option<(f64, DVec3)> = None;
+                let mut edge: Option<(f64, DVec3, &'static str)> = None;
                 'lanes: for &(l, d0) in &way {
                     let lane = &net.lanes[l];
                     let mut along = 0.0f64;
@@ -372,7 +374,7 @@ impl PlayerWatch {
                         along += (w[1] - w[0]).length();
                         let d = d0 as f64 + along;
                         if d > 0.0 && !world.has_ground(w[1].x, w[1].y) {
-                            edge = Some((d, w[1]));
+                            edge = Some((d, w[1], "no ground"));
                             break 'lanes;
                         }
                     }
@@ -383,13 +385,13 @@ impl PlayerWatch {
                     if let Some(&(l, d0)) = way.last() {
                         let d = d0 as f64 + net.lanes[l].length() as f64;
                         if d < load_radius {
-                            edge = Some((d, net.lanes[l].end()));
+                            edge = Some((d, net.lanes[l].end(), "the end of the route's loaded lanes"));
                         }
                     }
                 }
-                if let Some((d, p)) = edge {
+                if let Some((d, p, what)) = edge {
                     if self.tiles_min.is_none_or(|m| d < m.0) {
-                        self.tiles_min = Some((d, t_s, p));
+                        self.tiles_min = Some((d, t_s, p, what));
                     }
                 }
             }
@@ -479,7 +481,7 @@ impl PlayerWatch {
         }
         out.push(format!("player watch: people held at a kerb in sight within {WATCH_RADIUS:.0} m: {:.0} person-s, {} people", self.held_s, self.held_ids.len()));
         out.push(match self.tiles_min {
-            Some((d, t, p)) => format!("player watch: unloaded ground along the route ahead: nearest {d:.0} m at {t:.0} s (at ({:.0}, {:.0})), {} probes", p.x, p.y, self.tiles_probes),
+            Some((d, t, p, what)) => format!("player watch: unloaded ground along the route ahead: nearest {d:.0} m at {t:.0} s ({what}, at ({:.0}, {:.0})), {} probes", p.x, p.y, self.tiles_probes),
             None if self.tiles_probes > 0 => format!("player watch: unloaded ground along the route ahead: none within the load radius, {} probes", self.tiles_probes),
             None => "player watch: unloaded ground along the route ahead: no route (standing)".to_string(),
         });
