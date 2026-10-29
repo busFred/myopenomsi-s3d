@@ -251,6 +251,9 @@ pub(crate) struct PlayerWatch {
 /// Step (m) of the way's points a body is measured against: the polyline between them is
 /// within a millimetre of a 25 m bend (the sagitta of a 0.5 m chord).
 const BODY_WAY_STEP: f32 = 0.5;
+/// How far past an edge (m) the signed measure counts a side as over it: 5 cm, a body truly
+/// over the line and not the pure pursuit's steady error.
+const BODY_SIDE_OVER: f64 = 0.05;
 /// Upper bounds (m) of the radius classes the bodies are told by (the bends of the unit
 /// test, `ai_motion`'s 25/40/80 m, and the rest).
 const BODY_RADIUS_CLASSES: [f64; 3] = [30.0, 60.0, 120.0];
@@ -282,9 +285,17 @@ struct BodyLane {
     /// The same vehicle-frames, signed against the bend: how far the body's inner side and its
     /// outer side leave the vehicle's lane (m, past its edges on the bend's inside and outside,
     /// `Network::lane_edges`, from the way; - = inside it): (inner, outer, frame time); and
-    /// the vehicle-seconds on a lane whose edges the map does not tell (not measured).
+    /// the vehicle-seconds on a lane whose edges the map does not tell, and those moving
+    /// sideways off their lane's axis (a lane change, a pull-out, a sideways move: the way is
+    /// not on the lane's axis the edges are measured from), not measured.
     sides: [[Vec<(f32, f32, f32)>; 4]; 2],
     sides_unknown_s: [[f64; 4]; 2],
+    sides_sideways_s: [[f64; 4]; 2],
+    /// Where the inner side passes the lane's edge by more than `BODY_SIDE_OVER`: vehicle-seconds
+    /// by the lane's source (spline lane, junction path) and the vehicle (bus or not), and per
+    /// vehicle its deepest frame (m, what it was doing then).
+    inner_over_s: HashMap<(&'static str, bool), f64>,
+    inner_worst: HashMap<u64, (f32, String)>,
     /// The street lanes by where their edges come from (`Network::lane_edges`), counted
     /// whenever the network has grown: (lanes counted, spline lanes with both edges, junction
     /// paths from the pieces they join, spline lanes not known, junction paths not known), and
@@ -408,7 +419,9 @@ impl BodyLane {
                 self.swing[kind][class].push((worst as f32, dt));
                 // the bend's side: + = it bends left, so its inside is the way's left
                 let left = (b - a).perp_dot(q - a) >= 0.0;
-                if let Some((el, er)) = edges {
+                if st.lateral != 0.0 || st.change.is_some() {
+                    self.sides_sideways_s[kind][class] += dt as f64;
+                } else if let Some((el, er)) = edges {
                     let (inward, inner_edge, outer_edge) = if left { (1.0, el, er) } else { (-1.0, er, el) };
                     let (mut inn, mut out) = (f64::MIN, f64::MIN);
                     for &(long, lat) in &corners {
@@ -417,6 +430,32 @@ impl BodyLane {
                         out = out.max(-l - outer_edge as f64);
                     }
                     self.sides[kind][class].push((inn as f32, out as f32, dt));
+                    if inn > BODY_SIDE_OVER && class < 3 {
+                        let ln = &net.lanes[st.lane];
+                        let junction = ln.source == 2;
+                        let bus = c.vehicle.ty.def.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bus"));
+                        *self.inner_over_s.entry((if junction { "junction path" } else { "spline lane" }, bus)).or_default() += dt as f64;
+                        let w = self.inner_worst.entry(c.id).or_insert((f32::MIN, String::new()));
+                        if inn as f32 > w.0 {
+                            let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                            *w = (
+                                inn as f32,
+                                format!(
+                                    "t={t_s:.1} #{} {} section {i} lane {} ({} {}) s {:.1} of {:.1} edges ({el:.2}, {er:.2}) bend {} R {:.0} speed {:.1}",
+                                    c.id,
+                                    ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                                    st.lane,
+                                    if junction { "junction path" } else { "spline lane" },
+                                    ln.name,
+                                    st.s,
+                                    ln.length(),
+                                    if left { "left" } else { "right" },
+                                    1.0 / k.max(1e-4),
+                                    st.speed
+                                ),
+                            );
+                        }
+                    }
                 } else {
                     self.sides_unknown_s[kind][class] += dt as f64;
                 }
@@ -492,7 +531,7 @@ impl BodyLane {
                     continue;
                 }
                 let secs: f64 = v.iter().map(|x| x.2 as f64).sum();
-                let over = |f: &dyn Fn(&(f32, f32, f32)) -> f32| v.iter().filter(|x| f(x) > 0.05).map(|x| x.2 as f64).sum::<f64>();
+                let over = |f: &dyn Fn(&(f32, f32, f32)) -> f32| v.iter().filter(|x| f(x) as f64 > BODY_SIDE_OVER).map(|x| x.2 as f64).sum::<f64>();
                 let stats = |f: &dyn Fn(&(f32, f32, f32)) -> f32| {
                     let mut x: Vec<f32> = v.iter().map(f).collect();
                     x.sort_by(|a, b| a.total_cmp(b));
@@ -502,8 +541,9 @@ impl BodyLane {
                 let (om, op, ox) = stats(&|x| x.1);
                 let name = if class == 0 { format!("R <= {:.0} m", BODY_RADIUS_CLASSES[0]) } else { format!("R {:.0}-{:.0} m", BODY_RADIUS_CLASSES[class - 1], BODY_RADIUS_CLASSES[class]) };
                 out.push(format!(
-                    "body lane signed: {part} {name}: {secs:.0} vehicle-s (and {:.0} on lanes of no known edges); past the lane's inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past its outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
+                    "body lane signed: {part} {name}: {secs:.0} vehicle-s (and {:.0} on lanes of no known edges, {:.0} moving sideways); past the lane's inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past its outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
                     self.sides_unknown_s[i][class],
+                    self.sides_sideways_s[i][class],
                     over(&|x| x.0),
                     over(&|x| x.1)
                 ));
@@ -524,6 +564,16 @@ impl BodyLane {
             names.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             let list: Vec<String> = names.iter().take(12).map(|(n, c)| format!("{n} {c}")).collect();
             out.push(format!("body lane: lane edges not known, by file: {}", list.join(", ")));
+        }
+        {
+            let mut by: Vec<String> = self.inner_over_s.iter().map(|((src, bus), s)| format!("{src} {} {s:.0}", if *bus { "bus" } else { "other" })).collect();
+            by.sort();
+            out.push(format!("body lane signed: inner side past the lane's edge by over {BODY_SIDE_OVER} m in bends (R <= {:.0} m), vehicle-s by lane and vehicle: {}", BODY_RADIUS_CLASSES[2], by.join(", ")));
+            let mut worst: Vec<&(f32, String)> = self.inner_worst.values().collect();
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (d, w) in worst.iter().take(12) {
+                out.push(format!("body lane signed:   inner side {d:.2} m past: {w}"));
+            }
         }
         let still: Vec<String> = self.open.values().map(|(since, depth, who)| format!("t={since:.1} still at the end, deepest {depth:.2} m: {who}")).collect();
         for e in self.episodes.iter().chain(&still) {
