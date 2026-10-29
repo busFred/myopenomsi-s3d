@@ -1208,7 +1208,7 @@ fn hhmmss() -> String {
 /// Two bodies count as inside each other past this depth (m): a touch of 20 cm is the
 /// bodies' rounding (`Traffic::overlaps`, the recordings' "overlap" trigger and the
 /// `OMSI_CHECK_OVERLAP` log).
-const OVERLAP_DEPTH: f64 = 0.2;
+pub(crate) const OVERLAP_DEPTH: f64 = 0.2;
 
 /// How far (m) a vehicle put on the road keeps its bodies from every other vehicle's
 /// (`Traffic::spawn_clear`): the stricter of the two tests it replaces (footprints with 1 m

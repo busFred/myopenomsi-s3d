@@ -4026,7 +4026,7 @@ const LEVEL_APART: f64 = 2.5;
 /// 2104/2046 at 1.3 m over the cutting of lanes 1616-1633 at -3.8 m, and 1956-1959 at 1.3-1.4 m
 /// over lanes 2303/2304 at -1.8 m beside the bridge's own street 1955 at 1.3 m): their walkers
 /// were held by, pushed by and counted inside the cars passing below.
-fn at_level(vehicle_z: f64, z: f64) -> bool {
+pub(crate) fn at_level(vehicle_z: f64, z: f64) -> bool {
     (vehicle_z - z).abs() <= LEVEL_APART
 }
 
@@ -6630,6 +6630,18 @@ impl Humans {
     /// vanishes (`follow_line::PlayerWatch`).
     pub fn everyone(&self) -> impl Iterator<Item = (u32, DVec3, bool)> + '_ {
         self.people.iter().filter(|p| !p.remote).map(|p| (p.id, p.position, p.place == Place::Ground))
+    }
+
+    /// The people inside bus `bus` (their ids), as of the last tick (the harness's
+    /// `follow_line::PlayerWatch`).
+    pub(crate) fn aboard(&self, bus: BusId) -> impl Iterator<Item = u32> + '_ {
+        self.people.iter().filter(move |p| matches!(p.place, Place::Bus(b, _) if b == bus)).map(|p| p.id)
+    }
+
+    /// Whether bus `bus` has a door open for the people as of the last tick (any entry or
+    /// exit, `BusNow::entry_open` / `exit_open`); None for a bus they do not know.
+    pub(crate) fn bus_doors_open(&self, bus: BusId) -> Option<bool> {
+        self.last_buses.iter().find(|b| b.id == bus).map(|b| b.entry_open.iter().chain(&b.exit_open).any(|o| *o))
     }
 
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
