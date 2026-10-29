@@ -2839,10 +2839,22 @@ fn stroll_lacks(t: &StrollTarget, on_path: &HashMap<usize, usize>, on_way: &Hash
     (t.want - on as f32).max(0.0)
 }
 
+/// The strollers (at `positions`) that count against the target of the player at `center`: every
+/// one until they go (`stroller_goes`) - those within `STROLL_RADIUS`, and those who walked out
+/// of it and are kept because the player sees them (nobody vanishes in sight). Counted only within
+/// the radius, the ones past it let the placer put down as many again for as long as the player
+/// looks: Wuluju at 08:20 with the bus parked had some 1400 past the radius, every one in sight,
+/// and the count climbed past 900 s. Not those within another player's radius (`others`): they
+/// are kept for that player's sight and would hold this player's target for good.
+fn strollers_held(positions: impl Iterator<Item = DVec3>, center: DVec3, others: &[DVec3]) -> usize {
+    positions.filter(|p| (*p - center).length() < STROLL_RADIUS || others.iter().all(|c| (*p - *c).length() >= STROLL_RADIUS)).count()
+}
+
 /// What the places lack in all, and how many strollers may be put down now: no more than
 /// they lack, nor than the `target` (all the places want, within the setting and the pool)
-/// leaves over the `have` strollers within the radius - a place over its target and the
-/// strollers on pavements wanting nobody count against the total as before.
+/// leaves over the `have` strollers of the player (within the radius, and past it in their
+/// sight) - a place over its target and the strollers on pavements wanting nobody count against
+/// the total.
 fn stroll_room(targets: &[StrollTarget], on_path: &HashMap<usize, usize>, on_way: &HashMap<(usize, bool), usize>, target: usize, have: usize) -> (f32, usize) {
     let deficit: f32 = targets.iter().map(|t| stroll_lacks(t, on_path, on_way)).sum();
     (deficit, target.saturating_sub(have).min(deficit.ceil() as usize))
@@ -7786,13 +7798,9 @@ impl Humans {
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
         let limit = self.pedestrians.min((self.max_people + strolling).saturating_sub(self.pool_used()));
         let target = (wanted.round() as usize).min(limit);
-        // (around this player only: whoever walked off behind the bus no longer counts
-        // against the people wanted about it)
-        let have = self
-            .people
-            .iter()
-            .filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS)
-            .count();
+        // (every stroller of this player's counts against the target until they go,
+        // `strollers_held`)
+        let have = strollers_held(self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).map(|p| p.position), center, &self.lan_centers);
         let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
         let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap, mut rej_queue, mut rej_wall) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         if room > 0 && !targets.is_empty() {
@@ -13795,6 +13803,16 @@ mod ped_tests {
         let src = StrollTarget { toward: Some(true), want: 3.0, source: true, ..place(3) };
         let on_way: HashMap<(usize, bool), usize> = [((3, false), 5), ((3, true), 1)].into_iter().collect();
         assert_eq!(stroll_lacks(&src, &HashMap::new(), &on_way), 2.0);
+    }
+
+    #[test]
+    fn p3_1_every_stroller_kept_for_the_players_sight_counts_against_the_target() {
+        // within the radius, and past it (kept in sight: nobody vanishes in sight) both count;
+        // one within another player's radius does not (kept for that player)
+        let other = DVec3::new(1000.0, 0.0, 0.0);
+        let at = [DVec3::new(0.0, 50.0, 0.0), DVec3::new(0.0, STROLL_RADIUS + 300.0, 0.0), DVec3::new(1000.0, 50.0, 0.0)];
+        assert_eq!(strollers_held(at.iter().copied(), DVec3::ZERO, &[]), 3);
+        assert_eq!(strollers_held(at.iter().copied(), DVec3::ZERO, &[other]), 2);
     }
 
     #[test]
