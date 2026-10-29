@@ -825,7 +825,7 @@ fn person_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lane: usize, s: f
     let mut best: Option<f32> = None;
     for k in sim.people_near_in_box(me.pos, (reach + me.state.front) as f64, lo, hi) {
         let q = &sim.people[k];
-        if (q.pos.z - me.pos.z).abs() > 2.5 || q.pos.x < lo.x || q.pos.x > hi.x || q.pos.y < lo.y || q.pos.y > hi.y {
+        if (q.pos.z - me.pos.z).abs() > crate::perception::LEVEL_APART || q.pos.x < lo.x || q.pos.x > hi.x || q.pos.y < lo.y || q.pos.y > hi.y {
             continue;
         }
         let Some((qs, d)) = l.nearest_point(q.pos) else { continue };
@@ -1104,7 +1104,7 @@ fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         // out, its body in the car it passes)
         for &k in &people {
             let p = &sim.people[k];
-            if (p.pos.z - me.pos.z).abs() <= 2.5 && Obb::point(p.pos, PERSON_RADIUS as f64).separation(&b) < clearance {
+            if (p.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART && Obb::point(p.pos, PERSON_RADIUS as f64).separation(&b) < clearance {
                 return false;
             }
         }
@@ -1252,7 +1252,7 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         let (obstacle_len, _) = obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM);
         let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
         let parked = parked_boxes(net, sim, me, level + st.front);
-        let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+        let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
         if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All) {
             return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock, round: obstacle });
         }
@@ -1285,7 +1285,7 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         None => pre + out_len,
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
-    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
     body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, Bodies::Over { speed: v, others: lead.is_some() })
 }
 
@@ -1553,7 +1553,7 @@ fn rear_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicl
         if sim.players.iter().any(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0 && pl.obb(0.0, 0.0).separation(&b) < clearance) {
             return false;
         }
-        if people.iter().any(|&k| (sim.people[k].pos.z - me.pos.z).abs() <= 2.5 && Obb::point(sim.people[k].pos, PERSON_RADIUS as f64).separation(&b) < clearance) {
+        if people.iter().any(|&k| (sim.people[k].pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART && Obb::point(sim.people[k].pos, PERSON_RADIUS as f64).separation(&b) < clearance) {
             return false;
         }
         if x >= reach {
@@ -2773,7 +2773,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             let level = real + obstacle_len + st.front + st.rear + 2.0;
             let parked = parked_boxes(net, sim, me, level + st.front);
-            let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= 2.5).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+            let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
             body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level, Profile::Smooth { pre: 0.0 }, Bodies::All)
         };
         if pass_possible && ready && pass_swept() {

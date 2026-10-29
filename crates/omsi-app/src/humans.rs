@@ -2283,6 +2283,8 @@ struct SeenCar {
     yielding: bool,
     /// Seconds it has stood (under 0.5 m/s).
     stood: f32,
+    /// The height it stands at (m), for whose level it is at (`at_level`).
+    z: f64,
 }
 
 /// What the walk needs of the person (copied in and out of `Person`).
@@ -2384,8 +2386,14 @@ fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, cent
 /// Whether somebody at `p` may be taken away: out of the player's sight (`figure_in_sight`) and
 /// farther than `traffic::NEVER_VANISH_WITHIN` from every player (`center`, `others`), the distance
 /// within which no car vanishes seen or not (the mirrors, a turn of the head). The one rule for
-/// every removal of a person but a walker leaving at the edge of the ground (`at_edge`, the
-/// user's decision P-D2) and a stop's going with its tile (`Humans::tiles_changed`).
+/// every removal of a person the people make themselves but a walker leaving at the edge of the
+/// ground (`at_edge`, the user's decision P-D2) and a stop's going with its tile
+/// (`Humans::tiles_changed`, beyond the load radius). The user's, the developer tools' and the LAN
+/// session's own actions take people away with no sight test: a new time set
+/// (`reshuffle_waiting`), a bus the player removed (`evict_bus`), the developer tools' fake
+/// passengers (`clear_fake`), an avatar taken away (`avatar_remove`), waiters handed to a client's
+/// bus (`hand_over`), a client switching to the host's people (`set_mirror`) and a host's person
+/// gone (`mirror_remove`).
 fn goes_unseen(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
     !figure_in_sight(eye, viewer, center, p) && far_from(center, others, p, crate::traffic::NEVER_VANISH_WITHIN)
 }
@@ -2534,9 +2542,10 @@ impl DecideCtx<'_> {
         // not loaded) leaves there, in sight or not (the user's decision P-D2; SUMO: a person
         // arriving at the network's fringe leaves it): the edge of the ground is an exit of the
         // stroll network (`at_edge`, `PedNet::unloaded`). Never on the carriageway: somebody on a
-        // crossing walks it to its end first and leaves there
+        // crossing walks it to its end first and leaves there, anybody else on a street lane's
+        // surface walks on off it (`on_lane_surface`)
         let crossing_now = matches!(&p.state, State::Strolling(w) if w.cross.is_some_and(|c| c.on(w.leg)));
-        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !crossing_now && !world.has_ground(pos2.x, pos2.y) {
+        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !crossing_now && !world.has_ground(pos2.x, pos2.y) && !net.is_some_and(|n| on_lane_surface(n, p.position)) {
             d.gone = true;
             d.edge = true;
             return d;
@@ -2566,7 +2575,7 @@ impl DecideCtx<'_> {
                     }
                 }
                 // (at the edge of the ground they leave, in sight or not: `at_edge`)
-                if self.ped.is_some_and(|pn| at_edge(pn, walk)) {
+                if self.ped.is_some_and(|pn| at_edge(pn, net, walk)) {
                     d.gone = true;
                     d.edge = true;
                     return d;
@@ -2600,6 +2609,21 @@ impl DecideCtx<'_> {
                 }
                 d.gone = goes_unseen(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
                 d.kept = !d.gone;
+                // (kept, they stand outside every street lane's people strip: inside one - off a
+                // bus beside its door, at a bus's doors when their stop went out of range - they
+                // step to the nearest point clear of the strips, the waiting places' rule
+                // (`clear_of_lanes`, P11-1), so that no vehicle of a lane is held by them however
+                // long the player looks)
+                if let (true, Some(net)) = (d.kept, net) {
+                    if within_lanes(net, p.position, &strip_reach) {
+                        if let Some(to) = clear_of_lanes(net, p.position).filter(|q| !within_lanes(net, *q, &strip_reach)) {
+                            let way = (to - p.position).truncate();
+                            if way.length() > KERB_ARRIVE {
+                                d.want = Want { vel: way.normalize() * p.pace, face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+                            }
+                        }
+                    }
+                }
                 d
             }
             _ => d,
@@ -4039,13 +4063,15 @@ const TURNS_AT_A_WALL: &str = "a parked car over the path: turns round";
 const HURRIES_ON: &str = "caught by the change: on across";
 
 /// A street lane, or a vehicle, more than this (m) above or below a person or a footpath point
-/// is on another level (the cars' people test, `perception::people_ahead`: 2.5 m); one within it
-/// is at their level (`at_level`).
-const LEVEL_APART: f64 = 2.5;
+/// is on another level; one within it is at their level (`at_level`). The cars' own people tests
+/// use the same constant (`omsi_traffic::perception::LEVEL_APART`): both sides agree on who is at
+/// whose level.
+const LEVEL_APART: f64 = omsi_traffic::perception::LEVEL_APART;
 
 /// Whether a vehicle standing on the ground at height `vehicle_z` is at the level of somebody
 /// standing at `z` (`LEVEL_APART`): the walkers meet the boxes of the vehicles at their level
-/// only, as the cars stop for the people at theirs (`perception::people_ahead`). The map's
+/// only, and a kerb's verdict (`kerb_verdict`) reads the vehicles at the kerb's level only, as the
+/// cars stop for the people at theirs (`perception::people_ahead`). The map's
 /// footbridges and the footpaths drawn over cuttings and under bridges lie over the traffic in
 /// 2-D (BeijingCity's footbridge 2294485 at 6 m over Jiangzhaikou's lane 723; the footpaths
 /// 2104/2046 at 1.3 m over the cutting of lanes 1616-1633 at -3.8 m, and 1956-1959 at 1.3-1.4 m
@@ -4619,6 +4645,13 @@ fn loaded_point(d0: f32, d1: f32, stretches: &[(f32, f32)], u: f32) -> f32 {
     (at + left).min(d1)
 }
 
+/// Whether `q` lies on a street lane's drawn surface: within half its width (`LANE_MIN_WIDTH`
+/// at least) of its axis. Nobody leaves at the edge of the ground there (the user's decision P-D2:
+/// never in a lane).
+fn on_lane_surface(net: &Network, q: DVec3) -> bool {
+    within_lanes(net, q, &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5)
+}
+
 /// Whether a stroller on a pavement leg that runs onto unloaded ground (`PedNet::unloaded`) is at
 /// the edge of the ground, where they leave in sight or not (the user's decision P-D2; SUMO: a
 /// person arriving at the network's fringe leaves it, `DecideCtx::decide`): at the edge ahead of
@@ -4626,11 +4659,14 @@ fn loaded_point(d0: f32, d1: f32, stretches: &[(f32, f32)], u: f32) -> f32 {
 /// than `KERB_AT`), decided on that leg and where they are along it (`walk.s`). On the way back
 /// from a closed end (`from_wall`) the stretch they stand in is behind them. Never on a crossing:
 /// somebody on one walks it to its end (the light-change rule keeps applying) and leaves on the
-/// pavement beyond, so nobody leaves on the carriageway.
-fn at_edge(ped: &PedNet, walk: &PedWalk) -> bool {
+/// pavement beyond, so nobody leaves on the carriageway; nor anywhere on a street lane's drawn
+/// surface (`on_lane_surface`): a piece that runs over a loaded street just short of the edge and
+/// is not taken for a crossing (its lights on the unloaded tile) is walked on until they are off
+/// the surface.
+fn at_edge(ped: &PedNet, net: &Network, walk: &PedWalk) -> bool {
     let Some(&leg) = walk.legs.get(walk.leg) else { return false };
     let Some(stretches) = ped.unloaded.get(&leg.lane) else { return false };
-    if walk.cross.is_some_and(|c| c.on(walk.leg)) {
+    if walk.cross.is_some_and(|c| c.on(walk.leg)) || on_lane_surface(net, leg.at(net, walk.s).0) {
         return false;
     }
     let here = leg.dist(walk.s.min(leg.len()));
@@ -5081,7 +5117,7 @@ fn clear_of_lanes_by(net: &Network, q: DVec3, reach_of: &dyn Fn(&omsi_sim::traff
             let t = ((p - w[0]).truncate().dot(ab.truncate()) / ab.truncate().length_squared().max(1e-9)).clamp(0.0, 1.0);
             let c = w[0] + ab * t;
             let d = (c - p).truncate().length();
-            if (c.z - p.z).abs() < 2.5 && best.is_none_or(|b| d < b.1) {
+            if (c.z - p.z).abs() < LEVEL_APART && best.is_none_or(|b| d < b.1) {
                 best = Some((c, d));
             }
         }
@@ -5302,6 +5338,10 @@ fn nearest_off_carriageway(ped: &PedNet, net: &Network, at: DVec3, reach: f64) -
 fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, yields: &mut YieldBook, approach: f32, side: f32) -> Result<(), &'static str> {
     let net = at.net;
     let next = walk.legs[c.from];
+    // (only the vehicles at the kerb's level, `at_level`, as for the walkers' boxes: one on a
+    // bridge over the crossing or in a cutting under it never passes it)
+    let kerb_z = next.at(net, 0.0).0.z;
+    let cars = || at.cars.iter().filter(move |car| at_level(car.z, kerb_z));
     // (their way across is their stripe, `side` m right of the axis: the cuts and the way off
     // the kerb are where they will walk)
     let (_, _, right) = crossing_axis(net, walk, c);
@@ -5330,8 +5370,7 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     let way = (ahead - from).truncate().normalize_or_zero();
     let from = from + shift.extend(0.0);
     let occupied = || {
-        at.cars
-            .iter()
+        cars()
             // (the "abandoned car" exemption past the cap is for one that stands: a car that
             // stood 19 s on the cut and then crept 2.2 m at 0.4-0.7 m/s kept its clock past
             // the cap and people stepped on at a lit green)
@@ -5389,7 +5428,7 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     // cut (it is no longer `stands_at` then), 2 x PED_YIELD_MAX at most, under PED_YIELD_CAP
     let dense = at.streams.get(&c.key).map(|v| v.len() as f32 >= PED_DENSE_STREAM * c.total.max(1.0)).unwrap_or(false);
     let window = if dense { 2.0 * PED_YIELD_MAX } else { PED_YIELD_MAX };
-    for car in at.cars {
+    for car in cars() {
         if car.vel.length() >= 0.5 || car.stood <= PED_YIELD_AFTER || !stands_at(car, &cuts) {
             continue;
         }
@@ -5443,14 +5482,14 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     // they step round it); one beside the way, or the player's bus with its nose short of
     // it, does not hold (nine walkers were held 5 s each 1-1.5 m from the nose of a
     // standing bus)
-    for car in at.cars {
+    for car in cars() {
         let speed = car.vel.length();
         if speed >= 0.5 && !car.yielding && covers_path(&car.body, from.truncate(), way, 1.5) {
             return Err(STANDS_ON);
         }
     }
     for x in &cuts {
-        for car in at.cars {
+        for car in cars() {
             // a car stopping for people stops: when the car yields,
             // the pedestrian passes (a child and a taxi stood for each other for minutes,
             // the child waiting for the taxi's creep, the taxi for the child)
@@ -6105,8 +6144,9 @@ pub struct Humans {
     stop_carry: HashMap<i64, StopCarry>,
     /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
     /// could see then (`figure_in_sight`; every removal rule of the people's own asks for out of
-    /// sight, `goes_unseen`, so none but a stop's going with its tile, `tiles_changed`; those who
-    /// leave at the edge of the ground are counted apart, `edge_departures`).
+    /// sight, `goes_unseen`, so none but a stop's going with its tile, `tiles_changed`, and the
+    /// user's and LAN actions `goes_unseen` names; those who leave at the edge of the ground are
+    /// counted apart, `edge_departures`).
     removed: (usize, usize),
     /// Counted for the gate (`summary`): the people whose removal was held back at least once
     /// because the player could see it or they were within `traffic::NEVER_VANISH_WITHIN`
@@ -6573,9 +6613,13 @@ impl Humans {
 
     /// May somebody be put down at `p` without the player seeing it: out of the player's
     /// sight (`seen`), or far enough off that a figure is a few pixels (over
-    /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (a ray from the eye to the person's
-    /// head blocked by a collision box, as the traffic asks for its cars; not within 25 m of
-    /// the eye). The one rule for every placement of a person: strollers (`populate_on_foot`)
+    /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (the rays from the eye to the person's
+    /// head and to either side of it a bounding sphere's radius across the line of sight
+    /// (`FIGURE_RADIUS`) all blocked by collision boxes, as the traffic asks for its cars; not
+    /// within 25 m of the eye): the whole figure hidden, as the view cone takes the whole bounding
+    /// sphere (`figure_view`) - with the head's ray alone a figure grazing a corner is hidden, and
+    /// one step later in plain view (Wuluju moving, #1359 at 104 m: in sight the frame it was put
+    /// down, where a step cannot cross the cone's sphere margin). The one rule for every placement of a person: strollers (`populate_on_foot`)
     /// and the waiters at the stops (`waiting_place`). Not used by the riders put on the seats
     /// of the player's bus, the LAN players' avatars, or the debug crossing knob
     /// (`OMSI_PAX_CROSS`). A building hides people because
@@ -6592,7 +6636,10 @@ impl Humans {
         if d < 25.0 {
             return false;
         }
-        world.collision.lock().ray_blocker(e.pos, p + DVec3::Z * 1.2, 2.5, 2.5).is_some()
+        let head = p + DVec3::Z * 1.2;
+        let across = (head - e.pos).truncate().perp().normalize_or_zero().extend(0.0) * FIGURE_RADIUS;
+        let boxes = world.collision.lock();
+        [head, head + across, head - across].iter().all(|&q| boxes.ray_blocker(e.pos, q, 2.5, 2.5).is_some())
     }
 
     /// Where somebody standing at `p` is for the player's eye by the people's own test
@@ -9591,6 +9638,7 @@ impl Humans {
                     body,
                     yielding: yields_to_people(c.ai.last.why),
                     stood: 0.0,
+                    z: c.vehicle.position.z,
                 });
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
                     blocks.push(body);
@@ -9617,11 +9665,11 @@ impl Humans {
         if let Some(pb) = bus_ix.get(&BusId::Player).map(|&i| &buses[i]) {
             let bodies = pb.blocks();
             let first = cars.len();
-            cars.push(SeenCar { id: PLAYER_CAR, pos: pb.pos.truncate(), vel: pb.fwd() * pb.speed, half_len: pb.half.y, body: bodies[0], yielding: false, stood: 0.0 });
+            cars.push(SeenCar { id: PLAYER_CAR, pos: pb.pos.truncate(), vel: pb.fwd() * pb.speed, half_len: pb.half.y, body: bodies[0], yielding: false, stood: 0.0, z: pb.pos.z });
             for (k, t) in pb.trailers.iter().enumerate() {
                 let h = t.heading.to_radians();
                 let body = bodies.get(k + 1).copied().unwrap_or(bodies[0]);
-                cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0 });
+                cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0, z: pb.pos.z });
             }
             block_car.extend((0..bodies.len()).map(|k| Some((first + k).min(cars.len() - 1))));
             block_z.extend(std::iter::repeat_n(pb.pos.z, bodies.len()));
@@ -12899,7 +12947,7 @@ mod ped_tests {
     fn l1_a_car_coming_holds_them_at_an_unlit_crossing_of_metre_pieces() {
         let moving = |x: f64| {
             let body = Block { center: DVec2::new(x, -1.75), half: DVec2::new(0.9, 2.25), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::new(12.0, 0.0) };
-            SeenCar { id: 3, pos: body.center, vel: body.vel, half_len: 2.25, body, yielding: false, stood: 0.0 }
+            SeenCar { id: 3, pos: body.center, vel: body.vel, half_len: 2.25, body, yielding: false, stood: 0.0, z: 0.0 }
         };
         // 30 m away at 12 m/s: they wait for it to pass, and go once it has
         let (went, car_x, said) = unlit_with_car(moving(-30.0));
@@ -13988,7 +14036,7 @@ mod ped_tests {
         assert_eq!(kerb_with(car), Some("go"));
         // the player's bus standing with its nose 1 m short of the way off the kerb: no hold
         let bus = Block { center: DVec2::new(-7.25, -4.6), half: DVec2::new(1.25, 6.0), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
-        let player = SeenCar { id: PLAYER_CAR, pos: bus.center, vel: DVec2::ZERO, half_len: 6.0, body: bus, yielding: false, stood: 30.0 };
+        let player = SeenCar { id: PLAYER_CAR, pos: bus.center, vel: DVec2::ZERO, half_len: 6.0, body: bus, yielding: false, stood: 30.0, z: 0.0 };
         assert_eq!(kerb_with(player), Some("go"));
         // with its nose over the way it holds them while it has stood under PED_OCCUPIED_CAP;
         // one standing longer is stepped round at once
@@ -14094,7 +14142,7 @@ mod ped_tests {
     /// A car standing in lane 0 with its front 2.75 m before the crossing of `crossing`.
     pub(super) fn car_before(stood: f32) -> SeenCar {
         let body = Block { center: DVec2::new(-5.0, -1.75), half: DVec2::new(0.9, 2.25), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
-        SeenCar { id: 7, pos: body.center, vel: DVec2::ZERO, half_len: 2.25, body, yielding: true, stood }
+        SeenCar { id: 7, pos: body.center, vel: DVec2::ZERO, half_len: 2.25, body, yielding: true, stood, z: 0.0 }
     }
 
     /// Somebody arriving at the kerb with another person just ahead of them on the crossing
@@ -14776,7 +14824,7 @@ mod ped_tests {
         // walker 10 s at most, then they squeeze on at jamfactor x pace; a car standing for
         // anything else, or not yet 10 s, is waited for as a parked one
         let body = car_box(5.0, 0.0);
-        let car = |yielding: bool, stood: f32| SeenCar { id: 9, pos: body.center, vel: DVec2::ZERO, half_len: 2.3, body, yielding, stood };
+        let car = |yielding: bool, stood: f32| SeenCar { id: 9, pos: body.center, vel: DVec2::ZERO, half_len: 2.3, body, yielding, stood, z: 0.0 };
         let track = walk_past(DVec2::new(-5.0, 0.0), &[body], &[Some(0)], &[car(true, 12.0)], 400);
         let at = |t: f64| track[(t * 10.0) as usize - 1];
         assert!(at(9.5).x < 5.0 - 2.3, "on before ten seconds of their own: {:?}", at(9.5));
@@ -15802,7 +15850,7 @@ mod ped_tests {
             let mut walk = PedWalk::new(vec![Leg { lane: 1, a, b }], true, 0.0);
             walk.s = s;
             walk.from_wall = from_wall;
-            at_edge(&ped, &walk)
+            at_edge(&ped, &net, &walk)
         };
         assert!(!at(0.0, 20.0, 9.0, false), "a metre short of it");
         assert!(at(0.0, 20.0, 9.8, false));
@@ -15835,7 +15883,7 @@ mod ped_tests {
         walk.leg = 1;
         let t = (0..=40).map(|k| k as f32 * 0.5).find(|&s| {
             walk.s = s;
-            at_edge(&ped, &walk)
+            at_edge(&ped, &net, &walk)
         });
         let t = t.expect("at the edge");
         assert!((10.0 - KERB_AT..=10.0).contains(&t), "{t}");
@@ -15868,6 +15916,29 @@ mod ped_tests {
     }
 
     #[test]
+    fn p3_4_nobody_leaves_at_the_edge_on_a_street_lanes_surface() {
+        // a path laid along a street lane, 0.5 m off its axis (not a crossing: it cuts no lane),
+        // onto unloaded ground at x 10: where the street is drawn up to the edge they walk on off
+        // its surface; where it ended before, they leave at the edge point
+        let net_with = |street_to: f64| {
+            let mut net = Network::default();
+            net.lanes.push(lane(vec![p(-50.0, 0.0), p(street_to, 0.0)], LaneKind::Street, 3.0));
+            net.lanes.push(lane(vec![p(0.0, 0.5), p(20.0, 0.5)], LaneKind::Sidewalk, 2.0));
+            net.link(1.5);
+            net.build_grid();
+            net
+        };
+        for (street_to, leaves) in [(50.0, false), (5.0, true)] {
+            let net = net_with(street_to);
+            let mut ped = PedNet::build(&net);
+            ped.mark_unloaded(&net, 1, 10.0, &|x: f64, _y: f64| x < 10.0);
+            let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 0.0, b: 20.0 }], true, 0.0);
+            walk.s = 9.9;
+            assert_eq!(at_edge(&ped, &net, &walk), leaves, "street to {street_to}");
+        }
+    }
+
+    #[test]
     fn p11_4_somebody_on_a_crossing_reaching_unloaded_ground_walks_it_to_its_end() {
         // the crossing piece (path 0) runs onto the unloaded tile at x 10: no turn on it
         let mut net = Network::default();
@@ -15880,7 +15951,7 @@ mod ped_tests {
         walk.cross = Some(Cross { from: 0, to: 0, total: 20.0, lead: 0.0, span: 20.0, light: Some((0, 0)), back: false, caught: false, kerb: None, key: 0, stripe: Some(0.0) });
         for s in [9.8, 10.3, 12.0] {
             walk.s = s;
-            assert!(!at_edge(&ped, &walk));
+            assert!(!at_edge(&ped, &net, &walk));
         }
     }
 
