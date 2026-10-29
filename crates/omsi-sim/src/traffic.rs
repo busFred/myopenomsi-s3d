@@ -3880,6 +3880,17 @@ impl AiState {
         AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
+    /// A random car woken after a time out of range (the game's dormant cars): it leaves the
+    /// trip end and route field of before and throws its dice anew, `dice` being the car's own
+    /// from its time asleep, so its next fork draws a trip end again from where it is
+    /// (`goal_way`) and not the one its seed gave at the first fork (SUMO: a vehicle re-entering
+    /// the simulation is routed from its current edge).
+    pub fn wake(&mut self, dice: u64) {
+        self.goal = None;
+        self.goal_field = None;
+        self.rng = dice | 1;
+    }
+
     fn rand(&mut self) -> u64 {
         let mut x = self.rng;
         x ^= x >> 12;
@@ -6004,6 +6015,27 @@ mod tests {
         // onto R2 again by a lane change: no link entry
         assert_eq!(at(&mut m, &mut car, 2, 190.0, false), None);
         assert_eq!((m.entries, m.vehicles.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_woken_car_draws_its_trip_end_again_from_where_it_is() {
+        // a car holding a trip end behind it, woken: the old end and field are gone and the next
+        // fork draws a reachable end by the dice it woke with, not the seed's: over several
+        // dice, more than one end is drawn, each one a trip end reachable forward
+        let net = four_arm_ring();
+        let mut ends = std::collections::BTreeSet::new();
+        for dice in 1..40u64 {
+            let mut car = AiState::new(4, 0.0, 5);
+            car.goal = Some(11);
+            car.goal_field = Some(net.goal_field(car.goal_key(&net, 11, GoalAccess::Open), |n| car.routable(&net, n, GoalAccess::Open), car.route_cost(&net)));
+            car.wake(dice);
+            assert!(car.goal.is_none() && car.goal_field.is_none());
+            car.plan_next(&net);
+            let g = car.goal.expect("a trip end drawn at the fork");
+            assert!((8..12).contains(&g), "{g}");
+            ends.insert(g);
+        }
+        assert!(ends.len() > 1, "{ends:?}");
     }
 
     #[test]
