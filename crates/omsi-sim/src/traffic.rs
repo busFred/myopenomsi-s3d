@@ -4578,6 +4578,16 @@ impl AiState {
         self.way_point_on(net, &self.seq(), change.as_ref(), d, &mut [Tangents::default(); 2])
     }
 
+    /// The heading (deg) of the car's lanes `d` metres ahead of it (behind for negative `d`),
+    /// along its lane sequence: the way's heading without the lane change and the sideways
+    /// moves (a bay, a pull-out, a pass). The body takes the bend of its lane from it
+    /// (`ai_motion::AiBody::step_in_lane`): the turn between two of these headings is the
+    /// lane's own, also where the plan goes on in a lane beside (a lane change ahead), whose
+    /// start lies a lane's width over but runs the same way.
+    pub fn lane_heading(&self, net: &Network, d: f32) -> f32 {
+        self.seq().heading(net, self.s, d)
+    }
+
     /// `way_point` at each of `ds`: the same points, the lane sequences built once and the
     /// tangents of a lane segment kept while the points fall in it (the perception samples
     /// a hundred metres of way for every car each frame).

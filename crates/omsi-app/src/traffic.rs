@@ -1391,7 +1391,10 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
 }
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
-/// vehicle posed on it.
+/// vehicle posed on it. A road vehicle drives the careful driver's line in bends with the
+/// traffic's extent of it (`AiBody::keep_swept_in_lane`: its front bumper `state.front`,
+/// its half width from `extents`), the bend taken from its lane's heading
+/// (`AiState::lane_heading`).
 fn place_body(
     net: &Network,
     state: &AiState,
@@ -1399,10 +1402,12 @@ fn place_body(
     kind: MotionKind,
 ) -> AiBody {
     let mut body = AiBody::new(&vehicle.ty.def, kind);
+    body.keep_swept_in_lane(state.front, extents(&vehicle.ty, state.length).2);
     let ground = vehicle.ground.clone();
     let contact = vehicle.contact.clone();
-    body.place(
+    body.place_in_lane(
         &|d| state.way_point(net, d),
+        Some(&|d| state.lane_heading(net, d)),
         ground
             .as_ref()
             .map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
@@ -4414,10 +4419,12 @@ impl Traffic {
                 }
                 let trail = &*trail;
                 let behind = |d: f64| rail_behind(trail, state, net, d);
-                body.step(
+                let lane = |d: f32| state.lane_heading(net, d);
+                body.step_in_lane(
                     dt,
                     state.speed,
                     &|d| if rail && d < 0.0 { behind(-d as f64) } else { state.way_point(net, d) },
+                    (!rail).then_some(&lane as &dyn Fn(f32) -> f32),
                     ground.as_ref().map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
                     contact.as_deref(),
                 );
@@ -5955,7 +5962,8 @@ impl Traffic {
         state.front = front;
         state.rear = rear;
         state.length = front + rear;
-        let body = AiBody::new(&ty.def, MotionKind::Road);
+        let mut body = AiBody::new(&ty.def, MotionKind::Road);
+        body.keep_swept_in_lane(front, half_width);
         let mut ai = AiVehicle::new(id, if scheduled { VehicleClass::ScheduledBus } else { VehicleClass::Car }, state, half_width, id);
         ai.fresh = 0.0;
         self.cars.push(AiCar {

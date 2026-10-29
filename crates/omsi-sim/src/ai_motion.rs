@@ -9,6 +9,10 @@
 //! wheels slid sideways through every bend, and a lane change was a sideways glide with a
 //! made-up yaw. Here the heading only ever changes by speed × tan(steering) / wheelbase,
 //! the rear axle never moves sideways, and the steering itself is rate limited.
+//!
+//! In a bend of its lane an AI road vehicle drives the careful driver's line
+//! (`careful_line_offset`): its rear axle runs inside the way by as much as centres its swept
+//! body on it, so the front no longer swings out over the next lane.
 
 use crate::vehicle::VehicleInstance;
 use glam::{DVec2, DVec3, Vec3};
@@ -35,6 +39,22 @@ pub fn rotation_point(def: &Vehicle) -> (f32, f32) {
     // a rotation point at (or in front of) the front axle is a file without one
     let rot = if def.axles.len() >= 2 && def.rot_pnt_long < front - 0.5 { def.rot_pnt_long } else { rear };
     (rot, (front - rot).max(0.8))
+}
+
+/// How far inside the centre line of a bend of curvature `k` (1/m, signed) the rotation
+/// point of a road vehicle runs (m, same sign as `k`): the careful driver's line. `reach`
+/// is the distance from the rotation point to the front bumper (the wheelbase and the
+/// front overhang), `half_width` half the body's width. With the rotation point on a
+/// circle of radius r the body sweeps the band from r - half_width (the inner side abreast
+/// of the rear axle) to √((r + half_width)² + reach²) (the outer front corner); centring
+/// that band on the bend's radius R gives r = R - reach² / (4 (R + half_width)), so the
+/// offset is reach² · k / (4 (1 + half_width · |k|)), and 0 on a straight.
+/// Why: a real vehicle off-tracks - in a bend its rear wheels run inside its front ones -
+/// and a careful driver holds the front out so that the whole swept path stays in the
+/// lane; SUMO keeps a vehicle's lateral extent within its lane and models no swing-out,
+/// which is the lane the traffic simulation reasons about (its rigid box on the way).
+pub fn careful_line_offset(k: f32, reach: f32, half_width: f32) -> f32 {
+    reach * reach * k / (4.0 * (1.0 + half_width * k.abs()))
 }
 
 /// Clearance a vehicle pulling out keeps from the corner of what it goes round (m).
@@ -156,6 +176,9 @@ pub struct AiBody {
     wheelbase: f32,
     front_long: f32,
     rear_long: f32,
+    /// The body for the careful driver's line (`keep_swept_in_lane`): rotation point to
+    /// front bumper and half the width (m); None drives the rotation point on the way.
+    swept: Option<(f32, f32)>,
     /// Largest front wheel angle (deg) and how fast the driver turns towards it (deg/s).
     max_steer: f32,
     steer_rate: f32,
@@ -277,6 +300,7 @@ impl AiBody {
             wheelbase,
             front_long,
             rear_long,
+            swept: None,
             max_steer,
             steer_rate: if heavy { 25.0 } else { 40.0 },
             wheels,
@@ -311,20 +335,43 @@ impl AiBody {
         }
     }
 
+    /// Drive the careful driver's line in bends (`careful_line_offset`): `front` is the
+    /// distance from the vehicle's origin to its front bumper, `half_width` half the body's
+    /// width (the traffic's extent of the type). For AI road vehicles; a body without it
+    /// keeps its rotation point on the way.
+    pub fn keep_swept_in_lane(&mut self, front: f32, half_width: f32) {
+        if self.kind == MotionKind::Road {
+            self.swept = Some(((front - self.rot_long).max(0.0), half_width.max(0.0)));
+        }
+    }
+
     /// Put the body onto its way, standing still and straight. `way(d)` is the point `d`
     /// metres along the way from the vehicle's origin.
     pub fn place(&mut self, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>, speed: f32) {
+        self.place_in_lane(way, None, ground, contact, speed);
+    }
+
+    /// `place`, with the heading of the vehicle's lane (see `step_in_lane`).
+    pub fn place_in_lane(&mut self, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>, speed: f32) {
         self.started = false;
         self.ground = None;
         self.contact_z.clear();
         self.last_speed = speed;
-        self.step(0.0, speed, way, ground, contact);
+        self.step_in_lane(0.0, speed, way, lane, ground, contact);
     }
 
     /// Follow the way for `dt` seconds at `speed` (m/s, the planner's speed).
     /// `contact`: what the wheels stand on (the faces under a height, as the player's wheels
     /// ask it); without it the plain height sampler `ground`.
     pub fn step(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>) {
+        self.step_in_lane(dt, speed, way, None, ground, contact);
+    }
+
+    /// `step`, with `lane(d)` the heading (deg) of the vehicle's lanes `d` metres along (the
+    /// way's without its lane change and its sideways moves, `AiState::lane_heading`): the
+    /// careful driver's line takes the bend from the lane, so a pull-out's or a lane change's
+    /// S-curve keeps the rotation point on the way. Without it the bend is the way's own.
+    pub fn step_in_lane(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>) {
         if dt > 0.0 {
             let a = (speed - self.last_speed) / dt;
             self.a_long += (a - self.a_long) * (dt / 0.15).min(1.0);
@@ -332,7 +379,7 @@ impl AiBody {
         self.last_speed = speed;
         match self.kind {
             MotionKind::Road => {
-                self.drive(dt, speed, way);
+                self.drive(dt, speed, way, lane);
                 self.settle(dt, way, ground, contact);
             }
             MotionKind::Rail => self.ride(way),
@@ -340,14 +387,45 @@ impl AiBody {
         }
     }
 
-    /// Bicycle model: the rotation point follows the way, the front wheels steer towards a
+    /// Bicycle model: the rotation point follows its line, the front wheels steer towards a
     /// point further along it (pure pursuit, looking further ahead the faster the car goes).
-    fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3) {
-        let target = way(self.rot_long).truncate();
+    /// The line is the way, moved inside a bend of the lane (`lane`, else the way) by
+    /// `careful_line_offset` where the body is given (`keep_swept_in_lane`).
+    fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>) {
+        let look = (1.2 * self.wheelbase).max(3.5) + 0.6 * speed.min(20.0);
+        // The way's points the steering looks at: the rotation point's, half way to the aim
+        // and the aim. The turn between the two chords says how tight the way bends over the
+        // look-ahead (a circle through the three points has curvature 2·turn/look; + = left).
+        let (a, b, c) = (way(self.rot_long).truncate(), way(self.rot_long + 0.5 * look).truncate(), way(self.rot_long + look).truncate());
+        let (u, w) = (b - a, c - b);
+        let turn_signed = (u.x * w.y - u.y * w.x).atan2(u.dot(w));
+        let turn = turn_signed.abs() as f32;
+        let bend_k = if look > 0.1 { 2.0 * turn / look } else { 0.0 };
+        // The careful driver's line: the rotation point and the aim both moved inside the
+        // bend by the offset that centres the swept body on the way, square to the way's
+        // tangent there (on that circle the tangent at the first point is the first chord
+        // turned back by half the turn, at the aim the second chord turned on by half). The
+        // bend is the lane's: its heading's turn from the rotation point to the aim over the
+        // look-ahead (the same mean curvature; + = left, headings turn clockwise).
+        let side = match self.swept {
+            Some((reach, half_width)) if look > 0.1 => {
+                let k = match lane {
+                    Some(l) => -(((l(self.rot_long + look) - l(self.rot_long)) as f64 + 180.0).rem_euclid(360.0) - 180.0).to_radians() as f32 / look,
+                    None => 2.0 * turn_signed as f32 / look,
+                };
+                careful_line_offset(k, reach, half_width) as f64
+            }
+            _ => 0.0,
+        };
+        let inside = |chord: DVec2, by: f64| {
+            let t = DVec2::from_angle(by).rotate(chord.normalize_or_zero());
+            DVec2::new(-t.y, t.x) * side
+        };
+        let (target, aim) = if side != 0.0 { (a + inside(u, -0.5 * turn_signed), c + inside(w, 0.5 * turn_signed)) } else { (a, c) };
         if !self.started || (target - self.rear).length() > 8.0 {
-            // spawned, or put somewhere else: stand on the way, straight
+            // spawned, or put somewhere else: stand on the line, straight along the way
             let ahead = way(self.rot_long + 2.0).truncate();
-            let d = ahead - target;
+            let d = ahead - a;
             self.heading = if d.length() > 1e-3 { d.x.atan2(d.y).to_degrees() } else { self.heading };
             self.rear = target;
             self.steer = 0.0;
@@ -367,8 +445,7 @@ impl AiBody {
         } else {
             (speed + 1.5 * along).clamp(0.0, speed + 3.0)
         };
-        let look = (1.2 * self.wheelbase).max(3.5) + 0.6 * speed.min(20.0);
-        let g = way(self.rot_long + look).truncate() - self.rear;
+        let g = aim - self.rear;
         let alpha = (g.dot(right) as f32).atan2(g.dot(fwd) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
         let reach = (g.length() as f32).max(1.0);
         // The way itself says how tight it bends here: a junction's turn laid tighter than
@@ -376,10 +453,6 @@ impl AiBody {
         // model's lock the car ran wide of it, through the kerb, the corner house and the
         // people on the pavement (#249; OMSI's AI keeps to its path). The lock the bend
         // needs, and a little more, is allowed, and the wheel may turn that much faster.
-        let (a, b, c) = (way(self.rot_long).truncate(), way(self.rot_long + 0.5 * look).truncate(), way(self.rot_long + look).truncate());
-        let (u, w) = (b - a, c - b);
-        let turn = (u.x * w.y - u.y * w.x).atan2(u.dot(w)).abs() as f32;
-        let bend_k = if look > 0.1 { 2.0 * turn / look } else { 0.0 };
         let need = (bend_k * self.wheelbase).atan().to_degrees() * 1.15;
         let limit = if std::env::var_os("OMSI_AI_MODEL_LOCK").is_some() { self.max_steer } else { self.max_steer.max(need.min(60.0)) };
         // OMSI_DEBUG_AI_WIDE: every tenth of a second a car stands over 1.5 m beside its way
@@ -617,7 +690,7 @@ impl AiBody {
         let mut best = gap(&body);
         if v < 0.05 {
             for _ in 0..(wait / dt).round() as usize {
-                body.drive(dt, 0.0, way);
+                body.drive(dt, 0.0, way, None);
             }
         }
         // (at most a minute of simulated time: a car that cannot move is not getting past)
@@ -629,7 +702,7 @@ impl AiBody {
             let ds = v * dt;
             x += ds;
             let at = x;
-            body.drive(dt, v, &|d| way(at + d));
+            body.drive(dt, v, &|d| way(at + d), None);
             best = best.min(gap(&body));
         }
         best
@@ -719,6 +792,111 @@ mod tests {
         assert!(body.heading > 60.0 && body.heading < 300.0, "heading {}", body.heading);
         assert!(worst_jump < 3.0, "yaw rate jumps by {worst_jump} deg/s in one frame");
         assert!(worst_off < 0.6, "rear axle {worst_off} m off the way");
+    }
+
+    /// A BJ6123, the 12 m two-axle bus of BeijingCity (`Vehicles/BJ6180_BJC/6123.bus`): its
+    /// axles and rotation point, and from its `[boundingbox]` (2.55 wide, 12.112 long, 0.478
+    /// ahead) its front bumper 6.534 m ahead of the origin and its half width.
+    fn bj6123() -> (Vehicle, f32, f32, f32) {
+        let mut v = Vehicle { mass: 10.0, moment_of_inertia: [361.6, 89.6, 341.5], cog_height: 1.0, rot_pnt_long: -2.87237, inv_min_turn_radius: 0.195, ..Default::default() };
+        v.axles = vec![Axle { long: 2.928, max_width: 2.37, spring: 300.0, damper: 20.0, wheel_diameter: 1.054, ..Default::default() }, Axle { long: -2.87237, max_width: 2.434, spring: 400.0, damper: 25.0, wheel_diameter: 1.054, ..Default::default() }];
+        (v, 12.112 * 0.5 + 0.478, 12.112 * 0.5 - 0.478, 2.55 * 0.5)
+    }
+
+    /// A Golf with the traffic's extent of a car (front, rear, half width).
+    fn golf_body() -> (Vehicle, f32, f32, f32) {
+        (golf(), 2.1, 2.2, 0.85)
+    }
+
+    /// Drive `body` round the bend of `bend(r, _)` at `speed` and return, once it is well
+    /// into the circle, how far its body leaves a lane `lane_width` wide centred on the
+    /// way: (outward, inward), the most of each over half a circle (m, + = outside the
+    /// lane's edge). The body is sampled at its four corners and at its sides abreast of
+    /// the rotation point (where the inner side comes nearest the centre).
+    fn swept_outside(body: &mut AiBody, (front, rear, half): (f32, f32, f32), r: f64, speed: f32, lane_width: f64) -> (f64, f64) {
+        let dt = 1.0 / 30.0;
+        let mut s = 30.0f64;
+        // the lane's heading along the bend (deg, clockwise: a right turn)
+        let heading = |x: f64| if x < 50.0 { 0.0 } else { ((x - 50.0) / r).to_degrees() as f32 };
+        body.place_in_lane(&|d| bend(r, s + d as f64), Some(&|d| heading(s + d as f64)), None, None, speed);
+        let centre = DVec2::new(r, 50.0);
+        let (mut out, mut inn) = (f64::MIN, f64::MIN);
+        let into = 50.0 + r * 1.5 * std::f64::consts::PI;
+        while s < into + r * std::f64::consts::PI {
+            s += (speed * dt) as f64;
+            let at = s;
+            body.step_in_lane(dt, speed, &|d| bend(r, at + d as f64), Some(&|d| heading(at + d as f64)), None, None);
+            if s < into {
+                continue;
+            }
+            let fwd = dir(body.heading);
+            let right = DVec2::new(fwd.y, -fwd.x);
+            let o = body.position.truncate();
+            for (long, lat) in [(front, half), (front, -half), (-rear, half), (-rear, -half), (body.rot_long, half), (body.rot_long, -half)] {
+                let p = o + fwd * long as f64 + right * lat as f64;
+                let radius = (p - centre).length();
+                out = out.max(radius - (r + lane_width * 0.5));
+                inn = inn.max((r - lane_width * 0.5) - radius);
+            }
+        }
+        (out, inn)
+    }
+
+    /// The careful driver's line: a 12 m bus and a car in steady bends of 25, 40 and 80 m.
+    /// Before (the rotation point on the way) the outer front corner swings out over the lane's
+    /// edge (the bus 0.6 m at 40 m); with the line the swept band is centred on the way, its
+    /// excess over the lane shared equally by both sides, never more than before on either.
+    #[test]
+    fn the_swept_body_is_centred_on_its_lane_in_a_bend() {
+        let lane = 3.5;
+        for (name, (def, front, rear, half)) in [("BJ6123", bj6123()), ("car", golf_body())] {
+            for (r, speed) in [(25.0f64, 5.0f32), (40.0, 7.0), (80.0, 10.0)] {
+                let mut before = AiBody::new(&def, MotionKind::Road);
+                let (out0, in0) = swept_outside(&mut before, (front, rear, half), r, speed, lane);
+                let mut after = AiBody::new(&def, MotionKind::Road);
+                after.keep_swept_in_lane(front, half);
+                let (out1, in1) = swept_outside(&mut after, (front, rear, half), r, speed, lane);
+                // the band of the geometry: inner side at r_r - half, outer front corner
+                let reach = (front - after.rot_long) as f64;
+                let rr = r - careful_line_offset(1.0 / r as f32, reach as f32, half) as f64;
+                let excess = ((rr + half as f64).hypot(reach) - (rr - half as f64) - lane) * 0.5;
+                eprintln!("{name} R {r}: before out {out0:.3} in {in0:.3}, after out {out1:.3} in {in1:.3}, band excess {excess:.3}");
+                assert!((out1 - in1).abs() < 0.05, "{name} R {r}: after out {out1:.3} in {in1:.3}");
+                assert!((out1 - excess).abs() < 0.05 && (in1 - excess).abs() < 0.05, "{name} R {r}: after out {out1:.3} in {in1:.3}, band {excess:.3}");
+                assert!(out1.max(in1) <= out0.max(in0) + 1e-3, "{name} R {r}: after {:.3} before {:.3}", out1.max(in1), out0.max(in0));
+            }
+        }
+        // the bus at 40 m: the swung-out front of the rotation point on the way
+        let (def, front, rear, half) = bj6123();
+        let (out0, _) = swept_outside(&mut AiBody::new(&def, MotionKind::Road), (front, rear, half), 40.0, 7.0, lane);
+        assert!(out0 > 0.5, "front {out0:.3} m out");
+    }
+
+    /// On a straight lane the careful driver's line is the way: the pose is the same, bit
+    /// for bit, as a body driven on the way - on a straight way, and on a pull-out's S-curve
+    /// (round a bus standing ahead) laid on a straight lane, whose bend is not the lane's.
+    #[test]
+    fn on_a_straight_lane_the_line_is_the_way() {
+        let (def, front, _, half) = bj6123();
+        let straight = |d: f32| DVec3::new(0.0, d as f64, 0.0);
+        let north = |_d: f32| 0.0f32;
+        let pull_out = straight_pull_out(3.3, 12.0);
+        for way in [&straight as &dyn Fn(f32) -> DVec3, &pull_out] {
+            let mut plain = AiBody::new(&def, MotionKind::Road);
+            let mut line = AiBody::new(&def, MotionKind::Road);
+            line.keep_swept_in_lane(front, half);
+            plain.place(way, None, None, 0.0);
+            line.place_in_lane(way, Some(&north), None, None, 0.0);
+            let (mut s, mut v) = (0.0f32, 0.0f32);
+            for _ in 0..600 {
+                v = (v + 0.05).min(12.0);
+                s += v / 30.0;
+                let at = s;
+                plain.step(1.0 / 30.0, v, &|d| way(at + d), None, None);
+                line.step_in_lane(1.0 / 30.0, v, &|d| way(at + d), Some(&north), None, None);
+                assert_eq!((plain.position, plain.heading, plain.steer), (line.position, line.heading, line.steer));
+            }
+        }
     }
 
     #[test]
