@@ -2288,21 +2288,53 @@ fn past_sight(viewer: Option<&crate::traffic::Viewer>, dist: f64) -> bool {
     }
 }
 
-/// Whether the player could see a figure standing at `p`: in the view cone (`Eye`) and not past
-/// their sight (`past_sight`); with no eye, within `traffic::NEVER_VANISH_WITHIN` of `center` (the
-/// traffic's reach of the mirrors and a turn of the head, where no car appears or vanishes seen or
-/// not). The one measure for everything about people the player may see: who appears
-/// (`may_appear`), who is taken away (`stroller_goes`, the pool, standing people), where the density
-/// is wanted (`in_sight_reach`, with a head turn).
-fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
+/// Where a figure standing at `p` is for the player's eye (`figure_view`), and with
+/// `Humans::figure_sight` whether the people's rule for putting somebody down (`may_appear`)
+/// lets them be there in the view cone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FigureSight {
+    /// Out of the view cone (with no eye: farther than `traffic::NEVER_VANISH_WITHIN`).
+    Out,
+    /// In the cone past the player's sight (`past_sight`).
+    Beyond,
+    /// In sight, behind a building (`may_appear`'s ray to the head blocked).
+    Hidden,
+    /// In plain view past `APPEAR_IN_VIEW_BEYOND`, where `may_appear` lets somebody be put down.
+    Far,
+    /// In sight.
+    In,
+}
+
+/// Where a figure standing at `p` is for the player's eye: out of the view cone (`Eye`), in it
+/// past their sight (`past_sight`), or in sight (within 3 m of the eye always); with no eye, in
+/// sight within `traffic::NEVER_VANISH_WITHIN` of `center` (the traffic's reach of the mirrors
+/// and a turn of the head, where no car appears or vanishes seen or not).
+fn figure_view(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> FigureSight {
     match eye {
-        None => (p - center).length() < crate::traffic::NEVER_VANISH_WITHIN,
+        None if (p - center).length() < crate::traffic::NEVER_VANISH_WITHIN => FigureSight::In,
+        None => FigureSight::Out,
         Some(e) => {
             let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
             let dist = d.length();
-            dist < 3.0 || (d.dot(e.fwd) / dist > e.cos_half && !past_sight(viewer, dist))
+            if dist < 3.0 {
+                FigureSight::In
+            } else if d.dot(e.fwd) / dist <= e.cos_half {
+                FigureSight::Out
+            } else if past_sight(viewer, dist) {
+                FigureSight::Beyond
+            } else {
+                FigureSight::In
+            }
         }
     }
+}
+
+/// Whether the player could see a figure standing at `p` (`figure_view`). The one measure for
+/// everything about people the player may see: who appears (`may_appear`), who is taken away
+/// (`stroller_goes`, the pool, standing people), where the density is wanted (`in_sight_reach`,
+/// with a head turn).
+fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, p: DVec3) -> bool {
+    figure_view(eye, viewer, center, p) == FigureSight::In
 }
 
 /// Whether a stroller at `p` goes: out of the player's sight (`figure_in_sight`) and out of
@@ -6458,6 +6490,20 @@ impl Humans {
             return false;
         }
         world.collision.lock().ray_blocker(e.pos, p + DVec3::Z * 1.2, 2.5, 2.5).is_some()
+    }
+
+    /// Where somebody standing at `p` is for the player's eye by the people's own test
+    /// (`figure_view`), told apart in sight by `may_appear`: behind a building, or in plain
+    /// view past `APPEAR_IN_VIEW_BEYOND`. For the offscreen harness's watch of who appears and
+    /// vanishes (`follow_line::PlayerWatch`).
+    pub(crate) fn figure_sight(&self, world: &World, p: DVec3) -> FigureSight {
+        match figure_view(self.eye, self.viewer.as_ref(), self.center, p) {
+            FigureSight::In if self.may_appear(world, p) => match self.eye {
+                Some(e) if (p - e.pos).length() > APPEAR_IN_VIEW_BEYOND => FigureSight::Far,
+                _ => FigureSight::Hidden,
+            },
+            v => v,
+        }
     }
 
     /// Whether the player could see somebody standing at `p`.

@@ -21,13 +21,13 @@
 //! `--watch-player` (implied by `--follow-line`; `PlayerWatch`): what happens round the
 //! player while the run goes on, for a moving player and a standing one alike, printed in the
 //! run's summary: the player's position and speed every `POSITION_EVERY` s; cars and people
-//! appearing or vanishing in the view cone (`traffic::Viewer::frames`) within `WATCH_RADIUS`
-//! of the player, and vanishing in the cone farther off, each told apart as in sight, behind
-//! cover (`Traffic::occluded`) or beyond its perceptual horizon
-//! (`traffic::Viewer::beyond_horizon`), the ones in sight logged with their id and time;
-//! the people taken in sight by the people's own test (`Humans::gone`); people held at a
-//! kerb in sight; the nearest unloaded ground (or end of the loaded lanes) along the AI
-//! bus's route ahead; and the bus's own holds by reason, with their times. People put down
+//! appearing or vanishing in the view cone within `WATCH_RADIUS` of the player, and vanishing
+//! in the cone farther off, each told apart as in sight, behind cover or beyond its horizon
+//! by its own kind's test (`Sight`: a car by the traffic's, a person by the people's,
+//! `Humans::figure_sight`), the ones in sight logged with their id and time; the people taken
+//! in sight by the people's own test (`Humans::gone`); people held at a kerb in sight; the
+//! nearest unloaded ground (or end of the loaded lanes) along the AI bus's whole route ahead;
+//! and the bus's own holds by reason, with their times. People put down
 //! in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted
 //! apart and not listed. A car that parks or pulls out of a parked space (its parked object
 //! put down or taken up where it stands) and anything while the map loads
@@ -156,15 +156,33 @@ struct Event {
     sight: Sight,
 }
 
-/// Where something stands for the eye: out of the view cone, in it behind cover (a building
-/// or the ground, `Traffic::occluded`), in it beyond its perceptual horizon
-/// (`traffic::Viewer::beyond_horizon`), or in sight.
+/// Where something stands for the eye, by the test of its own kind: a car by the traffic's
+/// (the view cone `traffic::Viewer::frames`, its perceptual horizon
+/// `traffic::Viewer::beyond_horizon`, cover `Traffic::occluded`), a person by the people's
+/// (`Humans::figure_sight`: the view cone, the horizon of a `humans::FIGURE_HEIGHT` figure,
+/// `may_appear`'s ray to the head). Out of the view cone, in it behind cover, in it beyond the
+/// horizon, a person in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (where the people's
+/// rule lets somebody be put down), or in sight.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Sight {
     Out,
     Hidden,
     Beyond,
+    Far,
     In,
+}
+
+impl From<crate::humans::FigureSight> for Sight {
+    fn from(f: crate::humans::FigureSight) -> Sight {
+        use crate::humans::FigureSight as F;
+        match f {
+            F::Out => Sight::Out,
+            F::Beyond => Sight::Beyond,
+            F::Hidden => Sight::Hidden,
+            F::Far => Sight::Far,
+            F::In => Sight::In,
+        }
+    }
 }
 
 impl Sight {
@@ -173,6 +191,7 @@ impl Sight {
             Sight::Out => "out of the view cone",
             Sight::Hidden => "behind cover",
             Sight::Beyond => "beyond its horizon",
+            Sight::Far => "in plain view past the people's in-view appearance distance",
             Sight::In => "in sight",
         }
     }
@@ -243,7 +262,7 @@ impl PlayerWatch {
     ) {
         let me = player.position;
         let viewer = traffic.viewer;
-        let sight = |p: DVec3, r: f64, height: f64| match viewer {
+        let car_sight = |p: DVec3, r: f64, height: f64| match viewer {
             Some(v) if v.frames(p, r) => {
                 if v.beyond_horizon((p - v.pos).length(), height, r) {
                     Sight::Beyond
@@ -288,7 +307,7 @@ impl PlayerWatch {
                 } else {
                     "spawned"
                 };
-                self.see(t_s, loading, "car", id, how, p, sight(p, r, height), near(p), me, true, how == "pulled out of its space");
+                self.see(t_s, loading, "car", id, how, p, car_sight(p, r, height), near(p), me, true, how == "pulled out of its space");
             }
             let before: Vec<(u64, (DVec3, f64, f64))> = self.cars.iter().map(|(k, v)| (*k, *v)).collect();
             for (id, (p, r, height)) in before {
@@ -303,18 +322,19 @@ impl PlayerWatch {
                 } else {
                     "taken off the road"
                 };
-                self.see(t_s, loading, "car", id, how, p, sight(p, r, height), near(p), me, false, parked_here);
+                self.see(t_s, loading, "car", id, how, p, car_sight(p, r, height), near(p), me, false, parked_here);
             }
-            let (height, radius) = (crate::humans::FIGURE_HEIGHT, crate::humans::FIGURE_HEIGHT * 0.5);
+            // (people by the people's own sight test)
+            let person_sight = |p: DVec3| humans.map(|h| Sight::from(h.figure_sight(world, p))).unwrap_or(Sight::Out);
             for (&id, &(p, ground)) in &people {
                 if ground && !self.people.contains_key(&id) {
-                    self.see(t_s, loading, "person", id as u64, "put down", p, sight(p, radius, height), near(p), me, true, false);
+                    self.see(t_s, loading, "person", id as u64, "put down", p, person_sight(p), near(p), me, true, false);
                 }
             }
             let before: Vec<(u32, (DVec3, bool))> = self.people.iter().map(|(k, v)| (*k, *v)).collect();
             for (id, (p, ground)) in before {
                 if ground && !people.contains_key(&id) {
-                    self.see(t_s, loading, "person", id as u64, "taken away", p, sight(p, radius, height), near(p), me, false, false);
+                    self.see(t_s, loading, "person", id as u64, "taken away", p, person_sight(p), near(p), me, false, false);
                 }
             }
         }
@@ -327,10 +347,10 @@ impl PlayerWatch {
             self.people_taken_seen += h.gone().iter().filter(|g| g.1).count();
         }
         // people held at a kerb in sight within the radius (`Traffic::people`: the people's
-        // own `at_kerb`)
+        // own `at_kerb`; in sight by the people's own test, `Humans::figure_sight`)
         for &(p, _, _, _, _, at_kerb, _, id, _) in &traffic.people {
-            let (height, radius) = (crate::humans::FIGURE_HEIGHT, crate::humans::FIGURE_HEIGHT * 0.5);
-            if at_kerb && near(p) && sight(p, radius, height) == Sight::In {
+            let seen = humans.is_some_and(|h| matches!(h.figure_sight(world, p), crate::humans::FigureSight::In | crate::humans::FigureSight::Far));
+            if at_kerb && near(p) && seen {
                 self.held_s += dt as f64;
                 self.held_ids.insert(id);
             }
@@ -422,7 +442,10 @@ impl PlayerWatch {
     /// eye, `near` within `WATCH_RADIUS`: counted when in the view cone within the radius,
     /// or a disappearance in the cone at any distance; neither while the map loads
     /// (`Traffic::loading_phase`), nor a car that parked or pulled out (`unchanged`: its
-    /// parked object stands where it was). One in sight (inside its horizon) is logged.
+    /// parked object stands where it was). One in sight (inside its horizon) is logged. A
+    /// person put down in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (`Sight::Far`) is
+    /// counted apart, not logged; one taken away there is in sight (the people's rule for
+    /// taking somebody away has no such distance, `figure_in_sight`).
     #[allow(clippy::too_many_arguments)]
     fn see(&mut self, t: f32, loading: bool, what: &'static str, id: u64, how: &'static str, p: DVec3, sight: Sight, near: bool, me: DVec3, came: bool, unchanged: bool) {
         let kind: &'static str = match (what, came) {
@@ -431,21 +454,16 @@ impl PlayerWatch {
             (_, true) => "person appeared",
             (_, false) => "person vanished",
         };
+        let sight = if sight == Sight::Far && !came { Sight::In } else { sight };
         if loading || unchanged || sight == Sight::Out || (came && !near) {
             *self.uncounted.entry(kind).or_default() += 1;
             return;
         }
         let dist = (p - me).length();
-        if sight == Sight::In && !Self::past_people_reach(kind, dist) {
+        if sight == Sight::In {
             log::info!("player watch t={t:.1}: {kind} IN SIGHT #{id} ({how}) {dist:.0} m from the player at ({:.1}, {:.1})", p.x, p.y);
         }
         self.events.push(Event { t, what: kind, id, how, dist, pos: p, sight });
-    }
-
-    /// Somebody put down in plain view past `humans::APPEAR_IN_VIEW_BEYOND`, as the people's
-    /// rule lets them be (counted, not listed).
-    fn past_people_reach(kind: &str, dist: f64) -> bool {
-        kind == "person appeared" && dist > crate::humans::APPEAR_IN_VIEW_BEYOND
     }
 
     /// The summary: the lines for the run's log.
@@ -480,11 +498,11 @@ impl PlayerWatch {
         }
         // (the people's rule lets somebody be put down in plain view past
         // `humans::APPEAR_IN_VIEW_BEYOND`)
-        let past = self.events.iter().filter(|e| e.sight == Sight::In && Self::past_people_reach(e.what, e.dist)).count();
+        let past = self.events.iter().filter(|e| e.sight == Sight::Far).count();
         out.push(format!("player watch: of the people appeared in sight, {past} past the people's in-view appearance distance ({:.0} m, not listed)", crate::humans::APPEAR_IN_VIEW_BEYOND));
         out.push(format!("player watch: people taken in sight by the people's own test (`Humans::gone`): {}", self.people_taken_seen));
         out.push(format!("player watch: not counted (out of the view cone, appeared beyond the radius, a car parked or pulled out, the map loading): {:?}", self.uncounted));
-        for e in self.events.iter().filter(|e| e.sight == Sight::In && !Self::past_people_reach(e.what, e.dist)) {
+        for e in self.events.iter().filter(|e| e.sight == Sight::In) {
             out.push(format!("player watch:   t={:.1} {} #{} ({}) {:.0} m at ({:.1}, {:.1})", e.t, e.what, e.id, e.how, e.dist, e.pos.x, e.pos.y));
         }
         out.push(format!("player watch: people held at a kerb in sight within {WATCH_RADIUS:.0} m: {:.0} person-s, {} people", self.held_s, self.held_ids.len()));
