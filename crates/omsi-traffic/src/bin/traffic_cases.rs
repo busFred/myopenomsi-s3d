@@ -6106,6 +6106,34 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 }
             }
         }
+        // (`--route`: the watched vehicle's route from its index on, and its planned next lane)
+        if args.iter().any(|a| a == "--route") {
+            for &i in &found {
+                let st = &r.vehicles[i].state;
+                let ahead: Vec<String> = st.route.iter().skip(st.route_index.saturating_sub(1)).take(6).map(|l| format!("{l}{}", r.net.lanes.get(*l).map(|x| format!("->{:?}", x.next)).unwrap_or_default())).collect();
+                println!("t={t:.1}   route #{} index {} of {}: {} planned_next {:?}", r.vehicles[i].id, st.route_index, st.route.len(), ahead.join(" "), st.planned_next);
+            }
+        }
+        // (`--ctl N`: light controller N's clock, its requests this frame and its stop points)
+        if let Some(n) = opt(args, "--ctl").and_then(|x| x.parse::<usize>().ok()) {
+            if let Some(c) = r.sim.lights.get(n) {
+                println!("t={t:.1}   ctl {n} time {:.1} requests {:?} stops {:?}", c.time, c.request, c.stops);
+            }
+        }
+        // (`--cuts`: the footpaths crossing the watched vehicle's way within 60 m, as distances
+        // from its front to each cut's axis, with the footpath lane)
+        if args.iter().any(|a| a == "--cuts") {
+            for &i in &found {
+                let st = &r.vehicles[i].state;
+                let cuts: Vec<String> = omsi_traffic::perception::way_lanes(&r.net, st, 60.0)
+                    .iter()
+                    .flat_map(|&(l, d0)| r.net.walks.get(l).into_iter().flatten().map(move |&(path, sa, _)| (l, path, d0 + sa - st.front)))
+                    .filter(|&(_, _, d)| d > -20.0)
+                    .map(|(l, path, d)| format!("{l}x{path}@{d:.1}"))
+                    .collect();
+                println!("t={t:.1}   cuts #{} (from the front): {}", r.vehicles[i].id, cuts.join(" "));
+            }
+        }
         for &i in &found {
             if let Some((c, g)) = r.sim.claims.iter().find(|(c, _)| c.vehicle == i) {
                 println!(

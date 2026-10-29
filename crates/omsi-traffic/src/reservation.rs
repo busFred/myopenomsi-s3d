@@ -859,8 +859,9 @@ fn lead_release(claims: &[Claim], claim_of: &hashbrown::HashMap<usize, usize>, k
     None
 }
 
-/// Links of a chain followed by `held_by`, `held_by_standing` and `held_off` (a three-car ring).
-const LEAD_CHAIN: usize = 4;
+/// Links of a chain followed by `held_by`, `held_by_standing`, `held_off` and the ease's
+/// `sim::held_back` (a three-car ring).
+pub(crate) const LEAD_CHAIN: usize = 4;
 
 /// The standing claim `k` cannot come while what holds it holds (not coming): it is stuck itself
 /// (people, a zebra, a standing lead in front of it), or it stands refused by the junction

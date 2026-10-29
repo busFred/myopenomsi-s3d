@@ -692,7 +692,9 @@ fn route_place(net: &Network, st: &omsi_sim::traffic::AiState, lane: usize, s: f
 /// the vehicle is, its class, driver, size and external inputs. It stays where it is: its
 /// place, speed, odometer and lane changes in progress; a new route is planned
 /// afresh from where it is, as the game's `set_route` does (bus_service.rs), not along the
-/// lanes the old one had planned.
+/// lanes the old one had planned. A new route that does not hold the vehicle's lane is joined to
+/// the old one where the old one reaches its first lane (the vehicle is behind the game's); one
+/// the old way does not reach is taken with the recorded index.
 fn take_way(o: &mut Vehicle, rec: &Vehicle, net: &Network) {
     o.class = rec.class;
     o.params = rec.params.clone();
@@ -713,9 +715,20 @@ fn take_way(o: &mut Vehicle, rec: &Vehicle, net: &Network) {
     st.reaction = r.reaction;
     st.lat_accel = r.lat_accel;
     let new_route = st.route != r.route;
-    st.route = r.route.clone();
-    // (where it is in the new route: its lane's place in it when it is there)
-    st.route_index = st.route.iter().position(|&l| l == st.lane).unwrap_or(r.route_index);
+    // (where it is in the new route: its lane's place in it when it is there. A vehicle behind
+    // the game's, on its old way short of the new route's first lane, keeps its old way up to
+    // that lane: the game handed the route over where its own vehicle was, and from here the
+    // next lane of the new route is no successor of this one: stepping to it would put the
+    // vehicle down on that lane, metres on, over whoever stands there)
+    let here = st.route.get(st.route_index).filter(|&&l| l == st.lane).map(|_| st.route_index).or_else(|| st.route.iter().position(|&l| l == st.lane));
+    let joined = match (r.route.iter().position(|&l| l == st.lane), here, r.route.first()) {
+        (Some(k), _, _) => Some((r.route.clone(), k)),
+        (None, Some(h), Some(&first)) => st.route[h..].iter().position(|&l| l == first).map(|k| (st.route[..h + k].iter().chain(r.route.iter()).copied().collect(), h)),
+        _ => None,
+    };
+    let (route, index) = joined.unwrap_or_else(|| (r.route.clone(), r.route_index));
+    st.route = route;
+    st.route_index = index;
     if new_route && !st.route.is_empty() {
         st.planned_next = None;
         st.ahead.clear();
@@ -796,4 +809,40 @@ fn build(h: &Header, compile: bool) -> (Network, Simulation) {
     sim.junctions = junctions;
     sim.left_hand = net.left_hand;
     (net, sim)
+}
+
+#[cfg(test)]
+mod take_way_tests {
+    use super::*;
+    use crate::driver::VehicleClass;
+    use omsi_sim::traffic::AiState;
+
+    fn bus(lane: usize, route: Vec<usize>, index: usize) -> Vehicle {
+        let mut st = AiState::new(lane, 5.0, 1);
+        st.route = route;
+        st.route_index = index;
+        Vehicle::new(1, VehicleClass::ScheduledBus, st, 1.25, 7)
+    }
+
+    /// x10 case03 #1041: the game hands the bus its next trip's route (from 2598 on) while the
+    /// replay's bus is still on 2591, three lanes short of it: the bus keeps its old way up to
+    /// 2598 and goes on along the new route from there, never stepping from 2591 to 2599.
+    #[test]
+    fn j11_5_a_route_handed_over_ahead_of_the_replayed_vehicle_is_joined_to_its_old_way() {
+        let net = Network::default();
+        let mut mine = bus(2591, vec![2684, 2591, 2596, 2597, 2598, 2599, 2600], 1);
+        let rec = bus(2598, vec![2598, 2599, 2601, 2602], 0);
+        take_way(&mut mine, &rec, &net);
+        assert_eq!(mine.state.route, vec![2684, 2591, 2596, 2597, 2598, 2599, 2601, 2602]);
+        assert_eq!(mine.state.route_index, 1);
+        assert_eq!(mine.state.route[mine.state.route_index], 2591);
+        // (on the new route already: its place there)
+        let mut there = bus(2599, vec![2598, 2599, 2600], 1);
+        take_way(&mut there, &rec, &net);
+        assert_eq!((there.state.route.clone(), there.state.route_index), (vec![2598, 2599, 2601, 2602], 1));
+        // (its old way does not reach the new route: the recorded route and index, as before)
+        let mut off = bus(77, vec![76, 77, 78], 1);
+        take_way(&mut off, &rec, &net);
+        assert_eq!((off.state.route.clone(), off.state.route_index), (vec![2598, 2599, 2601, 2602], 0));
+    }
 }
