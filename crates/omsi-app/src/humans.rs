@@ -2971,8 +2971,6 @@ struct PedNet {
     /// lies off every street lane's footprint, where the map lays the footpath along a street
     /// lane (`free_strip`).
     strips: Vec<std::sync::OnceLock<Option<(f64, f64)>>>,
-    /// Per pavement lane: whether it runs above or below the traffic (`elevated`).
-    levels: Vec<std::sync::OnceLock<bool>>,
     /// Pavement lanes by 50 m cell.
     grid: HashMap<(i32, i32), Vec<usize>>,
     /// The junctions and a 1.5 m grid of them, for joining the paths of tiles loaded later.
@@ -3005,7 +3003,6 @@ impl PedNet {
             against: Vec::new(),
             cuts: Vec::new(),
             strips: Vec::new(),
-            levels: Vec::new(),
             grid: HashMap::new(),
             nodes: Vec::new(),
             cells: HashMap::new(),
@@ -3039,11 +3036,9 @@ impl PedNet {
         if from > 0 && (from..net.lanes.len()).any(|i| net.lanes[i].kind == LaneKind::Street) {
             self.cuts.clear();
             self.strips.clear();
-            self.levels.clear();
         }
         self.cuts.resize_with(net.lanes.len(), std::sync::OnceLock::new);
         self.strips.resize_with(net.lanes.len(), std::sync::OnceLock::new);
-        self.levels.resize_with(net.lanes.len(), std::sync::OnceLock::new);
         let mut nodes: HashMap<usize, (usize, usize)> = HashMap::new();
         for &i in &lit {
             let l = &net.lanes[i];
@@ -3416,48 +3411,6 @@ impl PedNet {
         match self.strips.get(lane) {
             Some(c) => *c.get_or_init(|| PedNet::strip_of(self, net, lane)),
             None => PedNet::strip_of(self, net, lane),
-        }
-    }
-
-    /// Whether pavement lane `lane` runs above or below the traffic: a street lane passes
-    /// under or over it (its footprint and a body reaching the path, `footprint_reach`; its height
-    /// at the point under it) at more than `LEVEL_APART` in height, and
-    /// none at its own level (BeijingCity's footbridge 2294485 at 6 m over Jiangzhaikou's lane 723:
-    /// its walkers were taken for people inside the cars passing below, and the cars' boxes
-    /// pushed and held them up there). Its walkers meet no vehicle box.
-    fn elevated(&self, net: &Network, lane: usize) -> bool {
-        let f = || {
-            let l = &net.lanes[lane];
-            let (mut other, mut same) = (false, false);
-            let len = l.length();
-            let n = (len as f64 / FOOT_SAMPLE).ceil().max(1.0) as usize;
-            for k in 0..=n {
-                let (q, _) = l.at(len * k as f32 / n as f32);
-                let q = &q;
-                let cell = ((q.x / 50.0).floor() as i32, (q.y / 50.0).floor() as i32);
-                for &i in net.grid.get(&cell).map(|v| v.as_slice()).unwrap_or(&[]) {
-                    let o = &net.lanes[i];
-                    if o.kind != LaneKind::Street {
-                        continue;
-                    }
-                    for w in o.points.windows(2) {
-                        let (c, t) = crowd::project_on_segment(q.truncate(), w[0].truncate(), w[1].truncate());
-                        if (c - q.truncate()).length() < footprint_reach(o) {
-                            let z = w[0].z + (w[1].z - w[0].z) * t;
-                            if (z - q.z).abs() > LEVEL_APART {
-                                other = true;
-                            } else {
-                                same = true;
-                            }
-                        }
-                    }
-                }
-            }
-            other && !same
-        };
-        match self.levels.get(lane) {
-            Some(c) => *c.get_or_init(f),
-            None => f(),
         }
     }
 
@@ -4046,14 +3999,44 @@ const WALL_TURN_CELL: f64 = 10.0;
 const TURNS_AT_A_WALL: &str = "a parked car over the path: turns round";
 const HURRIES_ON: &str = "caught by the change: on across";
 
-/// A street lane more than this (m) above or below a footpath point is on another
-/// level (the cars' people test, `perception::people_ahead`: 2.5 m); one within it is at the
-/// path's level. (A street lane is under or beside the point when its footprint and a body,
-/// `footprint_reach`, reach it.)
+/// A street lane, or a vehicle, more than this (m) above or below a person or a footpath point
+/// is on another level (the cars' people test, `perception::people_ahead`: 2.5 m); one within it
+/// is at their level (`at_level`).
 const LEVEL_APART: f64 = 2.5;
-/// The crowd's space of the walkers on a level of their own above or below the traffic:
-/// they meet no vehicle box (the crowd's blocks are the ground's, space 0).
-const ELEVATED_SPACE: u64 = 1 << 62;
+
+/// Whether a vehicle standing on the ground at height `vehicle_z` is at the level of somebody
+/// standing at `z` (`LEVEL_APART`): the walkers meet the boxes of the vehicles at their level
+/// only, as the cars stop for the people at theirs (`perception::people_ahead`). The map's
+/// footbridges and the footpaths drawn over cuttings and under bridges lie over the traffic in
+/// 2-D (BeijingCity's footbridge 2294485 at 6 m over Jiangzhaikou's lane 723; the footpaths
+/// 2104/2046 at 1.3 m over the cutting of lanes 1616-1633 at -3.8 m, and 1956-1959 at 1.3-1.4 m
+/// over lanes 2303/2304 at -1.8 m beside the bridge's own street 1955 at 1.3 m): their walkers
+/// were held by, pushed by and counted inside the cars passing below.
+fn at_level(vehicle_z: f64, z: f64) -> bool {
+    (vehicle_z - z).abs() <= LEVEL_APART
+}
+
+/// The vehicle boxes of `blocks` near `here` (`grid`) as somebody standing there at height `z`
+/// meets them (`at_level`): None when every one near is at their level (the shared list holds),
+/// else those at it, with the vehicles they are bodies of (`block_car`) and their grid.
+fn blocks_at_level(blocks: &[Block], block_z: &[f64], block_car: &[Option<usize>], grid: &crowd::BlockGrid, here: DVec2, z: f64) -> Option<(Vec<Block>, Vec<Option<usize>>, crowd::BlockGrid)> {
+    let mut near: Vec<usize> = Vec::new();
+    let mut apart = false;
+    grid.for_each_near(here, |k| {
+        if at_level(block_z[k], z) {
+            near.push(k);
+        } else {
+            apart = true;
+        }
+    });
+    if !apart {
+        return None;
+    }
+    let bl: Vec<Block> = near.iter().map(|&k| blocks[k]).collect();
+    let bc: Vec<Option<usize>> = near.iter().map(|&k| block_car[k]).collect();
+    let g = crowd::BlockGrid::new(&bl, box_grid_margin(), crowd::BLOCK_CELL);
+    Some((bl, bc, g))
+}
 
 /// The spacing (m) of the points of a footpath tested against a junction piece's
 /// footprint (`PedNet::cuts_of`): under a body's width (2 x BODY_OUTSIDE).
@@ -9340,8 +9323,10 @@ impl Humans {
         // the pedestrians: a crowd on the pavements
         let mut cars: Vec<SeenCar> = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
-        // (per block, the vehicle among `cars` it is the body of: None for a parked car)
+        // (per block, the vehicle among `cars` it is the body of: None for a parked car; and the
+        // height of the ground it stands on, `at_level`)
         let mut block_car: Vec<Option<usize>> = Vec::new();
+        let mut block_z: Vec<f64> = Vec::new();
         if let Some(t) = traffic {
             for c in &t.cars {
                 if (c.vehicle.position - self.center).length() > 320.0 {
@@ -9366,12 +9351,14 @@ impl Humans {
                 if !matches!(c.vehicle.ty.def.kind, omsi_vehicle::VehicleKind::Other(3)) {
                     blocks.push(body);
                     block_car.push(Some(cars.len() - 1));
+                    block_z.push(c.vehicle.position.z);
                     for t in &c.vehicle.trailers {
                         let tb = t.ty.def.bounding_box.unwrap_or([2.5, 7.0, 3.0, 0.0, 0.0, 1.5]);
                         let o = omsi_sim::collision::Obb::from_box(tb, t.position, t.heading);
                         let th = t.heading.to_radians();
                         blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::new(th.sin(), th.cos()) * c.ai.state.speed as f64 });
                         block_car.push(Some(cars.len() - 1));
+                        block_z.push(t.position.z);
                     }
                 }
             }
@@ -9380,6 +9367,7 @@ impl Humans {
             if (o.center - self.center.truncate()).length() < 320.0 {
                 blocks.push(Block { center: o.center, half: o.half, heading: o.heading, vel: DVec2::ZERO });
                 block_car.push(None);
+                block_z.push(o.z0);
             }
         }
         if let Some(pb) = bus_ix.get(&BusId::Player).map(|&i| &buses[i]) {
@@ -9392,6 +9380,7 @@ impl Humans {
                 cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0 });
             }
             block_car.extend((0..bodies.len()).map(|k| Some((first + k).min(cars.len() - 1))));
+            block_z.extend(std::iter::repeat_n(pb.pos.z, bodies.len()));
             blocks.extend(bodies);
         }
         // the boxes by where they are, for the walkers' tests of the ones near them
@@ -9567,17 +9556,18 @@ impl Humans {
                 continue;
             }
             let (here, on_crossing, on_pavement) = (p.position.truncate(), p.on_crossing, pavement_walker(p));
-            // (up on a footbridge or down in an underpass: no vehicle is in their way)
-            if let (State::Strolling(walk), Some(n), Some(pn)) = (&p.state, net, self.ped.as_ref()) {
-                if walk.legs.get(walk.leg).is_some_and(|l| pn.elevated(n, l.lane)) {
-                    continue;
-                }
-            }
             let z = p.position.z;
+            // (only the vehicles at their level are in their way, `at_level`: none below a
+            // footbridge or over an underpass)
+            let level = blocks_at_level(&blocks, &block_z, &block_car, &block_grid, here, z);
+            let (blocks, block_grid, block_car) = match &level {
+                Some((b, c, g)) => (b.as_slice(), g, c.as_slice()),
+                None => (blocks.as_slice(), &block_grid, block_car.as_slice()),
+            };
             let off_lanes = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY));
             // (a stroller may turn round at a wall; somebody walking somewhere waits it out)
             let turns = matches!(&p.state, State::Strolling(w) if w.roam);
-            let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, &mut wants[i], &blocks, &block_grid, &block_car, &cars, &off_lanes, dt);
+            let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, &mut wants[i], blocks, block_grid, block_car, &cars, &off_lanes, dt);
             if outcome == BoxOutcome::Wall {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
                     if let (Some(pn), Some(l)) = (self.ped.as_mut(), walk.legs.get(walk.leg)) {
@@ -9650,18 +9640,13 @@ impl Humans {
             }
             let fixed = matches!(p.state, State::Pax(_));
             let w = &wants[i];
-            // (the walkers of a footbridge or an underpass on a level of their own)
-            let elevated = match (&p.state, net, self.ped.as_ref()) {
-                (State::Strolling(walk), Some(n), Some(pn)) => walk.legs.get(walk.leg).is_some_and(|l| pn.elevated(n, l.lane)),
-                _ => false,
-            };
             walkers.push(Walker {
                 pos: p.position.truncate(),
                 vel: p.vel,
                 radius: BODY_OUTSIDE,
                 want: w.vel,
                 give: w.give,
-                space: if elevated { ELEVATED_SPACE } else { 0 },
+                space: 0,
                 fixed,
                 // people on foot touch nothing but the vehicles (`solid`):
                 // not each other, not the scenery (jammed, not the box they squeeze
@@ -9685,13 +9670,37 @@ impl Humans {
         let near = crowd::near_any(&blocks, &places, CROWD_BLOCK_REACH);
         let near_idx: Vec<usize> = near.iter().enumerate().filter(|(_, n)| **n).map(|(k, _)| k).collect();
         let near_blocks: Vec<Block> = near_idx.iter().map(|&k| blocks[k]).collect();
+        let near_z: Vec<f64> = near_idx.iter().map(|&k| block_z[k]).collect();
         stage!("ped.walkers");
         let mut g = walkers.clone();
-        crowd::step(&mut g, &near_blocks, &CrowdParams::default(), dt as f64);
+        // (each walker meets the vehicle boxes at their level, `at_level`; the walkers are ghosts
+        // to each other, so those with a box at another level near are moved apart, each with
+        // the boxes at theirs, and everybody else together)
+        let near_grid = crowd::BlockGrid::new(&near_blocks, CROWD_BLOCK_REACH, crowd::BLOCK_CELL);
+        let walker_z: Vec<f64> = who.iter().map(|&i| self.people[i].position.z).collect();
+        let apart: Vec<bool> = g
+            .iter()
+            .zip(&walker_z)
+            .map(|(w, &z)| {
+                let mut any = false;
+                near_grid.for_each_near(w.pos, |b| any |= !at_level(near_z[b], z));
+                any
+            })
+            .collect();
+        let together: Vec<usize> = (0..g.len()).filter(|&k| !apart[k]).collect();
+        let mut main: Vec<Walker> = together.iter().map(|&k| g[k]).collect();
+        crowd::step(&mut main, &near_blocks, &CrowdParams::default(), dt as f64);
+        for (w, &k) in main.into_iter().zip(&together) {
+            g[k] = w;
+        }
+        for k in (0..g.len()).filter(|&k| apart[k]) {
+            let own: Vec<Block> = near_blocks.iter().zip(&near_z).filter(|(_, &bz)| at_level(bz, walker_z[k])).map(|(b, _)| *b).collect();
+            crowd::step(std::slice::from_mut(&mut g[k]), &own, &CrowdParams::default(), dt as f64);
+        }
         stage!("ped.crowd");
         // (the gate's counts: jammed strollers, and anybody inside a moving vehicle's box)
         {
-            let moving: Vec<(Block, Option<u64>)> = near_blocks.iter().zip(&near_idx).filter(|(b, _)| b.vel.length() >= 0.5).map(|(b, &k)| (*b, block_car[k].map(|c| cars[c].id))).collect();
+            let moving: Vec<(Block, Option<u64>, f64)> = near_blocks.iter().zip(&near_idx).filter(|(b, _)| b.vel.length() >= 0.5).map(|(b, &k)| (*b, block_car[k].map(|c| cars[c].id), block_z[k])).collect();
             let boxes: Vec<Block> = moving.iter().map(|m| m.0).collect();
             let grid = crowd::BlockGrid::new(&boxes, 0.0, crowd::BLOCK_CELL);
             for (k, w) in g.iter().enumerate() {
@@ -9701,7 +9710,8 @@ impl Humans {
                 }
                 let mut hit = None;
                 grid.for_each_near(w.pos, |b| {
-                    if w.space != 0 {
+                    // (a vehicle at another level is not where they are, `at_level`)
+                    if w.space != 0 || !at_level(moving[b].2, p.position.z) {
                         return;
                     }
                     if hit.is_none() && boxes[b].closest(w.pos).1 {
@@ -14176,17 +14186,27 @@ mod ped_tests {
     }
 
     #[test]
-    fn p2b1_a_footbridge_over_the_traffic_is_a_level_of_its_own() {
-        // Jiangzhaikou's footbridge 2294485 at 6 m over lane 723: its walkers are no ground walkers
-        let mut net = Network::default();
-        net.lanes.push(lane(vec![p(0.0, -30.0), p(0.0, 30.0)], LaneKind::Street, 3.0));
-        net.lanes.push(lane(vec![DVec3::new(-10.0, 0.0, 6.0), DVec3::new(10.0, 0.0, 6.0)], LaneKind::Sidewalk, 2.0));
-        net.lanes.push(lane(vec![p(3.0, -20.0), p(3.0, 20.0)], LaneKind::Sidewalk, 2.0));
-        net.build_grid();
-        net.link(1.5);
-        let ped = PedNet::build(&net);
-        assert!(ped.elevated(&net, 1), "the bridge");
-        assert!(!ped.elevated(&net, 2), "the pavement beside the street");
+    fn p2b1_the_walkers_meet_the_vehicles_at_their_level_only() {
+        // Jiangzhaikou's footpath 1956 at 1.3 m: a car on the bridge's own street at 1.3 m beside
+        // it, one in the road 3.1 m below under it; a walker on the path meets the first only
+        let car = |x: f64| Block { center: DVec2::new(x, 0.0), half: DVec2::new(1.0, 2.3), heading: 0.0, vel: DVec2::new(0.0, 11.0) };
+        let blocks = vec![car(3.0), car(0.0)];
+        let (block_z, block_car) = (vec![1.3, -1.8], vec![Some(0), Some(1)]);
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let (bl, bc, _) = blocks_at_level(&blocks, &block_z, &block_car, &grid, DVec2::ZERO, 1.3).expect("one below");
+        assert_eq!((bl.len(), bc), (1, vec![Some(0)]));
+        assert!((bl[0].center.x - 3.0).abs() < 1e-9);
+        // all at their level: the shared list
+        assert!(blocks_at_level(&blocks, &[1.3, 1.0], &block_car, &grid, DVec2::ZERO, 1.3).is_none());
+        // the footbridge 2294485 at 6 m over a car at 0: in the crowd it does not push them
+        assert!(!at_level(0.0, 6.0) && at_level(-1.0, 1.3));
+        let mut w = Walker::new(DVec2::new(0.0, 0.0), BODY_OUTSIDE, 0);
+        w.want = DVec2::new(1.3, 0.0);
+        w.ghost = true;
+        w.solid = true;
+        let own: Vec<Block> = blocks.iter().zip(&block_z).filter(|(_, &z)| at_level(z, 6.0)).map(|(b, _)| *b).collect();
+        crowd::step(std::slice::from_mut(&mut w), &own, &CrowdParams::default(), 1.0 / 30.0);
+        assert!(w.pos.x > 0.0 && w.pos.y.abs() < 1e-6, "walks on over the car below: {:?}", w.pos);
     }
 
     #[test]
