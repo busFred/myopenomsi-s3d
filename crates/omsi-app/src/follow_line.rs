@@ -258,6 +258,9 @@ const BODY_RADIUS_CLASSES: [f64; 3] = [30.0, 60.0, 120.0];
 /// pure pursuit's steady error on a straight stay within millimetres; a centimetre is a body
 /// truly turned off its way.
 const BODY_COUNTED: f64 = 0.01;
+/// Half the width (m) of the reference lane the signed measure counts against: a 3.5 m lane
+/// (the unit tests' of `ai_motion`; the map gives no painted width, `humans::LANE_MIN_WIDTH`).
+const BODY_REF_LANE_HALF: f64 = 1.75;
 
 /// The AI road bodies as the game draws them, every frame outside the map's loading: per
 /// vehicle section the point of its outline farthest outside a lane as wide as the body
@@ -279,6 +282,10 @@ struct BodyLane {
     /// Per section kind (front, rear) and radius class (and beyond the last): every
     /// vehicle-frame's swing (m) and its frame time (s); the most with its second, id, type.
     swing: [[Vec<(f32, f32)>; 4]; 2],
+    /// The same vehicle-frames, signed against the bend: how far the body's inner side and its
+    /// outer side leave the reference lane (m, `BODY_REF_LANE_HALF` from the way; - = inside
+    /// it): (inner, outer, frame time).
+    sides: [[Vec<(f32, f32, f32)>; 4]; 2],
     most: [[(f64, f32, u64, String); 4]; 2],
     /// Overlapping pair-seconds, the pairs, the deepest (m) with its second and ids.
     overlap_s: f64,
@@ -307,6 +314,18 @@ impl BodyLane {
             let n = ((st.rear + st.front + 4.0) / BODY_WAY_STEP).ceil() as usize;
             let first = -st.rear - 2.0;
             let way: Vec<DVec2> = st.way_points(net, (0..=n).map(|i| first + i as f32 * BODY_WAY_STEP)).into_iter().map(|p| p.truncate()).collect();
+            // the signed lateral distance of a point from the way (+ = left of its direction)
+            let lateral = |p: DVec2| {
+                way.windows(2)
+                    .map(|w| {
+                        let (a, b) = (w[0], w[1]);
+                        let t = ((p - a).dot(b - a) / (b - a).length_squared().max(1e-12)).clamp(0.0, 1.0);
+                        let c = a + (b - a) * t;
+                        ((p - c).length(), (b - a).perp_dot(p - c).signum() * (p - c).length())
+                    })
+                    .fold((f64::MAX, 0.0), |m, x| if x.0 < m.0 { x } else { m })
+                    .1
+            };
             let off_way = |p: DVec2| {
                 way.windows(2)
                     .map(|w| {
@@ -351,7 +370,8 @@ impl BodyLane {
                 let fwd = DVec2::new(h.sin(), h.cos());
                 let right = DVec2::new(fwd.y, -fwd.x);
                 let o = pos.truncate();
-                let worst = [(front, half), (front, -half), (-rear, half), (-rear, -half), (turning, half), (turning, -half)]
+                let corners = [(front, half), (front, -half), (-rear, half), (-rear, -half), (turning, half), (turning, -half)];
+                let worst = corners
                     .iter()
                     .map(|&(long, lat)| off_way(o + fwd * long as f64 + right * lat as f64) - half as f64)
                     .fold(f64::MIN, f64::max);
@@ -362,6 +382,15 @@ impl BodyLane {
                 let class = BODY_RADIUS_CLASSES.iter().position(|r| k * r >= 1.0).unwrap_or(3);
                 let kind = (i > 0) as usize;
                 self.swing[kind][class].push((worst as f32, dt));
+                // the bend's side: + = it bends left, so its inside is the way's left
+                let inward = if (b - a).perp_dot(q - a) >= 0.0 { 1.0 } else { -1.0 };
+                let (mut inn, mut out) = (f64::MIN, f64::MIN);
+                for &(long, lat) in &corners {
+                    let l = lateral(o + fwd * long as f64 + right * lat as f64) * inward;
+                    inn = inn.max(l - BODY_REF_LANE_HALF);
+                    out = out.max(-l - BODY_REF_LANE_HALF);
+                }
+                self.sides[kind][class].push((inn as f32, out as f32, dt));
                 let m = &mut self.most[kind][class];
                 if worst > m.0 || m.3.is_empty() {
                     let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
@@ -424,6 +453,30 @@ impl BodyLane {
                 out.push(format!(
                     "body lane: {part} {name}: {secs:.0} vehicle-s, out of its own footprint {out_s:.0} vehicle-s; swing mean {mean:.2} p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} m (t={:.1} #{} {})",
                     pct(0.5), pct(0.95), pct(0.99), m.0, m.1, m.2, m.3
+                ));
+            }
+        }
+        for (i, part) in ["front section", "rear sections"].iter().enumerate() {
+            for class in 0..3 {
+                let v = &self.sides[i][class];
+                if v.is_empty() {
+                    continue;
+                }
+                let secs: f64 = v.iter().map(|x| x.2 as f64).sum();
+                let over = |f: &dyn Fn(&(f32, f32, f32)) -> f32| v.iter().filter(|x| f(x) > 0.05).map(|x| x.2 as f64).sum::<f64>();
+                let stats = |f: &dyn Fn(&(f32, f32, f32)) -> f32| {
+                    let mut x: Vec<f32> = v.iter().map(f).collect();
+                    x.sort_by(|a, b| a.total_cmp(b));
+                    (x.iter().map(|&y| y as f64).sum::<f64>() / x.len() as f64, x[((x.len() - 1) as f64 * 0.95).round() as usize], x[x.len() - 1])
+                };
+                let (im, ip, ix) = stats(&|x| x.0);
+                let (om, op, ox) = stats(&|x| x.1);
+                out.push(format!(
+                    "body lane signed: {part} R <= {:.0} m: {secs:.0} vehicle-s; past the {:.2} m inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past the outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
+                    BODY_RADIUS_CLASSES[class],
+                    BODY_REF_LANE_HALF,
+                    over(&|x| x.0),
+                    over(&|x| x.1)
                 ));
             }
         }
