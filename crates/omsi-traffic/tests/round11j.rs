@@ -1,5 +1,5 @@
 //! Round 11 area J3: two paths converging at a shallow angle are a meeting place where the
-//! bodies on them would touch (J11-2).
+//! bodies on them would touch (J11-2), and the ease of a mutual hold (J11-6c).
 //! `cargo test --release -p omsi-traffic --test round11j -- --nocapture`
 
 use glam::DVec3;
@@ -133,4 +133,116 @@ fn j11_2_two_cars_on_paths_converging_to_more_than_their_widths_go_through_abrea
     println!("least {least:.2} odometers {odo:?}");
     assert!(least > 0.0, "the two cars touched: {least:.2} m");
     assert!((odo[0] - odo[1]).abs() < 2.0, "one waited for the other: odometers {odo:?}");
+}
+
+/// Object 9: piece 0 eastbound along y = 0 and piece 1 northbound along x = 0 crossing it at the
+/// origin, each with its way on (lanes 2 east, 3 north).
+fn crossing_ways() -> Network {
+    let mut net = Network::default();
+    let mut east = piece(&[(-40.0, 0.0), (20.0, 0.0)], 0);
+    east.width = 3.5;
+    let mut north = piece(&[(0.0, -40.0), (0.0, 20.0)], 1);
+    north.width = 3.5;
+    net.lanes.push(east);
+    net.lanes.push(north);
+    net.lanes.push(road(&[(20.0, 0.0), (300.0, 0.0)], 2));
+    net.lanes.push(road(&[(0.0, 20.0), (0.0, 300.0)], 3));
+    finish(net)
+}
+
+/// [J11-6c, end to end] The three-car ring of viz5 case02 through `Simulation::tick`: A (id 1)
+/// eased off for B (id 2), B standing behind its lead C (id 3), C eased off for A. B cannot move
+/// off before A (its lead C, C's ease for A); A is held back for B by nothing physical: A's ease
+/// is the one that closes the ring, it ends, and C's stays while A crosses. A goes, then C and B
+/// follow; nobody waits out `EASE_MAX`, nobody touches, no new ease is started.
+#[test]
+fn j11_6c_a_three_car_ring_of_eases_and_a_lead_opens_end_to_end() {
+    let net = crossing_ways();
+    let mut sim = Simulation::new(&net, vec![]);
+    let j = sim.junctions.of_lane[&0].0;
+    assert_eq!(sim.junctions.of_lane[&1].0, j, "one junction");
+    // (fronts: C 3.5 m short of the crossing, B 2 m behind C, A 3.5 m short on the other way)
+    let mut c = vehicle(3, VehicleClass::Car, vec![0, 2], 40.0 - 3.5 - 2.2, 0.0, 2.2, 0.9);
+    let mut b = vehicle(2, VehicleClass::Car, vec![0, 2], 40.0 - 3.5 - 2.2 - 4.4 - 2.0, 0.0, 2.2, 0.9);
+    let mut a = vehicle(1, VehicleClass::Car, vec![1, 3], 40.0 - 3.5 - 2.2, 0.0, 2.2, 0.9);
+    for v in [&mut a, &mut b, &mut c] {
+        v.state.max_speed_kmh = 30.0;
+    }
+    a.ease_for = Some((2, j, 0.0));
+    c.ease_for = Some((1, j, 0.0));
+    let mut cars = vec![a, b, c];
+    let mut t = 0.0;
+    let (mut a_ease_end, mut c_ease_end, mut least, mut eases) = (None, None, f32::INFINITY, 0usize);
+    let mut eased: Vec<u64> = vec![1, 3];
+    let mut through = [false; 3];
+    sim.update_positions(&net, &mut cars);
+    while t < 20.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        for (k, v) in cars.iter().enumerate() {
+            for w in cars.iter().skip(k + 1) {
+                least = least.min(v.obb().separation(&w.obb()) as f32);
+            }
+            match (v.ease_for.is_some(), eased.contains(&v.id)) {
+                (true, false) => {
+                    eases += 1;
+                    eased.push(v.id);
+                }
+                (false, true) => {
+                    eased.retain(|&x| x != v.id);
+                    if v.id == 1 && a_ease_end.is_none() {
+                        a_ease_end = Some(t);
+                    }
+                    if v.id == 3 && c_ease_end.is_none() {
+                        c_ease_end = Some(t);
+                    }
+                }
+                _ => {}
+            }
+            through[(v.id - 1) as usize] |= v.state.lane >= 2;
+        }
+        t += DT;
+    }
+    println!("A's ease ended {a_ease_end:?}, C's {c_ease_end:?}, new eases {eases}, least {least:.2}, through {through:?}");
+    let a_end = a_ease_end.expect("A's ease never ended");
+    assert!(a_end < 0.5, "A's ease closing the ring ended at {a_end:.2} s");
+    assert!(c_ease_end.is_some_and(|e| e > a_end), "C's ease ended before A's: {c_ease_end:?}");
+    assert!(through.iter().all(|&x| x), "not everybody went through: {through:?}");
+    assert_eq!(eases, 0, "a new ease was started");
+    assert!(least > 0.0, "touched: {least:.2}");
+}
+
+/// Two cars standing refused for each other (`wait_for` both ways) at the crossing of
+/// `crossing_ways`: A (id 1) on piece 0 with its front `a_short` m short of the crossing, B (id 2)
+/// on piece 1 with its front `b_front` m past it. One frame to make the claims, then
+/// `Simulation::negotiate`: who eased off.
+fn negotiated(a_short: f32, b_front: f32) -> Option<(u64, u64)> {
+    let net = crossing_ways();
+    let mut sim = Simulation::new(&net, vec![]);
+    let a = vehicle(1, VehicleClass::Car, vec![0, 2], 40.0 - a_short - 2.2, 0.0, 2.2, 0.9);
+    let b = vehicle(2, VehicleClass::Car, vec![1, 3], 40.0 + b_front - 2.2, 0.0, 2.2, 0.9);
+    let mut cars = vec![a, b];
+    sim.update_positions(&net, &mut cars);
+    sim.tick(&net, DT, &mut cars);
+    let claim_of: Vec<Option<usize>> = (0..cars.len()).map(|i| sim.claims.iter().position(|(c, _)| c.vehicle == i)).collect();
+    assert!(claim_of.iter().all(|c| c.is_some()), "both claim the junction");
+    for k in 0..2 {
+        let other = cars[1 - k].id;
+        cars[k].state.speed = 0.0;
+        cars[k].last.wait_for = Some(other);
+        sim.claims[claim_of[k].unwrap()].0.speed = 0.0;
+    }
+    sim.negotiate(&mut cars, &claim_of, DT);
+    cars.iter().find_map(|c| c.ease_for.map(|(o, _, _)| (c.id, o)))
+}
+
+/// [J11-6c] An ease its own end test would undo at once is not started: B's rear is already past
+/// the crossing, the meeting place of the two (`Simulation::ease_holds`: the other past the first
+/// meeting place beyond the eased car's front ends the ease), so neither eases off; with B still
+/// short of it, one does.
+#[test]
+fn j11_6c_an_ease_that_would_end_at_once_is_not_started() {
+    assert!(negotiated(3.5, -3.5).is_some(), "two short of the crossing, refused for each other: nobody eased off");
+    // (B's front 8 m past the crossing: its rear 3.6 m past, the meeting place behind it)
+    assert_eq!(negotiated(3.5, 8.0), None, "an ease was started that ends at once");
 }

@@ -799,7 +799,10 @@ fn held_each_other_as(red: bool, wait_for: &[u64], blocked: &[u64], body_on: f32
     held_each_other_led(red, wait_for, blocked, &[], body_on, body_off, secs)
 }
 
-/// `held_each_other_as` with the cars in `led` following the other as their lead (`lead_id`).
+/// `held_each_other_as` with the cars in `led` following the other as their standing lead
+/// (`lead_id`; in their claim the lead, standing close ahead: `Claim::stuck`). Who is held
+/// back for whom is read from the claims (`sim::held_back_for`), as the ease's end reads it: the
+/// claims carry the bodies and leads set here.
 fn held_each_other_led(red: bool, wait_for: &[u64], blocked: &[u64], led: &[u64], body_on: f32, body_off: f32, secs: f32) -> Option<(u64, u64, usize, f32)> {
     let (net, mut cars) = side_and_main(6.0);
     let mut sim = Simulation::new(&net, vec![]);
@@ -819,6 +822,14 @@ fn held_each_other_led(red: bool, wait_for: &[u64], blocked: &[u64], led: &[u64]
             me.last.wait_for = wait_for.contains(&me.id).then_some(other);
             me.last.body_block = (blocked.contains(&me.id) && body_now).then_some(other);
             me.last.lead_id = led.contains(&me.id).then_some(other);
+        }
+        for k in 0..2 {
+            let (c, _) = &mut sim.claims[claim_of[k].unwrap()];
+            c.body_block = cars[k].last.body_block;
+            c.lead = led.contains(&cars[k].id).then_some(1 - k);
+            c.lead_gap = c.lead.map(|_| (2.0, 0.0));
+            c.stuck = c.lead.is_some();
+            c.speed = 0.0;
         }
         sim.negotiate(&mut cars, &claim_of, DT);
         if let Some(e) = cars.iter().find_map(|c| c.ease_for.map(|(o, j, _)| (c.id, o, j, t))) {

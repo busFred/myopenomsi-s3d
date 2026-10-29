@@ -508,6 +508,16 @@ pub fn held_back<'a>(claim: &dyn Fn(usize) -> &'a Claim, claim_of: &[Option<usiz
     false
 }
 
+/// `held_back` over the vehicles and their claims as they stand: the claim `k` cannot move off
+/// before the vehicle with index `to` has (the eases as the vehicles carry them). The one test
+/// of "held back" for both the choice of who eases off (`Simulation::negotiate`) and the end of
+/// an ease (`Simulation::ease_holds`), so an ease is never started that its own end test undoes.
+pub fn held_back_for<'a>(vehicles: &[Vehicle], claim: &dyn Fn(usize) -> &'a Claim, claim_of: &[Option<usize>], by_id: &HashMap<u64, usize>, k: usize, to: usize) -> bool {
+    let index_of = |id: u64| by_id.get(&id).copied();
+    let ease = |v: usize| vehicles[v].ease_for.and_then(|(p, _, _)| by_id.get(&p).copied());
+    held_back(claim, claim_of, &index_of, &ease, k, to)
+}
+
 /// Which of two vehicles (ids `a`, `b`) in a mutual hold at junction `j` eases off: a hash of
 /// the lower id, the higher and the junction, the same in every run.
 pub fn eases_off(a: u64, b: u64, j: usize) -> u64 {
@@ -1811,44 +1821,20 @@ impl Simulation {
     }
 
     /// The claims of the cars eased off in a mutual hold (`Vehicle::ease_for`): marked
-    /// `yields_now` for the other while it has not left the meeting places of the two; the
-    /// ease ends when it has, when either is gone or no longer claims the junction, when either
-    /// is held by a red light, after `EASE_MAX`, or when the other cannot move off before this
-    /// one (`held_back`: its standing lead or a body holds it, and that chain comes back to this
-    /// one, through a third car eased off for this one, say) while nothing physical holds this
-    /// one back for the other: such an ease closes a ring and lets nobody go, and without it the
-    /// resolver drops the other as a foe that waits for this one (`reservation::will_pass`).
+    /// `yields_now` for the other while the ease holds (`ease_holds`), the ease's clock run on;
+    /// the ease ends when it does not.
     fn eased_claims(&self, vehicles: &mut [Vehicle], claims: &mut [Claim], claim_of: &[Option<usize>], dt: f32) {
         let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         for i in 0..vehicles.len() {
-            let Some((oid, j, since)) = vehicles[i].ease_for else { continue };
-            let keep = (|| {
-                let k = claim_of[i]?;
-                let o = *by_id.get(&oid)?;
-                let ko = claim_of[o]?;
-                let (mine, theirs) = (&claims[k], &claims[ko]);
-                if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
-                    return None;
-                }
-                // (the eases as they stand: one ended earlier in this loop is no link)
-                let index_of = |id: u64| by_id.get(&id).copied();
-                let ease = |v: usize| vehicles[v].ease_for.and_then(|(p, _, _)| by_id.get(&p).copied());
+            if vehicles[i].ease_for.is_none() {
+                continue;
+            }
+            // (the eases as they stand: one ended earlier in this loop is no link)
+            let held = {
                 let claim = |c: usize| &claims[c];
-                if held_back(&claim, claim_of, &index_of, &ease, ko, i) && !held_back(&claim, claim_of, &index_of, &ease, k, o) {
-                    return None;
-                }
-                // (the other still short of, or in, the first meeting place of the two beyond
-                // where I stand, its rear not yet `JM_TIMEGAP_MINOR` s of its speed past that
-                // stretch's end. Not every meeting place of the chain: two merging
-                // run on along one way, and the ease must not hold the one behind until the other
-                // has left the whole object)
-                let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
-                let my_front = mine.s + mine.front;
-                let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
-                let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::JM_TIMEGAP_MINOR * theirs.speed.max(0.0));
-                inside.then_some((k, o))
-            })();
-            match keep {
+                self.ease_holds(vehicles, &claim, claim_of, &by_id, i)
+            };
+            match held {
                 Some((k, o)) => {
                     claims[k].yields_now = Some(o);
                     if let Some(e) = vehicles[i].ease_for.as_mut() {
@@ -1860,6 +1846,38 @@ impl Simulation {
         }
     }
 
+    /// Whether the ease of vehicle `i` (`Vehicle::ease_for`: the other, the junction, how long)
+    /// holds over `claims`: its claim and the other's at that junction, the claim index of the
+    /// eased car and the other's vehicle index. It does not when either is gone or no longer
+    /// claims the junction, when either is held by a red light, after `EASE_MAX`, when the other
+    /// cannot move off before this one while this one is not held back so for the other
+    /// (`held_back` both ways: such an ease closes a ring and lets nobody go, and without it the
+    /// resolver drops the other as a foe that waits for this one, `reservation::will_pass`), or
+    /// when the other has left the first meeting place of the two beyond this one's front.
+    fn ease_holds<'a>(&self, vehicles: &[Vehicle], claim: &dyn Fn(usize) -> &'a Claim, claim_of: &[Option<usize>], by_id: &HashMap<u64, usize>, i: usize) -> Option<(usize, usize)> {
+        let (oid, j, since) = vehicles[i].ease_for?;
+        let k = claim_of[i]?;
+        let o = *by_id.get(&oid)?;
+        let ko = claim_of[o]?;
+        let (mine, theirs) = (claim(k), claim(ko));
+        if mine.junction != j || theirs.junction != j || mine.light_red || theirs.light_red || since > EASE_MAX {
+            return None;
+        }
+        if held_back_for(vehicles, claim, claim_of, by_id, ko, i) && !held_back_for(vehicles, claim, claim_of, by_id, k, o) {
+            return None;
+        }
+        // (the other still short of, or in, the first meeting place of the two beyond
+        // where I stand, its rear not yet `JM_TIMEGAP_MINOR` s of its speed past that
+        // stretch's end. Not every meeting place of the chain: two merging
+        // run on along one way, and the ease must not hold the one behind until the other
+        // has left the whole object)
+        let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
+        let my_front = mine.s + mine.front;
+        let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
+        let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::JM_TIMEGAP_MINOR * theirs.speed.max(0.0));
+        inside.then_some((k, o))
+    }
+
     /// Two vehicles that hold each other (each the other's `wait_for` or `body_block`), both
     /// standing, at a junction where their ways meet, neither at a red light: one eases off
     /// (`Vehicle::ease_for`), the other goes on by the ordinary rules - bodies, other foes and
@@ -1868,10 +1886,11 @@ impl Simulation {
     /// itself), else, one of them held by the other's
     /// body only, after `MUTUAL_HOLD` times the lower id's `mutual_jitter`; a hold not seen
     /// for less than `MUTUAL_GAP` keeps its clock. The one that eases off: of two where only
-    /// one is held back for the other - the other's body or the other as its lead, or a chain
-    /// of standing leads, bodies and eases that comes back to the other (`held_back`) - that one
-    /// (it cannot go anyway; the other waits for it at the junction); else by `eases_off`, the
-    /// same in every run.
+    /// one is held back for the other (`held_back_for`: the other's body across its way, the
+    /// other as its standing lead, or a chain of standing leads, bodies and eases that comes back
+    /// to the other; the test the ease's end reads, `ease_holds`) - that one (it cannot go
+    /// anyway; the other waits for it at the junction); else by `eases_off`, the same in every
+    /// run. An ease `ease_holds` would end at once is not started.
     pub fn negotiate(&mut self, vehicles: &mut [Vehicle], claim_of: &[Option<usize>], dt: f32) {
         let by_id: HashMap<u64, usize> = vehicles.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
         let holds = |v: &Vehicle, id: u64| v.last.wait_for == Some(id) || v.last.body_block == Some(id);
@@ -1925,17 +1944,14 @@ impl Simulation {
             if !meet {
                 continue;
             }
-            // (behind the other: held by its body, or following it as its lead, or held back for
-            // it through a chain of standing leads, bodies and eases (`held_back`) - that one
-            // cannot go anyway; easing the one in front of a nose-to-tail pair would leave it
-            // standing `EASE_MAX` for the one behind it, and easing the one a chain comes back
-            // to closes a ring)
+            // (held back for the other: its body, its standing lead, or a chain of standing
+            // leads, bodies and eases that comes back to the other, `held_back_for`, the test
+            // the ease's end reads - that one cannot go anyway, and easing the one a chain comes
+            // back to closes a ring)
             let (ida, idb) = (vehicles[a].id, vehicles[b].id);
-            let index_of = |id: u64| by_id.get(&id).copied();
-            let eased = |v: usize| vehicles[v].ease_for.and_then(|(p, _, _)| by_id.get(&p).copied());
             let claim = |c: usize| &self.claims[c].0;
-            let blocked_a = vehicles[a].last.body_block == Some(idb) || vehicles[a].last.lead_id == Some(idb) || held_back(&claim, claim_of, &index_of, &eased, ka, b);
-            let blocked_b = vehicles[b].last.body_block == Some(ida) || vehicles[b].last.lead_id == Some(ida) || held_back(&claim, claim_of, &index_of, &eased, kb, a);
+            let blocked_a = held_back_for(vehicles, &claim, claim_of, &by_id, ka, b);
+            let blocked_b = held_back_for(vehicles, &claim, claim_of, &by_id, kb, a);
             let ease = if blocked_a != blocked_b {
                 if blocked_a {
                     a
@@ -1948,7 +1964,14 @@ impl Simulation {
                 b
             };
             let other = if ease == a { idb } else { ida };
+            // (an ease its own end test would undo at once - the other already past the first
+            // meeting place of the two beyond this one's front - is not started: it would only
+            // be counted)
             vehicles[ease].ease_for = Some((other, j, 0.0));
+            if self.ease_holds(vehicles, &claim, claim_of, &by_id, ease).is_none() {
+                vehicles[ease].ease_for = None;
+                continue;
+            }
             vehicles[a].mutual = None;
             vehicles[b].mutual = None;
             vehicles[a].mutual_gap = 0.0;
