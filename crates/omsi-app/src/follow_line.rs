@@ -652,4 +652,91 @@ mod tests {
         assert!(!on_red, "drove past the red light");
         assert!(ai[0].state.lane == 3, "never got through the bend after the green ({t:.0} s, lane {})", ai[0].state.lane);
     }
+
+    /// End to end as the harness runs it: `LineFollower::place` asks the timetable for the
+    /// player's trip (`Schedule::drive_player_trip`), which puts the departure's AI vehicle
+    /// on the trip's lane under the player's bus and hands it the departure there
+    /// (`spawn_departure(.., here = true)`: the route from the lane it stands on, the stops
+    /// from there on, the station behind it none of them); `Traffic::tick` drives it (its
+    /// `BusService`, the light, its body) and `LineFollower::pose` puts the player's bus where
+    /// it is: within its lane, at its stop with the doors open, at the red light, through the
+    /// bend after the green. The traffic's network, the light and the stop objects come from
+    /// a world as its tiles bring them (`World::lanes`, `traffic_lights`, `object_positions`).
+    #[test]
+    fn the_follower_puts_the_players_trip_on_where_its_bus_stands_and_drives_it_to_its_stop_and_the_light() {
+        use crate::scene::World;
+        let dir = std::env::temp_dir().join(format!("openomsi-follow-line-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("global.cfg"), "[name]\nFollow\n").unwrap();
+        let world = World::open(&dir, &dir.join("global.cfg"), 20261001).unwrap();
+        world.lanes.lock().extend(route().lanes);
+        world.lane_tiles.lock().push((0, 0));
+        // red for 90 s, then green
+        world.traffic_lights.lock().push(TrafficLightController::new(vec![vec![(0, 90.0), (6, 90.0)]], 180.0));
+        // stations at the kerb (on the right): 30 m behind the player's bus, 30 m ahead of it, far east
+        let positions = [(6, DVec3::new(2.0, 0.0, 0.0)), (7, DVec3::new(2.0, 60.0, 0.0)), (8, DVec3::new(1500.0, 198.0, 0.0))];
+        for (id, p) in positions {
+            world.object_positions.lock().insert(id, (p, [0.0; 3]));
+        }
+        let mut traffic = Traffic::new(&dir, &world, 0).unwrap();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(omsi_render::Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let departure = 8.0 * 3600.0;
+        let steps = [(1, 0, 150.0), (9, 0, 20.0), (2, 0, 47.0), (3, 0, 1970.0)];
+        let (mut schedule, duty) = crate::schedule::tests::one_trip(&world, "t104", &steps, &[6, 7, 8], departure, bus().ty.clone());
+        // (late on its trip: it leaves its stop once its people are aboard)
+        traffic.day_time = departure + 400.0;
+        let net = &traffic.net;
+        let lane_of = |id: i64| net.by_key[&LaneKey { tile: (0, 0), id, path: 0 }][0];
+        let (first, last) = (lane_of(1), lane_of(3));
+        let mut player = bus();
+        let (p, h) = net.lanes[first].at(30.0);
+        (player.position, player.heading) = (p, h as f64);
+        let mut follower = LineFollower::default();
+        follower.place(0.0, &mut schedule, &duty, &world, &mut traffic, &renderer, &mut scene, &player);
+        let id = follower.car.unwrap_or_else(|| panic!("not put on the trip: {:?}", follower.refused));
+        let c = traffic.cars.iter().find(|c| c.id == id).unwrap();
+        // on the lane under the player's bus, where it stands, its route from there
+        assert_eq!((c.ai.state.lane, c.ai.state.route.first()), (first, Some(&first)));
+        assert!((c.ai.state.s - 30.0).abs() < 0.5, "put at s {:.1}", c.ai.state.s);
+        let stops: Vec<i64> = c.bus.as_ref().unwrap().stops.iter().map(|s| s.id).collect();
+        assert_eq!(stops, vec![7, 8], "the stops from the bus on");
+        let half_lane = 3.5 / 2.0;
+        let (mut worst, mut served_at, mut stood_at_red, mut on_red) = (0.0f64, None, false, false);
+        let mut t = 0.0f32;
+        loop {
+            traffic.tick(DT, None);
+            assert!(follower.pose(t, &traffic, &mut player), "lost at {t:.1} s: {:?}", follower.lost);
+            let c = traffic.cars.iter().find(|c| c.id == id).unwrap();
+            let st = &c.ai.state;
+            if st.lane == last && st.s > 50.0 || t > 300.0 {
+                break;
+            }
+            let off = st.route.iter().filter_map(|&l| traffic.net.lanes[l].nearest_point(player.position)).map(|(_, d)| d).fold(f64::MAX, f64::min);
+            worst = worst.max(off);
+            assert!((player.physics.speed - st.speed).abs() < 1e-6);
+            if c.at_stop() && player.physics.speed < 0.3 && served_at.is_none() {
+                served_at = Some((t, player.position.y));
+            }
+            let red = traffic.sim.lights[0].state(0) < 6;
+            if red && st.lane == first && st.speed < 0.3 && c.ai.last.why == Why::Light {
+                stood_at_red = true;
+            }
+            if red && st.lane != first {
+                on_red = true;
+            }
+            t += DT;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(t <= 300.0, "never got through the bend after the green");
+        assert!(worst <= half_lane, "{worst:.2} m off its lane's middle line");
+        let (when, y) = served_at.expect("never stood at its stop with the doors open");
+        assert!((y - 60.0).abs() < 3.0, "served its stop at y {y:.1} ({when:.1} s)");
+        assert!(stood_at_red, "never stood at the red light");
+        assert!(!on_red, "drove past the red light");
+    }
 }

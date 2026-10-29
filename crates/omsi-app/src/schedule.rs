@@ -5586,6 +5586,57 @@ impl PlayerDuty {
 pub(crate) mod tests {
     use super::*;
 
+    /// A timetable of one trip, `name`, on a track of `steps` (tile (0, 0): map id, path,
+    /// length) past the stations `stations` (stop objects, where the world has them), leaving
+    /// at `departure` (s of the day) on tour 1 of line 104 of AI group "depot", whose depot
+    /// has the one vehicle `ty`; and the player's duty on that tour and trip (the timetable
+    /// leaves the tour to the player). For the harness's tests outside this module
+    /// (`follow_line`).
+    pub(crate) fn one_trip(world: &World, name: &str, steps: &[(i64, u16, f64)], stations: &[i64], departure: f64, ty: Arc<VehicleType>) -> (Schedule, PlayerDuty) {
+        let mut s = Schedule::new_for_lists(&world.root, world, &omsi_sim::SimClock::default());
+        let trip = omsi_timetable::Trip { name: name.into(), display_name: name.into(), terminus: "T".into(), line: "104".into(), stations: stations.to_vec(), ..Default::default() };
+        let entries = steps.iter().map(|&(id, path, len)| omsi_timetable::TrackEntry { values: vec![id as f64, path as f64, 0.0, 0.0, len] }).collect();
+        s.data.tracks = vec![omsi_timetable::Track { path: format!("TTData/{name}.ttr").into(), entries }];
+        s.times = vec![vec![TripTimes::new(stations, None, &|_, _| None)]];
+        s.data.trips = vec![trip];
+        s.departures = vec![Departure { time: departure, trip: 0, profile: 0, line: "104".into(), ai_group: "depot".into(), tour: "1".into(), mask: 1023, spawned: false }];
+        s.trip_departures = vec![vec![0]];
+        s.tour_prev = vec![None];
+        s.tour_next = vec![None];
+        s.tile_coords = vec![(0, 0)];
+        s.depots.insert("depot".into(), vec![(ty, Vec::new(), None)]);
+        s.player_tour = Some(("104".into(), "1".into()));
+        let tt = s.times[0][0].clone();
+        let stops = stations
+            .iter()
+            .zip(&tt.stations)
+            .map(|(&id, &(arr, dep))| PlannedStop { object_id: id, name: format!("s{id}"), arr: departure + arr, dep: departure + dep, position: world.object_positions.lock().get(&id).map(|p| p.0), dir: StopDir::default(), stops: true })
+            .collect();
+        let planned = PlannedTrip { name: name.into(), line: "104".into(), terminus: "T".into(), departure, end: departure + tt.duration, stops };
+        let duty = PlayerDuty {
+            line: "104".into(),
+            tour: "1".into(),
+            trips: vec![planned],
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            served_terminus: None,
+            left_late: None,
+            held_back: false,
+            placed: true,
+            trip_changed: false,
+            skipped: None,
+            picked: true,
+            first_update: None,
+            heading: 0.0,
+            pos: None,
+        };
+        (s, duty)
+    }
+
     /// The first stop behind a bus handed its next trip: where it stands when it
     /// creeps, where it comes to rest braking gently on the move - and passed, not clamped
     /// to the lane's end, when that rest lies beyond its lane.
