@@ -2954,11 +2954,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 let at = latched.unwrap_or(st.front + end_dist - room);
                 let brake = v * v / (2.0 * dp.comfort_brake);
                 let returns = !dead || end_dist >= brake;
-                // (standing before it, or within `REST_SHORT` past it, it stays - the stop alone
-                // holds it: from rest the brake test places no stop a centimetre ahead,
+                // (standing there it stays - the stop alone holds it, landed within `REST_SHORT`
+                // either side of it: from rest the brake test places no stop a centimetre ahead,
                 // the car crept on, stopped again past it, and each creep took it further until it
                 // was past the stop's place and drove on to the end, round7j q84 at 75 s)
-                let holds = v < STANDING_SPEED && at > st.front - REST_SHORT;
+                // (a car standing further short of it - behind its own lead in a queue, or behind
+                // a leader there it drops back behind - is held by that, not by the stop: no hold,
+                // and none counted, `sim::STRATEGIC_HOLD_MS`)
+                let holds = v < STANDING_SPEED && (at - st.front).abs() <= REST_SHORT;
                 let at = if holds { at.max(st.front) } else { at };
                 if latched.is_some() || holds || (returns && at > st.front - 0.3 && at - st.front <= brake) {
                     min_stop(&mut out.stop, &mut out.why, Some(at), Why::Merge);
