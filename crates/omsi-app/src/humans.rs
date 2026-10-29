@@ -1821,7 +1821,7 @@ impl PedWalk {
         self.from_wall = false;
     }
 
-    /// Round where they stand on a pavement leg (`BoxOutcome::Wall`, `edge_turn`): back along it to the end
+    /// Round where they stand on a pavement leg (`BoxOutcome::Wall`): back along it to the end
     /// it came from, and on from there as a stroll goes on (`plan_next_leg`: never onto a closed path,
     /// straight back along the path only at a dead end); a closed end counted (`closed_ends`, `pocket`).
     fn turn_round(&mut self, net: &Network) {
@@ -2360,11 +2360,12 @@ fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, cent
     far_from(center, others, p, STROLL_RADIUS) && !figure_in_sight(eye, viewer, center, p)
 }
 
-/// Whether a stroller at the loaded ground's edge at `p` leaves there rather than turning
-/// (`edge_turn`): out of the player's sight (`figure_in_sight`) and farther than
-/// `traffic::NEVER_VANISH_WITHIN` from every player (`center`, `others`), the distance within which
-/// no car vanishes seen or not (the mirrors, a turn of the head).
-fn leaves_at_edge(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
+/// Whether somebody at `p` may be taken away: out of the player's sight (`figure_in_sight`) and
+/// farther than `traffic::NEVER_VANISH_WITHIN` from every player (`center`, `others`), the distance
+/// within which no car vanishes seen or not (the mirrors, a turn of the head). The one rule for
+/// every removal of a person but a walker leaving at the edge of the ground (`at_edge`, the
+/// user's decision P-D2) and a stop's going with its tile (`Humans::tiles_changed`).
+fn goes_unseen(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
     !figure_in_sight(eye, viewer, center, p) && far_from(center, others, p, crate::traffic::NEVER_VANISH_WITHIN)
 }
 
@@ -2424,9 +2425,9 @@ struct Decision {
     walk_rng: u64,
     /// `Person::approach`.
     approach: Option<(DVec2, f32, f32)>,
-    /// Turned round at the loaded ground's edge (`Humans::edge_turns`).
-    edge_turn: bool,
-    /// They would go, but the player could see it (`leaves_at_edge` refused): they stay
+    /// Left at the edge of the ground (`at_edge`), in sight or not (`Humans::edge_departures`).
+    edge: bool,
+    /// They would go, but the player could see it (`goes_unseen` refused): they stay
     /// (`Humans::kept_for_sight`).
     kept: bool,
 }
@@ -2445,7 +2446,7 @@ impl Decision {
             walk_pace: p.walk_pace,
             walk_rng: p.walk_rng,
             approach: p.approach,
-            edge_turn: false,
+            edge: false,
             kept: false,
         }
     }
@@ -2502,22 +2503,23 @@ impl DecideCtx<'_> {
     fn decide(&self, p: &Person, dt: f32, world: &World, net: Option<&Network>, lights: Option<&LightsOf>, cars: &[SeenCar], yields: &mut YieldBook) -> Decision {
         let mut d = Decision::of(p);
         let pos2 = p.position.truncate();
-        // somebody walking on onto ground that is not loaded goes only as a vehicle at the loaded
-        // tiles' edge does: out of the player's sight and beyond the distance within which no car
-        // vanishes seen or not (`leaves_at_edge`). The stroll network ends at the edge itself
-        // (`edge_turn`, `PedNet::unloaded`), so only a step past it, or a crossing begun before
-        // the tile beyond it went, brings one onto unloaded ground; within that distance, or in
-        // sight, their walk goes on from there
-        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !world.has_ground(pos2.x, pos2.y) && leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
+        // somebody walking on onto ground that is not loaded (past the map's last tile, or a tile
+        // not loaded) leaves there, in sight or not (the user's decision P-D2; SUMO: a person
+        // arriving at the network's fringe leaves it): the edge of the ground is an exit of the
+        // stroll network (`at_edge`, `PedNet::unloaded`). Never on the carriageway: somebody on a
+        // crossing walks it to its end first and leaves there
+        let crossing_now = matches!(&p.state, State::Strolling(w) if w.cross.is_some_and(|c| c.on(w.leg)));
+        if p.place == Place::Ground && p.vel.length_squared() > 1e-4 && !crossing_now && !world.has_ground(pos2.x, pos2.y) {
             d.gone = true;
+            d.edge = true;
             return d;
         }
         match &p.state {
             State::Strolling(walk) => {
                 // (with no street network there is no walk: they go as anybody does, out of
-                // sight and beyond NEVER_VANISH_WITHIN, `leaves_at_edge`; else they stand)
+                // sight and beyond NEVER_VANISH_WITHIN, `goes_unseen`; else they stand)
                 let Some(net) = net else {
-                    d.gone = leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
+                    d.gone = goes_unseen(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
                     d.kept = !d.gone;
                     return d;
                 };
@@ -2536,22 +2538,15 @@ impl DecideCtx<'_> {
                         return d;
                     }
                 }
-                let mut walk = walk.clone();
-                if let Some(pn) = self.ped {
-                    d.edge_turn = edge_turn(pn, net, &mut walk);
+                // (at the edge of the ground they leave, in sight or not: `at_edge`)
+                if self.ped.is_some_and(|pn| at_edge(pn, walk)) {
+                    d.gone = true;
+                    d.edge = true;
+                    return d;
                 }
+                let mut walk = walk.clone();
                 d.want = self.walk_want(p, &mut d, &mut walk, net, lights, cars, dt, yields);
                 d.state = Some(State::Strolling(walk));
-                // (at the loaded ground's edge out of the player's sight and beyond the distance
-                // within which no car vanishes seen or not (`traffic::NEVER_VANISH_WITHIN`: the
-                // mirrors and a turn of the head) they leave, as a vehicle at the loaded tiles'
-                // edge does (`removal::RemoveRule::DeadEnd`; SUMO: a person arriving at the
-                // network's fringe leaves it); within it they turn as in sight. Turned back
-                // everywhere, the strollers of a whole edge walked back into the first junction's
-                // kerbs - Jiangzhaikou's queues of 107-139 waiters against 36-38)
-                if d.edge_turn && leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
-                    d.gone = true;
-                }
                 d
             }
             State::Standing => {
@@ -2560,7 +2555,7 @@ impl DecideCtx<'_> {
                 // the street does not count: they walked into the bus to reach it). With none
                 // within reach they go as a vehicle at the loaded tiles' edge goes, out of the
                 // player's sight and beyond the distance within which nothing vanishes seen or
-                // not (`leaves_at_edge`, `traffic::NEVER_VANISH_WITHIN`): the one rule for
+                // not (`goes_unseen`, `traffic::NEVER_VANISH_WITHIN`): the one rule for
                 // taking somebody away. Until then they stand where they are and look again
                 // (`kept`; as in OMSI 2 the spawner puts a pedestrian where one belongs)
                 let t = p.t_state;
@@ -2576,7 +2571,7 @@ impl DecideCtx<'_> {
                         return d;
                     }
                 }
-                d.gone = leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
+                d.gone = goes_unseen(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
                 d.kept = !d.gone;
                 d
             }
@@ -2859,7 +2854,7 @@ fn stroll_candidate(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>,
 }
 
 /// The longest piece (m) that lies between two pieces proper of one crossing without ending it: a
-/// median (`crossing_span`, `PedNet::crossing_chain`).
+/// median (`crossing_span`).
 const CROSSING_MEDIAN_MAX: f32 = 6.0;
 
 /// The crossing starting with `walk.legs[start]`: the pieces on from it that
@@ -2886,8 +2881,9 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
                 break;
             }
             let prev = walk.legs[k - 1];
-            // (never onto unloaded ground: nobody is turned on a crossing, `edge_turn`)
-            let Some(n) = ped.straight_on(net, &prev, PED_STRAIGHT_ON_TURN, |p, l| !p.unloaded.contains_key(&l) && (core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT)) else { break };
+            // (onto unloaded ground too: they walk the crossing to its end and leave at the edge
+            // beyond it, `at_edge`)
+            let Some(n) = ped.straight_on(net, &prev, PED_STRAIGHT_ON_TURN, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT) else { break };
             walk.legs.push(n);
         }
         let leg = walk.legs[k];
@@ -2989,18 +2985,14 @@ struct PedNet {
     /// as a walking area edge SUMO leaves unconnected; the way on (`next_leg`) and the
     /// strollers' placer never take them.
     walls: HashSet<usize>,
-    /// The paths that run onto ground that is not loaded, with their stretches on it
-    /// (`unloaded_stretches`): the stroll network ends at the loaded ground's edge (the network
-    /// keeps the lanes of tiles unloaded since, and nobody walks where there is no ground). Such a
-    /// path stays open up to the edge: the way on takes it, the placer uses its loaded stretches,
-    /// and a stroller on it turns or leaves at the edge itself (`edge_turn`). Marked again when
-    /// the tiles or the network change (`mark_unloaded`, `unloaded_at`).
+    /// The paths that run onto ground that is not loaded (past the map's last tile, or a tile not
+    /// loaded), with their stretches on it (`unloaded_stretches`): the edge of the ground is an
+    /// exit of the stroll network (the network keeps the lanes of tiles unloaded since, and nobody
+    /// walks where there is no ground). Such a path is open up to the edge: the way on takes it,
+    /// a crossing onto it is walked, the placer uses its loaded stretches, and a stroller on a
+    /// pavement leaves at the edge itself (`at_edge`), one on a crossing at the crossing's end.
+    /// Marked again when the tiles or the network change (`mark_unloaded`, `unloaded_at`).
     unloaded: HashMap<usize, Vec<(f32, f32)>>,
-    /// The crossing pieces among `unloaded` (`core_piece`) and the pieces of their crossings
-    /// (`crossing_chain`): closed ends of the stroll network as
-    /// `walls` are, at their kerb, because somebody on a crossing walks it to its end and is never
-    /// turned on it (`edge_turn`), so a crossing onto unloaded ground is never begun.
-    unloaded_crossings: HashSet<usize>,
     /// The tiles' generation and the network's lane count `unloaded` was marked for.
     unloaded_at: (u64, usize),
 }
@@ -3020,7 +3012,6 @@ impl PedNet {
             built: 0,
             walls: HashSet::new(),
             unloaded: HashMap::new(),
-            unloaded_crossings: HashSet::new(),
             unloaded_at: (u64::MAX, 0),
         };
         p.extend(net);
@@ -3192,10 +3183,9 @@ impl PedNet {
     }
 
     /// Whether path `lane` is a closed end of the stroll network: a map-parked car closes it
-    /// (`walls`) or it is a crossing piece that runs onto ground that is not loaded
-    /// (`unloaded_crossings`). A pavement onto unloaded ground is open up to the edge (`unloaded`).
+    /// (`walls`). A path onto unloaded ground is open up to the edge, an exit (`unloaded`).
     fn closed(&self, lane: usize) -> bool {
-        self.walls.contains(&lane) || self.unloaded_crossings.contains(&lane)
+        self.walls.contains(&lane)
     }
 
     /// Whether a path other than `lane` leaving junction `node` is closed (`closed`).
@@ -3204,9 +3194,8 @@ impl PedNet {
     }
 
     /// Mark the paths that run onto ground that is not loaded with their stretches on it
-    /// (`unloaded`) and the crossing pieces among them (`unloaded_crossings`), when the tiles'
-    /// `generation` or the network changed since the last marking.
-    fn mark_unloaded(&mut self, net: &Network, generation: u64, tile: f64, loaded: &dyn Fn(f64, f64) -> bool, lights: Option<&dyn PedLights>) {
+    /// (`unloaded`), when the tiles' `generation` or the network changed since the last marking.
+    fn mark_unloaded(&mut self, net: &Network, generation: u64, tile: f64, loaded: &dyn Fn(f64, f64) -> bool) {
         if self.unloaded_at == (generation, net.lanes.len()) {
             return;
         }
@@ -3214,49 +3203,6 @@ impl PedNet {
         let mut keys: Vec<usize> = self.ends.keys().copied().filter(|&l| l < net.lanes.len()).collect();
         keys.sort_unstable();
         self.unloaded = keys.into_iter().filter_map(|l| Some((l, unloaded_stretches(&net.lanes[l], tile, loaded))).filter(|(_, v)| !v.is_empty())).collect();
-        // a crossing is begun at its kerb and walked as one span (`crossing_span`): when any piece
-        // of its chain (`crossing_chain`, wider than the span) runs onto unloaded ground the whole
-        // chain is closed at its kerb, so nobody is left standing mid-road on a loaded first piece
-        let mut crossings: HashSet<usize> = HashSet::new();
-        for l in self.unloaded.keys().copied().filter(|&l| core_piece(self, net, lights, l)).collect::<Vec<_>>() {
-            if crossings.insert(l) {
-                crossings.extend(self.crossing_chain(net, lights, l));
-            }
-        }
-        self.unloaded_crossings = crossings;
-    }
-
-    /// The pieces proper of the crossing that `lane` belongs to, either way along it: a piece that
-    /// goes on straight (`PED_STRAIGHT_ON_TURN`) from the end of another, with pieces of at most
-    /// `CROSSING_MEDIAN_MAX` m (a median) between, following every such branch. Wider than
-    /// `crossing_span`, which also stops where the governing light changes and at a lit stub: the
-    /// chain can take in a neighbouring loaded crossing, which is then closed too (its walkers turn
-    /// back at the kerb).
-    fn crossing_chain(&self, net: &Network, lights: Option<&dyn PedLights>, lane: usize) -> HashSet<usize> {
-        let mut seen: HashSet<usize> = HashSet::from([lane]);
-        let mut chain: HashSet<usize> = HashSet::new();
-        let mut todo: Vec<(usize, f32)> = vec![(lane, 0.0)];
-        while let Some((l, pending)) = todo.pop() {
-            let Some(&(a, b)) = self.ends.get(&l) else { continue };
-            for (node, h_in) in [(b, net.lanes[l].end_heading() as f64), (a, wrap_heading(net.lanes[l].start_heading() as f64 + 180.0))] {
-                let leaving = self.out.get(node).into_iter().flatten().copied().chain(self.against.get(node).into_iter().flatten().map(|&c| (c, false)));
-                for (c, fwd) in leaving {
-                    let cl = &net.lanes[c];
-                    let h = if fwd { cl.start_heading() as f64 } else { wrap_heading(cl.end_heading() as f64 + 180.0) };
-                    if !seen.contains(&c) && angle_between(h_in, h) <= PED_STRAIGHT_ON_TURN {
-                        if core_piece(self, net, lights, c) {
-                            seen.insert(c);
-                            chain.insert(c);
-                            todo.push((c, 0.0));
-                        } else if pending + cl.length() <= CROSSING_MEDIAN_MAX {
-                            seen.insert(c);
-                            todo.push((c, pending + cl.length()));
-                        }
-                    }
-                }
-            }
-        }
-        chain
     }
 
     /// Whether `lane` ends at junction `node` in a closed end: a closed path leaves the node
@@ -3266,8 +3212,8 @@ impl PedNet {
     }
 
     /// A leg leaving junction `node`, not back along `came` and never a closed path
-    /// (`closed`: walled, or a crossing piece onto unloaded ground; a pavement onto unloaded
-    /// ground is taken, and its stroller turns or leaves at the edge, `edge_turn`). At a dead end
+    /// (`closed`: walled; a path onto unloaded ground is taken, and its stroller leaves at the
+    /// edge, `at_edge`). At a dead end
     /// (no other way, or all closed):
     /// on over a one-way crossing piece ending there against its way, else back along `came`.
     fn next_leg(&self, net: &Network, node: usize, came: usize, pick: u64) -> Option<Leg> {
@@ -3315,7 +3261,7 @@ impl PedNet {
         // decided at the kerb like any crossing (turned round there, walkers stepped onto the
         // lane edge and went back over the crossing they had just walked, as on BeijingCity's
         // one-way chain 6132-6142); the one most nearly ahead
-        let against: Vec<(usize, bool)> = self.against.get(node).map(|v| v.iter().filter(|&&l| !twin(l) && !self.unloaded.contains_key(&l)).map(|&l| (l, false)).collect()).unwrap_or_default();
+        let against: Vec<(usize, bool)> = self.against.get(node).map(|v| v.iter().filter(|&&l| !twin(l)).map(|&l| (l, false)).collect()).unwrap_or_default();
         let (lane, fwd) = if list.is_empty() && !against.is_empty() {
             *against.iter().min_by(|a, b| angle_between(heading_in, leaving(a)).total_cmp(&angle_between(heading_in, leaving(b)))).unwrap()
         } else if list.is_empty() {
@@ -4579,7 +4525,7 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
 }
 
 /// Whether strollers may be put down on path `lane`: it is not closed (no map-parked car closes
-/// it, it is no crossing piece onto unloaded ground: `PedNet::closed`), and it is not a pocket
+/// it: `PedNet::closed`), and it is not a pocket
 /// (both its ends closed, `PedNet::closed_end`). On a path onto unloaded ground only its loaded
 /// stretches are used (`loaded_metres`, `loaded_point`).
 fn stroll_path_open(ped: Option<&PedNet>, net: &Network, lane: usize) -> bool {
@@ -4651,41 +4597,28 @@ fn loaded_point(d0: f32, d1: f32, stretches: &[(f32, f32)], u: f32) -> f32 {
     (at + left).min(d1)
 }
 
-/// A stroller on a pavement leg that runs onto unloaded ground (`PedNet::unloaded`) turns round
-/// at the loaded ground's edge itself, as at a wall (`PedWalk::turn_round`; the edge is a closed
-/// end of the stroll network): once at the edge ahead of them on the leg they walk (within
-/// `KERB_AT`, a leg's end), or past it (a frame's step is longer than `KERB_AT`), decided on that
-/// leg and where they are along it (`walk.s`). The way back leads away from the edge (and is the
-/// way back from a closed end, `from_wall`, so the stretch they may stand in does not count),
-/// which never turns them again. Never on a crossing: somebody on one walks it to its end (the
-/// light-change rule keeps applying), and no crossing onto unloaded ground is begun
-/// (`PedNet::unloaded_crossings`, `crossing_span`). True when they turned (out of the player's
-/// sight and reach they leave there instead, `DecideCtx::decide`).
-fn edge_turn(ped: &PedNet, net: &Network, walk: &mut PedWalk) -> bool {
+/// Whether a stroller on a pavement leg that runs onto unloaded ground (`PedNet::unloaded`) is at
+/// the edge of the ground, where they leave in sight or not (the user's decision P-D2; SUMO: a
+/// person arriving at the network's fringe leaves it, `DecideCtx::decide`): at the edge ahead of
+/// them on the leg they walk (within `KERB_AT`, a leg's end), or past it (a frame's step is longer
+/// than `KERB_AT`), decided on that leg and where they are along it (`walk.s`). On the way back
+/// from a closed end (`from_wall`) the stretch they stand in is behind them. Never on a crossing:
+/// somebody on one walks it to its end (the light-change rule keeps applying) and leaves on the
+/// pavement beyond, so nobody leaves on the carriageway.
+fn at_edge(ped: &PedNet, walk: &PedWalk) -> bool {
     let Some(&leg) = walk.legs.get(walk.leg) else { return false };
     let Some(stretches) = ped.unloaded.get(&leg.lane) else { return false };
-    if walk.pocket || walk.cross.is_some_and(|c| c.on(walk.leg)) {
+    if walk.cross.is_some_and(|c| c.on(walk.leg)) {
         return false;
     }
     let here = leg.dist(walk.s.min(leg.len()));
     let fwd = leg.b >= leg.a;
-    // (how far ahead on the leg the first stretch begins, 0 for one they stepped into; on the way
-    // back from a closed end the stretch they stand in is behind them)
-    let edge = stretches
-        .iter()
-        .filter_map(|&(s0, s1)| {
-            let (near, far, from) = if fwd { (s0 - here, s1 - here, leg.b - here) } else { (here - s1, here - s0, here - leg.b) };
-            let ahead = near >= 0.0 || (far > 0.0 && !walk.from_wall);
-            (ahead && near < from).then_some(near.max(0.0))
-        })
-        .min_by(f32::total_cmp);
-    match edge {
-        Some(ahead) if ahead <= KERB_AT => {
-            walk.turn_round(net);
-            true
-        }
-        _ => false,
-    }
+    // (how far ahead on the leg the first stretch begins, 0 for one they stepped into)
+    stretches.iter().any(|&(s0, s1)| {
+        let (near, far, from) = if fwd { (s0 - here, s1 - here, leg.b - here) } else { (here - s1, here - s0, here - leg.b) };
+        let ahead = near >= 0.0 || (far > 0.0 && !walk.from_wall);
+        ahead && near < from && near.max(0.0) <= KERB_AT
+    })
 }
 
 /// Where the people waiting for crossing `c` (its pieces among `legs`) stand: before its first
@@ -5870,11 +5803,14 @@ pub struct Humans {
     /// How many strollers turned round at a map-parked car (`BoxOutcome::Wall`), by
     /// `WALL_TURN_CELL` cell of where they stood (the strollers profile line reports them).
     wall_turns: HashMap<(i64, i64), u32>,
-    /// How many times a stroller turned round at the loaded ground's edge itself (`edge_turn`) in
-    /// the player's sight or within `traffic::NEVER_VANISH_WITHIN`, and how many out of both left
-    /// there instead (`DecideCtx::decide`); the strollers profile line reports both.
-    edge_turns: u64,
-    edge_gone: u64,
+    /// Counted for the gate (`summary`, the strollers profile line): the walkers who left at the
+    /// edge of the ground (`Decision::edge`), (in the player's sight, out of it).
+    edge_departures: (u64, u64),
+    /// The people leaving at the edge this tick (`take_decision`), told apart by `retire`.
+    edge_leaving: HashSet<u32>,
+    /// The people who left at the edge since the start of this tick (`retire`), for the offscreen
+    /// harness's watch (`left_at_edge`).
+    edge_left: Vec<u32>,
     hidden: Vec<usize>,
     /// GPU side of the human types, shared by everyone of a type: textures by file and the
     /// materials of every (type, mesh) - each person used to upload its own copies - and
@@ -6068,15 +6004,17 @@ pub struct Humans {
     stop_carry: HashMap<i64, StopCarry>,
     /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
     /// could see then (`figure_in_sight`; every removal rule of the people's own asks for out of
-    /// sight, `leaves_at_edge`, so none but a tile's going, `tiles_changed`).
+    /// sight, `goes_unseen`, so none but a stop's going with its tile, `tiles_changed`; those who
+    /// leave at the edge of the ground are counted apart, `edge_departures`).
     removed: (usize, usize),
     /// Counted for the gate (`summary`): the people whose removal was held back at least once
     /// because the player could see it or they were within `traffic::NEVER_VANISH_WITHIN`
-    /// (`leaves_at_edge`): a Standing person with no pavement (`Decision::kept`), a waiter of a
+    /// (`goes_unseen`): a Standing person with no pavement (`Decision::kept`), a waiter of a
     /// stop going out of range (`stops_tick`).
     kept_for_sight: HashSet<u32>,
     /// The people on foot taken away since the start of this tick (`retire`), with whether the
-    /// player could see them: the traffic's recording writes them with its next frame
+    /// player could see them (false for those who left at the edge of the ground, counted in
+    /// `edge_departures`): the traffic's recording writes them with its next frame
     /// (`traffic_link::traffic_inputs`, `Frame::people_gone`).
     gone: Vec<(u32, bool)>,
     /// The stops' waiting places moved out of a standing vehicle's body, with where they
@@ -6257,8 +6195,9 @@ impl Humans {
             streams: HashMap::new(),
             queues: Queues::default(),
             wall_turns: HashMap::new(),
-            edge_turns: 0,
-            edge_gone: 0,
+            edge_departures: (0, 0),
+            edge_leaving: HashSet::new(),
+            edge_left: Vec::new(),
             hidden: Vec::new(),
             gpu_textures: HashMap::new(),
             gpu_materials: HashMap::new(),
@@ -6373,7 +6312,8 @@ impl Humans {
     }
 
     /// The map's tiles changed: a stop gone with its tile takes the people waiting there
-    /// with it; a stop nobody waits at is set up again with what its tiles hold now (its
+    /// with it, and anybody on foot on ground no longer loaded leaves (an edge departure, in
+    /// sight or not: the user's decision P-D2); a stop nobody waits at is set up again with what its tiles hold now (its
     /// waiting places come with the objects round it, sub_620c0c), keeping whether it was in
     /// range, its refill clock and its factor (`StopCarry`, `set_up_stop`).
     fn tiles_changed(&mut self, world: &World) {
@@ -6392,6 +6332,12 @@ impl Humans {
             let lost_stop = bound(&p.state).is_some_and(|s| gone.contains(&s));
             let lost_ground = p.place == Place::Ground && p.puppet.is_none() && !world.has_ground(p.position.x, p.position.y);
             if lost_stop || lost_ground {
+                // (somebody on ground no longer loaded is at the edge of the ground and leaves
+                // there, in sight or not: the user's decision P-D2, counted with those who walk
+                // to it, `edge_departures`)
+                if lost_ground {
+                    self.edge_leaving.insert(p.id);
+                }
                 self.release(i);
                 let p = self.people.swap_remove(i);
                 if debug_pax() {
@@ -6555,10 +6501,10 @@ impl Humans {
         }
     }
 
-    /// May somebody at `p` be taken away (`leaves_at_edge`): out of the player's sight and
+    /// May somebody at `p` be taken away (`goes_unseen`): out of the player's sight and
     /// beyond `traffic::NEVER_VANISH_WITHIN` of every player.
     fn may_vanish(&self, p: DVec3) -> bool {
-        leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, &self.lan_centers, p)
+        goes_unseen(self.eye, self.viewer.as_ref(), self.center, &self.lan_centers, p)
     }
 
     /// Whether the player could see somebody standing at `p`.
@@ -6647,9 +6593,16 @@ impl Humans {
     }
 
     /// The people on foot taken away during the last tick, and whether the player could see
-    /// them (`retire`).
+    /// them (`retire`; those who left at the edge of the ground, `left_at_edge`, marked unseen:
+    /// no sight rule takes them).
     pub fn gone(&self) -> &[(u32, bool)] {
         &self.gone
+    }
+
+    /// The people who left at the edge of the ground during the last tick (`Decision::edge`), in
+    /// sight or not; in `gone` they are marked unseen.
+    pub fn left_at_edge(&self) -> &[u32] {
+        &self.edge_left
     }
 
     /// Everybody of this game (not a LAN player's people): id, position and whether on the
@@ -6990,7 +6943,19 @@ impl Humans {
     fn retire(&mut self, p: &Person) {
         // (the gate's count, `summary`, and the recording's, `gone`: everybody on foot taken
         // away, and whether the player could see it - nobody should go in sight)
-        if p.place == Place::Ground && p.puppet.is_none() && !p.remote {
+        let edge = self.edge_leaving.remove(&p.id);
+        if p.place == Place::Ground && p.puppet.is_none() && !p.remote && edge {
+            // (left at the edge of the ground, `Decision::edge`: in sight or not, counted apart;
+            // the recording's `gone` marks them unseen, as no rule of the sight took them)
+            let seen = figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
+            if seen {
+                self.edge_departures.0 += 1;
+            } else {
+                self.edge_departures.1 += 1;
+            }
+            self.gone.push((p.id, false));
+            self.edge_left.push(p.id);
+        } else if p.place == Place::Ground && p.puppet.is_none() && !p.remote {
             let seen = figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position);
             self.removed.0 += 1;
             if seen {
@@ -7884,7 +7849,7 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, turned at the loaded ground's edge {} in sight or near, left there {} (paths onto unloaded ground {})",
+                "t={:.1} strollers: {have} of {target} wanted ({} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
@@ -7894,8 +7859,8 @@ impl Humans {
                 },
                 ped.walls.len(),
                 self.people.iter().filter(|p| matches!(&p.state, State::Strolling(w) if w.pocket)).count(),
-                self.edge_turns,
-                self.edge_gone,
+                self.edge_departures.0,
+                self.edge_departures.1,
                 ped.unloaded.len()
             );
         }
@@ -9163,7 +9128,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
-        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight); kept for sight {}", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1, self.kept_for_sight.len()));
+        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight); kept for sight {}; edge_departures {} in sight {} out of sight", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1, self.kept_for_sight.len(), self.edge_departures.0, self.edge_departures.1));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -9273,6 +9238,7 @@ impl Humans {
         self.viewer = traffic.and_then(|t| t.viewer);
         self.loading = traffic.is_some_and(|t| t.loading_phase());
         self.gone.clear();
+        self.edge_left.clear();
         let net = traffic.map(|t| &t.net);
         if let Some(b) = bus {
             self.center = b.position;
@@ -9312,7 +9278,7 @@ impl Humans {
         }
         // (the paths onto ground that is not loaded: the stroll network ends at the edge)
         if let (Some(pn), Some(n)) = (self.ped.as_mut(), net) {
-            pn.mark_unloaded(n, generation, omsi_map::tile_size(), &|x, y| world.has_ground(x, y), traffic.map(|t| t as &dyn PedLights));
+            pn.mark_unloaded(n, generation, omsi_map::tile_size(), &|x, y| world.has_ground(x, y));
         }
         stage!("pedestrian network");
         if let Some(n) = net {
@@ -9811,12 +9777,8 @@ impl Humans {
         p.walk_pace = d.walk_pace;
         p.walk_rng = d.walk_rng;
         p.approach = d.approach;
-        if d.edge_turn {
-            if d.gone {
-                self.edge_gone += 1;
-            } else {
-                self.edge_turns += 1;
-            }
+        if d.edge {
+            self.edge_leaving.insert(self.people[i].id);
         }
         if d.gone {
             remove.push(i);
@@ -11233,7 +11195,7 @@ mod tests {
     }
 
     /// Nobody on foot is taken away where the player could see it or within
-    /// `traffic::NEVER_VANISH_WITHIN` (`leaves_at_edge`, the people's one rule for taking somebody
+    /// `traffic::NEVER_VANISH_WITHIN` (`goes_unseen`, the people's one rule for taking somebody
     /// away): the waiters of a stop going out of range 500 m off go when the eye is turned away,
     /// and walk on from it in view (here with no pavement known: standing, `State::Standing`),
     /// counted (`kept_for_sight`); somebody standing with no pavement stays while in sight or
@@ -11320,6 +11282,24 @@ mod tests {
         h.center = at - DVec3::new(0.0, crate::traffic::NEVER_VANISH_WITHIN - 10.0, 0.0);
         h.eye = Some(Eye { pos: h.center + DVec3::Z * 2.0, ..away });
         assert_eq!(decide(&h, 0), (false, true), "out of sight within NEVER_VANISH_WITHIN");
+        // (P-D2) walking on ground that is not loaded (this world has no tiles): they leave at
+        // the edge, in sight too - but never on a crossing, which they walk to its end
+        h.eye = Some(Eye { pos: at - DVec3::new(0.0, 40.0, -2.0), fwd: DVec3::Y, cos_half: ahead.cos_half });
+        assert!(h.seen(h.people[0].position));
+        h.people[0].vel = DVec2::new(1.2, 0.0);
+        let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }], true, 0.0);
+        h.people[0].state = State::Strolling(walk.clone());
+        let edge = |h: &Humans| {
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0 };
+            let mut yields = Yields::new();
+            let d = ctx.decide(&h.people[0], DT, &world, None, None, &[], &mut YieldBook::Book(&mut yields));
+            (d.gone, d.edge)
+        };
+        assert_eq!(edge(&h), (true, true), "at the edge in sight");
+        walk.cross = Some(Cross { from: 0, to: 0, total: 20.0, lead: 0.0, span: 20.0, light: None, back: false, caught: false, kerb: None, key: 0, stripe: Some(0.0) });
+        walk.s = 5.0;
+        h.people[0].state = State::Strolling(walk);
+        assert_eq!(edge(&h), (false, false), "on a crossing");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -15240,7 +15220,7 @@ mod ped_tests {
     }
 
     #[test]
-    fn p11_4_a_path_onto_unloaded_ground_is_open_to_the_edge_and_turns_a_stroller_there_once() {
+    fn p_d2_a_path_onto_unloaded_ground_is_open_to_the_edge_and_a_stroller_leaves_there() {
         // tiles of 10 m, loaded where x < 10: path 1 runs from x 0 onto the unloaded tile at x 10
         let mut net = Network::default();
         net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
@@ -15253,9 +15233,8 @@ mod ped_tests {
         let edge_end = lane(vec![p(0.0, 5.0), p(10.0, 5.0)], LaneKind::Sidewalk, 2.0);
         assert!(unloaded_stretches(&edge_end, 10.0, &loaded).is_empty());
         let mut ped = PedNet::build(&net);
-        ped.mark_unloaded(&net, 1, 10.0, &loaded, None);
+        ped.mark_unloaded(&net, 1, 10.0, &loaded);
         assert_eq!(ped.unloaded, HashMap::from([(1, vec![(10.0, 20.0)])]));
-        assert!(ped.unloaded_crossings.is_empty());
         // its loaded stretch is walkable: the way on takes it, and the placer may use it - only
         // the stretch up to the edge
         let node = ped.ends[&0].1;
@@ -15269,46 +15248,37 @@ mod ped_tests {
             let s = loaded_point(0.0, 20.0, st, u);
             assert!((s - 10.0 * u).abs() < 1e-4 && s <= 10.0, "{u} {s}");
         }
-        // somebody on it walking towards the edge turns at the edge point, once: two frames at the
-        // edge (the crowd still carrying them on) and the frames walking back turn nobody again
-        let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 0.0, b: 20.0 }], true, 0.0);
-        walk.s = 9.0;
-        assert!(!edge_turn(&ped, &net, &mut walk), "a metre short of it");
-        walk.s = 9.8;
-        assert!(edge_turn(&ped, &net, &mut walk));
-        let back = walk.legs[walk.leg];
-        assert!((back.a - 9.8).abs() < 1e-4 && back.b == 0.0 && walk.from_wall && walk.closed_ends == 1 && !walk.pocket, "{walk:?}");
-        for s in [0.0, 0.0, 0.4, 3.0] {
+        // somebody on it walking towards the edge is at it at the edge point (and leaves there,
+        // `DecideCtx::decide`), not a metre short of it; a frame's step past it too; walking away
+        // from it, or on the way back from a closed end standing in the stretch, never
+        let at = |a: f32, b: f32, s: f32, from_wall: bool| {
+            let mut walk = PedWalk::new(vec![Leg { lane: 1, a, b }], true, 0.0);
             walk.s = s;
-            assert!(!edge_turn(&ped, &net, &mut walk), "turned again at {s}: {walk:?}");
-        }
-        assert!(!walk.pocket && walk.closed_ends == 1);
-        // a frame's step past the edge: turned there too
-        let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 0.0, b: 20.0 }], true, 0.0);
-        walk.s = 10.3;
-        assert!(edge_turn(&ped, &net, &mut walk) && walk.legs[walk.leg].b == 0.0);
-        walk.s = 0.1;
-        assert!(!edge_turn(&ped, &net, &mut walk) && !walk.pocket);
-        // walking away from the edge: nothing
-        let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 9.9, b: 0.0 }], true, 0.0);
-        assert!(!edge_turn(&ped, &net, &mut walk));
+            walk.from_wall = from_wall;
+            at_edge(&ped, &walk)
+        };
+        assert!(!at(0.0, 20.0, 9.0, false), "a metre short of it");
+        assert!(at(0.0, 20.0, 9.8, false));
+        assert!(at(0.0, 20.0, 10.3, false), "a frame's step past it");
+        assert!(!at(9.9, 0.0, 0.0, false), "walking away from it");
+        assert!(!at(10.5, 0.0, 0.0, true), "back from a closed end");
         // with the tile loaded the path is plain again
-        ped.mark_unloaded(&net, 2, 10.0, &|_, _| true, None);
+        ped.mark_unloaded(&net, 2, 10.0, &|_, _| true);
         assert!(ped.unloaded.is_empty());
     }
 
     #[test]
-    fn p11_4_a_dead_end_beside_the_loaded_edge_is_no_turn_the_edge_itself_is() {
+    fn p_d2_a_path_onto_unloaded_ground_is_walked_to_the_edge_point() {
         // path 0 leads only onto path 1, which runs onto unloaded ground 10 m past the node: the
-        // way on takes path 1 (no turn at the junction, inside loaded ground), and the turn comes
-        // at the edge point on it
+        // way on takes path 1 (no turn at the junction, inside loaded ground), and the stroller is
+        // at the edge (and leaves) at the edge point on it
         let mut net = Network::default();
         net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
         net.lanes.push(lane(vec![p(0.0, 0.0), p(20.0, 0.0)], LaneKind::Sidewalk, 2.0));
         net.link(1.5);
         let loaded = |x: f64, _y: f64| x < 10.0;
         let mut ped = PedNet::build(&net);
-        ped.mark_unloaded(&net, 1, 10.0, &loaded, None);
+        ped.mark_unloaded(&net, 1, 10.0, &loaded);
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }], true, 0.0);
         walk.s = 20.0;
         let mut rng = 7u64;
@@ -15316,25 +15286,20 @@ mod ped_tests {
         assert_eq!((walk.legs[1].lane, walk.legs[1].b), (1, 20.0));
         assert!(walk.closed_ends == 0 && !walk.pocket);
         walk.leg = 1;
-        let mut turned_at = None;
-        for k in 0..=40 {
-            walk.s = k as f32 * 0.5;
-            if edge_turn(&ped, &net, &mut walk) {
-                turned_at = Some(k as f32 * 0.5);
-                break;
-            }
-        }
-        let t = turned_at.expect("turned at the edge");
+        let t = (0..=40).map(|k| k as f32 * 0.5).find(|&s| {
+            walk.s = s;
+            at_edge(&ped, &walk)
+        });
+        let t = t.expect("at the edge");
         assert!((10.0 - KERB_AT..=10.0).contains(&t), "{t}");
-        assert_eq!(walk.legs[walk.leg].b, 0.0);
     }
 
     #[test]
-    fn p11_4_a_crossing_onto_unloaded_ground_is_never_begun() {
+    fn p_d2_a_crossing_onto_unloaded_ground_is_open_and_walked_on() {
         // lit crossing pieces: path 1 (0..5 m, loaded) and path 3 straight on (5..20 m, onto the
-        // unloaded tile at x 10); path 2 a pavement turning off at their joint. The chain is closed
-        // at its kerb, path 1 as well as path 3: nobody steps onto path 1 to be left on it, and a
-        // crossing span over path 1 is never planned on over path 3
+        // unloaded tile at x 10); path 2 a pavement turning off at their joint. Nothing is closed:
+        // the way on at the kerb takes the crossing, and a span planned over path 1 runs on over
+        // path 3 (walked to its end, left beyond it)
         let mut net = Network::default();
         net.lanes.push(lane(vec![p(-20.0, 0.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
         net.lanes.push(lane(vec![p(0.0, 0.0), p(5.0, 0.0)], LaneKind::Sidewalk, 2.0));
@@ -15345,17 +15310,14 @@ mod ped_tests {
         net.link(1.5);
         let loaded = |x: f64, _y: f64| x < 10.0;
         let mut ped = PedNet::build(&net);
-        ped.mark_unloaded(&net, 1, 10.0, &loaded, None);
-        assert_eq!(ped.unloaded_crossings, HashSet::from([1, 3]));
-        assert!(ped.closed(3) && ped.closed(1) && !ped.closed(2) && !ped.closed(0));
-        // at the kerb (the end of path 0) the way on is never the closed first piece: back along the pavement
+        ped.mark_unloaded(&net, 1, 10.0, &loaded);
+        assert!((0..4).all(|l| !ped.closed(l)));
         let kerb = ped.ends[&0].1;
         let on: Vec<usize> = (0..64u64).filter_map(|k| ped.next_leg(&net, kerb, 0, k.wrapping_mul(0x9E37_79B9))).map(|l| l.lane).collect();
-        assert!(!on.is_empty() && on.iter().all(|&l| l != 1 && l != 3), "{on:?}");
-        // (a span planned from path 1 never runs on over path 3 either)
+        assert!(on.contains(&1), "{on:?}");
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }, Leg { lane: 1, a: 0.0, b: 5.0 }], true, 0.0);
-        let c = crossing_span(&ped, &net, None, &mut walk, 1).expect("the loaded piece is a crossing");
-        assert!(walk.legs.iter().all(|l| l.lane != 3) && c.to == 1, "{:?} {c:?}", walk.legs);
+        let c = crossing_span(&ped, &net, None, &mut walk, 1).expect("a crossing");
+        assert!(walk.legs.iter().any(|l| l.lane == 3) && c.to == 2, "{:?} {c:?}", walk.legs);
     }
 
     #[test]
@@ -15366,29 +15328,28 @@ mod ped_tests {
         net.link(1.5);
         let loaded = |x: f64, _y: f64| x < 10.0;
         let mut ped = PedNet::build(&net);
-        ped.mark_unloaded(&net, 1, 10.0, &loaded, None);
+        ped.mark_unloaded(&net, 1, 10.0, &loaded);
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }], true, 0.0);
         walk.cross = Some(Cross { from: 0, to: 0, total: 20.0, lead: 0.0, span: 20.0, light: Some((0, 0)), back: false, caught: false, kerb: None, key: 0, stripe: Some(0.0) });
         for s in [9.8, 10.3, 12.0] {
             walk.s = s;
-            assert!(!edge_turn(&ped, &net, &mut walk));
+            assert!(!at_edge(&ped, &walk));
         }
-        assert!(walk.cross.is_some() && walk.legs.len() == 1 && walk.legs[0].b == 20.0 && walk.closed_ends == 0);
     }
 
     #[test]
-    fn p11_4_nobody_leaves_at_the_edge_within_the_never_vanish_distance() {
+    fn nobody_goes_unseen_in_sight_or_within_the_never_vanish_distance() {
         // the eye at the origin looking north (+y): behind it, out of sight
         let eye = Eye { pos: DVec3::ZERO, fwd: DVec3::Y, cos_half: 0.7 };
         let r = crate::traffic::NEVER_VANISH_WITHIN;
         let behind = |d: f64| DVec3::new(0.0, -d, 0.0);
         assert!(!figure_in_sight(Some(eye), None, DVec3::ZERO, behind(r - 10.0)));
-        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], behind(r - 10.0)), "beside or behind the player (mirrors)");
-        assert!(leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], behind(r + 10.0)));
+        assert!(!goes_unseen(Some(eye), None, DVec3::ZERO, &[], behind(r - 10.0)), "beside or behind the player (mirrors)");
+        assert!(goes_unseen(Some(eye), None, DVec3::ZERO, &[], behind(r + 10.0)));
         // near another player: stays
-        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[behind(r + 20.0)], behind(r + 10.0)));
+        assert!(!goes_unseen(Some(eye), None, DVec3::ZERO, &[behind(r + 20.0)], behind(r + 10.0)));
         // in sight far off: stays (turns)
-        assert!(!leaves_at_edge(Some(eye), None, DVec3::ZERO, &[], DVec3::new(0.0, r + 10.0, 0.0)));
+        assert!(!goes_unseen(Some(eye), None, DVec3::ZERO, &[], DVec3::new(0.0, r + 10.0, 0.0)));
     }
 }
 

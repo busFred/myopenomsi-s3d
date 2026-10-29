@@ -225,6 +225,8 @@ pub(crate) struct PlayerWatch {
     uncounted: BTreeMap<&'static str, usize>,
     /// The people's own count of people taken in sight (`Humans::gone`).
     people_taken_seen: usize,
+    /// The people who left at the edge of the ground (`Humans::left_at_edge`): (in sight, not).
+    edge_left: (usize, usize),
     /// People held at a kerb in the cone within `WATCH_RADIUS`: person-seconds and who.
     held_s: f64,
     held_ids: HashSet<u32>,
@@ -331,9 +333,20 @@ impl PlayerWatch {
                     self.see(t_s, loading, "person", id as u64, "put down", p, person_sight(p), near(p), me, true, false);
                 }
             }
+            // (one who left at the edge of the ground, `Humans::left_at_edge`, in sight or not by
+            // the user's decision P-D2, is counted apart: `edge_left`)
+            let at_edge: Vec<u32> = humans.map(|h| h.left_at_edge().to_vec()).unwrap_or_default();
             let before: Vec<(u32, (DVec3, bool))> = self.people.iter().map(|(k, v)| (*k, *v)).collect();
             for (id, (p, ground)) in before {
                 if ground && !people.contains_key(&id) {
+                    if at_edge.contains(&id) {
+                        if matches!(person_sight(p), Sight::In | Sight::Far) {
+                            self.edge_left.0 += 1;
+                        } else {
+                            self.edge_left.1 += 1;
+                        }
+                        continue;
+                    }
                     self.see(t_s, loading, "person", id as u64, "taken away", p, person_sight(p), near(p), me, false, false);
                 }
             }
@@ -501,6 +514,7 @@ impl PlayerWatch {
         let past = self.events.iter().filter(|e| e.sight == Sight::Far).count();
         out.push(format!("player watch: of the people appeared in sight, {past} past the people's in-view appearance distance ({:.0} m, not listed)", crate::humans::APPEAR_IN_VIEW_BEYOND));
         out.push(format!("player watch: people taken in sight by the people's own test (`Humans::gone`): {}", self.people_taken_seen));
+        out.push(format!("player watch: people left at the edge of the ground (`Humans::left_at_edge`, not counted above): {} in sight, {} not", self.edge_left.0, self.edge_left.1));
         out.push(format!("player watch: not counted (out of the view cone, appeared beyond the radius, a car parked or pulled out, the map loading): {:?}", self.uncounted));
         for e in self.events.iter().filter(|e| e.sight == Sight::In) {
             out.push(format!("player watch:   t={:.1} {} #{} ({}) {:.0} m at ({:.1}, {:.1})", e.t, e.what, e.id, e.how, e.dist, e.pos.x, e.pos.y));
