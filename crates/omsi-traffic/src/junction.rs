@@ -467,22 +467,21 @@ impl Junctions {
 
     /// [`Junctions::foes_along`], each foe with the piece of the chain it meets.
     pub fn foes_along_pieces(&self, j: usize, chain: &[(usize, f32)]) -> Vec<(usize, Foe)> {
-        self.foes_along_with(j, chain, None)
+        self.foes_along_with(j, chain, false)
     }
 
-    /// [`Junctions::foes_along_pieces`] for a vehicle `half_width` wide each side, with the side
-    /// merges met only by wide bodies (`Movement::wide`) where it and the widest body
-    /// (`SWEPT_BUS_WIDTH`) could meet there: the resolver's foes, each pair then decided by
-    /// `reservation::meets`.
-    pub fn foes_along_wide(&self, j: usize, chain: &[(usize, f32)], half_width: f32) -> Vec<(usize, Foe)> {
-        self.foes_along_with(j, chain, Some(half_width))
+    /// [`Junctions::foes_along_pieces`] with the side merges met only by wide bodies
+    /// (`Movement::wide`) too: the resolver's foes, every pair then decided by
+    /// `reservation::meets` with the two bodies' own half widths.
+    pub fn foes_along_wide(&self, j: usize, chain: &[(usize, f32)]) -> Vec<(usize, Foe)> {
+        self.foes_along_with(j, chain, true)
     }
 
-    fn foes_along_with(&self, j: usize, chain: &[(usize, f32)], half_width: Option<f32>) -> Vec<(usize, Foe)> {
+    fn foes_along_with(&self, j: usize, chain: &[(usize, f32)], with_wide: bool) -> Vec<(usize, Foe)> {
         let node = &self.nodes[j];
         let mut out = Vec::new();
         for &(m, off) in chain {
-            let wide = node.movements[m].wide.iter().filter(|f| half_width.is_some_and(|h| h + omsi_sim::traffic::SWEPT_BUS_WIDTH * 0.5 > f.apart));
+            let wide = node.movements[m].wide.iter().filter(|_| with_wide);
             for f in node.movements[m].foes.iter().chain(wide) {
                 out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields, side: f.side, apart: f.apart }));
             }

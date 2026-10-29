@@ -708,7 +708,7 @@ fn standing_order(js: &Junctions, claims: &[Claim], plain: &[Grant]) -> Vec<Stan
         members.sort_by_key(|&k| claims[k].vehicle);
         let n = members.len();
         // yields[a][b]: a gives way to b by the table (None: not foes)
-        let foes: Vec<Vec<crate::junction::Foe>> = members.iter().map(|&k| js.foes_along_wide(j, &claims[k].chain, claims[k].half_width).into_iter().map(|(_, f)| f).collect()).collect();
+        let foes: Vec<Vec<crate::junction::Foe>> = members.iter().map(|&k| js.foes_along_wide(j, &claims[k].chain).into_iter().map(|(_, f)| f).collect()).collect();
         let yields = |a: usize, b: usize| -> Option<bool> {
             let mut hit = None;
             for f in &foes[a] {
@@ -810,7 +810,7 @@ pub fn meets(f: &crate::junction::Foe, a: &Claim, b: &Claim) -> bool {
 /// has left it, as `will_pass` counts a foe in the meeting place (`their_inside`).
 fn in_way_of(js: &Junctions, a: &Claim, b: &Claim) -> bool {
     a.junction == b.junction
-        && js.foes_along_wide(b.junction, &b.chain, b.half_width).iter().any(|(_, f)| {
+        && js.foes_along_wide(b.junction, &b.chain).iter().any(|(_, f)| {
             meets(f, a, b) && a.chain.iter().any(|&(m, off)| {
                 let s = a.s - off;
                 m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
@@ -1294,7 +1294,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
     for &k in &order {
         let c = &claims[k];
         let node = &js.nodes[c.junction];
-        let my_foes = js.foes_along_wide(c.junction, &c.chain, c.half_width);
+        let my_foes = js.foes_along_wide(c.junction, &c.chain);
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         // (held at my red I am held by my light, and no foe matters: the plan stops me at
         // the line, before any meeting place)

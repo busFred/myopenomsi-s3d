@@ -3669,10 +3669,6 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
 /// timetable bus (`Vehicles/NEOMAN_Overhaul_V3/_12a_MAN_A21_2D.bus`): its length, the
 /// `[boundingbox]`'s 11.8 m ...
 pub const SWEPT_BUS_LENGTH: f32 = 11.8;
-/// ... and its width, the `[boundingbox]`'s 2.5 m: the widest body the traffic has (a side
-/// merge met only by bodies wider than the centre lines are apart, `Crossing::apart`, is a foe
-/// of a vehicle only where it and this could meet there).
-pub const SWEPT_BUS_WIDTH: f32 = 2.5;
 /// ... its wheelbase, the two `[newachse]` `achse_long` 3.149 and -2.665 m apart, for the
 /// off-tracking wheelbase^2 / 2R in a bend of radius R (the piece's own curvature) ...
 pub const SWEPT_WHEELBASE: f32 = 3.149 + 2.665;

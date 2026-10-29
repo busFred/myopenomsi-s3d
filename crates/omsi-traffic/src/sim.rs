@@ -1871,9 +1871,9 @@ impl Simulation {
         // stretch's end. Not every meeting place of the chain: two merging
         // run on along one way, and the ease must not hold the one behind until the other
         // has left the whole object)
-        let pieces = self.junctions.foes_along_pieces(j, &mine.chain);
+        let pieces = self.junctions.foes_along_wide(j, &mine.chain);
         let my_front = mine.s + mine.front;
-        let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
+        let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front && reservation::meets(f, mine, theirs)).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
         let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::JM_TIMEGAP_MINOR * theirs.speed.max(0.0));
         inside.then_some((k, o))
     }
@@ -1940,7 +1940,7 @@ impl Simulation {
                 continue;
             }
             let j = ca.junction;
-            let meet = self.junctions.foes_along_pieces(j, &ca.chain).iter().any(|(_, f)| cb.chain.iter().any(|&(m, _)| m == f.movement));
+            let meet = self.junctions.foes_along_wide(j, &ca.chain).iter().any(|(_, f)| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement));
             if !meet {
                 continue;
             }
@@ -1952,7 +1952,9 @@ impl Simulation {
             let claim = |c: usize| &self.claims[c].0;
             let blocked_a = held_back_for(vehicles, &claim, claim_of, &by_id, ka, b);
             let blocked_b = held_back_for(vehicles, &claim, claim_of, &by_id, kb, a);
-            let ease = if blocked_a != blocked_b {
+            // (of two held back the same way the hash picks one; if its ease would end at once,
+            // the other is the same rule's second candidate)
+            let picked = if blocked_a != blocked_b {
                 if blocked_a {
                     a
                 } else {
@@ -1963,13 +1965,21 @@ impl Simulation {
             } else {
                 b
             };
-            let other = if ease == a { idb } else { ida };
+            let candidates: &[usize] = if blocked_a != blocked_b { &[picked] } else if picked == a { &[a, b] } else { &[b, a] };
             // (an ease its own end test would undo at once - the other already past the first
             // meeting place of the two beyond this one's front - is not started: it would only
             // be counted)
-            vehicles[ease].ease_for = Some((other, j, 0.0));
-            if self.ease_holds(vehicles, &claim, claim_of, &by_id, ease).is_none() {
+            let mut started = false;
+            for &ease in candidates {
+                let other = if ease == a { idb } else { ida };
+                vehicles[ease].ease_for = Some((other, j, 0.0));
+                if self.ease_holds(vehicles, &claim, claim_of, &by_id, ease).is_some() {
+                    started = true;
+                    break;
+                }
                 vehicles[ease].ease_for = None;
+            }
+            if !started {
                 continue;
             }
             vehicles[a].mutual = None;
