@@ -4827,6 +4827,9 @@ struct Queues {
     tail: HashMap<KerbKey, f64>,
     /// Per node: its waiters (person, the crossing piece they wait for, row, offset).
     waiting: HashMap<KerbKey, Vec<(u32, usize, u32, f64)>>,
+    /// Everybody standing on foot (under `STILL_BELOW`) by `QUEUE_CELL` cell: (person, where):
+    /// a place somebody stands on is no free place, whoever holds it (`Queues::stand`).
+    standing: HashMap<(i64, i64), Vec<(u32, DVec2)>>,
 }
 
 /// The cell of `Queues::taken` (m): a place is free of everybody within a stripe of it.
@@ -4837,9 +4840,21 @@ impl Queues {
         ((q.x / QUEUE_CELL).floor() as i64, (q.y / QUEUE_CELL).floor() as i64)
     }
     /// Whether nobody but `id` has a place within a stripe (`STRIPE_WIDTH`) of `q` (neighbouring
-    /// points of the queue grid lie a stripe or a row apart).
+    /// points of the queue grid lie a stripe or a row apart), nor stands there (`stand`): one place
+    /// a body. A waiter gives their place up when they step on, turn away or are sent another way
+    /// on, and stands on it until they move off: given to the next waiter then, two bodies were
+    /// on one place (BeijingCity c08, the kerbs of lanes 3111/3112 and 2912/2979: the queue moved
+    /// up onto places whose last waiters still stood there, and the new holders stood 0.9-2 m
+    /// off them for up to 2.5 s).
     fn free(&self, q: DVec2, id: u32) -> bool {
-        Self::free_in(&self.taken, q, id)
+        Self::free_in(&self.taken, q, id) && Self::free_in(&self.standing, q, id)
+    }
+    /// The people standing on foot this frame (person, where), for `free`.
+    fn stand(&mut self, bodies: impl Iterator<Item = (u32, DVec2)>) {
+        self.standing.clear();
+        for (id, q) in bodies {
+            Self::take(&mut self.standing, id, q);
+        }
     }
     fn free_in(taken: &HashMap<(i64, i64), Vec<(u32, DVec2)>>, q: DVec2, id: u32) -> bool {
         let (cx, cy) = Self::cell(q);
@@ -9711,6 +9726,8 @@ impl Humans {
                 _ => None,
             });
             self.queues.rebuild(places, self.ped.as_ref(), net, lights.as_ref().map(|t| t as &dyn PedLights));
+            // (and who stands where: a place somebody stands on is not free, `Queues::free`)
+            self.queues.stand(self.people.iter().filter(|p| p.place == Place::Ground && p.vel.length() < STILL_BELOW as f64).map(|p| (p.id, p.position.truncate())));
         }
         stage!("ped.prep");
         // what everybody on foot wants: decided side by side from the frame's state
@@ -15326,6 +15343,34 @@ mod ped_tests {
         assert!(waiting.iter().filter(|q| !area.contains(**q)).all(|q| q.x < -0.4 && (q.y + 5.5).abs() < 1.3), "{waiting:?}");
         let last = seconds.last().unwrap();
         assert!(last.iter().all(|(q, _)| q.y > -3.0), "{last:?}");
+    }
+
+    #[test]
+    fn p3_2_a_place_somebody_still_stands_on_is_given_to_nobody() {
+        // the waiter of the best place gave it up (stepped on, sent another way on) and still
+        // stands on it: the next one to pick a place there does not get it until they moved off
+        let (net, ped) = kerb_both_sides();
+        let lights = FakeLights::new(RED, 30.0);
+        let node = ped.ends[&3].0;
+        let area = node_area(&ped, &net, Some(&lights), node);
+        let next = Leg { lane: 3, a: 0.0, b: net.lanes[3].length() };
+        let frame = KerbFrame::of(&net, &next, &Stripes::of(net.lanes[3].width as f64, false));
+        let (gone, me) = (1u32, 2u32);
+        let from = DVec2::new(-3.0, -5.5);
+        let mut queues = Queues::default();
+        queues.rebuild(std::iter::empty(), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
+        let best = area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).expect("a place").0;
+        queues.stand([(gone, best)].into_iter());
+        assert!(!queues.free(best, me) && queues.free(best, gone));
+        let other = area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).expect("another place").0;
+        assert!((other - best).length() >= STRIPE_WIDTH - 1e-6, "given a place somebody stands on: {other:?}");
+        // (and claimed in the same frame it is refused too: `claim_spot` asks `free`)
+        let mut walk = across();
+        walk.spot = Some(KerbPlace { leg: 0, next: 3, pos: best, row: 0, lat: 0.0, key: node });
+        assert!(!claim_spot(me, None, &mut walk, &queues, &mut HashMap::new()) && walk.spot.is_none());
+        // moved off: it is free again
+        queues.stand([(gone, best + DVec2::new(0.0, -3.0))].into_iter());
+        assert_eq!(area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).map(|u| u.0), Some(best));
     }
 
     #[test]
