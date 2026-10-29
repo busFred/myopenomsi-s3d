@@ -183,13 +183,13 @@ fn budget_count(cars: impl Iterator<Item = (DVec3, bool, bool)>, near: Option<(D
 
 /// A vehicle type's half length (m), the radius the renderer's object distance is reckoned with
 /// (`Viewer::draws`): `VehicleType::half_length`, else `DEFAULT_BOX`'s.
-fn body_radius(ty: &VehicleType) -> f64 {
+pub(crate) fn body_radius(ty: &VehicleType) -> f64 {
     ty.half_length().map_or(DEFAULT_BOX[1] as f64 * 0.5, |h| h as f64)
 }
 
 /// A vehicle type's body height (m), the size its perceptual horizon
 /// is reckoned for: its `[boundingbox]`'s, else its model's, else `DEFAULT_BOX`'s (bus-sized).
-fn body_height(ty: &VehicleType) -> f64 {
+pub(crate) fn body_height(ty: &VehicleType) -> f64 {
     match ty.def.bounding_box {
         Some(bb) if bb[2] > 0.5 => bb[2] as f64,
         _ => ty.model_box().map(|(lo, hi)| (hi.z - lo.z) as f64).filter(|h| *h > 0.5).unwrap_or(DEFAULT_BOX[2] as f64),
@@ -2247,7 +2247,7 @@ impl Traffic {
     /// Every line of sight to it must be: to its middle, to both ends whichever way it
     /// points and over its roof. A single line to the middle let a car come and go half
     /// out from behind a corner, in plain view.
-    fn occluded(&self, world: &World, v: &Viewer, p: DVec3, r: f64) -> bool {
+    pub(crate) fn occluded(&self, world: &World, v: &Viewer, p: DVec3, r: f64) -> bool {
         let rel = (p - v.pos).truncate();
         let across = if rel.length() > 1e-3 {
             DVec3::new(-rel.y, rel.x, 0.0).normalize()

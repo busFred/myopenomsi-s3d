@@ -979,7 +979,7 @@ impl Schedule {
                 let open = self.awaiting.contains(&j) || (!d.spawned && self.runs(j));
                 if open && !self.is_player_tour(j) && self.day_base + d.time - day_time < TOUR_LAYOVER_MAX {
                     if let Placed::Spawned =
-                        self.spawn_departure(j, world, traffic, renderer, scene, day_time, Some(ci))
+                        self.spawn_departure(j, world, traffic, renderer, scene, day_time, Some(ci), false)
                     {
                         taken = true;
                         self.departures[j].spawned = true;
@@ -1631,6 +1631,66 @@ impl Schedule {
         out.into_iter().filter_map(|s| if let Slot::Lane(l) = s { Some(l) } else { None }).collect()
     }
 
+    /// The player's trip driven by the AI (the offscreen harness's `--follow-line`,
+    /// `follow_line::LineFollower`): a timetable bus of the departure's own AI group (`choose`)
+    /// is put on the lane of the trip's route nearest to the player's bus `bus` that runs its way (on the
+    /// lane's middle line: a bus standing in a stop's bay moves over onto it) and takes the
+    /// player's departure on where it stands (`spawn_departure` with `here`), with
+    /// the trip's stops from there on, its route carried on as the tiles come, as any
+    /// timetable bus. Returns the bus's car id, or why it could not be put there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drive_player_trip(
+        &mut self,
+        world: &World,
+        traffic: &mut Traffic,
+        renderer: &Renderer,
+        scene: &mut Scene,
+        day_time: f64,
+        duty: &PlayerDuty,
+        bus: &omsi_sim::VehicleInstance,
+    ) -> Result<u64, String> {
+        let planned = duty.trip();
+        let i = (0..self.departures.len())
+            .filter(|&i| self.is_player_tour(i) && self.data.trips[self.departures[i].trip].name.eq_ignore_ascii_case(&planned.name))
+            .min_by(|&a, &b| (self.departures[a].time - planned.departure).abs().total_cmp(&(self.departures[b].time - planned.departure).abs()))
+            .ok_or_else(|| format!("no departure of line {} tour {} runs trip {}", duty.line, duty.tour, planned.name))?;
+        let trip = &self.data.trips[self.departures[i].trip];
+        let (steps, _) = self.steps_of(&trip.name, &trip_stations(trip));
+        Self::add_twins(traffic, &steps);
+        let slots = self.slots(world, traffic, &steps, None);
+        // the lane of the route under the bus: the nearest that runs its way
+        let net = &traffic.net;
+        let (lane, s, d) = slots
+            .iter()
+            .filter_map(|x| if let Slot::Lane(l) = x { Some(*l) } else { None })
+            .filter_map(|l| net.lanes[l].nearest_point(bus.position).map(|(s, d)| (l, s, d)))
+            .filter(|&(l, s, _)| ((net.lanes[l].at(s).1 as f64 - bus.heading + 540.0).rem_euclid(360.0) - 180.0).abs() < 90.0)
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .ok_or_else(|| format!("trip {}: no lane of its route is loaded", planned.name))?;
+        // (the vehicle the departure's AI group runs it with: the player's own type, driven by
+        // the AI, opens no doors where its scripts know no `AI_Scheduled_AtStation` - the MAN
+        // A21 of the gate's runs - and its stop's waiters held it at the boarding cap)
+        let Choice { ty, number, hof, scheme, .. } = self.choose(i, world).ok_or_else(|| format!("trip {}: no vehicles for AI group '{}'", planned.name, self.departures[i].ai_group))?;
+        let ci = traffic
+            .spawn_bus(world, renderer, scene, ty, vec![lane], s, Vec::new(), number, hof, Some(scheme))
+            .ok_or_else(|| "the timetable buses are at the options' [AIMaxCountScheduled]".to_string())?;
+        // (standing, as the player's bus stands: a new car of the traffic starts at its lane's pace)
+        traffic.cars[ci].ai.state.speed = bus.physics.speed.max(0.0);
+        let id = traffic.cars[ci].id;
+        match self.spawn_departure(i, world, traffic, renderer, scene, day_time, Some(ci), true) {
+            Placed::Spawned => {
+                self.departures[i].spawned = true;
+                let c = &traffic.cars.iter().find(|c| c.id == id).expect("just put on").vehicle;
+                log::info!("follow line: bus {id} ({}, {:.1} m long; the player's {:.1} m) drives trip {} of line {} tour {} from lane {lane} at {s:.1} m ({d:.1} m from the player's bus)", c.ty.def.type_name, c.ty.half_length().unwrap_or(0.0) * 2.0, bus.ty.half_length().unwrap_or(0.0) * 2.0, planned.name, duty.line, duty.tour);
+                Ok(id)
+            }
+            _ => {
+                traffic.remove_car(world, renderer, scene, id);
+                Err(format!("trip {}: the departure could not be taken on from lane {lane}", planned.name))
+            }
+        }
+    }
+
     /// `OMSI_CHECK_TRIPS=1`: build the route of every trip on the loaded lanes and say where
     /// consecutive lanes do not join - a gap the bus would jump, or a lane taken the wrong
     /// way round (its end, not its start, lies where the lane before ends), which sends a
@@ -2161,7 +2221,7 @@ impl Schedule {
             };
             tried += 1;
             self.fail_reason = None;
-            let placed = self.spawn_departure(i, world, traffic, renderer, scene, day_time, None);
+            let placed = self.spawn_departure(i, world, traffic, renderer, scene, day_time, None, false);
             // a bus taken off the road as the last resort comes back however
             // its placement fails, every few seconds until well past its departure
             let before_its_time = self.resumes.respawn.get(&i).is_some_and(|r| day_time < r.at);
@@ -2305,7 +2365,10 @@ impl Schedule {
     /// the loaded tiles have, which is carried on as more tiles come.
     ///
     /// With `onto`, the timetable bus of that index (the tour's bus, at the end of its
-    /// previous trip) takes the trip on instead of a new one.
+    /// previous trip) takes the trip on instead of a new one. With `here` as well, that bus
+    /// stands on the trip's route already (the player's bus driven along its line,
+    /// `drive_player_trip`): the route begins at the step of the lane it stands on, where
+    /// it stands, rather than at the trip's first station.
     #[allow(clippy::too_many_arguments)]
     fn spawn_departure(
         &mut self,
@@ -2316,6 +2379,7 @@ impl Schedule {
         scene: &mut Scene,
         day_time: f64,
         onto: Option<usize>,
+        here: bool,
     ) -> Placed {
         let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
         let t_spawn = std::time::Instant::now();
@@ -2393,7 +2457,12 @@ impl Schedule {
                 Slot::Absent => 0.0,
             })
             .collect();
-        let Some((at, offset)) = step_at(&steps, &slots, &est, leg, frac) else {
+        // (a bus standing on the route: the first step of the lane it is on)
+        let placed_here = || {
+            let st = &traffic.cars[onto?].ai.state;
+            slots.iter().position(|s| *s == Slot::Lane(st.lane)).map(|k| (k, st.s as f64))
+        };
+        let Some((at, offset)) = (if here { placed_here() } else { step_at(&steps, &slots, &est, leg, frac) }) else {
             return Placed::Drop;
         };
         // a trip whose bus drove off a dead end goes on past it: from the
@@ -2446,6 +2515,7 @@ impl Schedule {
         // the part of the route around the bus that the network has
         let (start, end) = section_around(&slots, at);
         let start = resume.map_or(start, |r| start.max(r).min(at));
+        let start = if here { at } else { start };
         let whole = start == 0 && end == slots.len();
         let lane_of = |s: &Slot| {
             if let Slot::Lane(l) = s {
@@ -5515,6 +5585,57 @@ impl PlayerDuty {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A timetable of one trip, `name`, on a track of `steps` (tile (0, 0): map id, path,
+    /// length) past the stations `stations` (stop objects, where the world has them), leaving
+    /// at `departure` (s of the day) on tour 1 of line 104 of AI group "depot", whose depot
+    /// has the one vehicle `ty`; and the player's duty on that tour and trip (the timetable
+    /// leaves the tour to the player). For the harness's tests outside this module
+    /// (`follow_line`).
+    pub(crate) fn one_trip(world: &World, name: &str, steps: &[(i64, u16, f64)], stations: &[i64], departure: f64, ty: Arc<VehicleType>) -> (Schedule, PlayerDuty) {
+        let mut s = Schedule::new_for_lists(&world.root, world, &omsi_sim::SimClock::default());
+        let trip = omsi_timetable::Trip { name: name.into(), display_name: name.into(), terminus: "T".into(), line: "104".into(), stations: stations.to_vec(), ..Default::default() };
+        let entries = steps.iter().map(|&(id, path, len)| omsi_timetable::TrackEntry { values: vec![id as f64, path as f64, 0.0, 0.0, len] }).collect();
+        s.data.tracks = vec![omsi_timetable::Track { path: format!("TTData/{name}.ttr").into(), entries }];
+        s.times = vec![vec![TripTimes::new(stations, None, &|_, _| None)]];
+        s.data.trips = vec![trip];
+        s.departures = vec![Departure { time: departure, trip: 0, profile: 0, line: "104".into(), ai_group: "depot".into(), tour: "1".into(), mask: 1023, spawned: false }];
+        s.trip_departures = vec![vec![0]];
+        s.tour_prev = vec![None];
+        s.tour_next = vec![None];
+        s.tile_coords = vec![(0, 0)];
+        s.depots.insert("depot".into(), vec![(ty, Vec::new(), None)]);
+        s.player_tour = Some(("104".into(), "1".into()));
+        let tt = s.times[0][0].clone();
+        let stops = stations
+            .iter()
+            .zip(&tt.stations)
+            .map(|(&id, &(arr, dep))| PlannedStop { object_id: id, name: format!("s{id}"), arr: departure + arr, dep: departure + dep, position: world.object_positions.lock().get(&id).map(|p| p.0), dir: StopDir::default(), stops: true })
+            .collect();
+        let planned = PlannedTrip { name: name.into(), line: "104".into(), terminus: "T".into(), departure, end: departure + tt.duration, stops };
+        let duty = PlayerDuty {
+            line: "104".into(),
+            tour: "1".into(),
+            trips: vec![planned],
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            served_terminus: None,
+            left_late: None,
+            held_back: false,
+            placed: true,
+            trip_changed: false,
+            skipped: None,
+            picked: true,
+            first_update: None,
+            heading: 0.0,
+            pos: None,
+        };
+        (s, duty)
+    }
 
     /// The first stop behind a bus handed its next trip: where it stands when it
     /// creeps, where it comes to rest braking gently on the move - and passed, not clamped

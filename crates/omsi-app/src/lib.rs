@@ -98,6 +98,7 @@ mod input_script;
 mod launcher_link;
 mod lan_mods;
 mod memory;
+mod follow_line;
 mod offscreen;
 mod ground_gap;
 mod on_foot;
