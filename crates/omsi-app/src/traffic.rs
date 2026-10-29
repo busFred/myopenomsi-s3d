@@ -3144,7 +3144,12 @@ impl Traffic {
                 && self.spawn_clear(&ty, p, h, (lane, s), Spawn::Woken);
             if ok {
                 let d = self.dormant.swap_remove(i);
-                self.create_car(world, renderer, scene, center, d.kind, d.lane, d.s, d.ty, d.seed, Some(d.scheme), Some(d.id), Some(d.speed), None);
+                let id = self.create_car(world, renderer, scene, center, d.kind, d.lane, d.s, d.ty, d.seed, Some(d.scheme), Some(d.id), Some(d.speed), None);
+                // (it draws its trip end again from where it woke, by its own dice from its
+                // time asleep: `AiState::wake`; the seed alone gave the draw it made before)
+                if let Some(c) = self.cars.iter_mut().find(|c| c.id == id) {
+                    c.ai.state.wake(d.walk);
+                }
                 budget -= 1;
             } else {
                 i += 1;
