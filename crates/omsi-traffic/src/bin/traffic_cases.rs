@@ -4530,6 +4530,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut prev_people: Vec<(glam::DVec3, f64)> = Vec::new();
     // (pairs already listed as `CAPRED` events)
     let mut capped_seen: HashSet<(u64, u64)> = HashSet::new();
+    // (holds before a dead lane's end per car: (start time, lane, s, last held seconds))
+    let mut dead_holds: HashMap<u64, (f64, usize, f32, f32)> = HashMap::new();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4636,6 +4638,37 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 if v > 1.0 {
                     ex.end_moving += 1;
                     ex.events.push(format!("END-MOVING {} t={t:.1} #{id} v {v:.1} at ({:.0}, {:.0})", sc.name, pos.x, pos.y));
+                }
+            }
+            // (a hold before a dead lane's end of `STRATEGIC_LONG_HOLD` or more: where and how it ended)
+            let mut marks: Vec<usize> = Vec::new();
+            for (i, v) in r.vehicles.iter().enumerate() {
+                if v.dead_end_held > 0.0 {
+                    let e = dead_holds.entry(v.id).or_insert((now, v.state.lane, v.state.s, 0.0));
+                    if e.3 < omsi_traffic::sim::STRATEGIC_LONG_HOLD && v.dead_end_held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+                        marks.push(i);
+                    }
+                    e.3 = v.dead_end_held;
+                }
+            }
+            // (at the mark: what it waits beside - the lanes beside as it reads them, with the
+            // occupancy built again as the junction trace does, its lead, who is asked to make room)
+            if !marks.is_empty() {
+                r.sim.build_occupancy(&r.net, &r.vehicles);
+            }
+            for i in marks {
+                let v = &r.vehicles[i];
+                let p = omsi_traffic::perception::perceive(&r.net, &r.sim, &r.vehicles, i);
+                let nbs: Vec<String> = [p.left, p.right].into_iter().flatten().map(|nb| format!("lane {} ahead {:?} behind {:?} by {:?}", nb.lane, nb.ahead.map(|(g, s)| ((g * 10.0).round() / 10.0, (s * 10.0).round() / 10.0)), nb.behind.map(|(g, s)| ((g * 10.0).round() / 10.0, (s * 10.0).round() / 10.0)), nb.behind_id.map(|k| r.vehicles[k].id))).collect();
+                let helpers: Vec<u64> = r.vehicles.iter().filter(|o| o.help_for.is_some_and(|h| h.0 == v.id)).map(|o| o.id).collect();
+                ex.events.push(format!("DEAD-HOLD-60 {} t={now:.1} #{} lane {} s {:.1} stop {:?} lead {:?} at {:?} v {:?}; beside: {}; asked {:?}", sc.name, v.id, v.state.lane, v.state.s, v.last.stop.map(|x| (x - v.state.front) * 10.0).map(|x| x.round() / 10.0), v.last.lead_id, v.last.lead.map(|l| (l.gap * 10.0).round() / 10.0), v.last.lead.map(|l| (l.speed * 10.0).round() / 10.0), nbs.join(" | "), helpers));
+            }
+            let ended: Vec<u64> = dead_holds.keys().copied().filter(|id| r.vehicles.iter().find(|v| v.id == *id).is_none_or(|v| v.dead_end_held <= 0.0)).collect();
+            for id in ended {
+                let (t0, lane, s0, held) = dead_holds.remove(&id).unwrap();
+                if held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+                    let then = r.vehicles.iter().find(|v| v.id == id).map(|v| format!("lane {} change {:?} for {:?} v {:.1}", v.state.lane, v.state.change.map(|c| c.to), v.change_for, v.state.speed));
+                    ex.events.push(format!("DEAD-HOLD {} t={t0:.1} #{id} lane {lane} s {s0:.1} held {held:.1} s, then {}", sc.name, then.unwrap_or_else(|| "gone".into())));
                 }
             }
             change_since.retain(|id, _| ids.contains(id));
@@ -5060,6 +5093,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     }
     for (_, run) in std::mem::take(&mut open) {
         close(&mut sc, run);
+    }
+    for (id, (t0, lane, s0, held)) in dead_holds {
+        if held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+            ex.events.push(format!("DEAD-HOLD {} t={t0:.1} #{id} lane {lane} s {s0:.1} held {held:.1} s, still at the end", sc.name));
+        }
     }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
     // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
@@ -6157,7 +6195,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             let st = &v.state;
             let d = &v.last;
             println!(
-                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {} body {:.1}/{:.1}",
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {} for {:?} held_dead {:.1} help_for {:?} end_stop {:?} cap {:?} held {} body {:.1}/{:.1}",
                 v.id,
                 st.lane,
                 st.s,
@@ -6180,9 +6218,32 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 v.external.serves,
                 v.external.stop_at.map(|x| x - st.front),
                 v.external.at_stop,
+                v.change_for,
+                v.dead_end_held,
+                v.help_for,
+                v.lane_end_stop.map(|o| o - st.odometer),
+                st.accel_cap,
+                st.held,
                 st.front,
                 st.rear
             );
+        }
+        // (`--nb`: the lanes beside a watched vehicle as its perception reads them now)
+        if args.iter().any(|a| a == "--nb") {
+            r.sim.build_occupancy(&r.net, &r.vehicles);
+            for &i in &found {
+                let p = omsi_traffic::perception::perceive(&r.net, &r.sim, &r.vehicles, i);
+                for nb in [p.left, p.right].into_iter().flatten() {
+                    println!("t={t:.1}   nb of #{}: lane {} dir {} ahead {:?} behind {:?} by {:?} runs_on {:.1} foreign {} allowed {}", r.vehicles[i].id, nb.lane, nb.dir, nb.ahead, nb.behind, nb.behind_id.map(|k| r.vehicles[k].id), nb.runs_on, nb.foreign, nb.allowed);
+                }
+            }
+        }
+        // (the vehicles asked to make room for a watched one this frame, `Vehicle::help_for`)
+        for &i in &found {
+            let me = r.vehicles[i].id;
+            for o in r.vehicles.iter().filter(|o| o.help_for.is_some_and(|h| h.0 == me)) {
+                println!("t={t:.1}   helper of #{me}: #{} lane {} s {:.1} v {:.2} help {:?} why {} lead_id {:?}", o.id, o.state.lane, o.state.s, o.state.speed, o.help_for, why_name(o.last.why), o.last.lead_id);
+            }
         }
         // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the
         // body's separation from its box, the step, and what the people test reads of them)
@@ -6224,7 +6285,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         // (`--ctl N`: light controller N's clock, its requests this frame and its stop points)
         if let Some(n) = opt(args, "--ctl").and_then(|x| x.parse::<usize>().ok()) {
             if let Some(c) = r.sim.lights.get(n) {
-                println!("t={t:.1}   ctl {n} time {:.1} requests {:?} stops {:?}", c.time, c.request, c.stops);
+                println!("t={t:.1}   ctl {n} time {:.1} requests {:?} stops {:?} states {:?}", c.time, c.request, c.stops, (0..c.request.len()).map(|k| c.state(k)).collect::<Vec<_>>());
             }
         }
         // (`--cuts`: the footpaths crossing the watched vehicle's way within 60 m, as distances

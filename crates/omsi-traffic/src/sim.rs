@@ -400,6 +400,10 @@ pub struct Vehicle {
     /// `STRATEGIC_HOLD_MS`, `STRATEGIC_LONG_HOLDS`).
     #[serde(default)]
     pub dead_end_held: f32,
+    /// What the last lane change of the driver's own it started was for (`Plan::change_why`;
+    /// diagnostics: `traffic_cases watch` and its hold events).
+    #[serde(skip)]
+    pub change_for: Option<crate::plan::ChangeWhy>,
     /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
@@ -691,6 +695,7 @@ impl Vehicle {
             reversing: None,
             lane_end_stop: None,
             dead_end_held: 0.0,
+            change_for: None,
             unheld_for: 0.0,
             zip_behind: None,
             refused_last: false,
@@ -2310,6 +2315,7 @@ impl Simulation {
                     v.state.start_change(net, to, dir);
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
+                    v.change_for = plan.change_why;
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -2321,6 +2327,7 @@ impl Simulation {
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
                     v.stopped = 0.0;
+                    v.change_for = plan.change_why;
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
