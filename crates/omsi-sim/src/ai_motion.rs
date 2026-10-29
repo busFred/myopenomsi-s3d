@@ -16,6 +16,8 @@
 //! vehicle the body is the whole of it: the rear sections that hang on joints off-track
 //! further inside (`rear_off_tracking`), and the band to centre runs from the innermost point
 //! of whichever runs innermost.
+//! Where that band is wider than the lane the vehicle swings wide: the offset stops where the
+//! innermost point reaches the lane's inner edge, and the outer side takes the rest.
 
 use crate::vehicle::VehicleInstance;
 use glam::{DVec2, DVec3, Vec3};
@@ -59,9 +61,19 @@ pub fn rotation_point(def: &Vehicle) -> (f32, f32) {
 /// `rear_pull` (`rear_off_tracking`) is the rear sections' extra off-tracking: their inner
 /// side lies `rear_pull · |k| / 2` inside the band's inner side, which moves the band's
 /// centre by `rear_pull · k / 4`; the offset is that much less (never past 0).
-pub fn careful_line_offset(k: f32, reach: f32, half_width: f32, rear_pull: f32) -> f32 {
+/// Where the band is wider than the lane the bus swings wide: the innermost point of the
+/// body (the front section's inner side, or the rear sections' at `rear_pull · |k| / 2`
+/// further in) stays on the lane's inner edge, `lane_half` from the way, so the offset is
+/// at most `lane_half - half_width - rear_pull · |k| / 2` (never below 0) and the outer
+/// side takes all the excess (no rear wheels over the kerb on a right turn, none into the
+/// oncoming lane in a left bend).
+pub fn careful_line_offset(k: f32, reach: f32, half_width: f32, rear_pull: f32, lane_half: f32) -> f32 {
     let off = reach * reach * k / (4.0 * (1.0 + half_width * k.abs())) - rear_pull * k / 4.0;
-    if off * k < 0.0 { 0.0 } else { off }
+    if off * k < 0.0 {
+        return 0.0;
+    }
+    let cap = (lane_half - half_width - rear_pull * k.abs() * 0.5).max(0.0);
+    off.abs().min(cap).copysign(off)
 }
 
 /// The off-tracking of the rear sections hung behind a road vehicle, for `AiBody::
@@ -210,6 +222,9 @@ pub struct AiBody {
     /// How much further inside the rotation point's circle the rear sections hanging behind
     /// the vehicle run than its own inner side (m², `rear_off_tracking`); 0 for a rigid one.
     rear_pull: f32,
+    /// Half the width of the lane the vehicle drives in (m, `set_lane_half`): where its inner
+    /// edge lies for the careful driver's line. Infinite until set: no inner edge.
+    lane_half: f32,
     /// Largest front wheel angle (deg) and how fast the driver turns towards it (deg/s).
     max_steer: f32,
     steer_rate: f32,
@@ -333,6 +348,7 @@ impl AiBody {
             rear_long,
             swept: None,
             rear_pull: 0.0,
+            lane_half: f32::INFINITY,
             max_steer,
             steer_rate: if heavy { 25.0 } else { 40.0 },
             wheels,
@@ -383,6 +399,13 @@ impl AiBody {
     pub fn keep_swept_in_lane_with(&mut self, front: f32, half_width: f32, parts: &[&crate::vehicle::VehicleType]) {
         self.keep_swept_in_lane(front, half_width);
         self.rear_pull = rear_off_tracking(parts);
+    }
+
+    /// Half the width of the lane the vehicle drives in now (m): the careful driver's line
+    /// keeps the body's innermost point inside that edge (`careful_line_offset`); the lane's
+    /// width as the traffic knows it for the vehicle's lane.
+    pub fn set_lane_half(&mut self, lane_half: f32) {
+        self.lane_half = lane_half;
     }
 
     /// Put the body onto its way, standing still and straight. `way(d)` is the point `d`
@@ -446,14 +469,22 @@ impl AiBody {
         // tangent there (on that circle the tangent at the first point is the first chord
         // turned back by half the turn, at the aim the second chord turned on by half). The
         // bend is the lane's: its heading's turn from the rotation point to the aim over the
-        // look-ahead (the same mean curvature; + = left, headings turn clockwise).
+        // look-ahead (the same mean curvature; + = left, headings turn clockwise), up to the
+        // way's own curvature and 0 where their signs differ.
         let side = match self.swept {
             Some((reach, half_width)) if look > 0.1 => {
+                // (the way's own: 2·turn/look, + = left)
+                let k_way = 2.0 * turn_signed as f32 / look;
                 let k = match lane {
-                    Some(l) => -(((l(self.rot_long + look) - l(self.rot_long)) as f64 + 180.0).rem_euclid(360.0) - 180.0).to_radians() as f32 / look,
-                    None => 2.0 * turn_signed as f32 / look,
+                    Some(l) => {
+                        let k_lane = -(((l(self.rot_long + look) - l(self.rot_long)) as f64 + 180.0).rem_euclid(360.0) - 180.0).to_radians() as f32 / look;
+                        // no more of a bend than the way has, and none where the two turn
+                        // different ways (a lane's heading that its points do not follow)
+                        if k_lane * k_way > 0.0 { k_lane.abs().min(k_way.abs()).copysign(k_lane) } else { 0.0 }
+                    }
+                    None => k_way,
                 };
-                careful_line_offset(k, reach, half_width, self.rear_pull) as f64
+                careful_line_offset(k, reach, half_width, self.rear_pull, self.lane_half) as f64
             }
             _ => 0.0,
         };
@@ -885,7 +916,8 @@ mod tests {
     /// The careful driver's line: a 12 m bus and a car in steady bends of 25, 40 and 80 m.
     /// Before (the rotation point on the way) the outer front corner swings out over the lane's
     /// edge (the bus 0.6 m at 40 m); with the line the swept band is centred on the way, its
-    /// excess over the lane shared equally by both sides, never more than before on either.
+    /// excess over the lane shared equally by both sides, and the worse of the two sides is
+    /// never more than the worse side was before (the inner side may be worse than it was).
     #[test]
     fn the_swept_body_is_centred_on_its_lane_in_a_bend() {
         let lane = 3.5;
@@ -898,7 +930,7 @@ mod tests {
                 let (out1, in1) = swept_outside(&mut after, (front, rear, half), r, speed, lane);
                 // the band of the geometry: inner side at r_r - half, outer front corner
                 let reach = (front - after.rot_long) as f64;
-                let rr = r - careful_line_offset(1.0 / r as f32, reach as f32, half, 0.0) as f64;
+                let rr = r - careful_line_offset(1.0 / r as f32, reach as f32, half, 0.0, f32::INFINITY) as f64;
                 let excess = ((rr + half as f64).hypot(reach) - (rr - half as f64) - lane) * 0.5;
                 eprintln!("{name} R {r}: before out {out0:.3} in {in0:.3}, after out {out1:.3} in {in1:.3}, band excess {excess:.3}");
                 assert!((out1 - in1).abs() < 0.05, "{name} R {r}: after out {out1:.3} in {in1:.3}");
@@ -910,6 +942,80 @@ mod tests {
         let (def, front, rear, half) = bj6123();
         let (out0, _) = swept_outside(&mut AiBody::new(&def, MotionKind::Road), (front, rear, half), 40.0, 7.0, lane);
         assert!(out0 > 0.5, "front {out0:.3} m out");
+    }
+
+    /// Where the band is wider than the lane the bus swings wide (K2-D2): BJ6123 in bends of 10,
+    /// 15 and 25 m of a 3.5 m lane (`lane_half` 1.75 m): the inner side never passes the lane's
+    /// inner edge, the offset is the one that puts it there (`lane_half - half`), and the outer
+    /// front corner takes the rest of the band - more than centred, no more than with the rear
+    /// axle on the way (before). A bus whose lane is its own width (`lane_half` = half the
+    /// body) stays on the way's line.
+    #[test]
+    fn a_bus_in_a_tight_bend_swings_wide_and_keeps_its_inner_side_in_the_lane() {
+        let lane = 3.5;
+        let (def, front, rear, half) = bj6123();
+        for (r, speed) in [(10.0f64, 3.0f32), (15.0, 4.0), (25.0, 5.0)] {
+            let mut before = AiBody::new(&def, MotionKind::Road);
+            let (out0, in0) = swept_outside(&mut before, (front, rear, half), r, speed, lane);
+            let mut centred = AiBody::new(&def, MotionKind::Road);
+            centred.keep_swept_in_lane(front, half);
+            let (out_c, in_c) = swept_outside(&mut centred, (front, rear, half), r, speed, lane);
+            let mut wide = AiBody::new(&def, MotionKind::Road);
+            wide.keep_swept_in_lane(front, half);
+            wide.set_lane_half(lane as f32 * 0.5);
+            let (out1, in1) = swept_outside(&mut wide, (front, rear, half), r, speed, lane);
+            // the band of the geometry with the offset at its cap
+            let reach = (front - wide.rot_long) as f64;
+            let off = careful_line_offset(1.0 / r as f32, reach as f32, half, 0.0, lane as f32 * 0.5) as f64;
+            let rr = r - off;
+            let outer = (rr + half as f64).hypot(reach) - (r + lane * 0.5);
+            eprintln!("BJ6123 R {r}: before out {out0:.3} in {in0:.3}; centred out {out_c:.3} in {in_c:.3}; swung wide out {out1:.3} in {in1:.3} (offset {off:.3}, band outer {outer:.3})");
+            assert!(in_c > 0.05, "R {r}: the centred band's inner side is past the edge ({in_c:.3})");
+            assert!((off - (lane * 0.5 - half as f64)).abs() < 1e-4, "R {r}: offset {off:.3}");
+            assert!(in1 < 0.05, "R {r}: inner side {in1:.3} m past the inner edge");
+            assert!((out1 - outer).abs() < 0.05, "R {r}: outer {out1:.3}, band {outer:.3}");
+            assert!(out1 > out_c, "R {r}: outer side takes the rest ({out1:.3} against centred {out_c:.3})");
+            assert!(out1 <= out0 + 0.05, "R {r}: outer {out1:.3} more than with the rear axle on the way ({out0:.3})");
+        }
+        // a lane no wider than the body itself: no room to move in, the way's own line
+        let (mut tight, mut plain) = (AiBody::new(&def, MotionKind::Road), AiBody::new(&def, MotionKind::Road));
+        tight.keep_swept_in_lane(front, half);
+        tight.set_lane_half(half);
+        let a = swept_outside(&mut tight, (front, rear, half), 15.0, 4.0, lane);
+        let b = swept_outside(&mut plain, (front, rear, half), 15.0, 4.0, lane);
+        assert!((a.0 - b.0).abs() < 0.02 && (a.1 - b.1).abs() < 0.02, "{a:?} against {b:?}");
+    }
+
+    /// The careful driver's line takes the lane's curvature only up to the way's own and 0
+    /// where their signs differ: a lane heading that turns left while the way's points go
+    /// straight or right, and one that turns more than the way, do not move the body.
+    #[test]
+    fn the_lane_bend_counts_only_as_far_as_the_way_has_it() {
+        let (def, front, _, half) = bj6123();
+        let straight = |d: f32| DVec3::new(0.0, d as f64, 0.0);
+        let right = |d: f32| bend(40.0, 50.0 + d as f64);
+        let place = |way: &dyn Fn(f32) -> DVec3, lane: &dyn Fn(f32) -> f32| {
+            let mut b = AiBody::new(&def, MotionKind::Road);
+            b.keep_swept_in_lane(front, half);
+            b.place_in_lane(way, Some(lane), None, None, 5.0);
+            b.rear
+        };
+        // headings turning right 40 m radius / left 40 m radius / right 10 m radius
+        let r40 = |d: f32| (d as f64 / 40.0).to_degrees() as f32;
+        let l40 = |d: f32| -(d as f64 / 40.0).to_degrees() as f32;
+        let r10 = |d: f32| (d as f64 / 10.0).to_degrees() as f32;
+        let north = |_d: f32| 0.0f32;
+        // a straight way: a lane bend of either sign moves nothing
+        let on_way = place(&straight, &north);
+        assert_eq!(place(&straight, &r40), on_way);
+        assert_eq!(place(&straight, &l40), on_way);
+        // a way bending right: a lane bending left moves nothing, the same bend moves it
+        // inward, a tighter lane bend (10 m) no more than the way's (40 m)
+        let way_alone = place(&right, &north);
+        assert_eq!(place(&right, &l40), way_alone);
+        let same = place(&right, &r40);
+        assert!((same - way_alone).length() > 0.3, "a 40 m bend moves the body {:.3} m", (same - way_alone).length());
+        assert!((place(&right, &r10) - same).length() < 1e-3, "{:?} against {:?}", place(&right, &r10), same);
     }
 
     /// The installed BJ6180: its front section and the rear section hung on it (None when
