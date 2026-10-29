@@ -6,8 +6,9 @@
 //! steering from `--setvar drive_steer`, the brake from `drive_brake_at`, `OMSI_DRIVE_PROFILE`,
 //! `OMSI_AUTOPILOT`) on its own physics - a gate run holds the brake from 0 s and the bus
 //! stands where it starts; with `--follow-line` it drives its duty's trip as an AI timetable
-//! bus drives one (`follow_line::LineFollower`: an AI bus of its type on the trip, the player's
-//! vehicle put where that bus's body is every frame, its own physics not run). With
+//! bus drives one (`follow_line::LineFollower`: the departure's own AI vehicle, of its AI
+//! group, takes the player's departure on where the player's bus stands, and the player's
+//! vehicle is put where that bus's body is every frame, its own physics not run). With
 //! `--watch-player` (and `--follow-line`) the summary tells what appeared, vanished and held
 //! round the player (`follow_line::PlayerWatch`).
 
