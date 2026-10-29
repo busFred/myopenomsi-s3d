@@ -221,18 +221,18 @@ fn counters() -> (u64, u64, u64) {
     (g(&omsi_traffic::sim::CHANGES_BY_WHY[omsi_traffic::plan::ChangeWhy::Strategic as usize]), g(&omsi_sim::traffic::STRATEGIC_MISSED), g(&omsi_sim::traffic::GOAL_UNREACHABLE))
 }
 
-/// Car 1 on the left lane at x 40, 13 m/s, its trip end lane 3 (off the right-hand way), with no
-/// wish of its own to change for speed or to keep right (`lc_speed_gain`, `lc_keep_right` 0) and
-/// `lc_strategic` as given; with `platoon` a row of cars on the right lane level with it at its
-/// speed, too close one behind the other for any gap. Runs 40 s: (the lanes it drove, in order,
+/// Car 1 on the left lane at x `start`, 13 m/s, its trip end lane 3 (off the right-hand way), with
+/// no wish of its own to change for speed or to keep right (`lc_speed_gain`, `lc_keep_right` 0) and
+/// `lc_strategic` as given; with `platoon` a row of cars on the right lane from 60 m behind it, at
+/// its speed, too close one behind the other for any gap. Runs 40 s: (the lanes it drove, in order,
 /// the strategic changes, missed changes and goal redraws for unreachability counted meanwhile,
-/// its trip end at the end).
-fn to_the_trip_end_off_the_right(lc_strategic: f32, platoon: bool) -> (Vec<usize>, (u64, u64, u64), Option<usize>) {
+/// its trip end at the end, the longest it stood, s).
+fn to_the_trip_end_off_the_right(lc_strategic: f32, platoon: bool, start: f32) -> (Vec<usize>, (u64, u64, u64), Option<usize>, f32) {
     let net = fork_ahead();
     assert_eq!(net.lanes[0].right, Some(1));
     assert_eq!(net.lanes[0].next.len(), 2);
     let mut sim = Simulation::new(&net, vec![]);
-    let mut me = car(1, 0, 40.0, 13.0);
+    let mut me = car(1, 0, start, 13.0);
     me.state.change_cooldown = 0.0;
     me.state.goal = Some(3);
     me.params.lc_speed_gain = 0.0;
@@ -240,48 +240,142 @@ fn to_the_trip_end_off_the_right(lc_strategic: f32, platoon: bool) -> (Vec<usize
     me.params.lc_strategic = lc_strategic;
     let mut cars = vec![me];
     if platoon {
-        for (k, s) in (0..14).map(|k| (k, -20.0 + 9.0 * k as f32)).filter(|&(_, s)| s >= 0.0) {
+        for (k, s) in (0..14).map(|k| (k, start - 60.0 + 9.0 * k as f32)).filter(|&(_, s)| s >= 0.0) {
             let mut o = car(10 + k, 1, s, 13.0);
             o.state.change_cooldown = 1000.0;
             o.params.lc_speed_gain = 0.0;
             o.params.lc_keep_right = 0.0;
             o.state.max_speed_kmh = 13.0 * 3.6;
+            o.state.goal = Some(4);
             cars.push(o);
         }
         cars[0].state.max_speed_kmh = 13.0 * 3.6;
     }
     let before = counters();
     let mut lanes = vec![0usize];
-    let mut t = 0.0f32;
-    while t < 40.0 {
+    let (mut t, mut stood, mut longest) = (0.0f32, 0.0f32, 0.0f32);
+    while t < 60.0 {
         sim.tick(&net, DT, &mut cars);
         let Some(me) = cars.iter().find(|c| c.id == 1) else { break };
         if lanes.last() != Some(&me.state.lane) {
             lanes.push(me.state.lane);
         }
+        stood = if me.state.speed < 0.1 { stood + DT } else { 0.0 };
+        longest = longest.max(stood);
         t += DT;
     }
     let after = counters();
     let goal = cars.iter().find(|c| c.id == 1).and_then(|c| c.state.goal);
-    (lanes, (after.0 - before.0, after.1 - before.1, after.2 - before.2), goal)
+    (lanes, (after.0 - before.0, after.1 - before.1, after.2 - before.2), goal, longest)
 }
 
 /// L3-3, SUMO LC2013's strategic change: a car on the left lane whose trip end lies off the
 /// right-hand way at the fork changes right before the fork (counted strategic) and takes the way
 /// to its trip end; with `lc_strategic` -1 (SUMO: no strategic changes) it stays left and drives
-/// through the fork on its own lane's way. With the right lane packed level with it there is no
-/// gap: it misses the fork (counted `STRATEGIC_MISSED`) and its trip end is drawn again at its next
-/// fork because its road no longer reaches it (`GOAL_UNREACHABLE`).
+/// through the fork on its own lane's way. With a row on the right lane level with it, too close for
+/// any gap, the row is asked to make room (LC2013's `informFollower`) and it changes right in time
+/// and takes the turn, no miss. Only past the point of no return - the row level with it 25 m
+/// before the fork, where it can no longer stop at its comfortable brake - does it drive on
+/// through the fork (counted `STRATEGIC_MISSED`) and its trip end is drawn again
+/// (`GOAL_UNREACHABLE` at its next fork).
 #[test]
 fn a_car_changes_lanes_towards_its_trip_end_before_the_fork_or_misses_it_and_draws_again() {
-    let (lanes, (strategic, _, _), goal) = to_the_trip_end_off_the_right(1.0, false);
+    let (lanes, (strategic, _, _), goal, _) = to_the_trip_end_off_the_right(1.0, false, 40.0);
     assert!(lanes.starts_with(&[0, 1, 3]) && strategic >= 1, "changes right and takes the turn: lanes {lanes:?}, strategic {strategic}, goal {goal:?}");
-    let (lanes, _, _) = to_the_trip_end_off_the_right(-1.0, false);
+    let (lanes, _, _, _) = to_the_trip_end_off_the_right(-1.0, false, 40.0);
     assert!(lanes.len() >= 2 && lanes[1] != 1 && lanes[1] != 3, "no strategic change: lanes {lanes:?}");
-    let (lanes, (_, missed, unreachable), goal) = to_the_trip_end_off_the_right(1.0, true);
-    assert!(lanes.len() >= 3 && (lanes[1] == 2 || lanes[1] == 5), "no gap: drives on through the fork on its lane: lanes {lanes:?}");
+    let (lanes, (strategic, _, _), goal, _) = to_the_trip_end_off_the_right(1.0, true, 40.0);
+    assert!(lanes.starts_with(&[0, 1, 3]) && strategic >= 1, "a row beside: it makes room, the car changes: lanes {lanes:?}, strategic {strategic}, goal {goal:?}");
+    let (lanes, (_, missed, unreachable), goal, _) = to_the_trip_end_off_the_right(1.0, true, 275.0);
+    assert!(lanes.len() >= 3 && (lanes[1] == 2 || lanes[1] == 5), "past the point of no return: drives on through the fork on its lane: lanes {lanes:?}");
     assert!(missed >= 1, "the miss is counted: {missed}");
     assert!(unreachable >= 1 && goal != Some(3), "drawn again at the next fork: unreachable {unreachable}, goal {goal:?}");
+}
+
+/// A blocked urgent strategic change brings the car to a stop before the end of its dead lane
+/// (SUMO LC2013: the vehicle adapts its speed to stop at the lane's end while the change is
+/// blocked, sumo.md 3.2), where it waits for a gap: car 1 on the left lane of `fork_ahead` at x 200,
+/// 13 m/s, its trip end lane 3 off the right-hand way, beside a jam standing on the right lane
+/// from x 220 to the fork, stands before x 300 and is still on its lane with its trip end after
+/// 30 s (no miss); the jam gone, it changes right and takes the turn.
+#[test]
+fn a_blocked_strategic_change_stops_before_the_dead_lanes_end_and_waits() {
+    let net = fork_ahead();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 200.0, 13.0);
+    me.state.change_cooldown = 0.0;
+    me.state.goal = Some(3);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    let mut cars = vec![me];
+    for k in 0..12u64 {
+        cars.push(standing(10 + k, 1, 220.0 + 6.5 * k as f32));
+    }
+    let mut lanes = vec![0usize];
+    let mut t = 0.0f32;
+    while t < 50.0 {
+        if t >= 30.0 {
+            cars.retain(|c| c.id == 1);
+        }
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).expect("car 1");
+        if lanes.last() != Some(&me.state.lane) {
+            lanes.push(me.state.lane);
+        }
+        if (t - 29.9).abs() < DT * 0.5 {
+            assert!(me.state.lane == 0 && me.state.speed < 0.1 && me.state.s + me.state.front < 300.0 && me.state.goal == Some(3), "blocked: stands before the dead lane's end: lane {} s {:.1} v {:.1} goal {:?}", me.state.lane, me.state.s, me.state.speed, me.state.goal);
+        }
+        t += DT;
+    }
+    assert!(lanes.starts_with(&[0, 1, 3]), "the jam gone, it changes and takes the turn: lanes {lanes:?}");
+}
+
+/// The trip end of a car with none is drawn at the first fork within SUMO's strategic look-ahead
+/// (`LC_STRATEGIC_LOOKAHEAD`), not only once its plan (`PLAN_AHEAD`) reaches the fork: car 1 260 m
+/// before the fork of `fork_ahead` has one after its first frame, and over 40 cars some draw lane 3,
+/// the end reached only from the lane beside.
+#[test]
+fn a_trip_end_is_drawn_where_the_strategic_look_ahead_sees_the_fork() {
+    let net = fork_ahead();
+    let mut beside = 0;
+    for id in 1..=40u64 {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(id, 0, 40.0, 13.0)];
+        sim.tick(&net, DT, &mut cars);
+        let goal = cars[0].state.goal;
+        assert!(goal.is_some(), "car {id}: no trip end after its first frame, 260 m before the fork");
+        beside += (goal == Some(3)) as usize;
+    }
+    assert!(beside > 0, "lane 3, off the lane beside, never drawn");
+}
+
+/// A lane beside only on a short last piece before the fork does not count for the draw: the
+/// left lane (lane 0, x 0..285) runs into lane 1 (285..300) with lane 2 beside it only there
+/// (y -3.5), lane 2 leading to lane 3 (an end); lane 1 forks into lanes 4 and 5 (ends). A car at
+/// 13 m/s on lane 0 runs beside lane 2 for 15 m, less than a change takes (`change_space`): over 40
+/// cars none draws lane 3.
+#[test]
+fn a_lane_beside_only_on_a_short_last_piece_is_no_way_to_the_trip_end() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (285.0, 0.0)], 1, 0, 0.0));
+    net.lanes.push(road(&[(285.0, 0.0), (300.0, 0.0)], 2, 0, 0.0));
+    net.lanes.push(road(&[(285.0, -3.5), (300.0, -3.5)], 2, 1, 3.5));
+    net.lanes.push(road(&[(300.0, -3.5), (330.0, -10.0), (400.0, -100.0)], 3, 0, 0.0));
+    net.lanes.push(road(&[(300.0, 0.0), (600.0, 0.0)], 4, 0, 0.0));
+    net.lanes.push(road(&[(300.0, 0.0), (330.0, 7.0), (400.0, 100.0)], 5, 0, 0.0));
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    assert_eq!(net.lanes[1].right, Some(2));
+    assert_eq!(net.lanes[1].next.len(), 2);
+    assert!(omsi_sim::traffic::change_space(13.0, 1.0) > 15.0);
+    for id in 1..=40u64 {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut cars = vec![car(id, 0, 40.0, 13.0)];
+        sim.tick(&net, DT, &mut cars);
+        let goal = cars[0].state.goal;
+        assert!(goal.is_some_and(|g| g == 4 || g == 5), "car {id}: trip end {goal:?}, not one its own lane's ways reach");
+    }
 }
 
 /// Car 1 at rest on the right lane at s 100 behind car 2 standing at 106.5 (close enough that only

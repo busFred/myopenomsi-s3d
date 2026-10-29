@@ -100,9 +100,13 @@ pub struct Plan {
     /// gap rule fails again (`gap_accepted` against `change_target_view`) or somebody is on the
     /// move (`people_on_move`; counted, `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
-    /// The last-resort stop before a lane's end placed this frame (the odometer where the
-    /// front stops, `Vehicle::lane_end_stop`).
+    /// The last-resort stop before a lane's end, or a dead lane's end for a blocked urgent
+    /// strategic change, placed this frame (the odometer where the front stops,
+    /// `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
+    /// The car stands at that stop before a dead lane's end, its urgent strategic change blocked
+    /// (`sim::STRATEGIC_HOLD_MS`).
+    pub dead_end_hold: bool,
     /// Backing up out of a packed queue (`queue_escape`): (the odometer where it
     /// is to stand, stopping: a committed stop - the strip behind no longer clear or the queue
     /// moving).
@@ -367,13 +371,8 @@ pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
 /// brakes no harder than its comfortable brake times this.
 pub const HELP_DECEL_FACTOR: f32 = 1.0;
 
-/// The road a lane change started at `v` m/s takes (m): the signalling before
-/// it moves (`SIGNAL_BEFORE_CHANGE`, speeding up at `a` meanwhile) and the move
-/// (`change_length`).
-pub fn change_space(v: f32, a: f32) -> f32 {
-    let w = omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
-    v * w + 0.5 * a.max(0.0) * w * w + omsi_sim::traffic::change_length(v)
-}
+/// The road a lane change started at `v` m/s takes (m), `omsi_sim::traffic::change_space`.
+pub use omsi_sim::traffic::change_space;
 
 /// SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
 /// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side) plus two of the
@@ -621,11 +620,14 @@ fn change_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     // (`strategic_desire`), under the lane-end rules of where a change may be made
     // (`may_change_for_lane_end`: the lane leads elsewhere, its turn-lane rules do not hold), the
     // gap rule and nobody on the move; and only a move that fits before the dead lane's end (SUMO's
-    // `LCA_INSUFFICIENT_SPACE`: the change's whole road, `change_space`) - else the car drives on
-    // through the fork on its own lane and its trip end is drawn again (`STRATEGIC_MISSED`)
+    // `LCA_INSUFFICIENT_SPACE`: the change's whole road, `change_space`, less what the car's stop
+    // control lands either side of its stop before that end, `REST_SHORT`, as at a lane's end). A wish whose change is
+    // blocked brings the car to a stop before the dead lane's end, where it waits for a gap
+    // (`plan`'s blocked wish, as at a lane's end); only a car past the point of no return drives
+    // on through the fork on its own lane, and its trip end is drawn again (`STRATEGIC_MISSED`)
     if let Some((strategic, dist)) = strategic_desire(net, sim, vehicles, me, nb).filter(|s| s.0 > 0.0 && s.0 >= end) {
         if may_change_for_lane_end(net, sim, me, nb) {
-            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel) <= dist;
+            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel) <= dist + REST_SHORT;
             return (strategic, ok, ChangeWhy::Strategic);
         }
     }
@@ -839,9 +841,8 @@ pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
 /// considered to be a turn-lane that must be avoided" - a driver on the lane that runs on does not
 /// leave it for a keep-right onto one that runs on less than this (`stays_on_best`).
 pub const TURN_LANE_DIST: f32 = 200.0;
-/// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so
-/// the distance a lane beside runs on (`neighDist`), are looked along.
-pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
+/// SUMO's `lcStrategicLookahead` (m), `omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD`.
+pub use omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD;
 /// SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
 /// allowed (`avoidOvertakeRight` is false), above it the time on the lane beside is bounded by
 /// catching up with my own leader.
@@ -2679,13 +2680,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // move is still clear of the bodies near (below) - and is dropped if any fails before the
     // car moves over (SUMO's `checkChange` runs every step
     // until the change is carried out, and blocks it for a pedestrian on the target lane within
-    // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end asks for keeps
-    // informing the follower there (LC2013's `informFollower`, every step the strategic change
+    // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end or an
+    // urgent strategic wish (`strategic_desire`) asks for keeps informing the follower there (LC2013's `informFollower`, every step the strategic change
     // is wanted and not yet carried out: SUMO carries it out in the step it is accepted, the
     // OMSI driver signals first, and the follower that made room is not let go meanwhile)
     if let Some(c) = st.change.filter(|c| c.wait > 0.0 && c.t <= 0.0 && st.route.is_empty()) {
         if let Some(nb) = change_target_view(p, c.to, c.dir) {
-            if let (true, Some(f), Some((gap, vb))) = (lane_end_desire(net, sim, me, p, &nb) > 0.0, nb.behind_id, nb.behind) {
+            let urgent = lane_end_desire(net, sim, me, p, &nb) > 0.0 || strategic_desire(net, sim, vehicles, me, &nb).is_some_and(|s| s.0 > 0.0);
+            if let (true, Some(f), Some((gap, vb))) = (urgent, nb.behind_id, nb.behind) {
                 if gap > 0.0 {
                     out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
                 }
@@ -2741,16 +2743,25 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     if free_to_change {
         let near_junction = p.junction.as_ref().map(|j| !j.inside && j.line < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView, ChangeWhy)> = None;
-        // the strongest lane-end wish whose gap is not there
-        let mut blocked_end: Option<(f32, NeighbourView)> = None;
+        // the strongest lane-end or urgent strategic wish whose gap is not there: (desire, the
+        // lane beside, the distance from my front to where my lane ends for me - the lane's end,
+        // `Perception::lane_end`, or the dead lane's end, `strategic_desire` - and whether the car
+        // stops before it for the change: not at a merge, the zipper's; and whether that end is a
+        // dead lane's, which runs on)
+        let mut blocked_end: Option<(f32, NeighbourView, f32, bool, bool)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
             let (d, ok, why) = change_desire(net, sim, vehicles, me, p, &nb, near_junction, ant(&nb));
             if ok && d > 0.0 && best.map(|b| d > b.0).unwrap_or(true) {
                 best = Some((d, nb, why));
             }
             let end = lane_end_desire(net, sim, me, p, &nb);
-            if !ok && end > 0.0 && blocked_end.map(|b| end > b.0).unwrap_or(true) {
-                blocked_end = Some((end, nb));
+            let blocked = match p.lane_end {
+                Some(e) if !ok && end > 0.0 => Some((end, nb, e.dist, e.kind != LaneEndKind::Merge, false)),
+                _ if !ok && d > 0.0 && why == ChangeWhy::Strategic => strategic_desire(net, sim, vehicles, me, &nb).map(|(_, dist)| (d, nb, dist, true, true)),
+                _ => None,
+            };
+            if let Some(b) = blocked.filter(|b| blocked_end.map(|o| b.0 > o.0).unwrap_or(true)) {
+                blocked_end = Some(b);
             }
         }
         let threshold = 0.4 - 0.2 * me.impatience.value;
@@ -2768,7 +2779,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 None => change_clear(net, sim, vehicles, me, p, &nb, None, mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
             };
             out.change_why = Some(why);
-        } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
+        } else if let Some((_, nb, end_dist, stop_for, dead)) = blocked_end.filter(|b| b.0 >= threshold) {
             // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
             // when only it is in the way (room ahead there), is asked to make room
             // the gap my acceptance needs from it (`gap_needed_behind`); one level with me or ahead
@@ -2789,10 +2800,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 // else it is told not to brake and I change in behind it. Asked when it could
                 // not, the second follower of a chain would stand behind my rear closer than the
                 // gap the acceptance needs at rest, and all would stand)
-                let reach = p.lane_end.map_or(f32::INFINITY, |e| {
+                let reach = {
                     let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
-                    (e.dist - change_space(0.0, st.accel).max(bypass_min_len(me.length(), side))).max(0.0)
-                });
+                    (end_dist - change_space(0.0, st.accel).max(bypass_min_len(me.length(), side))).max(0.0)
+                };
                 let b_f = vehicles.get(f).map_or(dp.comfort_brake, |o| o.params.comfort_brake) * HELP_DECEL_FACTOR;
                 let can_open = gap + reach - vb * vb / (2.0 * b_f.max(0.1)) >= nb.behind_min_gap;
                 if gap > 0.0 && can_open {
@@ -2800,22 +2811,25 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     // before the lane ends, I cut in - it is only asked not to speed up, `need` 0;
                     // else it is asked to open the gap)
                     let need = gap_needed_behind(me, &nb, vb, v);
-                    let opens = p.lane_end.is_some_and(|e| v > vb && gap + (v - vb) * e.dist / v.max(STANDING_SPEED) >= need);
+                    let opens = v > vb && gap + (v - vb) * end_dist / v.max(STANDING_SPEED) >= need;
                     let need = if opens { 0.0 } else { need };
                     out.help = Some((f, gap, v, need));
                 } else if let Some(o) = vehicles.get(f) {
                     drop_back = Some((me.length() + o.length() + gap + st.min_gap, vb));
                 }
             }
-            if let (Some((overtake, v_other)), Some(e)) = (drop_back, p.lane_end) {
-                let remaining = e.dist / v.max(STANDING_SPEED);
+            if let Some((overtake, v_other)) = drop_back {
+                let remaining = end_dist / v.max(STANDING_SPEED);
                 let target = (v_other - overtake / remaining).max(0.0);
                 if target < v {
                     let cap = ((target - v) / st.headway.max(0.1)).max(-dp.comfort_brake * HELP_DECEL_FACTOR);
                     out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
                 }
             }
-            // ... and the last resort where the lane really ends (a merge is the zipper's): the
+            // ... and the last resort where the lane really ends (a merge is the zipper's) or
+            // where a dead lane ends for an urgent strategic change (SUMO LC2013: while the
+            // change is blocked the vehicle adapts its speed to stop at the end of the lane, and
+            // waits there for a gap, sumo.md 3.2-3.3): the
             // car stops before the end with the room to move over from standing (the cleanup's
             // keep-back for a bypass: a lane change's shortest move, or what the body needs to
             // steer the lane's width over, whichever is longer) - braking for it only once it
@@ -2825,14 +2839,28 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (once placed it is kept - a latch, `Vehicle::lane_end_stop` - until the change
             // starts or the car stands: placed and dropped by the brake test frame by frame, it
             // flicked on and off in the last metre, an 8 m/s² brake-light flicker)
-            if let Some(e) = p.lane_end.filter(|e| e.kind != LaneEndKind::Merge) {
-                let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
-                let room = change_space(0.0, st.accel).max(bypass_min_len(me.length(), side));
+            // (a dead lane runs on: a car that can no longer stop before its end at its
+            // comfortable brake is past the point of no return and drives on through the fork,
+            // `omsi_sim::traffic::STRATEGIC_MISSED`; so is one past the stop's place, as at a
+            // lane's end. Nor does it stop for it on a junction object's piece: SUMO changes lanes
+            // on the edges and no vehicle stands on an internal lane for its change - standing
+            // there it holds the junction's foes - so a change still blocked there is missed)
+            let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
+            let room = change_space(0.0, st.accel).max(bypass_min_len(me.length(), side));
+            let on_piece = |at: f32| p.way.iter().take_while(|w| w.1 <= at).last().is_some_and(|w| net.lanes[w.0].source == 2);
+            if stop_for && !(dead && on_piece(st.front + end_dist - room)) {
                 let latched = me.lane_end_stop.filter(|_| v >= STANDING_SPEED).map(|o| st.front + (o - st.odometer));
-                let at = latched.unwrap_or(st.front + e.dist - room);
-                if latched.is_some() || (at > st.front - 0.3 && at - st.front <= v * v / (2.0 * dp.comfort_brake)) {
+                let at = latched.unwrap_or(st.front + end_dist - room);
+                let brake = v * v / (2.0 * dp.comfort_brake);
+                let returns = !dead || end_dist >= brake;
+                // (standing there before a dead lane's end it stays - nothing ends its lane there,
+                // the stop alone holds it - landed within `REST_SHORT` either side of the stop)
+                let holds = dead && v < STANDING_SPEED && at > st.front - REST_SHORT;
+                let at = if holds { at.max(st.front) } else { at };
+                if latched.is_some() || holds || (returns && at > st.front - 0.3 && at - st.front <= brake) {
                     min_stop(&mut out.stop, &mut out.why, Some(at), Why::Merge);
                     out.lane_end_stop = Some(st.odometer + (at - st.front));
+                    out.dead_end_hold = holds;
                 }
             }
         }

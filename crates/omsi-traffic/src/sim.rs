@@ -390,11 +390,16 @@ pub struct Vehicle {
     /// stop; stopping); kept with the vehicle.
     #[serde(default)]
     pub reversing: Option<(f32, bool)>,
-    /// The last-resort stop before the end of a lane that ends for the driver, once placed
-    /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
-    /// the car stands - a latch, not a margin.
+    /// The last-resort stop before the end of a lane that ends for the driver, or of a dead lane
+    /// for a blocked urgent strategic change, once placed (the odometer where the front stops,
+    /// `Plan::lane_end_stop`): kept until the change starts or the car stands - a latch, not a
+    /// margin (standing before a dead lane's end, the stop itself holds it there).
     #[serde(default)]
     pub lane_end_stop: Option<f32>,
+    /// Seconds standing at its stop before a dead lane's end without a break (`Plan::dead_end_hold`;
+    /// `STRATEGIC_HOLD_MS`, `STRATEGIC_LONG_HOLDS`).
+    #[serde(default)]
+    pub dead_end_held: f32,
     /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
@@ -685,6 +690,7 @@ impl Vehicle {
             speed_gain: [0.0; 2],
             reversing: None,
             lane_end_stop: None,
+            dead_end_held: 0.0,
             unheld_for: 0.0,
             zip_behind: None,
             refused_last: false,
@@ -785,6 +791,17 @@ pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::syn
 /// with no lane: the lateral offset within the lane, SUMO's sublane `posLat`), every simulation
 /// of the process (diagnostics, `traffic_cases ab`'s `lane_offset_s`).
 pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds cars stood at their stop before a dead lane's end, their urgent strategic change
+/// blocked (`plan::Plan::dead_end_hold`; SUMO LC2013's stop at the end of the lane), every
+/// simulation of the process (`traffic_cases ab`'s `strategic_hold_s`).
+pub static STRATEGIC_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A hold before a dead lane's end at least this long (s) is counted (`STRATEGIC_LONG_HOLDS`):
+/// the review's mark for a standing car blocking its lane for long.
+pub const STRATEGIC_LONG_HOLD: f32 = 60.0;
+/// Holds before a dead lane's end that lasted `STRATEGIC_LONG_HOLD` or longer, every simulation
+/// of the process (`traffic_cases ab`'s `strategic_long_holds`).
+pub static STRATEGIC_LONG_HOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lane changes of the drivers' own dropped while signalling because their gap check failed
 /// again (`Plan::abort_change`; SUMO's `checkChange` every step), every simulation of the process
@@ -2251,6 +2268,18 @@ impl Simulation {
         // the last-resort stop's latch: dropped with a start or standing (the plan places it
         // afresh only while the wish is blocked)
         v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
+        // (standing before a dead lane's end for a blocked strategic change: counted, and each
+        // hold once it lasts `STRATEGIC_LONG_HOLD`)
+        if plan.dead_end_hold {
+            let before = v.dead_end_held;
+            v.dead_end_held += dt;
+            STRATEGIC_HOLD_MS.fetch_add((dt * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+            if before < STRATEGIC_LONG_HOLD && v.dead_end_held >= STRATEGIC_LONG_HOLD {
+                STRATEGIC_LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            v.dead_end_held = 0.0;
+        }
         // held out of its lane on the way back in: the ramp back begins where
         // the body would first feel it once let go - its start kept a heading chord ahead of
         // the standing body, so the body is not drawn turned into the lane while it waits

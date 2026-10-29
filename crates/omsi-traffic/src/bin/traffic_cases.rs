@@ -5373,7 +5373,7 @@ fn ab(args: &[String]) -> Res<()> {
         println!("(trip ends, whole map: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles)", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), total.extra.lane_revisits, total.extra.revisit_vehicles);
         // [L3-3] trip ends drawn again because the car's road no longer reached them (of
         // goal_repicked), and strategic changes missed at the fork
-        println!("(trip-end lane use, whole map: goal_unreachable {} strategic_missed {})", g(&GOAL_UNREACHABLE), g(&STRATEGIC_MISSED));
+        println!("(trip-end lane use, whole map: goal_unreachable {} strategic_missed {} strategic_hold_s {} strategic_long_holds {})", g(&GOAL_UNREACHABLE), g(&STRATEGIC_MISSED), g(&omsi_traffic::sim::STRATEGIC_HOLD_MS) / 1000, g(&omsi_traffic::sim::STRATEGIC_LONG_HOLDS));
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {}, strategic {})", c(0), c(1), c(2), c(3), c(4), c(5));
