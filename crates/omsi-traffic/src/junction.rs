@@ -236,6 +236,12 @@ impl Junctions {
                 if !c.merge && !c.outside {
                     continue;
                 }
+                // (a pair met only by bodies wider than the centre lines are apart, `Crossing::apart`,
+                // is no meeting place of its own: it is a foe, `Movement::wide`, only between lanes
+                // that are in one junction already, and does not group lanes into one)
+                if c.apart > 0.0 {
+                    continue;
+                }
                 let shared: Vec<usize> = net.lanes[a].next.iter().copied().filter(|n| net.lanes[b].next.contains(n)).collect();
                 let ways_on: Vec<usize> = if shared.is_empty() { net.lanes[a].next.iter().chain(&net.lanes[b].next).copied().collect() } else { shared };
                 for n in ways_on {

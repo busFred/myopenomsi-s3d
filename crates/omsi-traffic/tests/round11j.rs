@@ -4,7 +4,7 @@
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
-use omsi_traffic::{Simulation, Vehicle, VehicleClass};
+use omsi_traffic::{Claim, Impatience, Simulation, Vehicle, VehicleClass};
 
 const DT: f32 = 1.0 / 30.0;
 
@@ -83,13 +83,18 @@ fn run(net: &Network, sim: &mut Simulation, cars: &mut Vec<Vehicle>, secs: f32) 
 /// approaches. The centre lines come no closer than 2.3 m, under two buses' half widths
 /// (2 x 1.25 m).
 fn converging_turns() -> Network {
+    converging_turns_ending(2.3)
+}
+
+/// [`converging_turns`] with the second piece ending `gap` m beside the first.
+fn converging_turns_ending(gap: f64) -> Network {
     let mut net = Network::default();
     net.lanes.push(road(&[(-100.0, 0.0), (0.0, 0.0)], 1));
     net.lanes.push(road(&[(-100.0, 4.4), (0.0, 4.4)], 2));
     net.lanes.push(piece(&[(0.0, 0.0), (40.0, 0.0)], 0));
-    net.lanes.push(piece(&[(0.0, 4.4), (40.0, 2.3)], 1));
+    net.lanes.push(piece(&[(0.0, 4.4), (40.0, gap)], 1));
     net.lanes.push(road(&[(40.0, 0.0), (200.0, 0.0)], 3));
-    net.lanes.push(road(&[(40.0, 2.3), (200.0, 2.3)], 4));
+    net.lanes.push(road(&[(40.0, gap), (200.0, gap)], 4));
     finish(net)
 }
 
@@ -133,6 +138,39 @@ fn j11_2_two_cars_on_paths_converging_to_more_than_their_widths_go_through_abrea
     println!("least {least:.2} odometers {odo:?}");
     assert!(least > 0.0, "the two cars touched: {least:.2} m");
     assert!((odo[0] - odo[1]).abs() < 2.0, "one waited for the other: odometers {odo:?}");
+}
+
+fn claim_of(sim: &Simulation, lane: usize, vehicle: usize, half_width: f32) -> Claim {
+    let (j, m) = sim.junctions.of_lane[&lane];
+    Claim { half_width, chain: vec![(m, 0.0)], vehicle, junction: j, movement: m, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, red_at: f32::INFINITY, lead: None, was_standing: true, blocked: false, stuck: false, clearing: false, in_box_at_turn: false, lanes: Vec::new(), light: None, id: vehicle as u64, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6 }
+}
+
+/// [J11-2] The two paths converging to 2.0 m are a wide pair (`Movement::wide`, not a plain
+/// foe) that a bus (half width 1.25 m) and a car (0.9 m) meet at (2.15 m > 2.0 m) and two cars
+/// (1.8 m) do not (`reservation::meets`, read on both sides); and a bus and a car side by side
+/// on them go through one behind the other without touching.
+#[test]
+fn j11_2_a_bus_and_a_car_meet_at_a_wide_pair_that_two_cars_do_not() {
+    let net = converging_turns_ending(2.0);
+    let meet = net.crossings[2].iter().find(|c| c.other == 3).copied();
+    assert!(meet.is_some_and(|m| m.merge && m.side && (m.apart - 2.0).abs() < 0.05), "no side merge between the converging paths: {meet:?}");
+    let mut sim = Simulation::new(&net, vec![]);
+    let (j, m2) = sim.junctions.of_lane[&2];
+    let (_, m3) = sim.junctions.of_lane[&3];
+    assert!(sim.junctions.nodes[j].movements[m2].foes.iter().all(|f| f.movement != m3), "a wide pair is no plain foe");
+    let foe = sim.junctions.foes_along_wide(j, &[(m2, 0.0)]).into_iter().map(|(_, f)| f).find(|f| f.movement == m3).expect("the wide pair is in the resolver's foes");
+    let (bus, car, car2) = (claim_of(&sim, 2, 1, 1.25), claim_of(&sim, 3, 2, 0.9), claim_of(&sim, 2, 3, 0.9));
+    assert!(omsi_traffic::reservation::meets(&foe, &bus, &car), "a bus and a car meet");
+    assert!(omsi_traffic::reservation::meets(&foe, &car, &bus), "a car and a bus meet");
+    assert!(!omsi_traffic::reservation::meets(&foe, &car2, &car), "two cars do not");
+    let mut cars = vec![
+        vehicle(1, VehicleClass::Car, vec![1, 3, 5], 80.0, 5.0, 2.2, 0.9),
+        vehicle(2, VehicleClass::Bus, vec![0, 2, 4], 80.0, 5.0, 5.9, 1.25),
+    ];
+    let (least, odo) = run(&net, &mut sim, &mut cars, 30.0);
+    println!("least {least:.2} odometers {odo:?}");
+    assert!(least > 0.0, "the bus and the car touched: {least:.2} m");
+    assert!(odo.iter().all(|&o| o > 100.0), "both go through: {odo:?}");
 }
 
 /// Object 9: piece 0 eastbound along y = 0 and piece 1 northbound along x = 0 crossing it at the

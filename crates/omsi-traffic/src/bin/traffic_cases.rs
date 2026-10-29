@@ -5858,7 +5858,7 @@ fn joins(args: &[String]) -> Res<()> {
         let foe = |a: usize, b: usize| -> Option<omsi_traffic::FoeKind> {
             let (&(ja, ma), &(jb, mb)) = (js.of_lane.get(&a)?, js.of_lane.get(&b)?);
             (ja == jb).then_some(())?;
-            js.nodes[ja].movements[ma].foes.iter().find(|x| x.movement == mb).map(|x| x.kind)
+            js.nodes[ja].movements[ma].foes.iter().chain(&js.nodes[ja].movements[ma].wide).find(|x| x.movement == mb).map(|x| x.kind)
         };
         let street = |l: usize| net.lanes[l].kind == LaneKind::Street && net.lanes[l].points.len() >= 2;
         let (mut merge, mut other, mut none_in, mut none_out) = (0, 0, 0, 0);
