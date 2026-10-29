@@ -209,9 +209,9 @@ pub(crate) struct PlayerWatch {
     /// People held at a kerb in the cone within `WATCH_RADIUS`: person-seconds and who.
     held_s: f64,
     held_ids: HashSet<u32>,
-    /// The nearest unloaded ground along the route ahead (m), the least over the run, with
-    /// its run second, where, and what it was (no ground, or the end of the lanes of the
-    /// route the network has so far: its next steps' tiles have not brought their lanes);
+    /// The nearest unloaded ground along the AI bus's route ahead (m, its whole route from
+    /// its lane on, not its plan), the least over the run, with its run second, where, and
+    /// what it was (no ground, or the end of the route's lanes the loaded tiles have);
     /// and how often it was probed.
     tiles_min: Option<(f64, f32, DVec3, &'static str)>,
     tiles_probes: usize,
@@ -365,7 +365,14 @@ impl PlayerWatch {
                 self.tiles_next = t_s + TILES_EVERY;
                 self.tiles_probes += 1;
                 let net = &traffic.net;
-                let way = omsi_traffic::perception::way_lanes(net, &c.ai.state, load_radius as f32);
+                let st = &c.ai.state;
+                // the bus's whole route from its lane on, each lane from where it begins
+                // along the way (`AiState::route_distance`: a lane changed over to counts from
+                // the lane beside it), as far as the load radius
+                let way: Vec<(usize, f32)> = (st.route_index..st.route.len())
+                    .map(|k| (st.route[k], st.route_distance(net, k, 0.0)))
+                    .take_while(|&(_, d0)| (d0 as f64) < load_radius)
+                    .collect();
                 let mut edge: Option<(f64, DVec3, &'static str)> = None;
                 'lanes: for &(l, d0) in &way {
                     let lane = &net.lanes[l];
@@ -379,9 +386,10 @@ impl PlayerWatch {
                         }
                     }
                 }
-                // (the loaded part of the route ends short of the whole trip: its end is the
-                // edge of what is loaded)
-                if edge.is_none() && c.route_open() {
+                // (the route holds the trip's lanes as far as the loaded tiles have them,
+                // `BusSetup::route`; while the trip goes on past them, `route_open`, its last
+                // lane's end is the edge of what is loaded)
+                if edge.is_none() && c.route_open() && way.len() == st.route.len() - st.route_index {
                     if let Some(&(l, d0)) = way.last() {
                         let d = d0 as f64 + net.lanes[l].length() as f64;
                         if d < load_radius {
