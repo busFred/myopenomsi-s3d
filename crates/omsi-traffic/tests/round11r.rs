@@ -168,7 +168,7 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
                 }
             }
             last_lane.insert(va.id, lane);
-            if !entrants.contains(&va.id) && (lane == 2 || lane == 5) {
+            if !entrants.contains(&va.id) && (1..=2).contains(&lane) || !entrants.contains(&va.id) && lane == 5 {
                 if let Some(&v0) = last_v.get(&va.id) {
                     let over = (v0 - va.state.speed) / DT - va.params.comfort_brake;
                     if over > run.over_comfort {
