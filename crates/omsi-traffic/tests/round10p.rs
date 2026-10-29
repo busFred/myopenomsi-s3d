@@ -30,6 +30,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
         conflict_start: 0.0,
         converge: Vec::new(),
         converge_with: Vec::new(),
+        wide: Vec::new(),
     };
     let mut js = Junctions::default();
     js.nodes.push(Junction { key: ((0, 0), 1), movements: vec![arm(0), arm(1)], crossings: Vec::new() });
@@ -37,6 +38,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
     js.of_lane.insert(1, (0, 1));
     sim.junctions = js;
     let claim = Claim {
+        half_width: 0.9,
         yields_now: None,
         clear_ahead: f32::INFINITY,
         serving: false,

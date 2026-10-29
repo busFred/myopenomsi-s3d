@@ -114,6 +114,7 @@ fn main() {
         Some("converge") if args.len() >= 3 => converge(&args[2..]),
         Some("joins") if args.len() >= 3 => joins(&args[2..]),
         Some("crossings") if args.len() >= 3 => crossings(&args[2..]),
+        Some("sides") if args.len() >= 3 => sides(&args[2..]),
         Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
@@ -5434,6 +5435,40 @@ fn grown(fixture: &Path, lit: bool) -> Res<(Replay, usize)> {
 /// many, by the lanes' sources (spline or object piece, a track), whether both are movements of one
 /// junction with the crossing in its foe table, and the cost of the detection (the whole network
 /// once, and per tile batch as the network grew).
+/// `sides <rec>... [--list]`: the side-merge meeting places (`Crossing::side`) of each fixture's
+/// grown network (header and every tile batch, as the replay compiles them), counted, and with
+/// `--list` one line per pair (lanes, keys, the stretch along each, the centre lines' least
+/// distance, whether one comes in, and where): a compile change's new and lost pairs by `diff`.
+fn sides(args: &[String]) -> Res<()> {
+    let list = args.iter().any(|a| a == "--list");
+    for f in args.iter().filter(|a| !a.starts_with("--")) {
+        let (r, _) = grown(Path::new(f), true)?;
+        let net = &r.net;
+        let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
+        let object = |l: &omsi_sim::traffic::Lane| l.key.filter(|_| l.source == 2).map(|k| (k.tile, k.id));
+        let (mut n, mut only_in) = (0usize, 0usize);
+        for a in 0..net.crossings.len() {
+            for c in net.crossings[a].iter().filter(|c| c.side && c.other > a) {
+                n += 1;
+                let (la, lb) = (&net.lanes[a], &net.lanes[c.other]);
+                let conv = omsi_sim::traffic::converging_stretch(la, lb);
+                let least = conv.map(|v| v.least).unwrap_or(f64::NAN);
+                // (met only because one comes in: centre lines never under CONVERGE_DIST, and no
+                // edges' overlap of two pieces of one object)
+                let edges = object(la).is_some() && object(la) == object(lb) && (la.width as f64 + lb.width as f64) * 0.5 - least >= omsi_sim::traffic::CONVERGE_EDGE;
+                let by_in = least >= omsi_sim::traffic::CONVERGE_DIST && !edges;
+                only_in += by_in as usize;
+                if list {
+                    let p = la.at(c.at).0;
+                    println!("  side {a} ({}) {:.1}-{:.1} | {} ({}) {:.1}-{:.1}; least {least:.2} comes_in {}{} at ({:.1}, {:.1})", name(la), c.at - c.before, c.at, c.other, name(lb), c.other_at - c.other_before, c.other_at, conv.is_some_and(|v| v.comes_in), if by_in { " ONLY-COMES-IN" } else { "" }, p.x, p.y);
+                }
+            }
+        }
+        println!("{f}: {n} side meeting places, {only_in} of them only because one comes in");
+    }
+    Ok(())
+}
+
 fn crossings(args: &[String]) -> Res<()> {
     let list = args.iter().any(|a| a == "--list");
     for f in args.iter().filter(|a| !a.starts_with("--")) {
@@ -5605,7 +5640,7 @@ fn converge_outside(args: &[String]) -> Res<()> {
                 if net.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) || within(i, j) || within(j, i) || (a.start() - b.start()).truncate().length() <= 0.5 {
                     continue;
                 }
-                let Some(((a0, a1), (b0, b1), least)) = omsi_sim::traffic::converging_stretch(a, b) else { continue };
+                let Some(omsi_sim::traffic::Converging { a: (a0, a1), b: (b0, b1), least, comes_in }) = omsi_sim::traffic::converging_stretch(a, b) else { continue };
                 if omsi_sim::traffic::wrap_deg(a.at((a0 + a1) * 0.5).1 - b.at((b0 + b1) * 0.5).1).abs() > omsi_sim::traffic::CONVERGE_HEADING {
                     continue;
                 }
@@ -5613,7 +5648,7 @@ fn converge_outside(args: &[String]) -> Res<()> {
                 if lvl >= omsi_sim::traffic::MEET_DIST {
                     continue;
                 }
-                let tight = least < omsi_sim::traffic::CONVERGE_DIST;
+                let tight = least < omsi_sim::traffic::CONVERGE_DIST || comes_in;
                 // (what the pair is: a fork - the two leave one lane, or a lane of one leads
                 // into a lane the other leaves -, a lane ending on the other with no way on, or
                 // two ways coming together that never join)
@@ -5629,11 +5664,11 @@ fn converge_outside(args: &[String]) -> Res<()> {
                 if list {
                     let p = a.at((a0 + a1) * 0.5).0;
                     let name = |l: &omsi_sim::traffic::Lane| l.key.map(|k| format!("{}:{}/{}", if l.source == 1 { "spline" } else { "object" }, k.id, k.path)).unwrap_or_else(|| "-".into());
-                    println!("  {kind} {} {i} ({}) {a0:.1}-{a1:.1} of {:.1} | {j} ({}) {b0:.1}-{b1:.1} of {:.1}; least {least:.2} m, widths {:.1}/{:.1}, at ({:.1}, {:.1}); next {:?} / {:?}", if tight { "close" } else { "edges" }, name(a), a.length(), name(b), b.length(), a.width, b.width, p.x, p.y, a.next, b.next);
+                    println!("  {kind} {} {i} ({}) {a0:.1}-{a1:.1} of {:.1} | {j} ({}) {b0:.1}-{b1:.1} of {:.1}; least {least:.2} m, widths {:.1}/{:.1}, at ({:.1}, {:.1}); next {:?} / {:?}", if least < omsi_sim::traffic::CONVERGE_DIST { "close" } else if comes_in { "comes-in" } else { "edges" }, name(a), a.length(), name(b), b.length(), a.width, b.width, p.x, p.y, a.next, b.next);
                 }
             }
         }
-        println!("{f}: side by side outside one object with no meeting place: {close} with centre lines under CONVERGE_DIST, {edges} by the edges only; {kinds:?}");
+        println!("{f}: side by side outside one object with no meeting place: {close} with centre lines under CONVERGE_DIST or one coming in, {edges} by the edges only; {kinds:?}");
     }
     Ok(())
 }
@@ -6066,7 +6101,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             let st = &v.state;
             let d = &v.last;
             println!(
-                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {}",
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {} body {:.1}/{:.1}",
                 v.id,
                 st.lane,
                 st.s,
@@ -6088,7 +6123,9 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 v.stopped,
                 v.external.serves,
                 v.external.stop_at.map(|x| x - st.front),
-                v.external.at_stop
+                v.external.at_stop,
+                st.front,
+                st.rear
             );
         }
         // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the

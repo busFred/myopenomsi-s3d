@@ -1457,6 +1457,7 @@ impl Simulation {
                 let standing = st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0);
                 let claim = Claim {
                     chain: j.chain.clone(),
+                    half_width: v.half_width,
                     was_standing,
                     light_red,
                     until_go,
@@ -1681,6 +1682,7 @@ impl Simulation {
                 .flatten();
             claims.push(Claim {
                 chain,
+                half_width: p.half_width,
                 was_standing: false,
                 light_red,
                 until_go,
@@ -2432,7 +2434,7 @@ mod ease_ring_tests {
     use super::*;
 
     fn claim(vehicle: usize) -> Claim {
-        Claim { yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// The ring of viz5 case02 j0: A (0) eased off for B (1), B standing 2 m behind its lead C (2),

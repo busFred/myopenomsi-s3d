@@ -42,6 +42,12 @@ pub struct Foe {
     /// A merge of two lanes running side by side, not a joint (`Crossing::side`).
     #[serde(default)]
     pub side: bool,
+    /// The centre lines' least distance of a side merge met only because one lane comes in
+    /// to the other (`Crossing::apart`; such a foe is in `Movement::wide`): two vehicles meet
+    /// there only when their half widths together are more (`reservation::meets`); 0 for every
+    /// other foe.
+    #[serde(default)]
+    pub apart: f32,
 }
 
 /// One way through a junction: one of its lanes.
@@ -80,6 +86,14 @@ pub struct Movement {
     /// Per stretch of `converge`, the movement it converges with.
     #[serde(default)]
     pub converge_with: Vec<usize>,
+    /// The side merges met only by bodies wider than the centre lines are apart there
+    /// (`Foe::apart`): not in `foes` - for every rule that reads the junction's meeting places
+    /// whoever comes (the conflict stretch, the waiting places, the bands a refused car keeps
+    /// out of) they are no foes, a convergence (`converge`) as before - but foes of a vehicle in
+    /// the resolver where its body and the other's meet there (`Junctions::foes_along_wide`,
+    /// `reservation::meets`).
+    #[serde(default)]
+    pub wide: Vec<Foe>,
 }
 
 /// Where a pedestrian crossing cuts a way through the junction.
@@ -372,13 +386,14 @@ impl Junctions {
                     }
                     frontier = nxt;
                 }
-                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY, converge: Vec::new(), converge_with: Vec::new() }
+                Movement { lane, kind: l.kind, entries, exits, continues, light: l.traffic_light, foes: Vec::new(), conflict_end: 0.0, conflict_start: f32::INFINITY, converge: Vec::new(), converge_with: Vec::new(), wide: Vec::new() }
             })
             .collect();
         // foes from the network's crossings, both ways
         for mi in 0..movements.len() {
             let lane = movements[mi].lane;
             let mut foes = Vec::new();
+            let mut wide = Vec::new();
             for c in net.crossings.get(lane).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let Some(fm) = lanes.iter().position(|&l| l == c.other) else { continue };
                 let kind = if c.merge {
@@ -391,8 +406,14 @@ impl Junctions {
                 };
                 let mine = ((c.at - c.before).max(0.0), (c.at + c.after).min(net.lanes[lane].length()));
                 let theirs = ((c.other_at - c.other_before).max(0.0), (c.other_at + c.other_after).min(net.lanes[c.other].length()));
-                foes.push(Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other), side: c.side });
+                let foe = Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other), side: c.side, apart: c.apart };
+                if c.apart > 0.0 {
+                    wide.push(foe);
+                } else {
+                    foes.push(foe);
+                }
             }
+            movements[mi].wide = wide;
             // (a movement that continues into another inner piece is in the way of
             // everything that piece is in the way of, as far as the queue behind the stop
             // line is concerned: the continuation's foes are reached later along the way)
@@ -446,11 +467,24 @@ impl Junctions {
 
     /// [`Junctions::foes_along`], each foe with the piece of the chain it meets.
     pub fn foes_along_pieces(&self, j: usize, chain: &[(usize, f32)]) -> Vec<(usize, Foe)> {
+        self.foes_along_with(j, chain, None)
+    }
+
+    /// [`Junctions::foes_along_pieces`] for a vehicle `half_width` wide each side, with the side
+    /// merges met only by wide bodies (`Movement::wide`) where it and the widest body
+    /// (`SWEPT_BUS_WIDTH`) could meet there: the resolver's foes, each pair then decided by
+    /// `reservation::meets`.
+    pub fn foes_along_wide(&self, j: usize, chain: &[(usize, f32)], half_width: f32) -> Vec<(usize, Foe)> {
+        self.foes_along_with(j, chain, Some(half_width))
+    }
+
+    fn foes_along_with(&self, j: usize, chain: &[(usize, f32)], half_width: Option<f32>) -> Vec<(usize, Foe)> {
         let node = &self.nodes[j];
         let mut out = Vec::new();
         for &(m, off) in chain {
-            for f in &node.movements[m].foes {
-                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields, side: f.side }));
+            let wide = node.movements[m].wide.iter().filter(|f| half_width.is_some_and(|h| h + omsi_sim::traffic::SWEPT_BUS_WIDTH * 0.5 > f.apart));
+            for f in node.movements[m].foes.iter().chain(wide) {
+                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields, side: f.side, apart: f.apart }));
             }
         }
         out.sort_by(|a, b| a.1.mine.0.total_cmp(&b.1.mine.0));
@@ -461,7 +495,7 @@ impl Junctions {
     /// gives way to the other): SUMO's zipper node. (`reservation`'s zipper speed takes every
     /// merge that crosses nothing, the table ordering the pair where it says who yields.)
     pub fn is_zipper(&self, j: usize, mine: usize, foe: &Foe) -> bool {
-        foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().any(|f| f.movement == mine && f.yields)
+        foe.kind == FoeKind::Merge && !foe.yields && !self.nodes[j].movements[foe.movement].foes.iter().chain(&self.nodes[j].movements[foe.movement].wide).any(|f| f.movement == mine && f.yields)
     }
 
     /// Per lane of the object (in `lanes`' order): the stretches where its centre line comes
@@ -504,7 +538,7 @@ impl Junctions {
                     continue;
                 }
                 let lb = &net.lanes[b];
-                if la.key.map(|k| k.path) == lb.key.map(|k| k.path) || net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b)) {
+                if la.key.map(|k| k.path) == lb.key.map(|k| k.path) || net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b && c.apart <= 0.0)) {
                     continue;
                 }
                 if (la.start() - lb.start()).truncate().length() <= 0.5 || leads(a, b) || leads(b, a) {
