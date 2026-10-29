@@ -5134,7 +5134,9 @@ fn clear_of_lanes_by(net: &Network, q: DVec3, reach_of: &dyn Fn(&omsi_sim::traff
 /// that is not refused (it is cleared), else the point of the stop's pavement (`PaxStop::lane`,
 /// where those getting off walk on) cleared; else none, and true is returned with the lists
 /// (the point refused, counted). Their spread along the stop (`no_place_along`) is kept where
-/// every slot of it lies outside the strips (`PaxStop::kerb_spread`).
+/// every slot of it lies outside the strips (`PaxStop::kerb_spread`). The gather point
+/// (`PaxStop::gather`) is cleared as a place is; where it cannot be, it is where those with no
+/// place wait.
 fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> (Vec<usize>, Vec<usize>, bool) {
     let (mut moved, mut refused) = (Vec::new(), Vec::new());
     for (k, sp) in stop.spots.iter_mut().enumerate() {
@@ -5164,6 +5166,14 @@ fn clear_stop_of_lanes(stop: &mut PaxStop, net: &Network) -> (Vec<usize>, Vec<us
     let pavement = || stop.lane.and_then(|(l, s)| net.lanes.get(l).map(|x| x.at(s).0)).and_then(|q| clear_of_lanes(net, q));
     let point = clear_of_lanes(net, stop.pos).or_else(place).or_else(pavement);
     stop.kerb_shift = point.map(|p| p - stop.pos);
+    // the gather point, where the waiters step up to when their bus comes (task 2, OMSI's a metre
+    // into the road off the stop object), cleared as a place is: where it cannot be, where those
+    // with no place wait. In a lane's strip they stood up to the body of whatever stood there and
+    // held it - BeijingCity's Wuluju stop 2296442: a 12 m bus on lane 2232 (1 m piece) waiting at
+    // the light was held 100 s by its waiters stepping up for their own bus queued behind it
+    if let Some(g) = clear_of_lanes(net, stop.gather).or(point) {
+        stop.gather = g;
+    }
     let h = stop.heading.to_radians();
     let fwd = DVec3::new(h.sin(), h.cos(), 0.0);
     stop.kerb_spread = point.is_some_and(|p| (0..pax::NO_PLACE_SLOTS).all(|id| !within_lanes(net, p + fwd * pax::no_place_along(id), &strip_reach)));
@@ -7408,7 +7418,8 @@ impl Humans {
     /// nobody sees them appear at (`waiting_place`, `may_appear`); one held back for that is
     /// tried again each frame the clock is past its time. A stop set up again on a tile
     /// change is no stop coming into range (`set_up_stop`). A stop going out of range loses
-    /// the people waiting there.
+    /// its people on the ground (`may_vanish`); those the player could see walk on along its
+    /// pavement instead.
     fn stops_tick(&mut self, dt: f32, world: &World, renderer: &Renderer, scene: &mut Scene) {
         if self.mirror || self.avatar_only {
             return;
@@ -7442,13 +7453,16 @@ impl Humans {
             if !near {
                 if changed {
                     self.held_for_sight.remove(&id);
-                    // (sub_61be80) the people waiting there go - by the one rule for taking
-                    // somebody away (`may_vanish`); those the player could see, or within
-                    // NEVER_VANISH_WITHIN, walk on along the stop's pavement as pedestrians
-                    // instead (`walk_street_on`) and go as strollers do, counted (`kept_for_sight`)
+                    // (sub_61be80) the stop's people go - everybody on the ground bound to it,
+                    // at a place, at the gather point for a bus coming or walking to its doors
+                    // (as a stop's going with its tile takes them, `tiles_changed`) - by the one
+                    // rule for taking somebody away (`may_vanish`); those the player could see,
+                    // or within NEVER_VANISH_WITHIN, walk on along the stop's pavement as
+                    // pedestrians instead (`walk_street_on`) and go as strollers do, counted
+                    // (`kept_for_sight`). Those of a bus that never came stood there for good
                     let lane = self.stops.get(&id).and_then(|s| s.lane);
                     for i in (0..self.people.len()).rev() {
-                        let here = matches!(&self.people[i].state, State::Pax(p) if p.stop == Some(id) && p.inside.is_none() && matches!(p.task, Task::WaitingForBus | Task::WalkingToBusstop));
+                        let here = matches!(&self.people[i].state, State::Pax(p) if p.stop == Some(id) && p.inside.is_none());
                         if !here {
                             continue;
                         }
@@ -11640,6 +11654,13 @@ mod tests {
             h.eye = Some(Eye { pos: at + DVec3::new(0.0, 10.0, 2.0), fwd: DVec3::Y, cos_half: ahead.cos_half });
             h.stops_tick(DT, &world, &renderer, &mut scene);
             assert_eq!(on_foot(&h), 4, "filled out of sight");
+            // (two of them on their way to a bus coming: at the gather point, walking to its
+            // doors - the stop's people as much as those at the places)
+            for (k, task) in [(0, Task::ToBus), (1, Task::WalkingToBus)] {
+                if let State::Pax(x) = &mut h.people[k].state {
+                    x.task = task;
+                }
+            }
             h.center = DVec3::ZERO;
             h.eye = Some(eye);
             h.stops_tick(DT, &world, &renderer, &mut scene);
@@ -15006,6 +15027,8 @@ mod ped_tests {
         assert_eq!(clear_stop_of_lanes(&mut stop, &net), (vec![0], vec![], false));
         assert!(stop.cleared && (stop.spots[0].pos.y - reach).abs() < 0.02 && stop.spots[1].pos.y == 1.5 && stop.spots[2].pos.y == 3.0);
         assert!((stop.kerb_shift.unwrap().y - (reach - 1.5)).abs() < 0.02 && stop.kerb_spread);
+        // the gather point, where they step up to when their bus comes, is cleared as a place is
+        assert!((stop.gather.y - reach).abs() < 0.02 && stop.gather.x == 0.0, "{:?}", stop.gather);
     }
 
     /// Where those with no place wait at a stop whose point cannot be cleared of the lanes' people
@@ -15065,6 +15088,8 @@ mod ped_tests {
         assert!(refused == vec![0] && !no_point, "{refused:?}");
         let at = s.pos + s.kerb_shift.unwrap();
         assert!((at - kerb).length() < 1e-6 && !within_lanes(&net, at, &strip_reach), "{at:?}");
+        // (and the gather point, in the strips with no room clear of them, is where they wait)
+        assert!((s.gather - kerb).length() < 1e-6, "{:?}", s.gather);
         // (a rider of it with no place waits there, spread along the stop only where every slot is
         // outside the strips; one with the place at it)
         for who in [0u32, 7, 123] {
