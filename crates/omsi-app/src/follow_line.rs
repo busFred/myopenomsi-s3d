@@ -292,13 +292,14 @@ struct BodyLane {
     sides_unknown_s: [[f64; 4]; 2],
     sides_sideways_s: [[f64; 4]; 2],
     /// Where the inner side passes the lane's edge by more than `BODY_SIDE_OVER`: vehicle-seconds
-    /// by the lane's source (spline lane, junction path) and the vehicle (bus or not), and per
+    /// by the lane's source (spline lane, connector: a junction path or an editor-only lane) and the vehicle (bus or not), and per
     /// vehicle its deepest frame (m, what it was doing then).
     inner_over_s: HashMap<(&'static str, bool), f64>,
     inner_worst: HashMap<u64, (f32, String)>,
     /// The street lanes by where their edges come from (`Network::lane_edges`), counted
-    /// whenever the network has grown: (lanes counted, spline lanes with both edges, junction
-    /// paths from the pieces they join, spline lanes not known, junction paths not known), and
+    /// whenever the network has grown: (lanes counted, spline lanes with both edges, connectors
+    /// - junction paths and editor-only splines' lanes - from the pieces they join, spline lanes
+    /// not known, connectors not known), and
     /// the known lanes' widths (left + right edge, m).
     lane_edges: (usize, usize, usize, usize, usize, Vec<f32>),
     /// The files of the lanes whose edges are not known, with their counts.
@@ -324,7 +325,7 @@ impl BodyLane {
             let mut e = (net.lanes.len(), 0, 0, 0, 0, Vec::new());
             self.edges_unknown.clear();
             for (i, l) in net.lanes.iter().enumerate().filter(|(_, l)| l.kind == omsi_sim::traffic::LaneKind::Street) {
-                match (net.lane_edges(i), l.source == 2) {
+                match (net.lane_edges(i), l.source == 2 || l.invisible) {
                     (Some(w), junction) => {
                         if junction { e.2 += 1 } else { e.1 += 1 }
                         e.5.push(w.0 + w.1);
@@ -432,9 +433,9 @@ impl BodyLane {
                     self.sides[kind][class].push((inn as f32, out as f32, dt));
                     if inn > BODY_SIDE_OVER && class < 3 {
                         let ln = &net.lanes[st.lane];
-                        let junction = ln.source == 2;
+                        let junction = ln.source == 2 || ln.invisible;
                         let bus = c.vehicle.ty.def.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bus"));
-                        *self.inner_over_s.entry((if junction { "junction path" } else { "spline lane" }, bus)).or_default() += dt as f64;
+                        *self.inner_over_s.entry((if junction { "connector" } else { "spline lane" }, bus)).or_default() += dt as f64;
                         let w = self.inner_worst.entry(c.id).or_insert((f32::MIN, String::new()));
                         if inn as f32 > w.0 {
                             let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
@@ -445,7 +446,7 @@ impl BodyLane {
                                     c.id,
                                     ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
                                     st.lane,
-                                    if junction { "junction path" } else { "spline lane" },
+                                    if ln.invisible { "editor-only lane" } else if junction { "junction path" } else { "spline lane" },
                                     ln.name,
                                     st.s,
                                     ln.length(),
@@ -554,7 +555,7 @@ impl BodyLane {
             w.sort_by(|a, b| a.total_cmp(b));
             let pct = |p: f64| w.get(((w.len().max(1) - 1) as f64 * p).round() as usize).copied().unwrap_or(0.0);
             out.push(format!(
-                "body lane: lane edges of the {} street lanes of {n} lanes: spline lanes from the profile {spline}, junction paths from the pieces they join {junction}, not known: spline lanes {spline_unknown}, junction paths {junction_unknown}; known widths p5 {:.2} p50 {:.2} p95 {:.2} m",
+                "body lane: lane edges of the {} street lanes of {n} lanes: spline lanes from the profile {spline}, junction paths and editor-only splines' lanes from the pieces they join {junction}, not known: spline lanes {spline_unknown}, junction paths and editor-only lanes {junction_unknown}; known widths p5 {:.2} p50 {:.2} p95 {:.2} m",
                 *spline + *junction + *spline_unknown + *junction_unknown,
                 pct(0.05),
                 pct(0.5),
