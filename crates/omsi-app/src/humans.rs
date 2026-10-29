@@ -2415,6 +2415,12 @@ impl YieldBook<'_> {
 /// bodies' jobs are 50 us at least, AI_JOB_SECS in traffic.rs): about 150 us a job.
 const DECIDE_JOB: usize = 128;
 
+/// People stepped by one job of `tick_inner`'s parallel apply at least: a step (the ground
+/// probe under the feet and the progress along the path) takes about 2.1 us (4.3 ms a frame
+/// for 2000 people, the round-11 windowed Wuluju profile), and a rayon job much under 100 us
+/// costs more to hand out than it saves (as `DECIDE_JOB`): about 130 us a job.
+const APPLY_JOB: usize = 64;
+
 /// A pedestrian's decision of the frame (task 8, `WalkStreet`) and what it changes of
 /// them, made from the frame's state alone: by many threads at once in the read phase,
 /// taken over in index order in the apply phase (`Humans::take_decision`).
@@ -5548,6 +5554,26 @@ enum Place {
 /// "stood at the edge 3 s" exemption never fired.
 const STILL_BELOW: f32 = 0.15;
 
+/// Everybody the crowd moved this frame (`stepped`, by index; None: not in the crowd) takes
+/// it over (`Humans::apply`; a passenger outside only counts their standing time, the
+/// passengers' engine moves them). Each step reads the frame's state and writes only its
+/// own person, so the people are stepped side by side, in jobs of `APPLY_JOB`, with the
+/// result of stepping them one after the other.
+#[allow(clippy::too_many_arguments)]
+fn step_on_foot(people: &mut [Person], stepped: &[Option<Walker>], wants: &[Want], dt: f32, world: &World, net: Option<&Network>, buses: &[BusNow], bus_ix: &HashMap<BusId, usize>) {
+    people.par_iter_mut().zip(stepped.par_iter()).enumerate().with_min_len(APPLY_JOB).for_each(|(i, (p, w))| {
+        let Some(w) = w else { return };
+        if matches!(p.state, State::Pax(_)) {
+            // (the passengers' engine moves them; their standing time runs
+            // here: a bus waiter's `still` stayed 0 for ever, and a car beside their stop
+            // was never let go)
+            p.still = still_after(p.still, p.vel.length() as f32, dt);
+            return;
+        }
+        Humans::apply(p, w, &wants[i], dt, world, net, buses, bus_ix);
+    });
+}
+
 /// `Person::still` after a frame of `dt` at `speed`.
 fn still_after(still: f32, speed: f32, dt: f32) -> f32 {
     if speed < STILL_BELOW {
@@ -5587,6 +5613,9 @@ pub struct Person {
     /// thirty waiting people every frame took 2 ms of the frame at a bus station).
     skin_bones: Option<[glam::Affine3A; omsi_sim::human::SLOTS]>,
     pose_changed: bool,
+    /// The vertices of this frame's new pose, per mesh, made beside the skinning (in
+    /// parallel) and handed to the renderer in `sync`'s serial part.
+    vertices: Vec<omsi_render::MeshVertices>,
     /// Interior light of the bus the person is in (0 outside).
     interior: f32,
     /// The interior light as drawn: it follows `interior` over a moment (stepping through
@@ -6026,8 +6055,8 @@ pub struct Humans {
     /// Simulation time of the last `sync`.
     last_sync: f64,
     /// Frames synced, people posed and skinned, the time that took and the part of it spent
-    /// uploading (ms), in total.
-    pose_stats: (u32, usize, f64, f64),
+    /// uploading (ms), and the vertices uploaded, in total.
+    pose_stats: (u32, usize, f64, f64, usize),
     /// `OMSI_TRACE_PAX=<csv>`: every person near the eye, every frame (see `sync`).
     trace: Option<std::io::BufWriter<std::fs::File>>,
     /// `World::tiles_generation` the stops were last checked against.
@@ -6282,7 +6311,7 @@ impl Humans {
             bus_motion: HashMap::new(),
             map_humans_done: false,
             last_sync: 0.0,
-            pose_stats: (0, 0, 0.0, 0.0),
+            pose_stats: (0, 0, 0.0, 0.0, 0),
             trace: omsi_cfg::env::var("OMSI_TRACE_PAX").ok().and_then(|f| std::fs::File::create(f).ok()).map(|f| {
                 use std::io::Write;
                 let mut w = std::io::BufWriter::new(f);
@@ -6901,6 +6930,7 @@ impl Humans {
             state,
             t_state: 0.0,
             skins: Vec::new(),
+            vertices: Vec::new(),
             skin_bones: None,
             pose_changed: false,
             interior: 0.0,
@@ -9120,12 +9150,13 @@ impl Humans {
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
         out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight); kept for sight {}; edge_departures {} in sight {} out of sight", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1, self.kept_for_sight.len(), self.edge_departures.0, self.edge_departures.1));
-        let (frames, posed, ms, up) = self.pose_stats;
+        let (frames, posed, ms, up, verts) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
-                "; posing {:.2} ms a frame ({:.1} people, {:.2} ms of it uploading and placing)",
+                "; posing {:.2} ms a frame ({:.1} people, {:.0} vertices uploaded, {:.2} ms of it uploading and placing)",
                 ms / frames as f64,
                 posed as f64 / frames as f64,
+                verts as f64 / frames as f64,
                 up / frames as f64
             ));
         }
@@ -9744,21 +9775,14 @@ impl Humans {
             }
         }
         stage!("ped.count");
-        let ground: Vec<(usize, Walker)> = g.into_iter().enumerate().collect();
-        let mut moved = vec![false; self.people.len()];
-        for (k, w) in ground {
-            let i = who[k];
-            if matches!(self.people[i].state, State::Pax(_)) {
-                // (the passengers' engine moves them; their standing time runs
-                // here: a bus waiter's `still` stayed 0 for ever, and a car beside their stop
-                // was never let go)
-                let p = &mut self.people[i];
-                p.still = still_after(p.still, p.vel.length() as f32, dt);
-                continue;
-            }
-            moved[i] = true;
-            self.apply(i, &w, &wants[i], dt, world, net, &buses, &bus_ix);
+        // (each person's own step, from the crowd's result and the frame's state alone: side
+        // by side, the same as one after the other)
+        let mut stepped: Vec<Option<Walker>> = vec![None; self.people.len()];
+        for (k, w) in g.into_iter().enumerate() {
+            stepped[who[k]] = Some(w);
         }
+        let moved: Vec<bool> = self.people.iter().zip(&stepped).map(|(p, w)| w.is_some() && !matches!(p.state, State::Pax(_))).collect();
+        step_on_foot(&mut self.people, &stepped, &wants, dt, world, net, &buses, &bus_ix);
         for i in 0..self.people.len() {
             if !moved[i] && !matches!(self.people[i].state, State::Pax(_)) {
                 self.carry(i, dt, &buses, &bus_ix, wants[i].face);
@@ -9807,11 +9831,11 @@ impl Humans {
         d.want
     }
 
-    /// Take over where the crowd moved person `i`.
+    /// Take over where the crowd moved person `p`: what they do with it reads the frame's
+    /// state and writes only `p` (`tick_inner` steps everybody side by side).
     #[allow(clippy::too_many_arguments)]
     fn apply(
-        &mut self,
-        i: usize,
+        p: &mut Person,
         w: &Walker,
         want: &Want,
         dt: f32,
@@ -9821,7 +9845,6 @@ impl Humans {
         bus_ix: &HashMap<BusId, usize>,
     ) {
         let dt64 = dt as f64;
-        let p = &mut self.people[i];
         let speed = w.vel.length();
         p.still = still_after(p.still, speed as f32, dt);
         // somebody pressed against somebody else for seconds slips past them
@@ -10128,9 +10151,11 @@ impl Humans {
             );
         }
         let n_due = due.iter().filter(|d| **d).count();
+        let due_done = std::time::Instant::now();
         let pose_one = |p: &mut Person| {
-            let Person { anim, ty, skins, skin_bones, pose_changed, .. } = p;
+            let Person { anim, ty, skins, skin_bones, pose_changed, vertices, .. } = p;
             *pose_changed = false;
+            vertices.clear();
             let bones = omsi_sim::human::slots_from_omsi(&anim.bones(&ty.omsi));
             if bones.iter().any(|b| !b.is_finite()) && !skins.is_empty() {
                 // keep the last good mesh (the rest pose would be the file's T-pose)
@@ -10147,6 +10172,7 @@ impl Humans {
             }
             *skin_bones = Some(bones);
             *pose_changed = true;
+            vertices.extend(skins.iter().zip(&ty.meshes).map(|((pos, nrm), m)| omsi_render::skinned_vertices(pos, nrm, &m.data.uvs)));
         };
         // a handful is quicker on this thread than handed to the pool
         if n_due >= 8 {
@@ -10164,14 +10190,24 @@ impl Humans {
                 .for_each(|(p, _)| pose_one(p));
         }
         let upload = std::time::Instant::now();
+        let (mut mesh_s, mut verts) = (0.0f64, 0usize);
         for (p, &go) in self.people.iter_mut().zip(&due) {
             if go {
                 if p.pose_changed || !p.skinned {
+                    let t0 = std::time::Instant::now();
+                    // (the new pose's vertices, made in the parallel part; the skins as they
+                    // are for somebody drawn the first time without a new pose)
+                    let mut made = std::mem::take(&mut p.vertices).into_iter();
                     for (k, (id, _)) in p.meshes.iter().enumerate() {
                         if let Some((pos, nrm)) = p.skins.get(k) {
-                            renderer.update_mesh(scene, *id, pos, nrm, &p.ty.meshes[k].data.uvs);
+                            match made.next() {
+                                Some(v) if p.pose_changed => renderer.update_mesh_vertices(scene, *id, v),
+                                _ => renderer.update_mesh(scene, *id, pos, nrm, &p.ty.meshes[k].data.uvs),
+                            }
+                            verts += pos.len();
                         }
                     }
+                    mesh_s += t0.elapsed().as_secs_f64();
                 }
                 p.skinned = true;
                 p.since_posed = 0;
@@ -10251,10 +10287,23 @@ impl Humans {
                 }
             }
         }
+        if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            // (the humans profile line: the parts of the posing)
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
+            let now = std::time::Instant::now();
+            let parts = [("sync.due", ms(started, due_done)), ("sync.pose", ms(due_done, upload)), ("sync.mesh", mesh_s * 1000.0), ("sync.place", ms(upload, now) - mesh_s * 1000.0)];
+            for (n, t) in parts {
+                match self.stage_sums.0.iter_mut().find(|s| s.0 == n) {
+                    Some(s) => s.1 += t,
+                    None => self.stage_sums.0.push((n, t)),
+                }
+            }
+        }
         self.pose_stats.0 += 1;
         self.pose_stats.1 += n_due;
         self.pose_stats.2 += started.elapsed().as_secs_f64() * 1000.0;
         self.pose_stats.3 += upload.elapsed().as_secs_f64() * 1000.0;
+        self.pose_stats.4 += verts;
     }
 
 
@@ -12272,6 +12321,92 @@ mod ped_tests {
         net.link(1.5);
         let ped = PedNet::build(&net);
         (net, ped)
+    }
+
+    /// Everybody the crowd moved takes it over side by side (`step_on_foot`, jobs of
+    /// `APPLY_JOB` on four threads) exactly as one after the other in index order (the loop
+    /// over `Humans::apply` it replaced): 300 walkers on the crossing's network, some not in
+    /// the crowd, for 60 frames of changing crowd results and wants; every person's position,
+    /// speed, headings, standing and stuck clocks, detour, activity, place and progress along
+    /// the walk are bit for bit the same.
+    #[test]
+    fn people_stepped_side_by_side_are_the_ones_stepped_one_after_the_other() {
+        let root = std::env::temp_dir().join(format!("openomsi-step-on-foot-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        std::fs::write(root.join("global.cfg"), "[name]\nStep\n").unwrap();
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let (net, _) = crossing(false);
+        let n = 300usize;
+        let mut crowd = || {
+            let mut h = Humans::new(&root);
+            h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+            h.map_humans_done = true;
+            for k in 0..n {
+                let mut walk = across();
+                walk.s = (k % 10) as f32;
+                let at = DVec3::new(-10.0 + (k % 10) as f64, -5.5 + (k / 10) as f64 * 0.01, 0.0);
+                h.spawn(&world, &renderer, &mut scene, at, 90.0, State::Strolling(walk)).expect("spawned");
+            }
+            h
+        };
+        let (mut serial, mut side) = (crowd(), crowd());
+        assert_eq!(serial.people.len(), n);
+        std::fs::remove_dir_all(&root).ok();
+        let state = |h: &Humans| -> Vec<String> {
+            h.people
+                .iter()
+                .map(|p| {
+                    let s = match &p.state {
+                        State::Strolling(w) => Some((w.leg, w.s.to_bits())),
+                        _ => None,
+                    };
+                    let bits = |v: DVec3| v.to_array().map(f64::to_bits);
+                    format!("{:?}", (bits(p.position), p.vel.to_array().map(f64::to_bits), p.heading.to_bits(), p.lheading.to_bits(), p.still.to_bits(), p.stuck.to_bits(), p.detour.to_bits(), p.activity, p.place, s))
+                })
+                .collect()
+        };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (buses, bus_ix): (Vec<BusNow>, HashMap<BusId, usize>) = (Vec::new(), HashMap::new());
+        let dt = 1.0 / 30.0;
+        let mut moved = 0usize;
+        for f in 0..60usize {
+            let frame = |h: &Humans| -> (Vec<Option<Walker>>, Vec<Want>) {
+                h.people
+                    .iter()
+                    .enumerate()
+                    .map(|(k, p)| {
+                        let turn = ((k * 7 + f * 3) % 13) as f64 * 0.5;
+                        let vel = DVec2::new(turn.cos(), turn.sin()) * (((k + f) % 4) as f64 * 0.4);
+                        let mut w = Walker::new(p.position.truncate() + vel * dt as f64, BODY_OUTSIDE, 0);
+                        w.vel = vel;
+                        let mut want = Want::stand(((k + f) % 3 == 0).then_some(turn.to_degrees()), Activity::Stand);
+                        want.vel = vel * 1.1;
+                        (((k + f) % 9 != 0).then_some(w), want)
+                    })
+                    .unzip()
+            };
+            let (stepped, wants) = frame(&serial);
+            for (i, w) in stepped.iter().enumerate() {
+                if let Some(w) = w {
+                    Humans::apply(&mut serial.people[i], w, &wants[i], dt, &world, Some(&net), &buses, &bus_ix);
+                    moved += 1;
+                }
+            }
+            let (stepped, wants) = frame(&side);
+            pool.install(|| step_on_foot(&mut side.people, &stepped, &wants, dt, &world, Some(&net), &buses, &bus_ix));
+            assert_eq!(state(&serial), state(&side), "frame {f}");
+        }
+        assert!(moved > 60 * n / 2, "{moved}");
+        assert!(serial.people.iter().enumerate().filter(|(k, p)| matches!(&p.state, State::Strolling(w) if w.s != (k % 10) as f32)).count() > n / 2, "the walks went on");
     }
 
     /// Across the crossing of `crossing` from 10 m before the near kerb.

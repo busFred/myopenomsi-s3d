@@ -28,6 +28,40 @@ pub struct Vertex {
     pub uv: [f32; 2],
 }
 
+/// A reshaped mesh's vertices as its vertex buffer holds them, and its bounding sphere
+/// (centre, radius; None without vertices), for `Renderer::update_mesh_vertices`.
+pub struct MeshVertices {
+    bytes: Vec<u8>,
+    bounds: Option<(Vec3, f32)>,
+}
+
+/// The vertices of a reshaped mesh (positions, normals and uvs side by side, as many as
+/// the shortest of them) and the sphere about the box of all `positions`: what
+/// `Renderer::update_mesh` uploads, made without the renderer (on any thread).
+pub fn skinned_vertices(positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2]) -> MeshVertices {
+    let verts: Vec<Vertex> = positions
+        .iter()
+        .zip(normals)
+        .zip(uvs)
+        .map(|((p, n), uv)| Vertex {
+            pos: p.to_array(),
+            normal: n.to_array(),
+            uv: uv.to_array(),
+        })
+        .collect();
+    let bytes: Vec<u8> = bytemuck::cast_slice(&verts).to_vec();
+    let bounds = (!positions.is_empty()).then(|| {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in positions {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let centre = (lo + hi) * 0.5;
+        (centre, (hi - centre).length())
+    });
+    MeshVertices { bytes, bounds }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -2374,10 +2408,13 @@ pub struct Renderer {
     encoding_pool: Option<rayon::ThreadPool>,
     _device_poller: Option<DevicePoller>,
     /// Vertex data of changed meshes (skinned people, the driver) waiting for the next
-    /// picture: (mesh, bytes). Written with one staging buffer and a copy each at the start
-    /// of the frame - a `write_buffer` per mesh made wgpu create a staging buffer for every
-    /// one of them, forty a frame with a crowd at a stop.
+    /// picture: (mesh, bytes), one entry per mesh in the order of their first change since
+    /// the last picture (`flush_pending_meshes` writes them in that order).
     pending_meshes: std::cell::RefCell<Vec<(MeshId, Vec<u8>)>>,
+    /// Where each mesh of `pending_meshes` stands in it: a newer pose replaces the bytes of
+    /// the entry in place (a search of the list per mesh grew with the square of the people
+    /// posed in a frame).
+    pending_index: std::cell::RefCell<HashMap<MeshId, usize>>,
     /// What a freed mesh and a freed material hold (see `free_mesh`), made once.
     freed: std::cell::OnceCell<Freed>,
     /// Enhanced+: the ray tracer (on a device with ray queries, see `RenderOptions::ray_tracing`).
@@ -4968,6 +5005,7 @@ impl Renderer {
                     .build().ok()
             },
             pending_meshes: Default::default(),
+            pending_index: Default::default(),
             freed: std::cell::OnceCell::new(),
             rt,
             cab_probe: None,
@@ -5145,17 +5183,13 @@ impl Renderer {
         normals: &[Vec3],
         uvs: &[glam::Vec2],
     ) {
-        let verts: Vec<Vertex> = positions
-            .iter()
-            .zip(normals)
-            .zip(uvs)
-            .map(|((p, n), uv)| Vertex {
-                pos: p.to_array(),
-                normal: n.to_array(),
-                uv: uv.to_array(),
-            })
-            .collect();
-        let bytes: &[u8] = bytemuck::cast_slice(&verts);
+        self.update_mesh_vertices(scene, id, skinned_vertices(positions, normals, uvs));
+    }
+
+    /// `update_mesh` with the vertices already made (`skinned_vertices`, which needs no
+    /// renderer and can run on any thread): the bytes are kept as they are, not copied.
+    pub fn update_mesh_vertices(&self, scene: &mut Scene, id: MeshId, vertices: MeshVertices) {
+        let MeshVertices { bytes, bounds } = vertices;
         let m = &mut scene.meshes[id];
         if (m.vertex_bytes as usize) < bytes.len() {
             return;
@@ -5163,19 +5197,18 @@ impl Renderer {
         {
             // (a newer pose of the same mesh replaces one still waiting)
             let mut pending = self.pending_meshes.borrow_mut();
-            match pending.iter_mut().find(|(mid, _)| *mid == id) {
-                Some(e) => e.1 = bytes.to_vec(),
-                None => pending.push((id, bytes.to_vec())),
+            let mut index = self.pending_index.borrow_mut();
+            match index.get(&id) {
+                Some(&k) => pending[k].1 = bytes,
+                None => {
+                    index.insert(id, pending.len());
+                    pending.push((id, bytes));
+                }
             }
         }
-        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-        for p in positions {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
-        if !positions.is_empty() {
-            m.bounds_center = (lo + hi) * 0.5;
-            m.bounds_radius = (hi - m.bounds_center).length();
+        if let Some((centre, radius)) = bounds {
+            m.bounds_center = centre;
+            m.bounds_radius = radius;
             Self::mesh_bounds_changed(scene, id);
         }
     }
@@ -5186,6 +5219,7 @@ impl Renderer {
     /// creation failed validation and mapping it panicked (Windows, Vulkan).
     fn flush_pending_meshes(&self, scene: &Scene, _encoder: &mut wgpu::CommandEncoder) {
         let pending = std::mem::take(&mut *self.pending_meshes.borrow_mut());
+        self.pending_index.borrow_mut().clear();
         if let Some(rt) = self.rt.as_ref() {
             rt.meshes_changed(pending.iter().map(|(id, _)| *id));
         }
@@ -13661,6 +13695,87 @@ fn snap_rect(r: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `update_mesh_vertices` with vertices made apart (`skinned_vertices`, the people's
+    /// parallel posing) leaves the same frame as the per-mesh search it replaced: the same
+    /// waiting bytes in the same order, the same bounds, over frames of poses that repeat
+    /// a mesh, skip some, empty one and one too big for its buffer.
+    #[test]
+    fn vertices_made_apart_wait_for_the_picture_as_update_mesh_left_them() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let (mut a, mut b) = (renderer.new_scene(), renderer.new_scene());
+        let n = 40usize;
+        let data = |k: usize| MeshData {
+            positions: (0..30 + k).map(|v| Vec3::new(v as f32, k as f32, 0.5)).collect(),
+            normals: vec![Vec3::Z; 30 + k],
+            uvs: vec![glam::Vec2::ZERO; 30 + k],
+            indices: vec![0, 1, 2],
+            ranges: vec![(0, 3, 0)],
+            ..Default::default()
+        };
+        let ids: Vec<MeshId> = (0..n).map(|k| renderer.add_mesh(&mut a, &data(k))).collect();
+        for k in 0..n {
+            assert_eq!(renderer.add_mesh(&mut b, &data(k)), ids[k]);
+        }
+        // the search the index replaced, word for word
+        let by_search = |scene: &mut Scene, pending: &mut Vec<(MeshId, Vec<u8>)>, id: MeshId, positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2]| {
+            let verts: Vec<Vertex> = positions.iter().zip(normals).zip(uvs).map(|((p, n), uv)| Vertex { pos: p.to_array(), normal: n.to_array(), uv: uv.to_array() }).collect();
+            let bytes: &[u8] = bytemuck::cast_slice(&verts);
+            let m = &mut scene.meshes[id];
+            if (m.vertex_bytes as usize) < bytes.len() {
+                return;
+            }
+            match pending.iter_mut().find(|(mid, _)| *mid == id) {
+                Some(e) => e.1 = bytes.to_vec(),
+                None => pending.push((id, bytes.to_vec())),
+            }
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in positions {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            if !positions.is_empty() {
+                m.bounds_center = (lo + hi) * 0.5;
+                m.bounds_radius = (hi - m.bounds_center).length();
+            }
+        };
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for frame in 0..6 {
+            let mut reference: Vec<(MeshId, Vec<u8>)> = Vec::new();
+            for _ in 0..120 {
+                let k = (next() % n as u64) as usize;
+                let len = match next() % 10 {
+                    0 => 0,
+                    1 => 30 + k + 5,
+                    _ => 30 + k,
+                };
+                let f = (next() % 1000) as f32 * 0.01 + frame as f32;
+                let pos: Vec<Vec3> = (0..len).map(|v| Vec3::new(v as f32 * f, -f, (v % 7) as f32)).collect();
+                let nrm: Vec<Vec3> = (0..len).map(|v| Vec3::new(0.0, (v % 3) as f32, 1.0)).collect();
+                let uvs: Vec<glam::Vec2> = (0..len).map(|v| glam::Vec2::new(v as f32, f)).collect();
+                by_search(&mut a, &mut reference, ids[k], &pos, &nrm, &uvs);
+                renderer.update_mesh_vertices(&mut b, ids[k], skinned_vertices(&pos, &nrm, &uvs));
+            }
+            let got = std::mem::take(&mut *renderer.pending_meshes.borrow_mut());
+            renderer.pending_index.borrow_mut().clear();
+            assert!(reference.len() > 10, "frame {frame}: {} meshes", reference.len());
+            assert!(got == reference, "frame {frame}: waiting vertices differ");
+            for &id in &ids {
+                assert_eq!(a.meshes[id].bounds_center.to_array().map(f32::to_bits), b.meshes[id].bounds_center.to_array().map(f32::to_bits), "mesh {id}");
+                assert_eq!(a.meshes[id].bounds_radius.to_bits(), b.meshes[id].bounds_radius.to_bits(), "mesh {id}");
+            }
+        }
+    }
 
     /// Overlays drawn texel for pixel: onto whole pixels, their size kept.
     #[test]
