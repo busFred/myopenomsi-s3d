@@ -1,8 +1,8 @@
 //! Headless scenarios: the drawn road's drivable extent as the room for an in-lane squeeze
 //! that keeps SUMO's `minGapLat` from the body it passes (past the player's bus on any road,
 //! the wheels over the line into a free neighbour lane, an early start, no squeeze across a
-//! lit stub or into a junction's foe stretch) and the shift inside the drawn road past people
-//! on a kerbless pavement.
+//! lit stub or into a junction's foe stretch while a foe moves in it) and the shift inside the
+//! drawn road past people on a kerbless pavement.
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
@@ -359,12 +359,14 @@ fn inside_junction(mx: f64) -> Network {
 }
 
 #[test]
-fn l2_inside_a_junction_the_squeeze_keeps_clear_of_the_foe_stretch() {
+fn l2_inside_a_junction_the_squeeze_keeps_clear_of_a_foe_stretch_in_use() {
     // the bus pauses on the junction's piece 2.25 m right of its axis (the squeeze past it keeps
-    // minGapLat, 0.6, inside the piece's room), the car behind it on the
-    // piece too (`JUNCTION_KEEP` moot inside): with the main road 60 m on the squeeze ends
-    // well before the foe stretch and goes; 20 m on, it would run into it and does not
-    for (mx, expect) in [(190.0f64, true), (150.0, false)] {
+    // minGapLat, 0.6, inside the piece's room), the car behind it on the piece too
+    // (`JUNCTION_KEEP` moot inside): with the main road 60 m on the squeeze ends well before the
+    // foe stretch and goes; 20 m on it runs through that stretch, and goes while nobody moves in
+    // it (SUMO's foe-lane occupancy: a foe occupying the conflict area is what a vehicle waits
+    // for), but not while a car crawls across the main road through it (the 12 s it takes)
+    for (mx, crawler, expect) in [(190.0f64, false, true), (150.0, false, true), (150.0, true, false)] {
         let net = inside_junction(mx);
         let mut sim = Simulation::new(&net, vec![]);
         let player = bus(130.0, 0.0, 2.25, 30.0);
@@ -372,15 +374,30 @@ fn l2_inside_a_junction_the_squeeze_keeps_clear_of_the_foe_stretch() {
         let mut me = car(1, 1, 5.0, 3.0);
         me.state.max_speed_kmh = 30.0;
         let mut cars = vec![me];
+        if crawler {
+            // (on the main road's piece, a 12 m body over the crossing at s 15 for the whole run:
+            // from s 9 at the least speed a driver keeps, 3 km/h)
+            let mut c = car(2, 4, 9.0, 0.8);
+            c.state.front = 6.0;
+            c.state.rear = 6.0;
+            c.state.length = 12.0;
+            c.state.max_speed_kmh = 3.0;
+            c.state.change_cooldown = 1000.0;
+            cars.push(c);
+        }
         let (mut pass, mut least) = (None, f32::INFINITY);
-        run(&net, &mut sim, &mut cars, 20.0, |_, sim, cars| {
+        run(&net, &mut sim, &mut cars, if crawler { 12.0 } else { 20.0 }, |_, sim, cars| {
             sim.players = vec![player];
             if pass.is_none() {
                 pass = cars[0].passing;
             }
             least = least.min(cars[0].obb().separation(&player.obb(0.0, 0.0)) as f32);
         });
-        assert_eq!(pass.is_some(), expect, "main road at {mx}: {pass:?}");
+        assert_eq!(pass.is_some(), expect, "main road at {mx}, crawler {crawler}: {pass:?}");
+        if crawler {
+            let c = cars.iter().find(|c| c.id == 2).unwrap();
+            assert!(c.state.lane == 4 && c.state.speed >= omsi_traffic::driver::STANDING_SPEED && c.state.s - c.state.rear < 15.0, "the crawler is still on the crossing, moving: lane {} s {:.1} v {:.2}", c.state.lane, c.state.s, c.state.speed);
+        }
         if expect {
             assert!(pass.unwrap().lane.is_none(), "{pass:?}");
             assert!(least > 0.55, "least {least:.2}");

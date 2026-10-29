@@ -1305,6 +1305,27 @@ fn shift_clears(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     other.separation(&b) >= SQUEEZE_CLEARANCE as f64
 }
 
+/// Is a foe of my way through junction `j` moving in a meeting stretch (`Foe::mine`, in my way's
+/// distances) that lies within my way from `from` to `to`: a vehicle on the foe's lane whose
+/// body reaches into that lane's side of the stretch (`Foe::theirs`), or a player's vehicle
+/// there, at `STANDING_SPEED` or more (an in-lane squeeze inside a junction; SUMO: a foe occupying
+/// the conflict area that has not passed it).
+fn squeeze_foe_moving(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, from: f32, to: f32) -> bool {
+    let node = &sim.junctions.nodes[j.junction];
+    sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| j.entry + f.mine.0 < to && j.entry + f.mine.1 > from).any(|f| {
+        let lane = node.movements[f.movement].lane;
+        let (a, b) = f.theirs;
+        let on = sim.occupancy.get(&lane).into_iter().flatten().any(|o| {
+            vehicles.get(o.vehicle).is_some_and(|v| v.id != me.id && v.state.speed.abs() >= STANDING_SPEED && o.s - v.state.rear < b && o.s + v.state.front > a)
+        });
+        on || net.lanes.get(lane).is_some_and(|l| {
+            sim.players.iter().filter(|pl| pl.speed.abs() >= STANDING_SPEED && (pl.pos.z - me.pos.z).abs() <= 3.0).any(|pl| {
+                l.nearest_point(pl.pos).is_some_and(|(ps, d)| ps - pl.half_len < b && ps + pl.half_len > a && (d as f32) < l.width * 0.5 + pl.half_width)
+            })
+        })
+    })
+}
+
 /// The player's bus pausing in the lane: squeezed past inside the lane after
 /// `PLAYER_SQUEEZE_STAND` (`Headway::standing_obstacle` waits 4 s for the pass on the
 /// oncoming lane).
@@ -2997,11 +3018,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if matches!(l.what, Seen::Parked) {
                 return false;
             }
-            // (inside a junction a squeeze keeps off the stretch where the ways meet: its
-            // body out of its lane's middle there would be where the junction's foes are
-            // not reckoned to be)
+            // (inside a junction a squeeze keeps off a stretch where the ways meet while a foe
+            // there is in use - one moving in it - since its body out of its lane's middle there
+            // would be where that foe is not reckoned with: SUMO's foe-lane occupancy, a vehicle
+            // waits while a foe occupies the conflict area and has not passed it. A foe standing
+            // there is no conflict for a move its body is clear of, which the squeeze's own sweep
+            // keeps by its clearance, `squeeze_clear`)
             if squeeze && j.inside {
-                return squeeze_run > j.conflict_start && j.conflict_end > -st.rear;
+                return squeeze_foe_moving(net, sim, vehicles, me, j, -st.rear, squeeze_run);
             }
             let keep = j.line - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
             j.line < real + st.front + obstacle_len + zone || keep
