@@ -376,6 +376,9 @@ pub const HELP_DECEL_FACTOR: f32 = 1.0;
 /// stood longer than this is treated as a stopped vehicle - the changer drives on past it where
 /// both lengths with their standing gaps fit in what is left to its lane's end (`informLeader`).
 pub const BLOCKER_IS_BLOCKED_TIME: f32 = 5.0;
+/// SUMO LC2013's `HELP_OVERTAKE` (10 km/h, m/s): a follower on the target lane that must overtake
+/// the changer may pass at the changer's speed plus this (`vhelp`, `informFollower`).
+pub const HELP_OVERTAKE: f32 = 10.0 / 3.6;
 /// SUMO LC2013's `lcCooperative` (default 1.0; `lcCooperativeSpeed` defaults to it): the weight of
 /// a cooperative speed advice against the speed the follower would drive otherwise
 /// (`_patchSpeed`: `coopWeight = clamp(lcCooperativeSpeed, 0, 1)`, `v * coopWeight + (1 - coopWeight)
@@ -2898,8 +2901,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if let (false, false, Some(f), Some((gap, vb))) = (overtakes, ok_behind, nb.behind_id, nb.behind) {
                 // the follower there, when it misses the gap my acceptance needs from it, is asked to
                 // make room (`gap_needed_behind`); one level with me or ahead (no gap behind my rear)
-                // is not asked to brake: it must be overtaken - I slow so it passes by the lane's end
-                // (LC2013's `needDV = overtakeDist / remainingSeconds`)
+                // that I do not get ahead of in time must overtake me - I slow so it passes by the
+                // lane's end (LC2013's `needDV = overtakeDist / remainingSeconds`)
                 // (SUMO's `neededGap`/`decelGap` test before the `helpDecel` branch:
                 // asked to brake only if it can still open the gap from where it is - braking at
                 // its comfortable brake (times `HELP_DECEL_FACTOR`) to rest while I go on to my
@@ -2919,7 +2922,22 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     let need = if opens { 0.0 } else { need };
                     out.help = Some((f, gap, planned, need));
                 } else if let Some(o) = vehicles.get(f) {
-                    drop_back.push((me.length() + o.length() + gap + st.min_gap, vb));
+                    // (SUMO's "eventually" branch: faster than the follower after it has braked a
+                    // second at its help brake - `neighNewSpeed1s` - I get ahead of it before the end,
+                    // the gap growing by that difference: it is asked to brake, I drive on;
+                    // a follower level with me or ahead included - one standing beside me is
+                    // passed, not waited for)
+                    let vb1 = (vb - b_f).max(0.0);
+                    let dv = planned - vb1;
+                    let need = gap_needed_behind(me, &nb, vb1, planned);
+                    if dv > 0.0 && dv * remaining > need - (gap + dv) {
+                        out.help = Some((f, gap, planned, need));
+                    } else {
+                        // (else it must overtake me: LC2013 lets it pass at `vhelp`, its speed or
+                        // mine and `HELP_OVERTAKE`, whichever is more, and I slow by what that
+                        // overtaking needs over the time left, `needDV`)
+                        drop_back.push((me.length() + o.length() + gap + st.min_gap, vb.max(v + HELP_OVERTAKE)));
+                    }
                 }
             }
             if let Some(target) = drop_back.into_iter().map(advice).reduce(f32::min) {
