@@ -5662,6 +5662,9 @@ pub struct Person {
     /// thirty waiting people every frame took 2 ms of the frame at a bus station).
     skin_bones: Option<[glam::Affine3A; omsi_sim::human::SLOTS]>,
     pose_changed: bool,
+    /// The vertices of this frame's new pose, per mesh, made beside the skinning (in
+    /// parallel) and handed to the renderer in `sync`'s serial part.
+    vertices: Vec<omsi_render::MeshVertices>,
     /// Interior light of the bus the person is in (0 outside).
     interior: f32,
     /// The interior light as drawn: it follows `interior` over a moment (stepping through
@@ -6090,8 +6093,8 @@ pub struct Humans {
     /// Simulation time of the last `sync`.
     last_sync: f64,
     /// Frames synced, people posed and skinned, the time that took and the part of it spent
-    /// uploading (ms), in total.
-    pose_stats: (u32, usize, f64, f64),
+    /// uploading (ms), and the vertices uploaded, in total.
+    pose_stats: (u32, usize, f64, f64, usize),
     /// `OMSI_TRACE_PAX=<csv>`: every person near the eye, every frame (see `sync`).
     trace: Option<std::io::BufWriter<std::fs::File>>,
     /// `World::tiles_generation` the stops were last checked against.
@@ -6344,7 +6347,7 @@ impl Humans {
             bus_motion: HashMap::new(),
             map_humans_done: false,
             last_sync: 0.0,
-            pose_stats: (0, 0, 0.0, 0.0),
+            pose_stats: (0, 0, 0.0, 0.0, 0),
             trace: omsi_cfg::env::var("OMSI_TRACE_PAX").ok().and_then(|f| std::fs::File::create(f).ok()).map(|f| {
                 use std::io::Write;
                 let mut w = std::io::BufWriter::new(f);
@@ -6941,6 +6944,7 @@ impl Humans {
             state,
             t_state: 0.0,
             skins: Vec::new(),
+            vertices: Vec::new(),
             skin_bones: None,
             pose_changed: false,
             interior: 0.0,
@@ -9136,12 +9140,13 @@ impl Humans {
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
         out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1));
-        let (frames, posed, ms, up) = self.pose_stats;
+        let (frames, posed, ms, up, verts) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
-                "; posing {:.2} ms a frame ({:.1} people, {:.2} ms of it uploading and placing)",
+                "; posing {:.2} ms a frame ({:.1} people, {:.0} vertices uploaded, {:.2} ms of it uploading and placing)",
                 ms / frames as f64,
                 posed as f64 / frames as f64,
+                verts as f64 / frames as f64,
                 up / frames as f64
             ));
         }
@@ -10117,9 +10122,11 @@ impl Humans {
             );
         }
         let n_due = due.iter().filter(|d| **d).count();
+        let due_done = std::time::Instant::now();
         let pose_one = |p: &mut Person| {
-            let Person { anim, ty, skins, skin_bones, pose_changed, .. } = p;
+            let Person { anim, ty, skins, skin_bones, pose_changed, vertices, .. } = p;
             *pose_changed = false;
+            vertices.clear();
             let bones = omsi_sim::human::slots_from_omsi(&anim.bones(&ty.omsi));
             if bones.iter().any(|b| !b.is_finite()) && !skins.is_empty() {
                 // keep the last good mesh (the rest pose would be the file's T-pose)
@@ -10136,6 +10143,7 @@ impl Humans {
             }
             *skin_bones = Some(bones);
             *pose_changed = true;
+            vertices.extend(skins.iter().zip(&ty.meshes).map(|((pos, nrm), m)| omsi_render::skinned_vertices(pos, nrm, &m.data.uvs)));
         };
         // a handful is quicker on this thread than handed to the pool
         if n_due >= 8 {
@@ -10153,14 +10161,24 @@ impl Humans {
                 .for_each(|(p, _)| pose_one(p));
         }
         let upload = std::time::Instant::now();
+        let (mut mesh_s, mut verts) = (0.0f64, 0usize);
         for (p, &go) in self.people.iter_mut().zip(&due) {
             if go {
                 if p.pose_changed || !p.skinned {
+                    let t0 = std::time::Instant::now();
+                    // (the new pose's vertices, made in the parallel part; the skins as they
+                    // are for somebody drawn the first time without a new pose)
+                    let mut made = std::mem::take(&mut p.vertices).into_iter();
                     for (k, (id, _)) in p.meshes.iter().enumerate() {
                         if let Some((pos, nrm)) = p.skins.get(k) {
-                            renderer.update_mesh(scene, *id, pos, nrm, &p.ty.meshes[k].data.uvs);
+                            match made.next() {
+                                Some(v) if p.pose_changed => renderer.update_mesh_vertices(scene, *id, v),
+                                _ => renderer.update_mesh(scene, *id, pos, nrm, &p.ty.meshes[k].data.uvs),
+                            }
+                            verts += pos.len();
                         }
                     }
+                    mesh_s += t0.elapsed().as_secs_f64();
                 }
                 p.skinned = true;
                 p.since_posed = 0;
@@ -10240,10 +10258,23 @@ impl Humans {
                 }
             }
         }
+        if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            // (the humans profile line: the parts of the posing)
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
+            let now = std::time::Instant::now();
+            let parts = [("sync.due", ms(started, due_done)), ("sync.pose", ms(due_done, upload)), ("sync.mesh", mesh_s * 1000.0), ("sync.place", ms(upload, now) - mesh_s * 1000.0)];
+            for (n, t) in parts {
+                match self.stage_sums.0.iter_mut().find(|s| s.0 == n) {
+                    Some(s) => s.1 += t,
+                    None => self.stage_sums.0.push((n, t)),
+                }
+            }
+        }
         self.pose_stats.0 += 1;
         self.pose_stats.1 += n_due;
         self.pose_stats.2 += started.elapsed().as_secs_f64() * 1000.0;
         self.pose_stats.3 += upload.elapsed().as_secs_f64() * 1000.0;
+        self.pose_stats.4 += verts;
     }
 
 
