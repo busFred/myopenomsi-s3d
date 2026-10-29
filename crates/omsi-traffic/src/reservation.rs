@@ -242,9 +242,12 @@ pub struct ZipCap {
     pub floor: f32,
     pub stop: bool,
     /// The distance from my front to the stretch's start while the foe's rear
-    /// has not been past it `tau` (`getZipperSpeed`'s target): a position bound, I do not enter
-    /// before my turn (a constant-deceleration bound would let the follower creep in). None for a
-    /// car with the right of way over the foe's stream: it follows its link leader in.
+    /// has not been past it `tau` (`getZipperSpeed`'s target) and my earliest arrival there, from
+    /// my state at my own acceleration, comes before that: a position bound, I do not enter
+    /// before my turn (a constant-deceleration bound would let the follower creep in); one that
+    /// cannot arrive before its turn has none. Of several foes ahead, the nearest hold of any
+    /// (`decide_in`). None for a car with the right of way over the foe's stream: it follows its
+    /// link leader in.
     pub hold: Option<f32>,
     /// The foe is in the stretch already (its front past the start): a cap
     /// that brings me to rest behind it puts me at a waiting position (`plan`).
@@ -594,10 +597,15 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     };
     let w = (t_e / ZIPPER_BLEND_TIME).min(1.0);
     let floor = -(w * c.decel + (1.0 - w) * MAX_BRAKE);
-    // (short of the start while the foe's rear has not been past it for `tau`: wait at the start;
-    // not with the right of way over its stream: the foe is my link leader, and I advance behind
-    // it, SUMO's `jmAdvance`, because a hold at the start would let a whole minor stream by)
-    let hold = (!yields_to_me && d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau).then_some(d_e);
+    // (short of the start while the foe's rear has not been past it for `tau` and I could be at
+    // the start before then: wait at the start. My earliest arrival there is `t_e`, from my state
+    // at my own acceleration; one that cannot be there before `t_target` is not entering before
+    // its turn and rolls on under the cap - SUMO's `getZipperSpeed` targets the arrival `tau`
+    // after the foe, and its `blockedByFoe` reads the ego's arrival time from its state, so a car
+    // standing back from the start moves off while the foe is still passing. Not with the right
+    // of way over its stream: the foe is my link leader, and I advance behind it, SUMO's
+    // `jmAdvance`, because a hold at the start would let a whole minor stream by)
+    let hold = (!yields_to_me && d_e > 0.0 && o.speed >= STANDING_SPEED && o_len - p_f > -o.speed * c.tau && t_e < t_target).then_some(d_e);
     Some(ZipCap { foe: o.vehicle, gap, speed: o.speed, arrive, floor, stop: false, hold, inside: p_f >= 0.0, dist: -p_e, red_short })
 }
 
@@ -1410,8 +1418,17 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                                 None => true,
                                 Some(w) => (z.stop && !w.stop) || (z.stop == w.stop && (if z.stop { z.gap < w.gap } else { cap(&z) < cap(&w) })),
                             };
+                            // (and the position hold of any of them, the nearest: a foe ahead whose turn I
+                            // could be at the start before holds me there, whichever foe caps hardest)
+                            let hold = match (zip_cap.and_then(|w| w.hold), z.hold) {
+                                (Some(a), Some(b)) => Some(a.min(b)),
+                                (a, b) => a.or(b),
+                            };
                             if tighter {
                                 zip_cap = Some(z);
+                            }
+                            if let Some(w) = zip_cap.as_mut() {
+                                w.hold = hold;
                             }
                         }
                         None => note("zipper_behind", None),
