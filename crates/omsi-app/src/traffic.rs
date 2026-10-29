@@ -1428,7 +1428,7 @@ fn open_trace() -> Option<std::io::BufWriter<std::fs::File>> {
 
 /// The vehicle's extent from its origin: (to the front bumper, to the rear bumper, half
 /// the width) from its `[boundingbox]`.
-fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
+pub(crate) fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
     let (front, rear, width) = match ty.def.bounding_box {
         Some(bb) if bb[1] > 1.0 => (
             bb[1] * 0.5 + bb[4],

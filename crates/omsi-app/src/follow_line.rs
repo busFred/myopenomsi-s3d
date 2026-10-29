@@ -31,7 +31,9 @@
 //! in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted
 //! apart and not listed. A car that parks or pulls out of a parked space (its parked object
 //! put down or taken up where it stands) and anything while the map loads
-//! (`Traffic::loading_phase`) is not counted.
+//! (`Traffic::loading_phase`) is not counted. The AI bodies as the game draws them
+//! (`BodyLane`): how far each swings out of its own footprint along its way and where two of
+//! them overlap.
 
 use crate::traffic::Traffic;
 use glam::{DVec3, Vec3};
@@ -242,6 +244,196 @@ pub(crate) struct PlayerWatch {
     /// The position lines.
     lines: Vec<String>,
     next_line: f32,
+    /// The AI bodies against their lanes and each other.
+    bodies: BodyLane,
+}
+
+/// Step (m) of the way's points a body is measured against: the polyline between them is
+/// within a millimetre of a 25 m bend (the sagitta of a 0.5 m chord).
+const BODY_WAY_STEP: f32 = 0.5;
+/// Upper bounds (m) of the radius classes the bodies are told by (the bends of the unit
+/// test, `ai_motion`'s 25/40/80 m, and the rest).
+const BODY_RADIUS_CLASSES: [f64; 3] = [30.0, 60.0, 120.0];
+/// Swing (m) from which a body counts as out of its footprint: the way's polyline and the
+/// pure pursuit's steady error on a straight stay within millimetres; a centimetre is a body
+/// truly turned off its way.
+const BODY_COUNTED: f64 = 0.01;
+
+/// The AI road bodies as the game draws them, every frame outside the map's loading: per
+/// vehicle section the point of its outline farthest outside a lane as wide as the body
+/// itself (the four corners and the sides abreast of its turning line, the inner side's
+/// nearest point to a bend's centre): its distance from the vehicle's way
+/// (`AiState::way_point`, with its lane change and sideways moves) less the section's half
+/// width, i.e. how far the body leaves its own footprint along the way; for a lane W wide it
+/// is outside the lane by this less (W/2 - half width). (The lanes' own `width` is the path's,
+/// 1 m on most BeijingCity lanes, not the painted lane.) Front section and coupled rear
+/// sections apart, told by the radius of the way under the section (the circle through the
+/// way's points at its rear bumper, origin and front bumper), as percentiles of the
+/// vehicle-frames (a body put back on its way after a jump of the traffic's state stands
+/// metres off it for a frame: the maximum alone is that). And the pairs of bodies (every
+/// section) whose outlines overlap (`collision::Obb::separation`), each overlap listed once
+/// over with both vehicles as they were when it began (position, heading, speed, lane, place,
+/// sideways offset, the lane's radius there).
+#[derive(Default)]
+struct BodyLane {
+    /// Per section kind (front, rear) and radius class (and beyond the last): every
+    /// vehicle-frame's swing (m) and its frame time (s); the most with its second, id, type.
+    swing: [[Vec<(f32, f32)>; 4]; 2],
+    most: [[(f64, f32, u64, String); 4]; 2],
+    /// Overlapping pair-seconds, the pairs, the deepest (m) with its second and ids.
+    overlap_s: f64,
+    pairs: HashSet<(u64, u64)>,
+    deepest: (f64, f32, u64, u64),
+    /// The overlaps going on: pair -> (since, deepest, both vehicles as they were then).
+    open: HashMap<(u64, u64), (f32, f64, String)>,
+    /// Each overlap once over: its line.
+    episodes: Vec<String>,
+}
+
+impl BodyLane {
+    fn frame(&mut self, t_s: f32, dt: f32, traffic: &Traffic) {
+        use glam::DVec2;
+        use omsi_sim::ai_motion::MotionKind;
+        use omsi_sim::collision::Obb;
+        let net = &traffic.net;
+        let mut boxes: Vec<(u64, Obb, f64)> = Vec::new();
+        // per vehicle: what it is and does, for the overlap lines
+        let mut what: HashMap<u64, String> = HashMap::new();
+        for c in traffic.cars.iter().filter(|c| c.body.kind == MotionKind::Road) {
+            let st = &c.ai.state;
+            if st.lane >= net.lanes.len() {
+                continue;
+            }
+            let n = ((st.rear + st.front + 4.0) / BODY_WAY_STEP).ceil() as usize;
+            let first = -st.rear - 2.0;
+            let way: Vec<DVec2> = st.way_points(net, (0..=n).map(|i| first + i as f32 * BODY_WAY_STEP)).into_iter().map(|p| p.truncate()).collect();
+            let off_way = |p: DVec2| {
+                way.windows(2)
+                    .map(|w| {
+                        let (a, b) = (w[0], w[1]);
+                        let t = ((p - a).dot(b - a) / (b - a).length_squared().max(1e-12)).clamp(0.0, 1.0);
+                        (p - (a + (b - a) * t)).length()
+                    })
+                    .fold(f64::MAX, f64::min)
+            };
+            // the way at `d` m from the vehicle's origin (between its samples)
+            let at = |d: f32| {
+                let x = ((d - first) / BODY_WAY_STEP).clamp(0.0, n as f32);
+                let i = (x.floor() as usize).min(n.saturating_sub(1));
+                way[i].lerp(way[(i + 1).min(n)], (x - i as f32) as f64)
+            };
+            what.insert(
+                c.id,
+                format!(
+                    "#{} {} at ({:.1}, {:.1}) heading {:.0} {:.1} m/s lane {} s {:.1} lateral {:.2} radius {:.0}",
+                    c.id,
+                    c.vehicle.ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                    c.vehicle.position.x,
+                    c.vehicle.position.y,
+                    c.vehicle.heading,
+                    st.speed,
+                    st.lane,
+                    st.s,
+                    st.lateral,
+                    1.0 / net.lanes[st.lane].curvature_at(st.s).abs().max(1e-4)
+                ),
+            );
+            let mut sections: Vec<(DVec3, f64, (f32, f32, f32), f32, f32)> = Vec::new();
+            let ext = crate::traffic::extents(&c.vehicle.ty, st.length);
+            sections.push((c.vehicle.position, c.vehicle.heading, ext, omsi_sim::ai_motion::rotation_point(&c.vehicle.ty.def).0, 0.0));
+            for t in &c.vehicle.trailers {
+                // (where along the way the section stands: its origin's distance behind the front's)
+                let back = (t.position - c.vehicle.position).truncate().length() as f32;
+                sections.push((t.position, t.heading, crate::traffic::extents(&t.ty, st.length), omsi_sim::ai_motion::rotation_point(&t.ty.def).0, -back));
+            }
+            for (i, &(pos, heading, (front, rear, half), turning, along)) in sections.iter().enumerate() {
+                let h = heading.to_radians();
+                let fwd = DVec2::new(h.sin(), h.cos());
+                let right = DVec2::new(fwd.y, -fwd.x);
+                let o = pos.truncate();
+                let worst = [(front, half), (front, -half), (-rear, half), (-rear, -half), (turning, half), (turning, -half)]
+                    .iter()
+                    .map(|&(long, lat)| off_way(o + fwd * long as f64 + right * lat as f64) - half as f64)
+                    .fold(f64::MIN, f64::max);
+                // the way's radius under the section: the circle through three of its points
+                let (a, b, q) = (at(along - rear), at(along), at(along + front));
+                let cross = (b - a).perp_dot(q - a).abs();
+                let k = 2.0 * cross / ((b - a).length() * (q - b).length() * (q - a).length()).max(1e-9);
+                let class = BODY_RADIUS_CLASSES.iter().position(|r| k * r >= 1.0).unwrap_or(3);
+                let kind = (i > 0) as usize;
+                self.swing[kind][class].push((worst as f32, dt));
+                let m = &mut self.most[kind][class];
+                if worst > m.0 || m.3.is_empty() {
+                    let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                    let name = ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    *m = (worst, t_s, c.id, name);
+                }
+                boxes.push((c.id, Obb::vehicle(o, heading, front as f64, rear as f64, half as f64), front.max(rear).hypot(half) as f64));
+            }
+        }
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for (i, (a, ba, ra)) in boxes.iter().enumerate() {
+            for (b, bb, rb) in boxes.iter().skip(i + 1) {
+                if a == b || (ba.center - bb.center).length() > ra + rb {
+                    continue;
+                }
+                let sep = ba.separation(bb);
+                if sep < 0.0 {
+                    let pair = (*a.min(b), *a.max(b));
+                    if seen.insert(pair) {
+                        self.overlap_s += dt as f64;
+                        self.pairs.insert(pair);
+                        let e = self.open.entry(pair).or_insert_with(|| (t_s, 0.0, format!("{} / {}", what.get(&pair.0).cloned().unwrap_or_default(), what.get(&pair.1).cloned().unwrap_or_default())));
+                        e.1 = e.1.max(-sep);
+                    } else if let Some(e) = self.open.get_mut(&pair) {
+                        e.1 = e.1.max(-sep);
+                    }
+                    if -sep > self.deepest.0 {
+                        self.deepest = (-sep, t_s, pair.0, pair.1);
+                    }
+                }
+            }
+        }
+        let over: Vec<(u64, u64)> = self.open.keys().filter(|k| !seen.contains(k)).copied().collect();
+        for k in over {
+            if let Some((since, depth, who)) = self.open.remove(&k) {
+                self.episodes.push(format!("t={since:.1} for {:.1} s, deepest {depth:.2} m: {who}", t_s - since));
+            }
+        }
+    }
+
+    fn report(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, part) in ["front section", "rear sections"].iter().enumerate() {
+            for class in 0..4 {
+                let v = &mut self.swing[i][class];
+                if v.is_empty() {
+                    continue;
+                }
+                let name = match class {
+                    0 => format!("R <= {:.0} m", BODY_RADIUS_CLASSES[0]),
+                    3 => format!("R > {:.0} m", BODY_RADIUS_CLASSES[2]),
+                    c => format!("R {:.0}-{:.0} m", BODY_RADIUS_CLASSES[c - 1], BODY_RADIUS_CLASSES[c]),
+                };
+                let secs: f64 = v.iter().map(|x| x.1 as f64).sum();
+                let out_s: f64 = v.iter().filter(|x| x.0 as f64 > BODY_COUNTED).map(|x| x.1 as f64).sum();
+                let mean = v.iter().map(|x| x.0 as f64).sum::<f64>() / v.len() as f64;
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let pct = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize].0;
+                let m = &self.most[i][class];
+                out.push(format!(
+                    "body lane: {part} {name}: {secs:.0} vehicle-s, out of its own footprint {out_s:.0} vehicle-s; swing mean {mean:.2} p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} m (t={:.1} #{} {})",
+                    pct(0.5), pct(0.95), pct(0.99), m.0, m.1, m.2, m.3
+                ));
+            }
+        }
+        let still: Vec<String> = self.open.values().map(|(since, depth, who)| format!("t={since:.1} still at the end, deepest {depth:.2} m: {who}")).collect();
+        for e in self.episodes.iter().chain(&still) {
+            out.push(format!("body lane:   overlap {e}"));
+        }
+        out.push(format!("body lane: AI bodies overlapping as drawn: {:.1} pair-s, {} pairs, deepest {:.2} m at t={:.1} #{}/#{}", self.overlap_s, self.pairs.len(), self.deepest.0, self.deepest.1, self.deepest.2, self.deepest.3));
+        out
+    }
 }
 
 impl PlayerWatch {
@@ -424,6 +616,9 @@ impl PlayerWatch {
                 }
             }
         }
+        if !loading {
+            self.bodies.frame(t_s, dt, traffic);
+        }
         if t_s >= self.next_line {
             self.next_line = t_s + POSITION_EVERY;
             let held = self.hold.as_ref().map(|h| format!(", held ({}) {:.0} s", h.why, t_s - h.since)).unwrap_or_default();
@@ -517,6 +712,7 @@ impl PlayerWatch {
                 out.push(format!("player watch:   held t={since:.1} for {secs:.1} s: {why}{} lane {lane}", other.map(|o| format!(" #{o}")).unwrap_or_default()));
             }
         }
+        out.extend(self.bodies.report());
         out
     }
 }
