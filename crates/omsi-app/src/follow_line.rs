@@ -645,7 +645,7 @@ mod tests {
             t += DT as f64;
         }
         assert!(worst <= half_lane, "{worst:.2} m off its lane's middle line");
-        let (when, y) = served_at.expect("never stood at its stop with the doors open");
+        let (when, y) = served_at.expect("never stood at its stop (at_station, speed under 0.3 m/s)");
         // (at its stop point, where `BusService::step` brings it to rest)
         assert!((y - 60.0).abs() < 2.0, "served its stop at y {y:.1} ({when:.1} s)");
         assert!(stood_at_red, "never stood at the red light");
@@ -734,7 +734,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(t <= 300.0, "never got through the bend after the green");
         assert!(worst <= half_lane, "{worst:.2} m off its lane's middle line");
-        let (when, y) = served_at.expect("never stood at its stop with the doors open");
+        let (when, y) = served_at.expect("never stood at its stop (at_station, speed under 0.3 m/s)");
         assert!((y - 60.0).abs() < 3.0, "served its stop at y {y:.1} ({when:.1} s)");
         assert!(stood_at_red, "never stood at the red light");
         assert!(!on_red, "drove past the red light");

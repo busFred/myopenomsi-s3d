@@ -2626,14 +2626,26 @@ impl Humans {
         }
     }
 
-    /// sub_61c8d8: a free waiting place of the stop, at random.
+    /// sub_61c8d8: a free waiting place of the stop, at random (`free_spots`).
     pub(super) fn take_spot(&mut self, stop: i64) -> Option<usize> {
+        let free = self.free_spots(stop);
+        if free.is_empty() {
+            return None;
+        }
+        let k = free[(self.rand() as usize) % free.len()];
+        self.stops.get_mut(&stop)?.taken[k] = true;
+        Some(k)
+    }
+
+    /// The free waiting places of the stop: not taken, not refused (`clear_stop_of_lanes`),
+    /// and nobody of another stop standing on one.
+    pub(super) fn free_spots(&self, stop: i64) -> Vec<usize> {
         // Stops a few metres apart (both sides of a bus station's platform, a stop and its
         // copy for another line) find the same objects' places, and each kept its own list of
         // who stands where (as Omsi.exe's 0x61c8d8 does), so two or three people stood in
         // one another. A place somebody of another stop stands on is not free (nor one of the
         // stop's own a few centimetres from a taken one: objects placed twice).
-        let s = self.stops.get(&stop)?;
+        let Some(s) = self.stops.get(&stop) else { return Vec::new() };
         let (pos, reach) = (s.pos, 40.0_f64.max(s.length as f64 + 15.0) * 2.0);
         let elsewhere: Vec<DVec3> = self
             .stops
@@ -2647,9 +2659,7 @@ impl Humans {
                     .map(|(sp, _)| sp.pos)
             })
             .collect();
-        let s = self.stops.get(&stop)?;
-        let free: Vec<usize> = s
-            .taken
+        s.taken
             .iter()
             .enumerate()
             .filter(|(k, t)| {
@@ -2658,13 +2668,7 @@ impl Humans {
                     .any(|q| (*q - s.spots[*k].pos).truncate().length() < 0.4)
             })
             .map(|(k, _)| k)
-            .collect();
-        if free.is_empty() {
-            return None;
-        }
-        let k = free[(self.rand() as usize) % free.len()];
-        self.stops.get_mut(&stop).unwrap().taken[k] = true;
-        Some(k)
+            .collect()
     }
 
     /// The task part of the tick (sub_62a6a0 from 0x62b984).
