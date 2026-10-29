@@ -3,7 +3,8 @@
 //! and the rest, the kerb faces (two consecutive points at the same x and different
 //! heights) and every edge between strips; and from them the drivable extent of a
 //! traffic path ([`lane_drivable`]): how far either side of its axis the drawn road goes
-//! on before a kerb, a pavement or the asphalt's end.
+//! on before a kerb, a pavement or the asphalt's end; and the edges of the lane the path is
+//! the axis of ([`lane_edges`]).
 //!
 //! (Shared by the game's lane builder and the `omsi-roadmask` tool; laying an x offset
 //! along a placed spline is the tool's own, it needs the map's curve.)
@@ -368,6 +369,41 @@ pub fn lane_drivable(def: &Spline, path_index: usize, mirror: bool, reversed: bo
     }
 }
 
+/// The edges of the lane that street path `path_index` of spline type `def` is the axis of,
+/// to its left and right in its direction of travel (metres from the axis): half way to the
+/// next street path of the spline on that side (two paths of one road side are a lane width
+/// apart and the painted line between them lies midway; BeijingCity's `Andingmn_1.sli`: paths
+/// at -8.65 and -5.5, its lane line at -7.1; the oncoming lane's path likewise puts the
+/// centre line midway), and no further than the drawn road goes (the kerb or the asphalt's
+/// end, [`CrossSection::drivable_extent`]) on the side with no path beyond. 0 on a side
+/// neither tells: a path over no drawn road (an invisible helper spline, a Human_path) with
+/// no street path beside it on that side. `mirror` and `reversed` as for [`lane_drivable`].
+pub fn lane_edges(def: &Spline, path_index: usize, mirror: bool, reversed: bool) -> (f32, f32) {
+    let Some(p) = def.paths.get(path_index) else { return (0.0, 0.0) };
+    let (x, z) = (p.start[0], p.start[2]);
+    let (mut neg, mut pos) = cross_section(def).drivable_extent(x, z).unwrap_or((f32::INFINITY, f32::INFINITY));
+    for (i, o) in def.paths.iter().enumerate() {
+        if i == path_index || o.kind != 0 || (o.start[2] - z).abs() > PATH_ON_STRIP_DZ || (o.start[0] - x).abs() < SAME_X {
+            continue;
+        }
+        let half_gap = (o.start[0] - x).abs() * 0.5;
+        if o.start[0] > x {
+            pos = pos.min(half_gap);
+        } else {
+            neg = neg.min(half_gap);
+        }
+    }
+    let known = |v: f32| if v.is_finite() { v } else { 0.0 };
+    let (neg, pos) = (known(neg), known(pos));
+    // (turned over and reversed as in `lane_drivable`)
+    let (left, right) = if mirror { (pos, neg) } else { (neg, pos) };
+    if reversed {
+        (right, left)
+    } else {
+        (left, right)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +538,30 @@ mod tests {
         assert!((l - 2.3).abs() < 1e-5 && (r - 4.6).abs() < 1e-5, "{l} {r}");
         let (l, r) = lane_drivable(&def, 0, false, true);
         assert!((l - 2.3).abs() < 1e-5 && (r - 3.6).abs() < 1e-5, "{l} {r}");
+    }
+
+    #[test]
+    fn a_lanes_edges_lie_midway_to_the_next_street_path_and_at_the_kerb_beyond() {
+        // kerbed(): pavement to -3.5 (kerb), road -3.5 .. 3.5; two lanes one way at -2.6 and
+        // -0.9 (1 m paths, as BeijingCity draws them), the oncoming lane at +1.75
+        let mut def = kerbed();
+        def.paths = vec![path(-2.6, 0.0, 1.0, 0), path(-0.9, 0.0, 1.0, 0), path(1.75, 0.0, 1.0, 1)];
+        // the kerb lane: 0.9 m to the kerb on the left, half of 1.7 m to its neighbour
+        let (l, r) = lane_edges(&def, 0, false, false);
+        assert!((l - 0.9).abs() < 1e-5 && (r - 0.85).abs() < 1e-5, "{l} {r}");
+        // the middle one: half way to each path beside it
+        let (l, r) = lane_edges(&def, 1, false, false);
+        assert!((l - 0.85).abs() < 1e-5 && (r - 1.325).abs() < 1e-5, "{l} {r}");
+        // the oncoming lane runs backwards: its left is the spline's +x (1.75 to the drawn
+        // end), its right the centre line midway
+        let (l, r) = lane_edges(&def, 2, false, true);
+        assert!((l - 1.75).abs() < 1e-5 && (r - 1.325).abs() < 1e-5, "{l} {r}");
+        // mirrored and running backwards: the same lane, the same edges
+        assert_eq!(lane_edges(&def, 0, true, true), lane_edges(&def, 0, false, false));
+        // over no drawn road: only the side with a path beside it is known
+        let mut bare = Spline::default();
+        bare.paths = vec![path(0.0, 0.0, 1.0, 0), path(3.0, 0.0, 1.0, 0)];
+        assert_eq!(lane_edges(&bare, 0, false, false), (0.0, 1.5));
     }
 
     #[test]

@@ -13424,6 +13424,8 @@ fn spline_lanes(
             let mut l = LaneBuilder::polyline(pts, kind, p.width);
             // the drawn road's reach either side of the path, from the spline's cross-section
             l.drivable = omsi_scenery::profile::lane_drivable(def, pi, s.mirror, reversed);
+            // where the lane itself ends: midway to the paths beside it, the kerb beyond
+            l.edges = omsi_scenery::profile::lane_edges(def, pi, s.mirror, reversed);
             if let Some(v) = priority {
                 l.priority = v;
             }

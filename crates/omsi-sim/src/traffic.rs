@@ -117,6 +117,15 @@ pub struct Lane {
     /// either side, see [`Lane::drivable`].
     #[serde(default)]
     pub drivable: (f32, f32),
+    /// Where the lane itself ends left and right of its axis (m): half way to the next street
+    /// path of its spline on that side, else the drawn road's edge (the kerb, the asphalt's
+    /// end), from the spline's paths and `[profile]` (`omsi_scenery::profile::lane_edges`).
+    /// The path's `width` is not the lane's: BeijingCity draws its paths 1 m wide in lanes
+    /// 3 m and more apart. 0 on a side the spline does not tell (a path over no drawn road with
+    /// no path beside it), and for a junction object's path (no profile): see
+    /// [`Network::lane_edges`].
+    #[serde(default)]
+    pub edges: (f32, f32),
     /// The lane ends at the edge of the loaded tiles: the road goes on
     /// into a tile of the map that is not loaded (set by the game, `Traffic::mark_loaded_edges`).
     /// A vehicle stops before its end (`plan`), as at the loaded end of a bus route, instead of
@@ -202,6 +211,49 @@ pub fn density_is_open(density: f32) -> bool {
 pub type PoolRef<'a> = Option<(&'a [i32], usize)>;
 
 impl Network {
+    /// Where lane `i` ends left and right of its axis (m): a spline lane's own
+    /// [`Lane::edges`] where it knows both sides. A junction object's path (`source` 2) has no
+    /// profile and its `width` is the path's, so it takes the road pieces it joins, side by
+    /// side the narrower: the spline lanes into its start and out of its end with both edges
+    /// known, through the object paths joined to it (layer by layer, the nearest such lanes)
+    /// where it joins none directly. None: a spline lane over no drawn road with no path beside
+    /// it on a side, a junction path that leads to no such lane.
+    pub fn lane_edges(&self, i: usize) -> Option<(f32, f32)> {
+        let known = |l: &Lane| l.edges.0 > 0.0 && l.edges.1 > 0.0;
+        let l = self.lanes.get(i)?;
+        if known(l) {
+            return Some(l.edges);
+        }
+        if l.source != 2 || l.kind != LaneKind::Street {
+            return None;
+        }
+        let mut seen: hashbrown::HashSet<usize> = hashbrown::HashSet::from_iter([i]);
+        let mut layer = vec![i];
+        while !layer.is_empty() {
+            let mut found: Option<(f32, f32)> = None;
+            let mut further = Vec::new();
+            for &j in &layer {
+                let prev = self.prev.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                for &n in prev.iter().chain(&self.lanes[j].next) {
+                    let Some(o) = self.lanes.get(n) else { continue };
+                    if o.kind != LaneKind::Street || !seen.insert(n) {
+                        continue;
+                    }
+                    if known(o) {
+                        found = Some(found.map_or(o.edges, |f| (f.0.min(o.edges.0), f.1.min(o.edges.1))));
+                    } else if o.source == 2 {
+                        further.push(n);
+                    }
+                }
+            }
+            if found.is_some() {
+                return found;
+            }
+            layer = further;
+        }
+        None
+    }
+
     /// Is `lane`, closed by density to the vehicle `st`, a marker and not a closure? The closed
     /// run it starts - this lane and the lanes after it while each is the only way on and also
     /// closed by density to the vehicle (a junction object's piece is no run: the way through is
@@ -479,7 +531,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), loaded_edge: false, edge_in_sight: true }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), edges: (0.0, 0.0), loaded_edge: false, edge_in_sight: true }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
