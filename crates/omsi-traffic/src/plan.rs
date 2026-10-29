@@ -9,7 +9,7 @@ use crate::reservation::{Grant, Hold};
 use crate::sim::{Passing, Simulation, Vehicle};
 use glam::DVec2;
 use omsi_sim::collision::Obb;
-use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network};
+use omsi_sim::traffic::{arrival_time, Aspect, Lead, Network, STOP_BRAKE_MARGIN, STOP_LINE_GAP};
 
 /// Why the car holds back, the nearest reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -2120,6 +2120,17 @@ pub fn next_wait(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView
     p
 }
 
+/// The nearest stop point (a distance from the car's origin) it can come to rest at braking no
+/// harder than the brake inside the object, 1.5 times its comfortable one (the brake `Claim::brake`
+/// reckons with there): the controller leaves `STOP_LINE_GAP` short of a stop point and brakes
+/// `STOP_BRAKE_MARGIN` over the constant deceleration, so a car rolling at `v` needs that gap and
+/// `STOP_BRAKE_MARGIN` v²/2b ahead of its front. A standing car: its front. A stop wanted nearer
+/// than this is an emergency brake; the car stops at this one instead.
+fn gentle_stop(me: &Vehicle) -> f32 {
+    let v = me.state.speed;
+    me.state.front + if v < STANDING_SPEED { 0.0 } else { STOP_LINE_GAP + STOP_BRAKE_MARGIN * v * v / (2.0 * 1.5 * me.state.decel) }
+}
+
 pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: &Perception, grant: Option<Grant>) -> Plan {
     let me = &vehicles[i];
     let st = &me.state;
@@ -2154,8 +2165,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     // (past the zebra stop already: where it can stop gently, while that is
                     // still short of the cut - as `hold_point` does for a refused car)
                     let mut at = cut - ZEBRA_STOP;
+                    // (a car moving at queue pace, under `QUEUE_COMING`, that cannot stop at the zebra
+                    // stop gently stops where it can, if that is still short of the cut; a faster one
+                    // stops at the zebra stop as hard as it must to stay off the crossing)
+                    let gentle = gentle_stop(me) + 0.3;
+                    let queue_pace = v >= STANDING_SPEED && v < QUEUE_COMING;
                     if at <= st.front - 0.3 {
-                        at = st.front + v * v / (2.0 * dp.comfort_brake) + 0.3;
+                        at = if queue_pace { gentle } else { st.front + v * v / (2.0 * dp.comfort_brake) + 0.3 };
+                    } else if queue_pace && at < gentle_stop(me) && gentle <= cut - 0.3 {
+                        at = gentle;
                     }
                     if at > st.front - 0.3 && at <= cut - 0.3 {
                         min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
@@ -2222,8 +2240,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // (the resolver gives a cap from a foe short of the stretch only within the car's zipper
         // reach, `reservation::zipper_reach`: farther off there is no hold)
         if let (Some(d), Some(j)) = (z.hold, p.junction.as_ref()) {
+            // (past the last waiting place a rolling car stops where it gently can, a little
+            // further on: a hold released while it crept off and bound again for the next foe,
+            // upstream, put the place at its front and braked it from ~1 m/s at the emergency
+            // brake)
             if let Some(at) = legal_before(&wait_bands(net, sim, j), me, st.front + d) {
-                min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3)), Why::Junction);
+                min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3).max(gentle_stop(me))), Why::Junction);
             }
         }
         // SUMO's waiting positions: where following the foe ahead brings the car

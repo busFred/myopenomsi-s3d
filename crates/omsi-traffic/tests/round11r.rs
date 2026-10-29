@@ -1,7 +1,7 @@
 //! Round 11 area R (roundabout entry capacity): a saturated entry into a single-lane ring with a
 //! circulating stream, driven in the simulation. The entry's flow is held against the HCM 6
-//! single-lane roundabout entry capacity, and no circulating car brakes beyond its comfortable
-//! brake for an entering one. `cargo test --release -p omsi-traffic --test round11r -- --nocapture`
+//! single-lane roundabout entry capacity, no circulating car brakes beyond its comfortable brake
+//! for an entering one, and no entrant brakes beyond the brake inside the object. `cargo test --release -p omsi-traffic --test round11r -- --nocapture`
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
 use omsi_traffic::{Simulation, Vehicle, VehicleClass};
@@ -83,6 +83,12 @@ struct EntryRun {
     /// The hardest braking of a circulating car on the ring piece or after M beyond its own
     /// comfortable brake (m/s², positive: harder), and the closest two boxes came (m).
     over_comfort: f32,
+    /// The hardest braking of an entrant on its approach or entry piece beyond the brake inside
+    /// the object, 1.5 times its comfortable one (`Claim::brake`: the most the resolver reckons it
+    /// stops with there), m/s²; nothing is excused, a stop a car cannot make gently is made later.
+    entrant_over: f32,
+    over_worst: String,
+    entrant_worst: String,
     min_sep: f32,
     /// Entrants still on the approach at the end (the entry was saturated throughout).
     queue_left: usize,
@@ -119,7 +125,7 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
     let mut last_v: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
     let (mut t, mut next_spawn) = (0.0f32, 0.0f32);
     let mut rng = seed;
-    let mut run = EntryRun { entered: 0, circulated: 0, window: secs - warm, over_comfort: f32::NEG_INFINITY, min_sep: f32::INFINITY, queue_left: 0 };
+    let mut run = EntryRun { entered: 0, circulated: 0, window: secs - warm, over_comfort: f32::NEG_INFINITY, entrant_over: f32::NEG_INFINITY, over_worst: String::new(), entrant_worst: String::new(), min_sep: f32::INFINITY, queue_left: 0 };
     while t < secs {
         if t >= next_spawn && !cars.iter().any(|c| c.state.lane == 0 && c.state.s < 12.0) {
             cars.push(car(next_id, 0, 3.0, 13.9));
@@ -134,11 +140,11 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
         for &i in sim.removed.iter().rev() {
             cars.remove(i);
         }
-        if std::env::var_os("R11R_WATCH").is_some() && ((t * 30.0).round() as i32) % 6 == 0 {
+        if std::env::var_os("R11R_WATCH").is_some() && ((t * 30.0).round() as i32) % std::env::var("R11R_EVERY").ok().and_then(|e| e.parse().ok()).unwrap_or(6) == 0 {
             for (c, g) in &sim.claims {
                 let Some(v) = cars.get(c.vehicle) else { continue };
                 if entrants.contains(&v.id) && (v.state.lane == 4 || (v.state.lane == 3 && v.state.s > approach - 25.0)) {
-                    println!("W {t:.2} #{} l{} s {:.1} v {:.2} why {:?} go {} zip {:?}", v.id, v.state.lane, c.s, c.speed, v.last.why, g.go, g.zipper.map(|z| (cars.get(z.foe).map(|f| f.id), (z.gap * 10.0).round() / 10.0, z.hold.map(|h| (h * 10.0).round() / 10.0), z.stop, (z.arrive * 100.0).round() / 100.0)));
+                    println!("W {t:.2} #{} l{} s {:.1} v {:.2} acc {:.2} lead {:?} stop {:?} why {:?} go {} zip {:?}", v.id, v.state.lane, c.s, c.speed, v.state.accel, v.last.lead.map(|l| (l.gap, l.speed)), v.last.stop, v.last.why, g.go, g.zipper.map(|z| (cars.get(z.foe).map(|f| f.id), (z.gap * 10.0).round() / 10.0, z.hold.map(|h| (h * 10.0).round() / 10.0), z.stop, (z.arrive * 100.0).round() / 100.0)));
                 }
             }
         }
@@ -164,7 +170,20 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
             last_lane.insert(va.id, lane);
             if !entrants.contains(&va.id) && (lane == 2 || lane == 5) {
                 if let Some(&v0) = last_v.get(&va.id) {
-                    run.over_comfort = run.over_comfort.max((v0 - va.state.speed) / DT - va.params.comfort_brake);
+                    let over = (v0 - va.state.speed) / DT - va.params.comfort_brake;
+                    if over > run.over_comfort {
+                        run.over_worst = format!("t {t:.2} #{} lane {} s {:.1} v {v0:.2} -> {:.2} why {:?} lead {:?}", va.id, lane, va.state.s, va.state.speed, va.last.why, va.last.lead_id);
+                    }
+                    run.over_comfort = run.over_comfort.max(over);
+                }
+            }
+            if entrants.contains(&va.id) {
+                if let Some(&v0) = last_v.get(&va.id) {
+                    let over = (v0 - va.state.speed) / DT - 1.5 * va.state.decel;
+                    if (3..=4).contains(&va.state.lane) && over > run.entrant_over {
+                        run.entrant_over = over;
+                        run.entrant_worst = format!("t {t:.2} #{} lane {} s {:.1} v {v0:.2} -> {:.2} why {:?}", va.id, va.state.lane, va.state.s, va.state.speed, va.last.why);
+                    }
                 }
             }
             last_v.insert(va.id, va.state.speed);
@@ -187,12 +206,16 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
 const HCM_BAND: (f32, f32) = (0.55, 1.0);
 
 fn check(zebra: bool) {
-    let run = run_entry(zebra, 6.0, 660.0, 60.0, 11);
+    let seed = std::env::var("R11R_SEED").ok().and_then(|e| e.parse().ok()).unwrap_or(11);
+    let run = run_entry(zebra, 6.0, 660.0, 60.0, seed);
     let (e, v_c, cap, ratio) = run.hcm_ratio();
     println!("zebra {zebra}: entering {e:.0}/h circulating {v_c:.0}/h HCM 6 capacity {cap:.0}/h ratio {ratio:.2}; circulating braking beyond comfort {:.2} m/s²; closest boxes {:.2} m; queue left {}", run.over_comfort, run.min_sep, run.queue_left);
+    println!("worst circulating {}", run.over_worst);
+    println!("worst entrant braking beyond 1.5 x comfort {:.2} m/s²: {}", run.entrant_over, run.entrant_worst);
     assert!((450.0..=750.0).contains(&v_c), "circulating {v_c:.0}/h, not about 600");
     assert!(run.queue_left > 0, "the entry's queue ran out: not saturated");
     assert!(run.over_comfort <= 0.0, "a circulating car braked {:.2} m/s² beyond its comfortable brake", run.over_comfort);
+    assert!(run.entrant_over <= 0.01, "an entrant braked {:.2} m/s² beyond the brake inside the object: {}", run.entrant_over, run.entrant_worst);
     assert!(run.min_sep > 0.0, "two bodies came {:.2} m apart", run.min_sep);
     assert!((HCM_BAND.0..=HCM_BAND.1).contains(&ratio), "entry flow {e:.0}/h is {ratio:.2} of the HCM 6 capacity {cap:.0}/h at {v_c:.0}/h circulating");
 }
@@ -200,7 +223,7 @@ fn check(zebra: bool) {
 /// [R-1] A circulating stream of about 600 veh/h (on average a car every 6 s) and a saturated entry
 /// whose waiting place is at the start of the merge: the entry's flow lies within `HCM_BAND` of
 /// the HCM 6 single-lane entry capacity at the measured circulating flow, no circulating car brakes
-/// harder than its comfortable brake, and no two bodies touch.
+/// harder than its comfortable brake, no entrant harder than the brake inside the object, and no two bodies touch.
 #[test]
 fn r11r_a_saturated_ring_entry_admits_the_hcm_capacity_and_no_circulating_car_brakes_hard() {
     check(false);

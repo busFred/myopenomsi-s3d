@@ -3913,7 +3913,10 @@ impl LaneRevisits {
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
-const STOP_LINE_GAP: f32 = 0.6;
+pub const STOP_LINE_GAP: f32 = 0.6;
+/// The stop controller brakes this much over the constant deceleration that stops the car at the
+/// stop point.
+pub const STOP_BRAKE_MARGIN: f32 = 1.05;
 /// A car backing up out of a packed queue does so at walking pace (m/s,
 /// `AiState::reverse_step`): 5 km/h, which the Austrian Supreme Court's decision
 /// OGH 23.03.2007, 2Ob262/05a equates with "Schrittgeschwindigkeit" in the lower court's findings
@@ -5129,7 +5132,7 @@ impl AiState {
             let room = (d - self.front - STOP_LINE_GAP).max(0.02);
             let need = v * v / (2.0 * room);
             let idm = (acc + interaction(d - self.front, 0.0, STOP_LINE_GAP, 0.2)).max(-0.5 * b);
-            let constant = -need * 1.05;
+            let constant = -need * STOP_BRAKE_MARGIN;
             let k = ((need - 0.35 * b) / (0.15 * b)).clamp(0.0, 1.0);
             let a_stop = idm + (constant - idm) * k;
             out = out.min(a_stop);
