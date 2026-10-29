@@ -97,8 +97,10 @@ pub struct Plan {
     /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
     /// The lane change of the driver's own that signals is dropped before it moves over: its
-    /// gap rule fails again (`gap_accepted` against `change_target_view`) or somebody is on the
-    /// move (`people_on_move`; counted, `sim::CHANGES_ABORTED`).
+    /// gap rule fails again (`gap_accepted` against `change_target_view`), somebody is on the
+    /// move (`people_on_move`), or its committed move swept again no longer clears and no step-out
+    /// from there does either (a plain change that has one goes on as that, `start`; counted,
+    /// `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
     /// The last-resort stop before a lane's end, or a dead lane's end for a blocked urgent
     /// strategic change, placed this frame (the odometer where the front stops,
@@ -1514,13 +1516,13 @@ fn bypass_need(me: &Vehicle, lead: &crate::perception::Headway, dir: f32) -> f32
     dir * lead.lateral + lead.half_width + me.half_width + crate::perception::LEAD_MARGIN as f32 + SQUEEZE_CLEARANCE
 }
 
-/// The gap (m) behind the standing `lead` from which a bypass into `nb` - the shortest move of
-/// its kind, the smoothstep (`bypass_min_len`) or with `full_lock` the two arcs
-/// (`full_lock_len`) - takes the lead out of my corridor before my front gets there (where its
-/// way reaches `bypass_need` across, less my front) and my body's front corners, turned along
-/// it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than the
-/// full-lock room cannot get out without reversing.
-fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool) -> Option<f32> {
+/// The gap (m) behind the standing `lead` from which a move from rest into `nb` - `len` metres
+/// long, else the shortest of its kind: the smoothstep (`bypass_min_len`) or with `full_lock` the
+/// two arcs (`full_lock_len`) - takes the lead out of my corridor before my front gets there
+/// (where its way reaches `bypass_need` across, less my front) and my body's front corners,
+/// turned along it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than
+/// the full-lock room cannot get out without reversing.
+fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool, len: Option<f32>) -> Option<f32> {
     let st = &me.state;
     let target = &net.lanes[nb.lane];
     let (ts, _) = target.nearest_point(me.pos)?;
@@ -1532,7 +1534,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     if side <= need {
         return None;
     }
-    let len = if full_lock { full_lock_len(me.length(), side) } else { bypass_min_len(me.length(), side) };
+    let len = len.unwrap_or_else(|| if full_lock { full_lock_len(me.length(), side) } else { bypass_min_len(me.length(), side) });
     // (the profile rises: halving finds where it is `need` across)
     let (mut lo, mut hi) = (0.0f32, len);
     for _ in 0..24 {
@@ -1577,6 +1579,36 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     let corner = hi2 + st.front;
     Some((hi.max(corner) - st.front).max(0.0))
 }
+
+/// Where a plain lane change signalling stops behind its leader (m from my front): where that one
+/// comes to rest, less the room the body needs to turn out of the lane from rest - the full-lock
+/// room the bypass keeps (`bypass_room` with the two arcs at full lock: the gap from which that
+/// move takes the leader out of my corridor and my body turned along it clears the leader's box;
+/// OMSI geometry: a body turns as it moves over, it does not slide sideways as SUMO's changes
+/// do), from which the change goes on as a step-out (`plan`'s re-sweep). Closed up to its standing
+/// gap, the body could not turn out at all and the change was dropped. Only where the car can
+/// still stop there at the keep-back's gentle brake (`KEEP_BACK_BRAKE`); nearer already, None: it
+/// follows as any car does.
+fn change_keep_room(net: &Network, me: &Vehicle, p: &Perception) -> Option<f32> {
+    let st = &me.state;
+    let c = st.change.filter(|c| !c.bypass && c.wait > 0.0)?;
+    let l = p.leader?;
+    let coming = l.rest.is_some() || l.speed < QUEUE_SPEED || (l.held && l.speed < QUEUE_COMING);
+    if !coming {
+        return None;
+    }
+    let nb = change_target_view(p, c.to, c.dir)?;
+    let room = bypass_room(net, me, &nb, &l, true, None)?;
+    let lead_rear = l.rest.unwrap_or(st.front + l.gap + l.speed.max(0.0).powi(2) / (2.0 * QUEUE_BRAKE));
+    let dist = lead_rear - room - st.front;
+    let v = st.speed.max(0.0);
+    (dist > 0.0 && v * v / (2.0 * dist) <= me.params.comfort_brake * KEEP_BACK_BRAKE).then_some(dist)
+}
+
+/// The keep-back behind a standing lead (room to pull out again) is placed only where the car can
+/// still stop there braking at most this many times its comfortable brake (a gentle stop, not an
+/// emergency one).
+pub const KEEP_BACK_BRAKE: f32 = 1.5;
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
 /// stop lands within half a metre of where it was aimed).
@@ -1811,7 +1843,7 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if queue_head(net, sim, vehicles, &l) != Some(QueueHead::ForGood) {
         return None;
     }
-    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l, true)).fold(f32::INFINITY, f32::min);
+    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l, true, None)).fold(f32::INFINITY, f32::min);
     // (any short of the room: the bypass starts from the room, `bypass_start`, not from inside it)
     if !need.is_finite() || l.gap >= need {
         return None;
@@ -2712,11 +2744,22 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // move beginning after the signal still to run, from the pose the car has on its own
             // lane's way: a car that came beside since, standing or rolling level with my body
             // where the rear swings, drops it; counted as every drop, `sim::CHANGES_ABORTED`)
+            // (where that move no longer clears a leader standing within it - the car closed up on
+            // a leader that came to rest - the change goes on as the step-out a change started
+            // from here would be, `bypass_start` from the change-less pose: the car stops and steps
+            // out round it from the room it kept, `change_keep_room`; OMSI geometry, a body turns
+            // as it moves over. Dropped only where that does not clear either)
             if !out.abort_change && !c.bypass {
                 let mut before = me.clone();
                 before.state.drop_change();
                 (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
-                out.abort_change = !change_clear(net, sim, vehicles, &before, p, &nb, near_standing_lead(p, v, (c.wait, c.length)).as_ref(), (c.wait, c.length));
+                let near = near_standing_lead(p, v, (c.wait, c.length));
+                if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
+                    match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
+                        Some(step_out) if out.start.is_none() => out.start = Some(step_out),
+                        _ => out.abort_change = true,
+                    }
+                }
             }
             if !out.abort_change && c.bypass {
                 let mut before = me.clone();
@@ -2735,6 +2778,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     // half out)
     if st.change.is_some_and(|c| c.bypass && c.wait > 0.0) {
         min_stop(&mut out.stop, &mut out.why, Some(st.front + v * v / (2.0 * dp.comfort_brake.max(0.1))), Why::Lead);
+    }
+
+    // a plain change signalling keeps the room to turn out behind its leader (`change_keep_room`)
+    if let Some(dist) = change_keep_room(net, me, p) {
+        min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);
     }
 
     // 7. a lane change of the driver's own: round something standing, for speed, to keep
@@ -3073,7 +3121,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {
-            Some(nb) => bypass_room(net, me, &nb, &l, false).unwrap_or(room),
+            Some(nb) => bypass_room(net, me, &nb, &l, false, None).unwrap_or(room),
             None => room,
         };
         // keep back: room to pull out again, where the car can still stop there gently - only
@@ -3087,7 +3135,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         if (pass_possible || bypass_possible) && !(me.serves_stops() && l.at_stop) && l.gap > room + slack {
             let dist = (l.gap - room).max(0.0);
             let need_brake = v * v / (2.0 * dist.max(0.1));
-            if need_brake <= dp.comfort_brake * 1.5 {
+            if need_brake <= dp.comfort_brake * KEEP_BACK_BRAKE {
                 min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);
             }
         }

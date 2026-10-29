@@ -193,6 +193,52 @@ fn a_plain_change_is_swept_again_while_it_signals() {
     assert!(!dropped && least > 0.3, "a car 2.5 m beside: dropped {dropped}, least {least:.2}");
 }
 
+/// Fix 1-2: a car signalling a plain change whose leader comes to rest ahead keeps behind it the
+/// room the body needs to turn out of the lane from rest (`change_keep_room`: the bypass's
+/// full-lock room) and the change goes on as the step-out from there, not dropped: car 1 at 6 m/s
+/// on the right lane of `two_lanes` signals a change left behind car 2 rolling at 6 m/s 15 m ahead;
+/// half a second later car 2 stands. Car 1 stops behind it with more than a standing gap, moves
+/// over without the change dropped, and its body never comes within `SQUEEZE_CLEARANCE` (0.3 m) of
+/// car 2's.
+#[test]
+fn a_car_signalling_a_change_keeps_the_room_to_turn_out_behind_its_leader() {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 6.0);
+    me.state.change_cooldown = 0.0;
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    me.state.start_change(&net, 0, 1);
+    let mut ahead = car(2, 1, 119.0, 6.0);
+    ahead.state.change_cooldown = 1000.0;
+    ahead.params.lc_speed_gain = 0.0;
+    ahead.params.lc_keep_right = 0.0;
+    let mut cars = vec![me, ahead];
+    let (mut dropped, mut least, mut gap_least) = (false, f32::INFINITY, f32::INFINITY);
+    let (mut t, mut stopped) = (0.0f32, false);
+    while t < 15.0 {
+        if !stopped && t >= 0.5 {
+            let k = cars.iter().position(|c| c.id == 2).unwrap();
+            cars[k] = standing(2, 1, cars[k].state.s);
+            stopped = true;
+        }
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        let o = cars.iter().find(|o| o.id == 2).unwrap();
+        if me.state.change.is_none() && me.state.lane == 1 {
+            dropped = true;
+        }
+        if me.state.lane == 1 && me.state.change.is_none_or(|c| c.t <= 0.0) {
+            gap_least = gap_least.min((o.state.s - o.state.rear) - (me.state.s + me.state.front));
+        }
+        least = least.min(me.obb().separation(&o.obb()) as f32);
+        t += DT;
+    }
+    let lane = cars.iter().find(|c| c.id == 1).unwrap().state.lane;
+    assert!(!dropped && lane == 0, "the change goes through: dropped {dropped}, lane {lane}, least gap before the move {gap_least:.2}");
+    assert!(gap_least > 2.5 && least > 0.3, "room kept behind the leader: least gap before the move {gap_least:.2}, least {least:.2}");
+}
+
 /// A two-lane eastbound approach (lane 0 the left at y 0, lane 1 the right at y -3.5, x 0..300)
 /// to a fork at x 300: lane 0 runs on straight (lane 2, to x 600) or turns left (lane 5); lane 1
 /// turns right (lane 3, the trip end, ending at (400, -100)) or runs on straight (lane 4). Lane 2
