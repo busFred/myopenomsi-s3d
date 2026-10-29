@@ -1228,8 +1228,9 @@ fn shifted_body(net: &Network, me: &Vehicle, d: f32, side: f32) -> Obb {
 /// the first `out_len` metres of way (the bent way starts at the car, `Passing::curve`),
 /// level with the obstacle to `level` metres ahead of the origin, and easing back to the axis
 /// over `back` metres more? (Sampled from the start of the way, so a car standing level or just
-/// ahead on the squeeze side is met.)
-fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, way: &[(usize, f32)], side: f32, out_len: f32, level: f32, back: f32) -> bool {
+/// ahead on the squeeze side is met.) With `only` the vehicle of that id alone is looked at.
+#[allow(clippy::too_many_arguments)]
+fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, way: &[(usize, f32)], side: f32, out_len: f32, level: f32, back: f32, only: Option<u64>) -> bool {
     let to = level + back;
     let from = 0.0f32;
     let near = sim.vehicles_near(me.pos, (to + 30.0) as f64);
@@ -1263,7 +1264,7 @@ fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         let b = shifted_body(net, me, d, side_d);
         // (nobody on foot in the corridor: a squeeze stopped for people mid-ramp stands half
         // out, its body in the car it passes)
-        for &k in &people {
+        for &k in people.iter().filter(|_| only.is_none()) {
             let p = &sim.people[k];
             if (p.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART && Obb::point(p.pos, PERSON_RADIUS as f64).separation(&b) < clearance {
                 return false;
@@ -1271,17 +1272,17 @@ fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
         }
         for &j in &near {
             let o = &vehicles[j];
-            if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 {
+            if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 || only.is_some_and(|id| o.id != id) {
                 continue;
             }
             if o.obb().separation(&b) < clearance {
                 return false;
             }
         }
-        if sim.players.iter().any(|p| (p.pos.z - me.pos.z).abs() <= 3.0 && p.obb(0.0, 0.0).separation(&b) < clearance) {
+        if only.is_none() && sim.players.iter().any(|p| (p.pos.z - me.pos.z).abs() <= 3.0 && p.obb(0.0, 0.0).separation(&b) < clearance) {
             return false;
         }
-        if parked.iter().any(|o| o.separation(&b) < clearance) {
+        if only.is_none() && parked.iter().any(|o| o.separation(&b) < clearance) {
             return false;
         }
         if d >= to {
@@ -3019,12 +3020,37 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let towards_middle = sim.oncoming_sign();
         let (lo, hi) = body_across(net, sim, vehicles, me, &l);
         let away = if l.lateral * towards_middle > 0.3 { -towards_middle } else { towards_middle };
-        let squeeze_side = if away < 0.0 { lo - MIN_GAP_LAT - me.half_width } else { hi + MIN_GAP_LAT + me.half_width };
-        // (a junction object's piece has no edge data: its lane reaches halfway to the piece
-        // laid beside it, `Network::piece_beside` - the paths tile the carriageway - and no
-        // further than its half width where none lies beside)
+        let least_side = if away < 0.0 { lo - MIN_GAP_LAT - me.half_width } else { hi + MIN_GAP_LAT + me.half_width };
+        // (the move the squeeze starts with: the usual one, or from nearer than that the
+        // shortest the body can steer, `bypass_min_len` - the out length the start uses below -
+        // and the stretch it runs level with what stands, to its end)
+        let squeeze_move = |side: f32| {
+            let out_len = squeeze_out(me, &l, side);
+            let (obstacle_len, _) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
+            (out_len, obstacle_len, real + obstacle_len + st.front + st.rear + 2.0)
+        };
+        // (nobody on the lane beside `nb` over the squeeze - ahead past what is passed and the
+        // way back in, behind the gap the driver accepts)
+        let empty_over = |nb: &NeighbourView, side: f32| {
+            let (out_len, obstacle_len, _) = squeeze_move(side);
+            nb.ahead.is_none_or(|a| a.0 > real + obstacle_len + out_len + PASS_ROOM) && gap_accepted(me, nb)
+        };
+        // (a junction object's piece: its drivable extent is the object's drawn road. The
+        // network holds no outline of the object's tarmac - its meshes' road faces are read only
+        // where the scene cuts the terrain - but the object's paths are drawn on its road (they
+        // tile its carriageway), so the drawn road reaches across the piece laid beside,
+        // `Network::piece_beside`: halfway to one the car may drive, the rest is that one's
+        // traffic's; over the whole width of one closed to the car while nobody is on it over the
+        // squeeze - it lends its width, the wheels cross the paint and the body keeps off its axis,
+        // `traffic_cap` below: the car does not drive in it; no further than its half width
+        // where none lies beside)
         let (drivable_left, drivable_right) = if lane.source == 2 {
-            let half = |nb: Option<NeighbourView>| nb.and_then(|nb| net.lanes[nb.lane].nearest_point(me.pos)).map_or(lane.width * 0.5, |(_, d)| (d as f32 * 0.5).max(lane.width * 0.5));
+            let half = |nb: Option<NeighbourView>| {
+                nb.and_then(|nb| net.lanes[nb.lane].nearest_point(me.pos).map(|(_, d)| (nb, d as f32))).map_or(lane.width * 0.5, |(nb, d)| {
+                    let lends = !nb.allowed && !nb.foreign && empty_over(&nb, least_side);
+                    (if lends { d + net.lanes[nb.lane].width * 0.5 } else { d * 0.5 }).max(lane.width * 0.5)
+                })
+            };
             (half(p.left), half(p.right))
         } else {
             lane.drivable()
@@ -3048,31 +3074,65 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             cap
         };
-        let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum()));
+        let extent = (if least_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(least_side.signum()));
+        // (the bent corridor - out, past what stands and back - touches no body now; with
+        // `only`, no part of the vehicle passed)
+        let corridor_clear_of = |side: f32, only: Option<u64>| {
+            let (out_len, _, end) = squeeze_move(side);
+            squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, end, Passing::back_len_for(side), only)
+        };
+        let corridor_clear = |side: f32| corridor_clear_of(side, None);
+        // the squeeze's offset: the least that keeps `MIN_GAP_LAT` from the thing passed; where
+        // from close behind a vehicle the corridor of that one meets the vehicle's near corner
+        // before the move has got out (the move's shortest steerable length runs past the
+        // corner), the least offset within the drawn road whose corridor clears that vehicle,
+        // halved for to `BOX_ROUNDING` (as a bypass's way takes the lead out of its corridor
+        // before its front gets there, `bypass_need`; OMSI geometry: the body is out by the time
+        // it is level with the corner), at most another `MIN_GAP_LAT` out: the driver borrows that
+        // little and no more - SUMO's sublane driver keeps minGapLat to a body; a swing further
+        // out from close behind is a pass, not a squeeze (on an asphalt pedestrian area the
+        // drawn road reaches 9 m). Only the thing passed widens it: the corridor at that offset
+        // must still clear everything else (`corridor_clear`), nobody is swerved round.
+        let passed = match l.what {
+            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.id),
+            Seen::Player(_) | Seen::Parked => None,
+        };
+        let most_side = least_side.signum() * (extent - me.half_width).min(least_side.abs() + MIN_GAP_LAT);
+        let squeeze_side = match passed.filter(|&id| most_side.abs() > least_side.abs() && !corridor_clear_of(least_side, Some(id)) && corridor_clear_of(most_side, Some(id))) {
+            Some(id) => {
+                let (mut lo_s, mut hi_s) = (least_side, most_side);
+                while (hi_s - lo_s).abs() > BOX_ROUNDING {
+                    let mid = 0.5 * (lo_s + hi_s);
+                    if corridor_clear_of(mid, Some(id)) {
+                        hi_s = mid;
+                    } else {
+                        lo_s = mid;
+                    }
+                }
+                hi_s
+            }
+            None => least_side,
+        };
         let reach = squeeze_side.abs() + me.half_width;
+        let (_, _, squeeze_end) = squeeze_move(squeeze_side);
         // not quite enough drawn road: the driver-side wheels may go `WHEELS_OVER_LINE` over
         // the line into the neighbour lane on that side when it is the car's to drive, nobody
         // passes on it the wrong way, no solid line, and it is free for the squeeze's length
-        // (ahead past what is passed and the way back in, behind the gap the driver accepts)
-        // (the move the squeeze starts with: the usual one, or from nearer than that the
-        // shortest the body can steer, `bypass_min_len` - the out length the start uses below)
-        let squeeze_out_len = squeeze_out(me, &l, squeeze_side);
-        let (squeeze_obstacle_len, _) = obstacle_run(p, &l, me.length() + squeeze_out_len + PASS_ROOM);
+        // (`empty_over`)
         let over_line = if reach > extent && reach <= extent + WHEELS_OVER_LINE && !solid {
             let nb = if squeeze_side < 0.0 { p.left } else { p.right };
-            nb.filter(|nb| nb.allowed && !nb.foreign && !net.lanes[nb.lane].no_overtaking && nb.ahead.is_none_or(|a| a.0 > real + squeeze_obstacle_len + squeeze_out_len + PASS_ROOM) && gap_accepted(me, nb))
+            nb.filter(|nb| nb.allowed && !nb.foreign && !net.lanes[nb.lane].no_overtaking && empty_over(nb, squeeze_side))
         } else {
             None
         };
-        // (and the bent corridor - out, past what stands and back - touches no body now, no
-        // person stops the car within it, and the thing passed has settled sideways)
-        let squeeze_end = real + squeeze_obstacle_len + st.front + st.rear + 2.0;
+        // (and the corridor clears, no person stops the car within it, and the thing passed has
+        // settled sideways)
         let squeeze = (reach <= extent || over_line.is_some())
             && !player_out
             && !vehicle_out(squeeze_side)
             && lateral_settled(vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
-            && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
+            && corridor_clear(squeeze_side);
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
         let room = out_len + 1.0;

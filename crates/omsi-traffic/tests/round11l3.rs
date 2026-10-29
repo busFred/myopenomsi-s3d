@@ -531,3 +531,82 @@ fn a_step_out_late_in_its_signal_is_swept_from_its_change_less_pose() {
     let least = seps.iter().copied().fold(f32::INFINITY, f32::min);
     assert!(drops.first().is_some_and(|&d| d <= t0 + signal + 0.05) && least >= first - 1e-3, "dropped {drops:?} (signal ends {:.2}), gap to the person when put down {first:.2}, least {least:.2}", t0 + signal);
 }
+
+/// A lane of crossing object 9 (source 2), 1 m wide as the drive's 12690.
+fn piece(pts: &[(f64, f64)], path: u16) -> omsi_sim::traffic::Lane {
+    let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 1.0);
+    l.source = 2;
+    l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+    l.priority = 128.0;
+    l
+}
+
+/// Fix 1-3, the drive's c0914 (09:14) geometry: car 1 (4.6 m, 1.84 m wide) stands on a 1 m
+/// crossing piece (lane 0, eastbound at y 0, x 100..200) 1.7 m behind the rear corner of car 2,
+/// which stands 10 degrees askew on a lane of its own (lane 5, heading 100 as #33376 beside
+/// #33433's 89), its rear-left corner 0.87 m right of car 1's axis: a squeeze to the left keeping
+/// `MIN_GAP_LAT` needs 1.57 m left of the axis. The object's piece beside on the left (lane 1,
+/// y 3.05) is closed to cars, an open one lies 3.2 m right; halfway to the piece beside gives
+/// 1.52 m. The object's paths are drawn on its road, and the closed piece, empty over the
+/// squeeze, lends its width (the body keeps off its axis): the squeeze goes, and from that close
+/// the least offset's shortest move meets car 2's corner before it is out, so it takes the least
+/// offset that is out by then (beyond 0.70 m), and never comes within `SQUEEZE_CLEARANCE` of a
+/// body. With a car on the closed piece beside car 1 it lends nothing and car 1 does not squeeze.
+#[test]
+fn on_a_junction_piece_a_closed_empty_piece_beside_lends_its_width_to_a_squeeze() {
+    let mut net = Network::default();
+    net.lanes.push(piece(&[(100.0, 0.0), (200.0, 0.0)], 0)); // 0
+    let mut closed = piece(&[(100.0, 3.05), (200.0, 3.05)], 1);
+    closed.no_cars = true;
+    net.lanes.push(closed); // 1
+    net.lanes.push(piece(&[(100.0, -3.2), (200.0, -3.2)], 2)); // 2
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1, 0, 0.0)); // 3
+    net.lanes.push(road(&[(200.0, 0.0), (600.0, 0.0)], 2, 0, 0.0)); // 4
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    // (lane 5: car 2's way, heading 100 - 10 degrees askew of lane 0 - through (152, -2.1), as
+    // #33376 stood on 12587 at heading 100 beside #33433's 89: its rear-left corner 0.87 m right
+    // of car 1's axis)
+    let slope = (10.0f64).to_radians().tan();
+    net.lanes.push(road(&[(140.0, -2.1 + 12.0 * slope), (170.0, -2.1 - 18.0 * slope)], 3, 0, 0.0)); // 5
+    net.build_grid();
+    assert_eq!((net.piece_beside(0, 50.0, 1), net.piece_beside(0, 50.0, 2)), (Some(1), Some(2)));
+    for occupied in [false, true] {
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut me = car(1, 0, 46.0, 0.0);
+        me.half_width = 0.92;
+        me.state.front = 2.4;
+        me.state.rear = 2.2;
+        me.state.length = 4.6;
+        me.stopped = 80.0;
+        me.state.max_speed_kmh = 30.0;
+        let mut ahead = standing(2, 5, 12.0 / (10.0f32).to_radians().cos());
+        ahead.stopped = 90.0;
+        let mut cars = vec![me, ahead];
+        if occupied {
+            cars.push(standing(3, 1, 46.0));
+        }
+        let (mut pass, mut least) = (None, f32::INFINITY);
+        let mut t = 0.0f32;
+        while t < 15.0 {
+            sim.tick(&net, DT, &mut cars);
+            let me = cars.iter().find(|c| c.id == 1).unwrap();
+            if pass.is_none() {
+                pass = me.passing;
+            }
+            for o in cars.iter().filter(|o| o.id != 1) {
+                least = least.min(me.obb().separation(&o.obb()) as f32);
+            }
+            t += DT;
+        }
+        let x = cars.iter().find(|c| c.id == 1).unwrap().pos.x;
+        if occupied {
+            assert!(pass.is_none() && x < 150.0, "the piece beside taken: no squeeze: {pass:?}, x {x:.1}");
+        } else {
+            let side = pass.map(|p| p.side);
+            assert!(pass.is_some_and(|p| p.lane.is_none() && p.side < -0.70 && p.side > -0.85), "squeezes to the left inside the junction: {pass:?}");
+            assert!(least > 0.3 && x > 160.0, "clear past car 2: least {least:.2}, x {x:.1}, side {side:?}");
+        }
+    }
+}
