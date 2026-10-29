@@ -1390,13 +1390,13 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
     crate::rail_drive::point_at(trail, u).unwrap_or_else(|| state.way_point(net, -d as f32))
 }
 
-/// Half the width of the lane `state` drives in (m) for the careful driver's line
-/// (`AiBody::set_lane_half`): the lane's width, `humans::LANE_MIN_WIDTH` at least, as the
-/// people's keep-off strip takes it (the lanes' own `width` is the path's: 1 m inside
-/// junctions and on most of BeijingCity's streets, not the painted lane, which the map
-/// does not give).
-fn lane_half_width(net: &Network, state: &AiState) -> f32 {
-    net.lanes.get(state.lane).map_or(f32::INFINITY, |l| (l.width as f64).max(crate::humans::LANE_MIN_WIDTH) as f32 * 0.5)
+/// Where the lane `state` drives in ends left and right of its axis (m) for the careful
+/// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edges`
+/// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path as the
+/// road pieces it joins). Where the map does not tell, no edge: the swept band centred on the
+/// way.
+fn lane_edges(net: &Network, state: &AiState) -> (f32, f32) {
+    net.lane_edges(state.lane).unwrap_or((f32::INFINITY, f32::INFINITY))
 }
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
@@ -1413,7 +1413,8 @@ fn place_body(
     let mut body = AiBody::new(&vehicle.ty.def, kind);
     let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*vehicle.ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
     body.keep_swept_in_lane_with(state.front, extents(&vehicle.ty, state.length).2, &parts);
-    body.set_lane_half(lane_half_width(net, state));
+    let (left, right) = lane_edges(net, state);
+    body.set_lane_edges(left, right);
     let ground = vehicle.ground.clone();
     let contact = vehicle.contact.clone();
     body.place_in_lane(
@@ -4432,7 +4433,8 @@ impl Traffic {
                 let behind = |d: f64| rail_behind(trail, state, net, d);
                 let lane = |d: f32| state.lane_heading(net, d);
                 if !rail {
-                    body.set_lane_half(lane_half_width(net, state));
+                    let (left, right) = lane_edges(net, state);
+                    body.set_lane_edges(left, right);
                 }
                 body.step_in_lane(
                     dt,
