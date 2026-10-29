@@ -1392,9 +1392,9 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
 
 /// Where the lane `state` drives in ends left and right of its axis (m) for the careful
 /// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edges`
-/// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path as the
-/// road pieces it joins). Where the map does not tell, no edge: the swept band centred on the
-/// way.
+/// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path or an
+/// editor-only spline's lane as the road pieces it joins). Where the map does not tell, no
+/// edge: the swept band centred on the way.
 fn lane_edges(net: &Network, state: &AiState) -> (f32, f32) {
     net.lane_edges(state.lane).unwrap_or((f32::INFINITY, f32::INFINITY))
 }

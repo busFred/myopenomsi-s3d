@@ -122,8 +122,8 @@ pub struct Lane {
     /// end), from the spline's paths and `[profile]` (`omsi_scenery::profile::lane_edges`).
     /// The path's `width` is not the lane's: BeijingCity draws its paths 1 m wide in lanes
     /// 3 m and more apart. 0 on a side the spline does not tell (a path over no drawn road with
-    /// no path beside it), and for a junction object's path (no profile): see
-    /// [`Network::lane_edges`].
+    /// no path beside it), and for a junction object's path (no profile); a junction's path and
+    /// an editor-only spline's lane take the pieces they join: see [`Network::lane_edges`].
     #[serde(default)]
     pub edges: (f32, f32),
     /// The lane ends at the edge of the loaded tiles: the road goes on
@@ -212,19 +212,23 @@ pub type PoolRef<'a> = Option<(&'a [i32], usize)>;
 
 impl Network {
     /// Where lane `i` ends left and right of its axis (m): a spline lane's own
-    /// [`Lane::edges`] where it knows both sides. A junction object's path (`source` 2) has no
-    /// profile and its `width` is the path's, so it takes the road pieces it joins, side by
-    /// side the narrower: the spline lanes into its start and out of its end with both edges
-    /// known, through the object paths joined to it (layer by layer, the nearest such lanes)
-    /// where it joins none directly. None: a spline lane over no drawn road with no path beside
-    /// it on a side, a junction path that leads to no such lane.
+    /// [`Lane::edges`] where it knows both sides. A connector takes the road pieces it joins,
+    /// side by side the narrower: the lanes into its start and out of its end with both edges
+    /// known, through the connectors joined to it (layer by layer, the nearest such lanes)
+    /// where it joins none directly. Connectors are a junction object's paths (`source` 2: no
+    /// profile, and the `width` is the path's) and the lanes of an editor-only spline
+    /// ([`Lane::invisible`]: BeijingCity's `invis_street1M.sli` turns, whose 1 m `[profile]` is
+    /// the editor's helper strip and draws no road; the road under them is drawn by the pieces
+    /// round them). None: a spline lane over no drawn road with no path beside it on a side,
+    /// a connector that leads to no such lane.
     pub fn lane_edges(&self, i: usize) -> Option<(f32, f32)> {
-        let known = |l: &Lane| l.edges.0 > 0.0 && l.edges.1 > 0.0;
+        let connector = |l: &Lane| l.source == 2 || l.invisible;
+        let known = |l: &Lane| !connector(l) && l.edges.0 > 0.0 && l.edges.1 > 0.0;
         let l = self.lanes.get(i)?;
         if known(l) {
             return Some(l.edges);
         }
-        if l.source != 2 || l.kind != LaneKind::Street {
+        if !connector(l) || l.kind != LaneKind::Street {
             return None;
         }
         let mut seen: hashbrown::HashSet<usize> = hashbrown::HashSet::from_iter([i]);
@@ -241,7 +245,7 @@ impl Network {
                     }
                     if known(o) {
                         found = Some(found.map_or(o.edges, |f| (f.0.min(o.edges.0), f.1.min(o.edges.1))));
-                    } else if o.source == 2 {
+                    } else if connector(o) {
                         further.push(n);
                     }
                 }
@@ -2894,6 +2898,35 @@ mod extend_tests {
         l.key = Some(LaneKey { tile, id, path: 0 });
         l.source = 1;
         l
+    }
+
+    /// A junction path takes the edges of the spline lanes it joins, side by side the narrower,
+    /// through an editor-only spline's lane too (whose own 1 m helper profile is no road edge);
+    /// a connector that joins no lane with known edges has none.
+    #[test]
+    fn a_connector_takes_the_edges_of_the_pieces_it_joins() {
+        let mut lanes = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 110.0, 2, (0, 0)), straight(0.0, 110.0, 120.0, 3, (0, 0)), straight(0.0, 120.0, 200.0, 4, (0, 0))];
+        lanes[0].edges = (1.5, 2.0);
+        lanes[1].source = 2;
+        lanes[2].invisible = true;
+        lanes[2].edges = (0.5, 0.5);
+        lanes[3].edges = (1.2, 3.0);
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        assert_eq!(net.lane_edges(0), Some((1.5, 2.0)));
+        // the junction path joins the first lane (known) and the editor-only one (a connector);
+        // the editor-only one joins the junction path (a connector) and the last lane (known)
+        assert_eq!(net.lane_edges(1), Some((1.5, 2.0)));
+        assert_eq!(net.lane_edges(2), Some((1.2, 3.0)));
+        // the junction path between two known lanes: the narrower side by side
+        net.lanes[2].invisible = false;
+        net.lanes[2].edges = (1.0, 4.0);
+        assert_eq!(net.lane_edges(1), Some((1.0, 2.0)));
+        // nothing known round it
+        let mut alone = Network { lanes: vec![straight(0.0, 0.0, 10.0, 1, (0, 0))], ..Default::default() };
+        alone.lanes[0].source = 2;
+        alone.link(1.5);
+        assert_eq!(alone.lane_edges(0), None);
     }
 
     #[test]
