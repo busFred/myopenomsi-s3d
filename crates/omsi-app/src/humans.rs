@@ -2426,6 +2426,9 @@ struct Decision {
     approach: Option<(DVec2, f32, f32)>,
     /// Turned round at the loaded ground's edge (`Humans::edge_turns`).
     edge_turn: bool,
+    /// They would go, but the player could see it (`leaves_at_edge` refused): they stay
+    /// (`Humans::kept_for_sight`).
+    kept: bool,
 }
 
 impl Decision {
@@ -2443,6 +2446,7 @@ impl Decision {
             walk_rng: p.walk_rng,
             approach: p.approach,
             edge_turn: false,
+            kept: false,
         }
     }
 }
@@ -2510,8 +2514,11 @@ impl DecideCtx<'_> {
         }
         match &p.state {
             State::Strolling(walk) => {
+                // (with no street network there is no walk: they go as anybody does, out of
+                // sight and beyond NEVER_VANISH_WITHIN, `leaves_at_edge`; else they stand)
                 let Some(net) = net else {
-                    d.gone = true;
+                    d.gone = leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
+                    d.kept = !d.gone;
                     return d;
                 };
                 if stroller_goes(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
@@ -2549,31 +2556,28 @@ impl DecideCtx<'_> {
             }
             State::Standing => {
                 // somebody who got off with no pavement known beside the stop (or off a stop)
-                // looks for one about once a second - those at a stop whose pavement was not
-                // found, or not loaded yet, stood there for good - and walks on along it
+                // looks for one about once a second and walks on along it (a pavement across
+                // the street does not count: they walked into the bus to reach it). With none
+                // within reach they go as a vehicle at the loaded tiles' edge goes, out of the
+                // player's sight and beyond the distance within which nothing vanishes seen or
+                // not (`leaves_at_edge`, `traffic::NEVER_VANISH_WITHIN`): the one rule for
+                // taking somebody away. Until then they stand where they are and look again
+                // (`kept`; as in OMSI 2 the spawner puts a pedestrian where one belongs)
                 let t = p.t_state;
-                if let (Some(net), true) = (net, t % 1.0 < dt || t == 0.0) {
-                    // a pavement across the street does not count (they
-                    // walked into the bus to reach it); with none within reach they are gone
-                    let found = self.ped.and_then(|pn| kerb_beside(pn, net, p.position));
+                if t % 1.0 < dt || t == 0.0 {
+                    let found = match (net, self.ped) {
+                        (Some(net), Some(pn)) => kerb_beside(pn, net, p.position),
+                        _ => None,
+                    };
                     if let Some((lane, s)) = found {
                         let leg = Leg { lane, a: s, b: s };
                         d.state = Some(State::Strolling(PedWalk::new(vec![leg], true, 0.0)));
                         d.t_state = 0.0;
                         return d;
                     }
-                    if self.ped.is_some() {
-                        d.gone = true;
-                        return d;
-                    }
                 }
-                // as in OMSI 2, somebody who finds no pavement is respawned
-                // (taken away; the spawner puts a pedestrian where one belongs): at once when out
-                // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
-                let gone = !figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p.position) && far_from(self.center, self.lan_centers, p.position, STROLL_RADIUS);
-                if gone || t >= STANDING_GIVE_UP {
-                    d.gone = true;
-                }
+                d.gone = leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position);
+                d.kept = !d.gone;
                 d
             }
             _ => d,
@@ -5573,9 +5577,6 @@ const VEHICLE_COLLISIONS: bool = true;
 
 /// How far (m) from where they stand somebody left standing looks for a pavement to walk on.
 const STANDING_REACH: f64 = 10.0;
-/// How long (s) somebody who got off and finds no pavement stands before
-/// being respawned: sooner when nobody sees them.
-const STANDING_GIVE_UP: f32 = 1.0;
 /// The share of the waiting who wait with others (two to four).
 const PARTY_CHANCE: f32 = 0.22;
 
@@ -6066,8 +6067,14 @@ pub struct Humans {
     /// what they keep across it (`StopCarry`), until `set_up_stop` sets them up again.
     stop_carry: HashMap<i64, StopCarry>,
     /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
-    /// could see then (`figure_in_sight`; every removal rule asks for out of sight, so none).
+    /// could see then (`figure_in_sight`; every removal rule of the people's own asks for out of
+    /// sight, `leaves_at_edge`, so none but a tile's going, `tiles_changed`).
     removed: (usize, usize),
+    /// Counted for the gate (`summary`): the people whose removal was held back at least once
+    /// because the player could see it or they were within `traffic::NEVER_VANISH_WITHIN`
+    /// (`leaves_at_edge`): a Standing person with no pavement (`Decision::kept`), a waiter of a
+    /// stop going out of range (`stops_tick`).
+    kept_for_sight: HashSet<u32>,
     /// The people on foot taken away since the start of this tick (`retire`), with whether the
     /// player could see them: the traffic's recording writes them with its next frame
     /// (`traffic_link::traffic_inputs`, `Frame::people_gone`).
@@ -6336,6 +6343,7 @@ impl Humans {
             loading: false,
             stop_carry: HashMap::new(),
             removed: (0, 0),
+            kept_for_sight: HashSet::new(),
             gone: Vec::new(),
             inside_seen: HashSet::new(),
             moved_places: HashMap::new(),
@@ -6547,6 +6555,12 @@ impl Humans {
         }
     }
 
+    /// May somebody at `p` be taken away (`leaves_at_edge`): out of the player's sight and
+    /// beyond `traffic::NEVER_VANISH_WITHIN` of every player.
+    fn may_vanish(&self, p: DVec3) -> bool {
+        leaves_at_edge(self.eye, self.viewer.as_ref(), self.center, &self.lan_centers, p)
+    }
+
     /// Whether the player could see somebody standing at `p`.
     fn seen(&self, p: DVec3) -> bool {
         figure_in_sight(self.eye, self.viewer.as_ref(), self.center, p)
@@ -6558,15 +6572,17 @@ impl Humans {
         self.people.iter().filter(|p| p.puppet.is_none() && !p.remote).count()
     }
 
-    /// Room in the pool for one more person; when it is full somebody walking the street out
-    /// of sight is taken for it, as Omsi.exe takes a task-8 person for a stop (0x61bd44).
+    /// Room in the pool for one more person; when it is full somebody walking the street whom
+    /// the people's one rule for taking somebody away lets go (`may_vanish`: out of sight and
+    /// beyond `traffic::NEVER_VANISH_WITHIN`) is taken for it, as Omsi.exe takes a task-8 person
+    /// for a stop (0x61bd44).
     fn pool_room(&mut self) -> bool {
         if self.pool_used() < self.max_people {
             return true;
         }
         let free = (0..self.people.len()).find(|&i| {
             let p = &self.people[i];
-            p.puppet.is_none() && !p.remote && matches!(p.state, State::Strolling(_) | State::Standing) && !self.seen(p.position)
+            p.puppet.is_none() && !p.remote && matches!(p.state, State::Strolling(_) | State::Standing) && self.may_vanish(p.position)
         });
         match free {
             Some(i) => {
@@ -7332,13 +7348,25 @@ impl Humans {
             if !near {
                 if changed {
                     self.held_for_sight.remove(&id);
-                    // (sub_61be80) the people waiting there go
+                    // (sub_61be80) the people waiting there go - by the one rule for taking
+                    // somebody away (`may_vanish`); those the player could see, or within
+                    // NEVER_VANISH_WITHIN, walk on along the stop's pavement as pedestrians
+                    // instead (`walk_street_on`) and go as strollers do, counted (`kept_for_sight`)
+                    let lane = self.stops.get(&id).and_then(|s| s.lane);
                     for i in (0..self.people.len()).rev() {
                         let here = matches!(&self.people[i].state, State::Pax(p) if p.stop == Some(id) && p.inside.is_none() && matches!(p.task, Task::WaitingForBus | Task::WalkingToBusstop));
-                        if here {
-                            self.release(i);
+                        if !here {
+                            continue;
+                        }
+                        let State::Pax(x) = &self.people[i].state else { continue };
+                        let (at, heading, pid) = (x.pos, x.yaw.to_degrees(), self.people[i].id);
+                        self.release(i);
+                        if self.may_vanish(at) {
                             let p = self.people.swap_remove(i);
                             self.retire(&p);
+                        } else {
+                            self.kept_for_sight.insert(pid);
+                            self.walk_street_on(i, at, heading, lane);
                         }
                     }
                     for t in self.stops.get_mut(&id).unwrap().taken.iter_mut() {
@@ -9135,7 +9163,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
-        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1));
+        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight); kept for sight {}", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1, self.kept_for_sight.len()));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -9792,6 +9820,9 @@ impl Humans {
         }
         if d.gone {
             remove.push(i);
+        }
+        if d.kept {
+            self.kept_for_sight.insert(self.people[i].id);
         }
         d.want
     }
@@ -11198,6 +11229,97 @@ mod tests {
         let first = first.expect("never filled again");
         assert!(first * 1000.0 > STOP_REFILL_MS, "the first again after {first:.2} s");
         assert_eq!(waiting(&h), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Nobody on foot is taken away where the player could see it or within
+    /// `traffic::NEVER_VANISH_WITHIN` (`leaves_at_edge`, the people's one rule for taking somebody
+    /// away): the waiters of a stop going out of range 500 m off go when the eye is turned away,
+    /// and walk on from it in view (here with no pavement known: standing, `State::Standing`),
+    /// counted (`kept_for_sight`); somebody standing with no pavement stays while in sight or
+    /// within the distance, out of sight, and goes once both allow it.
+    #[test]
+    fn nobody_on_foot_is_taken_away_in_sight_or_within_the_never_vanish_distance() {
+        let root = std::env::temp_dir().join(format!("openomsi-gone-sight-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        std::fs::write(root.join("global.cfg"), "[name]\nGone\n").unwrap();
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let at = DVec3::new(0.0, 500.0, 0.0);
+        let stop = || PaxStop {
+            name: "S".into(),
+            alias: String::new(),
+            pos: at,
+            heading: 0.0,
+            gather: at,
+            spots: (0..4).map(|k| WaitSpot { pos: at + DVec3::new(0.0, k as f64, 0.0), face: 90.0, height: 0.0 }).collect(),
+            taken: vec![false; 4],
+            refused: vec![false; 4],
+            enter_max: 4.0,
+            enter_min: 4.0,
+            length: 30.0,
+            lane: None,
+            was_near: false,
+            near: false,
+            clock_ms: 0.0,
+            want: 0,
+            factor: 1.0,
+            buses: Vec::new(),
+            dests: Vec::new(),
+            lines: Vec::new(),
+            cleared: true,
+            kerb_shift: Some(DVec3::ZERO),
+            kerb_spread: true,
+        };
+        let ahead = Eye { pos: DVec3::new(0.0, 0.0, 2.0), fwd: DVec3::Y, cos_half: 40f64.to_radians().cos() };
+        let away = Eye { fwd: -DVec3::Y, ..ahead };
+        const DT: f32 = 1.0 / 30.0;
+        let on_foot = |h: &Humans| h.people.iter().filter(|p| p.place == Place::Ground).count();
+        // filled out of sight with the player at the stop, then the player 500 m off
+        let mut filled = |eye: Eye| {
+            let mut h = Humans::new(&root);
+            h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+            h.map_humans_done = true;
+            (h.density, h.max_people) = (1.0, 100);
+            h.stops.insert(7, stop());
+            h.center = at;
+            h.eye = Some(Eye { pos: at + DVec3::new(0.0, 10.0, 2.0), fwd: DVec3::Y, cos_half: ahead.cos_half });
+            h.stops_tick(DT, &world, &renderer, &mut scene);
+            assert_eq!(on_foot(&h), 4, "filled out of sight");
+            h.center = DVec3::ZERO;
+            h.eye = Some(eye);
+            h.stops_tick(DT, &world, &renderer, &mut scene);
+            h
+        };
+        // the eye turned away: they go, none of it seen
+        let h = filled(away);
+        assert_eq!((on_foot(&h), h.removed, h.kept_for_sight.len()), (0, (4, 0), 0));
+        // in view: they stay, standing where they waited, counted
+        let mut h = filled(ahead);
+        assert_eq!((on_foot(&h), h.removed, h.kept_for_sight.len()), (4, (0, 0), 4));
+        assert!(h.people.iter().all(|p| matches!(p.state, State::Standing)));
+        // standing with no pavement: kept in sight, kept out of sight within the distance,
+        // gone out of sight beyond it
+        let decide = |h: &Humans, i: usize| {
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0 };
+            let mut yields = Yields::new();
+            let d = ctx.decide(&h.people[i], DT, &world, None, None, &[], &mut YieldBook::Book(&mut yields));
+            (d.gone, d.kept)
+        };
+        assert_eq!(decide(&h, 0), (false, true), "in sight");
+        h.eye = Some(away);
+        assert_eq!(decide(&h, 0), (true, false), "out of sight, 500 m off");
+        h.center = at - DVec3::new(0.0, crate::traffic::NEVER_VANISH_WITHIN - 10.0, 0.0);
+        h.eye = Some(Eye { pos: h.center + DVec3::Z * 2.0, ..away });
+        assert_eq!(decide(&h, 0), (false, true), "out of sight within NEVER_VANISH_WITHIN");
         let _ = std::fs::remove_dir_all(&root);
     }
 
