@@ -1392,8 +1392,8 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
 /// vehicle posed on it. A road vehicle drives the careful driver's line in bends with the
-/// traffic's extent of it (`AiBody::keep_swept_in_lane`: its front bumper `state.front`,
-/// its half width from `extents`), the bend taken from its lane's heading
+/// traffic's extent of it (`AiBody::keep_swept_in_lane_with`: its front bumper `state.front`,
+/// its half width from `extents`, the sections hung behind it), the bend taken from its lane's heading
 /// (`AiState::lane_heading`).
 fn place_body(
     net: &Network,
@@ -1402,7 +1402,8 @@ fn place_body(
     kind: MotionKind,
 ) -> AiBody {
     let mut body = AiBody::new(&vehicle.ty.def, kind);
-    body.keep_swept_in_lane(state.front, extents(&vehicle.ty, state.length).2);
+    let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*vehicle.ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+    body.keep_swept_in_lane_with(state.front, extents(&vehicle.ty, state.length).2, &parts);
     let ground = vehicle.ground.clone();
     let contact = vehicle.contact.clone();
     body.place_in_lane(
@@ -5963,7 +5964,8 @@ impl Traffic {
         state.rear = rear;
         state.length = front + rear;
         let mut body = AiBody::new(&ty.def, MotionKind::Road);
-        body.keep_swept_in_lane(front, half_width);
+        let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+        body.keep_swept_in_lane_with(front, half_width, &parts);
         let mut ai = AiVehicle::new(id, if scheduled { VehicleClass::ScheduledBus } else { VehicleClass::Car }, state, half_width, id);
         ai.fresh = 0.0;
         self.cars.push(AiCar {

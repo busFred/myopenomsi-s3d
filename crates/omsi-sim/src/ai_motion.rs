@@ -12,7 +12,10 @@
 //!
 //! In a bend of its lane an AI road vehicle drives the careful driver's line
 //! (`careful_line_offset`): its rear axle runs inside the way by as much as centres its swept
-//! body on it, so the front no longer swings out over the next lane.
+//! body on it, so the front no longer swings out over the next lane. For an articulated
+//! vehicle the body is the whole of it: the rear sections that hang on joints off-track
+//! further inside (`rear_off_tracking`), and the band to centre runs from the innermost point
+//! of whichever runs innermost.
 
 use crate::vehicle::VehicleInstance;
 use glam::{DVec2, DVec3, Vec3};
@@ -53,8 +56,33 @@ pub fn rotation_point(def: &Vehicle) -> (f32, f32) {
 /// and a careful driver holds the front out so that the whole swept path stays in the
 /// lane; SUMO keeps a vehicle's lateral extent within its lane and models no swing-out,
 /// which is the lane the traffic simulation reasons about (its rigid box on the way).
-pub fn careful_line_offset(k: f32, reach: f32, half_width: f32) -> f32 {
-    reach * reach * k / (4.0 * (1.0 + half_width * k.abs()))
+/// `rear_pull` (`rear_off_tracking`) is the rear sections' extra off-tracking: their inner
+/// side lies `rear_pull · |k| / 2` inside the band's inner side, which moves the band's
+/// centre by `rear_pull · k / 4`; the offset is that much less (never past 0).
+pub fn careful_line_offset(k: f32, reach: f32, half_width: f32, rear_pull: f32) -> f32 {
+    let off = reach * reach * k / (4.0 * (1.0 + half_width * k.abs())) - rear_pull * k / 4.0;
+    if off * k < 0.0 { 0.0 } else { off }
+}
+
+/// The off-tracking of the rear sections hung behind a road vehicle, for `AiBody::
+/// keep_swept_in_lane_with`: `parts` are the vehicle's own type and then the types hung on
+/// behind it, nearest first. In a steady bend the joint behind a section's rotation point
+/// (`[coupling_back]`, `d` behind it) runs on a circle of radius √(r² + d²) when that point
+/// is on one of radius r, and the next section's rotation point (`a` behind its
+/// `[coupling_front]`) on √(r² + d² - a²): so section i runs inside the front one's rotation
+/// circle by about G_i / (2r), G_i the sum of d² - a² over the joints up to it. The result is
+/// the most of -G_i over the sections (m², 0 when none runs inside the front section's own
+/// inner side).
+pub fn rear_off_tracking(parts: &[&crate::vehicle::VehicleType]) -> f32 {
+    let (mut g, mut pull) = (0.0f32, 0.0f32);
+    for w in parts.windows(2) {
+        let (back, front) = crate::vehicle::coupling_points(w[0], false, w[1], false);
+        let d = rotation_point(&w[0].def).0 - back.y;
+        let a = front.y - rotation_point(&w[1].def).0;
+        g += d * d - a * a;
+        pull = pull.max(-g);
+    }
+    pull
 }
 
 /// Clearance a vehicle pulling out keeps from the corner of what it goes round (m).
@@ -179,6 +207,9 @@ pub struct AiBody {
     /// The body for the careful driver's line (`keep_swept_in_lane`): rotation point to
     /// front bumper and half the width (m); None drives the rotation point on the way.
     swept: Option<(f32, f32)>,
+    /// How much further inside the rotation point's circle the rear sections hanging behind
+    /// the vehicle run than its own inner side (m², `rear_off_tracking`); 0 for a rigid one.
+    rear_pull: f32,
     /// Largest front wheel angle (deg) and how fast the driver turns towards it (deg/s).
     max_steer: f32,
     steer_rate: f32,
@@ -301,6 +332,7 @@ impl AiBody {
             front_long,
             rear_long,
             swept: None,
+            rear_pull: 0.0,
             max_steer,
             steer_rate: if heavy { 25.0 } else { 40.0 },
             wheels,
@@ -343,6 +375,14 @@ impl AiBody {
         if self.kind == MotionKind::Road {
             self.swept = Some(((front - self.rot_long).max(0.0), half_width.max(0.0)));
         }
+    }
+
+    /// `keep_swept_in_lane` for a vehicle with sections hung behind it: `parts` as for
+    /// `rear_off_tracking`. The swept band is the whole vehicle's, from the innermost point
+    /// of its rear sections to the outer front corner.
+    pub fn keep_swept_in_lane_with(&mut self, front: f32, half_width: f32, parts: &[&crate::vehicle::VehicleType]) {
+        self.keep_swept_in_lane(front, half_width);
+        self.rear_pull = rear_off_tracking(parts);
     }
 
     /// Put the body onto its way, standing still and straight. `way(d)` is the point `d`
@@ -413,7 +453,7 @@ impl AiBody {
                     Some(l) => -(((l(self.rot_long + look) - l(self.rot_long)) as f64 + 180.0).rem_euclid(360.0) - 180.0).to_radians() as f32 / look,
                     None => 2.0 * turn_signed as f32 / look,
                 };
-                careful_line_offset(k, reach, half_width) as f64
+                careful_line_offset(k, reach, half_width, self.rear_pull) as f64
             }
             _ => 0.0,
         };
@@ -858,7 +898,7 @@ mod tests {
                 let (out1, in1) = swept_outside(&mut after, (front, rear, half), r, speed, lane);
                 // the band of the geometry: inner side at r_r - half, outer front corner
                 let reach = (front - after.rot_long) as f64;
-                let rr = r - careful_line_offset(1.0 / r as f32, reach as f32, half) as f64;
+                let rr = r - careful_line_offset(1.0 / r as f32, reach as f32, half, 0.0) as f64;
                 let excess = ((rr + half as f64).hypot(reach) - (rr - half as f64) - lane) * 0.5;
                 eprintln!("{name} R {r}: before out {out0:.3} in {in0:.3}, after out {out1:.3} in {in1:.3}, band excess {excess:.3}");
                 assert!((out1 - in1).abs() < 0.05, "{name} R {r}: after out {out1:.3} in {in1:.3}");
@@ -870,6 +910,118 @@ mod tests {
         let (def, front, rear, half) = bj6123();
         let (out0, _) = swept_outside(&mut AiBody::new(&def, MotionKind::Road), (front, rear, half), 40.0, 7.0, lane);
         assert!(out0 > 0.5, "front {out0:.3} m out");
+    }
+
+    /// The installed BJ6180: its front section and the rear section hung on it (None when
+    /// BeijingCity is not installed).
+    fn bj6180() -> Option<(crate::vehicle::VehicleType, crate::vehicle::VehicleType)> {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Game/omsi2")))?;
+        let load = |f: &str| {
+            let path = root.join("Vehicles/BJ6180_BJC").join(f);
+            path.exists().then(|| crate::vehicle::VehicleType::load_ai(&root, &path).expect("the bus loads"))
+        };
+        Some((load("6180.bus")?, load("6180_T.bus")?))
+    }
+
+    /// `swept_outside` for an articulated bus: the (outward, inward) of the front section and
+    /// of the rear section, which hangs on its joint (its rotation point `a` behind the joint
+    /// is pulled towards it, the joint `d` behind the front's rotation point).
+    fn swept_outside_articulated(body: &mut AiBody, front_box: (f32, f32, f32), rear_box: (f32, f32), (d, a): (f32, f32), r: f64, speed: f32, lane_width: f64) -> [(f64, f64); 2] {
+        let (front, rear, half) = front_box;
+        let (t_front, t_rear) = rear_box;
+        let dt = 1.0 / 30.0;
+        let mut s = 30.0f64;
+        let heading = |x: f64| if x < 50.0 { 0.0 } else { ((x - 50.0) / r).to_degrees() as f32 };
+        body.place_in_lane(&|d| bend(r, s + d as f64), Some(&|d| heading(s + d as f64)), None, None, speed);
+        let centre = DVec2::new(r, 50.0);
+        let joint_of = |b: &AiBody| b.rear - dir(b.heading) * d as f64;
+        let mut axle = joint_of(body) - dir(body.heading) * a as f64;
+        let mut worst = [(f64::MIN, f64::MIN); 2];
+        let into = 50.0 + r * 1.5 * std::f64::consts::PI;
+        while s < into + r * std::f64::consts::PI {
+            s += (speed * dt) as f64;
+            let at = s;
+            body.step_in_lane(dt, speed, &|d| bend(r, at + d as f64), Some(&|d| heading(at + d as f64)), None, None);
+            // the rear section: its rotation point is pulled towards the joint
+            let joint = joint_of(body);
+            axle = joint - (joint - axle).normalize() * a as f64;
+            if s < into {
+                continue;
+            }
+            let fwd = dir(body.heading);
+            let right = DVec2::new(fwd.y, -fwd.x);
+            let o = body.position.truncate();
+            let t_fwd = (joint - axle).normalize();
+            let t_right = DVec2::new(t_fwd.y, -t_fwd.x);
+            let sections = [
+                (o, fwd, right, [(front, half), (front, -half), (-rear, half), (-rear, -half), (body.rot_long, half), (body.rot_long, -half)]),
+                (axle, t_fwd, t_right, [(t_front, half), (t_front, -half), (-t_rear, half), (-t_rear, -half), (0.0, half), (0.0, -half)]),
+            ];
+            for (i, (origin, f, rt, corners)) in sections.iter().enumerate() {
+                for &(long, lat) in corners {
+                    // (the rear section's lengths are from its rotation point)
+                    let p = *origin + *f * long as f64 + *rt * lat as f64;
+                    let radius = (p - centre).length();
+                    worst[i].0 = worst[i].0.max(radius - (r + lane_width * 0.5));
+                    worst[i].1 = worst[i].1.max((r - lane_width * 0.5) - radius);
+                }
+            }
+        }
+        worst
+    }
+
+    /// The careful driver's line for the whole of an articulated bus, the installed BJ6180
+    /// (`Vehicles/BJ6180_BJC`, a front section and a rear section on a joint) in steady bends
+    /// of 25, 40 and 80 m of a 3.5 m lane: the swept band runs from the rear section's
+    /// innermost point to the front's outer corner and is centred, so the two sides leave
+    /// the lane by the same amount; with the front section alone centred the rear section's
+    /// off-tracking leaves the inner edge by more than the front the outer one.
+    #[test]
+    fn an_articulated_bus_is_centred_on_its_lane_as_a_whole() {
+        let Some((front_ty, rear_ty)) = bj6180() else {
+            eprintln!("skipped: no BJ6180");
+            return;
+        };
+        let lane = 3.5;
+        let half = front_ty.def.bounding_box.unwrap()[0] * 0.5;
+        let boxed = |ty: &crate::vehicle::VehicleType| {
+            let bb = ty.def.bounding_box.unwrap();
+            (bb[1] * 0.5 + bb[4], bb[1] * 0.5 - bb[4])
+        };
+        let (f_front, f_rear) = boxed(&front_ty);
+        let (t_front, t_rear) = boxed(&rear_ty);
+        let rot_t = rotation_point(&rear_ty.def).0;
+        // the lengths of the rear section from its rotation point
+        let rear_box = (t_front - rot_t, t_rear + rot_t);
+        let (back, joint_front) = crate::vehicle::coupling_points(&front_ty, false, &rear_ty, false);
+        let dims = (rotation_point(&front_ty.def).0 - back.y, joint_front.y - rot_t);
+        let pull = rear_off_tracking(&[&front_ty, &rear_ty]);
+        assert!((pull - (dims.1 * dims.1 - dims.0 * dims.0)).abs() < 1e-3, "pull {pull}");
+        println!("BJ6180: joint {:.3} m behind the front's rotation point, the rear's {:.3} m behind it; pull {pull:.2} m2", dims.0, dims.1);
+        println!("R   | rule    | front out / in   | rear out / in");
+        for (r, speed) in [(25.0f64, 5.0f32), (40.0, 7.0), (80.0, 10.0)] {
+            let mut rows = Vec::new();
+            for with in [false, true] {
+                let mut body = AiBody::new(&front_ty.def, MotionKind::Road);
+                if with {
+                    body.keep_swept_in_lane_with(f_front, half, &[&front_ty, &rear_ty]);
+                } else {
+                    body.keep_swept_in_lane(f_front, half);
+                }
+                let w = swept_outside_articulated(&mut body, (f_front, f_rear, half), rear_box, dims, r, speed, lane);
+                println!("{r:<3} | {} | {:+.3} / {:+.3} | {:+.3} / {:+.3}", if with { "whole  " } else { "front  " }, w[0].0, w[0].1, w[1].0, w[1].1);
+                rows.push(w);
+            }
+            let (alone, whole) = (rows[0], rows[1]);
+            // the whole vehicle's band: the front's outer corner against the rear's inner side
+            let inner = whole[0].1.max(whole[1].1);
+            assert!((whole[0].0 - inner).abs() < 0.06, "R {r}: out {:.3} in {inner:.3}", whole[0].0);
+            // never worse on either side than the front section alone centred
+            assert!(whole[0].0.max(inner) <= alone[0].0.max(alone[0].1.max(alone[1].1)) + 1e-3, "R {r}");
+            assert!(inner < alone[0].1.max(alone[1].1), "R {r}: the rear section's inner side moves out");
+        }
     }
 
     /// On a straight lane the careful driver's line is the way: the pose is the same, bit
