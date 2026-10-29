@@ -2291,6 +2291,10 @@ struct Me {
 /// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
 /// adult's; the eye aims at its middle.
 pub(crate) const FIGURE_HEIGHT: f64 = 1.8;
+/// The radius (m) of a standing figure's bounding sphere about its middle, as the renderer culls
+/// it (`Viewer::draws`) and the traffic frames a vehicle by its own (`Viewer::frames`): half
+/// its height.
+const FIGURE_RADIUS: f64 = FIGURE_HEIGHT * 0.5;
 
 /// Whether a figure standing `dist` m from the eye is past the player's sight: beyond the
 /// vehicles' horizon for a body of `FIGURE_HEIGHT` (`Viewer::beyond_horizon`: its two-pixel
@@ -2299,7 +2303,7 @@ pub(crate) const FIGURE_HEIGHT: f64 = 1.8;
 /// horizon for it without one (`traffic::horizon_without_picture`).
 fn past_sight(viewer: Option<&crate::traffic::Viewer>, dist: f64) -> bool {
     match viewer {
-        Some(v) => v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_HEIGHT * 0.5),
+        Some(v) => v.with_lamps(false).beyond_horizon(dist, FIGURE_HEIGHT, FIGURE_RADIUS),
         None => dist > crate::traffic::horizon_without_picture(FIGURE_HEIGHT),
     }
 }
@@ -2321,7 +2325,9 @@ pub(crate) enum FigureSight {
     In,
 }
 
-/// Where a figure standing at `p` is for the player's eye: out of the view cone (`Eye`), in it
+/// Where a figure standing at `p` is for the player's eye: out of the view cone (`Eye`) with the
+/// whole of its bounding sphere (`FIGURE_RADIUS`: a figure whose middle is just outside the cone
+/// shows part of itself, and one put down there was in the cone after its first step), in it
 /// past their sight (`past_sight`), or in sight (within 3 m of the eye always); with no eye, in
 /// sight within `traffic::NEVER_VANISH_WITHIN` of `center` (the traffic's reach of the mirrors
 /// and a turn of the head, where no car appears or vanishes seen or not).
@@ -2332,9 +2338,11 @@ fn figure_view(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center
         Some(e) => {
             let d = p + DVec3::Z * (FIGURE_HEIGHT * 0.5) - e.pos;
             let dist = d.length();
+            // (the angle off the cone's axis less the sphere's angular radius)
+            let off = (d.dot(e.fwd) / dist).clamp(-1.0, 1.0).acos() - (FIGURE_RADIUS / dist).min(1.0).asin();
             if dist < 3.0 {
                 FigureSight::In
-            } else if d.dot(e.fwd) / dist <= e.cos_half {
+            } else if off >= e.cos_half.clamp(-1.0, 1.0).acos() {
                 FigureSight::Out
             } else if past_sight(viewer, dist) {
                 FigureSight::Beyond
@@ -15355,6 +15363,21 @@ mod ped_tests {
             walk.s = s;
             assert!(!at_edge(&ped, &walk));
         }
+    }
+
+    #[test]
+    fn a_figure_is_out_of_the_view_cone_only_with_its_whole_bounding_sphere() {
+        // a cone of 50 degrees half-angle looking north; a figure 43 m off (Wuluju's #1734) with
+        // its middle 0.5 m outside the cone's edge still shows: not out; 1 m outside, out
+        let half = 50f64.to_radians();
+        let e = Eye { pos: DVec3::ZERO, fwd: DVec3::Y, cos_half: half.cos() };
+        let at = |outside: f64| {
+            let ang = half + (outside / 43.0).atan();
+            DVec3::new(43.0 * ang.sin(), 43.0 * ang.cos(), -FIGURE_HEIGHT * 0.5)
+        };
+        assert_ne!(figure_view(Some(e), None, DVec3::ZERO, at(0.5)), FigureSight::Out);
+        assert_eq!(figure_view(Some(e), None, DVec3::ZERO, at(FIGURE_RADIUS + 0.1)), FigureSight::Out);
+        assert_eq!(figure_view(Some(e), None, DVec3::ZERO, at(-5.0)), FigureSight::In);
     }
 
     #[test]
