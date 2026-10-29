@@ -471,9 +471,9 @@ impl BodyLane {
                 };
                 let (im, ip, ix) = stats(&|x| x.0);
                 let (om, op, ox) = stats(&|x| x.1);
+                let name = if class == 0 { format!("R <= {:.0} m", BODY_RADIUS_CLASSES[0]) } else { format!("R {:.0}-{:.0} m", BODY_RADIUS_CLASSES[class - 1], BODY_RADIUS_CLASSES[class]) };
                 out.push(format!(
-                    "body lane signed: {part} R <= {:.0} m: {secs:.0} vehicle-s; past the {:.2} m inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past the outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
-                    BODY_RADIUS_CLASSES[class],
+                    "body lane signed: {part} {name}: {secs:.0} vehicle-s; past the {:.2} m inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past the outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
                     BODY_REF_LANE_HALF,
                     over(&|x| x.0),
                     over(&|x| x.1)
