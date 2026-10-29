@@ -1,0 +1,393 @@
+//! Lane changes of the drivers' own, round 11 L3: a step-out swept as committed once what it went
+//! round has moved off or gone, a plain change from rest projecting the cars beside it and swept
+//! again while it signals, and SUMO LC2013's strategic change towards a random car's trip end.
+use glam::DVec3;
+use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
+use omsi_traffic::{Simulation, Vehicle, VehicleClass};
+
+const DT: f32 = 1.0 / 30.0;
+
+fn road(pts: &[(f64, f64)], id: i64, path: u16, offset: f32) -> omsi_sim::traffic::Lane {
+    let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.0);
+    l.source = 1;
+    l.key = Some(LaneKey { tile: (0, 0), id, path });
+    l.offset = offset;
+    l
+}
+
+fn car(id: u64, lane: usize, s: f32, speed: f32) -> Vehicle {
+    let mut st = AiState::new(lane, s, id);
+    st.speed = speed;
+    st.front = 2.0;
+    st.rear = 2.0;
+    st.length = 4.0;
+    st.max_speed_kmh = 100.0;
+    st.veh_type = 0;
+    let mut v = Vehicle::new(id, VehicleClass::Car, st, 0.9, id * 7919);
+    v.fresh = 0.0;
+    v
+}
+
+/// Two eastbound lanes of one road to x 600: 0 the left at y 0, 1 the right at y -3.5.
+fn two_lanes() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (600.0, 0.0)], 1, 0, 0.0));
+    net.lanes.push(road(&[(0.0, -3.5), (600.0, -3.5)], 1, 1, 3.5));
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net
+}
+
+/// A car standing for good (its own plan never moves it off).
+fn standing(id: u64, lane: usize, s: f32) -> Vehicle {
+    let mut o = car(id, lane, s, 0.0);
+    o.pull_out = 1000.0;
+    o.state.change_cooldown = 1000.0;
+    o
+}
+
+/// Car 3 standing 2.2 m right of the right lane's axis at x `s`: beside car 1's rear, where a
+/// full-lock step-out to the left swings it.
+fn kerb_car(s: f32) -> Vehicle {
+    let lat = 2.2;
+    let mut c3 = standing(3, 1, s);
+    c3.state.lateral = lat;
+    c3.state.lateral_target = lat;
+    c3.state.lateral_ramp = (lat, lat, 0.0, 1.0);
+    c3
+}
+
+/// What a signalling step-out does once the car it went round is no longer standing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Obstacle {
+    /// Taken off the road the frame after the step-out started.
+    Gone,
+    /// Driven off at 2 m/s the frame after the step-out started.
+    MovesOff,
+}
+
+/// Car 1 at rest on the right lane 2.5 m behind car 2 steps out at full lock (as round11l's
+/// `from_rest`); the frame after it started, car 2 goes (`what`), and with `intruder` car 3 is put
+/// beside car 1's rear on the kerb side: (the change started - t, full lock -, whether it was
+/// dropped with car 1 still on its lane, the least gap of car 1's body to car 3).
+fn step_out_after_its_obstacle_left(what: Obstacle, intruder: bool) -> (Option<(f32, bool)>, bool, f32) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change_cooldown = 0.0;
+    let mut cars = vec![me, standing(2, 1, 106.5)];
+    let (mut started, mut dropped, mut least, mut done) = (None, false, f32::INFINITY, false);
+    let mut t = 0.0f32;
+    while t < 12.0 {
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        if started.is_none() {
+            started = me.state.change.map(|c| (t, c.full_lock));
+        } else if !done {
+            done = true;
+            match what {
+                Obstacle::Gone => cars.retain(|c| c.id != 2),
+                Obstacle::MovesOff => {
+                    let c2 = cars.iter_mut().find(|c| c.id == 2).unwrap();
+                    c2.pull_out = 0.0;
+                    c2.state.speed = 2.0;
+                }
+            }
+            if intruder {
+                cars.push(kerb_car(99.5));
+            }
+        }
+        if started.is_some() && me.state.change.is_none() && me.state.lane == 1 {
+            dropped = true;
+        }
+        if let Some(o) = cars.iter().find(|o| o.id == 3) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        t += DT;
+    }
+    (started, dropped, least)
+}
+
+/// L3-1: a step-out whose obstacle has gone, or moved off, still drives the full-lock move it
+/// committed to, so that move is swept on every frame of its signal (SUMO checks the manoeuvre
+/// each step): a car put beside its rear where the move swings it drops the change before the car
+/// moves over, and nothing is touched; with nobody put there the change is not dropped.
+#[test]
+fn a_step_out_whose_obstacle_has_left_still_sweeps_its_committed_move() {
+    for what in [Obstacle::Gone, Obstacle::MovesOff] {
+        let (started, dropped, _) = step_out_after_its_obstacle_left(what, false);
+        assert!(started.is_some_and(|s| s.1) && !dropped, "{what:?}, nobody beside: started {started:?}, dropped {dropped}");
+        let (started, dropped, least) = step_out_after_its_obstacle_left(what, true);
+        assert!(started.is_some_and(|s| s.1) && dropped && least > 0.3, "{what:?}, car beside the rear: started {started:?}, dropped {dropped}, least {least:.2}");
+    }
+}
+
+/// `two_lanes` with a third lane, 2, on the right of lane 1 (y -7).
+fn three_lanes() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (600.0, 0.0)], 1, 0, 0.0));
+    net.lanes.push(road(&[(0.0, -3.5), (600.0, -3.5)], 1, 1, 3.5));
+    net.lanes.push(road(&[(0.0, -7.0), (600.0, -7.0)], 1, 2, 7.0));
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net
+}
+
+/// A long body (front 3.5 m, rear 8.5 m) at 4 m/s on lane 1 signals a plain change left onto
+/// lane 0 at t 0; `after` s into the signal a car rolling at the same speed is put level with it
+/// on lane 2, 0.4 m beside its body (or 2.5 m), where its rear swings as it turns left:
+/// (dropped with the body still on lane 1, the least gap between the two bodies).
+fn plain_change_with_a_car_coming_beside(after: f32, gap: f32) -> (bool, f32) {
+    let net = three_lanes();
+    assert_eq!(net.lanes[1].left, Some(0));
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 4.0);
+    me.state.front = 3.5;
+    me.state.rear = 8.5;
+    me.state.length = 12.0;
+    me.state.max_speed_kmh = 14.4;
+    me.state.start_change(&net, 0, 1);
+    let mut far = car(2, 2, 100.0 + 0.75, 4.0);
+    far.state.max_speed_kmh = 14.4;
+    far.state.change_cooldown = 1000.0;
+    // (lane 2's axis is 3.5 m right of lane 1's; the far car's body 0.9 m wide either side)
+    let lat = -(3.5 - 0.9 - 0.9 - gap);
+    far.state.lateral = lat;
+    far.state.lateral_target = lat;
+    far.state.lateral_ramp = (lat, lat, 0.0, 1.0);
+    let mut cars = vec![me];
+    let (mut dropped, mut least, mut placed) = (false, f32::INFINITY, false);
+    let mut t = 0.0f32;
+    while t < 8.0 {
+        if !placed && t >= after {
+            let s = cars[0].state.s;
+            far.state.s = s + 0.75;
+            cars.push(far.clone());
+            placed = true;
+        }
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        if me.state.change.is_none() && me.state.lane == 1 {
+            dropped = true;
+        }
+        if let Some(o) = cars.iter().find(|o| o.id == 2) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        t += DT;
+    }
+    (dropped, least)
+}
+
+/// L3-2: a plain change sweeps its move again on every frame of its signal (as `change_clear`
+/// swept it at the start; SUMO checks the manoeuvre each step): a car that comes level with the
+/// body on the far side, 0.4 m beside it, where its rear swings out as it turns (without the sweep
+/// it went on and swung to 0.30 m, down to `SQUEEZE_CLEARANCE`), drops the change before the body
+/// moves over; 2.5 m beside it does not.
+#[test]
+fn a_plain_change_is_swept_again_while_it_signals() {
+    let (dropped, least) = plain_change_with_a_car_coming_beside(0.5, 0.4);
+    assert!(dropped && least > 0.3, "a car 0.4 m beside: dropped {dropped}, least {least:.2}");
+    let (dropped, least) = plain_change_with_a_car_coming_beside(0.5, 2.5);
+    assert!(!dropped && least > 0.3, "a car 2.5 m beside: dropped {dropped}, least {least:.2}");
+}
+
+/// A two-lane eastbound approach (lane 0 the left at y 0, lane 1 the right at y -3.5, x 0..300)
+/// to a fork at x 300: lane 0 runs on straight (lane 2, to x 600) or turns left (lane 5); lane 1
+/// turns right (lane 3, the trip end, ending at (400, -100)) or runs on straight (lane 4). Lane 2
+/// forks again at x 600 (lanes 6, 7), lane 5 at (400, 100) (lanes 8, 9); those and 4 end.
+fn fork_ahead() -> Network {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (300.0, 0.0)], 1, 0, 0.0));
+    net.lanes.push(road(&[(0.0, -3.5), (300.0, -3.5)], 1, 1, 3.5));
+    net.lanes.push(road(&[(300.0, 0.0), (600.0, 0.0)], 2, 0, 0.0));
+    net.lanes.push(road(&[(300.0, -3.5), (330.0, -10.0), (400.0, -100.0)], 3, 0, 0.0));
+    net.lanes.push(road(&[(300.0, -3.5), (600.0, -3.5)], 4, 0, 0.0));
+    net.lanes.push(road(&[(300.0, 0.0), (330.0, 7.0), (400.0, 100.0)], 5, 0, 0.0));
+    net.lanes.push(road(&[(600.0, 0.0), (900.0, 0.0)], 6, 0, 0.0));
+    net.lanes.push(road(&[(600.0, 0.0), (630.0, 7.0), (700.0, 100.0)], 7, 0, 0.0));
+    net.lanes.push(road(&[(400.0, 100.0), (400.0, 400.0)], 8, 0, 0.0));
+    net.lanes.push(road(&[(400.0, 100.0), (380.0, 130.0), (300.0, 200.0)], 9, 0, 0.0));
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net
+}
+
+/// The counters `traffic_cases ab` prints for the trip ends and lane use (whole process).
+fn counters() -> (u64, u64, u64) {
+    let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    (g(&omsi_traffic::sim::CHANGES_BY_WHY[omsi_traffic::plan::ChangeWhy::Strategic as usize]), g(&omsi_sim::traffic::STRATEGIC_MISSED), g(&omsi_sim::traffic::GOAL_UNREACHABLE))
+}
+
+/// Car 1 on the left lane at x 40, 13 m/s, its trip end lane 3 (off the right-hand way), with no
+/// wish of its own to change for speed or to keep right (`lc_speed_gain`, `lc_keep_right` 0) and
+/// `lc_strategic` as given; with `platoon` a row of cars on the right lane level with it at its
+/// speed, too close one behind the other for any gap. Runs 40 s: (the lanes it drove, in order,
+/// the strategic changes, missed changes and goal redraws for unreachability counted meanwhile,
+/// its trip end at the end).
+fn to_the_trip_end_off_the_right(lc_strategic: f32, platoon: bool) -> (Vec<usize>, (u64, u64, u64), Option<usize>) {
+    let net = fork_ahead();
+    assert_eq!(net.lanes[0].right, Some(1));
+    assert_eq!(net.lanes[0].next.len(), 2);
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 40.0, 13.0);
+    me.state.change_cooldown = 0.0;
+    me.state.goal = Some(3);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    me.params.lc_strategic = lc_strategic;
+    let mut cars = vec![me];
+    if platoon {
+        for (k, s) in (0..14).map(|k| (k, -20.0 + 9.0 * k as f32)).filter(|&(_, s)| s >= 0.0) {
+            let mut o = car(10 + k, 1, s, 13.0);
+            o.state.change_cooldown = 1000.0;
+            o.params.lc_speed_gain = 0.0;
+            o.params.lc_keep_right = 0.0;
+            o.state.max_speed_kmh = 13.0 * 3.6;
+            cars.push(o);
+        }
+        cars[0].state.max_speed_kmh = 13.0 * 3.6;
+    }
+    let before = counters();
+    let mut lanes = vec![0usize];
+    let mut t = 0.0f32;
+    while t < 40.0 {
+        sim.tick(&net, DT, &mut cars);
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { break };
+        if lanes.last() != Some(&me.state.lane) {
+            lanes.push(me.state.lane);
+        }
+        t += DT;
+    }
+    let after = counters();
+    let goal = cars.iter().find(|c| c.id == 1).and_then(|c| c.state.goal);
+    (lanes, (after.0 - before.0, after.1 - before.1, after.2 - before.2), goal)
+}
+
+/// L3-3, SUMO LC2013's strategic change: a car on the left lane whose trip end lies off the
+/// right-hand way at the fork changes right before the fork (counted strategic) and takes the way
+/// to its trip end; with `lc_strategic` -1 (SUMO: no strategic changes) it stays left and drives
+/// through the fork on its own lane's way. With the right lane packed level with it there is no
+/// gap: it misses the fork (counted `STRATEGIC_MISSED`) and its trip end is drawn again at its next
+/// fork because its road no longer reaches it (`GOAL_UNREACHABLE`).
+#[test]
+fn a_car_changes_lanes_towards_its_trip_end_before_the_fork_or_misses_it_and_draws_again() {
+    let (lanes, (strategic, _, _), goal) = to_the_trip_end_off_the_right(1.0, false);
+    assert!(lanes.starts_with(&[0, 1, 3]) && strategic >= 1, "changes right and takes the turn: lanes {lanes:?}, strategic {strategic}, goal {goal:?}");
+    let (lanes, _, _) = to_the_trip_end_off_the_right(-1.0, false);
+    assert!(lanes.len() >= 2 && lanes[1] != 1 && lanes[1] != 3, "no strategic change: lanes {lanes:?}");
+    let (lanes, (_, missed, unreachable), goal) = to_the_trip_end_off_the_right(1.0, true);
+    assert!(lanes.len() >= 3 && (lanes[1] == 2 || lanes[1] == 5), "no gap: drives on through the fork on its lane: lanes {lanes:?}");
+    assert!(missed >= 1, "the miss is counted: {missed}");
+    assert!(unreachable >= 1 && goal != Some(3), "drawn again at the next fork: unreachable {unreachable}, goal {goal:?}");
+}
+
+/// Car 1 at rest on the right lane at s 100 behind car 2 standing at 106.5 (close enough that only
+/// the full-lock move steers), car 5 standing at 112.5 behind car 2 with `queue` (the obstacle run
+/// spans both), car 4 standing on the left lane at 148.5; each frame `each(t, car 1, people)` may
+/// put people down. Runs 12 s: (the changes started - t, full lock, round -, the drops with car 1
+/// still on its lane - t -, the least gap of car 1's body to any other body or person, whether it
+/// ended on the left lane, the largest heading difference while signalling between car 1's pose
+/// and the pose on its way without the change, `sim::way_pose`).
+#[allow(clippy::type_complexity)]
+fn step_out_round_a_queue(queue: bool, mut each: impl FnMut(f32, &Vehicle, &mut Vec<omsi_traffic::Person>)) -> (Vec<(f32, bool, Option<u64>)>, Vec<f32>, f32, bool, f32) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 0.0);
+    me.state.change_cooldown = 0.0;
+    let mut cars = vec![me, standing(2, 1, 106.5), standing(4, 0, 148.5)];
+    if queue {
+        cars.push(standing(5, 1, 112.5));
+    }
+    let mut people: Vec<omsi_traffic::Person> = Vec::new();
+    let (mut starts, mut drops, mut least, mut turned) = (Vec::new(), Vec::new(), f32::INFINITY, 0.0f32);
+    let mut was = false;
+    let mut t = 0.0f32;
+    while t < 12.0 {
+        sim.people = people.clone();
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap().clone();
+        let now = me.state.change;
+        if let (Some(c), false) = (now, was) {
+            starts.push((t, c.full_lock, c.round));
+        }
+        if was && now.is_none() && me.state.lane == 1 {
+            drops.push(t);
+        }
+        if let Some(c) = now.filter(|c| c.wait > 0.0 && c.t <= 0.0) {
+            let _ = c;
+            let mut before = me.state.clone();
+            before.drop_change();
+            let (_, h) = omsi_traffic::sim::way_pose(&net, &before);
+            turned = turned.max(((me.heading - h + 540.0) % 360.0 - 180.0).abs());
+        }
+        was = now.is_some();
+        for o in cars.iter().filter(|o| o.id != 1) {
+            least = least.min(me.obb().separation(&o.obb()) as f32);
+        }
+        for q in &people {
+            least = least.min((omsi_sim::collision::Obb::point(q.pos, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&me.obb())) as f32);
+        }
+        each(t, &me, &mut people);
+        t += DT;
+    }
+    (starts, drops, least, cars.iter().find(|c| c.id == 1).unwrap().state.lane == 0, turned)
+}
+
+/// The final recheck's test A: a queue of two standing in front (cars 2 and 5) is stepped out
+/// round at full lock, the move swept on the change-less corridor with the committed kind, round
+/// car 2: one start, never dropped, ends on the left lane, nothing within `SQUEEZE_CLEARANCE`.
+#[test]
+fn a_step_out_round_a_queue_of_two_starts_once_and_is_not_dropped() {
+    let (starts, drops, least, left, _) = step_out_round_a_queue(true, |_, _, _| {});
+    assert!(starts.len() == 1 && starts[0].1 && starts[0].2 == Some(2), "one full-lock start round car 2: {starts:?}");
+    assert!(drops.is_empty() && left && least > 0.3, "drops {drops:?}, on the left lane {left}, least {least:.2}");
+}
+
+/// The final recheck's test B: (a) late in the signal the body's heading turns into the move laid
+/// ahead (more than a degree off the pose on its way without the change), and the step-out swept
+/// from the change-less pose is not dropped for it; (b) a person put down at 0.9 of the signal
+/// 0.15 m outside the un-turned body's front corner on the target side (left) - inside the turned
+/// body's corner there, the lagged chord of the move laid ahead - drops the step-out before the
+/// car moves over, and the car's body never comes nearer them than it was when they were put
+/// down (the turn eases back as the change is dropped).
+#[test]
+fn a_step_out_late_in_its_signal_is_swept_from_its_change_less_pose() {
+    let (starts, drops, least, left, turned) = step_out_round_a_queue(false, |_, _, _| {});
+    assert!(starts.len() == 1 && starts[0].1, "one full-lock start: {starts:?}");
+    assert!(turned > 1.0 && drops.is_empty() && left && least > 0.3, "turned {turned:.2} deg, drops {drops:?}, on the left lane {left}, least {least:.2}");
+    let net = two_lanes();
+    let signal = omsi_sim::traffic::BYPASS_SIGNAL;
+    let (mut start, mut placed) = (None::<f32>, false);
+    let mut seps: Vec<f32> = Vec::new();
+    let (starts, drops, _, _, _) = step_out_round_a_queue(false, |t, me, people| {
+        if let Some(q) = people.first() {
+            seps.push(omsi_sim::collision::Obb::point(q.pos, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&me.obb()) as f32);
+        }
+        if start.is_none() && me.state.change.is_some() {
+            start = Some(t);
+        }
+        if let (Some(t0), false) = (start, placed) {
+            if t - t0 >= 0.9 * signal && me.state.change.is_some_and(|c| c.t <= 0.0) {
+                let mut before = me.state.clone();
+                before.drop_change();
+                let (pos, h) = omsi_traffic::sim::way_pose(&net, &before);
+                let body = omsi_sim::collision::Obb::vehicle(pos.truncate(), h as f64, me.state.front as f64, me.state.rear as f64, me.half_width as f64);
+                // (the un-turned body's front corner on the left, and 0.15 m further left)
+                let hr = (h as f64).to_radians();
+                let (fwd, left) = (glam::DVec2::new(hr.sin(), hr.cos()), glam::DVec2::new(-hr.cos(), hr.sin()));
+                let corner = body.corners().into_iter().max_by(|a, b| ((*a - pos.truncate()).dot(fwd) + (*a - pos.truncate()).dot(left)).total_cmp(&((*b - pos.truncate()).dot(fwd) + (*b - pos.truncate()).dot(left)))).unwrap();
+                let q = corner + left * 0.15;
+                people.push(omsi_traffic::Person { pos: glam::DVec3::new(q.x, q.y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None });
+                placed = true;
+            }
+        }
+    });
+    assert!(placed && starts.first().is_some_and(|s| s.1), "placed {placed}, starts {starts:?}");
+    let t0 = starts[0].0;
+    let first = seps.first().copied().unwrap_or(f32::NAN);
+    let least = seps.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(drops.first().is_some_and(|&d| d <= t0 + signal + 0.05) && least >= first - 1e-3, "dropped {drops:?} (signal ends {:.2}), gap to the person when put down {first:.2}, least {least:.2}", t0 + signal);
+}
