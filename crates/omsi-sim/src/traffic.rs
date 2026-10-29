@@ -3949,8 +3949,9 @@ pub struct LaneChange {
     pub full_lock: bool,
     /// A bypass's: the vehicle it pulls out round (its id; a player's `PLAYER_ID_BASE` + its id,
     /// as `omsi_traffic::sim::Decision::wait_for`), `None` round a parked car (which has no id
-    /// and does not move). Its move is swept again round that body on every frame of the
-    /// signal while that body stands (`omsi_traffic::plan`).
+    /// and does not move). Its move is swept again on every frame of the signal: round that
+    /// body while it stands, and as committed (`length`, `full_lock`) once it has moved off or
+    /// gone (`omsi_traffic::plan`).
     #[serde(default)]
     pub round: Option<u64>,
 }

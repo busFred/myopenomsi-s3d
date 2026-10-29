@@ -1231,11 +1231,7 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if obstacle.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, moves)| moves || (bus && signals)) {
         return None;
     }
-    let target = &net.lanes[nb.lane];
-    let (ts, _) = target.nearest_point(me.pos)?;
-    let hr = (me.heading as f64).to_radians();
-    let right = DVec2::new(hr.cos(), -hr.sin());
-    let side = (target.at(ts).0 - me.pos).truncate().dot(right) as f32;
+    let side = bypass_side(net, me, nb)?;
     // (the gentle smoothstep first; the two arcs at full lock only where it does not clear;
     // the move begins after the signalling, `BYPASS_SIGNAL`, the car stopping meanwhile where it
     // can, `pre` on; its way must take the lead out of my corridor before my front is there,
@@ -1248,16 +1244,40 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         if bypass_lateral(lead.gap + st.front - pre, out_len, side.abs(), full_lock) < need {
             continue;
         }
-        let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
-        let (obstacle_len, _) = obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM);
-        let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
-        let parked = parked_boxes(net, sim, me, level + st.front);
-        let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-        if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All) {
+        if bypass_move_clear(net, sim, vehicles, me, ahead, road_left, side, Some(lead), out_len, full_lock) {
             return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock, round: obstacle });
         }
     }
     None
+}
+
+/// How far across (m, + right of my heading) the lane `nb` lies from me: a bypass's move.
+fn bypass_side(net: &Network, me: &Vehicle, nb: &NeighbourView) -> Option<f32> {
+    let target = &net.lanes[nb.lane];
+    let (ts, _) = target.nearest_point(me.pos)?;
+    let hr = (me.heading as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    Some((target.at(ts).0 - me.pos).truncate().dot(right) as f32)
+}
+
+/// Does a bypass's move from rest - `side` metres over `out_len` metres, the two arcs at full
+/// lock with `full_lock` else the smoothstep, after what the car rolls on braking to rest - clear
+/// every vehicle, player, parked car and person near by `SQUEEZE_CLEARANCE` (`body_sweep_clear`,
+/// `Bodies::All`)? Swept up to level with the far end of the thing passed, `lead`, and what stands
+/// beyond it in my corridor (`ahead`, `obstacle_run_in`) and past my rear; with no `lead` (it has
+/// gone from my way) over the move itself.
+#[allow(clippy::too_many_arguments)]
+fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, ahead: &[(f32, f32, f32)], road_left: f32, side: f32, lead: Option<&crate::perception::Headway>, out_len: f32, full_lock: bool) -> bool {
+    let st = &me.state;
+    let pre = st.speed.max(0.0).powi(2) / (2.0 * me.params.comfort_brake.max(0.1));
+    let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
+    let level = match lead {
+        Some(lead) => lead.gap + obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM).0 + st.front + st.rear + 2.0,
+        None => pre + out_len,
+    };
+    let parked = parked_boxes(net, sim, me, level + st.front);
+    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All)
 }
 
 /// Does a lane change into `nb` started now, at speed, clear what is near: the body turned
@@ -2448,16 +2468,19 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // beyond it there (`Perception::bypassed`; not the lead, which with the change laid
             // on the way can be the target lane's car), while it stands; it sweeps the kind of
             // move started, the smoothstep or the two arcs at full lock, as the car drives that one
-            // and not whichever clears now. Once that thing has moved off or gone from my way, the
-            // car still drives the bypass move it started, checked only by the gap and people
-            // rules above, as it always was when its lead left)
+            // and not whichever clears now. Once that thing has moved off, or gone from my way, the
+            // car still drives the move it committed to, so that move - its length and kind as
+            // started - is swept the same way from the same pose, up to level with the thing and
+            // what stands beyond it while it is on my way, over the move itself once it is gone;
+            // a sweep that fails drops the change, counted as every drop, `sim::CHANGES_ABORTED`)
             if !out.abort_change && c.bypass {
-                if let Some(b) = p.bypassed.as_ref().filter(|b| b.lead.speed < STANDING_SPEED) {
-                    let mut before = me.clone();
-                    before.state.drop_change();
-                    (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
-                    out.abort_change = bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none();
-                }
+                let mut before = me.clone();
+                before.state.drop_change();
+                (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
+                out.abort_change = match p.bypassed.as_ref() {
+                    Some(b) if b.lead.speed < STANDING_SPEED => bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none(),
+                    b => !bypass_side(net, &before, &nb).is_some_and(|side| bypass_move_clear(net, sim, vehicles, &before, b.map_or(&[][..], |b| &b.ahead[..]), p.road_left, side, b.map(|b| &b.lead), c.length, c.full_lock)),
+                };
             }
         }
     }
