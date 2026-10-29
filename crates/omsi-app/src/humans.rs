@@ -6059,6 +6059,9 @@ pub struct Humans {
     /// down there. The stops holding one back now are `held_for_sight`.
     waiters_held_for_sight: usize,
     held_for_sight: HashSet<i64>,
+    /// The traffic's `loading_phase` as of the last tick (the world is still being built, nothing
+    /// shown yet): the waiters of the first fill are put down anywhere (`waiting_place`).
+    loading: bool,
     /// The stops taken down on a tile change for being set up again (`tiles_changed`), with
     /// what they keep across it (`StopCarry`), until `set_up_stop` sets them up again.
     stop_carry: HashMap<i64, StopCarry>,
@@ -6330,6 +6333,7 @@ impl Humans {
             riders_sent_on: 0,
             waiters_held_for_sight: 0,
             held_for_sight: HashSet::new(),
+            loading: false,
             stop_carry: HashMap::new(),
             removed: (0, 0),
             gone: Vec::new(),
@@ -7387,7 +7391,8 @@ impl Humans {
 
     /// A free waiting place of stop `id` taken for somebody put down there (sub_61c8d8, at
     /// random): only one where nobody sees them appear (`may_appear`, the rule of every
-    /// placement of a person; Omsi.exe puts them down anywhere). None when every free one is
+    /// placement of a person; Omsi.exe puts them down anywhere), any while `loading` (the
+    /// traffic's `loading_phase`). None when every free one is
     /// in sight: the waiter is held back (counted once until one is put down there,
     /// `waiters_held_for_sight`) and is tried again (`stops_tick`).
     fn waiting_place(&mut self, world: &World, id: i64) -> Option<usize> {
@@ -7395,7 +7400,9 @@ impl Humans {
         if free.is_empty() {
             return None;
         }
-        let open: Vec<usize> = free.into_iter().filter(|&k| self.may_appear(world, self.stops[&id].spots[k].pos)).collect();
+        // (while the world is still being built nothing is shown yet: the traffic's own
+        // `loading_phase` exempts the first fill, as it does the first cars)
+        let open: Vec<usize> = free.into_iter().filter(|&k| self.loading || self.may_appear(world, self.stops[&id].spots[k].pos)).collect();
         if open.is_empty() {
             if self.held_for_sight.insert(id) {
                 self.waiters_held_for_sight += 1;
@@ -9230,6 +9237,7 @@ impl Humans {
         self.use_map_humans(world);
         self.time += dt as f64;
         self.viewer = traffic.and_then(|t| t.viewer);
+        self.loading = traffic.is_some_and(|t| t.loading_phase());
         self.gone.clear();
         let net = traffic.map(|t| &t.net);
         if let Some(b) = bus {
@@ -11136,6 +11144,14 @@ mod tests {
         let mut h = new_humans();
         h.stops.insert(7, stop(DVec3::new(2.0, 150.0, 0.0)));
         h.eye = Some(ahead);
+        tick(&mut h);
+        assert_eq!((waiting(&h), h.waiters_held_for_sight), (4, 0));
+
+        // 60 m ahead in plain view while the world is still loading: filled at once
+        let mut h = new_humans();
+        h.stops.insert(7, stop(near));
+        h.eye = Some(ahead);
+        h.loading = true;
         tick(&mut h);
         assert_eq!((waiting(&h), h.waiters_held_for_sight), (4, 0));
 
