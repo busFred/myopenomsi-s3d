@@ -194,16 +194,20 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
     run
 }
 
-/// The band of the entry's flow over the HCM 6 capacity (`EntryRun::hcm_ratio`) the ring's
-/// entry is held to: no more than the HCM capacity itself (1.0), and no less than 0.55 - this
-/// ring circulates at ~4.8 m/s (its 12.5 m radius at the drivers' bend acceleration), where the
-/// car-following model (IDM) lets a car in ahead of a circulating one only ~13 m ahead of it (the
-/// room it needs to follow a car starting from rest braking no harder than comfortably,
-/// `reservation::follow_room`), a lag of ~3.8 s at the merge, and an entrant from rest passes the
-/// merge ~3 s behind the circulating car it let by: ~7 s of gap for the first car against HCM's
-/// critical headway of ~5 s (its follow-up, ~2.8 s, is HCM's 2.6 s). At the tip, the entry with a
-/// footpath crossing between its waiting place and the ring ran at 0.37.
-const HCM_BAND: (f32, f32) = (0.55, 1.0);
+/// The extra critical headway (s) the car-following model (IDM) asks of this ring over HCM 6's
+/// drivers, and so the lower bound of the entry's flow over the HCM capacity: the HCM 6 single-lane
+/// entry model c = 1380 exp(-1.02e-3 v_c) is c = (3600/tf) exp(-v_c (tc - tf/2)/3600) with
+/// follow-up tf = 2.61 s and critical headway tc = 4.97 s (HCM 6 ch. 22; the equation as printed
+/// in LTRC Final Report 640, https://www.ltrc.lsu.edu/pdf/2021/FR_640.pdf, from the US field data
+/// of NCHRP Report 572). A longer critical headway tc + d scales it by exp(-v_c d / 3600). Here
+/// d = 4.1 s: this ring circulates at ~4.8 m/s (sqrt of the drivers' bend acceleration times its
+/// 12.5 m radius), where the IDM lets a car in ahead of a circulating one only if that is
+/// `reservation::follow_room` behind it, s* sqrt(a/b) with s* = s0 + v T + v Δv / (2 sqrt(a b))
+/// = 13.6 m for a = 1.8, b = 2.0 m/s², s0 = 2 m, T = 1.3 s and an entrant from rest: 2.8 s at
+/// 4.8 m/s; and the entrant itself keeps its time gap T = 1.3 s behind the car it lets by. The
+/// flow is held to between exp(-v_c d / 3600) of HCM's capacity and HCM's capacity itself. At the
+/// tip, the entry with a footpath crossing between its waiting place and the ring ran at 0.37.
+const IDM_LAG: f32 = 2.8 + 1.3;
 
 fn check(zebra: bool) {
     let seed = std::env::var("R11R_SEED").ok().and_then(|e| e.parse().ok()).unwrap_or(11);
@@ -217,11 +221,12 @@ fn check(zebra: bool) {
     assert!(run.over_comfort <= 0.0, "a circulating car braked {:.2} m/s² beyond its comfortable brake", run.over_comfort);
     assert!(run.entrant_over <= 0.01, "an entrant braked {:.2} m/s² beyond the brake inside the object: {}", run.entrant_over, run.entrant_worst);
     assert!(run.min_sep > 0.0, "two bodies came {:.2} m apart", run.min_sep);
-    assert!((HCM_BAND.0..=HCM_BAND.1).contains(&ratio), "entry flow {e:.0}/h is {ratio:.2} of the HCM 6 capacity {cap:.0}/h at {v_c:.0}/h circulating");
+    let lowest = (-v_c * IDM_LAG / 3600.0).exp();
+    assert!((lowest..=1.0).contains(&ratio), "entry flow {e:.0}/h is {ratio:.2} of the HCM 6 capacity {cap:.0}/h at {v_c:.0}/h circulating, outside {lowest:.2}..1");
 }
 
 /// [R-1] A circulating stream of about 600 veh/h (on average a car every 6 s) and a saturated entry
-/// whose waiting place is at the start of the merge: the entry's flow lies within `HCM_BAND` of
+/// whose waiting place is at the start of the merge: the entry's flow lies within `IDM_LAG`'s band of
 /// the HCM 6 single-lane entry capacity at the measured circulating flow, no circulating car brakes
 /// harder than its comfortable brake, no entrant harder than the brake inside the object, and no two bodies touch.
 #[test]
