@@ -5867,6 +5867,18 @@ pub struct Humans {
     /// The timetable buses a rider asked to stop this frame (the app fires `int_haltewunsch`
     /// on each, as on the player's bus: `Humans::take_ai_stop_requests`).
     ai_stop_requests: HashSet<u64>,
+    /// The timetable bus that drives the player's bus (the offscreen harness's `--follow-line`,
+    /// `follow_line::LineFollower`), set before each tick: the people see the player's bus in its
+    /// place - that bus is no bus of theirs, nor are its body and the way to its stop
+    /// (`buses_now`, the walkers' boxes, the waiters' step-out) - and what they ask of the
+    /// player's driver they ask of that bus's service and script, as of a timetable bus's: to
+    /// wait while they get on or off (`holds`), to stop (`ask_stop`, `stop_wishes`), with its
+    /// riders counted (`ai_riders`) and their door wants (`ai_requests`).
+    pub(crate) stand_in: Option<u64>,
+    /// The doors of `stand_in` as the people would see a timetable bus's open this tick
+    /// (any entry, any exit; `buses_now`): the harness opens the player's doors by them
+    /// (`set_player_doors`).
+    pub(crate) stand_in_doors: (bool, bool),
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -6235,6 +6247,8 @@ impl Humans {
             money: None,
             stop_request: false,
             ai_stop_requests: HashSet::new(),
+            stand_in: None,
+            stand_in_doors: (false, false),
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -8047,6 +8061,38 @@ impl Humans {
         (entry, exit)
     }
 
+    /// Open (or shut) the player's bus's entries (`doors.0`) and exits (`doors.1`) as
+    /// `doors_open` reads them: each door's `PAX_Entry<i>_Open` / `PAX_Exit<i>_Open` where the
+    /// script reports it, and the door's `door_<k>` (its animation; set where the vehicle has
+    /// it, made where neither variable exists). For the harness's stand-in (`stand_in`): the
+    /// player's scripts do not run while it drives, so nothing else moves them.
+    pub(crate) fn set_player_doors(&self, v: &mut VehicleInstance, doors: (bool, bool)) {
+        let Some(cabin) = self.player_cabin.as_ref() else { return };
+        let (n_entry, n_exit) = (cabin.entries.len(), cabin.exits.len());
+        let exit_door_base = if n_entry <= 1 { 1 } else { 2 };
+        // (door k open when any entry or exit on it is: an entry and an exit may share one)
+        let mut door = [None::<bool>; OMSI_PAX_DOORS];
+        let mut reported = [false; OMSI_PAX_DOORS];
+        for (kind, n, open, base) in [("Entry", n_entry, doors.0, 0), ("Exit", n_exit, doors.1, exit_door_base)] {
+            for i in 0..n.min(omsi_sim::vehicle::PAX_DOORS) {
+                let name = format!("PAX_{kind}{i}_Open");
+                let k = (base + i).min(OMSI_PAX_DOORS - 1);
+                if Self::own_pax_door(v, kind, i) && Self::script_reports(v, &name) {
+                    v.set_var(&name, if open { 1.0 } else { 0.0 });
+                    reported[k] = true;
+                }
+                door[k] = Some(door[k].unwrap_or(false) | open);
+            }
+        }
+        for (k, d) in door.iter().enumerate() {
+            let Some(open) = *d else { continue };
+            let x = if open { 1.0 } else { 0.0 };
+            if !v.set_var(&format!("door_{k}"), x) && !v.set_var(&format!("door{k}"), x) && !reported[k] {
+                v.set_engine_var(&format!("door_{k}"), x);
+            }
+        }
+    }
+
 
     /// Note which doors of `v` are opening now (see `door_moving`).
     fn note_door_motion(&mut self, id: BusId, v: &VehicleInstance, entry_open: &[bool], exit_open: &[bool]) {
@@ -8301,6 +8347,7 @@ impl Humans {
                 })
                 .collect();
             let mut visits = HashMap::new();
+            self.stand_in_doors = (false, false);
             for c in t.cars.iter().filter(|c| c.serves_stops()) {
                 let from_eye = self.eye.map(|e| (c.vehicle.position - e.pos).length()).unwrap_or(f64::MAX);
                 if (c.vehicle.position - near).length().min(from_eye) > 400.0 && !riding.contains(&c.id) {
@@ -8350,6 +8397,12 @@ impl Humans {
                             .chain(exit_open.iter_mut())
                             .for_each(|o| *o = true);
                     }
+                }
+                // (the bus driving the player's: the people see the player's bus there, and
+                // its doors open by these, `stand_in_doors`)
+                if self.stand_in == Some(c.id) {
+                    self.stand_in_doors = (entry_open.iter().any(|o| *o), exit_open.iter().any(|o| *o));
+                    continue;
                 }
                 self.seats
                     .entry(BusId::Ai(c.id))
@@ -9049,11 +9102,14 @@ impl Humans {
         for p in &self.people {
             let State::Pax(x) = &p.state else { continue };
             match x.task {
-                Task::InBusToExit => {
-                    if let Some(BusId::Ai(id)) = x.inside {
+                Task::InBusToExit => match x.inside {
+                    Some(BusId::Ai(id)) => {
                         alighting.insert(id);
                     }
-                }
+                    // (the player's bus driven by a timetable bus, `stand_in`: that bus)
+                    Some(BusId::Player) => alighting.extend(self.stand_in),
+                    None => {}
+                },
                 Task::WaitingForBus | Task::ToBus | Task::WalkingToBus => {
                     if let Some(s) = x.stop {
                         waiting.insert(s);
@@ -9380,7 +9436,8 @@ impl Humans {
         let mut block_z: Vec<f64> = Vec::new();
         if let Some(t) = traffic {
             for c in &t.cars {
-                if (c.vehicle.position - self.center).length() > 320.0 {
+                // (the bus driving the player's is the player's bus, below: `stand_in`)
+                if (c.vehicle.position - self.center).length() > 320.0 || Some(c.id) == self.stand_in {
                     continue;
                 }
                 let h = c.vehicle.heading.to_radians();
@@ -9447,7 +9504,9 @@ impl Humans {
         // smaller)
         let bodies: Vec<omsi_sim::collision::Obb> = traffic
             .map(|t| {
-                let near = |c: &&crate::traffic::AiCar| (c.vehicle.position - self.center).length() < 320.0;
+                // (not the bus driving the player's: its body is the player's bus's, its way to
+                // its stop none the people see, `stand_in`)
+                let near = |c: &&crate::traffic::AiCar| (c.vehicle.position - self.center).length() < 320.0 && Some(c.id) != self.stand_in;
                 let mut v: Vec<omsi_sim::collision::Obb> = t.cars.iter().filter(near).filter(|c| c.ai.state.speed < 0.5).map(|c| c.ai.obb()).collect();
                 for c in t.cars.iter().filter(near) {
                     if let Some(stop_at) = c.ai.external.stop_at {
@@ -11136,6 +11195,127 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The harness's stand-in (`Humans::stand_in`, `--follow-line`): the player's bus stands at
+    /// a stop on its duty, its doors opened as the AI bus driving it opens its own
+    /// (`set_player_doors`); the people waiting there board the player's bus through its doors
+    /// (`BusId::Player`, the player's door path), and while they come up to it the AI bus is
+    /// held at its stop for them (`holds`, as a timetable bus) with them counted as its riders
+    /// (`ai_riders`). With the doors shut again they read shut, and nobody holds the AI bus.
+    #[test]
+    fn riders_board_the_players_bus_driven_by_a_stand_in_through_its_doors() {
+        let root = std::env::temp_dir().join(format!("openomsi-stand-in-doors-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(root.join(name), text).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        write("global.cfg", "[name]\nStandIn\n");
+        // a 12 m bus: its door at the front right (x 1.1, y 4), an aisle, two places; its
+        // script knows `door_0` only (the people read the door by it, `doors_open`)
+        write("bus.bus", "[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nmain.osc\n[boundingbox]\n2.5\n12\n3\n0\n0\n1.5\n\n[passengercabin]\ncabin.cfg\n\n[paths]\npaths.cfg\n");
+        write("model.cfg", "");
+        write("vars.txt", "door_0\n");
+        write("main.osc", "{init}\n{end}\n");
+        write("paths.cfg", "[pathpnt]\n1.1\n4\n0.4\n\n[pathpnt]\n0\n4\n0.5\n\n[pathpnt]\n0\n0\n0.5\n\n[pathlink]\n0\n1\n\n[pathlink]\n1\n2\n");
+        write("cabin.cfg", "[entry]\n0\n\n[exit]\n0\n\n[passpos]\n-0.5\n1\n0.9\n0.45\n0\n\n[passpos]\n-0.5\n-1\n0.9\n0.45\n0\n");
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        let ty = std::sync::Arc::new(omsi_sim::VehicleType::load(&root, &root.join("bus.bus")).unwrap());
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        // the bus northbound in the stop's box (the stop object 1.5 m to its right), the
+        // stop's places at the kerb 2.8 m to its right, beside its door
+        let stop_at = DVec3::new(1.5, 0.0, 0.0);
+        let kerb = DVec3::new(2.8, 3.0, 0.0);
+        world.bus_stops.lock().push((7, stop_at, 0.0, "S".into()));
+        let mut v = VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()));
+        (v.position, v.heading) = (DVec3::ZERO, 0.0);
+        let mut h = Humans::new(&root);
+        h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+        h.map_humans_done = true;
+        (h.density, h.max_people) = (1.0, 100);
+        h.set_cabin(&mut v);
+        assert!(h.player_cabin.is_some(), "the player's cabin");
+        // on its duty: a public trip calling here and on to the terminus
+        let planned = crate::schedule::PlannedTrip {
+            name: "t".into(),
+            line: "1".into(),
+            terminus: "End".into(),
+            departure: 0.0,
+            end: 3600.0,
+            stops: [(7, "S"), (8, "End")]
+                .into_iter()
+                .map(|(object_id, name)| crate::schedule::PlannedStop { object_id, name: name.into(), arr: 0.0, dep: 0.0, position: None, dir: Default::default(), stops: true })
+                .collect(),
+        };
+        h.duty = Some((Arc::new(DutyTrip::of(&planned, None)), 0, false));
+        let spots: Vec<WaitSpot> = (0..2).map(|k| WaitSpot { pos: kerb + DVec3::new(0.0, k as f64, 0.0), face: 270.0, height: 0.0 }).collect();
+        h.stops.insert(
+            7,
+            PaxStop {
+                name: "S".into(),
+                alias: String::new(),
+                pos: stop_at,
+                heading: 0.0,
+                gather: kerb,
+                spots,
+                taken: vec![false; 2],
+                refused: vec![false; 2],
+                enter_max: 2.0,
+                enter_min: 2.0,
+                length: 30.0,
+                lane: None,
+                was_near: false,
+                near: false,
+                clock_ms: 0.0,
+                want: 0,
+                factor: 1.0,
+                buses: Vec::new(),
+                dests: Vec::new(),
+                lines: Vec::new(),
+                cleared: true,
+                kerb_shift: Some(DVec3::ZERO),
+                kerb_spread: true,
+            },
+        );
+        // (the eye away from the stop: its waiters may be put down)
+        h.eye = Some(Eye { pos: DVec3::new(0.0, -40.0, 2.0), fwd: -DVec3::Y, cos_half: 40f64.to_radians().cos() });
+        const DT: f32 = 1.0 / 30.0;
+        h.stops_tick(DT, &world, &renderer, &mut scene);
+        let waiting = h.people.iter().filter(|p| matches!(&p.state, State::Pax(x) if x.stop == Some(7))).count();
+        assert_eq!(waiting, 2, "two waiting");
+        // the AI bus 99 drives the player's: the player's doors open as its own
+        h.stand_in = Some(99);
+        h.set_player_doors(&mut v, (true, true));
+        let (entry, exit) = Humans::doors_open(&v, 1, 1);
+        assert_eq!((entry, exit), (vec![true], vec![true]), "the player's doors read open");
+        let (mut held, mut most_riders) = (false, 0u32);
+        for _ in 0..(60.0 / DT) as usize {
+            h.tick(DT, &world, Some(&v), None, &renderer, &mut scene);
+            held |= h.take_holds().iter().any(|&(id, stop, _)| id == 99 && stop.is_none_or(|s| s == 7));
+            most_riders = most_riders.max(h.ai_riders().get(&99).map_or(0, |r| r.aboard));
+            if h.aboard(BusId::Player).count() == 2 {
+                break;
+            }
+        }
+        let aboard = h.aboard(BusId::Player).count();
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(aboard, 2, "both got on the player's bus");
+        assert!(held, "the AI bus driving it was held at its stop while they came up");
+        assert!(most_riders >= 1, "its riders are the player's bus's");
+        assert!(!h.people.iter().any(|p| matches!(&p.state, State::Pax(x) if x.bus == Some(BusId::Ai(99)))), "nobody took the AI bus for a bus of theirs");
+        // the doors shut again: they read shut, and nobody holds the AI bus
+        h.set_player_doors(&mut v, (false, false));
+        assert_eq!(Humans::doors_open(&v, 1, 1), (vec![false], vec![false]));
+        h.tick(DT, &world, Some(&v), None, &renderer, &mut scene);
+        h.take_holds();
+        h.tick(DT, &world, Some(&v), None, &renderer, &mut scene);
+        assert!(h.take_holds().is_empty(), "nobody holds it with the doors shut");
+    }
 
     /// The waiters at a stop are put down only where nobody sees them appear (`may_appear`,
     /// the people's one rule for every placement): a stop of four places 60 m ahead in plain
