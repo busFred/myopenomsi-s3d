@@ -376,6 +376,60 @@ fn a_blocked_strategic_change_stops_before_the_dead_lanes_end_and_waits() {
     assert!(lanes.starts_with(&[0, 1, 3]), "the jam gone, it changes and takes the turn: lanes {lanes:?}");
 }
 
+/// Car 1 standing on the left lane of `fork_ahead` at x `at`, its trip end lane 3 off the right-hand
+/// way; a row of 14 cars on the right lane rolls past at 3 m/s from x 190, each at its standing gap
+/// behind the one ahead (6.5 m apart), none with a wish to change. Runs 40 s: (the time car 1 moved
+/// over onto lane 1, the least gap between car 1's body and any body of the row while it did).
+fn into_a_slow_row(at: f32) -> (Option<f32>, f32) {
+    let net = fork_ahead();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, at, 0.0);
+    me.state.change_cooldown = 0.0;
+    me.state.goal = Some(3);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    let mut cars = vec![me];
+    for k in 0..14u64 {
+        let mut o = car(10 + k, 1, 190.0 + 6.5 * k as f32, 3.0);
+        o.state.change_cooldown = 1000.0;
+        o.params.lc_speed_gain = 0.0;
+        o.params.lc_keep_right = 0.0;
+        o.state.max_speed_kmh = 3.0 * 3.6;
+        o.state.goal = Some(4);
+        cars.push(o);
+    }
+    let (mut t, mut moved, mut least) = (0.0f32, None, f32::INFINITY);
+    while t < 40.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).expect("car 1");
+        if moved.is_none() && me.state.lane != 0 {
+            moved = Some(t);
+        }
+        let b = me.obb();
+        for o in cars.iter().filter(|o| o.id != 1) {
+            least = least.min(o.obb().separation(&b) as f32);
+        }
+        t += DT;
+    }
+    (moved, least)
+}
+
+/// Fix 2-2, SUMO LC2013's speed advice for a blocked urgent change (`_wantsChange`: `informLeader`,
+/// then `informFollower` with the speed planned): a car waiting before its dead lane's end beside a
+/// slow row informs the follower there also while the leader there is still too close ahead, and
+/// that follower holds back (`LCA_AMBLOCKINGFOLLOWER`, `LC_COOPERATIVE` 1.0): car 1 at rest at x 270
+/// beside a row rolling past at 3 m/s, each car at its standing gap, moves over within 20 s (14.6 s;
+/// asking only a follower behind a leader there that was clear, it had not moved over after 40 s),
+/// and no body comes within 0.3 m of another.
+#[test]
+fn a_car_waiting_for_its_strategic_change_beside_a_slow_row_is_let_in() {
+    let (moved, least) = into_a_slow_row(270.0);
+    let t = moved.expect("car 1 never moved over");
+    assert!(t < 20.0, "car 1 moved over only at {t:.1} s");
+    assert!(least >= 0.3, "bodies {least:.2} m apart");
+}
+
 /// The trip end of a car with none is drawn at the first fork within SUMO's strategic look-ahead
 /// (`LC_STRATEGIC_LOOKAHEAD`), not only once its plan (`PLAN_AHEAD`) reaches the fork: car 1 260 m
 /// before the fork of `fork_ahead` has one after its first frame, and over 40 cars some draw lane 3,

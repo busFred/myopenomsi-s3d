@@ -265,8 +265,9 @@ fn j73_a_lane_ending_past_an_object_is_left_on_the_approach() {
 /// frame in the last metre (an 8 m/s² brake-light flicker) - and the car stands before the end.
 /// (The change it signals at once into the 25 m before the queue is dropped while it signals:
 /// at 12 m/s the queue is within the gap rule's room ahead before the move would begin. Beside the
-/// standing queue it then drops back behind each car there in turn, LC2013's `informLeader`
-/// follow speed, `drop_back`, and reaches the latch after about 130 s: the run is 150 s.)
+/// standing queue it drops back behind a car there only until that one has stood
+/// `BLOCKER_IS_BLOCKED_TIME`, then overtakes it - LC2013's `informLeader` - and stands at its stop
+/// at about 18 s; standing there the stop holds it to the end of the 150 s run.)
 #[test]
 fn q84_the_last_resort_stop_at_a_lane_end_is_a_latch() {
     let net = lane_drop(&[3]);

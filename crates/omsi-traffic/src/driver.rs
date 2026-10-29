@@ -89,7 +89,8 @@ pub struct DriverParams {
     /// Gap accepted in the lane changed into (s, to the car behind there).
     pub lc_gap: f32,
     /// Lane-change motivation weights (LMRS / LC2013): the route needing it, a faster
-    /// lane, keeping right. (LC2013's cooperative weight has no rule here yet.)
+    /// lane, keeping right. (LC2013's cooperative weight is SUMO's default for every driver,
+    /// `plan::LC_COOPERATIVE`.)
     pub lc_strategic: f32,
     pub lc_speed_gain: f32,
     pub lc_keep_right: f32,

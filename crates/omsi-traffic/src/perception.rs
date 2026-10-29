@@ -258,6 +258,9 @@ pub struct NeighbourView {
     /// longer look here is ours, so that the speed anticipated there (`plan::anticipated_speeds`)
     /// sees a queue standing further on.
     pub ahead: Option<(f32, f32)>,
+    /// That vehicle's index, when it is an AI vehicle (how long it has stood, `Vehicle::stopped`:
+    /// SUMO's `getWaitingSeconds` in `plan`'s blocked change, `BLOCKER_IS_BLOCKED_TIME`).
+    pub ahead_id: Option<usize>,
     /// The vehicle behind there that misses the most of the gap my change accepts from it
     /// (`plan::accepted_gap`, SUMO's `MSCriticalFollowerDistanceInfo`: the largest missing rear
     /// gap): (gap to my rear, its speed) - on that lane, or back over the lanes leading into it as
@@ -1950,6 +1953,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let allowed = crate::access::is_open_at(net, nb, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
+    let mut ahead_id: Option<usize> = None;
     let behind: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
     let mut behind_id: Option<usize> = None;
     let player_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
@@ -1968,6 +1972,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             let gap = d_rel - rear - st.front;
             if ahead.map(|a| gap < a.0).unwrap_or(true) {
                 ahead = Some((gap, speed));
+                ahead_id = who;
             }
         } else {
             let gap = -d_rel - front - st.rear;
@@ -2017,25 +2022,25 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     // keep right compare); at a fork the branch with the most room (the branch the car will take
     // there is not chosen yet)
     if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
-        let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
-            let mut best: Option<(f32, f32)> = None;
-            let mut put = |d_rel: f32, rear: f32, speed: f32| {
+        let first = |l: usize, offset: f32| -> Option<(f32, f32, Option<usize>)> {
+            let mut best: Option<(f32, f32, Option<usize>)> = None;
+            let mut put = |d_rel: f32, rear: f32, speed: f32, who: Option<usize>| {
                 if d_rel >= 0.0 {
                     let gap = d_rel - rear - st.front;
                     if best.is_none_or(|b| gap < b.0) {
-                        best = Some((gap, speed));
+                        best = Some((gap, speed, who));
                     }
                 }
             };
             for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
                 if occ.vehicle != i {
                     let o = &vehicles[occ.vehicle];
-                    put(occ.s + offset - s_b, o.state.rear, o.state.speed);
+                    put(occ.s + offset - s_b, o.state.rear, o.state.speed, Some(occ.vehicle));
                 }
             }
             for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let pl = &sim.players[k];
-                put(ps + offset - s_b, pl.half_len, pl.speed);
+                put(ps + offset - s_b, pl.half_len, pl.speed, None);
             }
             best
         };
@@ -2043,7 +2048,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         // vehicle; else the furthest vehicle)
         let reach = s_b + REACT_TO_STOPPED_DISTANCE;
         let starts: Vec<(usize, f32)> = lane.next.iter().map(|&n| (n, lane.length())).collect();
-        let (mut free, mut most) = (false, None::<(f32, f32)>);
+        let (mut free, mut most) = (false, None::<(f32, f32, Option<usize>)>);
         walk_ahead(net, &starts, NEIGHBOUR_AHEAD_LANES, |l, at, last| {
             if free {
                 return false;
@@ -2062,7 +2067,8 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         });
         if let Some(a) = most.filter(|_| !free) {
             if ahead.is_none_or(|x| a.0 < x.0) {
-                ahead = Some(a);
+                ahead = Some((a.0, a.1));
+                ahead_id = a.2;
             }
         }
     }
@@ -2077,7 +2083,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         d += net.lanes[n].length();
         cur = n;
     }
-    Some(NeighbourView { lane: nb, dir, ahead, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+    Some(NeighbourView { lane: nb, dir, ahead, ahead_id, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
 
 /// Walks every way on from the lanes `starts` (each a lane and the metres to its start), at
