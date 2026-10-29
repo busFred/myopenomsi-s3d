@@ -460,13 +460,151 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
     }
 }
 
+/// A random car's route costs to its trip end (`AiState::goal_field`) while it drives to that
+/// trip end (no timetable route: a route's own changes are `Start::RouteChange`).
+fn trip_field(me: &Vehicle) -> Option<&omsi_sim::traffic::GoalField> {
+    let st = &me.state;
+    st.goal_field.as_deref().filter(|f| st.route.is_empty() && Some(f.key.goal) == st.goal)
+}
+
+/// The lane `k` lanes from `lane` towards side `dir` (1 left, 2 right; `Lane::left`, `Lane::right`
+/// one after the other), its first step `first` where given (the perception's lane beside, which
+/// on a junction object's piece is `Network::piece_beside`).
+fn lane_toward(net: &Network, lane: usize, dir: i32, k: usize, first: Option<usize>) -> Option<usize> {
+    let mut cur = lane;
+    for i in 0..k {
+        cur = match (i, first) {
+            (0, Some(f)) => f,
+            _ => net.lanes.get(cur).and_then(|l| if dir == 1 { l.left } else { l.right })?,
+        };
+    }
+    Some(cur)
+}
+
+/// How many lane changes from `lane` towards `dir` (the first onto `first`) reach the nearest
+/// lane that leads to the trip end (SUMO LC2013's `bestLaneOffset` on that side); None where no
+/// lane of the road on that side does.
+fn changes_to_lead(net: &Network, f: &omsi_sim::traffic::GoalField, lane: usize, dir: i32, first: Option<usize>) -> Option<usize> {
+    (1..=net.road_beside(lane).len().max(1)).find(|&k| lane_toward(net, lane, dir, k, first).is_some_and(|b| f.leads(b)))
+}
+
+/// How far (m, from `s` on the first) a car can drive along `chain` - a dead lane and the lanes it
+/// runs into - while the lane `k` changes towards `dir` beside each (the first step `first`)
+/// leads to the trip end (SUMO's `currentDist` of the dead lane: where it must have left it), at
+/// most `LC_STRATEGIC_LOOKAHEAD`. It stops where that lane ends before the chain's lane.
+fn dead_run(net: &Network, f: &omsi_sim::traffic::GoalField, chain: &[usize], s: f32, dir: i32, k: usize, first: Option<usize>) -> f32 {
+    let mut d = -s;
+    for (i, &x) in chain.iter().enumerate() {
+        let Some(b) = lane_toward(net, x, dir, k, if i == 0 { first } else { None }).filter(|&b| f.leads(b)) else { break };
+        let len = net.lanes[x].length();
+        // (where the lane beside ends, along the chain's lane)
+        let left_b = net.lanes[b].length() - net.beside_s(x, b, 0.0);
+        d += len.min(left_b);
+        if d >= LC_STRATEGIC_LOOKAHEAD || left_b < len {
+            break;
+        }
+    }
+    d.min(LC_STRATEGIC_LOOKAHEAD)
+}
+
+/// SUMO's best-lane occupation (`LaneQ::occupation`, `getBruttoVehLenSum`): the lengths with their
+/// standing gaps of the vehicles on lane `best` and on the lanes it runs into towards the trip end
+/// (the way on of least route cost), as far as `LC_STRATEGIC_LOOKAHEAD`; what jams the room left
+/// for a change onto it (LC2013's `usableDist`, `JAM_FACTOR` 1).
+fn best_occupation(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, f: &omsi_sim::traffic::GoalField, best: usize) -> f32 {
+    let (mut cur, mut run, mut sum) = (best, 0.0f32, 0.0f32);
+    let mut seen: Vec<usize> = Vec::new();
+    for _ in 0..OPEN_RUN_LANES {
+        for o in sim.occupancy.get(&cur).into_iter().flatten() {
+            if !seen.contains(&o.vehicle) && vehicles.get(o.vehicle).is_some_and(|v| v.id != me.id) {
+                seen.push(o.vehicle);
+                sum += vehicles[o.vehicle].length() + vehicles[o.vehicle].state.min_gap;
+            }
+        }
+        run += net.lanes[cur].length();
+        let Some(n) = net.lanes[cur].next.iter().copied().filter(|&n| f.leads(n)).min_by(|&a, &b| f.to_goal(a).total_cmp(&f.to_goal(b))) else { break };
+        if run >= LC_STRATEGIC_LOOKAHEAD {
+            break;
+        }
+        cur = n;
+    }
+    sum
+}
+
+/// SUMO LC2013's strategic distance towards side `dir` (`laDist`): the look-ahead speed times
+/// `LC_LOOK_FORWARD` times `lc_strategic` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side),
+/// plus two lengths with the standing gap (`lane_end_look`).
+fn strategic_look(sim: &Simulation, me: &Vehicle, dir: i32) -> f32 {
+    let overtaking = dir == if sim.left_hand { 2 } else { 1 };
+    lane_end_look(me.look_ahead_speed.max(me.state.speed) * me.params.lc_strategic.max(0.0), overtaking, me)
+}
+
+/// SUMO LC2013's urgent strategic change towards the trip end (sumo.md 3.2, `lcStrategic`): on a
+/// dead lane - one whose ways on do not lead to the random car's trip end (`trip_field`,
+/// `GoalField::leads`) - towards `nb` where `nb` or a lane beyond it on that side leads there
+/// (`changes_to_lead`, `bestLaneOffset`): `lc_strategic` once the distance left to the dead lane's
+/// end (`dead_run` along the car's planned way) less the occupation of the lane that leads
+/// (`best_occupation`), per change needed, is under the strategic distance (`strategic_look`):
+/// `currentDistDisallows(usableDist, bestLaneOffset, laDist)`; else 0. Also that distance (m).
+/// `lc_strategic` below 0 never (SUMO: -1 disables strategic changes).
+fn strategic_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, nb: &NeighbourView) -> Option<(f32, f32)> {
+    let st = &me.state;
+    let f = trip_field(me)?;
+    if me.params.lc_strategic < 0.0 || f.leads(st.lane) {
+        return None;
+    }
+    let k = changes_to_lead(net, f, st.lane, nb.dir, Some(nb.lane))?;
+    let best = lane_toward(net, st.lane, nb.dir, k, Some(nb.lane))?;
+    let chain: Vec<usize> = std::iter::once(st.lane).chain(st.planned_next).chain(st.ahead.iter().copied()).collect();
+    let dist = dead_run(net, f, &chain, st.s + st.front, nb.dir, k, Some(nb.lane));
+    if dist <= 0.0 {
+        return None;
+    }
+    let usable = dist - best_occupation(net, sim, vehicles, me, f, best);
+    Some((if usable / (k as f32) < strategic_look(sim, me, nb.dir) { me.params.lc_strategic } else { 0.0 }, dist))
+}
+
+/// SUMO LC2013's strategic stay (`LCA_STAY | LCA_STRATEGIC`, "could not change back and forth in
+/// time"): no change for speed or to keep to the side onto `nb` when `nb` does not lead to the
+/// trip end and the room it leaves to get onto a lane that does - its run beside the nearest one
+/// (`dead_run`) - over the changes then needed (`bestLaneOffset` from my lane plus two) is under
+/// the strategic distance towards `nb` (`currentDistDisallows(neighLeftPlace, |bestLaneOffset| + 2,
+/// laDist)`). Only while my road leads there.
+fn strategic_stay(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> bool {
+    let st = &me.state;
+    let Some(f) = trip_field(me) else { return false };
+    if f.leads(nb.lane) {
+        return false;
+    }
+    let first = |dir: i32| if dir == 1 { p.left.map(|n| n.lane) } else { p.right.map(|n| n.lane) };
+    let mine = if f.leads(st.lane) { Some(0) } else { [1, 2].into_iter().filter_map(|d| changes_to_lead(net, f, st.lane, d, first(d))).min() };
+    let Some(mine) = mine else { return false };
+    // (from `nb`: back past my lane, or on beyond it)
+    let back = 3 - nb.dir;
+    let to_lead = [(back, Some(st.lane)), (nb.dir, None)].into_iter().filter_map(|(d, fst)| changes_to_lead(net, f, nb.lane, d, fst).map(|k| (k, d, fst))).min_by_key(|x| x.0);
+    let place = match to_lead {
+        Some((k, d, fst)) => {
+            let mut chain = vec![nb.lane];
+            while chain.len() < OPEN_RUN_LANES {
+                match net.lanes[*chain.last().unwrap()].next[..] {
+                    [n] => chain.push(n),
+                    _ => break,
+                }
+            }
+            dead_run(net, f, &chain, net.beside_s(st.lane, nb.lane, st.s) + st.front, d, k, fst)
+        }
+        None => 0.0,
+    };
+    place / ((mine + 2) as f32) < strategic_look(sim, me, nb.dir)
+}
+
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
-/// accepted: SUMO LC2013's motivations (the lane's end and the turn - strategic -, speed gain,
-/// keeping to the side) and an obstacle motive of ours (a standing obstacle).
+/// accepted: SUMO LC2013's motivations (the lane's end, the trip end and the turn - strategic -,
+/// speed gain, keeping to the side) and an obstacle motive of ours (a standing obstacle).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
 /// and only the turn lane and a standing obstacle are reasons to move over. `ant`: (mine, beside)
 /// from `anticipated_speeds`.
-fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool, ant: (f32, f32)) -> (f32, bool, ChangeWhy) {
+fn change_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool, ant: (f32, f32)) -> (f32, bool, ChangeWhy) {
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
@@ -478,6 +616,22 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // lands either side of a stop, `REST_SHORT`: the last-resort stop leaves the space from rest)
     let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel) <= e.dist + REST_SHORT);
     let end_ok = |ok: bool| ok && !(end > 0.0 && (people_on_move(net, sim, me, nb) || !fits));
+    // the car's lane does not lead to its trip end and `nb` is the way there: SUMO LC2013's
+    // urgent strategic change, first in its order, before speed gain and keeping to the side
+    // (`strategic_desire`), under the lane-end rules of where a change may be made
+    // (`may_change_for_lane_end`: the lane leads elsewhere, its turn-lane rules do not hold), the
+    // gap rule and nobody on the move; and only a move that fits before the dead lane's end (SUMO's
+    // `LCA_INSUFFICIENT_SPACE`: the change's whole road, `change_space`) - else the car drives on
+    // through the fork on its own lane and its trip end is drawn again (`STRATEGIC_MISSED`)
+    if let Some((strategic, dist)) = strategic_desire(net, sim, vehicles, me, nb).filter(|s| s.0 > 0.0 && s.0 >= end) {
+        if may_change_for_lane_end(net, sim, me, nb) {
+            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel) <= dist;
+            return (strategic, ok, ChangeWhy::Strategic);
+        }
+    }
+    // (and no change for speed or to keep to the side onto a lane that leaves no room to get back
+    // onto one that leads there, `strategic_stay`)
+    let stay = strategic_stay(net, sim, me, p, nb);
     if !may_change_to(net, sim, me, nb) {
         return (end, end > 0.0 && end_ok(gap_accepted(me, nb)), ChangeWhy::LaneEnd);
     }
@@ -518,7 +672,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let threshold = if towards_keep { SPEED_GAIN_THRESHOLD / SPEED_GAIN_RIGHT } else { SPEED_GAIN_THRESHOLD };
     let gained = me.speed_gain[(nb.dir as usize).clamp(1, 2) - 1] > threshold && (towards_keep || nb_safe > this_safe);
     let remains = nb.runs_on / st.speed.max(0.1) > SPEED_GAIN_REMAIN_TIME;
-    if gained && remains && !blocked && !near_junction && open_on(net, me, nb.lane, st.s) {
+    if gained && remains && !blocked && !near_junction && !stay && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
@@ -526,7 +680,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // hold (`stays_on_best`, over the lanes open to me: no `open_on` window); a speed-
     // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (how long the driver could keep
     // its speed there is the accumulator's rate)
-    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) {
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) && !stay {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -541,6 +695,8 @@ pub enum ChangeWhy {
     Obstacle = 2,
     SpeedGain = 3,
     KeepSide = 4,
+    /// Towards the lane that leads to a random car's trip end (`strategic_desire`).
+    Strategic = 5,
 }
 
 /// A turn lane is never left within this many metres (m) of its junction, nor one taken
@@ -718,8 +874,10 @@ fn stays_on_best(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// at a fork the way on that runs furthest. A random car's trip end (`AiState::goal`) is not
 /// looked at here: the way it takes at the fork is chosen when its plan reaches it
 /// (`AiState::choose_after`), from whichever lane it is on then, the least route cost to the
-/// trip end from there (`AiState::route_cost`: travel time over the group's relative density). (`NeighbourView::runs_on` is the network's reach, which counts no closed lane
-/// out and stops counting at `REACH_MAX`.)
+/// trip end from there (`AiState::route_cost`: travel time over the group's relative density),
+/// and its change onto a lane that leads there is the strategic one (`strategic_desire`).
+/// (`NeighbourView::runs_on` is the network's reach, which counts no closed lane out and stops
+/// counting at `REACH_MAX`.)
 fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
     // (at most `OPEN_RUN_LANES` lanes looked at: past that the way is taken to run on)
     fn walk(net: &Network, me: &Vehicle, lane: usize, d: f32, cap: f32, budget: &mut usize) -> f32 {
@@ -2565,7 +2723,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // the strongest lane-end wish whose gap is not there
         let mut blocked_end: Option<(f32, NeighbourView)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
-            let (d, ok, why) = change_desire(net, sim, me, p, &nb, near_junction, ant(&nb));
+            let (d, ok, why) = change_desire(net, sim, vehicles, me, p, &nb, near_junction, ant(&nb));
             if ok && d > 0.0 && best.map(|b| d > b.0).unwrap_or(true) {
                 best = Some((d, nb, why));
             }

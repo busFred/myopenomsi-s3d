@@ -777,9 +777,9 @@ fn cell(p: DVec3) -> (i32, i32) {
 }
 
 /// Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
-/// end, turn, obstacle, speed gain, keep side), every simulation of the process (diagnostics,
+/// end, turn, obstacle, speed gain, keep side, trip end), every simulation of the process (diagnostics,
 /// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
-pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Milliseconds driven (moving) out of the lane's middle on an in-lane squeeze (`Passing`
 /// with no lane: the lateral offset within the lane, SUMO's sublane `posLat`), every simulation

@@ -726,6 +726,18 @@ impl GoalField {
     pub fn to_goal(&self, lane: usize) -> f32 {
         self.dist.get(lane).copied().unwrap_or(f32::INFINITY)
     }
+
+    /// Does `lane` lead to the trip end (a finite route cost)? One that does not is a dead lane
+    /// for the car (SUMO LC2013: a lane without a connection to the route's next edge).
+    pub fn leads(&self, lane: usize) -> bool {
+        self.to_goal(lane).is_finite()
+    }
+
+    /// Does `lane`'s road lead to the trip end: the lane itself or a lane beside it the car may
+    /// change onto (`Network::road_beside`; SUMO's bestLanes over the lanes of the edge)?
+    pub fn road_leads(&self, net: &Network, lane: usize) -> bool {
+        self.leads(lane) || net.road_beside(lane).into_iter().any(|b| self.leads(b))
+    }
 }
 
 impl std::fmt::Debug for GoalField {
@@ -1100,6 +1112,24 @@ impl Network {
         // second carriageway as splines of their own, and Novi Sad's tracks change onto
         // them 30 m before the lane they come in on ends)
         self.beside(la, lb)
+    }
+
+    /// The lanes of `lane`'s road beside it the same way (`Lane::left`, `Lane::right`, one after
+    /// the other across the road), nearest first on each side: what a car on `lane` can change
+    /// onto (SUMO: the lanes of the vehicle's edge). A junction object's piece has none here.
+    pub fn road_beside(&self, lane: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for left in [true, false] {
+            let mut cur = lane;
+            while let Some(n) = self.lanes.get(cur).and_then(|l| if left { l.left } else { l.right }) {
+                if n == lane || out.contains(&n) {
+                    break;
+                }
+                out.push(n);
+                cur = n;
+            }
+        }
+        out
     }
 
     /// Does lane `b` run beside `a` (a lane's width or so to the side, the same way) along
@@ -3666,8 +3696,12 @@ pub struct AiState {
     /// only by density, at a density above 0 for its group, where no open one is reachable,
     /// `GoalAccess`) and not a loaded-tile edge in sight (`Network::ends_at_loaded_edge`). Drawn
     /// at random among the ends reachable from the fork where the car's plan first meets a
-    /// choice, by the density its group has on each (`AiState::goal_way`), drawn again where it
-    /// is gone or out of reach (`GOAL_REPICKED`). At a fork the car takes, among the ways on of
+    /// choice - its ways on and the lanes beside the fork's lane (the car's road) - by the density
+    /// its group has on each (`AiState::goal_way`), drawn again where it is gone or the car's road
+    /// no longer reaches it (`GOAL_REPICKED`, `GOAL_UNREACHABLE`). A car on a lane that does not
+    /// lead there while a lane beside does changes onto that one (SUMO LC2013's strategic change,
+    /// `omsi_traffic::plan`); one that misses the fork is counted (`STRATEGIC_MISSED`) and draws
+    /// again where it enters the way it took. At a fork the car takes, among the ways on of
     /// the best tier, the one with the least route cost to it (`choose_after`, `route_cost`;
     /// SUMO: the route the router computes to the trip's end decides the way on). None: no fork
     /// met yet, a timetable route, or no end reachable over lanes its group has a density above
@@ -3861,6 +3895,16 @@ pub static GOAL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// (`AiState::goal_way`; the others are drawn by that density), whole process. Only a closed
 /// marker (`Network::closed_marker`) is a trip end at density 0.
 pub static GOAL_UNWEIGHTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Trip ends drawn again because the car's road could no longer reach its own (a subset of
+/// `GOAL_REPICKED`; the rest were gone: their tile linked on, their edge come into sight), whole
+/// process (`AiState::goal_way`).
+pub static GOAL_UNREACHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Strategic lane changes missed: a random car on a dead lane - its trip end reachable only from
+/// a lane beside it (`GoalField::road_leads`) - that drove through the fork onto a way of its own
+/// lane from whose road the trip end cannot be reached, whole process. Counted where the car
+/// enters that way (`AiState::advance`), where its trip end is drawn again among those its road
+/// reaches and its way planned afresh (`goal_way`; SUMO's vehicle re-routes).
+pub static STRATEGIC_MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Forks a random car met with no trip end reachable over the lanes its group has a density
 /// above 0 on (`AiState::goal_way` found none: a pocket its group's traffic does not lead out
 /// of), whole process; per fork met, not per car (a car with no trip end tries again at each
@@ -4158,7 +4202,10 @@ impl AiState {
     /// A random car (no `route`) on a street chooses among the ways on that lead to its trip end
     /// (`goal_way`; SUMO: the vehicle's route decides which link it takes, a lane without a
     /// connection to the route's next edge is a dead lane, sumo.md 3 `lcStrategic`; one that
-    /// cannot reach it is never taken while one that can exists) among the ways on of the best
+    /// cannot reach it is never taken while one that can exists; where none does and the trip end
+    /// lies off a lane beside, the car chooses as with no trip end among its own lane's ways, and
+    /// its strategic lane change, `omsi_traffic::plan`, takes it onto that lane, whose ways are
+    /// chosen afresh when the change begins, `start_change`) among the ways on of the best
     /// tier present, and takes the one with the least route cost to it (`route_cost`, travel
     /// time over the group's relative density; SUMO's router: the route is the least-cost path),
     /// equal ones at random. The tier comes first (user decision X-D3, OMSI: the map's density
@@ -4188,7 +4235,7 @@ impl AiState {
         let kind = l.kind;
         // a random car's choice is the ways on that lead to its trip end (SUMO: a lane with no
         // connection to the route's next edge is a dead lane, no way on for the vehicle)
-        let field = if self.route.is_empty() && !self.probe && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, &next) } else { None };
+        let field = if self.route.is_empty() && !self.probe && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, lane, &next) } else { None };
         // (a car routed over the lanes closed only by density, `GoalAccess::Driven`, has its route
         // computed over those its group has a density above 0 on: for its choice they rank as
         // open, `ranked` - SUMO routes over every lane the class may use and the vehicle follows
@@ -4340,20 +4387,27 @@ impl AiState {
         net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.routable(net, n, access)
     }
 
-    /// The trip end's route costs for a choice among the ways on `next` of a fork, over the open
-    /// lanes first (`GoalAccess::Open`): the car's own trip end while it still is one and one of
-    /// `next` leads to it; else a trip end drawn at random among those reachable from `next`,
-    /// weighted by the density the map gives the car's group on each (SUMO's `randomTrips`: a
-    /// trip from or to the fringe, edges drawn by custom weights, a trip whose end cannot be
-    /// reached is dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`, `GOAL_UNWEIGHTED`). Only where no trip end is
+    /// The trip end's route costs for a choice among the ways on `next` of the fork at the end of
+    /// `lane`, over the open lanes first (`GoalAccess::Open`): the car's own trip end while it
+    /// still is one and the car's road can reach it - one of `next`, or a lane of the fork's road
+    /// or of the car's own road (the lane it is on, the lanes beside either it may change onto,
+    /// `GoalField::road_leads`: SUMO LC2013's strategic change takes the car onto the lane that
+    /// leads there; where none of `next` does, the choice is one its own lane has); else a trip end
+    /// drawn at random among those reachable from `next` and from the lanes beside `lane`
+    /// (`Network::road_beside`: the car's road, SUMO's edge), weighted by the density the map gives
+    /// the car's group on each (SUMO's `randomTrips`: a trip from or to the fringe, edges drawn by
+    /// custom weights, a trip whose end cannot be reached is dropped), counted (`GOAL_PICKED`,
+    /// `GOAL_REPICKED`, of these `GOAL_UNREACHABLE` where the old end was still one but the road
+    /// no longer reached it, `GOAL_UNWEIGHTED`). Only where no trip end is
     /// reachable over open lanes, the same over the lanes closed only by density on which the
     /// group still has a density above 0 (`GoalAccess::Driven`): `choose_after`'s own fallback
     /// for a car in a quarter its group drives at the map's "almost none" (such a density is
     /// OMSI's demand weight, no permission: SUMO's router routes over every lane the vehicle
     /// class may use). A lane at density 0 for the group is on neither (X-D3). None: no trip
     /// end reachable, counted (`GOAL_NONE_POCKET`).
-    fn goal_way(&mut self, net: &Network, next: &[usize]) -> Option<std::sync::Arc<GoalField>> {
+    fn goal_way(&mut self, net: &Network, lane: usize, next: &[usize]) -> Option<std::sync::Arc<GoalField>> {
         let had = self.goal.is_some();
+        let was_end = self.goal.is_some_and(|g| self.is_trip_end(net, g, GoalAccess::Open) || self.is_trip_end(net, g, GoalAccess::Driven));
         for access in [GoalAccess::Open, GoalAccess::Driven] {
             if let Some(g) = self.goal.filter(|&g| self.is_trip_end(net, g, access)) {
                 let key = self.goal_key(net, g, access);
@@ -4361,15 +4415,16 @@ impl AiState {
                     Some(f) => f,
                     None => net.goal_field(key, |n| self.routable(net, n, access), self.route_cost(net)),
                 };
-                if next.iter().any(|&n| f.to_goal(n).is_finite()) {
+                if next.iter().any(|&n| f.leads(n)) || f.road_leads(net, lane) || f.road_leads(net, self.lane) {
                     self.goal_field = Some(f.clone());
                     return Some(f);
                 }
             }
-            // (the trip ends reachable from the ways on, nearest first as met)
+            // (the trip ends reachable from the ways on and from the lanes beside the fork's
+            // lane, nearest first as met)
             let mut seen = vec![false; net.lanes.len()];
             let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-            for &n in next {
+            for &n in next.iter().chain(&net.road_beside(lane)) {
                 if n < seen.len() && !seen[n] && self.routable(net, n, access) {
                     seen[n] = true;
                     queue.push_back(n);
@@ -4416,6 +4471,9 @@ impl AiState {
                 ends[(self.rand() % ends.len() as u64) as usize]
             };
             if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if had && was_end {
+                GOAL_UNREACHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let key = self.goal_key(net, g, access);
             let f = net.goal_field(key, |n| self.routable(net, n, access), self.route_cost(net));
             self.goal = Some(g);
@@ -5288,12 +5346,22 @@ impl AiState {
                 return false; // dead end: despawn
             };
             self.s -= l.length();
+            // (a strategic change missed: the car drove off a dead lane whose road led to its trip
+            // end onto a way from whose road it does not, `STRATEGIC_MISSED`)
+            let missed = self.goal_field.as_ref().filter(|f| self.route.is_empty() && Some(f.key.goal) == self.goal).is_some_and(|f| !f.leads(self.lane) && f.road_leads(net, self.lane) && !f.road_leads(net, next));
             self.prev_lane = Some(self.lane);
             self.lane = next;
             if self.goal == Some(next) {
                 GOAL_REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if self.route.is_empty() {
+            if missed {
+                // (its trip end drawn again among those its road now reaches, and its way planned
+                // afresh from here towards it: SUMO's vehicle re-routes from where it is)
+                STRATEGIC_MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.goal_way(net, next, &[next]);
+                self.planned_next = None;
+                self.ahead.clear();
+            } else if self.route.is_empty() {
                 self.planned_next = if self.ahead.is_empty() { None } else { Some(self.ahead.remove(0)) };
             } else {
                 // the plan may have stepped over a lane-change entry of the route

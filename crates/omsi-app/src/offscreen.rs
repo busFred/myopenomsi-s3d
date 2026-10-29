@@ -1508,6 +1508,10 @@ pub(crate) fn run_offscreen(
             use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
             log::info!("trip ends: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), revisits.entries, revisits.vehicles.len());
+            // (trip ends drawn again because the car's road no longer reached them, strategic
+            // changes missed at the fork, and the drivers' own lane changes by what won them)
+            let c = |k: usize| g(&omsi_traffic::sim::CHANGES_BY_WHY[k]);
+            log::info!("lane use: goal_unreachable {} strategic_missed {}; lane changes: lane end {} turn {} obstacle {} speed gain {} keep side {} strategic {}; change_aborted {}", g(&omsi_sim::traffic::GOAL_UNREACHABLE), g(&omsi_sim::traffic::STRATEGIC_MISSED), c(0), c(1), c(2), c(3), c(4), c(5), g(&omsi_traffic::sim::CHANGES_ABORTED));
         }
         for c in t.cars.iter().filter(|c| c.serves_stops()) {
             log::info!("scheduled {} at ({:.1}, {:.1}, {:.1}) heading {:.0} speed {:.1} km/h, {} stops left, at_station={} dwell={:.1} delay={:+.0} s", c.vehicle.ty.def.type_name, c.vehicle.position.x, c.vehicle.position.y, c.vehicle.position.z, c.vehicle.heading, c.ai.state.speed * 3.6, c.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), c.at_station(), c.standing_for(t.day_time), c.bus.as_ref().map(|b| b.delay).unwrap_or(0.0));
