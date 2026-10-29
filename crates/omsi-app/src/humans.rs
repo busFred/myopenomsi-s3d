@@ -5873,7 +5873,8 @@ pub struct Humans {
     /// (`buses_now`, the walkers' boxes, the waiters' step-out) - and what they ask of the
     /// player's driver they ask of that bus's service and script, as of a timetable bus's: to
     /// wait while they get on or off (`holds`), to stop (`ask_stop`, `stop_wishes`), with its
-    /// riders counted (`ai_riders`) and their door wants (`ai_requests`).
+    /// riders counted (`ai_riders`) and their door wants (`ai_requests`). The player's bus
+    /// shows that bus's sign (its terminus): the player's scripts that set its own do not run.
     pub(crate) stand_in: Option<u64>,
     /// The doors of `stand_in` as the people would see a timetable bus's open this tick
     /// (any entry, any exit; `buses_now`): the harness opens the player's doors by them
@@ -8300,6 +8301,10 @@ impl Humans {
                     ibis.filter(|s| !s.is_empty()).or(duty_terminus)
                 }
             };
+            // (driven by a timetable bus, `stand_in`: the sign that bus shows - it is the one at
+            // the wheel, and the player's scripts that would set the player's own do not run)
+            let stand_in_sign = self.stand_in.and_then(|id| traffic.and_then(|t| t.cars.iter().find(|c| c.id == id))).and_then(|c| c.bus.as_ref()).map(|b| b.terminus.trim().to_string()).filter(|t| !t.is_empty());
+            let terminus = stand_in_sign.or(terminus);
             // (on a duty the people its trip takes where they are going get on, however the
             // depot file names the terminus; in free drive nobody)
             let takes = match &self.duty {
