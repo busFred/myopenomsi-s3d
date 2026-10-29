@@ -6395,6 +6395,7 @@ impl Humans {
         }
         for id in &gone {
             self.stops.remove(id);
+            self.held_for_sight.remove(id);
         }
         // (the stops nobody waits at are set up again, their waiting places from the objects
         // the new tiles bring; each keeps whether it was in range, its refill clock and its
@@ -6402,6 +6403,7 @@ impl Humans {
         let idle: Vec<i64> = self.stops.keys().copied().filter(|id| !used.contains(id)).collect();
         let rebuilt = idle.len();
         for id in idle {
+            self.held_for_sight.remove(&id);
             if let Some(st) = self.stops.remove(&id) {
                 self.stop_carry.insert(id, StopCarry { near: st.near, clock_ms: st.clock_ms, factor: st.factor });
             }
@@ -6512,7 +6514,9 @@ impl Humans {
     /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (a ray from the eye to the person's
     /// head blocked by a collision box, as the traffic asks for its cars; not within 25 m of
     /// the eye). The one rule for every placement of a person: strollers (`populate_on_foot`)
-    /// and the waiters at the stops (`waiting_place`). A building hides people because
+    /// and the waiters at the stops (`waiting_place`). Not used by the riders put on the seats
+    /// of the player's bus, the LAN players' avatars, or the debug crossing knob
+    /// (`OMSI_PAX_CROSS`). A building hides people because
     /// otherwise, while the bus drives, nobody could appear on the street ahead.
     fn may_appear(&self, world: &World, p: DVec3) -> bool {
         if !self.seen(p) {
@@ -7153,6 +7157,7 @@ impl Humans {
         if let Some(c) = self.stop_carry.remove(&id) {
             (st.near, st.was_near, st.clock_ms, st.factor) = (c.near, c.near, c.clock_ms, c.factor);
         }
+        self.held_for_sight.remove(&id);
         self.stops.insert(id, st);
     }
 
@@ -7326,6 +7331,7 @@ impl Humans {
             };
             if !near {
                 if changed {
+                    self.held_for_sight.remove(&id);
                     // (sub_61be80) the people waiting there go
                     for i in (0..self.people.len()).rev() {
                         let here = matches!(&self.people[i].state, State::Pax(p) if p.stop == Some(id) && p.inside.is_none() && matches!(p.task, Task::WaitingForBus | Task::WalkingToBusstop));
