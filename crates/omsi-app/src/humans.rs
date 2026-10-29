@@ -467,6 +467,22 @@ fn covers_path(b: &Block, from: DVec2, dir: DVec2, ahead: f64) -> bool {
 /// Stops within this distance of the player have their people (Omsi.exe: the stop's tile
 /// and the eight round the camera's, sub_61bf94).
 const STOP_RANGE: f64 = 450.0;
+/// A stop in range with fewer people than it should have gets one more each frame its refill
+/// clock is past this (ms) plus a random part of `STOP_REFILL_SPREAD_MS` (drawn each frame), 10..15
+/// s (Omsi.exe sub_61bf94); the clock starts again once the stop has what it should.
+const STOP_REFILL_MS: f32 = 10000.0;
+const STOP_REFILL_SPREAD_MS: f32 = 5000.0;
+
+/// What a stop taken down on a tile change keeps when it is set up again (`tiles_changed`,
+/// `set_up_stop`): whether it was in range (so that it is not taken for one coming into range,
+/// which gets its people at once), its refill clock and its random factor.
+#[derive(Clone, Copy, Debug)]
+struct StopCarry {
+    near: bool,
+    clock_ms: f32,
+    factor: f32,
+}
+
 /// Pedestrians stroll within this distance of the player (m).
 const STROLL_RADIUS: f64 = 200.0;
 /// Further off than this (m) somebody may be put down in plain view (`may_appear`). Not derived
@@ -6038,6 +6054,14 @@ pub struct Humans {
     points_refused: usize,
     /// Riders sent on on foot from a stop with nowhere to wait (`send_on_from_stop`).
     riders_sent_on: usize,
+    /// Counted for the gate (`summary`): waiters due at a stop held back because every free
+    /// waiting place there is in sight (`waiting_place`); counted once until one is put
+    /// down there. The stops holding one back now are `held_for_sight`.
+    waiters_held_for_sight: usize,
+    held_for_sight: HashSet<i64>,
+    /// The stops taken down on a tile change for being set up again (`tiles_changed`), with
+    /// what they keep across it (`StopCarry`), until `set_up_stop` sets them up again.
+    stop_carry: HashMap<i64, StopCarry>,
     /// Counted for the gate (`summary`): people on foot taken away, and those of them the player
     /// could see then (`figure_in_sight`; every removal rule asks for out of sight, so none).
     removed: (usize, usize),
@@ -6304,6 +6328,9 @@ impl Humans {
             places_refused: 0,
             points_refused: 0,
             riders_sent_on: 0,
+            waiters_held_for_sight: 0,
+            held_for_sight: HashSet::new(),
+            stop_carry: HashMap::new(),
             removed: (0, 0),
             gone: Vec::new(),
             inside_seen: HashSet::new(),
@@ -6335,7 +6362,8 @@ impl Humans {
 
     /// The map's tiles changed: a stop gone with its tile takes the people waiting there
     /// with it; a stop nobody waits at is set up again with what its tiles hold now (its
-    /// waiting places come with the objects round it, sub_620c0c).
+    /// waiting places come with the objects round it, sub_620c0c), keeping whether it was in
+    /// range, its refill clock and its factor (`StopCarry`, `set_up_stop`).
     fn tiles_changed(&mut self, world: &World) {
         let present: HashSet<i64> = world.bus_stops.lock().iter().map(|s| s.0).collect();
         let bound = |st: &State| -> Option<i64> {
@@ -6364,10 +6392,15 @@ impl Humans {
         for id in &gone {
             self.stops.remove(id);
         }
+        // (the stops nobody waits at are set up again, their waiting places from the objects
+        // the new tiles bring; each keeps whether it was in range, its refill clock and its
+        // factor, `StopCarry`, so it fills over time as any stop in range, not at once)
         let idle: Vec<i64> = self.stops.keys().copied().filter(|id| !used.contains(id)).collect();
         let rebuilt = idle.len();
         for id in idle {
-            self.stops.remove(&id);
+            if let Some(st) = self.stops.remove(&id) {
+                self.stop_carry.insert(id, StopCarry { near: st.near, clock_ms: st.clock_ms, factor: st.factor });
+            }
         }
         if debug_pax() || (omsi_cfg::env::var_os("OMSI_PROFILE").is_some() && (removed > 0 || !gone.is_empty())) {
             log::info!("people: tiles changed: {} stops gone, {rebuilt} set up again, {removed} people taken away", gone.len());
@@ -6470,13 +6503,13 @@ impl Humans {
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
-    /// May somebody be put down at `p` without the player seeing it:
-    /// out of the view (`seen`), or far enough off that a figure is a few pixels (over
+    /// May somebody be put down at `p` without the player seeing it: out of the player's
+    /// sight (`seen`), or far enough off that a figure is a few pixels (over
     /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (a ray from the eye to the person's
-    /// head blocked by a collision box, as the traffic asks for its cars). Until now only
-    /// the view cone counted, with no building ever hiding anybody: while the bus drove,
-    /// nobody could appear on the street ahead, and people were put down only beside and
-    /// behind it, where walkers never catch a bus up.
+    /// head blocked by a collision box, as the traffic asks for its cars; not within 25 m of
+    /// the eye). The one rule for every placement of a person: strollers (`populate_on_foot`)
+    /// and the waiters at the stops (`waiting_place`). A building hides people because
+    /// otherwise, while the bus drives, nobody could appear on the street ahead.
     fn may_appear(&self, world: &World, p: DVec3) -> bool {
         if !self.seen(p) {
             return true;
@@ -7037,13 +7070,15 @@ impl Humans {
             .filter(|s| (s.1 - center).length() < STOP_RANGE + 100.0)
             .map(|s| (s.0, s.1, s.2, s.3.clone()))
             .collect();
+        // (a stop taken down on a tile change and out of reach now is set up again as a new
+        // one, should it come into range: it gets its people at once then)
+        self.stop_carry.retain(|id, _| list.iter().any(|s| s.0 == *id));
         for (id, pos, rot, name) in list {
             // only once the ground under the stop is there
             if world.walk_height(pos.x, pos.y).is_none() || self.stops.contains_key(&id) {
                 continue;
             }
-            let st = self.build_pax_stop(world, net, id, pos, rot, &name);
-            self.stops.insert(id, st);
+            self.set_up_stop(world, net, id, pos, rot, &name);
         }
         // the stops set up before the network was there: their places cleared
         // of the street lanes now, and whoever is at a place that moved walks to it
@@ -7105,6 +7140,18 @@ impl Humans {
     /// places are the `[passpos]` of every object near it - within 10 m to the platform's
     /// side and from 10 m behind to the stop's length ahead of it -, the gather point a
     /// metre to the kerb and a metre ahead, the destinations of the trips leaving it.
+    /// Stop `id` set up (`build_pax_stop`); one taken down on a tile change keeps what it had
+    /// (`StopCarry`): in range before and now, it is no stop coming into range, and fills as
+    /// any stop in range does (`stops_tick`: once its refill clock is past `STOP_REFILL_MS` +
+    /// up to `STOP_REFILL_SPREAD_MS`, one a frame where nobody sees them appear), not at once.
+    fn set_up_stop(&mut self, world: &World, net: Option<&Network>, id: i64, pos: DVec3, heading: f64, name: &str) {
+        let mut st = self.build_pax_stop(world, net, id, pos, heading, name);
+        if let Some(c) = self.stop_carry.remove(&id) {
+            (st.near, st.was_near, st.clock_ms, st.factor) = (c.near, c.near, c.clock_ms, c.factor);
+        }
+        self.stops.insert(id, st);
+    }
+
     fn build_pax_stop(&mut self, world: &World, net: Option<&Network>, id: i64, pos: DVec3, heading: f64, name: &str) -> PaxStop {
         let length = world.stop_length(id);
         let side = world.stop_side(id).round().clamp(0.0, 255.0) as u8;
@@ -7234,10 +7281,15 @@ impl Humans {
     }
 
     /// The stops near the player fill with people (sub_61bf94, every frame): a stop coming
-    /// into range gets its people at once, one in range another one every 10..15 s while
-    /// it has fewer than it should - its `pass_enter_max`/`pass_enter_min` mean times its own random factor
-    /// times the passenger density, at most one per waiting place. A stop going out of
-    /// range loses the people waiting there.
+    /// into range gets its people at once; one in range with fewer than it should have gets
+    /// one more each frame its refill clock is past `STOP_REFILL_MS` + up to
+    /// `STOP_REFILL_SPREAD_MS`, the clock starting again once it is full. What it should have:
+    /// its `pass_enter_max`/`pass_enter_min` mean times its own random factor times the
+    /// passenger density, at most one per waiting place. Each is put down only at a place
+    /// nobody sees them appear at (`waiting_place`, `may_appear`); one held back for that is
+    /// tried again each frame the clock is past its time. A stop set up again on a tile
+    /// change is no stop coming into range (`set_up_stop`). A stop going out of range loses
+    /// the people waiting there.
     fn stops_tick(&mut self, dt: f32, world: &World, renderer: &Renderer, scene: &mut Scene) {
         if self.mirror || self.avatar_only {
             return;
@@ -7313,7 +7365,7 @@ impl Humans {
             s.clock_ms += dt * 1000.0;
             if !changed && !burst {
                 let r = self.rand_f() as f32;
-                if self.stops[&id].clock_ms <= r * 5000.0 + 10000.0 {
+                if self.stops[&id].clock_ms <= r * STOP_REFILL_SPREAD_MS + STOP_REFILL_MS {
                     continue;
                 }
             }
@@ -7331,6 +7383,29 @@ impl Humans {
                 self.stops.get_mut(&id).unwrap().clock_ms = 0.0;
             }
         }
+    }
+
+    /// A free waiting place of stop `id` taken for somebody put down there (sub_61c8d8, at
+    /// random): only one where nobody sees them appear (`may_appear`, the rule of every
+    /// placement of a person; Omsi.exe puts them down anywhere). None when every free one is
+    /// in sight: the waiter is held back (counted once until one is put down there,
+    /// `waiters_held_for_sight`) and is tried again (`stops_tick`).
+    fn waiting_place(&mut self, world: &World, id: i64) -> Option<usize> {
+        let free = self.free_spots(id);
+        if free.is_empty() {
+            return None;
+        }
+        let open: Vec<usize> = free.into_iter().filter(|&k| self.may_appear(world, self.stops[&id].spots[k].pos)).collect();
+        if open.is_empty() {
+            if self.held_for_sight.insert(id) {
+                self.waiters_held_for_sight += 1;
+            }
+            return None;
+        }
+        self.held_for_sight.remove(&id);
+        let k = open[(self.rand() as usize) % open.len()];
+        self.stops.get_mut(&id)?.taken[k] = true;
+        Some(k)
     }
 
     /// A destination drawn from stop `id`'s (sub_61baa8): by weight; none when the weights
@@ -7410,13 +7485,13 @@ impl Humans {
         (dest, line)
     }
 
-    /// A person put at a free waiting place of stop `id` (sub_626044) with a destination
-    /// drawn from the stop's (sub_61baa8); they settle there as task 6 does.
+    /// A person put at a free waiting place of stop `id` (sub_626044, `waiting_place`) with a
+    /// destination drawn from the stop's (sub_61baa8); they settle there as task 6 does.
     fn spawn_waiting(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, id: i64) -> Option<usize> {
         if self.stops.get(&id)?.taken.iter().enumerate().all(|(k, t)| *t || self.stops[&id].refused.get(k).copied().unwrap_or(false)) || !self.pool_room() || self.nothing_soon(id) {
             return None;
         }
-        let k = self.take_spot(id)?;
+        let k = self.waiting_place(world, id)?;
         let sp = self.stops[&id].spots[k].clone();
         // some wait in twos to fours: one destination, one ride, together
         let mut party = (0u32, 0u8, 0.0f32);
@@ -9047,7 +9122,7 @@ impl Humans {
             ));
         }
         out.push_str(&format!("; jammed {:.0} person-s, inside a moving vehicle {:.1} person-s", self.jam_stats.0, self.jam_stats.1));
-        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.riders_sent_on, self.removed.0, self.removed.1));
+        out.push_str(&format!("; waiting places refused {} (stop points refused {}); riders sent on from a stop with nowhere to wait {}; waiters held back for sight {}; taken away on foot {} ({} in sight)", self.places_refused, self.points_refused, self.riders_sent_on, self.waiters_held_for_sight, self.removed.0, self.removed.1));
         let (frames, posed, ms, up) = self.pose_stats;
         if frames > 0 {
             out.push_str(&format!(
@@ -10975,6 +11050,134 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The waiters at a stop are put down only where nobody sees them appear (`may_appear`,
+    /// the people's one rule for every placement): a stop of four places 60 m ahead in plain
+    /// view gets nobody however long it is due, the waiter held back counted once; with the
+    /// eye turned away it fills as a stop in range does (once its refill clock is past its
+    /// time, one a frame); 150 m ahead in plain view (past `APPEAR_IN_VIEW_BEYOND`) it fills
+    /// too. Taken down on a tile change with nobody waiting and set up again, it keeps being
+    /// in range (`StopCarry`): it is not filled at once as a stop coming into range, but once
+    /// its refill clock is past `STOP_REFILL_MS`, never more than one a frame.
+    #[test]
+    fn a_stop_gets_its_waiters_only_out_of_sight_and_one_set_up_again_fills_over_time() {
+        let root = std::env::temp_dir().join(format!("openomsi-stop-sight-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        std::fs::write(root.join("global.cfg"), "[name]\nStops\n").unwrap();
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let new_humans = || {
+            let mut h = Humans::new(&root);
+            h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+            h.map_humans_done = true;
+            (h.density, h.max_people) = (1.0, 100);
+            h
+        };
+        let spots = |pos: DVec3| -> Vec<WaitSpot> { (0..4).map(|k| WaitSpot { pos: pos + DVec3::new(0.0, k as f64, 0.0), face: 90.0, height: 0.0 }).collect() };
+        let stop = |pos: DVec3| PaxStop {
+            name: "S".into(),
+            alias: String::new(),
+            pos,
+            heading: 0.0,
+            gather: pos,
+            spots: spots(pos),
+            taken: vec![false; 4],
+            refused: vec![false; 4],
+            enter_max: 4.0,
+            enter_min: 4.0,
+            length: 30.0,
+            lane: None,
+            was_near: false,
+            near: false,
+            clock_ms: 0.0,
+            want: 0,
+            factor: 1.0,
+            buses: Vec::new(),
+            dests: Vec::new(),
+            lines: Vec::new(),
+            cleared: true,
+            kerb_shift: Some(DVec3::ZERO),
+            kerb_spread: true,
+        };
+        let ahead = Eye { pos: DVec3::new(0.0, 0.0, 2.0), fwd: DVec3::Y, cos_half: 40f64.to_radians().cos() };
+        let away = Eye { fwd: -DVec3::Y, ..ahead };
+        let waiting = |h: &Humans| h.people.iter().filter(|p| matches!(&p.state, State::Pax(x) if x.stop == Some(7))).count();
+        const DT: f32 = 1.0 / 30.0;
+        let frames = |secs: f32| (secs / DT).round() as usize;
+        let mut tick = |h: &mut Humans| h.stops_tick(DT, &world, &renderer, &mut scene);
+
+        // 60 m ahead in plain view: nobody, for 30 s; the waiter held back counted once
+        let mut h = new_humans();
+        let near = DVec3::new(2.0, 60.0, 0.0);
+        h.stops.insert(7, stop(near));
+        h.eye = Some(ahead);
+        assert!(!h.may_appear(&world, near), "a place 60 m ahead in plain view");
+        for _ in 0..frames(30.0) {
+            tick(&mut h);
+        }
+        assert_eq!((waiting(&h), h.waiters_held_for_sight), (0, 1));
+        // the eye turned away: the refill clock is past its time, one a frame until full
+        h.eye = Some(away);
+        for k in 1..=4 {
+            tick(&mut h);
+            assert_eq!(waiting(&h), k);
+        }
+        assert!(h.held_for_sight.is_empty());
+
+        // 150 m ahead in plain view: filled at once as a stop coming into range
+        let mut h = new_humans();
+        h.stops.insert(7, stop(DVec3::new(2.0, 150.0, 0.0)));
+        h.eye = Some(ahead);
+        tick(&mut h);
+        assert_eq!((waiting(&h), h.waiters_held_for_sight), (4, 0));
+
+        // out of sight: filled at once coming into range; then everybody gone (on a bus)
+        let mut h = new_humans();
+        h.stops.insert(7, stop(near));
+        h.eye = Some(away);
+        tick(&mut h);
+        assert_eq!(waiting(&h), 4);
+        for i in (0..h.people.len()).rev() {
+            h.release(i);
+            let p = h.people.swap_remove(i);
+            h.retire(&p);
+        }
+        h.stops.get_mut(&7).unwrap().taken = vec![false; 4];
+        assert_eq!(waiting(&h), 0);
+        // a tile change: the stop nobody waits at is taken down and set up again (its places
+        // from the objects round it: none in this world, so given again as they were)
+        world.bus_stops.lock().push((7, near, 0.0, "S".into()));
+        h.tiles_changed(&world);
+        assert!(!h.stops.contains_key(&7));
+        h.set_up_stop(&world, None, 7, near, 0.0, "S");
+        let st = h.stops.get_mut(&7).unwrap();
+        (st.spots, st.taken, st.refused, st.enter_max, st.enter_min, st.cleared) = (spots(near), vec![false; 4], vec![false; 4], 4.0, 4.0, true);
+        assert!(st.near && st.was_near, "kept in range across the tile change");
+        // not at once: nobody before the refill clock is past `STOP_REFILL_MS`, then one a frame
+        let (mut t, mut first) = (0.0f32, None);
+        for _ in 0..frames(20.0) {
+            let before = waiting(&h);
+            tick(&mut h);
+            t += DT;
+            let now = waiting(&h);
+            assert!(now <= before + 1, "{} at once at {t:.2} s", now - before);
+            if now > 0 && first.is_none() {
+                first = Some(t);
+            }
+        }
+        let first = first.expect("never filled again");
+        assert!(first * 1000.0 > STOP_REFILL_MS, "the first again after {first:.2} s");
+        assert_eq!(waiting(&h), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Off a bus 3 m from the pavement's path (along y), walking onto it at 1.1 m/s: hardly
     /// faster over any quarter of a second (pulled by the corridor all the way, over 1.5
