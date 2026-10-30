@@ -346,7 +346,6 @@ impl BodyLane {
             if st.lane >= net.lanes.len() {
                 continue;
             }
-            let edges = net.lane_edges(st.lane);
             let n = ((st.rear + st.front + 4.0) / BODY_WAY_STEP).ceil() as usize;
             let first = -st.rear - 2.0;
             let way: Vec<DVec2> = st.way_points(net, (0..=n).map(|i| first + i as f32 * BODY_WAY_STEP)).into_iter().map(|p| p.truncate()).collect();
@@ -418,6 +417,10 @@ impl BodyLane {
                 let class = BODY_RADIUS_CLASSES.iter().position(|r| k * r >= 1.0).unwrap_or(3);
                 let kind = (i > 0) as usize;
                 self.swing[kind][class].push((worst as f32, dt));
+                // the lane under the section's own origin: a trailer still on the piece before
+                // the front's is measured against that piece's edges
+                let (sec_lane, sec_s) = st.lane_at(net, along);
+                let edges = net.lane_edges(sec_lane);
                 // the bend's side: + = it bends left, so its inside is the way's left
                 let left = (b - a).perp_dot(q - a) >= 0.0;
                 if st.lateral != 0.0 || st.change.is_some() {
@@ -432,7 +435,7 @@ impl BodyLane {
                     }
                     self.sides[kind][class].push((inn as f32, out as f32, dt));
                     if inn > BODY_SIDE_OVER && class < 3 {
-                        let ln = &net.lanes[st.lane];
+                        let ln = &net.lanes[sec_lane];
                         let junction = ln.source == 2 || ln.invisible;
                         let bus = c.vehicle.ty.def.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bus"));
                         *self.inner_over_s.entry((if junction { "connector" } else { "spline lane" }, bus)).or_default() += dt as f64;
@@ -445,10 +448,10 @@ impl BodyLane {
                                     "t={t_s:.1} #{} {} section {i} lane {} ({} {}) s {:.1} of {:.1} edges ({el:.2}, {er:.2}) bend {} R {:.0} speed {:.1}",
                                     c.id,
                                     ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
-                                    st.lane,
+                                    sec_lane,
                                     if ln.invisible { "editor-only lane" } else if junction { "junction path" } else { "spline lane" },
                                     ln.name,
-                                    st.s,
+                                    sec_s,
                                     ln.length(),
                                     if left { "left" } else { "right" },
                                     1.0 / k.max(1e-4),
