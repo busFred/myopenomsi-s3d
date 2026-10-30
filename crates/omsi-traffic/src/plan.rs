@@ -3731,16 +3731,17 @@ mod piece_change_tests {
         assert!(run(30.0, (0, 40.0 + 3.5 + 2.0 + 6.0, 2.0)), "a slower car 6 m ahead on my own piece is not swept");
     }
 
-    /// L3-2: the same change started from rest projects the car rolling on level with it on the
-    /// far side by the time its body takes from rest at its acceleration (`Bodies::time_to`), not
-    /// by no time at all: the car 0.4 m beside rolling at 1 m/s bars the change (at speed 0 it was
-    /// not swept), and so does one standing there; 2.5 m beside it starts.
+    /// L3-2: the same change started from rest projects the car rolling on beside it on the far
+    /// side by the time its body takes - the signal's seconds (`signal_plan`), then from rest at its
+    /// acceleration (`Bodies::time_to`) - not by no time at all: a car 0.4 m beside, 6 m back,
+    /// rolling at 1 m/s, rolls on into the rear's swing and bars the change (at speed 0 it was not
+    /// swept), and so does one standing there; 2.5 m beside it starts.
     #[test]
     fn a_change_from_rest_projects_the_car_rolling_beside_it_on_the_far_side() {
         let mut net = Network::default();
         net.lanes.push(path((0.0, 0.0), (150.0, 0.0), 0, LaneKind::Street));
         net.lanes.push(path((0.0, -3.0), (150.0, -3.0), 1, LaneKind::Street));
-        let run = |y: f64, speed: f32| {
+        let run = |y: f64, speed: f32, at: f32| {
             let mut net = net.clone();
             net.lanes.push(path((0.0, y), (150.0, y), 2, LaneKind::Street));
             net.link(1.5);
@@ -3749,14 +3750,14 @@ mod piece_change_tests {
             let nb = beside(&net);
             let me = body(&net, 1, 0, 40.0, 0.0, (3.5, 8.5, 1.25));
             assert!(me.state.accel > 0.0);
-            let them = body(&net, 2, 2, 40.0, speed, (2.0, 2.0, 0.9));
+            let them = body(&net, 2, 2, at, speed, (2.0, 2.0, 0.9));
             let vehicles = vec![me, them];
             sim.build_occupancy(&net, &vehicles);
             change_clear(&net, &sim, &vehicles, &vehicles[0], &Perception::default(), &nb, None, (omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, omsi_sim::traffic::change_length(vehicles[0].state.speed)))
         };
-        assert!(!run(2.55, 1.0), "a car rolling on 0.4 m beside on the far side bars a change from rest");
-        assert!(!run(2.55, 0.0), "so does one standing there");
-        assert!(run(1.25 + 0.9 + 2.5, 1.0), "2.5 m beside, past the rear's swing, it starts");
+        assert!(!run(2.55, 1.0, 34.0), "a car rolling on 0.4 m beside on the far side, behind my middle, bars a change from rest: over the signal it rolls on into the swing");
+        assert!(!run(2.55, 0.0, 40.0), "so does one standing there");
+        assert!(run(1.25 + 0.9 + 2.5, 1.0, 34.0), "2.5 m beside, past the rear's swing, it starts");
     }
 }
 
