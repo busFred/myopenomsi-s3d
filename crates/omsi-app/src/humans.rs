@@ -5881,8 +5881,9 @@ pub struct Humans {
     /// (`set_player_doors`).
     pub(crate) stand_in_doors: (bool, bool),
     /// The stop `stand_in` serves where it stands (its timetable's, at its station; as of the
-    /// last tick): the one the people's holds of the player's bus keep it at (`holds`), and
-    /// while there is one the player's bus takes people (`BusNow::boards`).
+    /// last tick): while there is one the player's bus takes people (`BusNow::boards`). The
+    /// people's holds of the player's bus keep `stand_in` as a timetable bus's keep it, for the
+    /// stop they walk up from (`holds`; `BusService::hold` keeps it only at the stop it serves).
     pub(crate) stand_in_stop: Option<i64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,

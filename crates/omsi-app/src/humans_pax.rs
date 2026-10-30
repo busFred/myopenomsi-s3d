@@ -879,8 +879,9 @@ pub(super) fn at_stop(id: i64, stop: &PaxStop, terminus: Option<&str>, takes: &T
 pub(super) enum Fit {
     /// Its terminus is on their line record (sub_61c33c: Omsi.exe's only test).
     Terminus,
-    /// The player's duty takes them where they are going: its trip's terminus is on the
-    /// record, or their destination is a later stop of the trip than theirs.
+    /// The player's duty takes them where they are going: they wait at a stop object its trip
+    /// still calls at, and its trip's terminus is on their record or their destination is a
+    /// later stop of the trip.
     Duty,
     /// They have no line record: the first bus listed (sub_61c33c).
     Any,
@@ -901,10 +902,15 @@ pub(super) fn best_bus(buses: impl Iterator<Item = (BusId, Fit, f64)>) -> Option
 /// the timetable's termini. A depot file that spells them another way (another case, a
 /// shortened name, the terminus of another variant of the line, a file made for another
 /// map) left the people at every stop of a duty waiting for another bus. The duty knows
-/// the trip: whoever it takes where they are going gets on.
+/// the trip: whoever waits at a stop object the trip still calls at (by its id: the
+/// timetable's station, which a duty's people belong to) and goes where it goes gets on.
+/// Not at another object of the stop's name - another line's platform, often in the same
+/// kerb: its people wait for their own line (Omsi.exe's line record of their stop does not
+/// list this trip's terminus; SUMO: a person waits at their own busStop and boards only a
+/// vehicle stopping there), and taken by the duty they walked up to the player's bus where
+/// it served no stop of theirs and were left behind or stood in its way.
 pub(super) fn fit(
     id: i64,
-    stop: &PaxStop,
     dest: Option<&str>,
     termini: &HashSet<String>,
     terminus: &str,
@@ -924,16 +930,17 @@ pub(super) fn fit(
     if !trip.public {
         return None;
     }
+    // this stop object where the trip still calls at it (from the one before the stop the duty
+    // is due at: it counts a stop served 35 m on)
+    let here = (next.saturating_sub(1)..trip.stops.len()).find(|k| {
+        let (sid, _, stops) = &trip.stops[*k];
+        *stops && *sid == id
+    })?;
     if termini.contains(&trip.terminus) {
         return Some(Fit::Duty);
     }
+    // their destination after it
     let dest = dest?.trim();
-    // this stop where the trip still calls at it (from the one before the stop the duty is
-    // due at: it counts a stop served 35 m on), and their destination after it
-    let here = (next.saturating_sub(1)..trip.stops.len()).find(|k| {
-        let (sid, name, stops) = &trip.stops[*k];
-        *stops && (*sid == id || stop.is_named(name))
-    })?;
     trip.stops[here + 1..]
         .iter()
         .any(|(_, name, stops)| *stops && name.trim() == dest)
@@ -1300,7 +1307,6 @@ impl Humans {
                 }
                 let f = fit(
                     stop,
-                    s,
                     p.dest.as_deref(),
                     termini,
                     bn.terminus.as_deref()?,
@@ -1879,17 +1885,6 @@ impl Humans {
             }
             if any_exit {
                 self.holds.push((id, None, 2.5));
-            }
-            // (the player's bus is held at the stop the bus driving it serves, `stand_in_stop`,
-            // for whoever walks up to it whatever stop they came from: its duty takes the people
-            // of every stop named as its trip's, `fit` - held only for their own stop, the bus
-            // left with them on the way and they stood in its way for good; never where it is
-            // at no stop of its own, queued behind another bus)
-            if bn.id == BusId::Player {
-                if let Some(s) = self.stand_in_stop.filter(|_| !stops.is_empty()) {
-                    self.holds.push((id, Some(s), 2.5));
-                }
-                continue;
             }
             for s in stops {
                 self.holds.push((id, Some(s), 2.5));
@@ -3977,7 +3972,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -3990,7 +3984,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4001,7 +3994,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("12"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4013,7 +4005,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Waldweg"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4024,7 +4015,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Depot"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4036,7 +4026,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4047,7 +4036,6 @@ mod tests {
         assert_eq!(
             fit(
                 20,
-                &test_stop("Am Teich", "Am Teich"),
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4055,23 +4043,36 @@ mod tests {
             ),
             None
         );
-        // another platform of the stop's name will do
+        // nor at another object of the stop's name (another line's platform): its people
+        // wait for their own line, whatever the trip's terminus or their destination
+        for termini in [&["Waldweg"][..], &["Endstation"][..]] {
+            assert_eq!(
+                fit(
+                    14,
+                    Some("Kirche"),
+                    &set(termini),
+                    shown,
+                    &duty(0, false)
+                ),
+                None
+            );
+        }
+        // ... unless its line record lists the depot file's terminus: the bus is theirs as
+        // in Omsi.exe
         assert_eq!(
             fit(
                 14,
-                &test_stop("Bauernhof 2", "Bauernhof"),
                 Some("Kirche"),
-                &set(&["Waldweg"]),
+                &set(&["Endstation Grundorf"]),
                 shown,
                 &duty(0, false)
             ),
-            Some(Fit::Duty)
+            Some(Fit::Terminus)
         );
         // the depot file's terminus on the record: the bus is theirs as in Omsi.exe
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation Grundorf"]),
                 shown,
@@ -4088,7 +4089,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4123,7 +4123,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4145,7 +4144,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4156,7 +4154,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation Grundorf"]),
                 shown,
@@ -4173,7 +4170,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 "Endstation",
@@ -4184,7 +4180,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 "Endstation Grundorf",
