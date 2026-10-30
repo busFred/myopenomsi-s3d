@@ -242,7 +242,7 @@ pub const PLAYER_ID_BASE: u64 = 1 << 62;
 /// `player_seen`), and its grant is not read. The stand-in decides as the driver it is: its own
 /// AI claim, resolved against everybody else's claims without its player's (`tick`), gives the
 /// grant it drives by; nobody else sees that claim. The frames where the player's claim names
-/// another junction or way through than the stand-in's own are counted (`stand_in_unmatched`):
+/// another junction or way through than the stand-in's own are counted by kind (`ClaimsApart`):
 /// there a user's claim, filed from the indicator, says other than where the bus goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StandIn {
@@ -821,11 +821,25 @@ pub struct Simulation {
     /// The AI vehicle that drives a player's vehicle, if one (`StandIn`; set by the caller
     /// each frame, never by a recording).
     pub stand_in: Option<StandIn>,
-    /// Frames in which the stand-in's player claim - filed from the indicator, as a user's -
-    /// named another junction or another way through than the stand-in's own claim, or one of
-    /// the two was filed without the other (`StandIn`; diagnostics: where a real drive's claim
-    /// says other than where the bus goes).
-    pub stand_in_unmatched: u32,
+    /// How the stand-in's player claim - filed from the indicator, as a user's - and the
+    /// stand-in's own claim differ this frame, if they do (`StandIn`; diagnostics: where a real
+    /// drive's claim says other than where the bus goes), and the frames of each kind so far
+    /// (indexed by `ClaimsApart as usize`).
+    pub stand_in_apart: Option<ClaimsApart>,
+    pub stand_in_apart_frames: [u32; 4],
+}
+
+/// How a stand-in's player claim (from the indicator, as a user's) and its own claim differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimsApart {
+    /// About another junction.
+    Junction = 0,
+    /// About the same junction, another way through it (its first piece).
+    Way = 1,
+    /// Only the player's claim is filed.
+    PlayerOnly = 2,
+    /// Only the stand-in's own is filed.
+    OwnOnly = 3,
 }
 
 /// The phases of `Simulation::tick` timed in `phase_secs`.
@@ -927,7 +941,8 @@ impl Simulation {
             foe_trace: Vec::new(),
             phase_secs: [0.0; PHASES.len()],
             stand_in: None,
-            stand_in_unmatched: 0,
+            stand_in_apart: None,
+            stand_in_apart_frames: [0; 4],
         }
     }
 
@@ -1809,11 +1824,19 @@ impl Simulation {
             });
         }
         // (where the player's claim, filed as a user's, says other than the stand-in's own)
+        self.stand_in_apart = None;
         if let Some((_, pid)) = stand_in {
             let mine = stand_in_own.as_ref().map(|c| (c.junction, c.movement));
             let players = claims.iter().find(|c| c.vehicle == player_claim(pid)).map(|c| (c.junction, c.movement));
-            if mine != players {
-                self.stand_in_unmatched += 1;
+            self.stand_in_apart = match (players, mine) {
+                (Some(a), Some(b)) if a.0 != b.0 => Some(ClaimsApart::Junction),
+                (Some(a), Some(b)) if a.1 != b.1 => Some(ClaimsApart::Way),
+                (Some(_), None) => Some(ClaimsApart::PlayerOnly),
+                (None, Some(_)) => Some(ClaimsApart::OwnOnly),
+                _ => None,
+            };
+            if let Some(k) = self.stand_in_apart {
+                self.stand_in_apart_frames[k as usize] += 1;
             }
         }
         for (i, standing) in standing_now {

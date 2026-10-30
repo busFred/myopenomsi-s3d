@@ -91,7 +91,7 @@ struct Seen {
     own_min_speed: f32,
     other_min_speed: f32,
     /// Frames the player's claim (filed from the indicator, as a user's) and the stand-in's
-    /// own named another junction or way, or only one was filed (`stand_in_unmatched`).
+    /// own named another junction or way, or only one was filed (`stand_in_apart_frames`).
     unmatched: u32,
 }
 
@@ -132,7 +132,7 @@ fn run(net: &Network, mut vehicles: Vec<Vehicle>, secs: f32, stand_in: bool) -> 
         }
         t += DT;
     }
-    seen.unmatched = sim.stand_in_unmatched;
+    seen.unmatched = sim.stand_in_apart_frames.iter().sum();
     seen
 }
 

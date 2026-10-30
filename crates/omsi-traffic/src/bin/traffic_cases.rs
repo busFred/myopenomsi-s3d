@@ -6094,6 +6094,20 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the
         // body's separation from its box, the step, and what the people test reads of them)
         if args.iter().any(|a| a == "--people") {
+            // (with `--player`: everybody on foot within 25 m of each player's box as well - a
+            // harness run records the AI bus driving the player's bus as the player only)
+            if args.iter().any(|a| a == "--player") {
+                for pl in &r.sim.players {
+                    let b = pl.obb(0.0, 0.0);
+                    for (k, p) in r.sim.people.iter().enumerate() {
+                        if (p.pos - pl.pos).truncate().length() > 25.0 || (p.pos.z - pl.pos.z).abs() > 2.5 {
+                            continue;
+                        }
+                        let sep = omsi_sim::collision::Obb::point(p.pos, PERSON_RADIUS).separation(&b);
+                        println!("t={t:.1}   person {k} id {:?} near player {} ({:.2},{:.2}) vel ({:.2},{:.2}) sep {sep:.2} still {:.1} crossing {} kerb {} bus {} stop {:?} approach {:?}", p.id, pl.id, p.pos.x, p.pos.y, p.vel.x, p.vel.y, p.still, p.on_crossing, p.at_kerb, p.waiting_for_bus, p.waits_at, p.approach);
+                    }
+                }
+            }
             for &i in &found {
                 let v = &r.vehicles[i];
                 let b = v.obb();
