@@ -1394,13 +1394,14 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
 /// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edges`
 /// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path or an
 /// editor-only spline's lane as the road pieces it joins), side by side the narrowest of the
-/// lanes from its rotation point to its aim (`AiBody::steer_span`,
-/// `AiState::lane_edges_between`): the body spans them, and a narrower piece ahead is kept to
-/// before the rotation point reaches it. Where the map does not tell, no edge: the swept band
-/// centred on the way.
+/// lanes from the vehicle's rear end (its last section's, `AiState::rear`) to where it steers
+/// to (`AiBody::steer_span`, `AiState::lane_edges_between`): the body and its sections lie on
+/// those pieces, a narrower one ahead is kept to before the rotation point reaches it, and one
+/// the rear is still on until the rear has left it. Where the map does not tell, no edge: the
+/// swept band centred on the way.
 fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
     let (from, to) = body.steer_span(state.speed);
-    state.lane_edges_between(net, from, to)
+    state.lane_edges_between(net, from.min(-state.rear), to)
 }
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
