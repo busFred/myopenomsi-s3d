@@ -449,6 +449,17 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
 /// Seconds between two turns round beside a standing vehicle, at least.
 const PED_TURN_EVERY: f32 = 5.0;
 
+/// Whether the turn cap (`PED_TURN_EVERY`) applies to somebody in `state`: it stops pacing - a
+/// walker turning to and fro beside a standing box looking for a way past - not a kerb waiter
+/// going to the place their queue gave them (`PedWalk::spot`): the queue moving up turns them
+/// round as often as it moves, each time towards a place that is theirs (SUMO: a waiting person
+/// walks to its waiting position). With the cap, a waiter whose place moved up just after they
+/// had stepped onto their old one stood up to 5 s short of the new one (BeijingCity c08, #483 at
+/// the kerb of lane 2979 beside the cars at its light, 0.95 m off for 4 s).
+fn turn_capped(state: &State) -> bool {
+    !matches!(state, State::Strolling(w) if w.spot.is_some())
+}
+
 /// Whether somebody who last turned round `since` s ago may turn again.
 fn may_turn(since: f32) -> bool {
     since >= PED_TURN_EVERY
@@ -9901,7 +9912,7 @@ impl Humans {
             }
         }
         // beside a standing vehicle nobody turns round more than once in
-        // PED_TURN_EVERY seconds (they stand instead)
+        // PED_TURN_EVERY seconds (they stand instead; `turn_capped`)
         for i in 0..self.people.len() {
             if !matches!(self.people[i].state, State::Strolling(_)) || remove.contains(&i) {
                 continue;
@@ -9918,7 +9929,7 @@ impl Humans {
             let dir = v / speed;
             if p.want_dir.dot(dir) < -0.2 {
                 // (not on a crossing: turned back by the change, they go at once)
-                if near_box && !p.on_crossing && !may_turn(p.turned) {
+                if near_box && !p.on_crossing && turn_capped(&p.state) && !may_turn(p.turned) {
                     wants[i].vel = DVec2::ZERO;
                     continue;
                 }
@@ -15444,6 +15455,16 @@ mod ped_tests {
         // moved off: it is free again
         queues.stand([(gone, best + DVec2::new(0.0, -3.0))].into_iter());
         assert_eq!(area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).map(|u| u.0), Some(best));
+    }
+
+    #[test]
+    fn p3_2b_a_kerb_waiter_going_to_their_place_is_not_turn_capped() {
+        // the cap stops pacing beside a standing box; a waiter walking to the place the queue
+        // gave them may turn as often as the queue moves up
+        let mut walk = across();
+        assert!(turn_capped(&State::Strolling(walk.clone())));
+        walk.spot = Some(KerbPlace { leg: 0, next: 3, pos: DVec2::ZERO, row: 0, lat: 0.0, key: 0 });
+        assert!(!turn_capped(&State::Strolling(walk)));
     }
 
     #[test]
