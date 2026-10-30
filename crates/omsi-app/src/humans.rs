@@ -5880,8 +5880,9 @@ pub struct Humans {
     /// (any entry, any exit; `buses_now`): the harness opens the player's doors by them
     /// (`set_player_doors`).
     pub(crate) stand_in_doors: (bool, bool),
-    /// The stop `stand_in` serves where it stands this tick (its timetable's, at its station):
-    /// the one the people's holds of the player's bus keep it at (`holds`).
+    /// The stop `stand_in` serves where it stands (its timetable's, at its station; as of the
+    /// last tick): the one the people's holds of the player's bus keep it at (`holds`), and
+    /// while there is one the player's bus takes people (`BusNow::boards`).
     pub(crate) stand_in_stop: Option<i64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
@@ -8334,7 +8335,10 @@ impl Humans {
                 speed,
                 entry_open,
                 exit_open,
-                boards: true,
+                // (driven by a timetable bus, `stand_in`: while that bus serves its stop, as a
+                // timetable bus's own `boards` - else people walked up to it as it pulled away,
+                // stood in its way and held it for good)
+                boards: self.stand_in.is_none() || self.stand_in_stop.is_some(),
                 boarding_stop: None,
                 kerb: None,
                 interior: b.interior_light(),
