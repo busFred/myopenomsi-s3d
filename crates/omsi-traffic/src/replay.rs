@@ -507,6 +507,8 @@ impl Replay {
                 self.vehicles.push(v);
             } else if now > deadline {
                 self.dropped_spawns += 1;
+                let by = self.blocker(&v);
+                log::warn!("replay: spawn of {} on lane {} s {:.1} dropped at {now:.1} s: its place is taken by {by:?}", v.id, v.state.lane, v.state.s);
             } else {
                 self.pending_spawns.push((deadline, v));
             }
@@ -517,17 +519,21 @@ impl Replay {
     /// boxes in the plan, at about the same height) or stand less than `SPAWN_GAP` behind
     /// one on its lane.
     fn fits(&mut self, v: &Vehicle) -> bool {
+        self.blocker(v).is_none()
+    }
+
+    /// The vehicle on the road whose place `v` would take (`fits`; diagnostics: its id).
+    fn blocker(&mut self, v: &Vehicle) -> Option<u64> {
         let mut v = v.clone();
         self.sim.update_positions(&self.net, std::slice::from_mut(&mut v));
         self.sim.update_positions(&self.net, &mut self.vehicles);
         let b = v.obb();
-        self.vehicles.iter().all(|o| {
+        self.vehicles.iter().find(|o| {
             if (o.pos.z - v.pos.z).abs() <= 3.0 && o.obb().overlaps_plan(&b) {
-                return false;
+                return true;
             }
-            let ahead = o.state.lane == v.state.lane && o.state.s >= v.state.s && (o.state.s - o.state.rear) - (v.state.s + v.state.front) < SPAWN_GAP;
-            !ahead
-        })
+            o.state.lane == v.state.lane && o.state.s >= v.state.s && (o.state.s - o.state.rear) - (v.state.s + v.state.front) < SPAWN_GAP
+        }).map(|o| o.id)
     }
 
     fn frame(&mut self, f: &Frame) {

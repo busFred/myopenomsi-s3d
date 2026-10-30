@@ -4498,6 +4498,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // (diagnostics: per vehicle the seconds near the player, standing by what held it, on stderr: THRU)
     let mut thru: BTreeMap<u64, (f32, BTreeMap<String, f32>, usize, f64, f64)> = BTreeMap::new();
     let mut thru_t = r.sim.time;
+    let mut thru_root: BTreeMap<u64, (f32, usize, String)> = BTreeMap::new();
     let mut prev_front: HashMap<u64, glam::DVec2> = HashMap::new();
     let mut lit: Vec<StopLine> = Vec::new();
     let mut lit_lanes = 0;
@@ -4784,6 +4785,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             Vec::new()
         };
         let tdt = (r.sim.time - thru_t).clamp(0.0, 1.0) as f32;
+        let thru_ids: HashMap<u64, usize> = r.vehicles.iter().enumerate().map(|(k, v)| (v.id, k)).collect();
         thru_t = r.sim.time;
         // ---- every frame: the odometers and the stop lines
         for ll in &lit {
@@ -4826,7 +4828,31 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 let e = thru.entry(v.id).or_insert((0.0, BTreeMap::new(), 0, r.sim.time, 0.0));
                 e.0 += tdt;
                 if st.speed < 0.1 {
-                    *e.1.entry(format!("{}{}{}", why_name(v.last.why), if st.change.is_some() { "+chg" } else { "" }, if v.lane_end_stop.is_some() { "+les" } else { "" })).or_default() += tdt;
+                    let label = |o: &omsi_traffic::sim::Vehicle| format!("{}{}{}", why_name(o.last.why), if o.state.change.is_some() { "+chg" } else { "" }, if o.lane_end_stop.is_some() { "+les" } else { "" });
+                    let mut key = label(v);
+                    if v.last.why == Why::Lead {
+                        let (mut cur, mut hops) = (v, 0);
+                        loop {
+                            hops += 1;
+                            match cur.last.lead_id.and_then(|id| thru_ids.get(&id)).map(|&k| &r.vehicles[k]) {
+                                Some(l) if hops < 40 && l.state.speed < 0.1 && l.last.why == Why::Lead => cur = l,
+                                Some(l) if l.state.speed < 0.1 => {
+                                    key = format!("lead>{}", label(l));
+                                    let q = thru_root.entry(l.id).or_insert((0.0, l.state.lane, String::new()));
+                                    q.0 += tdt;
+                                    q.1 = l.state.lane;
+                                    q.2 = label(l);
+                                    break;
+                                }
+                                Some(_) => {
+                                    key = "lead>moving".to_string();
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    *e.1.entry(key).or_default() += tdt;
                 }
                 e.2 = st.lane;
                 e.4 = r.sim.time;
@@ -5119,6 +5145,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
     for (id, (near_s, stood, lane, t0, t1)) in &thru {
         eprintln!("THRU {} #{id} gain {:.0} near {:.0} t {:.0}-{:.0} lane {lane} stood {:?}", sc.name, gain.get(id).copied().unwrap_or(0.0), near_s, t0, t1, stood);
+    }
+    for (id, (q, lane, why)) in thru_root.iter().filter(|x| x.1 .0 >= 5.0) {
+        eprintln!("ROOT {} #{id} queue_s {q:.0} lane {lane} why {why}", sc.name);
     }
     // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
     // as loaded at the end of the run: how many such places the map has here)
@@ -6260,6 +6289,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 let p = omsi_traffic::perception::perceive(&r.net, &r.sim, &r.vehicles, i);
                 for nb in [p.left, p.right].into_iter().flatten() {
                     println!("t={t:.1}   nb of #{}: lane {} dir {} ahead {:?} behind {:?} by {:?} runs_on {:.1} foreign {} allowed {}", r.vehicles[i].id, nb.lane, nb.dir, nb.ahead, nb.behind, nb.behind_id.map(|k| r.vehicles[k].id), nb.runs_on, nb.foreign, nb.allowed);
+                    println!("t={t:.1}   nb of #{}: lane {} {}", r.vehicles[i].id, nb.lane, omsi_traffic::plan::strategic_debug(&r.net, &r.sim, &r.vehicles, &r.vehicles[i], &p, &nb));
                 }
             }
         }
