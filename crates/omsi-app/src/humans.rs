@@ -5885,6 +5885,13 @@ pub struct Humans {
     /// people's holds of the player's bus keep `stand_in` as a timetable bus's keep it, for the
     /// stop they walk up from (`holds`; `BusService::hold` keeps it only at the stop it serves).
     pub(crate) stand_in_stop: Option<i64>,
+    /// The stop `stand_in` boards at as its own `BusNow` names it (`boarding_stop`: its
+    /// timetable's at its station standing, else a stop object it stands at; as of the last
+    /// tick): the player's bus names it too, so that the doors' pavements are worked out as for
+    /// a timetable bus (`kerb_doors`). Riders stepping off with none - the next stop object of
+    /// their destination's name has no pavement (`walk_street`) - stood at the door inside the
+    /// player's bus's box (`State::Standing`, until the player is gone) and held the stand-in.
+    pub(crate) stand_in_boarding: Option<i64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -6256,6 +6263,7 @@ impl Humans {
             stand_in: None,
             stand_in_doors: (false, false),
             stand_in_stop: None,
+            stand_in_boarding: None,
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -8358,7 +8366,11 @@ impl Humans {
                 // timetable bus's own `boards` - else people walked up to it as it pulled away,
                 // stood in its way and held it for good)
                 boards: self.stand_in.is_none() || self.stand_in_stop.is_some(),
-                boarding_stop: None,
+                // (driven by a timetable bus: the stop that bus boards at, as its own `BusNow`
+                // has it, so that its riders step off onto that stop's pavement or a door's
+                // kerb, else ride on, `kerb_doors` - as the timetable bus's own riders do; the
+                // user's bus names none)
+                boarding_stop: self.stand_in.and(self.stand_in_boarding),
                 kerb: None,
                 interior: b.interior_light(),
                 air: CabinAir::of(b),
@@ -8381,6 +8393,7 @@ impl Humans {
             let mut visits = HashMap::new();
             self.stand_in_doors = (false, false);
             self.stand_in_stop = None;
+            self.stand_in_boarding = None;
             for c in t.cars.iter().filter(|c| c.serves_stops()) {
                 let from_eye = self.eye.map(|e| (c.vehicle.position - e.pos).length()).unwrap_or(f64::MAX);
                 if (c.vehicle.position - near).length().min(from_eye) > 400.0 && !riding.contains(&c.id) {
@@ -8436,6 +8449,7 @@ impl Humans {
                 if self.stand_in == Some(c.id) {
                     self.stand_in_doors = (entry_open.iter().any(|o| *o), exit_open.iter().any(|o| *o));
                     self.stand_in_stop = boarding_stop;
+                    self.stand_in_boarding = stop;
                     continue;
                 }
                 self.seats
