@@ -3122,7 +3122,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 // else it is told not to brake and I change in behind it. Asked when it could
                 // not, the second follower of a chain would stand behind my rear closer than the
                 // gap the acceptance needs at rest, and all would stand)
-                let reach = (end_dist - last_stop_room(net, me, &nb)).max(0.0);
+                // (a changer that stands goes on to no stop: held at its last-resort stop within
+                // `REST_SHORT` of it, or behind what stands before it, it does not creep the rest -
+                // SUMO's decelGap reads the changer's planned speed, here 0 - so a follower already
+                // standing inside the gap is not asked to open it: asked, it stood behind the
+                // changer for as long as the changer stood, a queue back over the junction behind,
+                // the Jiangzhaikou exit hold, game run p3p32 #2260 behind #2261 on 1666/1668)
+                let reach = if planned < STANDING_SPEED { 0.0 } else { (end_dist - last_stop_room(net, me, &nb)).max(0.0) };
                 let b_f = vehicles.get(f).map_or(dp.comfort_brake, |o| o.params.comfort_brake) * HELP_DECEL_FACTOR;
                 let can_open = gap + reach - vb * vb / (2.0 * b_f.max(0.1)) >= nb.behind_min_gap;
                 if gap > 0.0 && can_open {
