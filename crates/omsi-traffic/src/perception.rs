@@ -2351,6 +2351,12 @@ fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usi
     let lead = match c.round {
         None => cor.parked,
         Some(id) if id >= crate::sim::PLAYER_ID_BASE => cor.player.filter(|h| matches!(h.what, Seen::Player(p) if crate::sim::PLAYER_ID_BASE + p as u64 == id)),
+        // (a vehicle that has since become a player's stand-in, `sim::StandIn`: it is that
+        // player now, on no lane of the others)
+        Some(id) if sim.stand_in.is_some_and(|s| s.vehicle == id) => {
+            let player = sim.stand_in.map(|s| s.player);
+            cor.player.filter(|h| matches!(h.what, Seen::Player(p) if Some(p) == player))
+        }
         Some(id) => {
             // (that vehicle alone: another may have come nearer)
             let j = vehicles.iter().position(|o| o.id == id)?;
