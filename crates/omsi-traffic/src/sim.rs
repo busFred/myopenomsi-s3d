@@ -404,6 +404,10 @@ pub struct Vehicle {
     /// diagnostics: `traffic_cases watch` and its hold events).
     #[serde(skip)]
     pub change_for: Option<crate::plan::ChangeWhy>,
+    /// The check that dropped the driver's last lane change this frame (`Plan::abort_why`;
+    /// diagnostics: `traffic_cases ab`'s ABORT events).
+    #[serde(skip)]
+    pub aborted_for: Option<crate::plan::AbortWhy>,
     /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
@@ -696,6 +700,7 @@ impl Vehicle {
             lane_end_stop: None,
             dead_end_held: 0.0,
             change_for: None,
+            aborted_for: None,
             unheld_for: 0.0,
             zip_behind: None,
             refused_last: false,
@@ -807,6 +812,11 @@ pub const STRATEGIC_LONG_HOLD: f32 = 60.0;
 /// Holds before a dead lane's end that lasted `STRATEGIC_LONG_HOLD` or longer, every simulation
 /// of the process (`traffic_cases ab`'s `strategic_long_holds`).
 pub static STRATEGIC_LONG_HOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The drops of `CHANGES_ABORTED` by the check that dropped them (`plan::AbortWhy`) and what the
+/// change was for (`plan::ChangeWhy`, 6: not known), every simulation of the process (diagnostics,
+/// `traffic_cases ab`).
+pub static CHANGES_ABORTED_BY: [[std::sync::atomic::AtomicU64; 7]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 5];
 
 /// Lane changes of the drivers' own dropped while signalling because their gap check failed
 /// again (`Plan::abort_change`; SUMO's `checkChange` every step), every simulation of the process
@@ -2305,9 +2315,14 @@ impl Simulation {
             self.changes_started.push((to, s_to));
             true
         };
+        v.aborted_for = None;
         if plan.abort_change && v.state.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
             v.state.drop_change();
             CHANGES_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(w) = plan.abort_why {
+                CHANGES_ABORTED_BY[w as usize][v.change_for.map_or(6, |c| c as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            v.aborted_for = plan.abort_why;
         }
         match plan.start {
             Some(Start::Change { to, dir }) => {

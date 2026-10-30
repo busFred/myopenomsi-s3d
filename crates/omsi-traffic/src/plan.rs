@@ -102,6 +102,8 @@ pub struct Plan {
     /// from there does either (a plain change that has one goes on as that, `start`; counted,
     /// `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
+    /// Which check dropped it (`AbortWhy`; diagnostics, `sim::CHANGES_ABORTED_BY`).
+    pub abort_why: Option<AbortWhy>,
     /// The last-resort stop before a lane's end, or a dead lane's end for a blocked urgent
     /// strategic change, placed this frame (the odometer where the front stops,
     /// `Vehicle::lane_end_stop`).
@@ -729,6 +731,19 @@ pub enum ChangeWhy {
     KeepSide = 4,
     /// Towards the lane that leads to a random car's trip end (`strategic_desire`).
     Strategic = 5,
+}
+
+/// Which check dropped a signalling lane change (`Plan::abort_why`): the follower there misses
+/// the accepted gap, the leader there is too close (or the lane is another way's), somebody is on
+/// the move, a plain change's move swept again no longer clears (no step-out from there does), a
+/// bypass's swept again no longer clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortWhy {
+    GapBehind = 0,
+    GapAhead = 1,
+    People = 2,
+    PlainSweep = 3,
+    BypassSweep = 4,
 }
 
 /// A turn lane is never left within this many metres (m) of its junction, nor one taken
@@ -2762,7 +2777,17 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
                 }
             }
-            out.abort_change = !gap_accepted(me, &nb) || people_on_move(net, sim, me, &nb);
+            let (ok_behind, ok_ahead) = gap_parts(me, &nb);
+            out.abort_why = if !ok_behind {
+                Some(AbortWhy::GapBehind)
+            } else if !ok_ahead || nb.foreign {
+                Some(AbortWhy::GapAhead)
+            } else if people_on_move(net, sim, me, &nb) {
+                Some(AbortWhy::People)
+            } else {
+                None
+            };
+            out.abort_change = out.abort_why.is_some();
             // (a bypass from rest also sweeps its move again, as it did at its start,
             // `bypass_start`: every body near, not only the target lane's follower - one that came
             // to stand in the swept band or alongside since; SUMO checks every sublane it moves
@@ -2795,7 +2820,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
                     match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
                         Some(step_out) if out.start.is_none() => out.start = Some(step_out),
-                        _ => out.abort_change = true,
+                        _ => (out.abort_change, out.abort_why) = (true, Some(AbortWhy::PlainSweep)),
                     }
                 }
             }
@@ -2807,6 +2832,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     Some(b) if b.lead.speed < STANDING_SPEED => bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none(),
                     b => !bypass_side(net, &before, &nb).is_some_and(|side| bypass_move_clear(net, sim, vehicles, &before, b.map_or(&[][..], |b| &b.ahead[..]), p.road_left, side, b.map(|b| &b.lead), c.length, c.full_lock)),
                 };
+                if out.abort_change {
+                    out.abort_why = Some(AbortWhy::BypassSweep);
+                }
             }
         }
     }

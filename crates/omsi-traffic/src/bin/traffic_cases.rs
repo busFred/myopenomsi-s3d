@@ -4495,6 +4495,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut open: BTreeMap<u64, Vec<HeadTally>> = BTreeMap::new();
     let mut prev_odo: HashMap<u64, f32> = HashMap::new();
     let mut gain: BTreeMap<u64, f32> = BTreeMap::new();
+    // (diagnostics: per vehicle the seconds near the player, standing by what held it, on stderr: THRU)
+    let mut thru: BTreeMap<u64, (f32, BTreeMap<String, f32>, usize, f64, f64)> = BTreeMap::new();
+    let mut thru_t = r.sim.time;
     let mut prev_front: HashMap<u64, glam::DVec2> = HashMap::new();
     let mut lit: Vec<StopLine> = Vec::new();
     let mut lit_lanes = 0;
@@ -4573,6 +4576,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
             }
             ex.lane_revisits = revisits.entries;
+            for v in r.vehicles.iter().filter(|v| v.aborted_for.is_some() && near(v.pos)) {
+                ex.events.push(format!("ABORT {} t={now:.1} #{} lane {} s {:.1} v {:.1} by {:?} for {:?} lead {:?} gap {:?}", sc.name, v.id, v.state.lane, v.state.s, v.state.speed, v.aborted_for, v.change_for, v.last.lead_id, v.last.lead.map(|l| l.gap)));
+            }
             ex.revisit_vehicles = revisits.vehicles.len() as u64;
             for (i, v) in r.vehicles.iter().enumerate() {
                 if v.ease_for.is_none() || v.state.speed >= 0.3 {
@@ -4777,6 +4783,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
         } else {
             Vec::new()
         };
+        let tdt = (r.sim.time - thru_t).clamp(0.0, 1.0) as f32;
+        thru_t = r.sim.time;
         // ---- every frame: the odometers and the stop lines
         for ll in &lit {
             let Some(state) = r.sim.lights.get(ll.light.0).map(|c| c.state(ll.light.1)) else { continue };
@@ -4813,6 +4821,15 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             prev_odo.insert(v.id, st.odometer);
             if !near(v.pos) {
                 continue;
+            }
+            {
+                let e = thru.entry(v.id).or_insert((0.0, BTreeMap::new(), 0, r.sim.time, 0.0));
+                e.0 += tdt;
+                if st.speed < 0.1 {
+                    *e.1.entry(format!("{}{}{}", why_name(v.last.why), if st.change.is_some() { "+chg" } else { "" }, if v.lane_end_stop.is_some() { "+les" } else { "" })).or_default() += tdt;
+                }
+                e.2 = st.lane;
+                e.4 = r.sim.time;
             }
             // (`--pedtouch`, the round-6 reviewers' probe: a moving vehicle's body over a
             // person's disc, 0.28 m, every frame, on stderr)
@@ -5100,6 +5117,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
         }
     }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
+    for (id, (near_s, stood, lane, t0, t1)) in &thru {
+        eprintln!("THRU {} #{id} gain {:.0} near {:.0} t {:.0}-{:.0} lane {lane} stood {:?}", sc.name, gain.get(id).copied().unwrap_or(0.0), near_s, t0, t1, stood);
+    }
     // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
     // as loaded at the end of the run: how many such places the map has here)
     {
@@ -5416,6 +5436,11 @@ fn ab(args: &[String]) -> Res<()> {
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {}, strategic {})", c(0), c(1), c(2), c(3), c(4), c(5));
         println!("(lane changes dropped while signalling, whole map: change_aborted {})", omsi_traffic::sim::CHANGES_ABORTED.load(std::sync::atomic::Ordering::Relaxed));
+        {
+            let by = &omsi_traffic::sim::CHANGES_ABORTED_BY;
+            let row = |k: usize| by[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/");
+            println!("(change_aborted by check, each by what the change was for le/tu/ob/sg/ks/st/unknown: gap_behind {} gap_ahead {} people {} plain_sweep {} bypass_sweep {})", row(0), row(1), row(2), row(3), row(4));
+        }
         println!("(in-lane offset, whole map: lane_offset_s {:.0})", omsi_traffic::sim::LANE_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
     }
     {
