@@ -2521,20 +2521,20 @@ fn claim_place(p: &Person, d: &mut Decision, queues: &Queues, claimed: &mut Hash
         State::Strolling(w) => w.spot,
         _ => None,
     };
-    if !claim_spot(p.id, old, walk, queues, claimed) {
+    if !claim_spot(p.id, p.position.z, old, walk, queues, claimed) {
         d.want.vel = DVec2::ZERO;
     }
 }
 
 /// `claim_place` for the walk `walk` of person `id`, whose place was `old`: false when the new
 /// place was taken back.
-fn claim_spot(id: u32, old: Option<KerbPlace>, walk: &mut PedWalk, queues: &Queues, claimed: &mut HashMap<(i64, i64), Vec<(u32, DVec2)>>) -> bool {
+fn claim_spot(id: u32, z: f64, old: Option<KerbPlace>, walk: &mut PedWalk, queues: &Queues, claimed: &mut HashMap<(i64, i64), Vec<(u32, DVec2)>>) -> bool {
     let Some(new) = walk.spot else { return true };
     if old.is_some_and(|o| (o.pos - new.pos).length() < 1e-6) {
         Queues::take(claimed, id, new.pos);
         return true;
     }
-    if Queues::free_in(claimed, new.pos, id) && queues.free(new.pos, id) {
+    if Queues::free_in(claimed, new.pos, id) && queues.free(new.pos, z, id) {
         Queues::take(claimed, id, new.pos);
         return true;
     }
@@ -4304,7 +4304,7 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                 // (somebody standing in a lane's footprint already - put down on a crossing and turned
                 // back - is not held to a way off the lanes from there: out of it comes first)
                 let reached = |q: DVec2| !off(me.pos) || way_off_lanes(&[me.pos, q], &off);
-                let usable = |q: DVec2| at.queues.free(q, me.id) && clear_for_waiting(net, q.extend(z)) && reached(q);
+                let usable = |q: DVec2| at.queues.free(q, z, me.id) && clear_for_waiting(net, q.extend(z)) && reached(q);
                 let stay = Some(grid_point(grid_index(me.pos))).filter(|q| usable(*q));
                 let near = || ped.and_then(|p| nearest_free_place(p, net, at.queues, me.pos.extend(z), me.pos, KERB_SPOT_REACH, me.id));
                 let spot = || Some(grid_point(grid_index(kerb_spot(ped, net, &way, next, 0.0, KERB_STEP_BACK)))).filter(|q| usable(*q));
@@ -4415,6 +4415,8 @@ struct KerbArea {
     corner: Option<Vec<DVec2>>,
     /// The node's position.
     at: DVec2,
+    /// The node's height (`Queues::free`: who stands at its level).
+    z: f64,
 }
 
 /// A crossing's frame at its kerb: its start, the way across, its right, and the lateral range of
@@ -4464,7 +4466,7 @@ impl KerbArea {
         let mut best: Option<((bool, bool, u32, f64), DVec2, u32, f64)> = None;
         for &q in &self.places {
             let (row, off) = frame.rank(q);
-            if row >= before || !queues.free(q, id) {
+            if row >= before || !queues.free(q, self.z, id) {
                 continue;
             }
             let behind = (frame.start - q).dot(frame.fwd) > depth + 1e-6;
@@ -4496,7 +4498,7 @@ fn on_footprint(l: &omsi_sim::traffic::Lane, q: DVec3) -> bool {
 /// The waiting area of pedestrian node `node` (`KerbArea`).
 fn node_area(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, node: KerbKey) -> KerbArea {
     let at = ped.nodes.get(node).copied().unwrap_or_default();
-    let mut area = KerbArea { at: at.truncate(), ..KerbArea::default() };
+    let mut area = KerbArea { at: at.truncate(), z: at.z, ..KerbArea::default() };
     // (a node where only crossing pieces meet: the junction's corner, its own polygon)
     if let Some((poly, places)) = corner_places(ped, net, lights, node).filter(|(_, p)| !p.is_empty()) {
         area.cells = places.iter().map(|q| grid_index(*q)).collect();
@@ -4588,7 +4590,7 @@ fn behind_places(net: &Network, queues: &Queues, area: Option<&KerbArea>, way: &
         if along < KERB_STEP_BACK {
             continue;
         }
-        if queues.free(q, id) && !area.is_some_and(|a| a.contains(q)) && clear_for_waiting(net, q3) && !each(q) {
+        if queues.free(q, q3.z, id) && !area.is_some_and(|a| a.contains(q)) && clear_for_waiting(net, q3) && !each(q) {
             return;
         }
     }
@@ -4836,7 +4838,7 @@ fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) ->
     if let Some(n) = walk.legs.get(c.to).and_then(|l| ped.end_node(net, l)) {
         let area = area_at(n);
         if area.corner.is_some() && !area.places.is_empty() {
-            let free = area.places.iter().filter(|q| at.queues.free(**q, me.id)).count() + leaving(n);
+            let free = area.places.iter().filter(|q| at.queues.free(**q, area.z, me.id)).count() + leaving(n);
             if debug_pax() {
                 log::info!("t={:.1} pax #{} corner beyond crossing {}: {} places, {} free or leaving, {} ahead", at.time, me.id, c.key, area.places.len(), free, ahead);
             }
@@ -4853,7 +4855,7 @@ fn room_beyond(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me) ->
     let Some(n) = kerb_node(ped, &next) else { return Ok(()) };
     let area = area_at(n);
     let start = next.at(net, 0.0).0.truncate();
-    let mut free = area.places.iter().filter(|q| at.queues.free(**q, me.id)).count() + leaving(n);
+    let mut free = area.places.iter().filter(|q| at.queues.free(**q, area.z, me.id)).count() + leaving(n);
     if free <= ahead {
         behind_places(net, at.queues, Some(&area), &lead, me.id, start, &mut |_| {
             free += 1;
@@ -4886,8 +4888,12 @@ struct Queues {
     /// Per node: its waiters (person, the crossing piece they wait for, row, offset).
     waiting: HashMap<KerbKey, Vec<(u32, usize, u32, f64)>>,
     /// Everybody standing on foot (under `STILL_BELOW`) by `QUEUE_CELL` cell: (person, where):
-    /// a place somebody stands on is no free place, whoever holds it (`Queues::stand`).
+    /// a place somebody stands on at its level is no free place, whoever holds it
+    /// (`Queues::stand`).
     standing: HashMap<(i64, i64), Vec<(u32, DVec2)>>,
+    /// Their heights, by person (a body on a footbridge over a kerb's place stands on no place
+    /// of it, `at_level`).
+    standing_z: HashMap<u32, f64>,
 }
 
 /// The cell of `Queues::taken` (m): a place is free of everybody within a stripe of it.
@@ -4898,20 +4904,36 @@ impl Queues {
         ((q.x / QUEUE_CELL).floor() as i64, (q.y / QUEUE_CELL).floor() as i64)
     }
     /// Whether nobody but `id` has a place within a stripe (`STRIPE_WIDTH`) of `q` (neighbouring
-    /// points of the queue grid lie a stripe or a row apart), nor stands there (`stand`): one place
-    /// a body. A waiter gives their place up when they step on, turn away or are sent another way
+    /// points of the queue grid lie a stripe or a row apart), nor stands there at its height `z`
+    /// (`stand`, `at_level`): one place a body. A waiter gives their place up when they step on, turn away or are sent another way
     /// on, and stands on it until they move off: given to the next waiter then, two bodies were
     /// on one place (BeijingCity c08, the kerbs of lanes 3111/3112 and 2912/2979: the queue moved
     /// up onto places whose last waiters still stood there, and the new holders stood 0.9-2 m
     /// off them for up to 2.5 s).
-    fn free(&self, q: DVec2, id: u32) -> bool {
-        Self::free_in(&self.taken, q, id) && Self::free_in(&self.standing, q, id)
+    fn free(&self, q: DVec2, z: f64, id: u32) -> bool {
+        if !Self::free_in(&self.taken, q, id) {
+            return false;
+        }
+        // (nobody else at its level standing within a stripe of it)
+        let (cx, cy) = Self::cell(q);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(v) = self.standing.get(&(cx + dx, cy + dy)) {
+                    if v.iter().any(|(o, p)| *o != id && (*p - q).length() < STRIPE_WIDTH - 1e-6 && self.standing_z.get(o).is_none_or(|&bz| at_level(bz, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
-    /// The people standing on foot this frame (person, where), for `free`.
-    fn stand(&mut self, bodies: impl Iterator<Item = (u32, DVec2)>) {
+    /// The people standing on foot this frame (person, where, height), for `free`.
+    fn stand(&mut self, bodies: impl Iterator<Item = (u32, DVec3)>) {
         self.standing.clear();
+        self.standing_z.clear();
         for (id, q) in bodies {
-            Self::take(&mut self.standing, id, q);
+            Self::take(&mut self.standing, id, q.truncate());
+            self.standing_z.insert(id, q.z);
         }
     }
     fn free_in(taken: &HashMap<(i64, i64), Vec<(u32, DVec2)>>, q: DVec2, id: u32) -> bool {
@@ -5310,7 +5332,7 @@ fn nearest_free_place(ped: &PedNet, net: &Network, queues: &Queues, at: DVec3, f
         .into_iter()
         .filter(|q| {
             let q3 = q.extend(at.z);
-            (*q - at.truncate()).length() <= reach && queues.free(*q, id) && clear_for_waiting(net, q3) && paths.iter().any(|&l| on_footprint(&net.lanes[l], q3))
+            (*q - at.truncate()).length() <= reach && queues.free(*q, q3.z, id) && clear_for_waiting(net, q3) && paths.iter().any(|&l| on_footprint(&net.lanes[l], q3))
         })
         .map(|q| ((q - at.truncate()).length(), q))
         .collect();
@@ -6682,13 +6704,14 @@ impl Humans {
 
     /// May somebody be put down at `p` without the player seeing it: out of the player's
     /// sight (`seen`), or far enough off that a figure is a few pixels (over
-    /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (the rays from the eye to the person's
-    /// head and to either side of it a bounding sphere's radius across the line of sight
-    /// (`FIGURE_RADIUS`) all blocked by collision boxes, as the traffic asks for its cars; not
-    /// within 25 m of the eye): the whole figure hidden, as the view cone takes the whole bounding
-    /// sphere (`figure_view`) - with the head's ray alone a figure grazing a corner is hidden, and
-    /// one step later in plain view (Wuluju moving, #1359 at 104 m: in sight the frame it was put
-    /// down, where a step cannot cross the cone's sphere margin). The one rule for every placement of a person: strollers (`populate_on_foot`)
+    /// `APPEAR_IN_VIEW_BEYOND`), or behind a building (the rays from the eye to the point 1.2 m
+    /// up the person and to either side of it a bounding sphere's radius across the line of
+    /// sight (`FIGURE_RADIUS`) all blocked by collision boxes, as the traffic asks for its cars;
+    /// not within 25 m of the eye): the figure's width hidden at that height, as the view cone
+    /// takes the whole bounding sphere (`figure_view`) - with the one ray a figure grazing a
+    /// corner is hidden, and one step later in plain view (Wuluju moving, #1359 at 104 m: in
+    /// sight the frame it was put down, where a step cannot cross the cone's sphere margin). A
+    /// wall between 1.2 m and the head's height hides the rays but not the head. The one rule for every placement of a person: strollers (`populate_on_foot`)
     /// and the waiters at the stops (`waiting_place`). Not used by the riders put on the seats
     /// of the player's bus, the LAN players' avatars, or the debug crossing knob
     /// (`OMSI_PAX_CROSS`). A building hides people because
@@ -6705,10 +6728,10 @@ impl Humans {
         if d < 25.0 {
             return false;
         }
-        let head = p + DVec3::Z * 1.2;
-        let across = (head - e.pos).truncate().perp().normalize_or_zero().extend(0.0) * FIGURE_RADIUS;
+        let chest = p + DVec3::Z * 1.2;
+        let across = (chest - e.pos).truncate().perp().normalize_or_zero().extend(0.0) * FIGURE_RADIUS;
         let boxes = world.collision.lock();
-        [head, head + across, head - across].iter().all(|&q| boxes.ray_blocker(e.pos, q, 2.5, 2.5).is_some())
+        [chest, chest + across, chest - across].iter().all(|&q| boxes.ray_blocker(e.pos, q, 2.5, 2.5).is_some())
     }
 
     /// Where somebody standing at `p` is for the player's eye by the people's own test
@@ -9881,7 +9904,7 @@ impl Humans {
             });
             self.queues.rebuild(places, self.ped.as_ref(), net, lights.as_ref().map(|t| t as &dyn PedLights));
             // (and who stands where: a place somebody stands on is not free, `Queues::free`)
-            self.queues.stand(self.people.iter().filter(|p| p.place == Place::Ground && p.vel.length() < STILL_BELOW as f64).map(|p| (p.id, p.position.truncate())));
+            self.queues.stand(self.people.iter().filter(|p| p.place == Place::Ground && p.vel.length() < STILL_BELOW as f64).map(|p| (p.id, p.position)));
         }
         stage!("ped.prep");
         // what everybody on foot wants: decided side by side from the frame's state
@@ -11838,6 +11861,23 @@ mod tests {
         h.center = at - DVec3::new(0.0, crate::traffic::NEVER_VANISH_WITHIN - 10.0, 0.0);
         h.eye = Some(Eye { pos: h.center + DVec3::Z * 2.0, ..away });
         assert_eq!(decide(&h, 0), (false, true), "out of sight within NEVER_VANISH_WITHIN");
+        // (M2) kept, standing inside a street lane's people strip: they step out of it, to the
+        // nearest point clear of the strips (`clear_of_lanes`); clear of them, they stand
+        {
+            let me = h.people[1].position;
+            let mut net = Network::default();
+            let street = |y: f64| omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(me.x - 50.0, y, me.z), DVec3::new(me.x + 50.0, y, me.z)], LaneKind::Street, 3.0);
+            net.lanes.push(street(me.y - 1.0));
+            net.build_grid();
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.5 };
+            let mut yields = Yields::new();
+            let d = ctx.decide(&h.people[1], DT, &world, Some(&net), None, &[], &mut YieldBook::Book(&mut yields));
+            assert!(d.kept && d.want.vel.y > 0.5, "steps away from the lane: {:?}", d.want.vel);
+            net.lanes[0] = street(me.y - 4.0);
+            net.build_grid();
+            let d = ctx.decide(&h.people[1], DT, &world, Some(&net), None, &[], &mut YieldBook::Book(&mut yields));
+            assert!(d.kept && d.want.vel.length() < 1e-9, "clear of the strip: stands");
+        }
         // (P-D2) walking on ground that is not loaded (this world has no tiles): they leave at
         // the edge, in sight too - but never on a crossing, which they walk to its end
         h.eye = Some(Eye { pos: at - DVec3::new(0.0, 40.0, -2.0), fwd: DVec3::Y, cos_half: ahead.cos_half });
@@ -15401,7 +15441,7 @@ mod ped_tests {
                 let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: t as f64 };
                 let mut rng = 7u64 ^ m.id as u64;
                 let mut want = stroll(Some(&ped), &at, m, w, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), dt);
-                if !claim_spot(m.id, old, w, &queues, &mut claimed) {
+                if !claim_spot(m.id, 0.0, old, w, &queues, &mut claimed) {
                     want.vel = DVec2::ZERO;
                 }
                 m.pos += want.vel * dt as f64;
@@ -15439,7 +15479,7 @@ mod ped_tests {
                 let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: t as f64 };
                 let mut rng = 7u64 ^ m.id as u64;
                 let mut want = stroll(Some(&ped), &at, m, w, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), dt);
-                if !claim_spot(m.id, old, w, &queues, &mut claimed) {
+                if !claim_spot(m.id, 0.0, old, w, &queues, &mut claimed) {
                     want.vel = DVec2::ZERO;
                 }
                 m.pos += want.vel * dt as f64;
@@ -15526,16 +15566,18 @@ mod ped_tests {
         let mut queues = Queues::default();
         queues.rebuild(std::iter::empty(), Some(&ped), Some(&net), Some(&lights as &dyn PedLights));
         let best = area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).expect("a place").0;
-        queues.stand([(gone, best)].into_iter());
-        assert!(!queues.free(best, me) && queues.free(best, gone));
+        queues.stand([(gone, best.extend(0.0))].into_iter());
+        assert!(!queues.free(best, 0.0, me) && queues.free(best, 0.0, gone));
+        // (one on a footbridge 6 m over it stands on no place of the kerb)
+        assert!(queues.free(best, 6.0, me));
         let other = area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).expect("another place").0;
         assert!((other - best).length() >= STRIPE_WIDTH - 1e-6, "given a place somebody stands on: {other:?}");
         // (and claimed in the same frame it is refused too: `claim_spot` asks `free`)
         let mut walk = across();
         walk.spot = Some(KerbPlace { leg: 0, next: 3, pos: best, row: 0, lat: 0.0, key: node });
-        assert!(!claim_spot(me, None, &mut walk, &queues, &mut HashMap::new()) && walk.spot.is_none());
+        assert!(!claim_spot(me, 0.0, None, &mut walk, &queues, &mut HashMap::new()) && walk.spot.is_none());
         // moved off: it is free again
-        queues.stand([(gone, best + DVec2::new(0.0, -3.0))].into_iter());
+        queues.stand([(gone, (best + DVec2::new(0.0, -3.0)).extend(0.0))].into_iter());
         assert_eq!(area.pick(&queues, me, from, BEHIND_THE_QUEUE, &frame).map(|u| u.0), Some(best));
     }
 
@@ -15750,7 +15792,7 @@ mod ped_tests {
                 let at = Around { net: &net, lights: Some(&lights), cars: &[], streams: &streams, queues: &queues, time: t as f64 };
                 let mut rng = 7u64 ^ m.id as u64;
                 let mut want = stroll(Some(&ped), &at, m, w, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), dt);
-                if !claim_spot(m.id, old, w, &queues, &mut claimed) {
+                if !claim_spot(m.id, 0.0, old, w, &queues, &mut claimed) {
                     want.vel = DVec2::ZERO;
                 }
                 m.pos += want.vel * dt as f64;
