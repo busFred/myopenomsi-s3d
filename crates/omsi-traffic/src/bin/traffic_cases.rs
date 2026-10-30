@@ -5465,6 +5465,7 @@ fn ab(args: &[String]) -> Res<()> {
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
         println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {}, strategic {})", c(0), c(1), c(2), c(3), c(4), c(5));
         println!("(lane changes dropped while signalling, whole map: change_aborted {})", omsi_traffic::sim::CHANGES_ABORTED.load(std::sync::atomic::Ordering::Relaxed));
+        println!("(lane changes started on a gap taken for lane-change impatience, whole map: changes_impatient {})", omsi_traffic::sim::CHANGES_IMPATIENT.load(std::sync::atomic::Ordering::Relaxed));
         {
             let by = &omsi_traffic::sim::CHANGES_ABORTED_BY;
             let row = |k: usize| by[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/");

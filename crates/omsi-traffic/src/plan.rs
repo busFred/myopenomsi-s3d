@@ -115,6 +115,12 @@ pub struct Plan {
     /// The car stands at that stop before a dead lane's end, its urgent strategic change blocked
     /// (`sim::STRATEGIC_HOLD_MS`).
     pub dead_end_hold: bool,
+    /// An urgent lane-end or strategic change is wished and not started this frame: the driver's
+    /// lane-change impatience grows (`Vehicle::lc_impatience`).
+    pub urgent_blocked: bool,
+    /// The change started this frame took a gap the driver would not have taken without its
+    /// lane-change impatience (`sim::CHANGES_IMPATIENT`; diagnostics).
+    pub impatient_start: bool,
     /// Backing up out of a packed queue (`queue_escape`): (the odometer where it
     /// is to stand, stopping: a committed stop - the strip behind no longer clear or the queue
     /// moving).
@@ -152,6 +158,18 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
 
 /// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
 /// (the follower need not brake hard). (`informFollower` asks for it, .)
+/// The gap (m) a follower asked to make room opens (LC2013's `informFollower`: the secure gap,
+/// without the changer's impatience - SUMO applies `getSafetyFactor` to the changer's acceptance in
+/// `checkChange`, not to the gap it asks the follower for): `gap_needed_behind` of a calm driver.
+fn help_gap_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
+    if me.lc_impatience <= 0.0 {
+        return gap_needed_behind(me, nb, vb, v);
+    }
+    let mut calm = me.clone();
+    calm.lc_impatience = 0.0;
+    gap_needed_behind(&calm, nb, vb, v)
+}
+
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
     accepted_gap(me, nb.behind_min_gap, vb, v)
 }
@@ -159,14 +177,42 @@ fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
 /// The gap (m) I accept in front of a follower whose standing gap is `min_gap`, coming at `vb`
 /// m/s while I go at `v`: its standing gap, my accepted time gap at its speed and what it
 /// sheds braking at my comfort to my speed (`gap_needed_behind`'s; the way back
-/// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`).
+/// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`),
+/// divided by my lane-change impatience's factor (`lc_impatience_factor`, SUMO SL2015) but never
+/// below the standing gap and the braking at comfort (`impatient_gap`).
 pub(crate) fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
     // (the follower's own standing gap, not a fixed 2 m: the helper opens exactly
     // this gap, `informFollower`, one function on both sides; a follower resting at its 1.57 m
     // standing gap behind the changer was never accepted, and both stood)
-    min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
+    let brake = (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake);
+    impatient_gap(me, min_gap + me.impatience.gap(dp.lc_gap) * vb + brake, min_gap + brake)
 }
+
+/// The room (m) I accept ahead of me to a leader there at `va` m/s while I go at `v`: 2 m and 1.5 s
+/// of what I close on it, divided by my lane-change impatience's factor but never below my
+/// standing gap and what I shed braking at comfort to its speed (`impatient_gap`).
+fn ahead_needed(me: &Vehicle, v: f32, va: f32) -> f32 {
+    let dv = (v - va).max(0.0);
+    impatient_gap(me, 2.0 + dv * 1.5, me.state.min_gap.max(dv * dv / (2.0 * me.params.comfort_brake)))
+}
+
+/// SUMO SL2015's lane-change impatience (`MSLCM_SL2015::getSafetyFactor`, `1 / ((1 + 0.5 x
+/// myImpatience) x myAssertive)`, the factor `MSLaneChanger::checkChange` multiplies the secure gaps
+/// by; `lcAssertive` 1): the gap `full` divided by `1 + LC_IMPATIENCE_GAIN x lc_impatience`, at
+/// least `floor` - the standing gap and the braking at comfort, so an impatient driver takes a
+/// tighter gap but never one that has the follower brake harder than comfortably or stand closer
+/// than its standing gap (SUMO's gaps are net of the standing gap; its secure gap is the
+/// follower's braking at its maximal deceleration, ours at its comfortable one: OMSI's drivers do
+/// not force emergency braking on others).
+fn impatient_gap(me: &Vehicle, full: f32, floor: f32) -> f32 {
+    // (the floor bounds how far impatience lowers the gap: a calm driver's gap is `full`)
+    (full / (1.0 + LC_IMPATIENCE_GAIN * me.lc_impatience.clamp(0.0, 1.0))).max(floor.min(full))
+}
+
+/// SUMO SL2015's `0.5` in `getSafetyFactor`: at full lane-change impatience the gap needed shrinks
+/// by a factor 1.5.
+pub const LC_IMPATIENCE_GAIN: f32 = 0.5;
 
 /// The lane beside that a signalling change of my own onto `to` (side `dir`) is checked
 /// against (`gap_accepted`, the follower looked up back over the lanes leading in,
@@ -182,7 +228,7 @@ fn change_target_view(p: &Perception, to: usize, dir: i32) -> Option<NeighbourVi
 fn gap_parts(me: &Vehicle, nb: &NeighbourView) -> (bool, bool) {
     let v = me.state.speed;
     let ok_behind = nb.behind.map(|(g, vb)| g >= gap_needed_behind(me, nb, vb, v)).unwrap_or(true);
-    let ok_ahead = nb.ahead.map(|(g, va)| g > 2.0 + (v - va).max(0.0) * 1.5).unwrap_or(true);
+    let ok_ahead = nb.ahead.map(|(g, va)| g > ahead_needed(me, v, va)).unwrap_or(true);
     (ok_behind, ok_ahead)
 }
 
@@ -1623,10 +1669,16 @@ fn signal_plan(me: &Vehicle, p: &Perception, wait: f32) -> (f32, f32) {
 /// its gaps hold over the signal too (SUMO checks the gaps in the step the change is made; the
 /// OMSI driver signals first).
 fn gaps_through_signal(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> bool {
+    let (behind, ahead) = gap_parts_through_signal(me, p, nb, wait);
+    behind && ahead
+}
+
+/// `gaps_through_signal`'s two halves: (the follower there, the leader there).
+fn gap_parts_through_signal(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> (bool, bool) {
     let (pre, v_end) = signal_plan(me, p, wait);
     let behind = nb.behind.is_none_or(|(g, vb)| g + pre - vb * wait >= gap_needed_behind(me, nb, vb, v_end));
-    let ahead = nb.ahead.is_none_or(|(g, va)| g + va * wait - pre > 2.0 + (v_end - va).max(0.0) * 1.5);
-    behind && ahead
+    let ahead = nb.ahead.is_none_or(|(g, va)| g + va * wait - pre > ahead_needed(me, v_end, va));
+    (behind, ahead)
 }
 
 /// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
@@ -2899,7 +2951,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             let urgent = lane_end_desire(net, sim, me, p, &nb) > 0.0 || strategic_desire(net, sim, vehicles, me, &nb).is_some_and(|s| s.0 > 0.0);
             if let (true, Some(f), Some((gap, vb))) = (urgent, nb.behind_id, nb.behind) {
                 if gap > 0.0 {
-                    out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
+                    out.help = Some((f, gap, v, help_gap_behind(me, &nb, vb, v)));
                 }
             }
             let (ok_behind, ok_ahead) = gap_parts(me, &nb);
@@ -3022,17 +3074,29 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             .filter(|s| matches!(s, Start::Bypass { .. }) || gaps_through_signal(me, p, &nb, mv.0));
             out.change_why = Some(why);
+            if out.start.is_some() && me.lc_impatience > 0.0 {
+                let mut calm = me.clone();
+                calm.lc_impatience = 0.0;
+                out.impatient_start = !(gap_accepted(&calm, &nb) && gaps_through_signal(&calm, p, &nb, mv.0));
+            }
         }
         // an urgent lane-end or strategic change not started this frame - its gap not there, or
         // its gap there and its move not clear - keeps the car to its last-resort stop before the
         // end (SUMO: while the urgent change is wanted, the planned speed is at most the speed that
         // stops at the end of the lane, `informLeader`'s `stopSpeed(myLeftSpace - ...)`)
         if let Some((_, nb, end_dist, stop_for, dead, ok)) = urgent_end.filter(|b| b.0 >= threshold && out.start.is_none()) {
+            out.urgent_blocked = true;
             // SUMO LC2013's speed advice for a blocked urgent change (sumo.md 3.3, `_wantsChange`'s
             // urgent branch): first the leader there (`informLeader`), then - unless I overtake
             // that leader - the follower there with the speed I plan (`informFollower`), both every
             // frame the change stays blocked; none where the gap is there
-            let (ok_behind, ok_ahead) = if ok { (true, true) } else { gap_parts(me, &nb) };
+            // (the gap now and where the move would begin, `gaps_through_signal`: a change whose gap
+            // is there now but not at the end of its signal is blocked by that vehicle too)
+            let (ok_behind, ok_ahead) = {
+                let (b0, a0) = if ok { (true, true) } else { gap_parts(me, &nb) };
+                let (b1, a1) = gap_parts_through_signal(me, p, &nb, omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
+                (b0 && b1, a0 && a1)
+            };
             let remaining = end_dist / v.max(STANDING_SPEED);
             // (to fall in behind a vehicle there: how far I must drop back, and its speed; SUMO
             // takes the least of the speed advices to itself)
@@ -3048,7 +3112,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 let blocker = nb.ahead_id.and_then(|k| vehicles.get(k));
                 overtakes = blocker.is_some_and(|o| o.stopped > BLOCKER_IS_BLOCKED_TIME && me.length() + st.min_gap + o.length() + o.params.min_gap <= end_dist);
                 if !overtakes {
-                    drop_back.push(((2.0 + (v - va).max(0.0) * 1.5) - g, va));
+                    drop_back.push((ahead_needed(me, v, va) - g, va));
                 }
             }
             // (the speed I plan: my own, or the one that drops me back behind the leader there,
@@ -3080,7 +3144,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     // (SUMO's first branch: faster than the follower so that the gap opens by itself
                     // before the lane ends, I cut in - it is only asked not to speed up, `need` 0;
                     // else it is asked to open the gap)
-                    let need = gap_needed_behind(me, &nb, vb, planned);
+                    let need = help_gap_behind(me, &nb, vb, planned);
                     let opens = planned > vb && gap + (planned - vb) * end_dist / planned.max(STANDING_SPEED) >= need;
                     let need = if opens { 0.0 } else { need };
                     out.help = Some((f, gap, planned, need));
@@ -3092,7 +3156,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     // passed, not waited for)
                     let vb1 = (vb - b_f).max(0.0);
                     let dv = planned - vb1;
-                    let need = gap_needed_behind(me, &nb, vb1, planned);
+                    let need = help_gap_behind(me, &nb, vb1, planned);
                     if dv > 0.0 && dv * remaining > need - (gap + dv) {
                         out.help = Some((f, gap, planned, need));
                     } else {
