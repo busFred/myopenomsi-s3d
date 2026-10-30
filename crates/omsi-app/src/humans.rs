@@ -9957,6 +9957,16 @@ impl Humans {
             }
             let fixed = matches!(p.state, State::Pax(_));
             let w = &wants[i];
+            // (in a street lane's people strip, or stepping into one this frame: the vehicles act
+            // on their avoidance; on the pavement off every strip only the contact pass keeps them
+            // out of a box - SUMO's sidewalk walkers do not interact with vehicles. A kerb waiter
+            // at their place by a turning stream was pushed 0.10 m off it for 60 s, c08 #1307)
+            let here = p.position;
+            let step = here + (w.vel * dt as f64).extend(0.0);
+            // (asked only with a box within the crowd's reach of them, `CrowdParams::sense`)
+            let sense = CrowdParams::default().sense;
+            let boxed = block_grid.any_near(here.truncate(), |k| blocks[k].near(here.truncate(), sense));
+            let in_traffic = !boxed || net.is_none_or(|n| within_lanes(n, here, &strip_reach) || within_lanes(n, step, &strip_reach));
             walkers.push(Walker {
                 pos: p.position.truncate(),
                 vel: p.vel,
@@ -9971,6 +9981,7 @@ impl Humans {
                 ghost: true,
                 solid: VEHICLE_COLLISIONS,
                 through: p.boxes.through.filter(|_| p.boxes.jammed).map(|b| b.center),
+                in_traffic,
                 // (on a pavement the path holds them even on the way past a box: widened
                 // by what `along_box` lets a route lie off it)
                 corridor: match (p.detour > 0.0, pavement_walker(p)) {
