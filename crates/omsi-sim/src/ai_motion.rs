@@ -466,10 +466,20 @@ impl AiBody {
         (self.rot_long, self.rot_long + self.look(speed))
     }
 
-    /// Bicycle model: the rotation point follows its line, the front wheels steer towards a
-    /// point further along it (pure pursuit, looking further ahead the faster the car goes).
+    /// Bicycle model: the rotation point follows its line, the front wheels steer by the
+    /// line's own curvature where the body is and correct towards a point further along it
+    /// (feed-forward plus feedback, the standard path-tracking pair). The feed-forward is the
+    /// bicycle model's steer angle atan(wheelbase · k) for the line's curvature k over the
+    /// wheelbase ahead of the rotation point (the arc the two axles span). The feedback is
+    /// pure pursuit (looking further ahead the faster the car goes) less what pure pursuit
+    /// would steer from the line itself (the rotation point on it, the body along its
+    /// tangent): zero on the line, so it corrects only the tracking error, and pure
+    /// pursuit's own look-ahead no longer cuts the inside where the bend tightens.
     /// The line is the way, moved inside a bend of the lane (`lane`, else the way) by
-    /// `careful_line_offset` where the body is given (`keep_swept_in_lane`).
+    /// `careful_line_offset` where the body is given (`keep_swept_in_lane`); its curvature
+    /// is the way's over the wheelbase, tighter by the offset (the parallel curve
+    /// `side` inside: k / (1 - side · k)), which carries the rear sections' pull of an
+    /// articulated vehicle (`rear_pull`) as the offset does.
     fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>) {
         let look = self.look(speed);
         // The way's points the steering looks at: the rotation point's, half way to the aim
@@ -511,6 +521,27 @@ impl AiBody {
             DVec2::new(-t.y, t.x) * side
         };
         let (target, aim) = if side != 0.0 { (a + inside(u, -0.5 * turn_signed), c + inside(w, 0.5 * turn_signed)) } else { (a, c) };
+        // The line's curvature at the rotation point (+ = left): the way's, from the circle
+        // through its points half a wheelbase behind the rotation point, at it and half a
+        // wheelbase ahead (the curvature where the rotation point is, on the body's own
+        // scale), tighter by the offset inside it. On that circle the tangent at the middle
+        // point lies along the chord between the outer two: the line's tangent there, along
+        // which a body on the line would stand.
+        let (k_line, tangent) = {
+            let (p, r) = (way(self.rot_long - 0.5 * self.wheelbase).truncate(), way(self.rot_long + 0.5 * self.wheelbase).truncate());
+            let (u1, w1) = (a - p, r - a);
+            let turn1 = (u1.x * w1.y - u1.y * w1.x).atan2(u1.dot(w1));
+            let k_way = 2.0 * turn1 / self.wheelbase as f64;
+            (k_way / (1.0 - side * k_way).max(f64::EPSILON), (r - p).normalize_or_zero())
+        };
+        // The pure pursuit that a body standing on the line along it would steer (+ = right,
+        // as `alpha` below).
+        let ideal = {
+            let g = aim - target;
+            let r = DVec2::new(tangent.y, -tangent.x);
+            let alpha = (g.dot(r) as f32).atan2(g.dot(tangent) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
+            2.0 * alpha.sin() / (g.length() as f32).max(1.0)
+        };
         if !self.started || (target - self.rear).length() > 8.0 {
             // spawned, or put somewhere else: stand on the line, straight along the way
             let ahead = way(self.rot_long + 2.0).truncate();
@@ -555,7 +586,9 @@ impl AiBody {
                 }
             }
         }
-        let want = if reversing { 0.0 } else { (2.0 * self.wheelbase * alpha.sin() / reach).atan().to_degrees().clamp(-limit, limit) };
+        // feed-forward (the line's curvature, + = right) plus pure pursuit's correction
+        let k_cmd = -k_line as f32 + (2.0 * alpha.sin() / reach - ideal);
+        let want = if reversing { 0.0 } else { (self.wheelbase * k_cmd).atan().to_degrees().clamp(-limit, limit) };
         if dt > 0.0 {
             let rate = self.steer_rate * dt * if limit > self.max_steer { 1.5 } else { 1.0 };
             self.steer_cmd += (want - self.steer_cmd).clamp(-rate, rate);
@@ -877,10 +910,16 @@ mod tests {
             worst_off = worst_off.max((rear - q).length());
         }
         // a quarter turn done at 6 m/s: the heading has turned right, the yaw rate never
-        // jumps by more than a few degrees per second between frames, the car keeps to its lane
+        // changes between frames by more than the steering's own rate allows at the bend's
+        // lock (speed / wheelbase · d tan(steer); the way turns from straight into the circle
+        // at a point, and the steering takes the line's curvature at the steering's rate: 3.2
+        // deg/s per frame, 0.6 with pure pursuit alone, which cut the corner), the car keeps
+        // to its lane (the rear axle 0.20 m off the way, 0.47 with pure pursuit alone)
         assert!(body.heading > 60.0 && body.heading < 300.0, "heading {}", body.heading);
-        assert!(worst_jump < 3.0, "yaw rate jumps by {worst_jump} deg/s in one frame");
-        assert!(worst_off < 0.6, "rear axle {worst_off} m off the way");
+        let lock = (body.wheelbase / 12.0).atan();
+        let allowed = (speed / body.wheelbase * (body.steer_rate * dt).to_radians() / lock.cos().powi(2)).to_degrees();
+        assert!(worst_jump <= allowed, "yaw rate jumps by {worst_jump} deg/s in one frame (the steering allows {allowed})");
+        assert!(worst_off < 0.25, "rear axle {worst_off} m off the way");
     }
 
     /// A BJ6123, the 12 m two-axle bus of BeijingCity (`Vehicles/BJ6180_BJC/6123.bus`): its
@@ -1010,6 +1049,45 @@ mod tests {
         let a = swept_outside(&mut tight, (front, rear, half), 15.0, 4.0, lane);
         let b = swept_outside(&mut plain, (front, rear, half), 15.0, 4.0, lane);
         assert!((a.0 - b.0).abs() < 0.02 && (a.1 - b.1).abs() < 0.02, "{a:?} against {b:?}");
+    }
+
+    /// Entering a bend from the straight (K2-D3): BJ6123 swinging wide in a 3.5 m lane at R 10,
+    /// 15 and 25 and a car at R 12, over the whole pass from the straight into the circle: the
+    /// body's inner side never passes the lane's inner edge by more than the steady state's
+    /// (the steering takes the line's own curvature as it comes, so pure pursuit's look-ahead
+    /// does not cut the inside where the bend begins).
+    #[test]
+    fn entering_a_bend_the_inner_side_keeps_to_the_edge() {
+        let lane = 3.5f64;
+        for (name, (def, front, rear, half), r, speed) in [("BJ6123", bj6123(), 10.0f64, 3.0f32), ("BJ6123", bj6123(), 15.0, 4.0), ("BJ6123", bj6123(), 25.0, 5.0), ("car", golf_body(), 12.0, 6.0)] {
+            let mut body = AiBody::new(&def, MotionKind::Road);
+            body.keep_swept_in_lane(front, half);
+            body.set_lane_edges(lane as f32 * 0.5, lane as f32 * 0.5);
+            let dt = 1.0 / 30.0;
+            let mut s = 20.0f64;
+            let heading = |x: f64| if x < 50.0 { 0.0 } else { ((x - 50.0) / r).to_degrees() as f32 };
+            body.place_in_lane(&|d| bend(r, s + d as f64), Some(&|d| heading(s + d as f64)), None, None, speed);
+            let centre = DVec2::new(r, 50.0);
+            let mut inn = f64::MIN; let mut out = f64::MIN;
+            while s < 50.0 + r * std::f64::consts::FRAC_PI_2 {
+                s += (speed * dt) as f64;
+                let at = s;
+                body.step_in_lane(dt, speed, &|d| bend(r, at + d as f64), Some(&|d| heading(at + d as f64)), None, None);
+                let fwd = dir(body.heading);
+                let right = DVec2::new(fwd.y, -fwd.x);
+                let o = body.position.truncate();
+                for (long, lat) in [(front, half), (front, -half), (-rear, half), (-rear, -half), (body.rot_long, half), (body.rot_long, -half)] {
+                    let p = o + fwd * long as f64 + right * lat as f64;
+                    // (the inner edge: x = lane/2 beside the straight, r - lane/2 round the centre)
+                    let past = if p.y < 50.0 { p.x - lane * 0.5 } else { (r - lane * 0.5) - (p - centre).length() };
+                    inn = inn.max(past);
+                    let po = if p.y < 50.0 { -p.x - lane * 0.5 } else { (p - centre).length() - (r + lane * 0.5) };
+                    out = out.max(po);
+                }
+            }
+            eprintln!("{name} R {r}: inner side past the edge at most {inn:.3} m, outer {out:.3}");
+            assert!(inn < 0.05, "{name} R {r}: inner side {inn:.3} m past the edge entering the bend");
+        }
     }
 
     /// The careful driver's line takes the lane's curvature only up to the way's own and 0
@@ -1287,11 +1365,14 @@ mod tests {
     fn room_to_pull_out_depends_on_the_steering() {
         let car = pull_out_room(&golf(), (2.1, 2.2, 0.85), 1.25, 3.3);
         let lorry = pull_out_room(&lorry(), (3.6, 3.4, 1.25), 1.25, 3.3);
-        // a bus standing a little further over (or wider) needs more room
+        // a bus standing a little further over (or wider) needs no less room; the lorry, with
+        // its longer wheelbase and smaller lock, more (the steering takes the S-curve's own
+        // curvature up to the lock from the start, so the room is the steepest curve's that
+        // the lock can follow: car 3.25, wide 3.25, lorry 3.75 m)
         let wide = pull_out_room(&golf(), (2.1, 2.2, 0.85), 1.6, 3.3);
-        assert!(wide > car, "{wide} against {car}");
+        assert!(wide >= car, "{wide} against {car}");
         assert!(car > 1.5 && car < 6.0, "car {car}");
-        assert!(lorry > car + 0.5 && lorry < 12.5, "lorry {lorry}, car {car}");
+        assert!(lorry > car && lorry < 12.5, "lorry {lorry}, car {car}");
         // what it found works: from that room less the half metre of slack one of the
         // curves clears, from a metre less none does
         let clears = |gap: f32| {
