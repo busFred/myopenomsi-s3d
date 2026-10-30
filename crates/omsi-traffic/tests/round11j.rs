@@ -301,3 +301,15 @@ fn j11_6c_the_other_car_is_eased_when_the_picked_ones_ease_would_end_at_once() {
     assert_eq!(negotiated_ids(3.5, 6.5, 1, 2), Some((1, 2)), "ids A 1, B 2: A should ease off");
     assert_eq!(negotiated_ids(3.5, 6.5, 2, 1), Some((2, 1)), "ids A 2, B 1: A should ease off");
 }
+
+/// [J11-2] A pair met only by wider bodies than its centre lines are apart (`Crossing::apart`) is
+/// no meeting place the network knows: `meeting_on` gives the lane's end for it, as it did before
+/// the pair was compiled (the later compile passes - outside crossings, swept paths - do not
+/// treat it as covered either).
+#[test]
+fn j11_2_an_apart_pair_is_not_a_meeting_place_the_network_knows() {
+    let net = converging_turns_ending(2.0);
+    let c = net.crossings[2].iter().find(|c| c.other == 3).copied().expect("the wide pair is compiled");
+    assert!(c.apart > 0.0);
+    assert_eq!(net.meeting_on(2, 3), (net.lanes[2].length(), false));
+}

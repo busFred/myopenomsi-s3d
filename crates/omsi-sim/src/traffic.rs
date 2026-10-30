@@ -1379,7 +1379,7 @@ impl Network {
     /// Where lanes `a` and `b` meet, along `a` (the crossing point, or `a`'s end at a merge;
     /// `a`'s end when the network does not know the place), and whether it is a merge.
     pub fn meeting_on(&self, a: usize, b: usize) -> (f32, bool) {
-        match self.crossings.get(a).and_then(|v| v.iter().find(|c| c.other == b)) {
+        match self.crossings.get(a).and_then(|v| v.iter().find(|c| c.other == b && c.apart <= 0.0)) {
             Some(c) => (c.at, c.merge),
             None => (self.lanes[a].length(), false),
         }
@@ -1836,7 +1836,7 @@ impl Network {
                 if ba.0 > bb.2 + reach || bb.0 > ba.2 + reach || ba.1 > bb.3 + reach || bb.1 > ba.3 + reach {
                     continue;
                 }
-                if self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j)) {
+                if self.crossings.get(i).is_some_and(|c| c.iter().any(|c| c.other == j && c.apart <= 0.0)) {
                     continue;
                 }
                 out.push((j, i));
@@ -1992,7 +1992,7 @@ impl Network {
             }
             for &pi in pieces {
                 for &bi in &near {
-                    if pi == bi || self.crossings[pi].iter().any(|c| c.other == bi) {
+                    if pi == bi || self.crossings[pi].iter().any(|c| c.other == bi && c.apart <= 0.0) {
                         continue;
                     }
                     if self.one_way_pieces(pi, bi) || self.same_root(pi, bi) || self.links_within(pi, bi, 3) || self.links_within(bi, pi, 3) {
@@ -2031,7 +2031,7 @@ impl Network {
                     // the swept stretch, where a bus standing at `b`'s end reaches: the lead-in
                     // of a way that crosses the turn a few metres on, its claim's chain carries
                     // that meeting place)
-                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.other_at + c.other_after >= p0 - SWEPT_BUS_LENGTH * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BUS_LENGTH * 0.5)));
+                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.apart <= 0.0 && c.other_at + c.other_after >= p0 - SWEPT_BUS_LENGTH * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BUS_LENGTH * 0.5)));
                     if covered {
                         continue;
                     }
