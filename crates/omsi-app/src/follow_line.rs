@@ -301,9 +301,13 @@ const BODY_COUNTED: f64 = 0.01;
 /// way's points at its rear bumper, origin and front bumper), as percentiles of the
 /// vehicle-frames (a body put back on its way after a jump of the traffic's state stands
 /// metres off it for a frame: the maximum alone is that). And the pairs of bodies (every
-/// section) whose outlines overlap (`collision::Obb::separation`), each overlap listed once
-/// over with both vehicles as they were when it began (position, heading, speed, lane, place,
-/// sideways offset, the lane's radius there).
+/// section) whose outlines overlap (`collision::Obb::separation`) and whose bodies share heights
+/// (each section from its origin's height up by its `[boundingbox]` height,
+/// `traffic::body_height`: a car on a bridge deck and one in the underpass below cross in plan
+/// but not in space; BeijingCity's decks at Jiangzhaikou stand 3.1-5.1 m over the roads under
+/// them), each overlap listed once over with both vehicles as they were when it began
+/// (position, height, heading, speed, lane, place, sideways offset, the lane's radius there);
+/// the pair-seconds of bodies crossing in plan at heights apart are counted alone.
 #[derive(Default)]
 struct BodyLane {
     /// The front wheels' angle of each AI road vehicle at the last frame (deg), and every
@@ -349,6 +353,8 @@ struct BodyLane {
     most: [[(f64, f32, u64, String); 4]; 2],
     /// Overlapping pair-seconds, the pairs, the deepest (m) with its second and ids.
     overlap_s: f64,
+    /// Pair-seconds of bodies whose outlines overlap in plan at heights they do not share.
+    apart_s: f64,
     pairs: HashSet<(u64, u64)>,
     deepest: (f64, f32, u64, u64),
     /// The overlaps going on: pair -> (since, deepest, both vehicles as they were then).
@@ -487,11 +493,12 @@ impl BodyLane {
             what.insert(
                 c.id,
                 format!(
-                    "#{} {} at ({:.1}, {:.1}) heading {:.0} {:.1} m/s lane {} s {:.1} lateral {:.2} radius {:.0}",
+                    "#{} {} at ({:.1}, {:.1}) z {:.2} heading {:.0} {:.1} m/s lane {} s {:.1} lateral {:.2} radius {:.0}",
                     c.id,
                     c.vehicle.ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
                     c.vehicle.position.x,
                     c.vehicle.position.y,
+                    c.vehicle.position.z,
                     c.vehicle.heading,
                     st.speed,
                     st.lane,
@@ -610,7 +617,9 @@ impl BodyLane {
                     let name = ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                     *m = (worst, t_s, c.id, name);
                 }
-                boxes.push((c.id, Obb::vehicle(o, heading, front as f64, rear as f64, half as f64), front.max(rear).hypot(half) as f64));
+                let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                let body = Obb { z0: pos.z, z1: pos.z + crate::traffic::body_height(ty), ..Obb::vehicle(o, heading, front as f64, rear as f64, half as f64) };
+                boxes.push((c.id, body, front.max(rear).hypot(half) as f64));
             }
         }
         let mut seen: HashSet<(u64, u64)> = HashSet::new();
@@ -620,7 +629,9 @@ impl BodyLane {
                     continue;
                 }
                 let sep = ba.separation(bb);
-                if sep < 0.0 {
+                if sep < 0.0 && (ba.z1 < bb.z0 || bb.z1 < ba.z0) {
+                    self.apart_s += dt as f64;
+                } else if sep < 0.0 {
                     let pair = (*a.min(b), *a.max(b));
                     if seen.insert(pair) {
                         self.overlap_s += dt as f64;
@@ -749,7 +760,7 @@ impl BodyLane {
                 out.push(format!("body lane signed:   outer side {d:.2} m past: {w}"));
             }
         }
-        out.push(format!("body lane: AI bodies overlapping as drawn: {:.1} pair-s, {} pairs, deepest {:.2} m at t={:.1} #{}/#{}", self.overlap_s, self.pairs.len(), self.deepest.0, self.deepest.1, self.deepest.2, self.deepest.3));
+        out.push(format!("body lane: AI bodies overlapping as drawn: {:.1} pair-s, {} pairs, deepest {:.2} m at t={:.1} #{}/#{}; crossing in plan at heights apart (a deck over a road): {:.1} pair-s", self.overlap_s, self.pairs.len(), self.deepest.0, self.deepest.1, self.deepest.2, self.deepest.3, self.apart_s));
         out
     }
 }
