@@ -98,7 +98,7 @@ impl EntryRun {
     fn hcm_ratio(&self) -> (f32, f32, f32, f32) {
         let per_h = |n: usize| n as f32 * 3600.0 / self.window;
         let (e, v_c) = (per_h(self.entered), per_h(self.circulated));
-        // HCM 6 ch. 22 single-lane entry against one circulating lane: c = 1380 exp(-1.02e-3 v_c)
+        // HCM 6 single-lane entry against one circulating lane (ALDOT manual Eq. 2.3): c = 1380 exp(-1.02e-3 v_c)
         let cap = 1380.0 * (-1.02e-3 * v_c).exp();
         (e, v_c, cap, e / cap)
     }
@@ -197,9 +197,10 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
 /// The extra critical headway (s) the car-following model (IDM) asks of this ring over HCM 6's
 /// drivers, and so the lower bound of the entry's flow over the HCM capacity: the HCM 6 single-lane
 /// entry model c = 1380 exp(-1.02e-3 v_c) is c = (3600/tf) exp(-v_c (tc - tf/2)/3600) with
-/// follow-up tf = 2.61 s and critical headway tc = 4.97 s (HCM 6 ch. 22; the equation as printed
-/// in LTRC Final Report 640, https://www.ltrc.lsu.edu/pdf/2021/FR_640.pdf, from the US field data
-/// of NCHRP Report 572). A longer critical headway tc + d scales it by exp(-v_c d / 3600). Here
+/// follow-up tf = 2.6 s and critical headway tc = 5.0 s (A = 3600/tf, B = (tc - tf/2)/3600; ALDOT
+/// Roundabout Planning, Design, and Operations Manual (Dec 2015), Table 2.3 and Equation 2.3,
+/// https://www.dot.state.al.us/publications/Design/pdf/TrafficSafetyOp/RoundaboutPlanningDesignOpManual.pdf).
+/// A longer critical headway tc + d scales it by exp(-v_c d / 3600). Here
 /// d = 4.1 s: this ring circulates at ~4.8 m/s (sqrt of the drivers' bend acceleration times its
 /// 12.5 m radius), where the IDM lets a car in ahead of a circulating one only if that is
 /// `reservation::follow_room` behind it, s* sqrt(a/b) with s* = s0 + v T + v Δv / (2 sqrt(a b))
