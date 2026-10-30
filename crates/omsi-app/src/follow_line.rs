@@ -18,9 +18,12 @@
 //! get on or off, to stop - the AI bus's service and script are asked. The other drivers see the
 //! player there as in a drive of the user's (`traffic_link::player_seen`: the player's box,
 //! the player's claim at the junctions, its right of way, the AI bus's indicator as the
-//! player's) and the AI bus only as the player (`omsi_traffic::StandIn`: it is on no lane for
-//! them and files no claim of its own; it drives by the grant of the player's claim and does
-//! not see the player's vehicle, itself).
+//! player's; the player's claim filed from the indicator, as a user's) and the AI bus only as
+//! the player (`omsi_traffic::StandIn`: it is on no lane for them and they see no claim of its
+//! own; it drives by the grant of its own claim, resolved against theirs, and does not see the
+//! player's vehicle, itself; the bus service's queue tests of the other buses do not count it
+//! either, `Traffic::stand_in`). A recording of such a run has the AI bus as a vehicle and the
+//! player's box both (the replay knows no stand-in): its replay has two bodies there.
 //! When the bus is lost (taken off the road, its trip over and let go) the player's bus
 //! stands where it was left.
 //!
@@ -271,12 +274,16 @@ struct Round {
     claims: [(f64, f64); 2],
     /// Its doors open for the people (`Humans::bus_doors_open`).
     doors: [f64; 2],
-    /// The people inside it last frame, and how many got in and out.
+    /// The people inside it last frame, and how many got in and how many got out (still among
+    /// the people: on foot); those gone from the people while inside (put out with the bus,
+    /// `Humans::evict`) are counted apart.
     aboard: [HashSet<u32>; 2],
     boarded: [usize; 2],
     alighted: [usize; 2],
-    /// Frames in which the AI bus had no grant of its player's claim for the junction its own
-    /// way met (`Simulation::stand_in_unmatched`).
+    gone_aboard: [usize; 2],
+    /// Frames in which the player's claim, filed from the indicator as a user's, named another
+    /// junction or way through than the AI bus's own claim, or only one of the two was filed
+    /// (`Simulation::stand_in_unmatched`).
     unmatched: u32,
     /// AI cars' bodies (`omsi_traffic::Vehicle::obb`) and people on the ground inside the
     /// player's bus's box by more than `traffic::OVERLAP_DEPTH`: seconds and who.
@@ -535,6 +542,7 @@ impl PlayerWatch {
             }
         }
         let Some(h) = humans else { return };
+        let present: HashSet<u32> = h.everyone().map(|(id, _, _)| id).collect();
         for (k, id) in [Some(crate::humans::BusId::Player), bus_id.map(crate::humans::BusId::Ai)].into_iter().enumerate() {
             let Some(id) = id else { continue };
             if h.bus_doors_open(id) == Some(true) {
@@ -542,7 +550,13 @@ impl PlayerWatch {
             }
             let now: HashSet<u32> = h.aboard(id).collect();
             r.boarded[k] += now.difference(&r.aboard[k]).count();
-            r.alighted[k] += r.aboard[k].difference(&now).count();
+            for left in r.aboard[k].difference(&now) {
+                if present.contains(left) {
+                    r.alighted[k] += 1;
+                } else {
+                    r.gone_aboard[k] += 1;
+                }
+            }
             r.aboard[k] = now;
         }
         for (id, p, ground) in h.everyone() {
@@ -630,7 +644,7 @@ impl PlayerWatch {
         let r = &self.round;
         for (k, who) in ["the player (box and claim; the player's bus for the people)", "the AI bus as an AI vehicle"].into_iter().enumerate() {
             out.push(format!(
-                "player watch: seen as {who}: AI cars yielding to it {:.1} car-s by {} cars, following it {:.1} car-s by {}; its claim filed {:.1} s, refused {:.1} s; doors open {:.1} s; boarded {} alighted {}",
+                "player watch: seen as {who}: AI cars yielding to it {:.1} car-s by {} cars, following it {:.1} car-s by {}; its claim filed {:.1} s, refused {:.1} s; doors open {:.1} s; boarded {} alighted {} (gone from the people while aboard {})",
                 r.yields[k].0,
                 r.yields[k].1.len(),
                 r.follows[k].0,
@@ -640,10 +654,11 @@ impl PlayerWatch {
                 r.doors[k],
                 r.boarded[k],
                 r.alighted[k],
+                r.gone_aboard[k],
             ));
         }
         out.push(format!(
-            "player watch: inside the player's bus's box: AI cars {:.1} car-s ({:?}), people on the ground {:.1} person-s ({} people); frames the AI bus had no grant of the player's claim for its junction: {}",
+            "player watch: inside the player's bus's box: AI cars {:.1} car-s ({:?}), people on the ground {:.1} person-s ({} people); frames the player's claim (from the indicator, as a user's) and the AI bus's own named another junction or way: {}",
             r.cars_inside.0,
             r.cars_inside.1,
             r.people_inside.0,
