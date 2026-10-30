@@ -262,11 +262,6 @@ pub struct ZipCap {
     pub red_short: bool,
 }
 
-/// How far (m) a standing foe's front is into a merge stretch before it is a leader standing in it:
-/// a car rolling off a released hold, bound again, comes to rest this far past the waiting place at
-/// most (`plan::gentle_stop`: 0.6 m + 1.05 v^2/2b at ~1 m/s).
-const CREPT_IN: f32 = 1.5;
-
 /// How far away (s) a foe has to be before a fed-up driver takes the way in front of it:
 /// `driver::FED_UP_AFTER` for a foe that stands or crawls, twice that for one rolling,
 /// and never one at town speed or more.
@@ -590,10 +585,7 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // their starts lie where each way first comes within `MEET_DIST`, metres apart along the
     // road where one way runs in at an angle, and measured from them the gap came out short)
     let gap = ((o.s + o.front - foe.theirs.1) - o_len) - (c.s + c.front - foe.mine.1);
-    // (a foe standing with its front less than `CREPT_IN` into the stretch has come to rest at
-    // the waiting place a gentle stop puts it, a little past the start, `plan::gentle_stop`: it is
-    // not a leader standing in the stretch the cars behind it must stop for)
-    if o.speed < STANDING_SPEED && p_f >= CREPT_IN {
+    if o.speed < STANDING_SPEED && p_f >= 0.0 {
         return Some(ZipCap { foe: o.vehicle, gap, speed: 0.0, arrive: f32::INFINITY, floor: -MAX_BRAKE, stop: true, hold: None, inside: true, dist: -p_e, red_short });
     }
     let d_e = -p_e;

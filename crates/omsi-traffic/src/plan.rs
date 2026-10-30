@@ -2099,20 +2099,6 @@ pub fn legal_before(bands: &[(f32, f32)], me: &Vehicle, limit: f32) -> Option<f3
     None
 }
 
-/// The first place at or after `from` (the front's distance from the origin) where the body lies on
-/// no band of the way through (`wait_bands`).
-fn legal_after(bands: &[(f32, f32)], me: &Vehicle, from: f32) -> f32 {
-    let len = me.length();
-    let mut p = from;
-    for _ in 0..64 {
-        match bands.iter().filter(|b| b.0 < p && b.1 > p - len - REST_SHORT).map(|b| b.1).fold(f32::NEG_INFINITY, f32::max) {
-            x if x.is_finite() => p = x + len + REST_SHORT,
-            _ => return p,
-        }
-    }
-    p
-}
-
 /// SUMO's waiting positions: the first place the car can come to rest at
 /// with its body on no band of the way through (`wait_bands`), braking at `brake` (the claim's,
 /// `Simulation::tick`) - a distance from the origin. Until there it cannot wait: it is committed
@@ -2258,14 +2244,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // further on: a hold released while it crept off and bound again for the next foe,
             // upstream, put the place at its front and braked it from ~1 m/s at the emergency
             // brake)
-            let bands = wait_bands(net, sim, j);
-            if let Some(at) = legal_before(&bands, me, st.front + d) {
-                // (and not on a band - a crossing, a foe's path: SUMO's waiting positions - so
-                // where the gentle stop falls on one it is the first place beyond)
-                let at = at.max(st.front - 0.3);
-                let gentle = gentle_stop(me);
-                let at = if at >= gentle { at } else { legal_after(&bands, me, gentle) };
-                min_stop(&mut out.stop, &mut out.why, Some(at), Why::Junction);
+            if let Some(at) = legal_before(&wait_bands(net, sim, j), me, st.front + d) {
+                min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3).max(gentle_stop(me))), Why::Junction);
             }
         }
         // SUMO's waiting positions: where following the foe ahead brings the car
