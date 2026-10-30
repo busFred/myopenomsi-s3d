@@ -4172,6 +4172,10 @@ struct Score {
     wait_far_red_s: f64,
     /// Vehicles whose front crossed a lit lane's stop line (its start) while the light was red.
     red_cross: u64,
+    /// Crossings while the light was red that `red_cross` leaves out: the light went from a go
+    /// state straight to red (no amber) and the vehicle could not stop before the line then
+    /// (see `cannot_stop`). Not part of GATE.
+    red_noamber: u64,
     /// All such crossings (any colour), counted once per vehicle and light: what `red_cross` is a part of.
     lit_cross: u64,
     /// Vehicle-seconds in which an AI vehicle's box overlaps another's.
@@ -4349,6 +4353,7 @@ fn score_columns(s: &Score) -> Vec<(&'static str, String)> {
         ("wait_beside_red_s", n(s.wait_beside_red_s)),
         ("wait_far_red_s", n(s.wait_far_red_s)),
         ("red_cross", s.red_cross.to_string()),
+        ("red_noamber", s.red_noamber.to_string()),
         ("overlap_s", n(s.overlap_s)),
         ("dead_end_s", n(s.dead_end_s)),
         ("people_wait_s", n(s.people_wait_s)),
@@ -4368,6 +4373,7 @@ fn score_json(s: &Score) -> Value {
         "wait_beside_red_s": s.wait_beside_red_s,
         "wait_far_red_s": s.wait_far_red_s,
         "red_cross": s.red_cross,
+        "red_noamber": s.red_noamber,
         "lit_cross": s.lit_cross,
         "overlap_s": s.overlap_s,
         "dead_end_s": s.dead_end_s,
@@ -4435,6 +4441,16 @@ fn standing_and_heads(r: &Replay, near: &dyn Fn(DVec3) -> bool) -> (Vec<usize>, 
     (all, heads)
 }
 
+/// A vehicle at `speed` (m/s) cannot stop before a line `dist` m ahead of its front when the
+/// distance it needs at its comfortable deceleration `comfort_brake` (m/s^2), v^2 / (2 b),
+/// exceeds `dist`. SUMO lets such a vehicle pass: a signal that turns red without a yellow
+/// phase puts it in the dilemma zone, where it cannot stop at its comfortable braking.
+/// The user's decision (round 11) applies it to the `red_cross` metric: such a crossing is
+/// counted in `red_noamber`, not in `red_cross`.
+fn cannot_stop(speed: f64, comfort_brake: f64, dist: f64) -> bool {
+    comfort_brake > 0.0 && speed * speed / (2.0 * comfort_brake) > dist
+}
+
 /// The stop line of a lit lane: a segment through the lane's start, across it, as wide as
 /// the lane and 1 m more each side.
 struct StopLine {
@@ -4481,6 +4497,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut lit: Vec<StopLine> = Vec::new();
     let mut lit_lanes = 0;
     let mut crossed: HashSet<(u64, usize, usize)> = HashSet::new();
+    // (each lit light's state last frame; for a light that went from a go state (6..=8) straight
+    // to red (0..=5) and is still red, each vehicle's (speed, comfort brake, distance of its
+    // front before the light's stop lines) at that frame)
+    let mut light_prev: HashMap<(usize, usize), i32> = HashMap::new();
+    let mut red_onset: HashMap<(usize, usize), HashMap<u64, (f64, f64, f64)>> = HashMap::new();
     let mut touching: HashSet<(u64, u64)> = HashSet::new();
     let mut spawn_pairs: HashSet<(u64, u64)> = HashSet::new();
     let mut first_seen: HashMap<u64, f64> = HashMap::new();
@@ -4722,6 +4743,30 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             Vec::new()
         };
         // ---- every frame: the odometers and the stop lines
+        for ll in &lit {
+            let Some(state) = r.sim.lights.get(ll.light.0).map(|c| c.state(ll.light.1)) else { continue };
+            if light_prev.get(&ll.light) == Some(&state) {
+                continue;
+            }
+            let was = light_prev.insert(ll.light, state);
+            if !matches!(state, 0..=5) {
+                red_onset.remove(&ll.light);
+            } else if was.is_some_and(|w| matches!(w, 6..=8)) {
+                let mut snap: HashMap<u64, (f64, f64, f64)> = HashMap::new();
+                for v in &r.vehicles {
+                    let h = (v.heading as f64).to_radians();
+                    let front = v.pos.truncate() + glam::DVec2::new(h.sin(), h.cos()) * v.state.front as f64;
+                    for l2 in lit.iter().filter(|l2| l2.light == ll.light) {
+                        let d = -(front - l2.p0).dot(l2.fwd);
+                        if d >= 0.0 && (front - l2.p0).dot(l2.right).abs() <= l2.half {
+                            let e = snap.entry(v.id).or_insert((v.state.speed as f64, v.params.comfort_brake as f64, d));
+                            e.2 = e.2.min(d);
+                        }
+                    }
+                }
+                red_onset.insert(ll.light, snap);
+            }
+        }
         for v in &r.vehicles {
             let st = &v.state;
             if let Some(&p) = prev_odo.get(&v.id) {
@@ -4783,6 +4828,11 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         sc.lit_cross += 1;
                         // (the light's state this frame is the one the vehicle moved by)
                         if r.sim.lights.get(ll.light.0).is_some_and(|ctl| matches!(ctl.state(ll.light.1), 0..=5)) {
+                            let exempt = red_onset.get(&ll.light).and_then(|m| m.get(&v.id)).is_some_and(|&(sp, b, d)| cannot_stop(sp, b, d));
+                            if exempt {
+                                sc.red_noamber += 1;
+                                continue;
+                            }
                             sc.red_cross += 1;
                             sc.red_events.push(format!("{} t={:.1} (day {}) #{} crosses the stop line of lane {} (light {}.{}), way {:?}", sc.name, r.sim.time, hms(r.sim.day_time), v.id, ll.lane, ll.light.0, ll.light.1, way_lanes(&r.net, st, 40.0).iter().map(|w| format!("{}{}@{:.1}m", w.0, r.net.lanes[w.0].traffic_light.map(|(c, l)| format!("[lit {c}.{l}]")).unwrap_or_default(), (r.net.lanes[w.0].points[0].truncate() - ll.p0).length())).collect::<Vec<_>>()));
                         }
@@ -5237,6 +5287,7 @@ fn ab(args: &[String]) -> Res<()> {
         total.wait_beside_red_s += s.wait_beside_red_s;
         total.wait_far_red_s += s.wait_far_red_s;
         total.red_cross += s.red_cross;
+        total.red_noamber += s.red_noamber;
         total.lit_cross += s.lit_cross;
         total.overlap_s += s.overlap_s;
         total.dead_end_s += s.dead_end_s;
@@ -7434,4 +7485,19 @@ fn dwells(args: &[String]) -> Res<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod red_noamber_tests {
+    use super::cannot_stop;
+
+    #[test]
+    fn dilemma_zone() {
+        // the d24 case12 event: 3.1 m from the line at 6.4 m/s, b = 2: needs 10.2 m
+        assert!(cannot_stop(6.4, 2.0, 3.1));
+        // the same speed 15 m out can stop (needs 10.2 m)
+        assert!(!cannot_stop(6.4, 2.0, 15.0));
+        // a standing vehicle always can
+        assert!(!cannot_stop(0.0, 2.0, 0.0));
+    }
 }
