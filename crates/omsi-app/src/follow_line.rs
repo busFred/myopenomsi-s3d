@@ -283,8 +283,9 @@ struct BodyLane {
     /// vehicle-frame's swing (m) and its frame time (s); the most with its second, id, type.
     swing: [[Vec<(f32, f32)>; 4]; 2],
     /// The same vehicle-frames, signed against the bend: how far the body's inner side and its
-    /// outer side leave the vehicle's lane (m, past its edges on the bend's inside and outside,
-    /// `Network::lane_edges`, from the way; - = inside it): (inner, outer, frame time); and
+    /// outer side leave the vehicle's lanes (m, past the edges on the bend's inside and outside,
+    /// `Network::lane_edges`, each corner against the lane under it, from the way; - = inside
+    /// it): (inner, outer, frame time); and
     /// the vehicle-seconds on a lane whose edges the map does not tell, and those moving
     /// sideways off their lane's axis (a lane change, a pull-out, a sideways move: the way is
     /// not on the lane's axis the edges are measured from), not measured.
@@ -417,18 +418,24 @@ impl BodyLane {
                 let class = BODY_RADIUS_CLASSES.iter().position(|r| k * r >= 1.0).unwrap_or(3);
                 let kind = (i > 0) as usize;
                 self.swing[kind][class].push((worst as f32, dt));
-                // the lane under the section's own origin: a trailer still on the piece before
-                // the front's is measured against that piece's edges
+                // the lane under the section's own origin (for the lines below), and each
+                // corner against the edges of the lane under it: a body across a joint has its
+                // rear on the piece before, its front on the next
                 let (sec_lane, sec_s) = st.lane_at(net, along);
-                let edges = net.lane_edges(sec_lane);
+                let corner_edges: Vec<Option<(f32, f32)>> = corners.iter().map(|&(long, _)| net.lane_edges(st.lane_at(net, along + long).0)).collect();
+                // (the section lane's edges, shown in the lines; NaN where it has none but a
+                // corner's lane has)
+                let edges = corner_edges.iter().any(|e| e.is_some()).then(|| net.lane_edges(sec_lane).unwrap_or((f32::NAN, f32::NAN)));
                 // the bend's side: + = it bends left, so its inside is the way's left
                 let left = (b - a).perp_dot(q - a) >= 0.0;
                 if st.lateral != 0.0 || st.change.is_some() {
                     self.sides_sideways_s[kind][class] += dt as f64;
                 } else if let Some((el, er)) = edges {
-                    let (inward, inner_edge, outer_edge) = if left { (1.0, el, er) } else { (-1.0, er, el) };
+                    let inward = if left { 1.0 } else { -1.0 };
                     let (mut inn, mut out) = (f64::MIN, f64::MIN);
-                    for &(long, lat) in &corners {
+                    for (&(long, lat), e) in corners.iter().zip(&corner_edges) {
+                        let Some((cl, cr)) = *e else { continue };
+                        let (inner_edge, outer_edge) = if left { (cl, cr) } else { (cr, cl) };
                         let l = lateral(o + fwd * long as f64 + right * lat as f64) * inward;
                         inn = inn.max(l - inner_edge as f64);
                         out = out.max(-l - outer_edge as f64);
