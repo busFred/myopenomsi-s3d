@@ -1,7 +1,8 @@
 //! Round 11 area H2: an AI vehicle that drives the player's vehicle (`StandIn`, the offscreen
 //! harness's `--follow-line`) is seen by the others as the player - its player claim, its
-//! box - and not as an AI vehicle besides; it does not yield to itself and drives by the grant
-//! of its player's claim. `cargo test -p omsi-traffic --test round11h -- --nocapture`.
+//! box - and not as an AI vehicle besides; it does not yield to itself, its player's claim is
+//! filed as a user's (from the indicator) and it drives by the grant of its own claim, which
+//! only it reads (resolved against the others' claims, its player's left out). `cargo test -p omsi-traffic --test round11h -- --nocapture`.
 
 use glam::DVec3;
 use omsi_sim::traffic::{AiState, LaneBuilder, LaneKey, LaneKind, Network};
@@ -89,6 +90,9 @@ struct Seen {
     nearest: f32,
     own_min_speed: f32,
     other_min_speed: f32,
+    /// Frames the player's claim (filed from the indicator, as a user's) and the stand-in's
+    /// own named another junction or way, or only one was filed (`stand_in_unmatched`).
+    unmatched: u32,
 }
 
 /// Run the stand-in `own` (index 0) and the other car (index 1) for `secs`, the player's view
@@ -99,7 +103,7 @@ fn run(net: &Network, mut vehicles: Vec<Vehicle>, secs: f32, stand_in: bool) -> 
     let own_id = vehicles[0].id;
     let other_id = vehicles[1].id;
     sim.stand_in = stand_in.then_some(StandIn { vehicle: own_id, player: 0 });
-    let mut seen = Seen { other_waits_player: 0, other_waits_vehicle: 0, own_waits_self: 0, own_waits_other: 0, player_claims: 0, own_claims: 0, nearest: f32::INFINITY, own_min_speed: f32::INFINITY, other_min_speed: f32::INFINITY };
+    let mut seen = Seen { other_waits_player: 0, other_waits_vehicle: 0, own_waits_self: 0, own_waits_other: 0, player_claims: 0, own_claims: 0, nearest: f32::INFINITY, own_min_speed: f32::INFINITY, other_min_speed: f32::INFINITY, unmatched: 0 };
     let mut still = 0.0f32;
     let mut t = 0.0;
     // (the pose the first view is built from)
@@ -128,14 +132,14 @@ fn run(net: &Network, mut vehicles: Vec<Vehicle>, secs: f32, stand_in: bool) -> 
         }
         t += DT;
     }
-    assert_eq!(sim.stand_in_unmatched, 0, "the stand-in's player claim is about the junction its way meets");
+    seen.unmatched = sim.stand_in_unmatched;
     seen
 }
 
 /// The stand-in on the main road: the side road car gives way to it as it gives way to the
 /// player's bus (`adversarial.rs` p7) - waiting for the player's claim, never for an AI
 /// vehicle - and the stand-in, with its own player's claim let go, drives through without
-/// waiting for itself; it files no claim of its own.
+/// waiting for itself; nobody sees a claim of its own.
 #[test]
 fn h2_a_side_road_car_gives_way_to_the_stand_in_as_to_the_player() {
     let net = priority_junction();
@@ -145,8 +149,8 @@ fn h2_a_side_road_car_gives_way_to_the_stand_in_as_to_the_player() {
     assert!(plain.other_waits_vehicle > 0 && plain.own_claims > 0, "as a plain AI bus it is waited for as one");
     let s = run(&net, vehicles, 15.0, true);
     eprintln!(
-        "h2 main: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}",
-        s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed
+        "h2 main: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {} frames",
+        s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed, s.unmatched
     );
     assert!(s.other_waits_player > 0, "the side road car gave way to the player's claim");
     assert_eq!(s.other_waits_vehicle, 0, "the stand-in is no AI vehicle to the others");
@@ -159,20 +163,66 @@ fn h2_a_side_road_car_gives_way_to_the_stand_in_as_to_the_player() {
 }
 
 /// The stand-in on the side road: it gives way to the car on the main road by the grant of its
-/// player's claim (its way, its junction) and the car does not wait for it.
+/// own claim and the car does not wait for it.
 #[test]
-fn h2_the_stand_in_gives_way_by_its_players_grant() {
+fn h2_the_stand_in_gives_way_by_its_own_grant() {
     let net = priority_junction();
     let vehicles = vec![bus(1, 3, net.lanes[3].length() - 45.0, 10.0), car(2, 0, net.lanes[0].length() - 40.0, 11.0)];
     let s = run(&net, vehicles, 15.0, true);
     eprintln!(
-        "h2 side: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}",
-        s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed
+        "h2 side: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {} frames",
+        s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed, s.unmatched
     );
     assert!(s.own_waits_other > 0, "the stand-in waited for the car at the junction");
     assert_eq!(s.own_waits_self, 0, "the stand-in never waits for itself");
     assert_eq!(s.other_waits_player + s.other_waits_vehicle, 0, "the car on the main road waits for nobody");
-    assert_eq!(s.own_claims, 0, "no AI claim of the stand-in's own");
+    assert_eq!(s.own_claims, 0, "no AI claim of the stand-in's own among the others'");
     assert!(s.other_min_speed > 8.0, "the car went through: {:.1}", s.other_min_speed);
     assert!(s.nearest > 0.5, "the two met: {:.2} m", s.nearest);
 }
+
+
+/// The bus on the side road standing at its line while a car comes along the main road and is
+/// stopped short of the junction by somebody standing in its lane (stuck: it is not coming while
+/// they stand there): the second at which the bus's front enters the main road (its near edge,
+/// 1.75 m south of the axis), as a plain AI bus and as the stand-in.
+fn crossing_past_a_stuck_foe(stand_in: bool, secs: f32) -> Option<f32> {
+    let net = priority_junction();
+    let mut vehicles = vec![bus(1, 3, net.lanes[3].length() - 7.0, 0.0), car(2, 0, net.lanes[0].length() - 60.0, 9.0)];
+    let mut sim = Simulation::new(&net, vec![]);
+    sim.stand_in = stand_in.then_some(StandIn { vehicle: 1, player: 0 });
+    // (in the main road's lane 21 m short of the crossing's middle, standing)
+    sim.people = vec![omsi_traffic::sim::Person { pos: DVec3::new(-21.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+    sim.update_positions(&net, &mut vehicles);
+    let (mut t, mut still) = (0.0f32, 0.0f32);
+    while t < secs {
+        let own = vehicles.iter().find(|v| v.id == 1).expect("the bus is on the road");
+        if own.pos.y + own.state.front as f64 > -1.75 {
+            return Some(t);
+        }
+        still = if own.state.speed.abs() < 0.3 { still + DT } else { 0.0 };
+        sim.players = if stand_in { vec![player_of(own, still)] } else { Vec::new() };
+        sim.tick(&net, DT, &mut vehicles);
+        t += DT;
+    }
+    let own = vehicles.iter().find(|v| v.id == 1).unwrap();
+    let other = vehicles.iter().find(|v| v.id == 2).unwrap();
+    eprintln!("  not across: bus lane {} s {:.1} why {:?} wait_for {:?}; car lane {} s {:.1} v {:.1} why {:?}", own.state.lane, own.state.s, own.last.why, own.last.wait_for, other.state.lane, other.state.s, other.state.speed, other.last.why);
+    None
+}
+
+/// The stand-in waiting on the side road decides as the AI driver it is (its own claim, with
+/// its own patience and why it stands): a main road car that people stop short of the junction
+/// is not coming (`reservation`'s held-off foe), and the stand-in crosses as the plain AI bus
+/// does. Driven by its player's grant (a user's state: standing over `PLAYER_STILL` is blocked,
+/// which drops nobody; no impatience) it waited for that car for good.
+#[test]
+fn h2_the_stand_in_crosses_past_a_stuck_foe_as_the_ai_bus() {
+    let plain = crossing_past_a_stuck_foe(false, 40.0);
+    let own = crossing_past_a_stuck_foe(true, 40.0);
+    eprintln!("h2 stuck foe: the plain AI bus enters at {plain:?} s, the stand-in at {own:?} s");
+    let plain = plain.expect("the plain AI bus crosses in front of the stopped car");
+    let own = own.expect("the stand-in crosses in front of the stopped car");
+    assert!(own <= plain, "the stand-in no later than the plain AI bus: {own:.1} s against {plain:.1} s");
+}
+
