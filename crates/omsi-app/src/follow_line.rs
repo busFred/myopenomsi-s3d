@@ -248,6 +248,9 @@ pub(crate) struct PlayerWatch {
     bodies: BodyLane,
 }
 
+/// Speed (m/s) above which a vehicle counts as moving for the steering rate: the planner's
+/// standstill (`ai_motion`'s 0.02 m/s, where the body stops following its speed).
+const STEER_RATE_MOVING: f32 = 0.02;
 /// Step (m) of the way's points a body is measured against: the polyline between them is
 /// within a millimetre of a 25 m bend (the sagitta of a 0.5 m chord).
 const BODY_WAY_STEP: f32 = 0.5;
@@ -279,6 +282,11 @@ const BODY_COUNTED: f64 = 0.01;
 /// sideways offset, the lane's radius there).
 #[derive(Default)]
 struct BodyLane {
+    /// The front wheels' angle of each AI road vehicle at the last frame (deg), and every
+    /// moving vehicle-frame's steering rate (deg/s, `AiBody::steer`): how smoothly the bodies
+    /// steer.
+    last_steer: HashMap<u64, f32>,
+    steer_rate: Vec<f32>,
     /// Per section kind (front, rear) and radius class (and beyond the last): every
     /// vehicle-frame's swing (m) and its frame time (s); the most with its second, id, type.
     swing: [[Vec<(f32, f32)>; 4]; 2],
@@ -344,6 +352,11 @@ impl BodyLane {
         let mut what: HashMap<u64, String> = HashMap::new();
         for c in traffic.cars.iter().filter(|c| c.body.kind == MotionKind::Road) {
             let st = &c.ai.state;
+            if let Some(last) = self.last_steer.insert(c.id, c.body.steer) {
+                if dt > 0.0 && st.speed.abs() > STEER_RATE_MOVING {
+                    self.steer_rate.push((c.body.steer - last).abs() / dt);
+                }
+            }
             if st.lane >= net.lanes.len() {
                 continue;
             }
@@ -589,6 +602,12 @@ impl BodyLane {
         let still: Vec<String> = self.open.values().map(|(since, depth, who)| format!("t={since:.1} still at the end, deepest {depth:.2} m: {who}")).collect();
         for e in self.episodes.iter().chain(&still) {
             out.push(format!("body lane:   overlap {e}"));
+        }
+        if !self.steer_rate.is_empty() {
+            let v = &mut self.steer_rate;
+            v.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+            out.push(format!("body lane: steering rate of the moving AI road vehicles: {} vehicle-frames, p50 {:.2} p95 {:.2} p99 {:.2} max {:.1} deg/s", v.len(), pct(0.5), pct(0.95), pct(0.99), v[v.len() - 1]));
         }
         out.push(format!("body lane: AI bodies overlapping as drawn: {:.1} pair-s, {} pairs, deepest {:.2} m at t={:.1} #{}/#{}", self.overlap_s, self.pairs.len(), self.deepest.0, self.deepest.1, self.deepest.2, self.deepest.3));
         out
