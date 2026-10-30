@@ -4441,8 +4441,6 @@ fn standing_and_heads(r: &Replay, near: &dyn Fn(DVec3) -> bool) -> (Vec<usize>, 
     (all, heads)
 }
 
-/// The stop line of a lit lane: a segment through the lane's start, across it, as wide as
-/// the lane and 1 m more each side.
 /// A vehicle at `speed` (m/s) cannot stop before a line `dist` m ahead of its front when the
 /// distance it needs at its comfortable deceleration `comfort_brake` (m/s^2), v^2 / (2 b),
 /// exceeds `dist`. SUMO lets such a vehicle pass: a signal that turns red without a yellow
@@ -4453,6 +4451,8 @@ fn cannot_stop(speed: f64, comfort_brake: f64, dist: f64) -> bool {
     comfort_brake > 0.0 && speed * speed / (2.0 * comfort_brake) > dist
 }
 
+/// The stop line of a lit lane: a segment through the lane's start, across it, as wide as
+/// the lane and 1 m more each side.
 struct StopLine {
     p0: glam::DVec2,
     fwd: glam::DVec2,
