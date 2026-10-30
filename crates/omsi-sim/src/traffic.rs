@@ -2929,6 +2929,29 @@ mod extend_tests {
         assert_eq!(alone.lane_edges(0), None);
     }
 
+    /// The edges the careful line keeps to over a stretch are the narrowest of the lanes it
+    /// covers: before the front reaches a narrower junction path its edge counts already; the
+    /// lane at a distance is the sequence's (behind into the lane it came from).
+    #[test]
+    fn the_edges_over_a_stretch_are_the_narrowest_of_its_lanes() {
+        let mut lanes = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 110.0, 2, (0, 0)), straight(0.0, 110.0, 200.0, 3, (0, 0))];
+        lanes[0].edges = (1.5, 2.0);
+        lanes[1].source = 2;
+        lanes[2].edges = (1.0, 4.0);
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        let mut st = AiState::new(0, 95.0, 1);
+        st.planned_next = Some(1);
+        st.ahead = vec![2];
+        // only the first lane
+        assert_eq!(st.lane_edges_between(&net, 0.0, 4.0), (1.5, 2.0));
+        // into the junction path (the narrower of the pieces it joins: (1.0, 2.0))
+        assert_eq!(st.lane_edges_between(&net, 0.0, 8.0), (1.0, 2.0));
+        assert_eq!(st.lane_at(&net, 8.0), (1, 3.0));
+        let back = AiState { prev_lane: Some(0), ..AiState::new(1, 2.0, 1) };
+        assert_eq!(back.lane_at(&net, -5.0), (0, 97.0));
+    }
+
     #[test]
     fn extend_links_like_link() {
         let all = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 200.0, 2, (0, 0)), straight(0.0, 200.0, 300.0, 3, (0, 1)), straight(0.0, 300.0, 400.0, 4, (0, 1))];
@@ -4671,6 +4694,27 @@ impl AiState {
     /// start lies a lane's width over but runs the same way.
     pub fn lane_heading(&self, net: &Network, d: f32) -> f32 {
         self.seq().heading(net, self.s, d)
+    }
+
+    /// The lane of the car's lane sequence `d` metres ahead of it (behind for negative `d`)
+    /// and the distance along it: where it came from, where it is, its plan (the lane
+    /// change's target not taken).
+    pub fn lane_at(&self, net: &Network, d: f32) -> (usize, f32) {
+        let q = self.seq();
+        let (i, u) = q.locate(net, self.s, d);
+        (q.lanes[i], u)
+    }
+
+    /// Where the lanes of the car's lane sequence from `from` to `to` metres ahead of it end
+    /// left and right of their axes (m, `Network::lane_edges`), side by side the narrowest:
+    /// the body spans the pieces between its rotation point and where it steers to, and at a
+    /// joint where the next piece is narrower (a junction path's start) the edge it must keep
+    /// to is that piece's before it gets there. A lane whose edges the map does not tell sets
+    /// none (infinite); none told: infinite both.
+    pub fn lane_edges_between(&self, net: &Network, from: f32, to: f32) -> (f32, f32) {
+        let q = self.seq();
+        let (i0, i1) = (q.locate(net, self.s, from).0, q.locate(net, self.s, to.max(from)).0);
+        (i0..=i1).filter_map(|i| net.lane_edges(q.lanes[i])).fold((f32::INFINITY, f32::INFINITY), |m, e| (m.0.min(e.0), m.1.min(e.1)))
     }
 
     /// `way_point` at each of `ds`: the same points, the lane sequences built once and the

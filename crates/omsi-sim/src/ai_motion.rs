@@ -403,7 +403,7 @@ impl AiBody {
     }
 
     /// Where the lane the vehicle drives in now ends to the left and to the right of its axis
-    /// (m, `traffic::Network::lane_edges`): the careful driver's line keeps the body's
+    /// (m, `traffic::Network::lane_edges`, the narrowest over `steer_span`): the careful driver's line keeps the body's
     /// innermost point inside the edge on the bend's inside (`careful_line_offset`).
     /// Infinite: no edge known, the swept band centred on the way.
     pub fn set_lane_edges(&mut self, left: f32, right: f32) {
@@ -452,12 +452,26 @@ impl AiBody {
         }
     }
 
+    /// How far ahead of the rotation point the steering aims at `speed` (m): further the
+    /// faster the car goes.
+    fn look(&self, speed: f32) -> f32 {
+        (1.2 * self.wheelbase).max(3.5) + 0.6 * speed.min(20.0)
+    }
+
+    /// The stretch of the way (m from the vehicle's origin) the careful driver's line is
+    /// steered over at `speed`: from the rotation point to the aim. The lane edges it keeps to
+    /// (`set_lane_edges`) are the narrowest of the lanes along it
+    /// (`traffic::AiState::lane_edges_between`).
+    pub fn steer_span(&self, speed: f32) -> (f32, f32) {
+        (self.rot_long, self.rot_long + self.look(speed))
+    }
+
     /// Bicycle model: the rotation point follows its line, the front wheels steer towards a
     /// point further along it (pure pursuit, looking further ahead the faster the car goes).
     /// The line is the way, moved inside a bend of the lane (`lane`, else the way) by
     /// `careful_line_offset` where the body is given (`keep_swept_in_lane`).
     fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>) {
-        let look = (1.2 * self.wheelbase).max(3.5) + 0.6 * speed.min(20.0);
+        let look = self.look(speed);
         // The way's points the steering looks at: the rotation point's, half way to the aim
         // and the aim. The turn between the two chords says how tight the way bends over the
         // look-ahead (a circle through the three points has curvature 2·turn/look; + = left).

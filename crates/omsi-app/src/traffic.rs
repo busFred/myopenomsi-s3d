@@ -1390,13 +1390,17 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
     crate::rail_drive::point_at(trail, u).unwrap_or_else(|| state.way_point(net, -d as f32))
 }
 
-/// Where the lane `state` drives in ends left and right of its axis (m) for the careful
+/// Where the lanes `body` steers over end left and right of their axes (m) for the careful
 /// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edges`
 /// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path or an
-/// editor-only spline's lane as the road pieces it joins). Where the map does not tell, no
-/// edge: the swept band centred on the way.
-fn lane_edges(net: &Network, state: &AiState) -> (f32, f32) {
-    net.lane_edges(state.lane).unwrap_or((f32::INFINITY, f32::INFINITY))
+/// editor-only spline's lane as the road pieces it joins), side by side the narrowest of the
+/// lanes from its rotation point to its aim (`AiBody::steer_span`,
+/// `AiState::lane_edges_between`): the body spans them, and a narrower piece ahead is kept to
+/// before the rotation point reaches it. Where the map does not tell, no edge: the swept band
+/// centred on the way.
+fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
+    let (from, to) = body.steer_span(state.speed);
+    state.lane_edges_between(net, from, to)
 }
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
@@ -1413,7 +1417,7 @@ fn place_body(
     let mut body = AiBody::new(&vehicle.ty.def, kind);
     let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*vehicle.ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
     body.keep_swept_in_lane_with(state.front, extents(&vehicle.ty, state.length).2, &parts);
-    let (left, right) = lane_edges(net, state);
+    let (left, right) = lane_edges(net, state, &body);
     body.set_lane_edges(left, right);
     let ground = vehicle.ground.clone();
     let contact = vehicle.contact.clone();
@@ -4433,7 +4437,7 @@ impl Traffic {
                 let behind = |d: f64| rail_behind(trail, state, net, d);
                 let lane = |d: f32| state.lane_heading(net, d);
                 if !rail {
-                    let (left, right) = lane_edges(net, state);
+                    let (left, right) = lane_edges(net, state, body);
                     body.set_lane_edges(left, right);
                 }
                 body.step_in_lane(
