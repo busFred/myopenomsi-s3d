@@ -6227,7 +6227,19 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             next += every;
         }
         r.sim.update_positions(&r.net, &mut r.vehicles);
-        let found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        let mut found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        // (`--chain`: the watched vehicles' leads, one after the other, to the head of the queue)
+        if args.iter().any(|a| a == "--chain") {
+            let mut k = 0;
+            while k < found.len() && found.len() < 40 {
+                if let Some(j) = r.vehicles[found[k]].last.lead_id.and_then(|id| r.vehicles.iter().position(|v| v.id == id)) {
+                    if !found.contains(&j) {
+                        found.push(j);
+                    }
+                }
+                k += 1;
+            }
+        }
         if args.iter().any(|a| a == "--player") {
             for p in &r.sim.players {
                 let pb = p.obb(0.0, 0.0);
