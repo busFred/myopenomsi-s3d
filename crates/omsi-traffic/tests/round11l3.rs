@@ -596,16 +596,18 @@ fn piece(pts: &[(f64, f64)], path: u16) -> omsi_sim::traffic::Lane {
 }
 
 /// Fix 1-3, the drive's c0914 (09:14) geometry: car 1 (4.6 m, 1.84 m wide) stands on a 1 m
-/// crossing piece (lane 0, eastbound at y 0, x 100..200) 1.7 m behind the rear corner of car 2,
-/// which stands 10 degrees askew on a lane of its own (lane 5, heading 100 as #33376 beside
-/// #33433's 89), its rear-left corner 0.87 m right of car 1's axis: a squeeze to the left keeping
-/// `MIN_GAP_LAT` needs 1.57 m left of the axis. The object's piece beside on the left (lane 1,
-/// y 3.05) is closed to cars, an open one lies 3.2 m right; halfway to the piece beside gives
-/// 1.52 m. The object's paths are drawn on its road, and the closed piece, empty over the
-/// squeeze, lends its width (the body keeps off its axis): the squeeze goes, and from that close
-/// the least offset's shortest move meets car 2's corner before it is out, so it takes the least
-/// offset that is out by then (beyond 0.70 m), and never comes within `SQUEEZE_CLEARANCE` of a
-/// body. With a car on the closed piece beside car 1 it lends nothing and car 1 does not squeeze.
+/// crossing piece (lane 0, eastbound at y 0, x 100..200) behind car 2, which stands 10 degrees
+/// askew on a lane of its own (lane 5, heading 100 as #33376 beside #33433's 89), its rear-left
+/// corner 0.87 m right of car 1's axis: a squeeze to the left keeping `MIN_GAP_LAT` needs 1.57 m
+/// left of the axis. The object's piece beside on the left (lane 1, y 3.05) is closed to cars, an
+/// open one lies 3.2 m right; halfway to the piece beside gives 1.52 m. The object's paths are
+/// drawn on its road, and the closed piece, empty over the squeeze, lends its width (the body
+/// keeps off its axis): from 7.7 m behind car 2's rear the squeeze goes at the least offset
+/// (0.65 m) and never comes within `SQUEEZE_CLEARANCE` of a body. With a car on the closed piece
+/// beside car 1 it lends nothing and car 1 does not squeeze. From 1.7 m behind (as in the drive)
+/// the least offset's shortest move meets car 2's corner before the body is out, and the offset
+/// is the least one only (the user's decision L3-D1: SUMO's minGapLat is the only bound): car 1
+/// does not squeeze, it waits, clear of car 2.
 #[test]
 fn on_a_junction_piece_a_closed_empty_piece_beside_lends_its_width_to_a_squeeze() {
     let mut net = Network::default();
@@ -626,9 +628,9 @@ fn on_a_junction_piece_a_closed_empty_piece_beside_lends_its_width_to_a_squeeze(
     net.lanes.push(road(&[(140.0, -2.1 + 12.0 * slope), (170.0, -2.1 - 18.0 * slope)], 3, 0, 0.0)); // 5
     net.build_grid();
     assert_eq!((net.piece_beside(0, 50.0, 1), net.piece_beside(0, 50.0, 2)), (Some(1), Some(2)));
-    for occupied in [false, true] {
+    for (s0, occupied) in [(40.0f32, false), (40.0, true), (46.0, false)] {
         let mut sim = Simulation::new(&net, vec![]);
-        let mut me = car(1, 0, 46.0, 0.0);
+        let mut me = car(1, 0, s0, 0.0);
         me.half_width = 0.92;
         me.state.front = 2.4;
         me.state.rear = 2.2;
@@ -657,9 +659,11 @@ fn on_a_junction_piece_a_closed_empty_piece_beside_lends_its_width_to_a_squeeze(
         let x = cars.iter().find(|c| c.id == 1).unwrap().pos.x;
         if occupied {
             assert!(pass.is_none() && x < 150.0, "the piece beside taken: no squeeze: {pass:?}, x {x:.1}");
+        } else if s0 > 45.0 {
+            assert!(pass.is_none() && x < 150.0 && least > 0.3, "from 1.7 m behind the least offset does not clear: no squeeze, it waits: {pass:?}, x {x:.1}, least {least:.2}");
         } else {
             let side = pass.map(|p| p.side);
-            assert!(pass.is_some_and(|p| p.lane.is_none() && p.side < -0.70 && p.side > -0.85), "squeezes to the left inside the junction: {pass:?}");
+            assert!(pass.is_some_and(|p| p.lane.is_none() && (p.side + 0.65).abs() < 0.02), "squeezes to the left inside the junction at the least offset: {pass:?}");
             assert!(least > 0.3 && x > 160.0, "clear past car 2: least {least:.2}, x {x:.1}, side {side:?}");
         }
     }
