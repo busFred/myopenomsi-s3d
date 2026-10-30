@@ -2158,9 +2158,9 @@ enum Bodies {
     /// along their heading at their speed for that time (`Bodies::time_to`: the signal's `pre`
     /// metres in its `wait` seconds, then the move at `speed` m/s, or from rest speeding up at
     /// `accel` m/s²) (a lane change: the body turns as it moves over and its rear swings out the
-    /// other way, into a car beside on that side that rolls on level with it). The other moving
-    /// ones (ahead of my front, behind my rear) where they are now with `others`, else not swept:
-    /// the gap rule's and the car following's.
+    /// other way, into a car beside on that side that rolls on level with it), and so the moving
+    /// ones ahead of my front. The other moving ones (behind my rear) where they are now with
+    /// `others`, else not swept: the gap rule's and the car following's.
     Over { speed: f32, accel: f32, others: bool, pre: f32, wait: f32 },
 }
 
@@ -2197,12 +2197,17 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let along = b.corners().map(|c| (c - me.pos.truncate()).dot(f0));
         along.iter().cloned().fold(f64::INFINITY, f64::min) < st.front as f64 && along.iter().cloned().fold(f64::NEG_INFINITY, f64::max) > -(st.rear as f64)
     };
+    // (wholly ahead of my front along my heading)
+    let ahead_of_me = |b: &Obb| b.corners().map(|c| (c - me.pos.truncate()).dot(f0)).iter().cloned().fold(f64::INFINITY, f64::min) >= st.front as f64;
     // (whether a body of this speed is swept: `Some(true)` carried on to where it will be when
-    // my body reaches the sample, `Some(false)` where it is now)
+    // my body reaches the sample, `Some(false)` where it is now; a moving body ahead of my front
+    // is carried on too - a car creeping in a queue ahead is swept where it will be, as it is
+    // swept where it stands once it stands: the start and the re-sweep while signalling make the
+    // same test of it - those behind my rear are the gap rule's and the follower's)
     let swept = |speed: f32, b: &Obb| match bodies {
         _ if speed.abs() < STANDING_SPEED => Some(false),
         Bodies::All => Some(false),
-        Bodies::Over { .. } if bodies.time_to(0.0).is_some() && beside(b) => Some(true),
+        Bodies::Over { .. } if bodies.time_to(0.0).is_some() && (beside(b) || ahead_of_me(b)) => Some(true),
         Bodies::Over { others, .. } => others.then_some(false),
     };
     // (a body where it is when my body is `d` metres on: carried on along its heading at its
