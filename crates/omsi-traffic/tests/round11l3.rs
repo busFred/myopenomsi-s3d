@@ -668,3 +668,71 @@ fn on_a_junction_piece_a_closed_empty_piece_beside_lends_its_width_to_a_squeeze(
         }
     }
 }
+
+/// Fix 3, item 1: the dead lane's run beside the lane that leads (`dead_run`) is walked along the
+/// lanes beside, so a piece of the lane beside that is shorter than the dead lane's own piece - the
+/// inner lane of a bend - does not end it. A two-lane road (left lane on path 0, right on path 1
+/// of each spline): straight x 0..100, a bend to the right through 60 degrees (radius 200 on the
+/// left lane, 196.5 on the right: the right one 3.7 m shorter), straight again for 300 m to a fork
+/// where the left lane turns off left or right (lanes 6, 7) and the right lane runs on to the trip
+/// end (lane 5). A car on the left lane at x 10, 13 m/s, its trip end lane 5, with no wish to
+/// change for speed or to keep right: its urgent strategic change begins only where the distance
+/// left to the fork comes under its strategic distance (`laDist`, at 13 m/s some 143 m towards the
+/// right, more with its room to stop), on the last straight - not in the bend, as when the run
+/// ended with the bend's inner lane - and it takes the way to its trip end.
+#[test]
+fn a_dead_lanes_run_beside_the_lane_that_leads_goes_on_round_a_bend() {
+    let arc = |r: f64| -> Vec<(f64, f64)> { (0..=12).map(|k| { let a = (k as f64 * 5.0).to_radians(); (100.0 + r * a.sin(), -200.0 + r * a.cos()) }).collect() };
+    let (end_l, end_r) = (*arc(200.0).last().unwrap(), *arc(196.5).last().unwrap());
+    let dir = (-(60.0f64).to_radians().sin(), (60.0f64).to_radians().cos());
+    let along = |p: (f64, f64), d: f64| (p.0 + dir.1 * d, p.1 + dir.0 * d);
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1, 0, 0.0)); // 0
+    net.lanes.push(road(&[(0.0, -3.5), (100.0, -3.5)], 1, 1, 3.5)); // 1
+    net.lanes.push(road(&arc(200.0), 2, 0, 0.0)); // 2
+    net.lanes.push(road(&arc(196.5), 2, 1, 3.5)); // 3
+    net.lanes.push(road(&[end_l, along(end_l, 300.0)], 3, 0, 0.0)); // 4
+    net.lanes.push(road(&[end_r, along(end_r, 300.0), along(end_r, 600.0)], 3, 1, 3.5)); // 5
+    let fork = along(end_l, 300.0);
+    // (the left lane's ways on at the fork: off to the left, or straight on beside lane 5's way)
+    let (h, n) = ((dir.1, dir.0), (-dir.0, dir.1));
+    let at = |a: f64, b: f64| (fork.0 + h.0 * a + n.0 * b, fork.1 + h.1 * a + n.1 * b);
+    net.lanes.push(road(&[fork, at(20.0, 2.0), at(40.0, 30.0)], 4, 0, 0.0)); // 6
+    net.lanes.push(road(&[fork, at(20.0, 8.0), at(300.0, 30.0)], 5, 0, 0.0)); // 7
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    assert_eq!((net.lanes[2].right, net.lanes[4].right, net.lanes[4].next.len()), (Some(3), Some(5), 2));
+    assert!(net.lanes[3].length() + 1.0 < net.lanes[2].length(), "the bend's right lane is the shorter");
+    // (a car whose trip end, drawn on its first frame where the look-ahead sees the fork, is lane 5)
+    let (mut sim, mut cars) = (1..=60u64)
+        .map(|id| {
+            let mut sim = Simulation::new(&net, vec![]);
+            let mut me = car(id, 0, 10.0, 13.0);
+            me.state.change_cooldown = 0.0;
+            me.state.max_speed_kmh = 13.0 * 3.6;
+            me.params.lc_speed_gain = 0.0;
+            me.params.lc_keep_right = 0.0;
+            let mut cars = vec![me];
+            sim.tick(&net, DT, &mut cars);
+            (sim, cars)
+        })
+        .find(|(_, cars)| cars[0].state.goal == Some(5))
+        .expect("a car drawing lane 5");
+    let id = cars[0].id;
+    let (mut started_at, mut lanes, mut t) = (None, vec![0usize], 0.0f32);
+    while t < 60.0 {
+        sim.tick(&net, DT, &mut cars);
+        let Some(me) = cars.iter().find(|c| c.id == id) else { break };
+        if started_at.is_none() && me.state.change.is_some() {
+            started_at = Some((me.state.lane, me.state.s));
+        }
+        if lanes.last() != Some(&me.state.lane) {
+            lanes.push(me.state.lane);
+        }
+        t += DT;
+    }
+    let (lane, s) = started_at.expect("a strategic change");
+    assert!(lane == 4, "the change begins on the last straight, within the strategic distance of the fork - not in the bend, where the run ended at the bend's inner lane: lane {lane} s {s:.1}");
+    assert!(lanes.contains(&5), "takes the way to its trip end: lanes {lanes:?}");
+}
