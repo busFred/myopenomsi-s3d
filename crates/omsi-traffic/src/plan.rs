@@ -1552,10 +1552,11 @@ fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: 
 /// `wait` more seconds of signalling, `len` metres long (at its start `SIGNAL_BEFORE_CHANGE` and
 /// `change_length` at this speed; while it signals, what is left and `LaneChange::length`, the
 /// move the car drives): the body turned along the change's smoothstep over `len` after the road
-/// the signalling takes at this speed, swept by
+/// the signalling takes as the car will drive it (`signal_plan`: braking for its leader), swept by
 /// `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars, the people, the standing
 /// vehicles and players near and the moving ones beside me on either side, each where it will be
-/// when my body gets there at this speed, from rest at the car's acceleration (`Bodies::Over`: a
+/// when my body gets there - over the signal's road in its time, then at the speed the move
+/// begins with, or from rest at the car's acceleration (`Bodies::Over`: a
 /// standing one where it is, a moving one beside carried on at its speed), and with a `lead` standing within
 /// the move, run on past it and what stands beyond it, the other moving ones too where they are
 /// now (without one those are the gap rule's). OMSI geometry: the body turns as it moves over,
@@ -1564,12 +1565,11 @@ fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: 
 /// vehicle's lateral extent against the neighbours on both sides.
 fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: Option<&crate::perception::Headway>, (wait, len): (f32, f32)) -> bool {
     let st = &me.state;
-    let v = st.speed.max(0.0);
     let Some((ts, _)) = net.lanes[nb.lane].nearest_point(me.pos) else { return false };
     let hr = (me.heading as f64).to_radians();
     let right = DVec2::new(hr.cos(), -hr.sin());
     let side = (net.lanes[nb.lane].at(ts).0 - me.pos).truncate().dot(right) as f32;
-    let pre = v * wait;
+    let (pre, v_move) = signal_plan(me, p, wait);
     let out_len = len;
     let level = match lead {
         Some(lead) => lead.gap + obstacle_run(p, lead, me.length() + PASS_ROOM).0 + st.front + st.rear + 2.0,
@@ -1577,7 +1577,45 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
     let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, Bodies::Over { speed: v, accel: st.accel, others: lead.is_some() })
+    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, Bodies::Over { speed: v_move, accel: st.accel, others: lead.is_some(), pre, wait })
+}
+
+/// How the car drives the `wait` seconds of a change's signal (`SIGNAL_BEFORE_CHANGE`, OMSI's
+/// driver signals before it moves over where SUMO's change starts in the step it is decided -
+/// `lanechange.duration` 0): the road it covers and its speed when the move begins. On at its
+/// speed, as far as its leader lets it: that one's rear carried on over the time at its speed and
+/// acceleration (to rest where it brakes), less my standing gap behind it; held short of that, it
+/// brakes evenly over the road it has, to rest where the road runs out before the time does
+/// (car-following's way of closing up on a leader that slows or stands). The move's sweep and the
+/// target lane's gaps are checked from there (`change_clear`, `gaps_through_signal`), so a change
+/// is begun only when it is clear for the whole of what the car drives before and during it.
+fn signal_plan(me: &Vehicle, p: &Perception, wait: f32) -> (f32, f32) {
+    let st = &me.state;
+    let v = st.speed.max(0.0);
+    let free = v * wait;
+    let Some(l) = p.leader.filter(|_| wait > 0.0) else { return (free, v) };
+    let vl = l.speed.max(0.0);
+    // (the leader's rear over the time: braking to rest within it if it brakes that hard)
+    let lead_run = if l.acc < 0.0 && vl + l.acc * wait < 0.0 { vl * vl / (-2.0 * l.acc) } else { vl * wait + 0.5 * l.acc * wait * wait };
+    let room = (l.gap + lead_run.max(0.0) - st.min_gap).max(0.0);
+    if room >= free {
+        return (free, v);
+    }
+    // (even braking over `room`: at rest before the time runs out where it would end slower than 0)
+    (room, (2.0 * room / wait - v).max(0.0))
+}
+
+/// Do the target lane's gaps still hold where the move begins - after the signal's `wait`
+/// seconds driven as `signal_plan` has it, the follower and leader there carried on at their
+/// speeds - by the gap rule at the speed I have then (`gap_parts`' tests: the follower need not
+/// brake hard, `accepted_gap`; room ahead)? With the gap rule now, a change is begun only when
+/// its gaps hold over the signal too (SUMO checks the gaps in the step the change is made; the
+/// OMSI driver signals first).
+fn gaps_through_signal(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> bool {
+    let (pre, v_end) = signal_plan(me, p, wait);
+    let behind = nb.behind.is_none_or(|(g, vb)| g + pre - vb * wait >= gap_needed_behind(me, nb, vb, v_end));
+    let ahead = nb.ahead.is_none_or(|(g, va)| g + va * wait - pre > 2.0 + (v_end - va).max(0.0) * 1.5);
+    behind && ahead
 }
 
 /// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
@@ -2115,22 +2153,31 @@ enum Bodies {
     All,
     /// The standing ones near where they are, and the moving ones beside me (level with my
     /// body now, on either side) where they will be when my body reaches the sample: carried on
-    /// along their heading at their speed for that time (`Bodies::time_to`: driving on at `speed`
-    /// m/s, or from rest speeding up at `accel` m/s²) (a lane change: the body turns as it moves
-    /// over and its rear swings out the other way, into a car beside on that side that rolls on
-    /// level with it). The other moving ones (ahead of my front, behind my rear) where they are
-    /// now with `others`, else not swept: the gap rule's and the car following's.
-    Over { speed: f32, accel: f32, others: bool },
+    /// along their heading at their speed for that time (`Bodies::time_to`: the signal's `pre`
+    /// metres in its `wait` seconds, then the move at `speed` m/s, or from rest speeding up at
+    /// `accel` m/s²) (a lane change: the body turns as it moves over and its rear swings out the
+    /// other way, into a car beside on that side that rolls on level with it). The other moving
+    /// ones (ahead of my front, behind my rear) where they are now with `others`, else not swept:
+    /// the gap rule's and the car following's.
+    Over { speed: f32, accel: f32, others: bool, pre: f32, wait: f32 },
 }
 
 impl Bodies {
-    /// The time (s) my body takes to drive `d` metres on (`Bodies::Over`): at its speed, or from
-    /// rest at its acceleration (`d = a t² / 2`); None where it does not move at all.
+    /// The time (s) my body takes to drive `d` metres on (`Bodies::Over`): over the signal's
+    /// `pre` metres its `wait` seconds pro rata, past them at its speed, or from rest at its
+    /// acceleration (`d = a t² / 2`); None where it does not move at all.
     fn time_to(self, d: f32) -> Option<f32> {
-        match self {
-            Bodies::Over { speed, .. } if speed > 0.0 => Some(d / speed),
-            Bodies::Over { accel, .. } if accel > 0.0 => Some((2.0 * d.max(0.0) / accel).sqrt()),
-            _ => None,
+        let Bodies::Over { speed, accel, pre, wait, .. } = self else { return None };
+        if d < pre {
+            return Some(wait * d.max(0.0) / pre);
+        }
+        let rest = d - pre;
+        if speed > 0.0 {
+            Some(wait + rest / speed)
+        } else if accel > 0.0 {
+            Some(wait + (2.0 * rest / accel).sqrt())
+        } else {
+            None
         }
     }
 }
@@ -2929,7 +2976,8 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None),
                 Some(l) => change_clear(net, sim, vehicles, me, p, &nb, Some(&l), mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
                 None => change_clear(net, sim, vehicles, me, p, &nb, None, mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
-            };
+            }
+            .filter(|s| matches!(s, Start::Bypass { .. }) || gaps_through_signal(me, p, &nb, mv.0));
             out.change_why = Some(why);
         }
         // an urgent lane-end or strategic change not started this frame - its gap not there, or

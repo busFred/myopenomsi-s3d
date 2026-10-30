@@ -3674,8 +3674,12 @@ pub fn claim_horizon(speed: f32) -> f32 {
 /// Linked lanes may end up to 1.5 m apart; over this many metres on either side of a joint
 /// the way is bent so that it has no step (half the gap on each side).
 const JOINT_BLEND: f32 = 6.0;
-/// Seconds of signalling before a lane change begins to move sideways.
-// (two seconds of signal before the car moves over)
+/// Seconds of signalling before a lane change begins to move sideways (OMSI: the driver signals
+/// first; SUMO's change starts in the step it is decided, `lanechange.duration` 0). Unsourced: no
+/// measured central value was found - Lee, Olsen & Wierwille 2004 (NHTSA DOT HS 809 702,
+/// literature review) give only the range of signal onset, -2.42 to 3.62 s from the change's
+/// start (Hetrick 1997), and road codes ask for signalling in good time without a
+/// figure (StVO 7(5): "rechtzeitig und deutlich anzukündigen"). The start test plans through it (`omsi_traffic::plan`'s `signal_plan`).
 pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
