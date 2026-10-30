@@ -44,7 +44,8 @@ pub struct Strip {
     pub z0: f32,
     pub z1: f32,
     pub texture: String,
-    /// "road", "walk", "ground", "raised" or "other" (see [`classify_texture`]).
+    /// "road", "walk", "ground", "raised" or "other" (see [`classify_texture`]; a "walk" strip
+    /// a street path stands on and no pedestrian path does is "road", [`cross_section`]).
     pub class: &'static str,
 }
 
@@ -197,6 +198,19 @@ pub fn cross_section(def: &Spline) -> CrossSection {
                 texture: tex.clone(),
                 class: classify_texture(&tex),
             });
+        }
+    }
+    // the spline's own paths say what a strip is where its texture's name misleads: a strip
+    // a street path stands on and no pedestrian path does is road, whatever the name (X10's
+    // concrete-slab road `str_betonplatten` reads as paving slabs, "platte"; its street paths
+    // lie on it, its pedestrian paths on the `str_side` strips beside it)
+    let on = |s: &Strip, kind: i32| {
+        def.paths.iter().any(|p| p.kind == kind && p.start[0] >= s.x0 - SAME_X && p.start[0] <= s.x1 + SAME_X && (p.start[2] - s.z_at(p.start[0])).abs() <= PATH_ON_STRIP_DZ)
+    };
+    for i in 0..cs.strips.len() {
+        let st = &cs.strips[i];
+        if st.class == "walk" && on(st, 0) && !on(st, 1) {
+            cs.strips[i].class = "road";
         }
     }
     // a strip of unknown texture that stands above the road is a raised surface (a pavement
@@ -562,6 +576,34 @@ mod tests {
         let mut bare = Spline::default();
         bare.paths = vec![path(0.0, 0.0, 1.0, 0), path(3.0, 0.0, 1.0, 0)];
         assert_eq!(lane_edges(&bare, 0, false, false), (0.0, 1.5));
+    }
+
+    /// X10's `str_2spur_6m_erzgebirgs.sli`: a concrete-slab road (`str_betonplatten`, which
+    /// the name list reads as paving slabs) with its two street paths on it, pavements
+    /// (`str_side1`) raised 0.15 m beyond with the pedestrian paths on them. The slabs are
+    /// road: the lanes reach the kerbs (the pavements stop them by their kerb face; `str_`
+    /// classes them "road" by name). A paving strip a pedestrian path stands on stays a
+    /// pavement even with a street path on it too.
+    #[test]
+    fn a_strip_the_street_paths_lie_on_is_road_whatever_its_name() {
+        assert_eq!(classify_texture("str_betonplatten.bmp"), "walk");
+        let mut def = Spline::default();
+        def.textures = vec![tex("str_side1.bmp"), tex("str_betonplatten.bmp")];
+        def.profiles = vec![
+            SplineProfile { texture: 0, points: vec![pt(-6.0, 0.25), pt(-3.0, 0.25), pt(-3.0, 0.1)] },
+            SplineProfile { texture: 1, points: vec![pt(-3.0, 0.1), pt(0.0, 0.1), pt(3.0, 0.1)] },
+            SplineProfile { texture: 0, points: vec![pt(3.0, 0.1), pt(3.0, 0.25), pt(6.0, 0.25)] },
+        ];
+        let walker = |x: f32| PathDef { kind: 1, ..path(x, 0.25, 1.383, 2) };
+        def.paths = vec![walker(-4.572), path(-1.5, 0.1, 3.0, 1), path(1.5, 0.1, 3.0, 0), walker(4.572)];
+        let cs = cross_section(&def);
+        assert!(cs.strips.iter().filter(|s| s.texture == "str_betonplatten.bmp").all(|s| s.class == "road"));
+        assert_eq!(lane_edges(&def, 1, false, false), (1.5, 1.5));
+        assert_eq!(lane_edges(&def, 2, false, false), (1.5, 1.5));
+        // a street path and a pedestrian path on one paving strip: still a pavement
+        def.paths.push(PathDef { kind: 1, ..path(-2.0, 0.1, 1.0, 2) });
+        let cs = cross_section(&def);
+        assert!(cs.strips.iter().filter(|s| s.x1 <= 0.0 && s.texture == "str_betonplatten.bmp").all(|s| s.class == "walk"));
     }
 
     #[test]
