@@ -372,9 +372,6 @@ pub const LC_LOOK_FORWARD: f32 = 10.0;
 /// SUMO LC2013's `LOOK_AHEAD_SPEED_MEMORY`: the look-ahead speed falls by this
 /// factor per second (`Vehicle::look_ahead_speed`).
 pub const LOOK_AHEAD_SPEED_MEMORY: f32 = 0.9;
-/// ... times this towards the overtaking side (SUMO's `lcLookaheadLeft` default; the
-/// side mirrors on a left-hand-traffic map).
-pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
 /// SUMO LC2013's `HELP_DECEL_FACTOR`: a follower asked to make room for a lane change
 /// brakes no harder than its comfortable brake times this.
 pub const HELP_DECEL_FACTOR: f32 = 1.0;
@@ -395,10 +392,10 @@ pub const LC_COOPERATIVE: f32 = 1.0;
 pub use omsi_sim::traffic::change_space;
 
 /// SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
-/// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side) plus two of the
-/// vehicle's lengths with its standing gap.
+/// `LC_LOOK_FORWARD` (times the driver's `lc_lookahead_left` towards the overtaking side, which
+/// mirrors on a left-hand-traffic map) plus two of the vehicle's lengths with its standing gap.
 pub fn lane_end_look(v: f32, overtaking_side: bool, me: &Vehicle) -> f32 {
-    v * LC_LOOK_FORWARD * if overtaking_side { LC_LOOKAHEAD_LEFT } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
+    v * LC_LOOK_FORWARD * if overtaking_side { me.params.lc_lookahead_left } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
 }
 
 /// The room (m) the last-resort stop keeps before where my lane ends for me, towards `nb`: what
@@ -573,7 +570,7 @@ fn best_occupation(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &V
 }
 
 /// SUMO LC2013's strategic distance towards side `dir` (`laDist`): the look-ahead speed times
-/// `LC_LOOK_FORWARD` times `lc_strategic` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side),
+/// `LC_LOOK_FORWARD` times `lc_strategic` (times the driver's `lc_lookahead_left` towards the overtaking side),
 /// plus two lengths with the standing gap (`lane_end_look`).
 fn strategic_look(sim: &Simulation, me: &Vehicle, dir: i32) -> f32 {
     let overtaking = dir == if sim.left_hand { 2 } else { 1 };

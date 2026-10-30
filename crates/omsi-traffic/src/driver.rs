@@ -97,14 +97,26 @@ pub struct DriverParams {
     /// How fast impatience grows while waiting (per second) and where it caps.
     pub impatience_rate: f32,
     pub impatience_max: f32,
+    /// SUMO's vType `lcLookaheadLeft`: the strategic look-ahead towards the overtaking side as a
+    /// factor of the other side's (`plan::lane_end_look`; SUMO's default 2.0,
+    /// sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html). Ours is 1.0 for
+    /// the preset, drawn per driver over 0.65..1.35 from the driver's hurry
+    /// (`LOOKAHEAD_LEFT_HURRY`; the user's decision L3-D2: the low end near AASHTO's decision sight
+    /// distance for maneuver E, urban, t = 14.0-14.5 s, against LC2013's 2 x 10 s, INDOT Design
+    /// Manual ch. 42; centre and spread the user's choice).
+    pub lc_lookahead_left: f32,
 }
+
+/// How much a driver's hurry (-1 slow .. +1 quick) shortens its `lc_lookahead_left` (the user's
+/// decision L3-D2: 1.0 x (1 - 0.35 x hurry), 0.65..1.35).
+pub const LOOKAHEAD_LEFT_HURRY: f32 = 0.35;
 
 impl Default for DriverParams {
     /// Every field unknown (NaN): what a field a recording lacks is read as, until
     /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
         let n = f32::NAN;
-        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n }
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, lc_lookahead_left: n }
     }
 }
 
@@ -116,7 +128,7 @@ impl DriverParams {
         macro_rules! fill {
             ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
         }
-        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max);
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, lc_lookahead_left);
     }
 
     /// The preset of a class, before jitter.
@@ -137,6 +149,7 @@ impl DriverParams {
             lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
+            lc_lookahead_left: 1.0,
         };
         // (buses and lorries take bends more gently than cars: the app's 1.6 for every
         // heavy vehicle, until round 7)
@@ -189,6 +202,7 @@ impl DriverParams {
             // for every driver, or a slow driver sits behind a crawler for ever)
             lc_speed_gain: j(p.lc_speed_gain, 0.2),
             impatience_rate: j(p.impatience_rate, 0.5),
+            lc_lookahead_left: j(p.lc_lookahead_left, -LOOKAHEAD_LEFT_HURRY),
             ..p
         }
     }
