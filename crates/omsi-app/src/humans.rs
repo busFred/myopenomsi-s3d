@@ -5880,6 +5880,9 @@ pub struct Humans {
     /// (any entry, any exit; `buses_now`): the harness opens the player's doors by them
     /// (`set_player_doors`).
     pub(crate) stand_in_doors: (bool, bool),
+    /// The stop `stand_in` serves where it stands this tick (its timetable's, at its station):
+    /// the one the people's holds of the player's bus keep it at (`holds`).
+    pub(crate) stand_in_stop: Option<i64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -6250,6 +6253,7 @@ impl Humans {
             ai_stop_requests: HashSet::new(),
             stand_in: None,
             stand_in_doors: (false, false),
+            stand_in_stop: None,
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -8353,6 +8357,7 @@ impl Humans {
                 .collect();
             let mut visits = HashMap::new();
             self.stand_in_doors = (false, false);
+            self.stand_in_stop = None;
             for c in t.cars.iter().filter(|c| c.serves_stops()) {
                 let from_eye = self.eye.map(|e| (c.vehicle.position - e.pos).length()).unwrap_or(f64::MAX);
                 if (c.vehicle.position - near).length().min(from_eye) > 400.0 && !riding.contains(&c.id) {
@@ -8407,6 +8412,7 @@ impl Humans {
                 // its doors open by these, `stand_in_doors`)
                 if self.stand_in == Some(c.id) {
                     self.stand_in_doors = (entry_open.iter().any(|o| *o), exit_open.iter().any(|o| *o));
+                    self.stand_in_stop = boarding_stop;
                     continue;
                 }
                 self.seats
@@ -11295,13 +11301,14 @@ mod tests {
         assert_eq!(waiting, 2, "two waiting");
         // the AI bus 99 drives the player's: the player's doors open as its own
         h.stand_in = Some(99);
+        h.stand_in_stop = Some(7);
         h.set_player_doors(&mut v, (true, true));
         let (entry, exit) = Humans::doors_open(&v, 1, 1);
         assert_eq!((entry, exit), (vec![true], vec![true]), "the player's doors read open");
         let (mut held, mut most_riders) = (false, 0u32);
         for _ in 0..(60.0 / DT) as usize {
             h.tick(DT, &world, Some(&v), None, &renderer, &mut scene);
-            held |= h.take_holds().iter().any(|&(id, stop, _)| id == 99 && stop.is_none_or(|s| s == 7));
+            held |= h.take_holds().iter().any(|&(id, stop, _)| id == 99 && stop == Some(7));
             most_riders = most_riders.max(h.ai_riders().get(&99).map_or(0, |r| r.aboard));
             if h.aboard(BusId::Player).count() == 2 {
                 break;

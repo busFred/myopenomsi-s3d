@@ -1880,15 +1880,18 @@ impl Humans {
             if any_exit {
                 self.holds.push((id, None, 2.5));
             }
-            // (the player's bus is held for whoever walks up to it from any stop: its duty
-            // takes the people of every stop named as its trip's, `fit`, not only of the stop
-            // object the bus driving it serves - held only there, they stood in its way once it
-            // left and held it for good)
-            let any_stop = bn.id == BusId::Player && !stops.is_empty();
-            if any_stop && !any_exit {
-                self.holds.push((id, None, 2.5));
+            // (the player's bus is held at the stop the bus driving it serves, `stand_in_stop`,
+            // for whoever walks up to it whatever stop they came from: its duty takes the people
+            // of every stop named as its trip's, `fit` - held only for their own stop, the bus
+            // left with them on the way and they stood in its way for good; never where it is
+            // at no stop of its own, queued behind another bus)
+            if bn.id == BusId::Player {
+                if let Some(s) = self.stand_in_stop.filter(|_| !stops.is_empty()) {
+                    self.holds.push((id, Some(s), 2.5));
+                }
+                continue;
             }
-            for s in stops.into_iter().filter(|_| !any_stop) {
+            for s in stops {
                 self.holds.push((id, Some(s), 2.5));
             }
         }
