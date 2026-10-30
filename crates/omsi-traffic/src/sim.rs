@@ -408,6 +408,9 @@ pub struct Vehicle {
     /// diagnostics: `traffic_cases ab`'s ABORT events).
     #[serde(skip)]
     pub aborted_for: Option<crate::plan::AbortWhy>,
+    /// What its failing re-sweep met (`Plan::abort_detail`; diagnostics).
+    #[serde(skip)]
+    pub aborted_detail: Option<crate::plan::SweepBlocker>,
     /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
@@ -701,6 +704,7 @@ impl Vehicle {
             dead_end_held: 0.0,
             change_for: None,
             aborted_for: None,
+            aborted_detail: None,
             unheld_for: 0.0,
             zip_behind: None,
             refused_last: false,
@@ -2323,6 +2327,7 @@ impl Simulation {
                 CHANGES_ABORTED_BY[w as usize][v.change_for.map_or(6, |c| c as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             v.aborted_for = plan.abort_why;
+            v.aborted_detail = plan.abort_detail;
         }
         match plan.start {
             Some(Start::Change { to, dir }) => {

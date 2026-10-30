@@ -4578,7 +4578,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             }
             ex.lane_revisits = revisits.entries;
             for v in r.vehicles.iter().filter(|v| v.aborted_for.is_some() && near(v.pos)) {
-                ex.events.push(format!("ABORT {} t={now:.1} #{} lane {} s {:.1} v {:.1} by {:?} for {:?} lead {:?} gap {:?}", sc.name, v.id, v.state.lane, v.state.s, v.state.speed, v.aborted_for, v.change_for, v.last.lead_id, v.last.lead.map(|l| l.gap)));
+                ex.events.push(format!("ABORT {} t={now:.1} #{} lane {} s {:.1} v {:.1} by {:?} for {:?} lead {:?} gap {:?} met {:?}", sc.name, v.id, v.state.lane, v.state.s, v.state.speed, v.aborted_for, v.change_for, v.last.lead_id, v.last.lead.map(|l| l.gap), v.aborted_detail));
             }
             ex.revisit_vehicles = revisits.vehicles.len() as u64;
             for (i, v) in r.vehicles.iter().enumerate() {

@@ -104,6 +104,10 @@ pub struct Plan {
     pub abort_change: bool,
     /// Which check dropped it (`AbortWhy`; diagnostics, `sim::CHANGES_ABORTED_BY`).
     pub abort_why: Option<AbortWhy>,
+    /// What the failing re-sweep met (diagnostics: `traffic_cases ab`'s ABORT events): kind
+    /// (0 vehicle, 1 parked, 2 person), its id and lane, its speed, carried on or not, the least
+    /// separation, and where along the move.
+    pub abort_detail: Option<SweepBlocker>,
     /// The last-resort stop before a lane's end, or a dead lane's end for a blocked urgent
     /// strategic change, placed this frame (the odometer where the front stops,
     /// `Vehicle::lane_end_stop`).
@@ -2266,6 +2270,26 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
             None => sep >= clearance,
         };
         if !ok {
+            // (diagnostics: what the failing pose meets, `Plan::abort_detail`)
+            SWEEP_BLOCKER.with(|c| {
+                let mut best: (f64, Option<SweepBlocker>) = (f64::INFINITY, None);
+                for &(j, carried) in &near {
+                    let o = &vehicles[j];
+                    if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
+                        let sp = at(o.obb(), o.heading, o.state.speed, carried, d).separation(&b);
+                        if sp < best.0 {
+                            best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried, sp as f32, d)));
+                        }
+                    }
+                }
+                for (kind, o) in parked.iter().map(|o| (1u8, o)).chain(people.iter().map(|o| (2u8, o))) {
+                    let sp = o.separation(&b);
+                    if sp < best.0 {
+                        best = (sp, Some((kind, 0, 0, 0.0, false, sp as f32, d)));
+                    }
+                }
+                c.set(best.1);
+            });
             return false;
         }
         prev = Some((d, b, sep));
@@ -2273,6 +2297,15 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         d += if matches!(profile, Profile::FullLock { .. }) { 0.05 } else { 0.5 };
     }
     true
+}
+
+/// What a failing swept move met (diagnostics, `Plan::abort_detail`): (kind 0 vehicle, 1 parked,
+/// 2 person; id; lane; speed; carried on; separation; where along the move).
+pub type SweepBlocker = (u8, u64, usize, f32, bool, f32, f32);
+
+thread_local! {
+    /// What the last failing swept move met (diagnostics, `Plan::abort_detail`).
+    static SWEEP_BLOCKER: std::cell::Cell<Option<SweepBlocker>> = const { std::cell::Cell::new(None) };
 }
 
 /// What the driver does about the light ahead this frame.
@@ -2905,7 +2938,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
                     match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
                         Some(step_out) if out.start.is_none() => out.start = Some(step_out),
-                        _ => (out.abort_change, out.abort_why) = (true, Some(AbortWhy::PlainSweep)),
+                        _ => {
+                            (out.abort_change, out.abort_why) = (true, Some(AbortWhy::PlainSweep));
+                            out.abort_detail = SWEEP_BLOCKER.with(|c| c.get());
+                        }
                     }
                 }
             }
