@@ -105,6 +105,12 @@ pub struct DriverParams {
     /// distance for maneuver E, urban, t = 14.0-14.5 s, against LC2013's 2 x 10 s, INDOT Design
     /// Manual ch. 42; centre and spread the user's choice).
     pub lc_lookahead_left: f32,
+    /// Seconds a driver stands at its last-resort stop before a dead lane's end, its urgent
+    /// strategic change blocked, before it gives up and drives on through the fork on its own
+    /// lane (`plan`'s blocked strategic wish, `omsi_sim::traffic::STRATEGIC_GAVE_UP`), and over
+    /// which its lane-change impatience grows to 1. 30 s for the preset, `30 x (1 - hurry)`, 0..60 s,
+    /// per driver (the user's decision L3-D3).
+    pub strategic_patience: f32,
 }
 
 /// How much a driver's hurry (-1 slow .. +1 quick) shortens its `lc_lookahead_left` (the user's
@@ -116,7 +122,7 @@ impl Default for DriverParams {
     /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
         let n = f32::NAN;
-        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, lc_lookahead_left: n }
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, lc_lookahead_left: n, strategic_patience: n }
     }
 }
 
@@ -128,7 +134,7 @@ impl DriverParams {
         macro_rules! fill {
             ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
         }
-        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, lc_lookahead_left);
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, lc_lookahead_left, strategic_patience);
     }
 
     /// The preset of a class, before jitter.
@@ -150,6 +156,7 @@ impl DriverParams {
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
             lc_lookahead_left: 1.0,
+            strategic_patience: 30.0,
         };
         // (buses and lorries take bends more gently than cars: the app's 1.6 for every
         // heavy vehicle, until round 7)
@@ -203,6 +210,7 @@ impl DriverParams {
             lc_speed_gain: j(p.lc_speed_gain, 0.2),
             impatience_rate: j(p.impatience_rate, 0.5),
             lc_lookahead_left: j(p.lc_lookahead_left, -LOOKAHEAD_LEFT_HURRY),
+            strategic_patience: j(p.strategic_patience, -1.0),
             ..p
         }
     }

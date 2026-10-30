@@ -736,3 +736,51 @@ fn a_dead_lanes_run_beside_the_lane_that_leads_goes_on_round_a_bend() {
     assert!(lane == 4, "the change begins on the last straight, within the strategic distance of the fork - not in the bend, where the run ended at the bend's inner lane: lane {lane} s {s:.1}");
     assert!(lanes.contains(&5), "takes the way to its trip end: lanes {lanes:?}");
 }
+
+/// L3-D3: a blocked urgent strategic change is given up after the driver's own patience. Car 1 on
+/// the left lane of `fork_ahead`, its trip end lane 3 off the right-hand way, beside a jam standing
+/// on the right lane to the fork: with `strategic_patience` 5 s it stands at its stop before the
+/// dead lane's end, then drives on through the fork on its own lane's way (lane 2 or 5) within the
+/// 30 s the jam stands, counted `STRATEGIC_GAVE_UP` (not `STRATEGIC_MISSED`), and its trip end is
+/// drawn again; with a patience longer than the jam stands it waits and takes the turn (as
+/// `a_blocked_strategic_change_stops_before_the_dead_lanes_end_and_waits`).
+#[test]
+fn a_blocked_strategic_change_is_given_up_after_the_drivers_patience() {
+    for patience in [5.0f32, 1000.0] {
+        let net = fork_ahead();
+        let mut sim = Simulation::new(&net, vec![]);
+        let mut me = car(1, 0, 200.0, 13.0);
+        me.state.change_cooldown = 0.0;
+        me.state.goal = Some(3);
+        me.params.lc_speed_gain = 0.0;
+        me.params.lc_keep_right = 0.0;
+        me.params.strategic_patience = patience;
+        let mut cars = vec![me];
+        for k in 0..12u64 {
+            cars.push(standing(10 + k, 1, 220.0 + 6.5 * k as f32));
+        }
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        let (gave0, missed0) = (g(&omsi_sim::traffic::STRATEGIC_GAVE_UP), g(&omsi_sim::traffic::STRATEGIC_MISSED));
+        let (mut lanes, mut stood, mut t) = (vec![0usize], 0.0f32, 0.0f32);
+        while t < 50.0 {
+            if t >= 30.0 {
+                cars.retain(|c| c.id == 1);
+            }
+            sim.tick(&net, DT, &mut cars);
+            let Some(me) = cars.iter().find(|c| c.id == 1) else { break };
+            if lanes.last() != Some(&me.state.lane) {
+                lanes.push(me.state.lane);
+            }
+            if me.state.speed < 0.1 && t < 30.0 {
+                stood += DT;
+            }
+            t += DT;
+        }
+        let (gave, missed) = (g(&omsi_sim::traffic::STRATEGIC_GAVE_UP) - gave0, g(&omsi_sim::traffic::STRATEGIC_MISSED) - missed0);
+        if patience < 30.0 {
+            assert!(lanes.len() >= 2 && (lanes[1] == 2 || lanes[1] == 5) && stood >= patience - 0.5 && gave >= 1, "gives up after {patience} s and drives on its own lane's way: lanes {lanes:?}, stood {stood:.1}, gave up {gave}, missed {missed}");
+        } else {
+            assert!(lanes.starts_with(&[0, 1, 3]) && gave == 0, "waits and takes the turn: lanes {lanes:?}, gave up {gave}");
+        }
+    }
+}

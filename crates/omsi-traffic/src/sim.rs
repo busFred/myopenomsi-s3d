@@ -2296,6 +2296,14 @@ impl Simulation {
             if before < STRATEGIC_LONG_HOLD && v.dead_end_held >= STRATEGIC_LONG_HOLD {
                 STRATEGIC_LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            // (standing its patience there, the driver gives up the change and drives on through
+            // the fork on its own lane: the user's decision L3-D3; only a dead lane, which runs on -
+            // a lane that really ends keeps its stop)
+            if v.dead_end_held >= v.params.strategic_patience {
+                v.state.strategic_gave_up = true;
+                v.lane_end_stop = None;
+                v.dead_end_held = 0.0;
+            }
         } else {
             v.dead_end_held = 0.0;
         }

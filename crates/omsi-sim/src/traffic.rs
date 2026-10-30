@@ -3741,6 +3741,12 @@ pub struct AiState {
     /// speeds and group (`Network::goal_fields`); not recorded, computed again on need.
     #[serde(skip)]
     pub goal_field: Option<std::sync::Arc<GoalField>>,
+    /// The driver gave up its blocked urgent strategic change after standing its patience at the
+    /// last-resort stop before the dead lane's end (`omsi_traffic::sim`, the user's decision
+    /// L3-D3): it drives on through the fork on its own lane, where its trip end is drawn again
+    /// (`STRATEGIC_GAVE_UP`). Cleared with the next draw.
+    #[serde(default)]
+    pub strategic_gave_up: bool,
     /// A throwaway copy of a car as it would be put down, for a test of where it would stand
     /// (the game's `spawn_probe`): it plans its way without drawing a trip end (`goal_way`), so
     /// `GOAL_PICKED` counts real cars only; it chooses at random among the best tier.
@@ -3951,6 +3957,11 @@ pub static GOAL_UNREACHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// its change was not urgent in time), where its trip end is drawn again among those its road
 /// reaches and its way planned afresh (`goal_way`; SUMO's vehicle re-routes).
 pub static STRATEGIC_MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Strategic changes given up: a car that stood its patience at its last-resort stop before a
+/// dead lane's end (`AiState::strategic_gave_up`) and drove on through the fork on its own lane,
+/// counted where it enters that way as `STRATEGIC_MISSED` is (and not counted there), whole
+/// process; its trip end is drawn again the same way.
+pub static STRATEGIC_GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Forks a random car met with no trip end reachable over the lanes its group has a density
 /// above 0 on (`AiState::goal_way` found none: a pocket its group's traffic does not lead out
 /// of), whole process; per fork met, not per car (a car with no trip end tries again at each
@@ -4200,7 +4211,7 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, strategic_gave_up: false, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     /// A random car woken after a time out of range (the game's dormant cars): it leaves the
@@ -4531,6 +4542,7 @@ impl AiState {
             let key = self.goal_key(net, g, access);
             let f = net.goal_field(key, |n| self.routable(net, n, access), self.route_cost(net));
             self.goal = Some(g);
+            self.strategic_gave_up = false;
             self.goal_field = Some(f.clone());
             return Some(f);
         }
@@ -5460,7 +5472,8 @@ impl AiState {
             if missed {
                 // (its trip end drawn again among those its road now reaches, and its way planned
                 // afresh from here towards it: SUMO's vehicle re-routes from where it is)
-                STRATEGIC_MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.strategic_gave_up { &STRATEGIC_GAVE_UP } else { &STRATEGIC_MISSED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.strategic_gave_up = false;
                 self.goal_way(net, &[next], self.s, &[next], true);
                 self.planned_next = None;
                 self.ahead.clear();

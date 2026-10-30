@@ -585,11 +585,12 @@ fn strategic_look(sim: &Simulation, me: &Vehicle, dir: i32) -> f32 {
 /// `last_stop_room`) less the occupation of the lane that leads (`best_occupation`), per change
 /// needed, is under the strategic distance (`strategic_look`):
 /// `currentDistDisallows(usableDist, bestLaneOffset, laDist)`; else 0. Also that distance (m).
-/// `lc_strategic` below 0 never (SUMO: -1 disables strategic changes).
+/// `lc_strategic` below 0 never (SUMO: -1 disables strategic changes), nor once the driver has
+/// given it up (`AiState::strategic_gave_up`, standing its `strategic_patience` at its stop).
 fn strategic_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, nb: &NeighbourView) -> Option<(f32, f32)> {
     let st = &me.state;
     let f = trip_field(me)?;
-    if me.params.lc_strategic < 0.0 || f.leads(st.lane) {
+    if me.params.lc_strategic < 0.0 || f.leads(st.lane) || st.strategic_gave_up {
         return None;
     }
     let k = changes_to_lead(net, f, st.lane, nb.dir, Some(nb.lane))?;
