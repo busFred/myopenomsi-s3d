@@ -2031,7 +2031,7 @@ mod tests {
         assert!((zebra - 104.0).abs() < 1.5 && zebra + 6.0 <= 112.0 - 1.0, "off the zebra: {zebra}");
         // the mouth of a junction on its own lane 6 m past the pole: not into it
         let mut net = straight(300.0);
-        net.crossings = vec![vec![omsi_sim::traffic::Crossing { other: 0, at: 113.0, other_at: 0.0, merge: false, before: 1.0, after: 1.0, other_before: 1.0, other_after: 1.0, side: false, outside: false }]];
+        net.crossings = vec![vec![omsi_sim::traffic::Crossing { other: 0, at: 113.0, other_at: 0.0, merge: false, before: 1.0, after: 1.0, other_before: 1.0, other_after: 1.0, side: false, outside: false, apart: 0.0 }]];
         let mouth = first(&net, true, 0.0);
         assert!((mouth - 104.0).abs() < 1.5, "short of the junction: {mouth}");
         // in a bay: no further on than the bay is known to reach
