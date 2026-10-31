@@ -1910,7 +1910,10 @@ fn change_keep_room(net: &Network, me: &Vehicle, p: &Perception) -> Option<f32> 
 
 /// The keep-back behind a standing lead (room to pull out again) is placed only where the car can
 /// still stop there braking at most this many times its comfortable brake (a gentle stop, not an
-/// emergency one).
+/// emergency one). No source gives it: it is the gentle-stop factor this code already used before
+/// L3 - a junction line is held only where the car stops `<= comfort_brake * 1.5`
+/// (`refused_stop`'s `gently`), and the keep-back behind a standing lead in `plan` itself used it inline - named here and kept, so the keep-back
+/// ends where the other gentle stops do (3 m/s² for the car preset's 2.0, under `HARD_BRAKE`).
 pub const KEEP_BACK_BRAKE: f32 = 1.5;
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
@@ -2382,9 +2385,13 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     };
     // (wholly ahead of my front along my heading)
     let ahead_of_me = |b: &Obb| b.corners().map(|c| (c - me.pos.truncate()).dot(f0)).iter().cloned().fold(f64::INFINITY, f64::min) >= st.front as f64;
-    // (the lanes of my own way: a body on them ahead of me is my lead's or the car following's)
+    // (the vehicles swept are those whose origin lies within `reach` of mine - the move's road and
+    // 20 m, as before L3; the lanes of my own way: a body on them ahead of me is my lead's or the
+    // car following's - as far along my way as that: a gathered body's origin is no further along
+    // its lane than it is from me in a straight line, so every one on my way is on these lanes)
+    let reach = level + 20.0;
     let own_way: Vec<usize> = match bodies {
-        Bodies::Over { .. } => crate::perception::way_lanes(net, st, level + 30.0).into_iter().map(|w| w.0).collect(),
+        Bodies::Over { .. } => crate::perception::way_lanes(net, st, reach).into_iter().map(|w| w.0).collect(),
         Bodies::All => Vec::new(),
     };
     // (how a body of this speed, on this lane, is swept - one rule whatever its speed, so the start
@@ -2434,7 +2441,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
             c => at(o, heading, speed, c, d).separation(b),
         }
     };
-    let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| {
+    let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, reach as f64).into_iter().filter_map(|j| {
         let o = &vehicles[j];
         swept(o.state.speed, Some(o.state.lane), Some(o.state.decel.max(o.params.comfort_brake)), &o.obb()).map(|c| (j, c))
     }).collect();
