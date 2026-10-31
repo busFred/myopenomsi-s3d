@@ -1686,10 +1686,36 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     // from the perception with the change laid, the target lane's no longer limiting it, and may plan
     // the move further on than the start did - d26 #5610 at 812.68 s: 6.72 m against 6.26 - so the
     // start sweeps the moves beginning anywhere from here to there)
-    let free = st.speed.max(0.0) * wait;
+    // (and as far as the car gets if it speeds up meanwhile, `free_road`: the start assumed its speed
+    // kept, and a car accelerating while it signalled was re-swept from beyond what the start had
+    // covered - viz4 #24004 at 972.79 s, 1.21 -> 1.29 m/s, its road 2.20 -> 2.28 m)
+    // (no further than its own lane's leader lets it, as `signal_plan` reads that one: the
+    // re-sweep's plan is bound by it still)
+    let own_room = p.own_leader.map_or(f32::INFINITY, |l| {
+        let vl = l.speed.max(0.0);
+        let run = if l.acc < 0.0 && vl + l.acc * wait < 0.0 { vl * vl / (-2.0 * l.acc) } else { vl * wait + 0.5 * l.acc * wait * wait };
+        (l.gap + run.max(0.0) - st.min_gap).max(0.0)
+    });
+    let free = free_road(st.speed, st.accel, p.v_want, wait).min(own_room).max(st.speed.max(0.0) * wait);
     SIGNAL_SPREAD.iter().map(|k| k * pre).chain([free, 0.5 * (pre + free)].into_iter().filter(|&f| f > pre)).all(|p0| {
         body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level.max(p0 + out_len), Profile::Smooth { pre: p0 }, Bodies::Over { speed: v_move, accel: st.accel, others: lead.is_some(), pre: p0, wait })
     })
+}
+
+/// The road (m) a car at `v` m/s covers in `wait` seconds undelayed: speeding up at its
+/// acceleration `accel` (`AiState::accel`) to its wanted speed `v_want` (`Perception::v_want`) and
+/// on at that - the most of the signal's road it can drive, whatever its leaders do.
+fn free_road(v: f32, accel: f32, v_want: f32, wait: f32) -> f32 {
+    let (v, w) = (v.max(0.0), wait.max(0.0));
+    if v >= v_want || accel <= 0.0 {
+        return v * w;
+    }
+    let t_up = (v_want - v) / accel;
+    if t_up >= w {
+        v * w + 0.5 * accel * w * w
+    } else {
+        v * t_up + 0.5 * accel * t_up * t_up + v_want * (w - t_up)
+    }
 }
 
 /// Where along the signal's planned road a change's move is swept from (`change_clear`): the
@@ -3994,5 +4020,23 @@ mod stop_place_tests {
         assert_eq!(zebra_queue_stop(&me, cut), Some(comfortable));
         // with room for the gentle stop short of the cut, that one
         assert_eq!(zebra_queue_stop(&me, front + 2.0), Some(gentle_stop(&me) + 0.3));
+    }
+}
+
+#[cfg(test)]
+mod free_road_tests {
+    use super::free_road;
+
+    /// Pass 8 item 1: the undelayed signal road counts the car speeding up - the start check sweeps
+    /// a move beginning as far as the re-sweep can later plan it (viz4 #24004, 1.21 -> 1.29 m/s
+    /// over its signal): at its speed `v·w + a·w²/2`, capped at its wanted speed and on at that.
+    #[test]
+    fn the_free_signal_road_counts_the_car_speeding_up_to_its_wanted_speed() {
+        assert!((free_road(1.2, 1.5, 10.0, 2.0) - (2.4 + 3.0)).abs() < 1e-4);
+        // (up to 2 m/s in 0.8 s, on at it for 1.2 s)
+        let up = 1.2 * 0.8 + 0.5 * 1.0 * 0.64;
+        assert!((free_road(1.2, 1.0, 2.0, 2.0) - (up + 2.0 * 1.2)).abs() < 1e-4);
+        assert!((free_road(5.0, 1.5, 4.0, 2.0) - 10.0).abs() < 1e-4, "at or over its wanted speed: on at its speed");
+        assert!((free_road(0.0, 2.0, 10.0, 1.0) - 1.0).abs() < 1e-4, "from rest");
     }
 }
