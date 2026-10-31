@@ -332,8 +332,8 @@ fn the_players_pulling_away_is_measured() {
 }
 
 /// [fix pass 2, 2] A lane whose stop line lies in a tight turn's swept path (the turn's axis
-/// passing 3 m from its end: two 3 m lanes' half widths and a bus's off-tracking) meets the
-/// turn there: a meeting place is compiled between them.
+/// passing 3 m from its end: two 3 m lanes' half widths and a bus's swing in the turn,
+/// `SweptBody::sides`) meets the turn there: a meeting place is compiled between them.
 #[test]
 fn a_stop_line_in_a_tight_turns_sweep_is_a_meeting_place() {
     use glam::DVec3;

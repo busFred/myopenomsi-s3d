@@ -146,7 +146,7 @@ fn rule_d_on_red_the_held_car_stops_at_its_line() {
     assert!(furthest <= -15.0 + 0.3, "its front got to x = {furthest:.1}, past its red line at -15");
 }
 
-/// Northbound (x = 2): approach 0, lead-in piece 1 (y -20..-5, meets nobody), crossing piece
+/// Northbound (x = 2): approach 0, lead-in piece 1 (y -20..-5, meets no car), crossing piece
 /// 2 (y -5..20), exit 3. Southbound (x = -2): approach 4, a left turn 5 (south, then east
 /// across the northbound way at y = 1, flagged turn 1), exit 6 (east).
 fn oncoming_left_turn() -> Network {
@@ -167,8 +167,12 @@ fn oncoming_left_turn() -> Network {
 fn rule_e_the_oncoming_left_turner_yields_to_the_player_going_straight() {
     let net = oncoming_left_turn();
     let js = omsi_traffic::Junctions::compile(&net);
-    let (_, lead_in) = js.movement(1).unwrap();
-    assert!(lead_in.foes.is_empty(), "{:?}", lead_in.foes);
+    let (j, lead_in) = js.movement(1).unwrap();
+    // (the lead-in meets no car: the turn's sweep reaches its end, 4.2 m from the turn's corner,
+    // only with a bus's swing, `Network::compile_swept`)
+    let j = js.nodes.iter().position(|n| std::ptr::eq(n, j)).unwrap();
+    let two_cars = omsi_sim::traffic::SWEPT_CAR;
+    assert!(lead_in.foes.iter().all(|f| f.classes.is_some() && js.for_bodies(j, f, two_cars, Some(two_cars)).is_none()), "{:?}", lead_in.foes);
     let (_, turner) = js.movement(5).unwrap();
     assert!(turner.foes.iter().any(|f| f.yields && js.nodes[0].movements[f.movement].lane == 2), "{:?}", turner.foes);
     let mut sim = Simulation::new(&net, vec![]);

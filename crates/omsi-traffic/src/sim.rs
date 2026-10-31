@@ -458,6 +458,11 @@ pub struct Vehicle {
     /// has left the meeting places of the two.
     #[serde(default)]
     pub ease_for: Option<(u64, usize, f32)>,
+    /// Its body class for the meeting places (`omsi_sim::traffic::SWEPT_CLASSES`), from its type
+    /// as the game drives it (`omsi_sim::traffic::swept_class`); None (a recording made before it,
+    /// a vehicle made without its type): told by its size (`Vehicle::swept_class`).
+    #[serde(default)]
+    pub body: Option<u8>,
 }
 
 /// A player's pulling away (m/s²) before it is measured
@@ -727,6 +732,7 @@ impl Vehicle {
             mutual: None,
             mutual_gap: 0.0,
             ease_for: None,
+            body: None,
         }
     }
 
@@ -737,6 +743,12 @@ impl Vehicle {
 
     pub fn length(&self) -> f32 {
         self.state.front + self.state.rear
+    }
+
+    /// Its body class for the meeting places (`Vehicle::body`), else the class of its length and
+    /// half width (`omsi_sim::traffic::swept_class_of_size`).
+    pub fn swept_class(&self) -> usize {
+        self.body.map_or_else(|| omsi_sim::traffic::swept_class_of_size(self.length(), self.half_width), usize::from)
     }
 
     /// The body on the ground.
@@ -951,12 +963,18 @@ pub struct FleetBounds {
     pub min_gap: f32,
     /// The largest time gap (s).
     pub tau: f32,
+    /// How many vehicles of each body class are on the road (`omsi_sim::traffic::SWEPT_CLASSES`;
+    /// `Vehicle::swept_class`, a player's by its size): the meeting places of a body with whoever
+    /// may come are those with the classes on the road (`present`, `Junctions::foes_along_for`), so
+    /// a class's swing that nobody on the road has (a semi-trailer's) shapes no waiting place. None:
+    /// not known, every class.
+    pub bodies: Option<[u32; omsi_sim::traffic::SWEPT_CLASSES.len()]>,
 }
 
 impl Default for FleetBounds {
     /// Nobody on the road: no speed, so no reach.
     fn default() -> FleetBounds {
-        FleetBounds { speed_factor: 0.0, decel: f32::INFINITY, min_gap: 0.0, tau: 0.0 }
+        FleetBounds { speed_factor: 0.0, decel: f32::INFINITY, min_gap: 0.0, tau: 0.0, bodies: None }
     }
 }
 
@@ -964,12 +982,28 @@ impl FleetBounds {
     /// Over the road vehicles in `vehicles` and the `players`.
     pub fn of(vehicles: &[Vehicle], players: &[PlayerView]) -> FleetBounds {
         let player = (!players.is_empty()).then(|| DriverParams::preset(PLAYER_PRESET));
-        vehicles.iter().filter(|v| !matches!(v.class, VehicleClass::Rail | VehicleClass::Air)).map(|v| v.params).chain(player).fold(FleetBounds::default(), |b, p| FleetBounds {
+        let road = || vehicles.iter().filter(|v| !matches!(v.class, VehicleClass::Rail | VehicleClass::Air));
+        let mut bodies = [0u32; omsi_sim::traffic::SWEPT_CLASSES.len()];
+        for c in road().map(|v| v.swept_class()).chain(players.iter().map(|p| omsi_sim::traffic::swept_class_of_size(p.half_len * 2.0, p.half_width))) {
+            bodies[c] += 1;
+        }
+        let b = road().map(|v| v.params).chain(player).fold(FleetBounds::default(), |b, p| FleetBounds {
             speed_factor: b.speed_factor.max(p.speed_factor),
             decel: b.decel.min(p.comfort_brake),
             min_gap: b.min_gap.max(p.min_gap),
             tau: b.tau.max(p.tau),
-        })
+            bodies: None,
+        });
+        FleetBounds { bodies: Some(bodies), ..b }
+    }
+
+    /// The body classes on the road (bit `1 << class`, `Junctions::foes_along_for`): every class
+    /// when not known.
+    pub fn present(&self) -> u16 {
+        match self.bodies {
+            None => crate::junction::EVERY_BODY,
+            Some(n) => (0..n.len()).filter(|&c| n[c] > 0).fold(0, |m, c| m | 1 << c),
+        }
     }
 
     /// `MSLane::getMaximumBrakeDist` at a lane limit of `v_lim` (m/s): (that limit times the
@@ -1570,7 +1604,7 @@ impl Simulation {
                 // is in, not to that one (`reservation`: a meeting place I am in). (at the line a
                 // driver stops hard if it must; one already inside does not slam on in the middle
                 // of the junction, it goes on unless it can stop gently)
-                let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+                let next_ahead = self.junctions.foes_along_for(j.junction, &j.chain, v.swept_class(), self.fleet.present()).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
                 let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
                 let brake = if j.inside { st.decel * plan::INSIDE_BRAKE_FACTOR } else { plan::HARD_BRAKE };
                 // (SUMO's waiting positions: committed when the first place it can
@@ -1632,6 +1666,7 @@ impl Simulation {
                     pass_speed: st.bend_speed_at(net, j.conflict_start, crate::perception::change_committed(st)),
                     chain: j.chain.clone(),
                     half_width: v.half_width,
+                    body: v.swept_class(),
                     was_standing,
                     light_red,
                     until_go,
@@ -1700,10 +1735,11 @@ impl Simulation {
                     .iter()
                     .filter(|_| files_approaches(&claim, j.conflict_start - j.entry))
                     .map(|nj| {
-                        let next_ahead = self.junctions.foes_along(nj.junction, &nj.chain).iter().map(|f| nj.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+                        let next_ahead = self.junctions.foes_along_for(nj.junction, &nj.chain, v.swept_class(), self.fleet.present()).iter().map(|f| nj.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
                         let next = if next_ahead.is_finite() { next_ahead } else { nj.conflict_start };
                         let brake = plan::HARD_BRAKE;
                         let committed = (next_ahead.is_infinite() && nj.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, next - st.front - 0.6, brake);
+                        // (the vehicle's body class, as on its own claim: `..claim`)
                         Claim {
                             foe_only: true,
                             pass_speed: st.bend_speed_at(net, nj.conflict_start, crate::perception::change_committed(st)),
@@ -1824,7 +1860,8 @@ impl Simulation {
             let road_limit = net.lanes.get(road_limit).map(|l| l.speed_limit_kmh / 3.6).unwrap_or(13.0);
             // where its meeting places begin along the way through (the end of the way when
             // it meets nobody), and the next one its front has not entered
-            let foes = self.junctions.foes_along(j, &chain);
+            let body = omsi_sim::traffic::swept_class_of_size(p.half_len * 2.0, p.half_width);
+            let foes = self.junctions.foes_along_for(j, &chain, body, self.fleet.present());
             let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[self.junctions.nodes[j].movements[mm].lane].length()).sum();
             let cs = foes.iter().map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             let cs = if cs.is_finite() { cs } else { way_len };
@@ -1905,6 +1942,8 @@ impl Simulation {
                 pass_speed: f32::INFINITY,
                 chain,
                 half_width: p.half_width,
+                // (a player's vehicle is known to the traffic by its box)
+                body: omsi_sim::traffic::swept_class_of_size(p.half_len * 2.0, p.half_width),
                 was_standing: false,
                 light_red,
                 until_go,
@@ -1990,6 +2029,7 @@ impl Simulation {
         lap(&mut self.phase_secs[2]);
         self.foe_trace.clear();
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
+        self.signal_groups.bodies = self.fleet.bodies;
         // (the approaches filed at the later junctions go in as foes only: their grants are not read)
         let n_real = claims.len();
         self.approaches_filed = foe_only.len();
@@ -2128,7 +2168,8 @@ impl Simulation {
         // stretch's end. Not every meeting place of the chain: two merging
         // run on along one way, and the ease must not hold the one behind until the other
         // has left the whole object)
-        let pieces = self.junctions.foes_along_wide(j, &mine.chain);
+        // (the two bodies' meeting places, `Junctions::for_bodies`)
+        let pieces: Vec<(usize, crate::junction::Foe)> = self.junctions.foes_along_wide(j, &mine.chain).into_iter().filter_map(|(m, f)| self.junctions.for_bodies(j, &f, mine.body, Some(theirs.body)).map(|f| (m, f))).collect();
         let my_front = mine.s + mine.front;
         let first = pieces.iter().filter(|(_, f)| f.mine.1 > my_front && reservation::meets(f, mine, theirs)).find_map(|(_, f)| theirs.chain.iter().find(|&&(m, _)| m == f.movement).map(|&(_, off)| (f, off)));
         let inside = first.is_some_and(|(f, off)| theirs.s - off - theirs.rear <= f.theirs.1 + reservation::JM_TIMEGAP_MINOR * theirs.speed.max(0.0));
@@ -2197,7 +2238,7 @@ impl Simulation {
                 continue;
             }
             let j = ca.junction;
-            let meet = self.junctions.foes_along_wide(j, &ca.chain).iter().any(|(_, f)| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement));
+            let meet = self.junctions.foes_along_wide(j, &ca.chain).iter().any(|(_, f)| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && self.junctions.for_bodies(j, f, ca.body, Some(cb.body)).is_some());
             if !meet {
                 continue;
             }
@@ -2777,7 +2818,7 @@ mod ease_ring_tests {
     use super::*;
 
     fn claim(vehicle: usize) -> Claim {
-        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false, body: omsi_sim::traffic::SWEPT_CAR }
     }
 
     /// A car files approaches at the junctions after its first unless its red holds it short of

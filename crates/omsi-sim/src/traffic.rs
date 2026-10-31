@@ -673,6 +673,11 @@ pub struct Network {
     /// `piece_beside` measures. Static geometry, built with the grid, as SUMO fixes a lane's
     /// neighbours when it loads the network.
     pub beside_pieces: Vec<Vec<usize>>,
+    /// The meeting places per pair of body classes (`SWEPT_CLASSES`), one entry per
+    /// `Crossing::classes`: per (class on the crossing's lane, class on the other lane), the
+    /// stretches (from, to along the lane, from, to along the other; m, not clamped to the lanes)
+    /// where two such bodies touch, None where they never do (`ClassMeet`).
+    pub class_meets: Vec<ClassMeet>,
     /// The route costs to the random cars' trip ends (`Network::goal_field`), one per trip end,
     /// access, driver and group, kept while a car uses it.
     pub goal_fields: GoalFields,
@@ -823,9 +828,10 @@ pub struct Crossing {
     /// Both lanes end in the same place (one road runs into the other) rather than crossing.
     pub merge: bool,
     /// The meeting place: how far before and after `at` this lane's centre line stays
-    /// closer than `MEET_DIST` to the other's (where two vehicles on them would touch),
-    /// and the same along the other lane. Two paths that cross at a shallow angle, or two
-    /// turns that bend towards each other, meet over metres, not at a point.
+    /// closer than `MEET_DIST` to the other's (where two vehicles on them would touch), and the
+    /// same along the other lane - at a swept path the widest of the body classes' (`classes`).
+    /// Two paths that cross at a shallow angle, or two turns that bend towards each other, meet
+    /// over metres, not at a point.
     pub before: f32,
     pub after: f32,
     pub other_before: f32,
@@ -845,10 +851,22 @@ pub struct Crossing {
     /// (two buses, not two cars: `reservation::meets`). 0 for every other meeting place.
     #[serde(default)]
     pub apart: f32,
+    /// The swept path of an object's piece over a lane of the object or leading into it
+    /// (`Network::compile_swept`): `Junctions::extend` makes a lane leading in a movement of the
+    /// object, so that its line lies before the place.
+    #[serde(default)]
+    pub swept: bool,
+    /// The meeting place per pair of body classes (`Network::class_meets`, by index): the
+    /// stretches above are the widest of them. None: the same for every class (a rail lane's,
+    /// a side merge's, a `[blockpath]`'s). Derived again whenever the network is compiled, so
+    /// not written to a recording.
+    #[serde(skip)]
+    pub classes: Option<u32>,
 }
 
 /// Two vehicles whose centre lines come closer than this (m) touch: the half widths of two
-/// buses.
+/// buses. (At the swept paths the bodies' swing in a bend counts per pair of body classes,
+/// `Network::compile_swept`.)
 pub const MEET_DIST: f64 = 2.6;
 /// A meeting place reaches at most this far either side of the crossing point (m).
 const MEET_MAX: f32 = 14.0;
@@ -866,6 +884,119 @@ fn meeting_extent(a: &Lane, at: f32, b: &Lane) -> (f32, f32) {
         after += 0.5;
     }
     (before, after)
+}
+
+/// A body the street meeting places are compiled for (`SWEPT_CLASSES`): every member of the
+/// class fits inside it, so its swept band in a bend holds each member's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SweptBody {
+    /// Its longest member bumper to bumper, the whole consist (m): the class of a vehicle whose
+    /// type is not known (`swept_class_of_size`), and the stretch of a lane's end a standing
+    /// member covers (`Network::compile_swept`).
+    pub length: f32,
+    /// Half the widest member's body (m).
+    pub half_width: f32,
+    /// From the rotation point (the rear axle) to the front bumper (m), the most of the members
+    /// (`ai_motion::careful_line_offset`'s reach).
+    pub reach: f32,
+    /// The rear sections' off-tracking (m², `ai_motion::rear_off_tracking`), the most of the
+    /// members; 0 for a rigid body.
+    pub rear_pull: f32,
+}
+
+/// The body classes of the meeting places, each the largest of every dimension over the AI
+/// types of the installed stock maps BeijingCity and X10 Berlin in it (their `ailists.cfg`,
+/// `[boundingbox]`, axles, `[rot_pnt_long]`, couplings, rounded up to the centimetre; the test
+/// `swept_classes_hold_the_fleet` checks them against the files): a vehicle is of the first class that holds its body
+/// (`swept_class`). SUMO computes the conflict areas of two connections from their shapes with
+/// the widths (`NBEdge::firstIntersection`) and a vehicle's foe checks use its own length and
+/// width (`MSLink`); OMSI's AI vehicles drive the careful driver's line, whose swept band in a
+/// bend grows with the body (`ai_motion::careful_line_offset`): in a bend a car meets where a
+/// car's swept body would touch, a bus where a bus's would.
+pub const SWEPT_CLASSES: [SweptBody; 4] = [
+    // cars and vans up to the X10 Sprinter (7.10 m, reach 5.15 m); the widest the X10 R420
+    // tractor alone (2.44 m)
+    SweptBody { length: 7.10, half_width: 1.22, reach: 5.15, rear_pull: 0.0 },
+    // rigid buses and lorries up to the X10 MAN DL05 (13.50 m); BeijingCity's BPT WG120FK the
+    // widest (2.58 m), its BJ6123 the longest reach (9.41 m); a car with a box trailer
+    // (X10 Hyundai Tucson + Anhaenger, 9.04 m²) the rear sections
+    SweptBody { length: 13.50, half_width: 1.29, reach: 9.41, rear_pull: 9.04 },
+    // articulated buses: BeijingCity's BJ6180 (17.92 m, 2.55 m wide, reach 8.40 m), X10's
+    // MAN GN92 the rear section (18.10 m²)
+    SweptBody { length: 17.93, half_width: 1.275, reach: 8.41, rear_pull: 18.10 },
+    // a tractor and semi-trailer: X10's R420 with its trailer (14.86 m, 2.44 m wide, reach
+    // 3.80 m, 83.35 m²)
+    SweptBody { length: 14.87, half_width: 1.22, reach: 3.80, rear_pull: 83.36 },
+];
+/// `SWEPT_CLASSES` indices.
+pub const SWEPT_CAR: usize = 0;
+pub const SWEPT_RIGID: usize = 1;
+pub const SWEPT_ARTICULATED: usize = 2;
+/// Pairs of classes: (mine, the other's) at `mine * SWEPT_CLASSES.len() + other`.
+pub const SWEPT_PAIRS: usize = SWEPT_CLASSES.len() * SWEPT_CLASSES.len();
+
+/// Per pair of body classes (`SWEPT_PAIRS`) the meeting place of a crossing (`Crossing::classes`):
+/// [from, to along the crossing's lane, from, to along the other] (m), None where the two never
+/// touch.
+pub type ClassMeet = [Option<[f32; 4]>; SWEPT_PAIRS];
+
+/// The class of a vehicle with this body (`SWEPT_CLASSES`): the first that holds its half width,
+/// reach and rear sections' off-tracking (from its type, as the game drives it); the last
+/// class's body beyond them all.
+pub fn swept_class(half_width: f32, reach: f32, rear_pull: f32) -> usize {
+    SWEPT_CLASSES.iter().position(|c| half_width <= c.half_width + 1e-3 && reach <= c.reach + 1e-3 && rear_pull <= c.rear_pull + 1e-3).unwrap_or(SWEPT_CLASSES.len() - 1)
+}
+
+/// The class of a vehicle known only by its size (a recording made before the class was kept, a
+/// player): the first of car, rigid and articulated that is as long and as wide; articulated
+/// beyond them. (A semi-trailer is told only by its type.)
+pub fn swept_class_of_size(length: f32, half_width: f32) -> usize {
+    [SWEPT_CAR, SWEPT_RIGID, SWEPT_ARTICULATED].into_iter().find(|&c| length <= SWEPT_CLASSES[c].length + 1e-3 && half_width <= SWEPT_CLASSES[c].half_width + 1e-3).unwrap_or(SWEPT_ARTICULATED)
+}
+
+impl SweptBody {
+    /// How far the body reaches left and right of its lane's axis (m) where the lane bends with
+    /// curvature `k_left` (1/m, + = left), driving the careful driver's line
+    /// (`ai_motion::careful_line_offset`) with the lane's edges `edges` (left, right; infinite where
+    /// not known): the rotation point `off` inside the axis, the inner side abreast of it at
+    /// `off + half_width` and the rear sections `rear_pull · |k| / 2` further in, the outer front
+    /// corner at √((R - off + half_width)² + reach²) - R. On a straight its half width either
+    /// side. The bend counts up to the tightest turn a bus makes (`SWEPT_MIN_RADIUS`: a lane
+    /// sampled tighter is driven wider).
+    pub fn sides(&self, k_left: f32, edges: (f32, f32)) -> (f32, f32) {
+        let k = k_left.clamp(-1.0 / SWEPT_MIN_RADIUS, 1.0 / SWEPT_MIN_RADIUS);
+        if k.abs() < 1e-6 {
+            return (self.half_width, self.half_width);
+        }
+        let inner_edge = if k > 0.0 { edges.0 } else { edges.1 };
+        let off = crate::ai_motion::careful_line_offset(k, self.reach, self.half_width, self.rear_pull, inner_edge).abs();
+        // (the outer corner beyond the radius, √(a² + reach²) - r with a = r + d, d = half_width -
+        // off, as (2rd + d² + reach²) / (√(a² + reach²) + r): a gentle bend's r is large)
+        let (r, d, l) = (1.0 / k.abs() as f64, (self.half_width - off) as f64, self.reach as f64);
+        let inner = off + self.half_width + self.rear_pull * k.abs() * 0.5;
+        let outer = (((2.0 * r * d + d * d + l * l) / (((r + d) * (r + d) + l * l).sqrt() + r)) as f32).max(self.half_width);
+        if k > 0.0 { (inner, outer) } else { (outer, inner) }
+    }
+}
+
+/// The edges a body on lane `i` is kept inside in a bend (`Network::lane_edges`; infinite where
+/// the map does not tell), for `SweptBody::sides`.
+fn body_edges(net: &Network, i: usize) -> (f32, f32) {
+    net.lane_edges(i).unwrap_or((f32::INFINITY, f32::INFINITY))
+}
+
+/// How far the swept bodies of each class swing out towards `p` from lane `l` at distance `s`
+/// beyond their half width (m): the side of `l` that `p` lies on, from `SweptBody::sides` in a bend
+/// of curvature `k_left` (+ = left); 0 on a straight.
+fn swing_towards(l: &Lane, s: f32, k_left: f32, edges: (f32, f32), p: DVec3) -> [f32; SWEPT_CLASSES.len()] {
+    let (o, h) = l.at(s);
+    let (sin, cos) = (h as f64).to_radians().sin_cos();
+    // (headings clockwise from north: forward (sin, cos), its right (cos, -sin))
+    let right = (p.x - o.x) * cos - (p.y - o.y) * sin > 0.0;
+    SWEPT_CLASSES.map(|c| {
+        let (left, r) = c.sides(k_left, edges);
+        (if right { r } else { left }) - c.half_width
+    })
 }
 
 /// Two lanes of one object that neither cross nor run into one another but whose centre lines
@@ -1367,6 +1498,7 @@ impl Network {
     pub fn compute_conflicts(&mut self) {
         self.conflicts = vec![Vec::new(); self.lanes.len()];
         self.crossings = vec![Vec::new(); self.lanes.len()];
+        self.class_meets.clear();
         self.walks = vec![Vec::new(); self.lanes.len()];
         let (n, walks) = self.conflicts_from(0);
         let joins = self.compile_joins() + self.compile_swept();
@@ -1374,6 +1506,22 @@ impl Network {
         let outside = self.compile_lane_crossings(0);
         let beside = self.compile_outside_converging(0);
         log::info!("path network: {n} conflicting lane pairs at crossings, {joins} lane joins, {outside} lane crossings and {beside} merges outside the objects ({:.1} ms), {walks} footpath crossings", t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    /// Compile the meeting place of lanes `i` and `j` that cross (or run into one another, `merge`)
+    /// at `sa` along `i` and `sb` along `j`, both ways, `outside` any one object
+    /// (`Crossing::outside`): where the centre lines stay within `MEET_DIST` (`meeting_extent`),
+    /// one stretch for every body class (the classes' own places are the swept paths',
+    /// `compile_swept`). A merge reaches half a metre past the joint: after it the two are in one
+    /// lane.
+    fn push_meeting(&mut self, i: usize, j: usize, sa: f32, sb: f32, merge: bool, outside: bool) {
+        let (a, b) = (&self.lanes[i], &self.lanes[j]);
+        let ((ab, aa), (bb, ba)) = (meeting_extent(a, sa, b), meeting_extent(b, sb, a));
+        let (aa, ba) = if merge { (0.5, 0.5) } else { (aa, ba) };
+        self.conflicts[i].push(j);
+        self.conflicts[j].push(i);
+        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false, outside, apart: 0.0, swept: false, classes: None });
+        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false, outside, apart: 0.0, swept: false, classes: None });
     }
 
     /// `conflicts`, `crossings` and `walks` of the junction objects whose lanes start at
@@ -1423,19 +1571,14 @@ impl Network {
                         let (la, lb) = (a.length(), b.length());
                         self.conflicts[i].push(j);
                         self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false, outside: false, apart: 0.0 });
-                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false, outside: false, apart: 0.0 });
+                        self.crossings[i].push(Crossing { other: j, at: la * 0.5, other_at: lb * 0.5, merge: false, before: la * 0.5, after: la * 0.5, other_before: lb * 0.5, other_after: lb * 0.5, side: false, outside: false, apart: 0.0, swept: false, classes: None });
+                        self.crossings[j].push(Crossing { other: i, at: lb * 0.5, other_at: la * 0.5, merge: false, before: lb * 0.5, after: lb * 0.5, other_before: la * 0.5, other_after: la * 0.5, side: false, outside: false, apart: 0.0, swept: false, classes: None });
                         n += 1;
                         continue;
                     }
                     if let Some((sa, sb)) = place {
                         // (after a joint the two are in one lane, and follow each other)
-                        let (ab, aa) = if merge { (meeting_extent(a, sa, b).0, 0.5) } else { meeting_extent(a, sa, b) };
-                        let (bb, ba) = if merge { (meeting_extent(b, sb, a).0, 0.5) } else { meeting_extent(b, sb, a) };
-                        self.conflicts[i].push(j);
-                        self.conflicts[j].push(i);
-                        self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge, before: ab, after: aa, other_before: bb, other_after: ba, side: false, outside: false, apart: 0.0 });
-                        self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge, before: bb, after: ba, other_before: ab, other_after: aa, side: false, outside: false, apart: 0.0 });
+                        self.push_meeting(i, j, sa, sb, merge, false);
                         n += 1;
                     } else if self.add_converging(i, j) {
                         n += 1;
@@ -1886,8 +2029,8 @@ impl Network {
         let apart = if least >= CONVERGE_DIST && !edges { least as f32 } else { 0.0 };
         self.conflicts[i].push(j);
         self.conflicts[j].push(i);
-        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true, outside: false, apart });
-        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true, outside: false, apart });
+        self.crossings[i].push(Crossing { other: j, at: a1, other_at: b1, merge: true, before: a1 - a0 + 0.5, after: aa, other_before: b1 - b0 + 0.5, other_after: ba, side: true, outside: false, apart: apart, swept: false, classes: None });
+        self.crossings[j].push(Crossing { other: i, at: b1, other_at: a1, merge: true, before: b1 - b0 + 0.5, after: ba, other_before: a1 - a0 + 0.5, other_after: aa, side: true, outside: false, apart: apart, swept: false, classes: None });
         true
     }
 
@@ -1991,13 +2134,7 @@ impl Network {
         self.crossings.resize(len, Vec::new());
         let found = self.lane_crossings(first);
         for &(i, j, sa, sb) in &found {
-            let (a, b) = (&self.lanes[i], &self.lanes[j]);
-            let (ab, aa) = meeting_extent(a, sa, b);
-            let (bb, ba) = meeting_extent(b, sb, a);
-            self.conflicts[i].push(j);
-            self.conflicts[j].push(i);
-            self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: false, before: ab, after: aa, other_before: bb, other_after: ba, side: false, outside: true, apart: 0.0 });
-            self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: false, before: bb, after: ba, other_before: ab, other_after: aa, side: false, outside: true, apart: 0.0 });
+            self.push_meeting(i, j, sa, sb, false, true);
         }
         found.len()
     }
@@ -2064,14 +2201,8 @@ impl Network {
                     if self.crossings[i].iter().any(|c| c.other == j) || self.one_way_pieces(i, j) || self.same_root(i, j) {
                         continue;
                     }
-                    let (a, b) = (&self.lanes[i], &self.lanes[j]);
-                    let (sa, sb) = (a.length(), b.length());
-                    let ab = meeting_extent(a, sa, b).0;
-                    let bb = meeting_extent(b, sb, a).0;
-                    self.conflicts[i].push(j);
-                    self.conflicts[j].push(i);
-                    self.crossings[i].push(Crossing { other: j, at: sa, other_at: sb, merge: true, before: ab, after: 0.5, other_before: bb, other_after: 0.5, side: false, outside: false, apart: 0.0 });
-                    self.crossings[j].push(Crossing { other: i, at: sb, other_at: sa, merge: true, before: bb, after: 0.5, other_before: ab, other_after: 0.5, side: false, outside: false, apart: 0.0 });
+                    let (sa, sb) = (self.lanes[i].length(), self.lanes[j].length());
+                    self.push_meeting(i, j, sa, sb, true, false);
                     n += 1;
                 }
             }
@@ -2087,19 +2218,26 @@ impl Network {
         n
     }
 
-    /// The swept-path meeting places of the crossing objects: a piece of an
-    /// object and every lane of the object or leading into it whose last body length
-    /// (`SWEPT_BUS_LENGTH`) before its end lies in the piece's swept path - the two lanes' half
-    /// widths (their vehicles' room) and the off-tracking of a long vehicle in the piece's
-    /// tightest bend (`SWEPT_WHEELBASE`^2 / 2R, R no less than `SWEPT_MIN_RADIUS`) - when nothing else is compiled
-    /// between the two: a meeting place over the two stretches, so a vehicle standing there
-    /// counts as inside it and a refused vehicle stops before it - in the junction table where
-    /// both lanes are movements of the object (a piece, or a spline lane grouped into it by a
-    /// join); a lane leading in that is no movement of it keeps the place in the network only
-    /// (`Junctions::extend`; `traffic_cases crossings` counts them). SUMO: any conflict between
-    /// connection shapes is a foe (sumo.md 1.3); OMSI: a stop line can sit inside a tight
-    /// turn's sweep (x10 case03: bus #587 turning right on 2577 swept #3221 standing at
-    /// 2605's end, no meeting place between them). Returns how many were added.
+    /// The swept-path meeting places of the crossing objects: a piece of an object and every lane
+    /// of the object or leading into it whose end lies in the piece's swept path, when nothing else
+    /// is compiled between the two. Per pair of body classes (`SWEPT_CLASSES`, `Crossing::classes`):
+    /// the last body length of the class on the lane (where one stands at the lane's end, and the
+    /// metre a car comes to rest short of its stop, `plan`'s `REST_SHORT`) closer to the piece than
+    /// the two lanes' half widths and the two bodies' swing out towards one another
+    /// (`swing_towards`: the piece's body in its tightest bend driving the careful driver's line,
+    /// the lane's in the bend where it stands); the place is
+    /// over the two stretches, the widest of the pairs that touch, and a pair that never does has
+    /// none (a car is not held where only a bus's swing reaches). So a vehicle standing there counts
+    /// as inside it and a refused vehicle stops before it - in the junction table, where a lane
+    /// leading in becomes a movement of the object (`Crossing::swept`, `Junctions::extend`), its line
+    /// before the place. SUMO: any conflict between connection shapes is a foe (sumo.md 1.3), and
+    /// stop lines lie outside the conflict areas; OMSI: a stop line can sit inside a tight turn's
+    /// sweep (x10 case03: bus #587 turning right on 2577 swept #3221 standing at 2605's end, no
+    /// meeting place between them). A meeting place of the piece with the lane's way on does not
+    /// stand in for it: a vehicle on the lane waits a metre before that place with its body back on
+    /// the lane, inside the sweep (d24 case07 / d25 case04: a left turner standing on 10340 and a
+    /// car rolling along 9844 up to 10341's crossing with it, 1.0 m into each other). Returns how
+    /// many were added.
     pub fn compile_swept(&mut self) -> usize {
         let len = self.lanes.len();
         self.conflicts.resize(len, Vec::new());
@@ -2113,6 +2251,10 @@ impl Network {
                 }
             }
         }
+        let n_c = SWEPT_CLASSES.len();
+        let longest = SWEPT_CLASSES.iter().map(|c| c.length).fold(0.0f32, f32::max);
+        // (`body_edges` walks the joined lanes of a junction piece: once per lane)
+        let mut edges: HashMap<usize, (f32, f32)> = HashMap::new();
         let mut n = 0;
         for pieces in by_object.values() {
             // (the object's lanes and the lanes leading into them)
@@ -2132,25 +2274,34 @@ impl Network {
                     if self.one_way_pieces(pi, bi) || self.same_root(pi, bi) || self.links_within(pi, bi, 3) || self.links_within(bi, pi, 3) {
                         continue;
                     }
+                    let ep = *edges.entry(pi).or_insert_with(|| body_edges(self, pi));
+                    let eb = *edges.entry(bi).or_insert_with(|| body_edges(self, bi));
                     let (p, b) = (&self.lanes[pi], &self.lanes[bi]);
-                    let bend = p.curvature.iter().fold(0.0f32, |m, c| m.max(c.abs()));
-                    // (the two lanes' half widths - two lanes of a road side by side are no meeting
-                    // place - and the piece's off-tracking)
-                    let radius = if bend > 0.0 { (1.0 / bend).max(SWEPT_MIN_RADIUS) } else { f32::INFINITY };
-                    let reach = 0.5 * (p.width + b.width) + SWEPT_WHEELBASE * SWEPT_WHEELBASE / (2.0 * radius);
+                    // (the piece's tightest bend, + = left; the two lanes' half widths, the room
+                    // their vehicles have side by side - two lanes of a road side by side are no
+                    // meeting place - which the swing of the bodies in their bends reaches beyond)
+                    let bend = -p.curvature.iter().copied().fold(0.0f32, |m, c| if c.abs() > m.abs() { c } else { m });
+                    let room = 0.5 * (p.width + b.width);
                     let lb = b.length();
-                    let (mut b0, mut b1, mut p0, mut p1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
-                    // (the last body length: where a vehicle stands at the lane's end, the bus and
-                    // the metre a car comes to rest short of its stop, `plan`'s `REST_SHORT`)
-                    let mut sb = (lb - SWEPT_BUS_LENGTH - 1.0).max(0.0);
+                    // per pair (class on the piece, class on the lane): b0, b1, p0, p1
+                    let mut st = [[f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY]; SWEPT_PAIRS];
+                    let mut sb = (lb - longest - SWEPT_REST_SHORT).max(0.0);
                     loop {
                         let at = sb.min(lb);
-                        if let Some((sp, d)) = p.nearest_point(b.at(at).0) {
-                            if (d as f32) < reach && sp > 0.05 && sp < p.length() - 0.05 {
-                                b0 = b0.min(at);
-                                b1 = b1.max(at);
-                                p0 = p0.min(sp);
-                                p1 = p1.max(sp);
+                        let on_b = b.at(at).0;
+                        if let Some((sp, d)) = p.nearest_point(on_b) {
+                            if sp > 0.05 && sp < p.length() - 0.05 {
+                                let rp = swing_towards(p, sp, bend, ep, on_b);
+                                let rb = swing_towards(b, at, -b.curvature_at(at), eb, p.at(sp).0);
+                                for i in 0..n_c {
+                                    for j in 0..n_c {
+                                        if at < lb - SWEPT_CLASSES[j].length - SWEPT_REST_SHORT || d as f32 >= room + rp[i] + rb[j] {
+                                            continue;
+                                        }
+                                        let e = &mut st[i * n_c + j];
+                                        *e = [e[0].min(at), e[1].max(at), e[2].min(sp), e[3].max(sp)];
+                                    }
+                                }
                             }
                         }
                         if at >= lb {
@@ -2158,23 +2309,31 @@ impl Network {
                         }
                         sb += 0.5;
                     }
-                    if !b0.is_finite() {
+                    let met: Vec<usize> = (0..SWEPT_PAIRS).filter(|&k| st[k][0].is_finite()).collect();
+                    if met.is_empty() {
                         continue;
                     }
-                    // (the way on from `b` meets the piece there already - within half a bus of
-                    // the swept stretch, where a bus standing at `b`'s end reaches: the lead-in
-                    // of a way that crosses the turn a few metres on, its claim's chain carries
-                    // that meeting place)
-                    let covered = self.lanes[bi].next.iter().any(|&nx| self.crossings.get(nx).is_some_and(|cs| cs.iter().any(|c| c.other == pi && c.apart <= 0.0 && c.other_at + c.other_after >= p0 - SWEPT_BUS_LENGTH * 0.5 && c.other_at - c.other_before <= p1 + SWEPT_BUS_LENGTH * 0.5)));
-                    if covered {
-                        continue;
+                    let (b0, b1, p0, p1) = met.iter().fold((f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY), |(a, b, c, d), &k| (a.min(st[k][0]), b.max(st[k][1]), c.min(st[k][2]), d.max(st[k][3])));
+                    // (each stretch at least the half metre either side of its middle)
+                    let span = |a: f32, b: f32| {
+                        let (m, h) = ((a + b) * 0.5, ((b - a) * 0.5).max(0.5));
+                        (m, h)
+                    };
+                    let ((pa, ph), (ba, bh)) = (span(p0, p1), span(b0, b1));
+                    let (mut mp, mut mb): (ClassMeet, ClassMeet) = ([None; SWEPT_PAIRS], [None; SWEPT_PAIRS]);
+                    for &k in &met {
+                        let (i, j) = (k / n_c, k % n_c);
+                        let ((qa, qh), (ra, rh)) = (span(st[k][2], st[k][3]), span(st[k][0], st[k][1]));
+                        mp[i * n_c + j] = Some([qa - qh, qa + qh, ra - rh, ra + rh]);
+                        mb[j * n_c + i] = Some([ra - rh, ra + rh, qa - qh, qa + qh]);
                     }
-                    let (pa, ba) = ((p0 + p1) * 0.5, (b0 + b1) * 0.5);
-                    let (ph, bh) = (((p1 - p0) * 0.5).max(0.5), ((b1 - b0) * 0.5).max(0.5));
+                    self.class_meets.push(mp);
+                    self.class_meets.push(mb);
+                    let c = (self.class_meets.len() - 2) as u32;
                     self.conflicts[pi].push(bi);
                     self.conflicts[bi].push(pi);
-                    self.crossings[pi].push(Crossing { other: bi, at: pa, other_at: ba, merge: false, before: ph, after: ph, other_before: bh, other_after: bh, side: false, outside: false, apart: 0.0 });
-                    self.crossings[bi].push(Crossing { other: pi, at: ba, other_at: pa, merge: false, before: bh, after: bh, other_before: ph, other_after: ph, side: false, outside: false, apart: 0.0 });
+                    self.crossings[pi].push(Crossing { other: bi, at: pa, other_at: ba, merge: false, before: ph, after: ph, other_before: bh, other_after: bh, side: false, outside: false, apart: 0.0, swept: true, classes: Some(c) });
+                    self.crossings[bi].push(Crossing { other: pi, at: ba, other_at: pa, merge: false, before: bh, after: bh, other_before: ph, other_after: ph, side: false, outside: false, apart: 0.0, swept: true, classes: Some(c + 1) });
                     n += 1;
                 }
             }
@@ -3319,8 +3478,8 @@ mod stub_links_tests {
         }
         for (i, j) in [(0, 1), (3, 5)] {
             let (li, lj) = (net.lanes[i].length(), net.lanes[j].length());
-            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false, outside: false, apart: 0.0 });
-            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false, outside: false, apart: 0.0 });
+            net.crossings[i].push(Crossing { other: j, at: li, other_at: lj, merge: true, before: 2.0, after: 0.0, other_before: lj.min(2.0), other_after: 0.0, side: false, outside: false, apart: 0.0, swept: false, classes: None });
+            net.crossings[j].push(Crossing { other: i, at: lj, other_at: li, merge: true, before: lj.min(2.0), after: 0.0, other_before: 2.0, other_after: 0.0, side: false, outside: false, apart: 0.0, swept: false, classes: None });
             net.conflicts[i].push(j);
             net.conflicts[j].push(i);
         }
@@ -3927,15 +4086,13 @@ pub fn open_to(lane: &Lane, st: &AiState, kind: LaneKind) -> Result<(), Closed> 
     Ok(())
 }
 
-/// The swept path (`Network::compile_swept`), from the stock
-/// timetable bus (`Vehicles/NEOMAN_Overhaul_V3/_12a_MAN_A21_2D.bus`): its length, the
-/// `[boundingbox]`'s 11.8 m ...
-pub const SWEPT_BUS_LENGTH: f32 = 11.8;
-/// ... its wheelbase, the two `[newachse]` `achse_long` 3.149 and -2.665 m apart, for the
-/// off-tracking wheelbase^2 / 2R in a bend of radius R (the piece's own curvature) ...
-pub const SWEPT_WHEELBASE: f32 = 3.149 + 2.665;
-/// ... and the tightest turn it makes, the 12.5 m outer turning circle every bus must manage
-/// (Directive 97/27/EC, annex I 7.6), which caps the off-tracking.
+/// The metre a vehicle comes to rest short of its stop (`omsi_traffic::plan::REST_SHORT`): the
+/// end of a lane a body standing there covers reaches this much further back
+/// (`Network::compile_swept`).
+const SWEPT_REST_SHORT: f32 = 1.0;
+/// The tightest turn a bus makes, the 12.5 m outer turning circle every bus must manage
+/// (Directive 97/27/EC, annex I 7.6): a bend counts up to it in a body's swept band
+/// (`SweptBody::sides`).
 pub const SWEPT_MIN_RADIUS: f32 = 12.5;
 
 /// Ways on chosen by a tier below "open to me and leading on" (`AiState::choose_after`: a car

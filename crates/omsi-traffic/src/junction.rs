@@ -33,7 +33,7 @@ pub struct Foe {
     pub movement: usize,
     pub kind: FoeKind,
     /// The stretch along *my* lane where the two touch: (from, to) in metres from the
-    /// lane's start.
+    /// lane's start; the widest of the body classes' (`classes`).
     pub mine: (f32, f32),
     /// The same along the foe's lane.
     pub theirs: (f32, f32),
@@ -48,7 +48,24 @@ pub struct Foe {
     /// other foe.
     #[serde(default)]
     pub apart: f32,
+    /// The meeting place per pair of body classes (`Junction::class_meets`, by index; the
+    /// stretches above are the widest): `Junctions::for_bodies` reads it. None: the same for every
+    /// class. Compiled with the table, not written to a recording.
+    #[serde(skip)]
+    pub classes: Option<u32>,
+    /// How far along the way through the movement's lane starts (m, `Junctions::foes_along`):
+    /// `mine` is shifted by it, and so are the stretches `for_bodies` takes from the class table.
+    #[serde(skip)]
+    pub shift: f32,
 }
+
+/// The meeting place of a foe per pair of body classes (`omsi_sim::traffic::SWEPT_PAIRS`, mine
+/// first): (along my lane, along the foe's; from, to in metres from each lane's start), None where
+/// two such bodies never touch (`Network::class_meets`).
+pub type FoeClasses = [Option<((f32, f32), (f32, f32))>; omsi_sim::traffic::SWEPT_PAIRS];
+
+/// Every body class (`Junctions::for_bodies_among`'s `bodies`, bit `1 << class`).
+pub const EVERY_BODY: u16 = (1 << omsi_sim::traffic::SWEPT_CLASSES.len()) - 1;
 
 /// One way through a junction: one of its lanes.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -69,11 +86,11 @@ pub struct Movement {
     /// The light that controls entry (object instance, light index), if any.
     pub light: Option<(usize, usize)>,
     pub foes: Vec<Foe>,
-    /// The far end of the last stretch where any foe touches this lane (m from its start):
-    /// past it the car has left every conflict of the junction.
+    /// The far end of the last stretch where any foe touches this lane (m from its start, the
+    /// widest of the body classes'): past it every vehicle has left every conflict of the junction.
     pub conflict_end: f32,
-    /// The near end of the first conflict (m): before it the car is inside the junction
-    /// but in nobody's way yet.
+    /// The near end of the first conflict (m, the widest classes'): before it every vehicle is
+    /// inside the junction but in nobody's way yet (a body's own: `Junctions::foes_along_for`).
     pub conflict_start: f32,
     /// Stretches of this lane (from, to; m from its start) where its centre line comes within
     /// `MEET_DIST` of another way of the object that is no foe of it (no meeting place is
@@ -133,6 +150,9 @@ pub struct Junction {
     pub key: ((i32, i32), i64),
     pub movements: Vec<Movement>,
     pub crossings: Vec<PedCrossing>,
+    /// The class meeting places of the movements' foes (`Foe::classes`).
+    #[serde(skip)]
+    pub class_meets: Vec<FoeClasses>,
 }
 
 impl Junction {
@@ -178,10 +198,12 @@ impl Junctions {
     /// object: a spline lane joining or crossing an object's way goes into that object as one
     /// of its movements, and spline lanes alone make a junction of their own (`JOIN_TILE`), so
     /// that every such meeting place is in one junction table (`foe_between`). The swept path
-    /// of an object's piece over a lane leading into it (`Network::compile_swept`) groups
-    /// nothing: that lane stays an approach, where the queue stands. Junctions keep their index (a new
-    /// one comes at the end), so what a vehicle remembers of one (`ease_for`)
-    /// stays right.
+    /// of an object's piece over a lane leading into it (`Network::compile_swept`,
+    /// `Crossing::swept`) makes that lane a movement of the object the same way: its line lies a
+    /// metre before its first meeting place (`perception`'s `JunctionView::line`), so its queue's
+    /// head waits outside the turn's sweep (SUMO keeps a stop line out of the conflict areas).
+    /// Junctions keep their index (a new one comes at the end), so what a vehicle remembers of one
+    /// (`ease_for`) stays right.
     pub fn extend(&mut self, net: &Network, first: usize) {
         let _ = first;
         let object = |l: usize| -> Option<((i32, i32), i64)> {
@@ -223,17 +245,17 @@ impl Junctions {
                 let b = c.other;
                 // (a meeting place between lanes of no one object: a lane join, or lanes
                 // converging side by side before one, `Network::compile_joins`, or anywhere,
-                // `Network::compile_outside_converging`; or two lanes crossing outside any one
-                // object, `Network::compile_lane_crossings`. The swept
-                // path of an object's piece over a lane leading into it, `compile_swept`, leaves
-                // that lane an approach: its queue stands there.)
+                // `Network::compile_outside_converging`; two lanes crossing outside any one
+                // object, `Network::compile_lane_crossings`; or the swept path of an object's
+                // piece over a lane leading into it, `compile_swept`, which makes that lane a
+                // movement of the object)
                 if b <= a || b >= net.lanes.len() {
                     continue;
                 }
                 if object(a).is_some() && object(a) == object(b) {
                     continue;
                 }
-                if !c.merge && !c.outside {
+                if !c.merge && !c.outside && !c.swept {
                     continue;
                 }
                 // (a pair met only by bodies wider than the centre lines are apart, `Crossing::apart`,
@@ -396,6 +418,7 @@ impl Junctions {
             })
             .collect();
         // foes from the network's crossings, both ways
+        let mut class_meets: Vec<FoeClasses> = Vec::new();
         for mi in 0..movements.len() {
             let lane = movements[mi].lane;
             let mut foes = Vec::new();
@@ -410,9 +433,15 @@ impl Junctions {
                 } else {
                     FoeKind::Cross
                 };
-                let mine = ((c.at - c.before).max(0.0), (c.at + c.after).min(net.lanes[lane].length()));
-                let theirs = ((c.other_at - c.other_before).max(0.0), (c.other_at + c.other_after).min(net.lanes[c.other].length()));
-                let foe = Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other), side: c.side, apart: c.apart };
+                let (my_len, their_len) = (net.lanes[lane].length(), net.lanes[c.other].length());
+                let mine = ((c.at - c.before).max(0.0), (c.at + c.after).min(my_len));
+                let theirs = ((c.other_at - c.other_before).max(0.0), (c.other_at + c.other_after).min(their_len));
+                // (per pair of classes, clamped to the lanes as the widest is)
+                let classes = c.classes.and_then(|k| net.class_meets.get(k as usize)).map(|m| {
+                    class_meets.push(m.map(|p| p.map(|[f, t, of, ot]| ((f.max(0.0), t.min(my_len)), (of.max(0.0), ot.min(their_len))))));
+                    (class_meets.len() - 1) as u32
+                });
+                let foe = Foe { movement: fm, kind, mine, theirs, yields: net.must_yield(lane, c.other), side: c.side, apart: c.apart, classes, shift: 0.0 };
                 if c.apart > 0.0 {
                     wide.push(foe);
                 } else {
@@ -435,7 +464,7 @@ impl Junctions {
             m.converge_with = c.iter().map(|&(_, _, with)| with).collect();
         }
         let crossings = Self::crossings(net, &movements);
-        Junction { key, movements, crossings }
+        Junction { key, movements, crossings, class_meets }
     }
 
     /// The pieces of junction `j` a vehicle's way runs through, in order, each with how
@@ -466,7 +495,8 @@ impl Junctions {
     }
 
     /// The foes of a way through `j` over the pieces `chain` (as from `chain_along`), with
-    /// the meeting places at their distance along the whole way.
+    /// the meeting places at their distance along the whole way, the widest of every class
+    /// (`for_bodies` makes one a body's).
     pub fn foes_along(&self, j: usize, chain: &[(usize, f32)]) -> Vec<Foe> {
         self.foes_along_pieces(j, chain).into_iter().map(|(_, f)| f).collect()
     }
@@ -489,11 +519,47 @@ impl Junctions {
         for &(m, off) in chain {
             let wide = node.movements[m].wide.iter().filter(|_| with_wide);
             for f in node.movements[m].foes.iter().chain(wide) {
-                out.push((m, Foe { movement: f.movement, kind: f.kind, mine: (f.mine.0 + off, f.mine.1 + off), theirs: f.theirs, yields: f.yields, side: f.side, apart: f.apart }));
+                out.push((m, Foe { mine: (f.mine.0 + off, f.mine.1 + off), shift: f.shift + off, ..*f }));
             }
         }
         out.sort_by(|a, b| a.1.mine.0.total_cmp(&b.1.mine.0));
         out
+    }
+
+    /// The foes of a way through `j` over `chain` for a body of class `mine`
+    /// (`omsi_sim::traffic::SWEPT_CLASSES`) and whoever of the classes `bodies` may come on the
+    /// foe's way (bit `1 << class`, the classes on the road: `FleetBounds::present`): each foe's meeting
+    /// place as that body meets any of them (`for_bodies_among`), the foes it meets with none of
+    /// them left out.
+    pub fn foes_along_for(&self, j: usize, chain: &[(usize, f32)], mine: usize, bodies: u16) -> Vec<Foe> {
+        self.foes_along_pieces_for(j, chain, mine, bodies).into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// [`Junctions::foes_along_for`], each foe with the piece of the chain it meets.
+    pub fn foes_along_pieces_for(&self, j: usize, chain: &[(usize, f32)], mine: usize, bodies: u16) -> Vec<(usize, Foe)> {
+        let mut out: Vec<(usize, Foe)> = self.foes_along_pieces(j, chain).into_iter().filter_map(|(m, f)| self.for_bodies_among(j, &f, mine, bodies).map(|f| (m, f))).collect();
+        out.sort_by(|a, b| a.1.mine.0.total_cmp(&b.1.mine.0));
+        out
+    }
+
+    /// Foe `foe` of junction `j` (as `foes_along` has it, or as `for_bodies` made it) as a body of
+    /// class `mine` meets one of class `theirs` on the foe's way (None: of any class, the widest
+    /// of the stretches where one touches): its stretches those two bodies' (`Foe::classes`,
+    /// `Network::class_meets`), None where they never touch. A foe without classes is the same for
+    /// every body. SUMO computes a link's foe conflicts from the shapes with the widths and checks
+    /// them with the vehicle's own length and width (`MSLink`); here the classes' swept bodies.
+    pub fn for_bodies(&self, j: usize, foe: &Foe, mine: usize, theirs: Option<usize>) -> Option<Foe> {
+        self.for_bodies_among(j, foe, mine, theirs.map_or(EVERY_BODY, |c| 1 << c))
+    }
+
+    /// [`Junctions::for_bodies`] against whoever of the classes `bodies` (bit `1 << class`) may
+    /// come: the widest of the stretches where one of them touches; none of them, no meeting place.
+    pub fn for_bodies_among(&self, j: usize, foe: &Foe, mine: usize, bodies: u16) -> Option<Foe> {
+        let Some(k) = foe.classes else { return Some(*foe) };
+        let table = self.nodes.get(j)?.class_meets.get(k as usize)?;
+        let n = omsi_sim::traffic::SWEPT_CLASSES.len();
+        let (m, t) = (0..n).filter(|&c| bodies & (1 << c) != 0).filter_map(|c| table.get(mine * n + c).copied().flatten()).reduce(|a, b| ((a.0 .0.min(b.0 .0), a.0 .1.max(b.0 .1)), (a.1 .0.min(b.1 .0), a.1 .1.max(b.1 .1))))?;
+        Some(Foe { mine: (m.0 + foe.shift, m.1 + foe.shift), theirs: t, ..*foe })
     }
 
     /// Two movements merging into one another that no rule of the table separates (neither
@@ -505,7 +571,8 @@ impl Junctions {
 
     /// Per lane of the object (in `lanes`' order): the stretches where its centre line comes
     /// within `MEET_DIST` of another street lane of the object with no meeting place compiled
-    /// between them, and that lane's movement (`Movement::converge`, `converge_with`;
+    /// between them for every body class (one of some classes only, `Crossing::classes`, leaves
+    /// the band to the rest), and that lane's movement (`Movement::converge`, `converge_with`;
     /// `traffic_cases converge` lists them).
     fn converging(net: &Network, lanes: &[usize]) -> Vec<Vec<(f32, f32, usize)>> {
         let near = omsi_sim::traffic::MEET_DIST;
@@ -543,7 +610,10 @@ impl Junctions {
                     continue;
                 }
                 let lb = &net.lanes[b];
-                if la.key.map(|k| k.path) == lb.key.map(|k| k.path) || net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b && c.apart <= 0.0)) {
+                // (a meeting place of only some body classes - a swing-only side merge or swept
+                // place, `Crossing::classes` - leaves the convergence to the others)
+                let for_all = |c: &omsi_sim::traffic::Crossing| c.classes.and_then(|k| net.class_meets.get(k as usize)).is_none_or(|m| m.iter().all(Option::is_some));
+                if la.key.map(|k| k.path) == lb.key.map(|k| k.path) || net.crossings.get(a).is_some_and(|c| c.iter().any(|c| c.other == b && c.apart <= 0.0 && for_all(c))) {
                     continue;
                 }
                 if (la.start() - lb.start()).truncate().length() <= 0.5 || leads(a, b) || leads(b, a) {
