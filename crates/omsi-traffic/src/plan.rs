@@ -392,11 +392,18 @@ pub const LC_COOPERATIVE: f32 = 1.0;
 pub use omsi_sim::traffic::change_space;
 
 /// SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
-/// `LC_LOOK_FORWARD` (times the driver's `lc_lookahead_left` towards the overtaking side, which
-/// mirrors on a left-hand-traffic map) plus two of the vehicle's lengths with its standing gap.
+/// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side, which mirrors on a
+/// left-hand-traffic map) plus two of the vehicle's lengths with its standing gap: for a lane that
+/// really ends and the keep-side stays. The route changes and the strategic stay use the driver's
+/// own factor (`strategic_look`).
 pub fn lane_end_look(v: f32, overtaking_side: bool, me: &Vehicle) -> f32 {
-    v * LC_LOOK_FORWARD * if overtaking_side { me.params.lc_lookahead_left } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
+    v * LC_LOOK_FORWARD * if overtaking_side { LC_LOOKAHEAD_LEFT } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
 }
+
+/// SUMO's `lcLookaheadLeft` default (the strategic look-ahead towards the overtaking side as a
+/// factor of the other side's; sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html):
+/// a lane that really ends keeps it (the user's decision L3-D2 scope; `lane_end_look`).
+pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
 
 /// The room (m) the last-resort stop keeps before where my lane ends for me, towards `nb`: what
 /// the body needs to move over from standing - a lane change's shortest move from rest
@@ -570,11 +577,13 @@ fn best_occupation(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &V
 }
 
 /// SUMO LC2013's strategic distance towards side `dir` (`laDist`): the look-ahead speed times
-/// `LC_LOOK_FORWARD` times `lc_strategic` (times the driver's `lc_lookahead_left` towards the overtaking side),
-/// plus two lengths with the standing gap (`lane_end_look`).
+/// `LC_LOOK_FORWARD` times `lc_strategic` (times the driver's own `lc_lookahead_left` towards the
+/// overtaking side, the user's decision L3-D2: the route changes and the strategic stay only),
+/// plus two lengths with the standing gap (as `lane_end_look`).
 fn strategic_look(sim: &Simulation, me: &Vehicle, dir: i32) -> f32 {
     let overtaking = dir == if sim.left_hand { 2 } else { 1 };
-    lane_end_look(me.look_ahead_speed.max(me.state.speed) * me.params.lc_strategic.max(0.0), overtaking, me)
+    let v = me.look_ahead_speed.max(me.state.speed) * me.params.lc_strategic.max(0.0);
+    v * LC_LOOK_FORWARD * if overtaking { me.params.lc_lookahead_left } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
 }
 
 /// SUMO LC2013's urgent strategic change towards the trip end (sumo.md 3.2, `lcStrategic`): on a

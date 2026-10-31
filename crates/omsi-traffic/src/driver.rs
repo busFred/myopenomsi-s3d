@@ -98,7 +98,8 @@ pub struct DriverParams {
     pub impatience_rate: f32,
     pub impatience_max: f32,
     /// SUMO's vType `lcLookaheadLeft`: the strategic look-ahead towards the overtaking side as a
-    /// factor of the other side's (`plan::lane_end_look`; SUMO's default 2.0,
+    /// factor of the other side's, for the route changes and the strategic stay (`plan`'s
+    /// `strategic_look`; a lane that really ends keeps SUMO's 2.0, `plan::LC_LOOKAHEAD_LEFT`; SUMO's default 2.0,
     /// sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html). Ours is 1.0 for
     /// the preset, drawn per driver over 0.65..1.35 from the driver's hurry
     /// (`LOOKAHEAD_LEFT_HURRY`; the user's decision L3-D2: the low end near AASHTO's decision sight
