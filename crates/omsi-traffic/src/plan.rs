@@ -3484,7 +3484,9 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     (if lends { d + net.lanes[nb.lane].width * 0.5 } else { d * 0.5 }).max(lane.width * 0.5)
                 })
             };
-            (half(p.left), half(p.right))
+            // (and as far as the piece's lane edges where the map tells them, L3-D6)
+            let (el, er) = net.lane_edge_sides(st.lane);
+            (el.map_or(half(p.left), |e| e.max(half(p.left))), er.map_or(half(p.right), |e| e.max(half(p.right))))
         } else {
             lane.drivable()
         };
@@ -3511,7 +3513,16 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // a squeeze round a body inside the junction runs over its pieces, never past the kerb
         // face or into another way's traffic, L3-D6)
         let (_, _, squeeze_reach) = squeeze_move(squeeze_side);
-        let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane).filter_map(|w| net.lanes.get(w.0)).map(|l| { let (dl, dr) = l.drivable(); if squeeze_side < 0.0 { dl } else { dr } }).fold(f32::INFINITY, f32::min);
+        // (a junction object's piece reaches as far as its lane's edges, `Network::lane_edge_sides`:
+        // the narrower edges of the lanes it joins; a piece whose edges are not known keeps its
+        // drawn width, `Lane::drivable`)
+        let side_extent = |w: usize| -> f32 {
+            let l = &net.lanes[w];
+            let (dl, dr) = l.drivable();
+            let (el, er) = if l.source == 2 { net.lane_edge_sides(w) } else { (None, None) };
+            if squeeze_side < 0.0 { el.map_or(dl, |e| e.max(dl)) } else { er.map_or(dr, |e| e.max(dr)) }
+        };
+        let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane && w.0 < net.lanes.len()).map(|w| side_extent(w.0)).fold(f32::INFINITY, f32::min);
         let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum())).min(way_extent);
         // (the bent corridor - out, past what stands and back - touches no body now)
         let corridor_clear = |side: f32| {
