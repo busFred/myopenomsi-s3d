@@ -1516,7 +1516,7 @@ impl Simulation {
                 // of the junction, it goes on unless it can stop gently)
                 let next_ahead = self.junctions.foes_along(j.junction, &j.chain).iter().map(|f| j.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
                 let next = if next_ahead.is_finite() { next_ahead } else { j.conflict_start };
-                let brake = if j.inside { st.decel * 1.5 } else { plan::HARD_BRAKE };
+                let brake = if j.inside { st.decel * plan::INSIDE_BRAKE_FACTOR } else { plan::HARD_BRAKE };
                 // (SUMO's waiting positions: committed when the first place it can
                 // come to rest with its body on no band, `plan::next_wait`, lies past the next meeting
                 // place's band - not only when it cannot stop before the meeting place itself: a car

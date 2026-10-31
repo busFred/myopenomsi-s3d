@@ -108,7 +108,7 @@ struct EntryRun {
     /// comfortable brake (m/s², positive: harder), and the closest two boxes came (m).
     over_comfort: f32,
     /// The hardest braking of an entrant on its approach or entry piece beyond the brake inside
-    /// the object, 1.5 times its comfortable one (`Claim::brake`: the most the resolver reckons it
+    /// the object, `plan::INSIDE_BRAKE_FACTOR` times its comfortable one (`Claim::brake`: the most the resolver reckons it
     /// stops with there), m/s²; nothing is excused, a stop a car cannot make gently is made later.
     entrant_over: f32,
     over_worst: String,
@@ -205,7 +205,7 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
             }
             if entrants.contains(&va.id) {
                 if let Some(&v0) = last_v.get(&va.id) {
-                    let over = (v0 - va.state.speed) / DT - 1.5 * va.state.decel;
+                    let over = (v0 - va.state.speed) / DT - omsi_traffic::plan::INSIDE_BRAKE_FACTOR * va.state.decel;
                     if (3..=4).contains(&va.state.lane) && over > run.entrant_over {
                         run.entrant_over = over;
                         run.entrant_worst = format!("t {t:.2} #{} lane {} s {:.1} v {v0:.2} -> {:.2} why {:?}", va.id, va.state.lane, va.state.s, va.state.speed, va.last.why);
@@ -253,7 +253,7 @@ fn check(zebra: bool) {
     let (e, v_c, cap, ratio) = run.hcm_ratio();
     println!("zebra {zebra}: entering {e:.0}/h circulating {v_c:.0}/h HCM 6 capacity {cap:.0}/h ratio {ratio:.2}; circulating braking beyond comfort {:.2} m/s²; closest boxes {:.2} m; queue left {}", run.over_comfort, run.min_sep, run.queue_left);
     println!("worst circulating {}", run.over_worst);
-    println!("worst entrant braking beyond 1.5 x comfort {:.2} m/s²: {}", run.entrant_over, run.entrant_worst);
+    println!("worst entrant braking beyond the brake inside the object {:.2} m/s²: {}", run.entrant_over, run.entrant_worst);
     assert!((450.0..=750.0).contains(&v_c), "circulating {v_c:.0}/h, not about 600");
     assert!(run.queue_left > 0, "the entry's queue ran out: not saturated");
     assert!(run.over_comfort <= 0.0, "a circulating car braked {:.2} m/s² beyond its comfortable brake", run.over_comfort);
