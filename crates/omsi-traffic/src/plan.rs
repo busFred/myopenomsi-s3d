@@ -1572,23 +1572,25 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
 
 /// My lead when it would stand within the road a lane change `(wait, len)` takes from now at
 /// speed `v` - the signal's road (`wait` seconds left) and the move (`len` metres; `change_clear`)
-/// - were it to brake to rest now at its comfortable deceleration (`stop_reach`; SUMO's gap rule
-/// reads a leader by its braking whatever its speed): one standing, or creeping and about to
-/// stand, is the same lead to the start check and to the re-sweep while the change signals.
+/// - were it to brake to rest now at its maximal deceleration (`stop_reach`; SUMO's secure gap
+/// reads a leader by its maximal braking whatever its speed): one standing, or creeping and about
+/// to stand, is the same lead to the start check and to the re-sweep while the change signals.
 fn near_standing_lead(p: &Perception, vehicles: &[Vehicle], v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
     p.leader.filter(|l| {
         let b = match l.what {
-            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.params.comfort_brake),
+            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.state.decel.max(o.params.comfort_brake)),
             _ => None,
         };
         l.gap + stop_reach(l.speed, b) < len + v * wait
     })
 }
 
-/// How far (m) a body at `speed` m/s runs on braking to rest at `brake` m/s² (its comfortable
-/// deceleration; a preset car's where it is not known): where a leader would stand were it to
-/// stop now - the least it will be ahead of where it is (SUMO's secure gap assumes the leader
-/// brakes).
+/// How far (m) a body at `speed` m/s runs on braking to rest at `brake` m/s² (its maximal
+/// deceleration, `AiState::decel`; a preset car's comfortable one where it is not known): where a
+/// leader would stand were it to stop now as hard as it can - the least it will be ahead of where
+/// it is (SUMO's secure gap: `getSecureGap` with the leader's maximal deceleration). Braking only
+/// comfortably it was no bound: a car in a queue stopped short of it and a change let through by the
+/// start check was dropped by the re-sweep.
 fn stop_reach(speed: f32, brake: Option<f32>) -> f32 {
     let b = brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake).max(0.1);
     speed.max(0.0).powi(2) / (2.0 * b)
@@ -2308,7 +2310,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     // (how a body of this speed, on this lane, is swept - one rule whatever its speed, so the start
     // check and the re-sweep while the change signals make the same test of a car creeping that
     // stands a moment later: beside me, carried on at its speed (the rear's swing); ahead of my
-    // front, off my own way, where it would stand braking now at its comfortable deceleration (the
+    // front, off my own way, where it would stand braking now at its maximal deceleration (the
     // least it will have moved on, SUMO's secure gap); ahead on my own way, the car following's,
     // and so too once a lead would stand within the move (`near_standing_lead`, `others`); behind
     // my rear, standing where it is, moving the gap rule's, or where it is with `others`)
@@ -2340,7 +2342,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     };
     let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| {
         let o = &vehicles[j];
-        swept(o.state.speed, Some(o.state.lane), Some(o.params.comfort_brake), &o.obb()).map(|c| (j, c))
+        swept(o.state.speed, Some(o.state.lane), Some(o.state.decel.max(o.params.comfort_brake)), &o.obb()).map(|c| (j, c))
     }).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
     // (my body's pose `d` metres on and its least separation from what is swept)
