@@ -1598,6 +1598,9 @@ enum Carry {
     /// Carried on at its speed but no further than where it would stand braking at the given
     /// deceleration (`stop_reach`): the least it will have moved on.
     ToStop(f32),
+    /// Anywhere between the two: where it would stand braking at the given deceleration and where
+    /// it would be at its speed (a body beside me, which may brake or roll on as my rear swings).
+    Span(f32),
 }
 
 /// How far across (m, + right of my heading) the lane `nb` lies from me: a bypass's move.
@@ -2333,7 +2336,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let moving = speed.abs() >= STANDING_SPEED;
         match bodies {
             Bodies::All => Some(Carry::Now),
-            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::AtSpeed } else { Carry::Now }),
+            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::Span(brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake)) } else { Carry::Now }),
             Bodies::Over { others, .. } if ahead_of_me(b) => {
                 let to_stop = Carry::ToStop(brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake));
                 if others || !lane.is_some_and(|l| own_way.contains(&l)) {
@@ -2352,6 +2355,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let run = match (carry, bodies.time_to(d)) {
             (Carry::AtSpeed, Some(t)) => speed * t,
             (Carry::ToStop(brake), Some(t)) => (speed.max(0.0) * t).min(stop_reach(speed, Some(brake))),
+            (Carry::Span(_), _) => unreachable!("a span is swept at both its ends, `sep_of`"),
             _ => 0.0,
         };
         if run != 0.0 {
@@ -2359,6 +2363,13 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
             b.center += DVec2::new(h.sin(), h.cos()) * run as f64;
         }
         b
+    };
+    // (the least separation of a body so carried from my pose `b`: a span at both its ends)
+    let sep_of = |o: Obb, heading: f32, speed: f32, carry: Carry, d: f32, b: &Obb| -> f64 {
+        match carry {
+            Carry::Span(brake) => at(o, heading, speed, Carry::AtSpeed, d).separation(b).min(at(o, heading, speed, Carry::ToStop(brake), d).separation(b)),
+            c => at(o, heading, speed, c, d).separation(b),
+        }
     };
     let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| {
         let o = &vehicles[j];
@@ -2393,13 +2404,13 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         for &(j, carried) in &near {
             let o = &vehicles[j];
             if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
-                sep = sep.min(at(o.obb(), o.heading, o.state.speed, carried, d).separation(&b));
+                sep = sep.min(sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b));
             }
         }
         for pl in sim.players.iter().filter(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0) {
             let pb = pl.obb(0.0, 0.0);
             if let Some(carry) = swept(pl.speed, None, None, &pb) {
-                sep = sep.min(at(pb, pl.heading, pl.speed, carry, d).separation(&b));
+                sep = sep.min(sep_of(pb, pl.heading, pl.speed, carry, d, &b));
             }
         }
         for o in parked.iter().chain(people) {
@@ -2423,7 +2434,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
                 for &(j, carried) in &near {
                     let o = &vehicles[j];
                     if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
-                        let sp = at(o.obb(), o.heading, o.state.speed, carried, d).separation(&b);
+                        let sp = sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b);
                         if sp < best.0 {
                             best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried != Carry::Now, sp as f32, d)));
                         }
