@@ -27,28 +27,52 @@ fn arc(a: f64, b: f64) -> Vec<(f64, f64)> {
     (0..=n).map(|i| (a + (b - a) * i as f64 / n as f64).to_radians()).map(|t| (R * t.cos(), R * t.sin())).collect()
 }
 
+/// A cubic Bezier from `p0` to `p1` leaving `p0` along `d0` and arriving at `p1` along `d1` (unit
+/// vectors), its inner control points `k` m along them: `n` + 1 points.
+fn bezier(p0: (f64, f64), d0: (f64, f64), p1: (f64, f64), d1: (f64, f64), k: f64, n: usize) -> Vec<(f64, f64)> {
+    let (c0, c1) = ((p0.0 + k * d0.0, p0.1 + k * d0.1), (p1.0 - k * d1.0, p1.1 - k * d1.1));
+    (0..=n)
+        .map(|i| {
+            let t = i as f64 / n as f64;
+            let (a, b, c, d) = ((1.0 - t).powi(3), 3.0 * (1.0 - t).powi(2) * t, 3.0 * (1.0 - t) * t * t, t.powi(3));
+            (a * p0.0 + b * c0.0 + c * c1.0 + d * p1.0, a * p0.1 + b * c0.1 + c * c1.1 + d * p1.1)
+        })
+        .collect()
+}
+
 /// A single-lane ring (centre at the origin, radius `R`, counter-clockwise) with one entry, as
-/// X10's: the circulating way comes in by a straight feeder (0) round the ring (1), through the
-/// junction object's ring piece (2, the right of way) to the merge point M at angle 0; the entry
-/// (approach 3, 1000 m, the object's entry piece 4, giving way) runs into M at 40 degrees to the
-/// ring; after M the ring goes on (5) and leaves by a straight (6).
+/// X10's. Its legs are radial and cross nothing, as a roundabout's legs: the circulating way comes
+/// in along the radius at -150 degrees (feeder 0, 100 m, curving 12 m from the ring into it at
+/// -120 degrees), round the ring (1), through the junction object's ring piece (2, the right of
+/// way) to the merge point M at angle 0; the entry (approach 3, 1000 m, the object's entry piece
+/// 4, giving way) runs into M at 40 degrees to the ring; after M the ring goes on (5) and leaves at
+/// 60 degrees, curving out to the radius at 90 degrees (6, 300 m out).
 fn ring_entry(zebra: bool) -> Network {
     let tangent = |t: f64| (-t.to_radians().sin(), t.to_radians().cos());
+    let radial = |t: f64| (t.to_radians().cos(), t.to_radians().sin());
     let at = |t: f64| (R * t.to_radians().cos(), R * t.to_radians().sin());
-    let (p0, d0) = (at(-150.0), tangent(-150.0));
     let m = at(0.0);
     let dir = (-(40f64.to_radians().sin()), 40f64.to_radians().cos());
     let piece = if zebra { 16.0 } else { 8.0 };
     let e0 = (m.0 - piece * dir.0, m.1 - piece * dir.1);
-    let (p6, d6) = (at(60.0), tangent(60.0));
+    // (the feeder: inwards along the radius at -150 degrees to 12 m off the ring, then into it at -120)
+    let u_in = radial(-150.0);
+    let p1 = ((R + 12.0) * u_in.0, (R + 12.0) * u_in.1);
+    let mut feeder = vec![(p1.0 + 100.0 * u_in.0, p1.1 + 100.0 * u_in.1)];
+    feeder.extend(bezier(p1, (-u_in.0, -u_in.1), at(-120.0), tangent(-120.0), 6.0, 16));
+    // (the way out: out of the ring at 60 degrees to 12 m off it on the radius at 90, then along it)
+    let u_out = radial(90.0);
+    let pa = ((R + 12.0) * u_out.0, (R + 12.0) * u_out.1);
+    let mut away = bezier(at(60.0), tangent(60.0), pa, u_out, 6.0, 16);
+    away.push((pa.0 + 300.0 * u_out.0, pa.1 + 300.0 * u_out.1));
     let mut net = Network::default();
-    net.lanes.push(lane(vec![(p0.0 - 100.0 * d0.0, p0.1 - 100.0 * d0.1), p0], 1, 1, 0, 0.0)); // 0 feeder
-    net.lanes.push(lane(arc(-150.0, -40.0), 1, 2, 0, 0.0)); // 1 ring
+    net.lanes.push(lane(feeder, 1, 1, 0, 0.0)); // 0 feeder
+    net.lanes.push(lane(arc(-120.0, -40.0), 1, 2, 0, 0.0)); // 1 ring
     net.lanes.push(lane(arc(-40.0, 0.0), 2, 9, 0, 192.0)); // 2 ring piece
     net.lanes.push(lane(vec![(e0.0 - 1000.0 * dir.0, e0.1 - 1000.0 * dir.1), e0], 1, 3, 0, 0.0)); // 3 approach
     net.lanes.push(lane(vec![e0, m], 2, 9, 1, 64.0)); // 4 entry piece
     net.lanes.push(lane(arc(0.0, 60.0), 1, 4, 0, 0.0)); // 5 ring on
-    net.lanes.push(lane(vec![p6, (p6.0 + 300.0 * d6.0, p6.1 + 300.0 * d6.1)], 1, 5, 0, 0.0)); // 6 away
+    net.lanes.push(lane(away, 1, 5, 0, 0.0)); // 6 away
     if zebra {
         // 7: a footpath across the entry 9 m before M, as X10's at lane 7269
         let c = (m.0 - 9.0 * dir.0, m.1 - 9.0 * dir.1);
@@ -111,6 +135,8 @@ impl EntryRun {
 fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> EntryRun {
     let net = ring_entry(zebra);
     let mut sim = Simulation::new(&net, vec![]);
+    // (the legs cross nothing: the junction object is the ring's only junction)
+    assert_eq!(sim.junctions.nodes.len(), 1, "the ring's legs make junctions of their own: {:?}", sim.junctions.nodes.iter().map(|n| n.movements.len()).collect::<Vec<_>>());
     let mut cars: Vec<Vehicle> = Vec::new();
     let approach = net.lanes[3].length();
     let mut next_id = 1u64;
@@ -206,8 +232,7 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
 /// `reservation::follow_room` behind it, s* sqrt(a/b) with s* = s0 + v T + v Δv / (2 sqrt(a b))
 /// = 13.6 m for a = 1.8, b = 2.0 m/s², s0 = 2 m, T = 1.3 s and an entrant from rest: 2.8 s at
 /// 4.8 m/s; and the entrant itself keeps its time gap T = 1.3 s behind the car it lets by. The
-/// flow is held to between exp(-v_c d / 3600) of HCM's capacity and HCM's capacity itself. At the
-/// tip, the entry with a footpath crossing between its waiting place and the ring ran at 0.37.
+/// flow is held to between exp(-v_c d / 3600) of HCM's capacity and HCM's capacity itself.
 const IDM_LAG: f32 = 2.8 + 1.3;
 
 fn check(zebra: bool) {
