@@ -102,6 +102,9 @@ const STEP_SPEED: f32 = 0.5;
 /// the junctions before it: the critical headway of the intersection sight distance
 /// d2 = 1.47 V2 t, t = 5.0 s (ALDOT Roundabout Planning, Design, and Operations Manual, Dec 2015,
 /// section 3.8.5.2, Equation 3.3 and Table 3.7, source NCHRP 672; the same 5.0 s as Table 2.3).
+/// The source is the sight distance at a roundabout's entry; it is used at every junction, the one
+/// sight time the rules know (SUMO's look-ahead has no time limit of its own: it runs to the
+/// vehicle's brake gap and lanes ahead).
 pub const ENTRY_SIGHT_TIME: f32 = 5.0;
 
 /// A bus at its stop is an obstacle worth going round once it has stood this long there (s).
@@ -300,8 +303,10 @@ pub struct Perception {
     pub signal: Option<SignalView>,
     pub junction: Option<JunctionView>,
     /// The junctions after that one on the way that the car is within sight of
-    /// (`ENTRY_SIGHT_TIME`): it files an approach at each for the cars waiting there
-    /// (SUMO's `MSVehicle::setApproachingForAllLinks` registers at every link of its look-ahead).
+    /// (`ENTRY_SIGHT_TIME`): it files an approach at each for the cars waiting there (SUMO's
+    /// `MSVehicle::setApproachingForAllLinks` registers an approach at every link its
+    /// `planMoveInternal` requested, which stops at a light it can brake for or after slowing for
+    /// a minor link: `sim::files_approaches`).
     pub later: Vec<JunctionView>,
     pub left: Option<NeighbourView>,
     pub right: Option<NeighbourView>,

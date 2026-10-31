@@ -15,7 +15,9 @@ use omsi_sim::traffic::{arrival_time, APPROACH_WINDOW, MAX_BRAKE};
 pub struct Claim {
     /// An approach filed at a junction after the one the vehicle's own claim is at, so that the
     /// cars waiting there see it coming (`perception::ENTRY_SIGHT_TIME`): a foe of theirs, never
-    /// decided for itself.
+    /// decided for itself. AI vehicles only: a player's vehicle files none (the cars at the
+    /// junction after its first do not see it coming), and a stand-in's are dropped with its claim
+    /// (`StandIn`), nor does its grant see the others' (it is resolved on the claims alone).
     pub foe_only: bool,
     /// The pieces of the junction the way runs through, each with how far along the way
     /// its start lies (`Junctions::chain_along`): the claim stands for all of them.

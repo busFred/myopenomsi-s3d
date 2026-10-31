@@ -449,6 +449,16 @@ pub fn claim_horizon(speed: f32) -> f32 {
     omsi_sim::traffic::claim_horizon(speed)
 }
 
+/// Whether a car whose claim at its first junction is `claim` files approaches at the junctions
+/// after it (`Claim::foe_only`; `first_conflict` is that junction's first meeting place along the
+/// way through, the claim's distances): not when its red holds it short of that meeting place, nor
+/// when it was refused there last frame and can still stop - SUMO's `MSVehicle::planMoveInternal`
+/// requests no link beyond a yellow or red it can brake for, and once it has slowed down for a minor
+/// link it drops the requests of the links after it (`abortRequestAfterMinor`).
+pub fn files_approaches(claim: &Claim, first_conflict: f32) -> bool {
+    !(claim.light_red && claim.red_at <= first_conflict) && !(claim.refused_last && !claim.committed)
+}
+
 /// A timetable bus creeping up to its stop slower than this (m/s) has not
 /// moved off: its standing time (`Vehicle::stopped`) runs on (`STANDING_SPEED` would reset
 /// it in a 0.3-0.4 m/s creep).
@@ -828,6 +838,8 @@ pub struct Simulation {
     /// set by the tools (`traffic_cases watch`), never by the game.
     pub trace_foes: bool,
     pub foe_trace: Vec<reservation::FoeTrace>,
+    /// The approaches filed at junctions after a car's first (`Claim::foe_only`) this frame.
+    pub approaches_filed: usize,
     /// Wall seconds of each phase of `tick`, summed over the ticks (diagnostics, read by the
     /// game's `OMSI_PROFILE` line; the order is `PHASES`).
     pub phase_secs: [f64; PHASES.len()],
@@ -951,6 +963,7 @@ impl Simulation {
             signal_groups: reservation::Context::default(),
             claims: Vec::new(),
             trace_foes: false,
+            approaches_filed: 0,
             foe_trace: Vec::new(),
             phase_secs: [0.0; PHASES.len()],
             stand_in: None,
@@ -1623,9 +1636,13 @@ impl Simulation {
                 };
                 // (the junctions after this one it is within sight of, `perception::ENTRY_SIGHT_TIME`: an approach filed
                 // for the cars waiting there, no claim of its own - `Claim::foe_only`)
+                // (none past a stop it has to make first: SUMO's `planMoveInternal` requests no link
+                // beyond a yellow or red it can brake for, and drops the later links' requests once it
+                // has slowed for a minor link, `abortRequestAfterMinor` - `files_approaches`)
                 let extras: Vec<Claim> = p
                     .later
                     .iter()
+                    .filter(|_| files_approaches(&claim, j.conflict_start - j.entry))
                     .map(|nj| {
                         let next_ahead = self.junctions.foes_along(nj.junction, &nj.chain).iter().map(|f| nj.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
                         let next = if next_ahead.is_finite() { next_ahead } else { nj.conflict_start };
@@ -1919,6 +1936,7 @@ impl Simulation {
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
         // (the approaches filed at the later junctions go in as foes only: their grants are not read)
         let n_real = claims.len();
+        self.approaches_filed = foe_only.len();
         claims.extend(foe_only);
         let mut grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
         claims.truncate(n_real);
@@ -2651,6 +2669,20 @@ mod ease_ring_tests {
 
     fn claim(vehicle: usize) -> Claim {
         Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+    }
+
+    /// A car files approaches at the junctions after its first unless its red holds it short of
+    /// that junction's first meeting place, or it was refused there and can still stop (SUMO's
+    /// `planMoveInternal`: no request beyond a light it can brake for; `abortRequestAfterMinor`).
+    #[test]
+    fn approaches_are_not_filed_past_a_red_or_a_refusal_at_the_first_junction() {
+        let free = Claim { refused_last: false, ..claim(0) };
+        assert!(files_approaches(&free, 10.0));
+        assert!(!files_approaches(&Claim { light_red: true, red_at: 4.0, ..free.clone() }, 10.0));
+        // (a red past the first meeting place holds it only beyond that place)
+        assert!(files_approaches(&Claim { light_red: true, red_at: 20.0, ..free.clone() }, 10.0));
+        assert!(!files_approaches(&Claim { refused_last: true, ..free.clone() }, 10.0));
+        assert!(files_approaches(&Claim { refused_last: true, committed: true, ..free.clone() }, 10.0));
     }
 
     /// The ring of viz5 case02 j0: A (0) eased off for B (1), B standing 2 m behind its lead C (2),
