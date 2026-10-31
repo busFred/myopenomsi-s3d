@@ -43,7 +43,9 @@
 //! in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted
 //! apart and not listed. A car that parks or pulls out of a parked space (its parked object
 //! put down or taken up where it stands) and anything while the map loads
-//! (`Traffic::loading_phase`) is not counted.
+//! (`Traffic::loading_phase`) is not counted. The AI bodies as the game draws them
+//! (`BodyLane`): how far each swings out of its own footprint along its way and where two of
+//! them overlap.
 
 use crate::traffic::Traffic;
 use glam::{DVec3, Vec3};
@@ -258,6 +260,498 @@ pub(crate) struct PlayerWatch {
     next_line: f32,
     /// What the others made of the player's bus (`Round`).
     round: Round,
+    /// The AI bodies against their lanes and each other.
+    bodies: BodyLane,
+}
+
+/// Speed (m/s) above which a vehicle counts as moving for the steering rate: the planner's
+/// standstill (`ai_motion`'s 0.02 m/s, where the body stops following its speed).
+const STEER_RATE_MOVING: f32 = 0.02;
+/// Step (m) of the way's points a body is measured against: the polyline between them is
+/// within a millimetre of a 25 m bend (the sagitta of a 0.5 m chord).
+const BODY_WAY_STEP: f32 = 0.5;
+/// How far past an edge (m) the signed measure counts a side as over it: 5 cm, a body truly
+/// over the line and not the pure pursuit's steady error.
+const BODY_SIDE_OVER: f64 = 0.05;
+/// Upper bounds (m) of the radius classes the bodies are told by (the bends of the unit
+/// test, `ai_motion`'s 25/40/80 m, and the rest).
+const BODY_RADIUS_CLASSES: [f64; 3] = [30.0, 60.0, 120.0];
+/// A joint between two lanes counts as the cause of a vehicle-frame (`BodyLane::cause`) where
+/// the heading jump at it is more than this share of the lane headings' turn over the wheelbase
+/// (the rest is the lanes' own curvature): more than half, the jump dominates.
+const CAUSE_KINK_SHARE: f64 = 0.5;
+/// The careful line counts as swinging wide (`BodyLane::cause`) where the lane's inner edge takes
+/// more than this (m) off the offset that would centre the swept band: a centimetre, the band
+/// truly wider than the lane.
+const CAUSE_CAPPED: f32 = 0.01;
+/// Swing (m) from which a body counts as out of its footprint: the way's polyline and the
+/// pure pursuit's steady error on a straight stay within millimetres; a centimetre is a body
+/// truly turned off its way.
+const BODY_COUNTED: f64 = 0.01;
+
+/// The AI road bodies as the game draws them, every frame outside the map's loading: per
+/// vehicle section the point of its outline farthest outside a lane as wide as the body
+/// itself (the four corners and the sides abreast of its turning line, the inner side's
+/// nearest point to a bend's centre): its distance from the vehicle's way
+/// (`AiState::way_point`, with its lane change and sideways moves) less the section's half
+/// width, i.e. how far the body leaves its own footprint along the way; for a lane W wide it
+/// is outside the lane by this less (W/2 - half width). (The lanes' own `width` is the path's,
+/// 1 m on most BeijingCity lanes, not the painted lane.) Front section and coupled rear
+/// sections apart, told by the radius of the way under the section (the circle through the
+/// way's points at its rear bumper, origin and front bumper), as percentiles of the
+/// vehicle-frames (a body put back on its way after a jump of the traffic's state stands
+/// metres off it for a frame: the maximum alone is that). And the pairs of bodies (every
+/// section) whose outlines overlap (`collision::Obb::separation`), each overlap listed once
+/// over with both vehicles as they were when it began (position, heading, speed, lane, place,
+/// sideways offset, the lane's radius there).
+#[derive(Default)]
+struct BodyLane {
+    /// The front wheels' angle of each AI road vehicle at the last frame (deg), and every
+    /// moving vehicle-frame's steering rate (deg/s, `AiBody::steer`): how smoothly the bodies
+    /// steer.
+    last_steer: HashMap<u64, f32>,
+    steer_rate: Vec<(f32, &'static str)>,
+    /// Where the outer side passes the lane's edge by more than `BODY_SIDE_OVER` in bends:
+    /// vehicle-seconds by cause (`BodyLane::cause`), and per vehicle its deepest frame (m, what
+    /// it was doing then: the lanes' curvature at its axles, the steering's feed-forward and
+    /// the wheel's angle).
+    outer_over_s: BTreeMap<&'static str, f64>,
+    outer_worst: HashMap<u64, (f32, String)>,
+    /// Per section kind (front, rear) and radius class (and beyond the last): every
+    /// vehicle-frame's swing (m) and its frame time (s); the most with its second, id, type.
+    swing: [[Vec<(f32, f32)>; 4]; 2],
+    /// The same vehicle-frames, signed against the bend: how far the body's inner side and its
+    /// outer side leave the vehicle's lanes (m, past the edges on the bend's inside and outside,
+    /// `Network::lane_edges`, each corner against the lane under it, from the way; - = inside
+    /// it): (inner, outer, frame time); and
+    /// the vehicle-seconds on a lane whose edges the map does not tell, and those changing lanes
+    /// (the way runs from one lane's axis to the next), not measured. A way moved off its lane's
+    /// axis by its sideways offset (a bus bay, a swerve, `AiState::lateral_ahead`) is measured:
+    /// each corner from the lane's axis (its distance from the way less the offset).
+    sides: [[Vec<(f32, f32, f32)>; 4]; 2],
+    sides_unknown_s: [[f64; 4]; 2],
+    sides_sideways_s: [[f64; 4]; 2],
+    /// Where the inner side passes the lane's edge by more than `BODY_SIDE_OVER`: vehicle-seconds
+    /// by the lane's source (spline lane, connector: a junction path or an editor-only lane) and the vehicle (bus or not), and per
+    /// vehicle its deepest frame (m, what it was doing then).
+    inner_over_s: HashMap<(&'static str, bool), f64>,
+    /// Of those, the vehicle-seconds with the way off its lane's axis (bays, swerves).
+    inner_over_offset_s: f64,
+    inner_worst: HashMap<u64, (f32, String)>,
+    /// The street lanes by where their edges come from (`Network::lane_edges`), counted
+    /// whenever the network has grown: (lanes counted, spline lanes with both edges, connectors
+    /// - junction paths and editor-only splines' lanes - from the pieces they join, spline lanes
+    /// not known, connectors not known), and
+    /// the known lanes' widths (left + right edge, m).
+    lane_edges: (usize, usize, usize, usize, usize, Vec<f32>),
+    /// The files of the lanes whose edges are not known, with their counts.
+    edges_unknown: HashMap<String, usize>,
+    most: [[(f64, f32, u64, String); 4]; 2],
+    /// Overlapping pair-seconds, the pairs, the deepest (m) with its second and ids.
+    overlap_s: f64,
+    pairs: HashSet<(u64, u64)>,
+    deepest: (f64, f32, u64, u64),
+    /// The overlaps going on: pair -> (since, deepest, both vehicles as they were then).
+    open: HashMap<(u64, u64), (f32, f64, String)>,
+    /// Each overlap once over: its line.
+    episodes: Vec<String>,
+}
+
+impl BodyLane {
+    /// What a vehicle-frame's body is doing, for the outer side's crossings and the steering
+    /// rate: "bay/swerve" (the way off the lane's axis, or changing lanes); "joint kink" (the
+    /// lane headings over the wheelbase about the rotation point (`AiState::lane_heading`, which
+    /// jump where two pieces meet at an angle; the steering takes its bend from the pieces' own
+    /// arcs, `AiState::lane_arc_heading`) turn by a bend's worth, R <= the last radius class,
+    /// and a joint between two lanes there makes more than `CAUSE_KINK_SHARE` of it, the
+    /// lanes' own curvature the rest); "swing wide" (the lane's inner edge caps the careful
+    /// line's offset by more than `CAUSE_CAPPED`: the band wider than the lane, K2-D2);
+    /// "bend, band fits" (the lane at the rotation point bends, R <= the last class); "other".
+    /// And the line's fields: the lanes' radius at the front and rear axle, the feed-forward
+    /// and the wheel's angle.
+    fn cause(net: &omsi_sim::traffic::Network, c: &crate::traffic::AiCar) -> (&'static str, String) {
+        let st = &c.ai.state;
+        let (rot, wb) = omsi_sim::ai_motion::rotation_point(&c.vehicle.ty.def);
+        let hw = 0.5 * wb;
+        let wrap = |x: f64| (x + 540.0).rem_euclid(360.0) - 180.0;
+        let curv = |d: f32| {
+            let (l, u) = st.lane_at(net, d);
+            net.lanes[l].curvature_at(u)
+        };
+        // the headings' turn (deg, + = right) and the lanes' own over it
+        let turn = wrap((st.lane_heading(net, rot + hw) - st.lane_heading(net, rot - hw)) as f64);
+        let steps = 8;
+        let own = (0..steps).map(|j| curv(rot - hw + (j as f32 + 0.5) * wb / steps as f32) as f64 * (wb / steps as f32) as f64).sum::<f64>().to_degrees();
+        let joint = st.lane_at(net, rot - hw).0 != st.lane_at(net, rot + hw).0;
+        let kink = joint && turn.abs().to_radians() / wb as f64 >= 1.0 / BODY_RADIUS_CLASSES[2] && (turn - own).abs() > CAUSE_KINK_SHARE * turn.abs();
+        let (k_rot, k_front) = (curv(rot), curv(rot + wb));
+        let ext = crate::traffic::extents(&c.vehicle.ty, st.length);
+        let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*c.vehicle.ty).chain(c.vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+        let pull = omsi_sim::ai_motion::rear_off_tracking(&parts);
+        let (_, to) = c.body.steer_span(st.speed);
+        let (el, er) = st.lane_edges_between(net, rot.min(-st.rear), to);
+        // (careful_line_offset's k: + = left)
+        let k_left = -k_rot;
+        let inner = if k_left > 0.0 { el } else { er };
+        let reach = (ext.0 - rot).max(0.0);
+        let capped = omsi_sim::ai_motion::careful_line_offset(k_left, reach, ext.2, pull, f32::INFINITY).abs() - omsi_sim::ai_motion::careful_line_offset(k_left, reach, ext.2, pull, inner).abs() > CAUSE_CAPPED;
+        let cause = if st.change.is_some() || st.lateral != 0.0 {
+            "bay/swerve"
+        } else if kink {
+            "joint kink"
+        } else if capped {
+            "swing wide"
+        } else if k_rot.abs() as f64 * BODY_RADIUS_CLASSES[2] >= 1.0 {
+            "bend, band fits"
+        } else {
+            "other"
+        };
+        let r = |k: f32| if k.abs() < 1e-4 { "straight".to_string() } else { format!("{:.0}", 1.0 / k) };
+        let line = format!(
+            "lane R at front axle {} rear axle {} (+ = right), headings' turn over the wheelbase {turn:.1} deg (lanes' own {own:.1}{}), feed-forward {:.1} deg, wheel {:.1} deg",
+            r(k_front),
+            r(k_rot),
+            if joint { ", across a joint" } else { "" },
+            c.body.steer_ff,
+            c.body.steer
+        );
+        (cause, line)
+    }
+
+    fn frame(&mut self, t_s: f32, dt: f32, traffic: &Traffic) {
+        use glam::DVec2;
+        use omsi_sim::ai_motion::MotionKind;
+        use omsi_sim::collision::Obb;
+        let net = &traffic.net;
+        if self.lane_edges.0 != net.lanes.len() {
+            let mut e = (net.lanes.len(), 0, 0, 0, 0, Vec::new());
+            self.edges_unknown.clear();
+            for (i, l) in net.lanes.iter().enumerate().filter(|(_, l)| l.kind == omsi_sim::traffic::LaneKind::Street) {
+                match (net.lane_edges(i), l.source == 2 || l.invisible) {
+                    (Some(w), junction) => {
+                        if junction { e.2 += 1 } else { e.1 += 1 }
+                        e.5.push(w.0 + w.1);
+                    }
+                    (None, junction) => {
+                        if junction { e.4 += 1 } else { e.3 += 1 }
+                        *self.edges_unknown.entry(format!("{}{}", if l.invisible { "invisible " } else { "" }, l.name)).or_default() += 1;
+                    }
+                }
+            }
+            self.lane_edges = e;
+        }
+        let mut boxes: Vec<(u64, Obb, f64)> = Vec::new();
+        // per vehicle: what it is and does, for the overlap lines
+        let mut what: HashMap<u64, String> = HashMap::new();
+        for c in traffic.cars.iter().filter(|c| c.body.kind == MotionKind::Road) {
+            let st = &c.ai.state;
+            if st.lane >= net.lanes.len() {
+                continue;
+            }
+            let (cause, wheel) = Self::cause(net, c);
+            if let Some(last) = self.last_steer.insert(c.id, c.body.steer) {
+                if dt > 0.0 && st.speed.abs() > STEER_RATE_MOVING {
+                    self.steer_rate.push(((c.body.steer - last).abs() / dt, cause));
+                }
+            }
+            let n = ((st.rear + st.front + 4.0) / BODY_WAY_STEP).ceil() as usize;
+            let first = -st.rear - 2.0;
+            let way: Vec<DVec2> = st.way_points(net, (0..=n).map(|i| first + i as f32 * BODY_WAY_STEP)).into_iter().map(|p| p.truncate()).collect();
+            // the signed lateral distance of a point from the way (+ = left of its direction)
+            let lateral = |p: DVec2| {
+                way.windows(2)
+                    .map(|w| {
+                        let (a, b) = (w[0], w[1]);
+                        let t = ((p - a).dot(b - a) / (b - a).length_squared().max(1e-12)).clamp(0.0, 1.0);
+                        let c = a + (b - a) * t;
+                        ((p - c).length(), (b - a).perp_dot(p - c).signum() * (p - c).length())
+                    })
+                    .fold((f64::MAX, 0.0), |m, x| if x.0 < m.0 { x } else { m })
+                    .1
+            };
+            let off_way = |p: DVec2| {
+                way.windows(2)
+                    .map(|w| {
+                        let (a, b) = (w[0], w[1]);
+                        let t = ((p - a).dot(b - a) / (b - a).length_squared().max(1e-12)).clamp(0.0, 1.0);
+                        (p - (a + (b - a) * t)).length()
+                    })
+                    .fold(f64::MAX, f64::min)
+            };
+            // the way at `d` m from the vehicle's origin (between its samples)
+            let at = |d: f32| {
+                let x = ((d - first) / BODY_WAY_STEP).clamp(0.0, n as f32);
+                let i = (x.floor() as usize).min(n.saturating_sub(1));
+                way[i].lerp(way[(i + 1).min(n)], (x - i as f32) as f64)
+            };
+            what.insert(
+                c.id,
+                format!(
+                    "#{} {} at ({:.1}, {:.1}) heading {:.0} {:.1} m/s lane {} s {:.1} lateral {:.2} radius {:.0}",
+                    c.id,
+                    c.vehicle.ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                    c.vehicle.position.x,
+                    c.vehicle.position.y,
+                    c.vehicle.heading,
+                    st.speed,
+                    st.lane,
+                    st.s,
+                    st.lateral,
+                    1.0 / net.lanes[st.lane].curvature_at(st.s).abs().max(1e-4)
+                ),
+            );
+            let mut sections: Vec<(DVec3, f64, (f32, f32, f32), f32, f32)> = Vec::new();
+            let ext = crate::traffic::extents(&c.vehicle.ty, st.length);
+            sections.push((c.vehicle.position, c.vehicle.heading, ext, omsi_sim::ai_motion::rotation_point(&c.vehicle.ty.def).0, 0.0));
+            for t in &c.vehicle.trailers {
+                // (where along the way the section stands: its origin's distance behind the front's)
+                let back = (t.position - c.vehicle.position).truncate().length() as f32;
+                sections.push((t.position, t.heading, crate::traffic::extents(&t.ty, st.length), omsi_sim::ai_motion::rotation_point(&t.ty.def).0, -back));
+            }
+            for (i, &(pos, heading, (front, rear, half), turning, along)) in sections.iter().enumerate() {
+                let h = heading.to_radians();
+                let fwd = DVec2::new(h.sin(), h.cos());
+                let right = DVec2::new(fwd.y, -fwd.x);
+                let o = pos.truncate();
+                let corners = [(front, half), (front, -half), (-rear, half), (-rear, -half), (turning, half), (turning, -half)];
+                let worst = corners
+                    .iter()
+                    .map(|&(long, lat)| off_way(o + fwd * long as f64 + right * lat as f64) - half as f64)
+                    .fold(f64::MIN, f64::max);
+                // the way's radius under the section: the circle through three of its points
+                let (a, b, q) = (at(along - rear), at(along), at(along + front));
+                let cross = (b - a).perp_dot(q - a).abs();
+                let k = 2.0 * cross / ((b - a).length() * (q - b).length() * (q - a).length()).max(1e-9);
+                let class = BODY_RADIUS_CLASSES.iter().position(|r| k * r >= 1.0).unwrap_or(3);
+                let kind = (i > 0) as usize;
+                self.swing[kind][class].push((worst as f32, dt));
+                // the lane under the section's own origin (for the lines below), and each
+                // corner against the edges of the lane under it: a body across a joint has its
+                // rear on the piece before, its front on the next
+                let (sec_lane, sec_s) = st.lane_at(net, along);
+                let corner_edges: Vec<Option<(f32, f32)>> = corners.iter().map(|&(long, _)| net.lane_edges(st.lane_at(net, along + long).0)).collect();
+                // (the section lane's edges, shown in the lines; NaN where it has none but a
+                // corner's lane has)
+                let edges = corner_edges.iter().any(|e| e.is_some()).then(|| net.lane_edges(sec_lane).unwrap_or((f32::NAN, f32::NAN)));
+                // the bend's side: + = it bends left, so its inside is the way's left
+                let left = (b - a).perp_dot(q - a) >= 0.0;
+                if st.change.is_some() {
+                    self.sides_sideways_s[kind][class] += dt as f64;
+                } else if let Some((el, er)) = edges {
+                    let inward = if left { 1.0 } else { -1.0 };
+                    let (mut inn, mut out) = (f64::MIN, f64::MIN);
+                    for (&(long, lat), e) in corners.iter().zip(&corner_edges) {
+                        let Some((cl, cr)) = *e else { continue };
+                        let (inner_edge, outer_edge) = if left { (cl, cr) } else { (cr, cl) };
+                        // (from the lane's axis: the way lies the sideways offset to its right)
+                        let l = (lateral(o + fwd * long as f64 + right * lat as f64) - st.lateral_ahead(along + long) as f64) * inward;
+                        inn = inn.max(l - inner_edge as f64);
+                        out = out.max(-l - outer_edge as f64);
+                    }
+                    self.sides[kind][class].push((inn as f32, out as f32, dt));
+                    if out > BODY_SIDE_OVER && class < 3 {
+                        *self.outer_over_s.entry(cause).or_default() += dt as f64;
+                        let w = self.outer_worst.entry(c.id).or_insert((f32::MIN, String::new()));
+                        if out as f32 > w.0 {
+                            let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                            let ln = &net.lanes[sec_lane];
+                            *w = (
+                                out as f32,
+                                format!(
+                                    "t={t_s:.1} #{} {} section {i} lane {} ({}) s {:.1} of {:.1} edges ({el:.2}, {er:.2}) bend {} R {:.0} speed {:.1}; {wheel}; cause {cause}",
+                                    c.id,
+                                    ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                                    sec_lane,
+                                    ln.name,
+                                    sec_s,
+                                    ln.length(),
+                                    if left { "left" } else { "right" },
+                                    1.0 / k.max(1e-4),
+                                    st.speed
+                                ),
+                            );
+                        }
+                    }
+                    if inn > BODY_SIDE_OVER && class < 3 {
+                        let ln = &net.lanes[sec_lane];
+                        let junction = ln.source == 2 || ln.invisible;
+                        let bus = c.vehicle.ty.def.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bus"));
+                        *self.inner_over_s.entry((if junction { "connector" } else { "spline lane" }, bus)).or_default() += dt as f64;
+                        if st.lateral != 0.0 {
+                            self.inner_over_offset_s += dt as f64;
+                        }
+                        let w = self.inner_worst.entry(c.id).or_insert((f32::MIN, String::new()));
+                        if inn as f32 > w.0 {
+                            let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                            *w = (
+                                inn as f32,
+                                format!(
+                                    "t={t_s:.1} #{} {} section {i} lane {} ({} {}) s {:.1} of {:.1} edges ({el:.2}, {er:.2}) bend {} R {:.0} speed {:.1}",
+                                    c.id,
+                                    ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                                    sec_lane,
+                                    if ln.invisible { "editor-only lane" } else if junction { "junction path" } else { "spline lane" },
+                                    ln.name,
+                                    sec_s,
+                                    ln.length(),
+                                    if left { "left" } else { "right" },
+                                    1.0 / k.max(1e-4),
+                                    st.speed
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    self.sides_unknown_s[kind][class] += dt as f64;
+                }
+                let m = &mut self.most[kind][class];
+                if worst > m.0 || m.3.is_empty() {
+                    let ty = if i == 0 { &c.vehicle.ty } else { &c.vehicle.trailers[i - 1].ty };
+                    let name = ty.def.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    *m = (worst, t_s, c.id, name);
+                }
+                boxes.push((c.id, Obb::vehicle(o, heading, front as f64, rear as f64, half as f64), front.max(rear).hypot(half) as f64));
+            }
+        }
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for (i, (a, ba, ra)) in boxes.iter().enumerate() {
+            for (b, bb, rb) in boxes.iter().skip(i + 1) {
+                if a == b || (ba.center - bb.center).length() > ra + rb {
+                    continue;
+                }
+                let sep = ba.separation(bb);
+                if sep < 0.0 {
+                    let pair = (*a.min(b), *a.max(b));
+                    if seen.insert(pair) {
+                        self.overlap_s += dt as f64;
+                        self.pairs.insert(pair);
+                        let e = self.open.entry(pair).or_insert_with(|| (t_s, 0.0, format!("{} / {}", what.get(&pair.0).cloned().unwrap_or_default(), what.get(&pair.1).cloned().unwrap_or_default())));
+                        e.1 = e.1.max(-sep);
+                    } else if let Some(e) = self.open.get_mut(&pair) {
+                        e.1 = e.1.max(-sep);
+                    }
+                    if -sep > self.deepest.0 {
+                        self.deepest = (-sep, t_s, pair.0, pair.1);
+                    }
+                }
+            }
+        }
+        let over: Vec<(u64, u64)> = self.open.keys().filter(|k| !seen.contains(k)).copied().collect();
+        for k in over {
+            if let Some((since, depth, who)) = self.open.remove(&k) {
+                self.episodes.push(format!("t={since:.1} for {:.1} s, deepest {depth:.2} m: {who}", t_s - since));
+            }
+        }
+    }
+
+    fn report(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, part) in ["front section", "rear sections"].iter().enumerate() {
+            for class in 0..4 {
+                let v = &mut self.swing[i][class];
+                if v.is_empty() {
+                    continue;
+                }
+                let name = match class {
+                    0 => format!("R <= {:.0} m", BODY_RADIUS_CLASSES[0]),
+                    3 => format!("R > {:.0} m", BODY_RADIUS_CLASSES[2]),
+                    c => format!("R {:.0}-{:.0} m", BODY_RADIUS_CLASSES[c - 1], BODY_RADIUS_CLASSES[c]),
+                };
+                let secs: f64 = v.iter().map(|x| x.1 as f64).sum();
+                let out_s: f64 = v.iter().filter(|x| x.0 as f64 > BODY_COUNTED).map(|x| x.1 as f64).sum();
+                let mean = v.iter().map(|x| x.0 as f64).sum::<f64>() / v.len() as f64;
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let pct = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize].0;
+                let m = &self.most[i][class];
+                out.push(format!(
+                    "body lane: {part} {name}: {secs:.0} vehicle-s, out of its own footprint {out_s:.0} vehicle-s; swing mean {mean:.2} p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} m (t={:.1} #{} {})",
+                    pct(0.5), pct(0.95), pct(0.99), m.0, m.1, m.2, m.3
+                ));
+            }
+        }
+        for (i, part) in ["front section", "rear sections"].iter().enumerate() {
+            for class in 0..3 {
+                let v = &self.sides[i][class];
+                if v.is_empty() {
+                    continue;
+                }
+                let secs: f64 = v.iter().map(|x| x.2 as f64).sum();
+                let over = |f: &dyn Fn(&(f32, f32, f32)) -> f32| v.iter().filter(|x| f(x) as f64 > BODY_SIDE_OVER).map(|x| x.2 as f64).sum::<f64>();
+                let stats = |f: &dyn Fn(&(f32, f32, f32)) -> f32| {
+                    let mut x: Vec<f32> = v.iter().map(f).collect();
+                    x.sort_by(|a, b| a.total_cmp(b));
+                    (x.iter().map(|&y| y as f64).sum::<f64>() / x.len() as f64, x[((x.len() - 1) as f64 * 0.95).round() as usize], x[x.len() - 1])
+                };
+                let (im, ip, ix) = stats(&|x| x.0);
+                let (om, op, ox) = stats(&|x| x.1);
+                let name = if class == 0 { format!("R <= {:.0} m", BODY_RADIUS_CLASSES[0]) } else { format!("R {:.0}-{:.0} m", BODY_RADIUS_CLASSES[class - 1], BODY_RADIUS_CLASSES[class]) };
+                out.push(format!(
+                    "body lane signed: {part} {name}: {secs:.0} vehicle-s (and {:.0} on lanes of no known edges, {:.0} changing lanes); past the lane's inner edge by mean {im:.2} p95 {ip:.2} max {ix:.2} m ({:.0} vehicle-s over 5 cm); past its outer edge by mean {om:.2} p95 {op:.2} max {ox:.2} m ({:.0} vehicle-s over 5 cm)",
+                    self.sides_unknown_s[i][class],
+                    self.sides_sideways_s[i][class],
+                    over(&|x| x.0),
+                    over(&|x| x.1)
+                ));
+            }
+        }
+        {
+            let (n, spline, junction, spline_unknown, junction_unknown, w) = &mut self.lane_edges;
+            w.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f64| w.get(((w.len().max(1) - 1) as f64 * p).round() as usize).copied().unwrap_or(0.0);
+            out.push(format!(
+                "body lane: lane edges of the {} street lanes of {n} lanes: spline lanes from the profile {spline}, junction paths and editor-only splines' lanes from the pieces they join {junction}, not known: spline lanes {spline_unknown}, junction paths and editor-only lanes {junction_unknown}; known widths p5 {:.2} p50 {:.2} p95 {:.2} m",
+                *spline + *junction + *spline_unknown + *junction_unknown,
+                pct(0.05),
+                pct(0.5),
+                pct(0.95)
+            ));
+            let mut names: Vec<(&String, &usize)> = self.edges_unknown.iter().collect();
+            names.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let list: Vec<String> = names.iter().take(12).map(|(n, c)| format!("{n} {c}")).collect();
+            out.push(format!("body lane: lane edges not known, by file: {}", list.join(", ")));
+        }
+        {
+            let mut by: Vec<String> = self.inner_over_s.iter().map(|((src, bus), s)| format!("{src} {} {s:.0}", if *bus { "bus" } else { "other" })).collect();
+            by.sort();
+            out.push(format!("body lane signed: inner side past the lane's edge by over {BODY_SIDE_OVER} m in bends (R <= {:.0} m), vehicle-s by lane and vehicle: {}; of them with the way off its lane's axis (bays, swerves) {:.0}", BODY_RADIUS_CLASSES[2], by.join(", "), self.inner_over_offset_s));
+            let mut worst: Vec<&(f32, String)> = self.inner_worst.values().collect();
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (d, w) in worst.iter().take(12) {
+                out.push(format!("body lane signed:   inner side {d:.2} m past: {w}"));
+            }
+        }
+        let still: Vec<String> = self.open.values().map(|(since, depth, who)| format!("t={since:.1} still at the end, deepest {depth:.2} m: {who}")).collect();
+        for e in self.episodes.iter().chain(&still) {
+            out.push(format!("body lane:   overlap {e}"));
+        }
+        if !self.steer_rate.is_empty() {
+            let v = &mut self.steer_rate;
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let pct = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize].0;
+            out.push(format!("body lane: steering rate of the moving AI road vehicles: {} vehicle-frames, p50 {:.2} p95 {:.2} p99 {:.2} max {:.1} deg/s", v.len(), pct(0.5), pct(0.95), pct(0.99), v[v.len() - 1].0));
+            // the frames at or above p95 and p99, by cause
+            for p in [0.95, 0.99] {
+                let from = pct(p);
+                let mut by: BTreeMap<&str, usize> = BTreeMap::new();
+                for x in v.iter().filter(|x| x.0 >= from) {
+                    *by.entry(x.1).or_default() += 1;
+                }
+                let list: Vec<String> = by.iter().map(|(c, n)| format!("{c} {n}")).collect();
+                out.push(format!("body lane: steering rate frames at or above p{:.0} ({from:.2} deg/s) by cause: {}", p * 100.0, list.join(", ")));
+            }
+        }
+        {
+            let list: Vec<String> = self.outer_over_s.iter().map(|(c, s)| format!("{c} {s:.1}")).collect();
+            out.push(format!("body lane signed: outer side past the lane's edge by over {BODY_SIDE_OVER} m in bends (R <= {:.0} m), vehicle-s by cause: {}", BODY_RADIUS_CLASSES[2], list.join(", ")));
+            let mut worst: Vec<&(f32, String)> = self.outer_worst.values().collect();
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (d, w) in worst.iter().take(20) {
+                out.push(format!("body lane signed:   outer side {d:.2} m past: {w}"));
+            }
+        }
+        out.push(format!("body lane: AI bodies overlapping as drawn: {:.1} pair-s, {} pairs, deepest {:.2} m at t={:.1} #{}/#{}", self.overlap_s, self.pairs.len(), self.deepest.0, self.deepest.1, self.deepest.2, self.deepest.3));
+        out
+    }
 }
 
 /// What the traffic and the people made of the player's bus over the run, counted alike for
@@ -541,6 +1035,9 @@ impl PlayerWatch {
                 }
             }
         }
+        if !loading {
+            self.bodies.frame(t_s, dt, traffic);
+        }
         if t_s >= self.next_line {
             self.next_line = t_s + POSITION_EVERY;
             let held = self.hold.as_ref().map(|h| format!(", held ({}) {:.0} s", h.why, t_s - h.since)).unwrap_or_default();
@@ -774,6 +1271,7 @@ impl PlayerWatch {
                 out.push(format!("player watch:   held t={since:.1} for {secs:.1} s: {why}{} lane {lane}", other.map(|o| format!(" #{o}")).unwrap_or_default()));
             }
         }
+        out.extend(self.bodies.report());
         out
     }
 }

@@ -13420,10 +13420,17 @@ fn spline_lanes(
         let rule_bus = rule_of("bus").is_some();
         let rule_trucks = rule_of("trucks").is_some();
         let priority = rule_of("priority");
+        // the curvature of the arc the path runs on (+ = right): the spline's radius R from
+        // the map, the path `x` m to its right on the parallel curve of radius R - x
+        let x = side * p.start[0] as f64;
+        let arc_k = if curve.radius == 0.0 { 0.0 } else { (1.0 / (curve.radius - x)) as f32 };
         let mut push = |pts: Vec<DVec3>, reversed: bool| {
             let mut l = LaneBuilder::polyline(pts, kind, p.width);
+            l.arc_curvature = Some(if reversed { -arc_k } else { arc_k });
             // the drawn road's reach either side of the path, from the spline's cross-section
             l.drivable = omsi_scenery::profile::lane_drivable(def, pi, s.mirror, reversed);
+            // where the lane itself ends: midway to the paths beside it, the kerb beyond
+            l.edges = omsi_scenery::profile::lane_edges(def, pi, s.mirror, reversed);
             if let Some(v) = priority {
                 l.priority = v;
             }
@@ -13567,8 +13574,11 @@ fn object_lanes(
         let mut push = |reverse: bool| {
             let mut l = LaneBuilder::arc(start, path_heading, length, radius, dz, kind, p.width);
             if reverse {
+                // (the same arc driven the other way: its curvature turned over)
+                let arc_k = l.arc_curvature.map(|k| -k);
                 let pts: Vec<DVec3> = l.points.iter().rev().copied().collect();
                 l = LaneBuilder::polyline(pts, kind, p.width);
+                l.arc_curvature = arc_k;
             }
             if let Some(v) = limit {
                 l.speed_limit_kmh = v;

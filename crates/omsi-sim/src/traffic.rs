@@ -57,6 +57,16 @@ pub struct Lane {
     pub headings: Vec<f32>,
     /// Signed curvature at each point (1/m, positive = turning right).
     pub curvature: Vec<f32>,
+    /// The curvature of the circular arc the lane was laid on (1/m, + = turning right, 0
+    /// straight): every OMSI spline is one arc of the map's radius and every object `[path]` one
+    /// arc of its own, so a lane has one curvature along its whole length, the map's
+    /// (a spline's path `x` m to the right of a spline of radius R: 1/(R - x); against the
+    /// spline's direction, negated). `curvature` and `headings` are the sampled points'
+    /// (their ends one-sided chords: the joint between two arcs shows a heading jump of half a
+    /// chord's turn there that the map does not have). None: not known (a recording made
+    /// before it, a lane from points only).
+    #[serde(default)]
+    pub arc_curvature: Option<f32>,
     /// Cumulative distance at each point.
     pub dist: Vec<f32>,
     pub speed_limit_kmh: f32,
@@ -117,6 +127,16 @@ pub struct Lane {
     /// either side, see [`Lane::drivable`].
     #[serde(default)]
     pub drivable: (f32, f32),
+    /// Where the lane itself ends left and right of its axis (m): half way to the next street
+    /// path of its spline on that side, at the near side of a pedestrian or rail path on the
+    /// road, else the drawn road's edge (the kerb, the asphalt's end), from the spline's paths
+    /// and `[profile]` (`omsi_scenery::profile::lane_edges`).
+    /// The path's `width` is not the lane's: BeijingCity draws its paths 1 m wide in lanes
+    /// 3 m and more apart. 0 on a side the spline does not tell (a path over no drawn road with
+    /// no path beside it), and for a junction object's path (no profile); a junction's path and
+    /// an editor-only spline's lane take the pieces they join: see [`Network::lane_edges`].
+    #[serde(default)]
+    pub edges: (f32, f32),
     /// The lane ends at the edge of the loaded tiles: the road goes on
     /// into a tile of the map that is not loaded (set by the game, `Traffic::mark_loaded_edges`).
     /// A vehicle stops before its end (`plan`), as at the loaded end of a bus route, instead of
@@ -202,6 +222,64 @@ pub fn density_is_open(density: f32) -> bool {
 pub type PoolRef<'a> = Option<(&'a [i32], usize)>;
 
 impl Network {
+    /// Where lane `i` ends left and right of its axis (m), each side as far as the map tells
+    /// it: a spline lane's own [`Lane::edges`] (a side of 0 is not told). A connector takes the
+    /// road pieces it joins, each side the narrower of the lanes into its start and out of its
+    /// end that tell that side, through the connectors joined to it (layer by layer, the nearest
+    /// such lanes) where it joins none directly. Connectors are a junction object's paths
+    /// (`source` 2: no profile, and the `width` is the path's) and the lanes of an editor-only
+    /// spline ([`Lane::invisible`]: BeijingCity's `invis_street1M.sli` turns, whose 1 m
+    /// `[profile]` is the editor's helper strip and draws no road; the road under them is drawn
+    /// by the pieces round them). None on a side: a spline lane over no drawn road with no path
+    /// beside it there, a connector that leads to no lane telling it.
+    pub fn lane_edge_sides(&self, i: usize) -> (Option<f32>, Option<f32>) {
+        let connector = |l: &Lane| l.source == 2 || l.invisible;
+        let told = |v: f32| (v > 0.0).then_some(v);
+        let Some(l) = self.lanes.get(i) else { return (None, None) };
+        if !connector(l) {
+            return (told(l.edges.0), told(l.edges.1));
+        }
+        if l.kind != LaneKind::Street {
+            return (None, None);
+        }
+        let mut out: (Option<f32>, Option<f32>) = (None, None);
+        let mut seen: hashbrown::HashSet<usize> = hashbrown::HashSet::from_iter([i]);
+        let mut layer = vec![i];
+        while !layer.is_empty() && (out.0.is_none() || out.1.is_none()) {
+            let mut found: (Option<f32>, Option<f32>) = (None, None);
+            let mut further = Vec::new();
+            for &j in &layer {
+                let prev = self.prev.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                for &n in prev.iter().chain(&self.lanes[j].next) {
+                    let Some(o) = self.lanes.get(n) else { continue };
+                    if o.kind != LaneKind::Street || !seen.insert(n) {
+                        continue;
+                    }
+                    if connector(o) {
+                        further.push(n);
+                        continue;
+                    }
+                    let narrower = |f: Option<f32>, v: f32| match (f, told(v)) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    found = (narrower(found.0, o.edges.0), narrower(found.1, o.edges.1));
+                }
+            }
+            out = (out.0.or(found.0), out.1.or(found.1));
+            layer = further;
+        }
+        out
+    }
+
+    /// [`Network::lane_edge_sides`] where the map tells both sides.
+    pub fn lane_edges(&self, i: usize) -> Option<(f32, f32)> {
+        match self.lane_edge_sides(i) {
+            (Some(l), Some(r)) => Some((l, r)),
+            _ => None,
+        }
+    }
+
     /// Is `lane`, closed by density to the vehicle `st`, a marker and not a closure? The closed
     /// run it starts - this lane and the lanes after it while each is the only way on and also
     /// closed by density to the vehicle (a junction object's piece is no run: the way through is
@@ -469,7 +547,9 @@ impl LaneBuilder {
             headings.push(h as f32);
         }
         let k = if radius.abs() < 1e-6 { 0.0 } else { (1.0 / radius) as f32 };
-        Self::curve(points, headings, vec![k; n + 1], kind, width)
+        let mut l = Self::curve(points, headings, vec![k; n + 1], kind, width);
+        l.arc_curvature = Some(k);
+        l
     }
 
     /// Lane from sampled points with their tangent headings and curvatures.
@@ -479,7 +559,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), loaded_edge: false, edge_in_sight: true }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, arc_curvature: None, drivable: (width * 0.5, width * 0.5), edges: (0.0, 0.0), loaded_edge: false, edge_in_sight: true }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -2882,6 +2962,91 @@ mod extend_tests {
         l
     }
 
+    /// The lane's heading laid from its pieces' arcs (`AiState::lane_arc_heading`) turns by the
+    /// arcs' own curvature only: across the joint from a sampled R 25 spline lane (its end
+    /// heading the one-sided last chord's) to a straight object path set 10 degrees off (the
+    /// map's kink) it turns by the 9 m of arc and nothing at the joint, where the lanes'
+    /// sampled headings jump by the kink and half a chord's turn.
+    #[test]
+    fn the_arc_heading_does_not_jump_at_a_joint() {
+        let arc = LaneBuilder::arc(DVec3::ZERO, 0.0, 30.0, 25.0, 0.0, LaneKind::Street, 3.0);
+        let mut first = LaneBuilder::polyline(arc.points.clone(), LaneKind::Street, 3.0);
+        first.arc_curvature = Some(1.0 / 25.0);
+        let end_tangent = (30.0f64 / 25.0).to_degrees();
+        let second = LaneBuilder::arc(first.end(), end_tangent + 10.0, 30.0, 0.0, 0.0, LaneKind::Street, 3.0);
+        let net = Network { lanes: vec![first, second], ..Default::default() };
+        let mut st = AiState::new(1, 1.0, 1);
+        st.prev_lane = Some(0);
+        let arcs = st.lane_arc_heading(&net, 10.0) - st.lane_arc_heading(&net, -10.0);
+        let sampled = st.lane_heading(&net, 10.0) - st.lane_heading(&net, -10.0);
+        let want = (9.0f64 / 25.0).to_degrees() as f32;
+        assert!((arcs - want).abs() < 1e-3, "arc headings turn {arcs:.3} deg, the arc {want:.3}");
+        assert!(sampled - want > 10.0, "sampled headings turn {sampled:.3} deg");
+    }
+
+    /// A junction path takes the edges of the spline lanes it joins, side by side the narrower,
+    /// through an editor-only spline's lane too (whose own 1 m helper profile is no road edge);
+    /// a connector that joins no lane with known edges has none; each side is taken from the
+    /// lanes that tell it.
+    #[test]
+    fn a_connector_takes_the_edges_of_the_pieces_it_joins() {
+        let mut lanes = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 110.0, 2, (0, 0)), straight(0.0, 110.0, 120.0, 3, (0, 0)), straight(0.0, 120.0, 200.0, 4, (0, 0))];
+        lanes[0].edges = (1.5, 2.0);
+        lanes[1].source = 2;
+        lanes[2].invisible = true;
+        lanes[2].edges = (0.5, 0.5);
+        lanes[3].edges = (1.2, 3.0);
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        assert_eq!(net.lane_edges(0), Some((1.5, 2.0)));
+        // the junction path joins the first lane (known) and the editor-only one (a connector);
+        // the editor-only one joins the junction path (a connector) and the last lane (known)
+        assert_eq!(net.lane_edges(1), Some((1.5, 2.0)));
+        assert_eq!(net.lane_edges(2), Some((1.2, 3.0)));
+        // the junction path between two known lanes: the narrower side by side
+        net.lanes[2].invisible = false;
+        net.lanes[2].edges = (1.0, 4.0);
+        assert_eq!(net.lane_edges(1), Some((1.0, 2.0)));
+        // nothing known round it
+        let mut alone = Network { lanes: vec![straight(0.0, 0.0, 10.0, 1, (0, 0))], ..Default::default() };
+        alone.lanes[0].source = 2;
+        alone.link(1.5);
+        assert_eq!(alone.lane_edges(0), None);
+        assert_eq!(alone.lane_edge_sides(0), (None, None));
+        // a joined lane telling one side only: the connector knows that side
+        net.lanes[0].edges = (0.0, 2.0);
+        net.lanes[2].edges = (0.0, 4.0);
+        assert_eq!(net.lane_edge_sides(1), (None, Some(2.0)));
+        assert_eq!(net.lane_edges(1), None);
+    }
+
+    /// The edges the careful line keeps to over a stretch are the narrowest of the lanes it
+    /// covers: before the front reaches a narrower junction path its edge counts already; the
+    /// lane at a distance is the sequence's (behind into the lane it came from); a side a lane
+    /// of the stretch does not tell is 0.
+    #[test]
+    fn the_edges_over_a_stretch_are_the_narrowest_of_its_lanes() {
+        let mut lanes = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 110.0, 2, (0, 0)), straight(0.0, 110.0, 200.0, 3, (0, 0))];
+        lanes[0].edges = (1.5, 2.0);
+        lanes[1].source = 2;
+        lanes[2].edges = (1.0, 4.0);
+        let mut net = Network { lanes, ..Default::default() };
+        net.link(1.5);
+        let mut st = AiState::new(0, 95.0, 1);
+        st.planned_next = Some(1);
+        st.ahead = vec![2];
+        // only the first lane
+        assert_eq!(st.lane_edges_between(&net, 0.0, 4.0), (1.5, 2.0));
+        // into the junction path (the narrower of the pieces it joins: (1.0, 2.0))
+        assert_eq!(st.lane_edges_between(&net, 0.0, 8.0), (1.0, 2.0));
+        assert_eq!(st.lane_at(&net, 8.0), (1, 3.0));
+        let back = AiState { prev_lane: Some(0), ..AiState::new(1, 2.0, 1) };
+        assert_eq!(back.lane_at(&net, -5.0), (0, 97.0));
+        // a side the map does not tell is 0 (no room known: the way's line on that side)
+        net.lanes[0].edges = (0.0, 2.0);
+        assert_eq!(st.lane_edges_between(&net, 0.0, 4.0), (0.0, 2.0));
+    }
+
     #[test]
     fn extend_links_like_link() {
         let all = vec![straight(0.0, 0.0, 100.0, 1, (0, 0)), straight(0.0, 100.0, 200.0, 2, (0, 0)), straight(0.0, 200.0, 300.0, 3, (0, 1)), straight(0.0, 300.0, 400.0, 4, (0, 1))];
@@ -3903,6 +4068,32 @@ impl LaneSeq {
         let (i, u) = self.locate(net, s, d);
         net.lanes[self.lanes[i]].heading_at_ext(u)
     }
+
+    /// The heading (deg) of the lane `d` m along laid from the pieces' own arcs: the heading
+    /// where the vehicle is (`heading` at 0) plus the turn of each piece's arc from there
+    /// (`Lane::arc_curvature` times the length on it, else its sampled headings' turn within
+    /// it), so it does not jump where two pieces meet at an angle; straight on before the
+    /// first lane and past the last, as `heading`.
+    fn arc_heading(&self, net: &Network, s: f32, d: f32) -> f32 {
+        // the turn (rad, + = right) of piece `i` from `a` to `b` m along it, within its length
+        let piece = |i: usize, a: f32, b: f32| -> f64 {
+            let l = &net.lanes[self.lanes[i]];
+            let (a, b) = (a.clamp(0.0, l.length()), b.clamp(0.0, l.length()));
+            match l.arc_curvature {
+                Some(k) => (k * (b - a)) as f64,
+                None => (wrap_deg(l.heading_at(b) - l.heading_at(a)) as f64).to_radians(),
+            }
+        };
+        let here = self.locate(net, s, 0.0);
+        let there = self.locate(net, s, d);
+        let (from, to, sign) = if there.0 > here.0 || (there.0 == here.0 && there.1 >= here.1) { (here, there, 1.0) } else { (there, here, -1.0) };
+        let turn = if from.0 == to.0 {
+            piece(from.0, from.1, to.1)
+        } else {
+            piece(from.0, from.1, f32::INFINITY) + (from.0 + 1..to.0).map(|i| piece(i, 0.0, f32::INFINITY)).sum::<f64>() + piece(to.0, 0.0, to.1)
+        };
+        self.heading(net, s, 0.0) + (sign * turn).to_degrees() as f32
+    }
 }
 
 impl Default for AiState {
@@ -4625,6 +4816,48 @@ impl AiState {
     pub fn way_point(&self, net: &Network, d: f32) -> DVec3 {
         let change = self.change.filter(|c| c.to < net.lanes.len()).map(|c| self.change_seq(c.to));
         self.way_point_on(net, &self.seq(), change.as_ref(), d, &mut [Tangents::default(); 2])
+    }
+
+    /// The heading (deg) of the car's lanes `d` metres ahead of it (behind for negative `d`),
+    /// along its lane sequence: the way's heading without the lane change and the sideways
+    /// moves (a bay, a pull-out, a pass), also where the plan goes on in a lane beside (a lane
+    /// change ahead), whose start lies a lane's width over but runs the same way. (The body
+    /// takes its bend from `lane_arc_heading`: these headings jump where two pieces meet at an
+    /// angle.)
+    pub fn lane_heading(&self, net: &Network, d: f32) -> f32 {
+        self.seq().heading(net, self.s, d)
+    }
+
+    /// The heading (deg) of the car's lanes `d` metres ahead of it (behind for negative `d`),
+    /// along its lane sequence as `lane_heading` but laid from each piece's own arc, the map's
+    /// (`Lane::arc_curvature`): a joint where two pieces meet at an angle, or where the sampled
+    /// points' one-sided end chords meet, is no turn in it. The body steers by it
+    /// (`ai_motion::AiBody::step_in_lane`).
+    pub fn lane_arc_heading(&self, net: &Network, d: f32) -> f32 {
+        self.seq().arc_heading(net, self.s, d)
+    }
+
+    /// The lane of the car's lane sequence `d` metres ahead of it (behind for negative `d`)
+    /// and the distance along it: where it came from, where it is, its plan (the lane
+    /// change's target not taken).
+    pub fn lane_at(&self, net: &Network, d: f32) -> (usize, f32) {
+        let q = self.seq();
+        let (i, u) = q.locate(net, self.s, d);
+        (q.lanes[i], u)
+    }
+
+    /// Where the lanes of the car's lane sequence from `from` to `to` metres ahead of it end
+    /// left and right of their axes (m, `Network::lane_edge_sides`), side by side the
+    /// narrowest: the body spans the pieces between its rear end and where it steers to, so
+    /// at a joint where the next piece is narrower (a junction path's start) the edge it must
+    /// keep to is that piece's before it gets there, and the piece the rear is still on counts
+    /// until the rear has left it. A side some lane of the stretch does not tell is 0: no room
+    /// known, so no inward offset on that side (the way's line).
+    pub fn lane_edges_between(&self, net: &Network, from: f32, to: f32) -> (f32, f32) {
+        let q = self.seq();
+        let (i0, i1) = (q.locate(net, self.s, from).0, q.locate(net, self.s, to.max(from)).0);
+        let side = |m: f32, e: Option<f32>| e.map_or(0.0, |e| m.min(e));
+        (i0..=i1).map(|i| net.lane_edge_sides(q.lanes[i])).fold((f32::INFINITY, f32::INFINITY), |m, e| (side(m.0, e.0), side(m.1, e.1)))
     }
 
     /// `way_point` at each of `ds`: the same points, the lane sequences built once and the

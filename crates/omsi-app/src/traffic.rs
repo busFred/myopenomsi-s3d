@@ -1144,6 +1144,10 @@ pub struct Traffic {
     /// cars have been removed and put down since.
     occupancy_ids: Vec<u64>,
     tick_inner_sum: ([f64; 3], u32),
+    /// `OMSI_PROFILE`: the seconds the AI road bodies spent finding their lane edges
+    /// (`lane_edges`) and stepping (`AiBody::step_in_lane`), summed over all cars and threads,
+    /// over the frames of `tick_inner_sum`.
+    body_profile: (f64, f64),
     /// Seconds each of them has stood still.
     others_still: HashMap<u32, f32>,
     /// Timetable buses taken off the road because the tile under them was unloaded (their
@@ -1408,8 +1412,32 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
     crate::rail_drive::point_at(trail, u).unwrap_or_else(|| state.way_point(net, -d as f32))
 }
 
+/// Where the lanes `body` steers over end left and right of its way (m) for the careful
+/// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edge_sides`
+/// (a spline lane midway to the street paths beside it, at a pedestrian path's near side and
+/// at the kerb beyond, a junction path or an editor-only spline's lane as the road pieces it
+/// joins), side by side the narrowest of the lanes from the vehicle's rear end (its last
+/// section's, `AiState::rear`) to where it steers to (`AiBody::steer_span`,
+/// `AiState::lane_edges_between`): the body and its sections lie on those pieces, a narrower one
+/// ahead is kept to before the rotation point reaches it, and one the rear is still on until the
+/// rear has left it. The edges are the lanes' axes'; the way runs off the axis by its sideways
+/// offset (a bus bay, a swerve round a parked car, `AiState::lateral_ahead`, + = right), so the
+/// room on each side is the edge less the most the way leans towards it at the stretch's ends and
+/// the rotation point (never below 0). A side the map does not tell is 0: the way's line.
+fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
+    let (rot, to) = body.steer_span(state.speed);
+    let from = rot.min(-state.rear);
+    let (left, right) = state.lane_edges_between(net, from, to);
+    let lat = [from, rot, to].map(|d| state.lateral_ahead(d));
+    let (most_left, most_right) = (lat.iter().copied().fold(0.0f32, f32::min), lat.iter().copied().fold(0.0f32, f32::max));
+    ((left + most_left).max(0.0), (right - most_right).max(0.0))
+}
+
 /// A body for a vehicle that has just been put on the way `state` describes, with the
-/// vehicle posed on it.
+/// vehicle posed on it. A road vehicle drives the careful driver's line in bends with the
+/// traffic's extent of it (`AiBody::keep_swept_in_lane_with`: its front bumper `state.front`,
+/// its half width from `extents`, the sections hung behind it), the bend taken from its lanes'
+/// headings laid from their own arcs (`AiState::lane_arc_heading`).
 fn place_body(
     net: &Network,
     state: &AiState,
@@ -1417,10 +1445,15 @@ fn place_body(
     kind: MotionKind,
 ) -> AiBody {
     let mut body = AiBody::new(&vehicle.ty.def, kind);
+    let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*vehicle.ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+    body.keep_swept_in_lane_with(state.front, extents(&vehicle.ty, state.length).2, &parts);
+    let (left, right) = lane_edges(net, state, &body);
+    body.set_lane_edges(left, right);
     let ground = vehicle.ground.clone();
     let contact = vehicle.contact.clone();
-    body.place(
+    body.place_in_lane(
         &|d| state.way_point(net, d),
+        Some(&|d| state.lane_arc_heading(net, d)),
         ground
             .as_ref()
             .map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
@@ -1446,7 +1479,7 @@ fn open_trace() -> Option<std::io::BufWriter<std::fs::File>> {
 
 /// The vehicle's extent from its origin: (to the front bumper, to the rear bumper, half
 /// the width) from its `[boundingbox]`.
-fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
+pub(crate) fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
     let (front, rear, width) = match ty.def.bounding_box {
         Some(bb) if bb[1] > 1.0 => (
             bb[1] * 0.5 + bb[4],
@@ -1853,6 +1886,7 @@ impl Traffic {
             links: CarLinks::default(),
             occupancy_ids: Vec::new(),
             tick_inner_sum: ([0.0; 3], 0),
+            body_profile: (0.0, 0.0),
             others_still: HashMap::new(),
             removed_scheduled: Vec::new(),
             dead_ended: Vec::new(),
@@ -4451,6 +4485,7 @@ impl Traffic {
                 }
             }
             let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
+            let (edges_ns, step_ns) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
             // (a few cars per job: every job handed out wakes a worker, and the waking cost
             // the main thread more than a car's work)
             jobs.into_par_iter().flatten_iter().for_each(|(state, body, vehicle, frame, trail, secs)| {
@@ -4463,13 +4498,25 @@ impl Traffic {
                 }
                 let trail = &*trail;
                 let behind = |d: f64| rail_behind(trail, state, net, d);
-                body.step(
+                let lane = |d: f32| state.lane_arc_heading(net, d);
+                if !rail {
+                    let (left, right) = lane_edges(net, state, body);
+                    body.set_lane_edges(left, right);
+                }
+                let t_edges = std::time::Instant::now();
+                body.step_in_lane(
                     dt,
                     state.speed,
                     &|d| if rail && d < 0.0 { behind(-d as f64) } else { state.way_point(net, d) },
+                    (!rail).then_some(&lane as &dyn Fn(f32) -> f32),
                     ground.as_ref().map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
                     contact.as_deref(),
                 );
+                if profile && !rail {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    edges_ns.fetch_add((t_edges - t0).as_nanos() as u64, Relaxed);
+                    step_ns.fetch_add(t_edges.elapsed().as_nanos() as u64, Relaxed);
+                }
                 body.apply(vehicle);
                 if rail && !vehicle.trailers.is_empty() {
                     // the coupled cars (a train's, a tram's sections) on the track it
@@ -4484,6 +4531,8 @@ impl Traffic {
                     log::info!("  slow AI frame: {} body {:.1} ms, scripts {:.1} ms", vehicle.ty.def.path.display(), (t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
                 }
             });
+            self.body_profile.0 += edges_ns.into_inner() as f64 * 1e-9;
+            self.body_profile.1 += step_ns.into_inner() as f64 * 1e-9;
         }
         self.tick_split = [(t_plan - t_start).as_secs_f64(), (t_par - t_plan).as_secs_f64(), t_par.elapsed().as_secs_f64()];
         if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
@@ -4494,7 +4543,8 @@ impl Traffic {
             *n += 1;
             if *n >= TICK_PROFILE_FRAMES {
                 let ms = |x: f64| x * 1000.0 / *n as f64;
-                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame; Simulation::tick by phase (ms): {}", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]), omsi_traffic::sim::PHASES.iter().zip(self.sim.phase_secs).map(|(k, v)| format!("{k} {:.2}", ms(v))).collect::<Vec<_>>().join(", "));
+                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame; Simulation::tick by phase (ms): {}; AI road bodies (summed over threads): lane edges {:.3} ms, stepping {:.2} ms per frame", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]), omsi_traffic::sim::PHASES.iter().zip(self.sim.phase_secs).map(|(k, v)| format!("{k} {:.2}", ms(v))).collect::<Vec<_>>().join(", "), ms(self.body_profile.0), ms(self.body_profile.1));
+                self.body_profile = (0.0, 0.0);
                 self.sim.phase_secs = [0.0; omsi_traffic::sim::PHASES.len()];
                 self.tick_inner_sum = ([0.0; 3], 0);
             }
@@ -6007,7 +6057,9 @@ impl Traffic {
         state.front = front;
         state.rear = rear;
         state.length = front + rear;
-        let body = AiBody::new(&ty.def, MotionKind::Road);
+        let mut body = AiBody::new(&ty.def, MotionKind::Road);
+        let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+        body.keep_swept_in_lane_with(front, half_width, &parts);
         let mut ai = AiVehicle::new(id, if scheduled { VehicleClass::ScheduledBus } else { VehicleClass::Car }, state, half_width, id);
         ai.fresh = 0.0;
         self.cars.push(AiCar {
@@ -6750,5 +6802,33 @@ mod spawn_people_tests {
         assert_eq!(seen(0, true).len(), 1, "on its own lane");
         assert_eq!(seen(1, true), vec![95.0], "on the lane it moves onto, where its body is");
         assert!(seen(1, false).is_empty() && seen(0, false).is_empty(), "gone since the frame");
+    }
+}
+
+#[cfg(test)]
+mod careful_line_edge_tests {
+    use super::lane_edges;
+    use glam::DVec3;
+    use omsi_sim::ai_motion::{AiBody, MotionKind};
+    use omsi_sim::traffic::{AiState, LaneBuilder, LaneKind, Network};
+
+    /// The room the careful line keeps to is measured from the way: a way moved 0.8 m to the
+    /// right of its lane's axis (a bus bay) has 0.8 m less on the right and no more on the left;
+    /// a side the map does not tell is 0 (the way's line).
+    #[test]
+    fn the_edges_are_taken_from_the_way_less_its_sideways_offset() {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 200.0, 0.0)], LaneKind::Street, 1.0);
+        l.source = 1;
+        l.edges = (1.5, 2.0);
+        let mut net = Network { lanes: vec![l], ..Default::default() };
+        net.link(1.5);
+        let body = AiBody::new(&omsi_vehicle::Vehicle::default(), MotionKind::Road);
+        let mut st = AiState::new(0, 50.0, 1);
+        assert_eq!(lane_edges(&net, &st, &body), (1.5, 2.0));
+        st.lateral_ramp = (0.8, 0.8, 0.0, 1.0);
+        let (left, right) = lane_edges(&net, &st, &body);
+        assert!((left - 1.5).abs() < 1e-5 && (right - 1.2).abs() < 1e-5, "{left} {right}");
+        net.lanes[0].edges = (1.5, 0.0);
+        assert_eq!(lane_edges(&net, &st, &body).1, 0.0);
     }
 }
