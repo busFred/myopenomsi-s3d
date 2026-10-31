@@ -1665,7 +1665,12 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     // the signal's road than planned - braking harder for its leader - and the re-sweep while it
     // signals then sweeps a move beginning nearer, `SIGNAL_SPREAD`; checked over that spread the
     // start covers every move the re-sweep can later sweep, and the two are one test)
-    SIGNAL_SPREAD.iter().map(|k| k * pre).all(|p0| {
+    // (up to the road the signal takes undelayed, `free`: the re-sweep's own plan reads its leaders
+    // from the perception with the change laid, the target lane's no longer limiting it, and may plan
+    // the move further on than the start did - d26 #5610 at 812.68 s: 6.72 m against 6.26 - so the
+    // start sweeps the moves beginning anywhere from here to there)
+    let free = st.speed.max(0.0) * wait;
+    SIGNAL_SPREAD.iter().map(|k| k * pre).chain([free, 0.5 * (pre + free)].into_iter().filter(|&f| f > pre)).all(|p0| {
         body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level.max(p0 + out_len), Profile::Smooth { pre: p0 }, Bodies::Over { speed: v_move, accel: st.accel, others: lead.is_some(), pre: p0, wait })
     })
 }
