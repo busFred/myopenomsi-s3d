@@ -2321,7 +2321,9 @@ impl Simulation {
         }
         if plan.urgent_blocked {
             v.lc_impatience = (v.lc_impatience + dt / v.params.strategic_patience.max(dt)).min(1.0);
-        } else if v.state.change.is_none_or(|c| c.wait <= 0.0 || c.t > 0.0) {
+        } else if plan.start.is_none() && v.state.change.is_none_or(|c| c.wait <= 0.0 || c.t > 0.0) {
+            // (not in the frame the change starts: the re-check while it signals reads the same
+            // impatient gap the start took, so the start check and the re-check are one test)
             v.lc_impatience = 0.0;
         }
         // held out of its lane on the way back in: the ramp back begins where
