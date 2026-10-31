@@ -443,7 +443,7 @@ pub const HELP_OVERTAKE: f32 = 10.0 / 3.6;
 pub const URGENCY: f32 = 2.0;
 /// SUMO's default step length (`--step-length` 1 s), the least `remainingSeconds` (`MAX2(TS, ...)`).
 const SUMO_STEP: f32 = 1.0;
-/// SUMO's `NUMERICAL_EPS` (StdDefs.h), the least look-ahead speed `remainingSeconds` divides by.
+/// SUMO's `NUMERICAL_EPS` (src/config.h.cmake: 0.001), the least look-ahead speed `remainingSeconds` divides by.
 const NUMERICAL_EPS: f32 = 0.001;
 /// SUMO LC2013's `lcCooperative` (default 1.0; `lcCooperativeSpeed` defaults to it): the weight of
 /// a cooperative speed advice against the speed the follower would drive otherwise
@@ -3276,7 +3276,10 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // leader at its lane's end counted a minute left, and the follower beside it was asked
             // to brake for a change that could not come, standing at the junction's exit behind it,
             // game run p3p81 #74 for #3312 on 1666/1668)
-            let remaining = (end_dist / me.look_ahead_speed.max(NUMERICAL_EPS) / URGENCY).max(SUMO_STEP);
+            // (over the changes still needed, SUMO's `remainingLanes = MAX2(1, abs(bestLaneOffset))`:
+            // a dead lane's, `changes_to_lead`; a lane's end, one)
+            let lanes = if dead { trip_field(me).and_then(|f| changes_to_lead(net, f, st.lane, nb.dir, Some(nb.lane))).unwrap_or(1).max(1) } else { 1 };
+            let remaining = (end_dist / me.look_ahead_speed.max(NUMERICAL_EPS) / lanes as f32 / URGENCY).max(SUMO_STEP);
             // (to fall in behind a vehicle there: how far I must drop back, and its speed; SUMO
             // takes the least of the speed advices to itself)
             let mut drop_back: Vec<(f32, f32)> = Vec::new();
