@@ -468,16 +468,19 @@ impl AiBody {
 
     /// Bicycle model: the rotation point follows its line, the front wheels steer by the
     /// line's own curvature where the body is and correct towards a point further along it
-    /// (feed-forward plus feedback, the standard path-tracking pair). The feed-forward is the
-    /// bicycle model's steer angle atan(wheelbase · k) for the line's curvature k over the
-    /// wheelbase ahead of the rotation point (the arc the two axles span). The feedback is
+    /// (feed-forward plus feedback, the standard path-tracking pair: J. M. Snider, "Automatic
+    /// Steering Methods for Autonomous Automobile Path Tracking", CMU-RI-TR-09-08, 2009, the
+    /// control law δ = -Kx + δ_ff of its "Optimal Control with Feed Forward Term", and its
+    /// kinematic bicycle model's δ = atan(κL)). The feed-forward is the bicycle model's steer
+    /// angle atan(wheelbase · k) for the line's curvature k at the rotation point (the circle
+    /// through the way half a wheelbase either side of it). The feedback is
     /// pure pursuit (looking further ahead the faster the car goes) less what pure pursuit
     /// would steer from the line itself (the rotation point on it, the body along its
     /// tangent): zero on the line, so it corrects only the tracking error, and pure
     /// pursuit's own look-ahead no longer cuts the inside where the bend tightens.
     /// The line is the way, moved inside a bend of the lane (`lane`, else the way) by
     /// `careful_line_offset` where the body is given (`keep_swept_in_lane`); its curvature
-    /// is the way's over the wheelbase, tighter by the offset (the parallel curve
+    /// is the way's there, tighter by the offset (the parallel curve
     /// `side` inside: k / (1 - side · k)), which carries the rear sections' pull of an
     /// articulated vehicle (`rear_pull`) as the offset does.
     fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>) {
