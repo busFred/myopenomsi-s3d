@@ -222,7 +222,7 @@ pub struct AiBody {
     /// How much further inside the rotation point's circle the rear sections hanging behind
     /// the vehicle run than its own inner side (m², `rear_off_tracking`); 0 for a rigid one.
     rear_pull: f32,
-    /// Where the lane the vehicle drives in ends left and right of its axis (m,
+    /// Where the lanes the vehicle drives over end left and right of its way (m,
     /// `set_lane_edges`): the inner edge of a bend for the careful driver's line. Infinite
     /// until set: no inner edge.
     lane_edges: (f32, f32),
@@ -402,10 +402,12 @@ impl AiBody {
         self.rear_pull = rear_off_tracking(parts);
     }
 
-    /// Where the lane the vehicle drives in now ends to the left and to the right of its axis
-    /// (m, `traffic::Network::lane_edges`, the narrowest over `steer_span`): the careful driver's line keeps the body's
-    /// innermost point inside the edge on the bend's inside (`careful_line_offset`).
-    /// Infinite: no edge known, the swept band centred on the way.
+    /// Where the lanes the vehicle drives over now end to the left and to the right of its way
+    /// (m): the careful driver's line keeps the body's innermost point inside the edge on the
+    /// bend's inside (`careful_line_offset`). The game gives the narrowest of the lanes from the
+    /// vehicle's rear end to the end of `steer_span` (`traffic::AiState::lane_edges_between`),
+    /// less the way's sideways offset towards each side, and 0 on a side the map does not tell
+    /// (no inward offset there: the way's line). Infinite (as before it is set): no edge.
     pub fn set_lane_edges(&mut self, left: f32, right: f32) {
         self.lane_edges = (left, right);
     }
@@ -460,8 +462,8 @@ impl AiBody {
 
     /// The stretch of the way (m from the vehicle's origin) the careful driver's line is
     /// steered over at `speed`: from the rotation point to the aim. The lane edges it keeps to
-    /// (`set_lane_edges`) are the narrowest of the lanes along it
-    /// (`traffic::AiState::lane_edges_between`).
+    /// (`set_lane_edges`) are the narrowest of the lanes from the vehicle's rear end (its last
+    /// section's) to the aim, the end of this stretch (`traffic::AiState::lane_edges_between`).
     pub fn steer_span(&self, speed: f32) -> (f32, f32) {
         (self.rot_long, self.rot_long + self.look(speed))
     }
