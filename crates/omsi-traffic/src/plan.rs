@@ -887,7 +887,7 @@ fn may_change_to(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// an internal lane, whose stretch is where the ways of the junction meet (`mayChange`, sumo.md
 /// 3.1). An OMSI object also lays plain road as paths, so the move is allowed where it touches no
 /// meeting place: the stretch the body covers - from beside my rear to my front, plus what the car
-/// drives while it signals (`SIGNAL_BEFORE_CHANGE` at its speed, as `change_clear` lays it) and the
+/// drives while it signals (the driver's `signal_before_change` at its speed) and the
 /// move's length (`change_length`) - must stay on both pieces and touch, on either piece, no foe's
 /// stretch (`Foe::mine`), no stretch converging with a third way (`Movement::converge`) and no
 /// people's crossing (`Network::walks`, the cuts the perception's zebra rule reads; SUMO's
@@ -899,7 +899,7 @@ fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &Neighb
     if j != j2 {
         return false;
     }
-    let pre = st.speed.max(0.0) * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
+    let pre = st.speed.max(0.0) * me.params.signal_before_change;
     let mv = omsi_sim::traffic::change_length(st.speed);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
     let mine = (st.s - st.rear, st.s + st.front + pre + mv);
