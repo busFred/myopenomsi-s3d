@@ -6329,6 +6329,10 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
     let js = &r.sim.junctions;
     for a in args {
         let Ok(l) = a.parse::<usize>() else { continue };
+        // (the crosswalks cutting it, `Network::walks`: walk lane, along it, the walk's width)
+        if let Some(ws) = r.net.walks.get(l).filter(|w| !w.is_empty()) {
+            println!("lane {l} walks {:?}", ws.iter().map(|&(w, sa, _)| (w, (sa * 10.0).round() / 10.0, r.net.lanes.get(w).map(|x| x.width))).collect::<Vec<_>>());
+        }
         let Some(&(j, m)) = js.of_lane.get(&l) else {
             // (a footpath piece of a junction's crossing: the light that governs it,
             // `Junctions::crossing_light`)
