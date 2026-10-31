@@ -820,3 +820,56 @@ fn a_signalling_car_follows_its_own_lanes_leader() {
     }
     assert!(least > 0.0 && sig_least > 0.5, "no contact with the leader standing on its own lane: least {least:.2}, while signalling {sig_least:.2}");
 }
+
+/// L3-D6: the in-lane squeeze (least offset keeping `MIN_GAP_LAT`, L3-D1) applies on a junction's
+/// pieces too. Lane 0 (x 0..100) runs into piece 1 of a junction object (x 100..160, 3.5 m wide,
+/// crossed by piece 3 at x 130) and on to lane 2. A car stands on piece 1 at x 104, just inside the
+/// junction, 2.0 m off its axis, its body 1.1 m from the axis - in car 1's way with the corridor's
+/// margin, as the lorry's nose at viz2 j17 was; car 1 starts from rest on lane 0 at x 88, outside
+/// the junction, and is held there by it (without L3-D6 it waits: the squeeze was kept off a
+/// junction ahead).
+/// It gets round the standing car inside the junction at the least offset, never within
+/// `SQUEEZE_CLEARANCE` of it and not past the piece's drawn road, and goes on along lane 2.
+#[test]
+fn a_car_squeezes_round_a_body_across_its_way_inside_a_junction() {
+    let wide_piece = |pts: &[(f64, f64)], path: u16| {
+        let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.5);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+        l.priority = 128.0;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1, 0, 0.0)); // 0
+    net.lanes.push(wide_piece(&[(100.0, 0.0), (160.0, 0.0)], 0)); // 1
+    net.lanes.push(road(&[(160.0, 0.0), (400.0, 0.0)], 2, 0, 0.0)); // 2
+    net.lanes.push(wide_piece(&[(130.0, -40.0), (130.0, 40.0)], 1)); // 3
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net.build_grid();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 88.0, 0.0);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    let mut ob = standing(2, 1, 4.0);
+    ob.stopped = 60.0;
+    ob.state.lateral = 2.0;
+    ob.state.lateral_target = 2.0;
+    ob.state.lateral_ramp = (2.0, 2.0, 0.0, 1.0);
+    let mut cars = vec![me, ob];
+    let (mut squeezed, mut least, mut max_lat, mut t) = (false, f32::INFINITY, 0.0f32, 0.0f32);
+    while t < 40.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let o = cars.iter().find(|c| c.id == 2).unwrap();
+        squeezed |= me.passing.is_some_and(|p| p.lane.is_none());
+        least = least.min(me.obb().separation(&o.obb()) as f32);
+        max_lat = max_lat.max(me.state.lateral.abs());
+        t += DT;
+    }
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(squeezed && me.state.lane == 2, "squeezes round the body inside the junction and goes on: squeezed {squeezed}, lane {}", me.state.lane);
+    assert!(least > 0.3 && max_lat < 1.75 - 0.9, "least {least:.2} m to the body, swung {max_lat:.2} m (drawn road 1.75 m, half width 0.9)");
+}

@@ -3479,7 +3479,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             cap
         };
-        let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum()));
+        // (and over the squeeze's stretch the drivable road of every lane of my way on that side -
+        // a squeeze round a body inside the junction runs over its pieces, never past the kerb
+        // face or into another way's traffic, L3-D6)
+        let (_, _, squeeze_reach) = squeeze_move(squeeze_side);
+        let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane).filter_map(|w| net.lanes.get(w.0)).map(|l| { let (dl, dr) = l.drivable(); if squeeze_side < 0.0 { dl } else { dr } }).fold(f32::INFINITY, f32::min);
+        let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum())).min(way_extent);
         // (the bent corridor - out, past what stands and back - touches no body now)
         let corridor_clear = |side: f32| {
             let (out_len, _, end) = squeeze_move(side);
@@ -3517,7 +3522,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
         let zone = if squeeze || !player { SQUEEZE_ZONE } else { PASS_ZONE_PLAYER };
-        let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
+        // (a squeeze round a body across my way inside the junction ahead - the user's decision
+        // L3-D6, ours: SUMO changes no lanes on internal lanes, this extends L3-D1's in-lane squeeze
+        // onto the junction's pieces - goes on a light that lets me go; a body standing past the
+        // junction's entry line is "in the junction")
+        let in_junction = squeeze && p.junction.as_ref().is_some_and(|j| j.inside || j.line < real + st.front);
+        let light_go = p.signal.is_some_and(|s| matches!(s.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow));
+        let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false) && !(in_junction && light_go);
         // (an in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when the obstacle
         // stands within `SQUEEZE_NEAR`, and inside the junction already it may go where its
         // stretch - out, past the obstacle and back in - keeps clear of the foe stretches)
@@ -3532,7 +3543,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // waits while a foe occupies the conflict area and has not passed it. A foe standing
             // there is no conflict for a move its body is clear of, which the squeeze's own sweep
             // keeps by its clearance, `squeeze_clear`)
-            if squeeze && j.inside {
+            if squeeze && (j.inside || j.line < real + st.front) {
                 return squeeze_foe_moving(net, sim, vehicles, me, j, -st.rear, squeeze_run);
             }
             let keep = j.line - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
