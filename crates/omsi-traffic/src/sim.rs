@@ -1467,7 +1467,7 @@ impl Simulation {
         let mut passed_now: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
         // (one vehicle's part of it reads only the perceptions, the vehicles and the simulation:
         // built for every vehicle in parallel, filed below in vehicle order, as the serial loop did)
-        let parts: Vec<(Option<Option<(usize, usize)>>, Option<(bool, Claim)>)> = vehicles
+        let parts: Vec<(Option<Option<(usize, usize)>>, Option<(bool, Claim)>, Vec<Claim>)> = vehicles
             .par_iter()
             .zip(&perceptions)
             .enumerate()
@@ -1482,14 +1482,14 @@ impl Simulation {
                     }
                 });
                 let passed_change = (passed != v.passed_on_go).then_some(passed);
-                let Some(j) = p.junction.as_ref() else { return (passed_change, None) };
+                let Some(j) = p.junction.as_ref() else { return (passed_change, None, Vec::new()) };
                 let st = &v.state;
                 // a claim is filed from `claim_horizon` before the meeting place: the drivers who
                 // give way to this one see it coming in time to stop, not only once it is a
                 // braking distance from its own line
                 let horizon = claim_horizon(st.speed);
                 if !j.inside && j.conflict_start - st.front > horizon {
-                    return (passed_change, None);
+                    return (passed_change, None, Vec::new());
                 }
                 // committed: too close to the next meeting place it has not entered to stop before
                 // it even braking hard, or past every one it has (in the last it is in). A driver
@@ -1559,6 +1559,7 @@ impl Simulation {
                 let was_standing = v.claim_standing;
                 let standing = st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0);
                 let claim = Claim {
+                    foe_only: false,
                     chain: j.chain.clone(),
                     half_width: v.half_width,
                     was_standing,
@@ -1619,11 +1620,41 @@ impl Simulation {
                     clear_ahead: [p.people_stop, p.leader.filter(|l| l.speed < STANDING_SPEED).map(|l| st.front + l.gap)].into_iter().flatten().fold(f32::INFINITY, f32::min),
                     brake,
                 };
-                (passed_change, Some((standing, claim)))
+                // (the junctions after this one it is within sight of, `perception::ENTRY_SIGHT_TIME`: an approach filed
+                // for the cars waiting there, no claim of its own - `Claim::foe_only`)
+                let extras: Vec<Claim> = p
+                    .later
+                    .iter()
+                    .map(|nj| {
+                        let next_ahead = self.junctions.foes_along(nj.junction, &nj.chain).iter().map(|f| nj.entry + f.mine.0).filter(|&d| d - st.front > 0.5).fold(f32::INFINITY, f32::min);
+                        let next = if next_ahead.is_finite() { next_ahead } else { nj.conflict_start };
+                        let brake = plan::HARD_BRAKE;
+                        let committed = (next_ahead.is_infinite() && nj.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, next - st.front - 0.6, brake);
+                        Claim {
+                            foe_only: true,
+                            chain: nj.chain.clone(),
+                            junction: nj.junction,
+                            movement: nj.movement,
+                            s: -nj.entry,
+                            next_wait: plan::next_wait(net, self, v, nj, brake) - nj.entry,
+                            committed,
+                            exit_room: true,
+                            light_red: false,
+                            until_go: None,
+                            red_at: f32::INFINITY,
+                            light: None,
+                            clearing: false,
+                            in_box_at_turn: false,
+                            ..claim.clone()
+                        }
+                    })
+                    .collect();
+                (passed_change, Some((standing, claim)), extras)
             })
             .collect();
         let mut stand_in_own: Option<Claim> = None;
-        for (i, (passed_change, filed)) in parts.into_iter().enumerate() {
+        let mut foe_only: Vec<Claim> = Vec::new();
+        for (i, (passed_change, filed, extras)) in parts.into_iter().enumerate() {
             if let Some(passed) = passed_change {
                 passed_now.push((i, passed));
             }
@@ -1640,6 +1671,7 @@ impl Simulation {
                 standing_now.push((i, standing));
                 claim_of[i] = Some(claims.len());
                 claims.push(claim);
+                foe_only.extend(extras);
             }
         }
         // the players' vehicles claim their way like anybody else (their grants are not
@@ -1794,6 +1826,7 @@ impl Simulation {
                 })
                 .flatten();
             claims.push(Claim {
+                foe_only: false,
                 chain,
                 half_width: p.half_width,
                 was_standing: false,
@@ -1881,7 +1914,12 @@ impl Simulation {
         lap(&mut self.phase_secs[2]);
         self.foe_trace.clear();
         let trace = if self.trace_foes { Some(&mut self.foe_trace) } else { None };
-        let grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
+        // (the approaches filed at the later junctions go in as foes only: their grants are not read)
+        let n_real = claims.len();
+        claims.extend(foe_only);
+        let mut grants: Vec<Grant> = reservation::resolve_traced(&self.junctions, &claims, &self.signal_groups, trace);
+        claims.truncate(n_real);
+        grants.truncate(n_real);
         self.claims = claims.iter().cloned().zip(grants.iter().copied()).collect();
         // the stand-in's own grant: its claim resolved as an AI car's against everybody else's
         // claims, its own player's left out (it is that vehicle: `StandIn`) - the driver obeys
@@ -2609,7 +2647,7 @@ mod ease_ring_tests {
     use super::*;
 
     fn claim(vehicle: usize) -> Claim {
-        Claim { half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// The ring of viz5 case02 j0: A (0) eased off for B (1), B standing 2 m behind its lead C (2),

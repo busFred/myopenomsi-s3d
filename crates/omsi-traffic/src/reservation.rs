@@ -13,6 +13,10 @@ use omsi_sim::traffic::{arrival_time, APPROACH_WINDOW, MAX_BRAKE};
 /// A vehicle asking for its way through a junction this frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
+    /// An approach filed at a junction after the one the vehicle's own claim is at, so that the
+    /// cars waiting there see it coming (`perception::ENTRY_SIGHT_TIME`): a foe of theirs, never
+    /// decided for itself.
+    pub foe_only: bool,
     /// The pieces of the junction the way runs through, each with how far along the way
     /// its start lies (`Junctions::chain_along`): the claim stands for all of them.
     pub chain: Vec<(usize, f32)>,
@@ -1301,9 +1305,13 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
         }
     }
     // claim of each vehicle, for following a chain of leads
-    let claim_of: hashbrown::HashMap<usize, usize> = claims.iter().enumerate().map(|(k, c)| (c.vehicle, k)).collect();
+    let claim_of: hashbrown::HashMap<usize, usize> = claims.iter().enumerate().filter(|(_, c)| !c.foe_only).map(|(k, c)| (c.vehicle, k)).collect();
     for &k in &order {
         let c = &claims[k];
+        if c.foe_only {
+            out[k] = Some(Grant::go(c.vehicle));
+            continue;
+        }
         let node = &js.nodes[c.junction];
         let my_foes = js.foes_along_wide(c.junction, &c.chain);
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
@@ -1618,7 +1626,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.

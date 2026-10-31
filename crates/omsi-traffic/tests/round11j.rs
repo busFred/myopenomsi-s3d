@@ -142,7 +142,7 @@ fn j11_2_two_cars_on_paths_converging_to_more_than_their_widths_go_through_abrea
 
 fn claim_of(sim: &Simulation, lane: usize, vehicle: usize, half_width: f32) -> Claim {
     let (j, m) = sim.junctions.of_lane[&lane];
-    Claim { half_width, chain: vec![(m, 0.0)], vehicle, junction: j, movement: m, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, red_at: f32::INFINITY, lead: None, was_standing: true, blocked: false, stuck: false, clearing: false, in_box_at_turn: false, lanes: Vec::new(), light: None, id: vehicle as u64, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6 }
+    Claim { foe_only: false, half_width, chain: vec![(m, 0.0)], vehicle, junction: j, movement: m, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, red_at: f32::INFINITY, lead: None, was_standing: true, blocked: false, stuck: false, clearing: false, in_box_at_turn: false, lanes: Vec::new(), light: None, id: vehicle as u64, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6 }
 }
 
 /// [J11-2] The two paths converging to 2.0 m are a wide pair (`Movement::wide`, not a plain

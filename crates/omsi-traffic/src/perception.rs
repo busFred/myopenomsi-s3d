@@ -98,6 +98,12 @@ impl Headway {
 /// (0.1 m/s beside a standing car's body).
 const STEP_SPEED: f32 = 0.5;
 
+/// How far ahead (s at the car's own speed) a car waiting at a junction sees the cars coming up on
+/// the junctions before it: the critical headway of the intersection sight distance
+/// d2 = 1.47 V2 t, t = 5.0 s (ALDOT Roundabout Planning, Design, and Operations Manual, Dec 2015,
+/// section 3.8.5.2, Equation 3.3 and Table 3.7, source NCHRP 672; the same 5.0 s as Table 2.3).
+pub const ENTRY_SIGHT_TIME: f32 = 5.0;
+
 /// A bus at its stop is an obstacle worth going round once it has stood this long there (s).
 pub const AT_STOP_OBSTACLE_STAND: f32 = 0.5;
 /// Anything standing this long (s) is an obstacle, whatever holds it (its hold is not
@@ -293,6 +299,10 @@ pub struct Perception {
     pub body_block: Option<u64>,
     pub signal: Option<SignalView>,
     pub junction: Option<JunctionView>,
+    /// The junctions after that one on the way that the car is within sight of
+    /// (`ENTRY_SIGHT_TIME`): it files an approach at each for the cars waiting there
+    /// (SUMO's `MSVehicle::setApproachingForAllLinks` registers at every link of its look-ahead).
+    pub later: Vec<JunctionView>,
     pub left: Option<NeighbourView>,
     pub right: Option<NeighbourView>,
     /// Distance from the origin to stop for a person in the way.
@@ -1770,6 +1780,11 @@ const EXIT_NEAR: f32 = 15.0;
 /// which the car's whole body needs; a vehicle whose tail is behind the car's own front is
 /// behind it and never counts (SUMO's junction blocking judges the exit lane ahead of the link).
 fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<JunctionView> {
+    junction_ahead_at(net, sim, vehicles, i, way).map(|(jv, _)| jv)
+}
+
+/// `junction_ahead`, with the index in `way` of the first piece of the junction found.
+fn junction_ahead_at(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, way: &[(usize, f32)]) -> Option<(JunctionView, usize)> {
     let me = &vehicles[i];
     let js: &Junctions = &sim.junctions;
     let horizon = crate::sim::claim_horizon(me.state.speed);
@@ -1913,7 +1928,7 @@ fn junction_ahead(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usiz
         if !jv.exit_room && crate::plan::wait_bands(net, sim, &jv).is_empty() {
             jv.exit_room = true;
         }
-        return Some(jv);
+        return Some((jv, k));
     }
     None
 }
@@ -2446,7 +2461,21 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             None => people_stop,
         };
         p.signal = signal_ahead(net, sim, &p.way, st.rear, st.front + st.rear);
-        p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
+        let first = junction_ahead_at(net, sim, vehicles, i, &p.way);
+        if let Some((jv, k)) = &first {
+            let me = &vehicles[i];
+            let sight = ENTRY_SIGHT_TIME * me.state.speed;
+            let mut from = k + jv.chain.len();
+            for _ in 0..4 {
+                let Some((nj, nk)) = junction_ahead_at(net, sim, vehicles, i, &p.way[from.min(p.way.len())..]) else { break };
+                from += nk + nj.chain.len();
+                if nj.conflict_start - me.state.front > sight.max(0.0) {
+                    break;
+                }
+                p.later.push(nj);
+            }
+        }
+        p.junction = first.map(|(jv, _)| jv);
         p.letting_out = letting_out(sim, me);
         if lane.kind == LaneKind::Street && !me.is_rail() {
             // (a junction object's piece has no `left`/`right`: the piece of the object laid
