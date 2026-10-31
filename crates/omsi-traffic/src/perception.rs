@@ -301,6 +301,10 @@ pub struct Perception {
     /// Lanes ahead: (lane, distance from the origin to its start).
     pub way: Vec<(usize, f32)>,
     pub leader: Option<Headway>,
+    /// The lead along my own lane's way without a signalling change laid on it (`own_lane_leader`;
+    /// with no change signalling, `leader`): what a change's start check and its re-sweep read as
+    /// the car's own leader (`plan`'s `near_standing_lead`, `signal_plan`).
+    pub own_leader: Option<Headway>,
     /// A vehicle's body across the way that held the car (its id), for mutual waits.
     pub body_block: Option<u64>,
     pub signal: Option<SignalView>,
@@ -2481,7 +2485,10 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
         // change is under way ("also slow down for leaders on the shadowLane relative to the
         // current lane")
         if st.change.is_some_and(|c| !c.bypass && c.wait > 0.0 && c.t <= 0.0) {
-            p.leader = Headway::nearer(p.leader, own_lane_leader(net, sim, vehicles, i));
+            p.own_leader = own_lane_leader(net, sim, vehicles, i);
+            p.leader = Headway::nearer(p.leader, p.own_leader);
+        } else {
+            p.own_leader = p.leader;
         }
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
         // the shift past people beside the lane, towards the middle only while the oncoming lane
