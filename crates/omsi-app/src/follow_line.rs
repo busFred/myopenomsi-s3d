@@ -344,8 +344,9 @@ struct BodyLane {
 impl BodyLane {
     /// What a vehicle-frame's body is doing, for the outer side's crossings and the steering
     /// rate: "bay/swerve" (the way off the lane's axis, or changing lanes); "joint kink" (the
-    /// lane headings over the wheelbase about the rotation point, which the steering's
-    /// feed-forward takes its bend from, turn by a bend's worth, R <= the last radius class,
+    /// lane headings over the wheelbase about the rotation point (`AiState::lane_heading`, which
+    /// jump where two pieces meet at an angle; the steering takes its bend from the pieces' own
+    /// arcs, `AiState::lane_arc_heading`) turn by a bend's worth, R <= the last radius class,
     /// and a joint between two lanes there makes more than `CAUSE_KINK_SHARE` of it, the
     /// lanes' own curvature the rest); "swing wide" (the lane's inner edge caps the careful
     /// line's offset by more than `CAUSE_CAPPED`: the band wider than the lane, K2-D2);

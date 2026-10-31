@@ -57,6 +57,16 @@ pub struct Lane {
     pub headings: Vec<f32>,
     /// Signed curvature at each point (1/m, positive = turning right).
     pub curvature: Vec<f32>,
+    /// The curvature of the circular arc the lane was laid on (1/m, + = turning right, 0
+    /// straight): every OMSI spline is one arc of the map's radius and every object `[path]` one
+    /// arc of its own, so a lane has one curvature along its whole length, the map's
+    /// (a spline's path `x` m to the right of a spline of radius R: 1/(R - x); against the
+    /// spline's direction, negated). `curvature` and `headings` are the sampled points'
+    /// (their ends one-sided chords: the joint between two arcs shows a heading jump of half a
+    /// chord's turn there that the map does not have). None: not known (a recording made
+    /// before it, a lane from points only).
+    #[serde(default)]
+    pub arc_curvature: Option<f32>,
     /// Cumulative distance at each point.
     pub dist: Vec<f32>,
     pub speed_limit_kmh: f32,
@@ -537,7 +547,9 @@ impl LaneBuilder {
             headings.push(h as f32);
         }
         let k = if radius.abs() < 1e-6 { 0.0 } else { (1.0 / radius) as f32 };
-        Self::curve(points, headings, vec![k; n + 1], kind, width)
+        let mut l = Self::curve(points, headings, vec![k; n + 1], kind, width);
+        l.arc_curvature = Some(k);
+        l
     }
 
     /// Lane from sampled points with their tangent headings and curvatures.
@@ -547,7 +559,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, drivable: (width * 0.5, width * 0.5), edges: (0.0, 0.0), loaded_edge: false, edge_in_sight: true }
+        Lane { key: None, reversed: false, one_way: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new(), no_overtaking: false, arc_curvature: None, drivable: (width * 0.5, width * 0.5), edges: (0.0, 0.0), loaded_edge: false, edge_in_sight: true }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -2912,6 +2924,28 @@ mod extend_tests {
         l
     }
 
+    /// The lane's heading laid from its pieces' arcs (`AiState::lane_arc_heading`) turns by the
+    /// arcs' own curvature only: across the joint from a sampled R 25 spline lane (its end
+    /// heading the one-sided last chord's) to a straight object path set 10 degrees off (the
+    /// map's kink) it turns by the 9 m of arc and nothing at the joint, where the lanes'
+    /// sampled headings jump by the kink and half a chord's turn.
+    #[test]
+    fn the_arc_heading_does_not_jump_at_a_joint() {
+        let arc = LaneBuilder::arc(DVec3::ZERO, 0.0, 30.0, 25.0, 0.0, LaneKind::Street, 3.0);
+        let mut first = LaneBuilder::polyline(arc.points.clone(), LaneKind::Street, 3.0);
+        first.arc_curvature = Some(1.0 / 25.0);
+        let end_tangent = (30.0f64 / 25.0).to_degrees();
+        let second = LaneBuilder::arc(first.end(), end_tangent + 10.0, 30.0, 0.0, 0.0, LaneKind::Street, 3.0);
+        let net = Network { lanes: vec![first, second], ..Default::default() };
+        let mut st = AiState::new(1, 1.0, 1);
+        st.prev_lane = Some(0);
+        let arcs = st.lane_arc_heading(&net, 10.0) - st.lane_arc_heading(&net, -10.0);
+        let sampled = st.lane_heading(&net, 10.0) - st.lane_heading(&net, -10.0);
+        let want = (9.0f64 / 25.0).to_degrees() as f32;
+        assert!((arcs - want).abs() < 1e-3, "arc headings turn {arcs:.3} deg, the arc {want:.3}");
+        assert!(sampled - want > 10.0, "sampled headings turn {sampled:.3} deg");
+    }
+
     /// A junction path takes the edges of the spline lanes it joins, side by side the narrower,
     /// through an editor-only spline's lane too (whose own 1 m helper profile is no road edge);
     /// a connector that joins no lane with known edges has none; each side is taken from the
@@ -3996,6 +4030,32 @@ impl LaneSeq {
         let (i, u) = self.locate(net, s, d);
         net.lanes[self.lanes[i]].heading_at_ext(u)
     }
+
+    /// The heading (deg) of the lane `d` m along laid from the pieces' own arcs: the heading
+    /// where the vehicle is (`heading` at 0) plus the turn of each piece's arc from there
+    /// (`Lane::arc_curvature` times the length on it, else its sampled headings' turn within
+    /// it), so it does not jump where two pieces meet at an angle; straight on before the
+    /// first lane and past the last, as `heading`.
+    fn arc_heading(&self, net: &Network, s: f32, d: f32) -> f32 {
+        // the turn (rad, + = right) of piece `i` from `a` to `b` m along it, within its length
+        let piece = |i: usize, a: f32, b: f32| -> f64 {
+            let l = &net.lanes[self.lanes[i]];
+            let (a, b) = (a.clamp(0.0, l.length()), b.clamp(0.0, l.length()));
+            match l.arc_curvature {
+                Some(k) => (k * (b - a)) as f64,
+                None => (wrap_deg(l.heading_at(b) - l.heading_at(a)) as f64).to_radians(),
+            }
+        };
+        let here = self.locate(net, s, 0.0);
+        let there = self.locate(net, s, d);
+        let (from, to, sign) = if there.0 > here.0 || (there.0 == here.0 && there.1 >= here.1) { (here, there, 1.0) } else { (there, here, -1.0) };
+        let turn = if from.0 == to.0 {
+            piece(from.0, from.1, to.1)
+        } else {
+            piece(from.0, from.1, f32::INFINITY) + (from.0 + 1..to.0).map(|i| piece(i, 0.0, f32::INFINITY)).sum::<f64>() + piece(to.0, 0.0, to.1)
+        };
+        self.heading(net, s, 0.0) + (sign * turn).to_degrees() as f32
+    }
 }
 
 impl Default for AiState {
@@ -4711,12 +4771,21 @@ impl AiState {
 
     /// The heading (deg) of the car's lanes `d` metres ahead of it (behind for negative `d`),
     /// along its lane sequence: the way's heading without the lane change and the sideways
-    /// moves (a bay, a pull-out, a pass). The body takes the bend of its lane from it
-    /// (`ai_motion::AiBody::step_in_lane`): the turn between two of these headings is the
-    /// lane's own, also where the plan goes on in a lane beside (a lane change ahead), whose
-    /// start lies a lane's width over but runs the same way.
+    /// moves (a bay, a pull-out, a pass), also where the plan goes on in a lane beside (a lane
+    /// change ahead), whose start lies a lane's width over but runs the same way. (The body
+    /// takes its bend from `lane_arc_heading`: these headings jump where two pieces meet at an
+    /// angle.)
     pub fn lane_heading(&self, net: &Network, d: f32) -> f32 {
         self.seq().heading(net, self.s, d)
+    }
+
+    /// The heading (deg) of the car's lanes `d` metres ahead of it (behind for negative `d`),
+    /// along its lane sequence as `lane_heading` but laid from each piece's own arc, the map's
+    /// (`Lane::arc_curvature`): a joint where two pieces meet at an angle, or where the sampled
+    /// points' one-sided end chords meet, is no turn in it. The body steers by it
+    /// (`ai_motion::AiBody::step_in_lane`).
+    pub fn lane_arc_heading(&self, net: &Network, d: f32) -> f32 {
+        self.seq().arc_heading(net, self.s, d)
     }
 
     /// The lane of the car's lane sequence `d` metres ahead of it (behind for negative `d`)

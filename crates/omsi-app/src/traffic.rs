@@ -1418,8 +1418,8 @@ fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
 /// A body for a vehicle that has just been put on the way `state` describes, with the
 /// vehicle posed on it. A road vehicle drives the careful driver's line in bends with the
 /// traffic's extent of it (`AiBody::keep_swept_in_lane_with`: its front bumper `state.front`,
-/// its half width from `extents`, the sections hung behind it), the bend taken from its lane's heading
-/// (`AiState::lane_heading`).
+/// its half width from `extents`, the sections hung behind it), the bend taken from its lanes'
+/// headings laid from their own arcs (`AiState::lane_arc_heading`).
 fn place_body(
     net: &Network,
     state: &AiState,
@@ -1435,7 +1435,7 @@ fn place_body(
     let contact = vehicle.contact.clone();
     body.place_in_lane(
         &|d| state.way_point(net, d),
-        Some(&|d| state.lane_heading(net, d)),
+        Some(&|d| state.lane_arc_heading(net, d)),
         ground
             .as_ref()
             .map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
@@ -4449,7 +4449,7 @@ impl Traffic {
                 }
                 let trail = &*trail;
                 let behind = |d: f64| rail_behind(trail, state, net, d);
-                let lane = |d: f32| state.lane_heading(net, d);
+                let lane = |d: f32| state.lane_arc_heading(net, d);
                 if !rail {
                     let (left, right) = lane_edges(net, state, body);
                     body.set_lane_edges(left, right);

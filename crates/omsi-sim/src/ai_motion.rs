@@ -443,10 +443,13 @@ impl AiBody {
         self.step_in_lane(dt, speed, way, None, ground, contact);
     }
 
-    /// `step`, with `lane(d)` the heading (deg) of the vehicle's lanes `d` metres along (the
-    /// way's without its lane change and its sideways moves, `AiState::lane_heading`): the
-    /// careful driver's line takes the bend from the lane, so a pull-out's or a lane change's
-    /// S-curve keeps the rotation point on the way. Without it the bend is the way's own.
+    /// `step`, with `lane(d)` the heading (deg) of the vehicle's lanes `d` metres along laid
+    /// from their pieces' own arcs (`AiState::lane_arc_heading`: the way's without its lane
+    /// change and its sideways moves, and without the heading jumps where two pieces meet at an
+    /// angle): the careful driver's line and the steering's feed-forward take the bend from the
+    /// lane, so a pull-out's or a lane change's S-curve keeps the rotation point on the way and
+    /// a joint's kink is a tracking error the pure pursuit takes out, not a bend fed forward.
+    /// Without it the bend is the way's own.
     pub fn step_in_lane(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>) {
         if dt > 0.0 {
             let a = (speed - self.last_speed) / dt;
@@ -555,7 +558,8 @@ impl AiBody {
             2.0 * alpha.sin() / (g.length() as f32).max(1.0)
         };
         // The feed-forward and what it replaces of pure pursuit are the lane's bend only (its
-        // headings `lane`: the way without its lane change and sideways moves), the parallel
+        // headings `lane`, laid from its pieces' arcs: the way without its lane change, its
+        // sideways moves and the kinks at joints), the parallel
         // line `side` inside it: a lane change's, a pull-out's or a swerve's S-curve is steered
         // by pure pursuit, whose look-ahead turns the wheel back before the S's second half (fed
         // forward, the rate-limited wheel lagged the S and the body ran on past it into the next
@@ -1475,6 +1479,36 @@ mod tests {
             body.step(dt, 4.0, &|d| way(at + d), None, None);
         }
         assert!((body.position.x + 3.3).abs() < 0.2, "ended at x {}", body.position.x);
+    }
+
+    /// A joint where two straight pieces meet at an angle (the map's: junction paths meeting
+    /// at 10 degrees) is no bend fed forward: the lane's heading laid from the pieces' own arcs
+    /// (`AiState::lane_arc_heading`) does not turn there, so the feed-forward stays 0 and the
+    /// careful line's offset with it, and pure pursuit takes the kink out as a tracking error -
+    /// the bus ends on the second piece's line.
+    #[test]
+    fn a_kink_between_two_straight_pieces_is_not_fed_forward() {
+        let (def, front, _, half) = bj6123();
+        let kink = 10.0f64.to_radians();
+        let way = move |s: f64| if s < 50.0 { DVec3::new(0.0, s, 0.0) } else { DVec3::new((s - 50.0) * kink.sin(), 50.0 + (s - 50.0) * kink.cos(), 0.0) };
+        let arcs = |_d: f32| 0.0f32;
+        let mut body = AiBody::new(&def, MotionKind::Road);
+        body.keep_swept_in_lane(front, half);
+        body.set_lane_edges(1.75, 1.75);
+        let (dt, speed, mut s) = (1.0 / 30.0, 8.0f32, 20.0f64);
+        body.place_in_lane(&|d| way(s + d as f64), Some(&arcs), None, None, speed);
+        let mut ff = 0.0f32;
+        while s < 110.0 {
+            s += (speed * dt) as f64;
+            let at = s;
+            body.step_in_lane(dt, speed, &|d| way(at + d as f64), Some(&arcs), None, None);
+            ff = ff.max(body.steer_ff.abs());
+        }
+        // the rotation point's distance from the second piece's line (square to it)
+        let off = (body.rear - way(50.0).truncate()).perp_dot(DVec2::new(kink.sin(), kink.cos())).abs();
+        eprintln!("kink: feed-forward at most {ff:.4} deg, rotation point {off:.3} m off the line at the end");
+        assert_eq!(ff, 0.0);
+        assert!(off < 0.05, "rotation point {off:.3} m off the second piece's line");
     }
 
     /// A lane change's S-curve is steered by pure pursuit, not fed forward: a car pulling
