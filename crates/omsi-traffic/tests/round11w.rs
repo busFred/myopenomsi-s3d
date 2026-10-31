@@ -141,3 +141,66 @@ fn w1_the_people_reach_covers_a_comfortable_stop_at_city_speed() {
     assert!(seen.hardest <= comfort, "braked {:.2} m/s^2 (comfortable {comfort:.2})", seen.hardest);
     assert!(seen.least_sep > 0.0, "touched the walker: {:.2} m", seen.least_sep);
 }
+
+/// An eastbound road through crossing object 9's piece (lane 1, x -15..45) whose zebra lies at
+/// x = 23 (lane 3, 3.5 m wide, y -8..8): the walk's near edge at x = 21.25, its zebra stop
+/// (`plan::ZEBRA_STOP`, 2.5 m before the cut) at x = 20.5.
+fn road_with_a_zebra() -> Network {
+    let lane = |pts: &[(f64, f64)], kind: LaneKind| LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), kind, 3.5);
+    let road = |pts: &[(f64, f64)], id: i64| {
+        let mut l = lane(pts, LaneKind::Street);
+        l.source = 1;
+        l.key = Some(LaneKey { tile: (0, 0), id, path: 0 });
+        l
+    };
+    let piece = |pts: &[(f64, f64)], path: u16, kind: LaneKind| {
+        let mut l = lane(pts, kind);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+        l.priority = 128.0;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(road(&[(-300.0, 0.0), (-15.0, 0.0)], 1));
+    net.lanes.push(piece(&[(-15.0, 0.0), (45.0, 0.0)], 0, LaneKind::Street));
+    net.lanes.push(road(&[(45.0, 0.0), (400.0, 0.0)], 2));
+    net.lanes.push(piece(&[(23.0, -8.0), (23.0, 8.0)], 3, LaneKind::Sidewalk));
+    net.link(1.5);
+    net.build_grid();
+    net.compute_conflicts();
+    net
+}
+
+#[test]
+fn w2_a_car_standing_just_past_its_zebra_stop_is_not_let_onto_the_walk_while_somebody_walks_onto_it() {
+    // viz2 case11 #40365: standing just past its zebra stop, the crossing test was off and the
+    // strip test let the car roll onto the walk while people walked onto it. SUMO's vehicle asks
+    // blockedAtDist until its front is on the crossing: somebody on the crossing walking towards
+    // its band from within jmCrossingGap (10 m) holds it. Here 7 m off its axis at 1 m/s; the
+    // car's front stays short of the walk
+    let net = road_with_a_zebra();
+    let mut st = AiState::new(1, (20.6 - 2.0 + 15.0) as f32, 1);
+    st.front = 2.0;
+    st.rear = 2.0;
+    st.length = 4.0;
+    st.max_speed_kmh = 50.0;
+    let mut me = Vehicle::new(1, VehicleClass::Car, st, 0.9, 7919);
+    me.fresh = 0.0;
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut cars = vec![me];
+    let vel = DVec2::new(0.0, -1.0);
+    let mut p = walker(23.0, 7.0, vel);
+    p.on_crossing = true;
+    let mut furthest = f64::NEG_INFINITY;
+    let mut t = 0.0;
+    while t < 3.0 {
+        sim.people = vec![p.clone()];
+        sim.tick(&net, DT, &mut cars);
+        let me = &cars[0];
+        let h = (me.heading as f64).to_radians();
+        furthest = furthest.max(me.pos.x + h.sin() * me.state.front as f64);
+        p.pos += (vel * DT as f64).extend(0.0);
+        t += DT;
+    }
+    assert!(furthest < 21.25, "rolled onto the walk with somebody walking onto it: front at x {furthest:.2}");
+}

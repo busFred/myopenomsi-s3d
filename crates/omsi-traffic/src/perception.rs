@@ -1343,21 +1343,28 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     let covered_walks: Vec<usize> = lanes.iter().flat_map(|&(l, d0)| net.walks.get(l).map(|ws| ws.as_slice()).unwrap_or(&[]).iter().filter(move |&&(_, sa, _)| d0 + sa >= -st.rear && d0 + sa <= st.front).map(|&(w, _, _)| w)).collect();
     let covering = !covered_walks.is_empty();
     // SUMO's crossing test (`MSLink::getLeaderInfo` with `blockedAtDist`, sumo.md 4.3):
-    // for every crossing my way cuts whose zebra stop (`plan::ZEBRA_STOP` before the cut) my
-    // front has not passed - a position test, no braking test, as SUMO's (`distToCrossing -
-    // jmStoplineCrossingGap >= -SAFETY_GAP`: SUMO stops 1 m before the crossing and asks until
-    // it is on top of it; here the stop is 2.5 m before and the test runs to it, OMSI's
-    // crossing geometry; past it the strip and body tests below decide) - anybody on its
-    // walk who is in my band (crossing flag or not) or, with the crossing flag, walks
-    // towards it from within `JM_CROSSING_GAP` holds me short of the crossing, whatever
-    // their pace (position, direction and waiting time, no pace, as blockedAtDist).
+    // for every crossing my way cuts whose walk my front has not reached - a position test,
+    // as SUMO's (`distToCrossing - jmStoplineCrossingGap >= -SAFETY_GAP`: SUMO stops 1 m
+    // before the crossing and asks until its front is on it) - anybody on its walk who is in
+    // my band (crossing flag or not) or, with the crossing flag, walks towards it from within
+    // `JM_CROSSING_GAP` holds me short of the crossing, whatever their pace (position,
+    // direction and waiting time, no pace, as blockedAtDist): at the zebra stop
+    // (`plan::ZEBRA_STOP` before the cut, OMSI's crossing geometry) while my front is short of
+    // it, and where my front is once it is past it, as long as I can still stop short of the
+    // walk (`plan::cannot_stop`, the hard brake; SUMO's vehicle brakes for the crossing as soon
+    // as it can, `distToPeds` negative) - a car standing just past its zebra stop is not let onto
+    // the walk by the strip test while the walkers leave its strip, still in its band. Past
+    // that the strip and body tests below decide.
     // Not implemented: SUMO's "stopped less than 2 s ago still walks" for somebody whose step
     // is zero (the person's walking direction is not kept here). Kerb waiters (on the walking
     // area, not the crossing) and bus waiters are no crossing users; somebody walking up to the
     // crossing with the verdict to go is an approaching person (below).
     let sideways = me.passing.is_some() || st.change.is_some_and(|c| c.bypass);
     let on_walks = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + (JM_CROSSING_GAP + me.half_width) as f64) };
-    for z in zebras.iter().filter(|z| z.along - crate::plan::ZEBRA_STOP > st.front) {
+    for z in zebras.iter().filter(|z| {
+        let walk_edge = z.along - net.lanes.get(z.walk).map_or(0.0, |w| w.width * 0.5);
+        z.along - crate::plan::ZEBRA_STOP > st.front || (walk_edge > st.front && !crate::plan::cannot_stop(v, walk_edge - st.front, crate::plan::HARD_BRAKE))
+    }) {
         let lat = st.lateral_ahead(z.along);
         if on_walks.iter().any(|&k| {
             let p = &sim.people[k];
@@ -1369,7 +1376,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             // car off a band, while the front is short of it and the car can still stop there,
             // `plan::cannot_stop`)
             let len = me.length();
-            let mut stop = z.along - crate::plan::ZEBRA_STOP;
+            let mut stop = (z.along - crate::plan::ZEBRA_STOP).max(st.front);
             for _ in 0..zebras.len() {
                 let earlier = zebras
                     .iter()
