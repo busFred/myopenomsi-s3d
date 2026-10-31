@@ -1126,6 +1126,10 @@ pub struct Traffic {
     /// cars have been removed and put down since.
     occupancy_ids: Vec<u64>,
     tick_inner_sum: ([f64; 3], u32),
+    /// `OMSI_PROFILE`: the seconds the AI road bodies spent finding their lane edges
+    /// (`lane_edges`) and stepping (`AiBody::step_in_lane`), summed over all cars and threads,
+    /// over the frames of `tick_inner_sum`.
+    body_profile: (f64, f64),
     /// Seconds each of them has stood still.
     others_still: HashMap<u32, f32>,
     /// Timetable buses taken off the road because the tile under them was unloaded (their
@@ -1863,6 +1867,7 @@ impl Traffic {
             links: CarLinks::default(),
             occupancy_ids: Vec::new(),
             tick_inner_sum: ([0.0; 3], 0),
+            body_profile: (0.0, 0.0),
             others_still: HashMap::new(),
             removed_scheduled: Vec::new(),
             dead_ended: Vec::new(),
@@ -4431,6 +4436,7 @@ impl Traffic {
                 }
             }
             let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
+            let (edges_ns, step_ns) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
             // (a few cars per job: every job handed out wakes a worker, and the waking cost
             // the main thread more than a car's work)
             jobs.into_par_iter().flatten_iter().for_each(|(state, body, vehicle, frame, trail, secs)| {
@@ -4448,6 +4454,7 @@ impl Traffic {
                     let (left, right) = lane_edges(net, state, body);
                     body.set_lane_edges(left, right);
                 }
+                let t_edges = std::time::Instant::now();
                 body.step_in_lane(
                     dt,
                     state.speed,
@@ -4456,6 +4463,11 @@ impl Traffic {
                     ground.as_ref().map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
                     contact.as_deref(),
                 );
+                if profile && !rail {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    edges_ns.fetch_add((t_edges - t0).as_nanos() as u64, Relaxed);
+                    step_ns.fetch_add(t_edges.elapsed().as_nanos() as u64, Relaxed);
+                }
                 body.apply(vehicle);
                 if rail && !vehicle.trailers.is_empty() {
                     // the coupled cars (a train's, a tram's sections) on the track it
@@ -4470,6 +4482,8 @@ impl Traffic {
                     log::info!("  slow AI frame: {} body {:.1} ms, scripts {:.1} ms", vehicle.ty.def.path.display(), (t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
                 }
             });
+            self.body_profile.0 += edges_ns.into_inner() as f64 * 1e-9;
+            self.body_profile.1 += step_ns.into_inner() as f64 * 1e-9;
         }
         self.tick_split = [(t_plan - t_start).as_secs_f64(), (t_par - t_plan).as_secs_f64(), t_par.elapsed().as_secs_f64()];
         if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
@@ -4480,7 +4494,8 @@ impl Traffic {
             *n += 1;
             if *n >= TICK_PROFILE_FRAMES {
                 let ms = |x: f64| x * 1000.0 / *n as f64;
-                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame; Simulation::tick by phase (ms): {}", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]), omsi_traffic::sim::PHASES.iter().zip(self.sim.phase_secs).map(|(k, v)| format!("{k} {:.2}", ms(v))).collect::<Vec<_>>().join(", "));
+                log::info!("traffic profile over {} frames, {} cars: pre-plan {:.2} ms, recorder {:.2} ms, Simulation::tick {:.2} ms per frame; Simulation::tick by phase (ms): {}; AI road bodies (summed over threads): lane edges {:.3} ms, stepping {:.2} ms per frame", n, self.cars.len(), ms(sum[0]), ms(sum[1]), ms(sum[2]), omsi_traffic::sim::PHASES.iter().zip(self.sim.phase_secs).map(|(k, v)| format!("{k} {:.2}", ms(v))).collect::<Vec<_>>().join(", "), ms(self.body_profile.0), ms(self.body_profile.1));
+                self.body_profile = (0.0, 0.0);
                 self.sim.phase_secs = [0.0; omsi_traffic::sim::PHASES.len()];
                 self.tick_inner_sum = ([0.0; 3], 0);
             }
