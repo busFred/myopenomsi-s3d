@@ -1810,14 +1810,20 @@ fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
     lane.nearest_point(pos).is_some_and(|(_, d)| d <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND)
 }
 
-/// `on_path` for the walk `walk`: on the path of its current leg or of the next, or holding a place
+/// `on_path` for the walk `walk`: on the path of its current leg or of the next, holding a place
 /// in a kerb's queue (the queue's places lie on the footpaths and the walking areas; one behind
-/// the queue may lie on a path behind the leg they walked up).
+/// the queue may lie on a path behind the leg they walked up), or on the way round a standing
+/// box (`round_box`, `BoxWait::around`): the box rule's way past a body standing on the path is
+/// the path's own way there (SUMO's pedestrians pass an obstacle within their own lane), and
+/// its far corner may lie past the corridor: with the legs held there, the point they walk to
+/// stays behind the box and they go round it again and again, holding the vehicle (Jiangzhaikou,
+/// a car standing over crossing piece 3070, circled 90 s).
 /// Taken in the plane, at each leg's own height there (the walkers' heights follow the ground and
 /// a bridge's deck, the paths' their splines: a footpath on a ramp lay 4 m under its walkers, who
 /// were then never on it and stood for good).
-fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec2) -> bool {
-    walk.spot.is_some()
+fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec2, round_box: bool) -> bool {
+    round_box
+        || walk.spot.is_some()
         || walk.legs[walk.leg..].iter().take(2).enumerate().any(|(k, l)| {
             let s = if k == 0 { walk.s.min(l.len()) } else { 0.0 };
             on_path(net, l, pos.extend(l.at(net, s).0.z))
@@ -2382,6 +2388,8 @@ struct Me {
     /// Walking up to a crossing with the verdict "go": where they step onto it and the
     /// seconds until they do and until they are across (`Person::approach`).
     approach: Option<(DVec2, f32, f32)>,
+    /// On the way round a standing box (`BoxWait::around`): on the path (`walk_on_path`).
+    round_box: bool,
 }
 
 /// A standing figure's height (m), for its horizon in the picture (`figure_in_sight`): an
@@ -2714,7 +2722,7 @@ impl DecideCtx<'_> {
     /// Where a walk along the pavement takes somebody next.
     #[allow(clippy::too_many_arguments)]
     fn walk_want(&self, p: &Person, d: &mut Decision, walk: &mut PedWalk, net: &Network, lights: Option<&LightsOf>, cars: &[SeenCar], dt: f32, yields: &mut YieldBook) -> Want {
-        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None };
+        let mut me = Me { id: p.id, pos: p.position.truncate(), pace: p.pace, on_crossing: p.on_crossing, decision: p.last_decision, why: p.why, walk_pace: p.pace, approach: None, round_box: p.boxes.around.is_some() };
         let at = Around { net, lights: lights.map(|t| t as &dyn PedLights), cars, streams: self.streams, queues: self.queues, time: self.time };
         let w = stroll(self.ped, &at, &mut me, walk, &mut d.walk_rng, yields, dt);
         d.on_crossing = me.on_crossing;
@@ -3745,7 +3753,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let leg = walk.legs[walk.leg];
     // (on the path of their leg, `on_path`: off it they walk to the leg first - no verdict at a
     // kerb ahead, no leg's end)
-    let here_on_path = walk_on_path(net, walk, pos2);
+    let here_on_path = walk_on_path(net, walk, pos2, me.round_box);
     // the verdict on the crossing ahead is taken on the way to its kerb, `kerb_look`
     // short of it (SUMO: a pedestrian waits at the crossing's start, on the walking area, never
     // on the carriageway; OMSI's crossings start at the lane's edge, so the start of the
@@ -10395,10 +10403,11 @@ impl Humans {
         // progress along the pavement
         if let Some(net) = net {
             let pos = p.position;
+            let round_box = p.boxes.around.is_some();
             match &mut p.state {
                 State::Strolling(walk) => {
                     // (not off the path: there they walk to the leg, `on_path`)
-                    if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(net, walk, pos.truncate())) {
+                    if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(net, walk, pos.truncate(), round_box)) {
                         walk.s = leg.project(net, pos, walk.s).max(walk.s - 0.3);
                     }
                 }
@@ -13061,7 +13070,7 @@ mod ped_tests {
     }
 
     pub(super) fn me(id: u32, pos: DVec2, pace: f64) -> Me {
-        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace, approach: None }
+        Me { id, pos, pace, on_crossing: false, decision: None, why: "", walk_pace: pace, approach: None, round_box: false }
     }
 
     /// One frame of the walk as the game moves them (the crowd left out): (velocity).
@@ -15763,6 +15772,54 @@ mod ped_tests {
         let leg = Leg { lane: 0, a: 10.0, b: 10.0 };
         assert!(on_path(&net, &leg, p(10.0, 1.0)));
         assert!(!on_path(&net, &leg, p(10.0, 5.0)));
+    }
+
+    #[test]
+    fn p3_a_a_walker_round_a_car_standing_over_the_crossing_gets_past_it() {
+        // Jiangzhaikou 08:17 (run rpa-2): car #1389 turning right on lane 3066 stood from t 63 s
+        // with its body over crossing piece 3070 (2.9 m, x 495.7), between it and the second
+        // crossing at x 499.0; the walkers on 3069 -> 3070 -> 3071 went round its front end, whose
+        // corner lies 4.4 m off the path, their legs held there (`walk_on_path`), and walked back to
+        // the point behind the box, round it again: #160 circled it 90 s and held it the whole time.
+        // The same pieces here, x 495.7 -> 0 and y -1676.83 -> 0
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(-0.28, -5.67), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(-0.07, 2.86)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(-0.07, 2.86), p(-0.12, 4.86)], LaneKind::Sidewalk, 2.0));
+        net.lanes.push(lane(vec![p(-0.12, 4.86), p(-0.17, 10.86)], LaneKind::Sidewalk, 2.0));
+        net.build_grid();
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let body = Block { center: DVec2::new(1.08, 2.42), half: DVec2::new(0.86, 2.27), heading: 45.3f64.to_radians(), vel: DVec2::ZERO };
+        let blocks = [body];
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let streams: Streams = HashMap::new();
+        let queues = Queues::default();
+        let at = Around { net: &net, lights: None, cars: &[], streams: &streams, queues: &queues, time: 0.0 };
+        let run = |round_box_on_path: bool| -> (usize, f64) {
+            let legs: Vec<Leg> = (0..4).map(|l| Leg { lane: l, a: 0.0, b: net.lanes[l].length() }).collect();
+            let mut walk = PedWalk::new(legs, false, 0.0);
+            let mut m = me(160, DVec2::new(-0.2, -3.0), 1.3);
+            let (mut bw, mut detour, mut rng) = (BoxWait::default(), 0.0f32, 7u64);
+            for _ in 0..1200 {
+                m.round_box = round_box_on_path && bw.around.is_some();
+                let mut want = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+                past_boxes(&mut bw, &mut detour, m.pos, true, false, false, &mut want, &blocks, &grid, &[None], &[], &|_| true, 0.05);
+                m.pos += want.vel * 0.05;
+                detour = (detour - 0.05).max(0.0);
+                if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(&net, &walk, m.pos, round_box_on_path && bw.around.is_some())) {
+                    walk.s = leg.project(&net, m.pos.extend(0.0), walk.s).max(walk.s - 0.3);
+                }
+                if walk.leg >= 3 && m.pos.y > 6.0 {
+                    break;
+                }
+            }
+            (walk.leg, m.pos.y)
+        };
+        let (leg, y) = run(true);
+        assert!(leg >= 3 && y > 6.0, "past the car: leg {leg} y {y}");
+        let (leg, y) = run(false);
+        assert!(leg < 3, "with the legs held round the box: leg {leg} y {y}");
     }
 
     #[test]
