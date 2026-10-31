@@ -293,6 +293,11 @@ struct Round {
     /// player's bus's box by more than `traffic::OVERLAP_DEPTH`: seconds and who.
     cars_inside: (f64, HashSet<u64>),
     people_inside: (f64, HashSet<u32>),
+    /// Riders of any bus who stepped off onto the footpath nearest their door (their stop gave
+    /// them no pavement), and riders who rode on as no footpath was within reach
+    /// (`Humans::walked_to_footpath`, `Humans::rode_on`).
+    walked_to_footpath: u32,
+    rode_on: usize,
 }
 
 /// Radius (m) round the player's bus within which the people are listed while it is held by
@@ -570,6 +575,7 @@ impl PlayerWatch {
             }
         }
         let Some(h) = humans else { return };
+        (r.walked_to_footpath, r.rode_on) = (h.walked_to_footpath, h.rode_on.len());
         let present: HashSet<u32> = h.everyone().map(|(id, _, _)| id).collect();
         for (k, id) in [Some(crate::humans::BusId::Player), bus_id.map(crate::humans::BusId::Ai)].into_iter().enumerate() {
             let Some(id) = id else { continue };
@@ -691,6 +697,10 @@ impl PlayerWatch {
             r.cars_inside.1,
             r.people_inside.0,
             r.people_inside.1.len(),
+        ));
+        out.push(format!(
+            "player watch: riders of any bus who stepped off onto the footpath nearest their door (no stop pavement): {}; who rode on with none within reach: {}",
+            r.walked_to_footpath, r.rode_on
         ));
         let kinds = ["another junction", "another way through the junction", "the player's claim only", "the AI bus's own only"];
         out.push(format!(

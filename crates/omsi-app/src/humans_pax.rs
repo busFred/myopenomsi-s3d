@@ -3222,6 +3222,11 @@ impl Humans {
                 p.door
             );
         }
+        // (onto the footpath nearest their door where their stop gives them no pavement,
+        // `kerb_doors`: counted)
+        if kerb.is_some() && self.door_walk.contains(&bn.id) {
+            self.walked_to_footpath += 1;
+        }
         match kerb {
             Some(leg) => self.walk_street_on(i, w, h, Some(leg)),
             None => self.walk_street(i, w, h, stop, world, remove),

@@ -1418,17 +1418,30 @@ fn in_stop_object_box(pos: DVec2, mid: DVec2, stop: DVec2, heading_deg: f64, len
     [pos - stop, mid - stop].iter().any(|q| q.dot(s_right).abs() < 2.0 && q.dot(s_fwd).abs() < reach)
 }
 
-/// Where a rider of a timetable bus boarding at a stop outside the people's table steps onto
+/// Where a rider of a bus standing at a stop outside the people's table (or at none) steps onto
 /// the pavement: in the stop object's box, the stop's own pavement (`stop_pavement`, a lane
 /// between allowed, as at a stop of the table: the stop object's position is the alighting
-/// place); outside it, only the pavement beside their door (`door_kerb`, not across a
-/// street). None: they do not step off there.
+/// place); outside it, the footpath nearest their door (`door_kerb`, `door_footpath`). None:
+/// they do not step off there.
 fn alight_pavement(in_box: bool, stop_pavement: Option<(usize, f32)>, door_kerb: Option<(usize, f32)>) -> Option<(usize, f32)> {
     if in_box && stop_pavement.is_some() {
         stop_pavement
     } else {
         door_kerb
     }
+}
+
+/// Where a rider stepping off a bus by a door at `at` walks to when their stop gives them no
+/// pavement (the stop object's, `alight_pavement`): the nearest point of the people's footpaths
+/// within `STANDING_REACH` of the door - one on their side of the road first, else the nearest
+/// across the lanes between (`PedNet::nearest`; they take the shortest way over, and are
+/// never left standing in the road or in the bus's box). None: nothing walkable within reach,
+/// the door counts shut there and they ride on. SUMO: persons alight onto the stop's lane
+/// edge and walk on over the pedestrian network; for a stop whose object has no pavement,
+/// where Omsi.exe leaves the rider standing until the player is gone, this is the user's
+/// decision (round 11 H2-D1).
+fn door_footpath(ped: &PedNet, net: &Network, at: DVec3) -> Option<(usize, f32)> {
+    ped.nearest(net, at, STANDING_REACH).map(|(lane, s, _)| (lane, s))
 }
 
 /// The pavement within `STANDING_REACH` of `at` that is reached without going over a
@@ -5892,6 +5905,13 @@ pub struct Humans {
     /// their destination's name has no pavement (`walk_street`) - stood at the door inside the
     /// player's bus's box (`State::Standing`, until the player is gone) and held the stand-in.
     pub(crate) stand_in_boarding: Option<i64>,
+    /// The buses whose riders step off this frame onto the footpath nearest their door, not a
+    /// stop's own pavement (`kerb_doors`, `door_footpath`), and the riders who stepped off so
+    /// (counted at the door); the riders who rode on as no footpath was within reach of any open
+    /// exit (rider, bus; `kerb_doors`).
+    door_walk: HashSet<BusId>,
+    pub(crate) walked_to_footpath: u32,
+    pub(crate) rode_on: HashSet<(u32, BusId)>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -6264,6 +6284,9 @@ impl Humans {
             stand_in_doors: (false, false),
             stand_in_stop: None,
             stand_in_boarding: None,
+            door_walk: HashSet::new(),
+            walked_to_footpath: 0,
+            rode_on: HashSet::new(),
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -8221,30 +8244,43 @@ impl Humans {
         self.request_stop(*id, Some(&name), None)
     }
 
-    /// A timetable bus boarding at a stop that is not in the people's table with a pavement,
-    /// or outside its box (`register_buses`; the people's stops are set up only where people
-    /// are, and a bus queued behind another serves up to 45 m short): standing in the stop
-    /// object's box, its riders step onto the stop's own pavement, a lane between allowed, as
-    /// at a stop of the table (SUMO: persons alight at the stop's position onto its lane
-    /// edge); outside the box only by a door with a pavement beside it that is not across a
-    /// street (`kerb_beside`, the rule of somebody standing with no pavement known). A door
+    /// A bus standing where its riders have no stop pavement to step onto - a timetable bus
+    /// boarding at a stop that is not in the people's table with a pavement, or outside its box
+    /// (`register_buses`; the people's stops are set up only where people are, and a bus queued
+    /// behind another serves up to 45 m short), or the user's bus anywhere but in the box of a
+    /// stop of the table with a pavement: in the stop object's box its riders step onto the
+    /// stop's own pavement, a lane between allowed, as at a stop of the table (SUMO: persons
+    /// alight at the stop's position onto its lane edge); elsewhere they walk from their door to
+    /// the nearest footpath within reach (`door_footpath`, the user's decision H2-D1). A door
     /// with neither counts shut for the people: nobody steps off beside it into the road,
     /// nobody waits at it holding the bus, and the riders bound there ride on
-    /// (`alight_pavement`). Without a pavement network (a map without one) the doors stay as
-    /// the script has them.
-    fn kerb_doors(&self, buses: &mut [BusNow], world: &World, net: Option<&Network>) {
-        let (Some(ped), Some(net)) = (self.ped.as_ref(), net) else { return };
+    /// (`alight_pavement`; counted, `rode_on`). One rule for every bus. Without a pavement
+    /// network (a map without one) the doors stay as the script has them.
+    fn kerb_doors(&mut self, buses: &mut [BusNow], world: &World, net: Option<&Network>) {
+        let Some(net) = net else { return };
+        let Some(ped) = self.ped.take() else { return };
+        self.kerb_doors_with(&ped, buses, world, net);
+        self.ped = Some(ped);
+    }
+
+    fn kerb_doors_with(&mut self, ped: &PedNet, buses: &mut [BusNow], world: &World, net: &Network) {
         let objects: HashMap<i64, (DVec3, f64)> = world.bus_stops.lock().iter().map(|s| (s.0, (s.1, s.2))).collect();
         for bn in buses.iter_mut() {
-            let Some(stop) = bn.boarding_stop else { continue };
-            let at_pole = self.in_stop_box(stop, bn.id) && self.stops.get(&stop).is_some_and(|s| s.lane.is_some());
+            // (the user's bus names no stop: the stop of the table it stands in the box of, if one)
+            let stop = bn.boarding_stop.or_else(|| {
+                (bn.id == BusId::Player).then(|| self.stops.iter().filter(|(id, _)| self.in_stop_box(**id, bn.id)).map(|(id, _)| *id).min()).flatten()
+            });
+            if stop.is_none() && bn.id != BusId::Player {
+                continue;
+            }
+            let at_pole = stop.is_some_and(|stop| self.in_stop_box(stop, bn.id) && self.stops.get(&stop).is_some_and(|s| s.lane.is_some()));
             if at_pole {
                 continue;
             }
             let body = bn.fwd();
             let mid = bn.pos.truncate() + DVec2::new(body.y, -body.x) * bn.centre.x + body * bn.centre.y;
-            let (in_box, stop_pavement) = match objects.get(&stop) {
-                Some(&(pos, heading)) => (
+            let (in_box, stop_pavement) = match stop.and_then(|stop| objects.get(&stop).map(|o| (stop, *o))) {
+                Some((stop, (pos, heading))) => (
                     in_stop_object_box(bn.pos.truncate(), mid, pos.truncate(), heading, world.stop_length(stop) as f64),
                     ped.nearest(net, pos, STOP_PAVEMENT_REACH).map(|(l, s, _)| (l, s)),
                 ),
@@ -8253,14 +8289,25 @@ impl Humans {
             let beside = |doors: &[Door]| -> Vec<Option<(usize, f32)>> {
                 doors
                     .iter()
-                    .map(|d| alight_pavement(in_box, stop_pavement, kerb_beside(ped, net, bn.world(d.outside))))
+                    .map(|d| alight_pavement(in_box, stop_pavement, door_footpath(ped, net, bn.world(d.outside))))
                     .collect()
             };
             let (exits, entries) = (beside(&bn.cabin.exits), beside(&bn.cabin.entries));
+            // (the riders on their way out of a bus whose every open exit counts shut here ride
+            // on: counted once per rider and bus, `rode_on`)
+            let exit_was_open = bn.exit_open.iter().any(|o| *o);
             for (open, kerb) in [(&mut bn.exit_open, &exits), (&mut bn.entry_open, &entries)] {
                 for (o, k) in open.iter_mut().zip(kerb) {
                     *o &= k.is_some();
                 }
+            }
+            if exit_was_open && !bn.exit_open.iter().any(|o| *o) {
+                let id = bn.id;
+                let leaving: Vec<u32> = self.people.iter().filter(|p| matches!(&p.state, State::Pax(x) if x.inside == Some(id) && x.task == Task::InBusToExit)).map(|p| p.id).collect();
+                self.rode_on.extend(leaving.into_iter().map(|p| (p, id)));
+            }
+            if !(in_box && stop_pavement.is_some()) {
+                self.door_walk.insert(bn.id);
             }
             bn.kerb = Some((exits, entries));
         }
@@ -9462,6 +9509,7 @@ impl Humans {
         // the stops: which buses stand at them (sub_61f93c), who waits there (sub_61bf94)
         let at_stops = self.register_buses(&buses, dt);
         let mut buses = buses;
+        self.door_walk.clear();
         self.kerb_doors(&mut buses, world, net);
         let buses = buses;
         self.claim_waiting();
@@ -11811,9 +11859,11 @@ mod tests {
     /// through lanes northwards at x -3.5 and 0, a lane at x 5.7 between the stop object and
     /// its pavement (x 8.7, from y 40 on), and a pavement across the street (x -9.5). At the pole (the stop object in the road
     /// at x 1.4, y 50, the bus in its box) they step onto the stop's own pavement across the
-    /// lane between (as at a stop of the table); 40 m short in the through lane there is no
-    /// pavement beside the door (the near one starts at the stop, the far one is across the
-    /// lanes), so the door counts shut and they ride on.
+    /// lane between (as at a stop of the table); outside the box beside it they walk from the
+    /// door to the nearest footpath, the same pavement across the lane between (`door_footpath`,
+    /// H2-D1); 40 m short in the through lane no footpath is within reach of the door (the near
+    /// one starts at the stop, the far one is 11 m off across the lanes), so the door counts
+    /// shut and they ride on.
     #[test]
     fn riders_step_off_at_the_pole_onto_the_stops_pavement_and_not_40_m_short() {
         let mut net = Network::default();
@@ -11834,12 +11884,14 @@ mod tests {
         assert!(in_stop_object_box(pos, mid, stop.truncate(), 0.0, 30.0));
         let door = DVec3::new(1.8, 50.0, 0.0);
         assert_eq!(kerb_beside(&ped, &net, door), None, "the lane between the door and the pavement");
-        assert_eq!(alight_pavement(true, stop_pavement, kerb_beside(&ped, &net, door)).map(|k| k.0), Some(3));
-        // 40 m short in the through lane: outside the box, no pavement beside the door
+        assert_eq!(alight_pavement(true, stop_pavement, door_footpath(&ped, &net, door)).map(|k| k.0), Some(3));
+        // outside the box there: the footpath nearest the door, across the lane between
+        assert_eq!(alight_pavement(false, None, door_footpath(&ped, &net, door)).map(|k| k.0), Some(3), "they walk over to it");
+        // 40 m short in the through lane: outside the box, no footpath within reach of the door
         let (pos, mid) = (DVec2::new(0.0, 12.0), DVec2::new(0.0, 7.0));
         assert!(!in_stop_object_box(pos, mid, stop.truncate(), 0.0, 30.0));
         let door = DVec3::new(1.8, 10.0, 0.0);
-        assert_eq!(alight_pavement(false, stop_pavement, kerb_beside(&ped, &net, door)), None, "they ride on");
+        assert_eq!(alight_pavement(false, stop_pavement, door_footpath(&ped, &net, door)), None, "they ride on");
         // at the stop with a pavement beside the door: that one
         assert_eq!(kerb_beside(&ped, &net, DVec3::new(7.5, 50.0, 0.0)).map(|k| k.0), Some(3));
     }
