@@ -924,3 +924,47 @@ fn a_car_passes_in_front_of_a_turning_vehicles_nose_whatever_it_indicates() {
     assert!(squeezed && me.state.lane == 2, "passes in front of the nose: squeezed {squeezed}, lane {}", me.state.lane);
     assert!(least > 0.3, "least {least:.2} m to the indicating car");
 }
+
+/// A blocked urgent change shows its side while it waits for the gap (SUMO: the blocked wish stays
+/// in the vehicle's own state, `MSLaneChanger::change`'s `setOwnState`, and
+/// `MSVehicle::setBlinkerInformation` lights the blinker for it), and what it has shown counts
+/// towards the driver's signalling time: car 1 of `a_blocked_strategic_change_stops_before_the_dead_lanes_end_and_waits`,
+/// standing before the dead lane's end beside the jam, indicates right; the jam gone after 30 s -
+/// far longer than its `signal_before_change` - its change starts with nothing left to signal and
+/// moves over at once, where a fresh change signals its whole time first.
+#[test]
+fn a_blocked_urgent_change_indicates_while_it_waits_and_moves_over_as_the_gap_opens() {
+    let net = fork_ahead();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 200.0, 13.0);
+    me.state.change_cooldown = 0.0;
+    me.state.goal = Some(3);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    assert!(me.params.signal_before_change > 0.5, "the driver signals before a fresh change: {}", me.params.signal_before_change);
+    let mut cars = vec![me];
+    for k in 0..12u64 {
+        cars.push(standing(10 + k, 1, 220.0 + 6.5 * k as f32));
+    }
+    let (mut t, mut shown_waiting, mut started) = (0.0f32, None, None);
+    while t < 40.0 {
+        if t >= 30.0 {
+            cars.retain(|c| c.id == 1);
+        }
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).expect("car 1");
+        if (t - 29.9).abs() < DT * 0.5 {
+            assert!(me.state.change.is_none() && me.state.speed < 0.1, "still waiting for the gap: change {:?} v {:.1}", me.state.change, me.state.speed);
+            shown_waiting = Some(me.blinker_shown);
+        }
+        if let (None, Some(c)) = (started, me.state.change) {
+            started = Some((t, c.dir, c.wait));
+        }
+        t += DT;
+    }
+    let (shown, since) = shown_waiting.expect("sampled while waiting");
+    let (at, dir, wait) = started.expect("the jam gone, the change starts");
+    assert!(shown != 0 && shown == dir, "indicates the side of its change while it waits: shown {shown}, change dir {dir}");
+    assert!(since < 25.0, "and has done so for long: since {since:.1} s");
+    assert!(at >= 30.0 && wait == 0.0, "the change starts once the gap is there, nothing left to signal: at {at:.2} s, wait {wait:.2} s");
+}

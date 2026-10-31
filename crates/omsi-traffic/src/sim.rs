@@ -407,6 +407,11 @@ pub struct Vehicle {
     /// (the user's decision L3-D4).
     #[serde(default)]
     pub lc_impatience: f32,
+    /// The side of the blocked urgent change it waited for last frame (`Plan::urgent_side`, 0
+    /// none): its indicator shows there, and what it has shown counts towards the change's signal
+    /// (`plan::signal_left`).
+    #[serde(default)]
+    pub urgent_side: i32,
     /// What the last lane change of the driver's own it started was for (`Plan::change_why`;
     /// diagnostics: `traffic_cases watch` and its hold events).
     #[serde(skip)]
@@ -697,6 +702,7 @@ impl Vehicle {
             external: External::default(),
             last: Decision::default(),
             blinker_shown: (0, 0.0),
+            urgent_side: 0,
             pos: DVec3::ZERO,
             heading: 0.0,
             claim_standing: false,
@@ -2319,6 +2325,7 @@ impl Simulation {
         } else {
             v.dead_end_held = 0.0;
         }
+        v.urgent_side = plan.urgent_side;
         if plan.urgent_blocked {
             v.lc_impatience = (v.lc_impatience + dt / v.params.strategic_patience.max(dt)).min(1.0);
         } else if plan.start.is_none() && v.state.change.is_none_or(|c| c.wait <= 0.0 || c.t > 0.0) {
@@ -2361,8 +2368,10 @@ impl Simulation {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
                     // (the driver's own signalling time, `DriverParams::signal_before_change`)
+                    // (less what its indicator showed while the change waited for its gap,
+                    // `plan::signal_left`, as the start check planned it)
                     if let Some(c) = v.state.change.as_mut() {
-                        c.wait = v.params.signal_before_change;
+                        c.wait = plan.signal_wait.unwrap_or(v.params.signal_before_change);
                     }
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
@@ -2624,6 +2633,11 @@ impl Simulation {
                 v.state.signal = if v.state.lateral > 0.0 { 1 } else { 2 };
                 v.state.signal_time = 0.25;
             }
+        }
+        // (a blocked urgent change shows its side while it waits for the gap, `Plan::urgent_side`)
+        if plan.urgent_side != 0 && v.state.change.is_none() && v.passing.is_none() {
+            v.state.signal = plan.urgent_side;
+            v.state.signal_time = 0.25;
         }
         v.state.update_blinker(net);
         let want = if v.external.blinker_off { 0 } else { v.state.blinker };

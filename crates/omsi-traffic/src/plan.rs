@@ -118,6 +118,15 @@ pub struct Plan {
     /// An urgent lane-end or strategic change is wished and not started this frame: the driver's
     /// lane-change impatience grows (`Vehicle::lc_impatience`).
     pub urgent_blocked: bool,
+    /// The side of that blocked urgent change (`Start::Change`'s `dir`, 0 none): the car shows its
+    /// indicator there while it waits for the gap (SUMO: `MSLaneChanger::change` keeps a blocked
+    /// wish in the vehicle's own state, `setOwnState`, and `MSVehicle::setBlinkerInformation`
+    /// switches the blinker on for it; `Vehicle::urgent_side`).
+    pub urgent_side: i32,
+    /// The seconds a change started this frame still signals before it moves over: the driver's
+    /// `signal_before_change` less what its indicator has already shown that side while the change
+    /// waited for its gap (`signal_left`); `None`: the whole of it.
+    pub signal_wait: Option<f32>,
     /// The change started this frame took a gap the driver would not have taken without its
     /// lane-change impatience (`sim::CHANGES_IMPATIENT`; diagnostics).
     pub impatient_start: bool,
@@ -1680,6 +1689,21 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
 /// a car braking harder than planned can reach (sampled, as the move itself is).
 const SIGNAL_SPREAD: [f32; 3] = [1.0, 0.5, 0.0];
 
+/// The seconds a change towards `dir` still signals before it moves over, at `now`: the driver's
+/// own signalling time (`DriverParams::signal_before_change`) less the time its indicator has
+/// already shown that side for a blocked urgent change it waited for there (`Vehicle::urgent_side`;
+/// SUMO's blocked wish lights the blinker, `MSVehicle::setBlinkerInformation`, and a driver who has
+/// signalled while waiting at a merge moves over as the gap opens - not the whole time again once
+/// it is there, the follower that stopped for it standing meanwhile).
+pub fn signal_left(me: &Vehicle, dir: i32, now: f64) -> f32 {
+    let full = me.params.signal_before_change;
+    if me.urgent_side == dir && me.blinker_shown.0 == dir {
+        (full - (now - me.blinker_shown.1).max(0.0) as f32).max(0.0)
+    } else {
+        full
+    }
+}
+
 /// How the car drives the `wait` seconds of a change's signal (`SIGNAL_BEFORE_CHANGE`, OMSI's
 /// driver signals before it moves over where SUMO's change starts in the step it is decided -
 /// `lanechange.duration` 0): the road it covers and its speed when the move begins. On at its
@@ -3174,7 +3198,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // body steers out round the one in front)
             // (under way the move itself must clear the parked cars, the people, the standing
             // bodies near and the moving ones beside me where they will be, `change_clear`)
-            let mv = (me.params.signal_before_change, omsi_sim::traffic::change_length(v.max(0.0)));
+            let mv = (signal_left(me, nb.dir, sim.time), omsi_sim::traffic::change_length(v.max(0.0)));
             let near = near_standing_lead(p, v, mv);
             // (the move swept from the pose the car has on its own lane's way, `sim::way_pose`, as the
             // re-sweep while it signals sweeps it: a car still easing back into its lane - a change
@@ -3187,6 +3211,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 None => change_clear(net, sim, vehicles, &on_way, p, &nb, None, mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
             }
             .filter(|s| matches!(s, Start::Bypass { .. }) || gaps_through_signal(me, p, &nb, mv.0));
+            out.signal_wait = Some(mv.0);
             out.change_why = Some(why);
             if out.start.is_some() && me.lc_impatience > 0.0 {
                 let mut calm = me.clone();
@@ -3200,6 +3225,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // stops at the end of the lane, `informLeader`'s `stopSpeed(myLeftSpace - ...)`)
         if let Some((_, nb, end_dist, stop_for, dead, ok)) = urgent_end.filter(|b| b.0 >= threshold && out.start.is_none()) {
             out.urgent_blocked = true;
+            out.urgent_side = nb.dir;
             // SUMO LC2013's speed advice for a blocked urgent change (sumo.md 3.3, `_wantsChange`'s
             // urgent branch): first the leader there (`informLeader`), then - unless I overtake
             // that leader - the follower there with the speed I plan (`informFollower`), both every
@@ -3208,7 +3234,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // is there now but not at the end of its signal is blocked by that vehicle too)
             let (ok_behind, ok_ahead) = {
                 let (b0, a0) = if ok { (true, true) } else { gap_parts(me, &nb) };
-                let (b1, a1) = gap_parts_through_signal(me, p, &nb, me.params.signal_before_change);
+                let (b1, a1) = gap_parts_through_signal(me, p, &nb, signal_left(me, nb.dir, sim.time));
                 (b0 && b1, a0 && a1)
             };
             let remaining = end_dist / v.max(STANDING_SPEED);
