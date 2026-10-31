@@ -8145,6 +8145,19 @@ impl Humans {
             }
             (metres, ks)
         };
+        // (the metres of a path within the whole stroll radius, its loaded stretches only: the
+        // pavement `have` counts the strollers of)
+        let metres_within = |l: usize| -> f32 {
+            let lane = &net.lanes[l];
+            let off = ped.unloaded.get(&l);
+            (0..lane.points.len().saturating_sub(1))
+                .filter(|&k| (lane.points[k] - center).truncate().length() < STROLL_RADIUS)
+                .map(|k| match off {
+                    None => lane.dist[k + 1] - lane.dist[k],
+                    Some(st) => loaded_metres(lane.dist[k], lane.dist[k + 1], st),
+                })
+                .sum()
+        };
         let ahead = self.eye.map(|e| DVec3::new(e.fwd.x, e.fwd.y, 0.0).normalize_or_zero());
         let candidates: Vec<(usize, f32, Vec<usize>)> = lanes
             .iter()
@@ -8185,7 +8198,30 @@ impl Humans {
         let in_circle = |p: DVec3| (p - center).truncate().length() < radius;
         let targets = stroll_targets(ped, net, &candidates, &in_reach, &in_circle, rho);
         let lacks = stroll_lacks;
-        let wanted: f32 = targets.iter().map(|t| t.want).sum();
+        // (the target covers the pavement `have` counts the strollers of, the open pavement within
+        // the whole radius: beside the places strollers are put down on, the open paths that are no
+        // stroll candidate - a crossing's pieces, a short junction piece - and the paths' stretches
+        // between 0.9 and 1 radius, each in sight wanting the same density, `rho`, over its area.
+        // Nobody is put down there: they fill with the walkers walking onto them. Counted on one
+        // side only, the circle filled to half again its target (3190 for 1977, the crossing
+        // walkers counted) or the paths stood under theirs (the crossing walkers' want left out))
+        let mid_in_reach = |l: usize| {
+            let pts = &net.lanes[l].points;
+            in_reach(pts[pts.len() / 2])
+        };
+        let extra: Vec<(usize, f32)> = lanes
+            .iter()
+            .copied()
+            .filter(|&l| ped.ends.contains_key(&l) && stroll_path_open(Some(&*ped), net, l) && mid_in_reach(l))
+            .filter_map(|l| {
+                let all = metres_within(l);
+                let placed_on = candidates.iter().find(|c| c.0 == l).map(|c| c.1).unwrap_or(0.0);
+                let rest = all - placed_on;
+                (rest > 0.0).then(|| (l, rho * area(l, rest)))
+            })
+            .collect();
+        let extra_want: f32 = extra.iter().map(|e| e.1).sum();
+        let wanted: f32 = targets.iter().map(|t| t.want).sum::<f32>() + extra_want;
         // (the setting is an upper bound, and never past the pool)
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
         let limit = self.pedestrians.min((self.max_people + strolling).saturating_sub(self.pool_used()));
@@ -8373,6 +8409,36 @@ impl Humans {
             let past_box = past.iter().filter(|p| p.vel.length() < 0.1 && p.boxes.jam > 0.0).count();
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
+            // (what each class of pavement wants and holds: the paths in sight strollers are put
+            // down on, the sources, and the rest `have` counts - the crossings' and junctions'
+            // pieces and the ring past 0.9 radius - and the density reached over the in-sight
+            // pavement against `rho`)
+            let lack_of = |want: f32, on: usize| (want - on as f32).max(0.0);
+            let (mut p_want, mut p_on, mut p_lack) = (0.0f32, 0usize, 0.0f32);
+            for t in targets.iter().filter(|t| !t.source) {
+                let on = on_path.get(&t.lane).copied().unwrap_or(0);
+                (p_want, p_on, p_lack) = (p_want + t.want, p_on + on, p_lack + lack_of(t.want, on));
+            }
+            let (mut s_want, mut s_on, mut s_lack) = (0.0f32, 0usize, 0.0f32);
+            for t in targets.iter().filter(|t| t.source) {
+                let on = on_way.get(&(t.lane, t.toward.unwrap_or(true))).copied().unwrap_or(0);
+                (s_want, s_on, s_lack) = (s_want + t.want, s_on + on, s_lack + lack_of(t.want, on));
+            }
+            let (mut x_on, mut x_over) = (0usize, 0.0f32);
+            for &(l, w) in extra.iter().filter(|e| !candidates.iter().any(|c| c.0 == e.0)) {
+                let on = on_path.get(&l).copied().unwrap_or(0);
+                x_on += on;
+                x_over += (on as f32 - w).max(0.0);
+            }
+            let x_want: f32 = extra.iter().filter(|e| !candidates.iter().any(|c| c.0 == e.0)).map(|e| e.1).sum();
+            let ring_want = extra_want - x_want;
+            let sight_m2: f32 = seen_m2 + extra.iter().map(|&(l, _)| area(l, metres_within(l) - candidates.iter().find(|c| c.0 == l).map(|c| c.1).unwrap_or(0.0))).sum::<f32>();
+            let sight_on: usize = p_on + x_on;
+            log::info!(
+                "t={:.1} stroll classes: in-sight paths want {p_want:.0} hold {p_on} lacking {p_lack:.0}; sources want {s_want:.0} hold {s_on} lacking {s_lack:.0}; pieces (crossings, junctions) want {x_want:.0} hold {x_on} over {x_over:.0}; ring 0.9-1 radius want {ring_want:.0}; in-sight density {:.3} of {rho:.3} per m2 ({sight_on} on {sight_m2:.0} m2)",
+                self.time,
+                if sight_m2 > 0.0 { sight_on as f32 / sight_m2 } else { 0.0 }
+            );
             log::info!(
                 "t={:.1} strollers: {have} of {target} wanted, off the closed paths ({within} within the radius; {} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, on a street lane {rej_lane}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
