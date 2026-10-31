@@ -3414,8 +3414,25 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // overtaken there (SUMO: a vehicle does not overtake within the lane one that has
         // announced a change into its path, the sublane model's blinker; as the bus and the
         // player above)
+        // (only one I would pass alongside: a vehicle standing across my way - its heading nearer my
+        // way's crosswise axis than its lengthwise one - whose nose is what reaches into my way is
+        // crossed in front of, not passed alongside, and its indicator says where it will turn, not
+        // that it will move into my path beside it: the road rule against overtaking on the side a
+        // vehicle indicates is about passing it alongside, ours; viz2 j17, a car going straight past
+        // a right-turning lorry's front)
+        let alongside = |o: &Vehicle| {
+            let h = (me.heading as f64).to_radians();
+            let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
+            let ho = (o.heading as f64).to_radians();
+            let of = DVec2::new(ho.sin(), ho.cos());
+            let across = of.dot(right).abs() > of.dot(fwd).abs();
+            // (its nose nearer my way's axis than its tail)
+            let nose = o.pos.truncate() + of * o.state.front as f64 - me.pos.truncate();
+            let tail = o.pos.truncate() - of * o.state.rear as f64 - me.pos.truncate();
+            !(across && nose.dot(right).abs() < tail.dot(right).abs())
+        };
         let vehicle_out = |side: f32| match l.what {
-            Seen::Vehicle(j) | Seen::Body(j) => side != 0.0 && vehicles.get(j).is_some_and(|o| o.blinker_shown.0 == if side < 0.0 { 1 } else { 2 }),
+            Seen::Vehicle(j) | Seen::Body(j) => side != 0.0 && vehicles.get(j).is_some_and(|o| o.blinker_shown.0 == if side < 0.0 { 1 } else { 2 } && alongside(o)),
             Seen::Player(_) | Seen::Parked => false,
         };
         // a bus does not pass what stands at its own next stop
