@@ -3940,6 +3940,33 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let right = DVec2::new(hr.cos(), -hr.sin());
     let target = p.truncate() + right * side;
     let vel = (target - pos2).normalize_or_zero() * pace;
+    // on a path the map lays on a street lane's surface (`on_lane_surface` where they walk to),
+    // not a crossing: a vehicle coming (`SeenCar::stood` 0) or standing for people (it moves on
+    // once they are out of its way) whose body lies on their way along the rest of the leg's line
+    // (`covers_path`, at their level) has them step out of the lanes' people strips
+    // (`clear_of_lanes`, the rule the waiting places and the walkers kept for sight keep, P11-1,
+    // M2) and wait there until it is off their way. SUMO's vehicles wait for a person in their
+    // path; its pedestrians walk sidewalks, and OMSI's maps lay some footpaths in the lane, where
+    // the walkers waited for the car's box and the car for them: Jiangzhaikou path 1529/1530 on
+    // lane 1159, eight standing 1.2 m before a car's front, the car held 80 s
+    if !me.on_crossing && !crossing && on_lane_surface(net, p) {
+        // (the leg's line from where they are along it, to its end)
+        let (from, _) = leg.at(net, walk.s.min(len));
+        let along = DVec2::new(hr.sin(), hr.cos());
+        let rest = (len - walk.s).max(0.0) as f64;
+        let here3 = pos2.extend(p.z);
+        if at.cars.iter().any(|c| (c.yielding || c.stood <= 0.0) && at_level(c.z, here3.z) && covers_path(&c.body, from.truncate(), along, rest)) {
+            me.decision = Some(GIVES_WAY_IN_THE_LANE);
+            me.why = GIVES_WAY_IN_THE_LANE;
+            if let Some(to) = clear_of_lanes(net, here3).filter(|q| !within_lanes(net, *q, &strip_reach)) {
+                let way = (to - here3).truncate();
+                if way.length() > KERB_ARRIVE {
+                    return Want { vel: way.normalize() * pace, face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+                }
+            }
+            return Want::stand(Some(h), Activity::Stand);
+        }
+    }
     // somebody off the paths (`on_path`: a rider off a bus walking to their pavement), not on a
     // crossing: the first step into a lane is decided as at an unsignalled kerb
     // (`steps_into_traffic`), the wait counted on `walk.edge_wait`
@@ -5654,6 +5681,9 @@ fn lane_under(net: &Network, pos: DVec3) -> Option<usize> {
 /// A kerb waiting for a car to come by (an unsignalled crossing, `kerb_verdict`, or the first
 /// step into a lane off a crossing, `steps_into_traffic`).
 const WAITS_FOR_A_CAR: &str = "waits for a car to pass";
+/// A walker on a path laid on a street lane stepped out of the lanes' people strips for a
+/// vehicle on their way (`stroll`).
+const GIVES_WAY_IN_THE_LANE: &str = "steps out of the lane for a vehicle";
 
 /// Whether `car` comes to the cut `x` within `t` s: moving (0.5 m/s or more), not yielding (a
 /// car stopping for people stops: when it yields, the pedestrian passes - a child and a taxi
@@ -15857,6 +15887,47 @@ mod ped_tests {
         let leg = Leg { lane: 0, a: 10.0, b: 10.0 };
         assert!(on_path(&net, &leg, p(10.0, 1.0)));
         assert!(!on_path(&net, &leg, p(10.0, 5.0)));
+    }
+
+    #[test]
+    fn p3_n2_a_walker_on_a_path_in_the_lane_steps_out_of_the_strip_for_a_car_on_their_way() {
+        // Jiangzhaikou path 1529/1530 (1 m wide) runs 0.8 m off the axis of lane 1159 (2.3 m), on
+        // its surface; walkers going south on it met a car standing in the lane and stood 1.2 m
+        // before its front, the car waiting for them. Here the lane runs along y at x 0 and the
+        // path at x 0.8; the car stands at y 0 facing north
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(0.0, -30.0), p(0.0, 30.0)], LaneKind::Street, 2.3));
+        net.lanes.push(lane(vec![p(0.8, 20.0), p(0.8, -20.0)], LaneKind::Sidewalk, 1.0));
+        net.build_grid();
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let streams: Streams = HashMap::new();
+        let queues = Queues::default();
+        let body = Block { center: DVec2::new(0.0, 0.0), half: DVec2::new(0.9, 2.3), heading: 0.0, vel: DVec2::ZERO };
+        let car = SeenCar { id: 4673, pos: body.center, vel: DVec2::ZERO, half_len: 2.3, body, yielding: true, stood: 20.0, z: 0.0, lane: Some(0) };
+        let run = |cars: &[SeenCar]| -> (Me, f64) {
+            let at = Around { net: &net, lights: None, cars, streams: &streams, queues: &queues, time: 0.0 };
+            let mut walk = PedWalk::new(vec![Leg { lane: 1, a: 0.0, b: 40.0 }], false, 0.0);
+            let mut m = me(3586, DVec2::new(0.8, 19.0), 1.3);
+            let mut rng = 3u64;
+            let mut min_y = f64::MAX;
+            for _ in 0..600 {
+                let w = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+                m.pos += w.vel * 0.05;
+                if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(&net, &walk, m.pos, false)) {
+                    walk.s = leg.project(&net, m.pos.extend(0.0), walk.s).max(walk.s - 0.3);
+                }
+                min_y = min_y.min(m.pos.y);
+            }
+            (m, min_y)
+        };
+        // the car on their way: out of the lanes' people strips beside the path, short of the car
+        let (m, min_y) = run(&[car]);
+        assert!(!within_lanes(&net, m.pos.extend(0.0), &strip_reach), "in the strip at {:?}", m.pos);
+        assert!(min_y > 2.3 && m.decision == Some(GIVES_WAY_IN_THE_LANE), "{:?} {min_y} {:?}", m.pos, m.decision);
+        // no car: along the path past where it stood
+        let (_, min_y) = run(&[]);
+        assert!(min_y < -5.0, "{min_y}");
     }
 
     #[test]
