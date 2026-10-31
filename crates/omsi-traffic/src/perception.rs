@@ -122,10 +122,18 @@ pub const HELD_OBSTACLE_STAND: f32 = 25.0;
 /// the same value for the vehicles in their way (omsi-app's `humans::at_level`).
 pub const LEVEL_APART: f64 = 2.5;
 
-/// How far ahead of its front (m) a driver at `v` m/s looks for people on its way: a stop
-/// and some, 8 m at least, 45 m at most (`people_ahead`, `perceive`).
-pub fn people_reach(v: f32) -> f32 {
-    (v * v / 5.0 + v + 6.0).clamp(8.0, 45.0)
+/// How far past its front (m) a car at rest looks for people on its way before it moves off
+/// (`people_hold_at_rest`), and what a moving car looks beyond its stop and time window: the
+/// people test's floor, unchanged from its earlier form.
+const PEOPLE_REACH_REST: f32 = 8.0;
+
+/// How far ahead of its front (m) a driver at `v` m/s braking at `comfort` m/s^2 looks for
+/// people on its way: its comfortable stop, the road it covers in SUMO's `jmTimegapMinor`
+/// (`JM_TIMEGAP_MINOR`, the window an approaching person's is compared with), and
+/// `PEOPLE_REACH_REST` - so a walker whose path meets its window is seen while it can still stop
+/// for them at its comfortable deceleration (`people_ahead`, `perceive`).
+pub fn people_reach(v: f32, comfort: f32) -> f32 {
+    v * v / (2.0 * comfort.max(0.1)) + v * JM_TIMEGAP_MINOR + PEOPLE_REACH_REST
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1065,9 +1073,10 @@ const KERB_CLEAR: f32 = 0.3;
 
 /// How far ahead (s) the step of a person about to enter my lane is followed, at most: the
 /// time I need to reach them, at least 2 s (`dist / v` alone is 0.15 s at
-/// 13 m/s, and a stepper beside the bumper would never be braked for); 4 s covers my reach of 45 m at
-/// 11 m/s. For the people `walk_across` does not time (on a crossing, at the kerb, waiting for a
-/// bus, walking up to a crossing, or crossing my way level with my body).
+/// 13 m/s, and a stepper beside the bumper would never be braked for); 4 s covers 45 m at
+/// 11 m/s. For the people `walk_across` does not time (on a crossing or the walk of a crossing my
+/// way cuts, at the kerb, waiting for a bus, walking up to a crossing, walking along my way more
+/// than towards it, or crossing it level with my body without my rear clearing first).
 const STEP_LOOK: f32 = 4.0;
 /// Who is about to enter my lane: moving toward it from within this (m) of my people strip,
 /// a step and a half (a kerb waiter half a step behind the spot is 1.15 m off the strip).
@@ -1313,7 +1322,7 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
 fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, f32)], way: &WayPts, parked_swerve: Option<f32>) -> (Option<f32>, Option<(f32, Option<f32>)>) {
     let st = &me.state;
     let v = st.speed;
-    let reach = people_reach(v);
+    let reach = people_reach(v, me.params.comfort_brake);
     let radius = (st.front + reach + 6.0) as f64;
     // who holds the car on its way, and who would on the lane's axis (the shift's candidates)
     let mut holders: Vec<Holder> = Vec::new();
@@ -1754,7 +1763,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
 /// Whether the people test holds vehicle `me` standing where it is (`people_ahead` at speed 0):
 /// somebody whose body (`PERSON_RADIUS`) is over its body (`Vehicle::obb`), now or where their
 /// step takes them, or who is in its strip (half width and 0.3 m; 1.5 m on a crossing) on its way
-/// ahead within `people_reach(0)` past its front, with the test's own exemptions (level with the
+/// ahead within `people_reach` at rest past its front, with the test's own exemptions (level with the
 /// body outside its footprint, a kerb waiter, somebody standing at the edge, the shift past people
 /// beside the lane, taken only where the live car could take it: towards the middle only while
 /// the oncoming lane is clear for it, `people_shift_clear`, with the vehicles on a lane given by
@@ -1766,7 +1775,7 @@ pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle, occupa
     let mut me = me.clone();
     me.state.speed = 0.0;
     let st = &me.state;
-    let reach = st.front + people_reach(0.0);
+    let reach = st.front + people_reach(0.0, me.params.comfort_brake);
     let lanes = way_lanes(net, st, reach);
     let way = WayPts::sample(net, st, reach);
     let (stop, shifted) = people_ahead(net, sim, &me, &lanes, &way, None);
@@ -1780,7 +1789,7 @@ pub fn people_hold_at_rest(net: &Network, sim: &Simulation, me: &Vehicle, occupa
 fn reach_of_people(sim: &Simulation, me: &Vehicle, way: &WayPts) -> f32 {
     let st = &me.state;
     let v = st.speed;
-    let reach = people_reach(v);
+    let reach = people_reach(v, me.params.comfort_brake);
     let radius = (st.front + reach + 6.0) as f64;
     let half = (me.half_width + 0.3) as f64;
     let mut far = 0.0f32;
@@ -2496,7 +2505,7 @@ struct Corridor {
 fn corridor(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, me: &Vehicle, lanes: &[(usize, f32)], look: f32) -> Corridor {
     let st = &me.state;
     let body_look = (st.speed * st.speed / (2.0 * st.decel.max(0.5)) + 2.0 * st.speed + 12.0).clamp(12.0, 70.0);
-    let people_reach = people_reach(st.speed) + st.front;
+    let people_reach = people_reach(st.speed, me.params.comfort_brake) + st.front;
     let player_near = sim.players.iter().any(|pl| (pl.pos - me.pos).truncate().length() < 180.0);
     let (cand, far) = body_candidates(sim, me, lanes, look, body_look);
     let upto = body_look.max(people_reach).max(far).max(if player_near { look } else { 0.0 });

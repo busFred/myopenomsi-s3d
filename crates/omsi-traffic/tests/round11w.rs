@@ -114,3 +114,30 @@ fn w1_a_slow_car_waits_for_a_walker_crossing_ahead() {
     assert!(seen.first.is_some(), "never held for the walker");
     assert!(seen.least_sep > 0.0, "touched the walker: {:.2} m", seen.least_sep);
 }
+
+#[test]
+fn w1_a_walker_along_the_pavement_drifting_in_does_not_hold_the_car() {
+    // pass 2: a walker on the pavement 2.6 m right of the near lane's axis walking along the road
+    // towards the car at 1.3 m/s and drifting in at 0.3 m/s (more along it than across): SUMO's
+    // person on the lane, held for where they are; they never reach the strip while the car is
+    // there, so it neither brakes for them nor touches them
+    let v0 = 10.0;
+    let seen = drive(sedan(100.0, v0), DVec2::new(100.0 + 2.42 + 25.0, -3.5 - 2.6), DVec2::new(-1.3, 0.3), 3.0);
+    assert!(seen.first.is_none(), "held for a walker walking along the pavement");
+    assert!(seen.least_sep > 0.0, "touched the walker: {:.2} m", seen.least_sep);
+}
+
+#[test]
+fn w1_the_people_reach_covers_a_comfortable_stop_at_city_speed() {
+    // pass 2: at 13.9 m/s (50 km/h) the comfortable stop at 2 m/s^2 is 48 m: a walker crossing
+    // 60 m ahead of the front whose path meets the car's window is braked for at the comfortable
+    // deceleration, never harder
+    let v0 = 13.9;
+    let me = sedan(100.0, v0);
+    let comfort = me.params.comfort_brake;
+    let seen = drive(me, DVec2::new(100.0 + 2.42 + 75.0, 2.5), DVec2::new(0.0, -1.2), 14.0);
+    let (v, gap) = seen.first.expect("never braked for the walker crossing its way");
+    assert!(gap - 1.5 >= v * v / (2.0 * comfort), "first held {gap:.1} m before their line at {v:.1} m/s: inside its comfortable stop");
+    assert!(seen.hardest <= comfort, "braked {:.2} m/s^2 (comfortable {comfort:.2})", seen.hardest);
+    assert!(seen.least_sep > 0.0, "touched the walker: {:.2} m", seen.least_sep);
+}
