@@ -2,13 +2,8 @@
 
 use super::*;
 
-/// Position, heading, half extents and speed of the player's vehicle for the AI's
-/// obstacle checks.
-pub(crate) fn player_outline(p: &Player) -> traffic::PlayerBox {
-    vehicle_outline(&p.vehicle, p.vehicle.physics.speed)
-}
-
-/// `player_outline` of any vehicle moving at `speed` (m/s).
+/// Position, heading, half extents and speed (`speed`, m/s) of a vehicle for the AI's
+/// obstacle checks: the player's (`player_seen`), a LAN player's (`lan_outlines`).
 pub(crate) fn vehicle_outline(v: &omsi_sim::VehicleInstance, speed: f32) -> traffic::PlayerBox {
     let bb =
         v.ty.def
@@ -29,7 +24,7 @@ pub(crate) fn vehicle_outline(v: &omsi_sim::VehicleInstance, speed: f32) -> traf
 /// the front section and drove into the back of a turning GN92), and the vehicles placed
 /// by hand from the vehicle list, with their trailers - under ids of their own beside the
 /// LAN players'.
-pub(crate) fn own_outlines(player: Option<&Player>, placed: &[Player]) -> Vec<(u32, traffic::PlayerBox)> {
+pub(crate) fn own_outlines(player: Option<&omsi_sim::VehicleInstance>, placed: &[Player]) -> Vec<(u32, traffic::PlayerBox)> {
     let mut out = Vec::new();
     let mut add = |v: &omsi_sim::VehicleInstance, base: u32, whole: bool| {
         let speed = v.physics.speed;
@@ -48,13 +43,57 @@ pub(crate) fn own_outlines(player: Option<&Player>, placed: &[Player]) -> Vec<(u
             out.push((base + 1 + k as u32, (centre, t.heading, bb[1] * 0.5, bb[0] * 0.5, speed)));
         }
     };
-    if let Some(p) = player {
-        add(&p.vehicle, 0xFFFF_0000, false);
+    if let Some(v) = player {
+        add(v, 0xFFFF_0000, false);
     }
     for (i, q) in placed.iter().enumerate() {
         add(&q.vehicle, 0xFFFE_0000 - (i as u32) * 16, true);
     }
     out
+}
+
+/// The player as the traffic sees it this frame: the player's box (`vehicle_outline`), the
+/// rest of the player's own vehicles (`own_outlines`), its right of way (its script's
+/// `TrafficPriority`), its indicator, and the timetable bus that drives it, if one. One rule for
+/// the player's own driving and for the offscreen harness's stand-in (`--follow-line`,
+/// `follow_line::LineFollower`), so a harness run sees the player's bus as a real drive does:
+/// the player's vehicle is put where the stand-in is every frame (`follow_line::pose_player`,
+/// its speed and its rear sections too), so its box and its other sections are the player's
+/// as always; its indicator is the stand-in's (`AiState::blinker`: the stand-in is the one at
+/// the wheel, and the player's scripts that would show the player's own do not run); and the
+/// traffic is told which car that is (`Traffic::stand_in`), so that the drivers see it as the
+/// player only (`omsi_traffic::StandIn`).
+pub(crate) struct PlayerSeen {
+    pub outline: Option<traffic::PlayerBox>,
+    pub parts: Vec<(u32, traffic::PlayerBox)>,
+    pub priority: bool,
+    pub blinker: u8,
+    pub stand_in: Option<u64>,
+}
+
+/// `PlayerSeen` of the player's vehicle `player`, the vehicles `placed` by hand, and the
+/// timetable bus `stand_in` driving the player's vehicle.
+pub(crate) fn player_seen(player: Option<&omsi_sim::VehicleInstance>, placed: &[Player], stand_in: Option<&traffic::AiCar>) -> PlayerSeen {
+    PlayerSeen {
+        outline: player.map(|v| vehicle_outline(v, v.physics.speed)),
+        parts: own_outlines(player, placed),
+        priority: player.and_then(|v| v.var("TrafficPriority")).is_some_and(|x| x > 0.5),
+        blinker: match stand_in {
+            Some(c) => c.ai.state.blinker.clamp(0, 3) as u8,
+            None => player.map(lan::indicator).unwrap_or(0),
+        },
+        stand_in: stand_in.filter(|_| player.is_some()).map(|c| c.id),
+    }
+}
+
+/// Tell the traffic about the player for its next `tick` (`PlayerSeen`; the LAN players'
+/// boxes in `Traffic::others` are set before): returns the player's box for that tick.
+pub(crate) fn show_player(t: &mut traffic::Traffic, seen: PlayerSeen) -> Option<traffic::PlayerBox> {
+    t.others.extend(seen.parts);
+    t.player_priority = seen.priority;
+    t.player_blinker = seen.blinker;
+    t.stand_in = seen.stand_in;
+    seen.outline
 }
 
 /// The LAN players' buses as obstacles for the AI traffic (their speed as last sent).

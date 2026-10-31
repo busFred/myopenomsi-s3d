@@ -879,8 +879,9 @@ pub(super) fn at_stop(id: i64, stop: &PaxStop, terminus: Option<&str>, takes: &T
 pub(super) enum Fit {
     /// Its terminus is on their line record (sub_61c33c: Omsi.exe's only test).
     Terminus,
-    /// The player's duty takes them where they are going: its trip's terminus is on the
-    /// record, or their destination is a later stop of the trip than theirs.
+    /// The player's duty takes them where they are going: they wait at a stop object its trip
+    /// still calls at, and its trip's terminus is on their record or their destination is a
+    /// later stop of the trip.
     Duty,
     /// They have no line record: the first bus listed (sub_61c33c).
     Any,
@@ -901,10 +902,14 @@ pub(super) fn best_bus(buses: impl Iterator<Item = (BusId, Fit, f64)>) -> Option
 /// the timetable's termini. A depot file that spells them another way (another case, a
 /// shortened name, the terminus of another variant of the line, a file made for another
 /// map) left the people at every stop of a duty waiting for another bus. The duty knows
-/// the trip: whoever it takes where they are going gets on.
+/// the trip: whoever waits at a stop object the trip still calls at (by its id: the
+/// timetable's station, which a duty's people belong to) and goes where it goes gets on.
+/// Not at another object of the stop's name - another line's platform, often in the same
+/// kerb: its people wait for their own line (Omsi.exe's line record of their stop does not
+/// list this trip's terminus; SUMO: a person waits at their own busStop and boards only a
+/// vehicle stopping there).
 pub(super) fn fit(
     id: i64,
-    stop: &PaxStop,
     dest: Option<&str>,
     termini: &HashSet<String>,
     terminus: &str,
@@ -924,16 +929,17 @@ pub(super) fn fit(
     if !trip.public {
         return None;
     }
+    // this stop object where the trip still calls at it (from the one before the stop the duty
+    // is due at: it counts a stop served 35 m on)
+    let here = (next.saturating_sub(1)..trip.stops.len()).find(|k| {
+        let (sid, _, stops) = &trip.stops[*k];
+        *stops && *sid == id
+    })?;
     if termini.contains(&trip.terminus) {
         return Some(Fit::Duty);
     }
+    // their destination after it
     let dest = dest?.trim();
-    // this stop where the trip still calls at it (from the one before the stop the duty is
-    // due at: it counts a stop served 35 m on), and their destination after it
-    let here = (next.saturating_sub(1)..trip.stops.len()).find(|k| {
-        let (sid, name, stops) = &trip.stops[*k];
-        *stops && (*sid == id || stop.is_named(name))
-    })?;
     trip.stops[here + 1..]
         .iter()
         .any(|(_, name, stops)| *stops && name.trim() == dest)
@@ -1300,7 +1306,6 @@ impl Humans {
                 }
                 let f = fit(
                     stop,
-                    s,
                     p.dest.as_deref(),
                     termini,
                     bn.terminus.as_deref()?,
@@ -1824,17 +1829,30 @@ impl Humans {
                 ));
             }
         }
-        // each timetable bus's riders, aboard, on the way out, and come up for it
+        // the player's bus's wants go to the timetable bus driving it too (`stand_in`): its
+        // door script opens for them
+        if let (Some(id), Some((e, x))) = (self.stand_in, self.pax_req.get(&BusId::Player)) {
+            let (entry_busy, exit_busy) = self.pax_busy.get(&BusId::Player).cloned().unwrap_or_default();
+            self.ai_requests.push((id, DoorWants { entry_req: e.clone(), exit_req: x.clone(), entry_busy, exit_busy, places: Vec::new() }));
+        }
+        // each timetable bus's riders, aboard, on the way out, and come up for it (the
+        // player's bus's under the timetable bus driving it, `stand_in`)
         self.ai_riders.clear();
+        let stand_in = self.stand_in;
+        let ai_of = |b: Option<BusId>| match b {
+            Some(BusId::Ai(id)) => Some(id),
+            Some(BusId::Player) => stand_in,
+            None => None,
+        };
         for p in &self.people {
             let State::Pax(x) = &p.state else { continue };
-            if let Some(BusId::Ai(id)) = x.inside {
+            if let Some(id) = ai_of(x.inside) {
                 let r = self.ai_riders.entry(id).or_default();
                 r.aboard += 1;
                 if x.task == Task::InBusToExit {
                     r.leaving += 1;
                 }
-            } else if let (Some(BusId::Ai(id)), Task::ToBus | Task::WalkingToBus) = (x.bus, x.task) {
+            } else if let (Some(id), Task::ToBus | Task::WalkingToBus) = (ai_of(x.bus), x.task) {
                 self.ai_riders.entry(id).or_default().boarders += 1;
             }
         }
@@ -1842,9 +1860,14 @@ impl Humans {
         // somebody of this bus on the way out while it has a door open, or walking up to its
         // doors from the stop the bus serves - the traffic checks the stop (`hold_boarding`) -
         // not standing at a shut door (`holds_bus`). People at the gather point do not hold
-        // it: with the bus full they stood there and kept it at the stop for good (#767)
+        // it: with the bus full they stood there and kept it at the stop for good (#767). The
+        // player's bus is held so only while a timetable bus drives it (`stand_in`: that bus)
         for bn in buses {
-            let BusId::Ai(id) = bn.id else { continue };
+            let id = match (bn.id, self.stand_in) {
+                (BusId::Ai(id), _) => id,
+                (BusId::Player, Some(id)) => id,
+                (BusId::Player, None) => continue,
+            };
             if bn.speed.abs() > 0.5 {
                 continue;
             }
@@ -3016,14 +3039,18 @@ impl Humans {
     }
 
     /// A rider's stop request (sub_62e42c fires the trigger `int_haltewunsch` on the
-    /// person's bus, whoever drives it): the player's bus through `stop_request`, a timetable
-    /// bus through `ai_stop_requests`. The stock AI door scripts (WG120FK `door.osc`, BJ6123 and
+    /// person's bus, whoever drives it): the player's bus through `stop_request` (and the
+    /// timetable bus driving it, `stand_in`, through `ai_stop_requests`: its driver hears it), a
+    /// timetable bus through `ai_stop_requests`. The stock AI door scripts (WG120FK `door.osc`, BJ6123 and
     /// BJ6180 `door-6.osc`) open the rear doors at a stop only with `haltewunsch` set, which
     /// that trigger sets; the MAN D92 has no such trigger and raises it from the exit requests
     /// (`PAX_Exit<i>_Req`, written every frame from `pax_req`).
     pub(super) fn ask_stop(&mut self, bus: BusId) {
         match bus {
-            BusId::Player => self.stop_request = true,
+            BusId::Player => {
+                self.stop_request = true;
+                self.ai_stop_requests.extend(self.stand_in);
+            }
             BusId::Ai(id) => {
                 self.ai_stop_requests.insert(id);
             }
@@ -3193,6 +3220,11 @@ impl Humans {
                 stop,
                 p.door
             );
+        }
+        // (onto the footpath nearest their door where their stop gives them no pavement,
+        // `kerb_doors`: counted)
+        if kerb.is_some() && self.door_walk.contains(&bn.id) {
+            self.walked_to_footpath += 1;
         }
         match kerb {
             Some(leg) => self.walk_street_on(i, w, h, Some(leg)),
@@ -3944,7 +3976,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -3957,7 +3988,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -3968,7 +3998,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("12"),
                 &set(&["Waldweg"]),
                 shown,
@@ -3980,7 +4009,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Waldweg"),
                 &set(&["Waldweg"]),
                 shown,
@@ -3991,7 +4019,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Depot"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4003,7 +4030,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4014,7 +4040,6 @@ mod tests {
         assert_eq!(
             fit(
                 20,
-                &test_stop("Am Teich", "Am Teich"),
                 Some("Kirche"),
                 &set(&["Waldweg"]),
                 shown,
@@ -4022,23 +4047,36 @@ mod tests {
             ),
             None
         );
-        // another platform of the stop's name will do
+        // nor at another object of the stop's name (another line's platform): its people
+        // wait for their own line, whatever the trip's terminus or their destination
+        for termini in [&["Waldweg"][..], &["Endstation"][..]] {
+            assert_eq!(
+                fit(
+                    14,
+                    Some("Kirche"),
+                    &set(termini),
+                    shown,
+                    &duty(0, false)
+                ),
+                None
+            );
+        }
+        // ... unless its line record lists the depot file's terminus: the bus is theirs as
+        // in Omsi.exe
         assert_eq!(
             fit(
                 14,
-                &test_stop("Bauernhof 2", "Bauernhof"),
                 Some("Kirche"),
-                &set(&["Waldweg"]),
+                &set(&["Endstation Grundorf"]),
                 shown,
                 &duty(0, false)
             ),
-            Some(Fit::Duty)
+            Some(Fit::Terminus)
         );
         // the depot file's terminus on the record: the bus is theirs as in Omsi.exe
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation Grundorf"]),
                 shown,
@@ -4055,7 +4093,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4090,7 +4127,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4112,7 +4148,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 shown,
@@ -4123,7 +4158,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation Grundorf"]),
                 shown,
@@ -4140,7 +4174,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 "Endstation",
@@ -4151,7 +4184,6 @@ mod tests {
         assert_eq!(
             fit(
                 10,
-                &here,
                 Some("Kirche"),
                 &set(&["Endstation"]),
                 "Endstation Grundorf",

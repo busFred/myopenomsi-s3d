@@ -10,11 +10,20 @@
 //! So the player's bus stops at its stops for a dwell with the doors open, obeys the lights
 //! and gives way as an AI timetable bus does (`bus_service`, `omsi_traffic`), and moves as
 //! the AI's bodies move (`ai_motion`). The physics and scripts of the player's vehicle do not
-//! run meanwhile; its doors stay shut, and the people see the AI bus in its place, not the
-//! player's bus nor the duty (`Humans::tick` gets no player's bus while it drives): they
-//! board it and wait for it at its stops as for any timetable bus. The other
-//! drivers see the AI bus, not a player's outline (`Traffic::tick` gets no player box while
-//! it drives): what they do round the player's bus is what they do round a timetable bus.
+//! run meanwhile. The people see the player's bus there, on its duty, as in a drive of the
+//! user's, and the AI bus only as the player's driver (`Humans::stand_in`: no bus of theirs,
+//! no body or way of its own for them): the player's doors open and shut as the AI bus's do
+//! at its stops (`Humans::stand_in_doors`, `Humans::set_player_doors`), the people board and
+//! alight through them, and what they would ask of the player's driver - to wait while they
+//! get on or off, to stop - the AI bus's service and script are asked. The other drivers see the
+//! player there as in a drive of the user's (`traffic_link::player_seen`: the player's box,
+//! the player's claim at the junctions, its right of way, the AI bus's indicator as the
+//! player's; the player's claim filed from the indicator, as a user's) and the AI bus only as
+//! the player (`omsi_traffic::StandIn`: it is on no lane for them and they see no claim of its
+//! own; it drives by the grant of its own claim, resolved against theirs, and does not see the
+//! player's vehicle, itself; the bus service's queue tests of the other buses do not count it
+//! either, `Traffic::stand_in`). A recording of such a run has the AI bus once, as the player
+//! (its box; `Traffic::stand_in`), not as a vehicle.
 //! When the bus is lost (taken off the road, its trip over and let go) the player's bus
 //! stands where it was left.
 //!
@@ -27,7 +36,10 @@
 //! `Humans::figure_sight`), the ones in sight logged with their id and time; the people taken
 //! in sight by the people's own test (`Humans::gone`); people held at a kerb in sight; the
 //! nearest unloaded ground (or end of the loaded lanes) along the AI bus's whole route ahead;
-//! and the bus's own holds by reason, with their times. People put down
+//! the bus's own holds by reason, with their times; and what the others made of the player's
+//! bus (`Round`): AI cars yielding to it and following it, its junction claim, its doors open,
+//! the people boarding and alighting, and cars and people inside its box - counted for the
+//! player and for the AI bus driving it as an AI vehicle alike. People put down
 //! in plain view past `humans::APPEAR_IN_VIEW_BEYOND` (the people's own rule) are counted
 //! apart and not listed. A car that parks or pulls out of a parked space (its parked object
 //! put down or taken up where it stands) and anything while the map loads
@@ -244,7 +256,63 @@ pub(crate) struct PlayerWatch {
     /// The position lines.
     lines: Vec<String>,
     next_line: f32,
+    /// What the others made of the player's bus (`Round`).
+    round: Round,
 }
+
+/// What the traffic and the people made of the player's bus over the run, counted alike for
+/// the player (the player's box and claim, `omsi_traffic::sim::PLAYER_ID_BASE`; the player's
+/// bus for the people, `humans::BusId::Player`) and for the AI bus driving it as an AI vehicle
+/// (its car id; `BusId::Ai`): seconds and who.
+#[derive(Default)]
+struct Round {
+    /// AI cars waiting at a junction for it (`Decision::wait_for`).
+    yields: [(f64, HashSet<u64>); 2],
+    /// AI cars following it (their lead: `Seen::Player`, or the AI bus's id).
+    follows: [(f64, HashSet<u64>); 2],
+    /// Its junction claim filed (`Simulation::claims`), and of that refused.
+    claims: [(f64, f64); 2],
+    /// Its doors open for the people (`Humans::bus_doors_open`).
+    doors: [f64; 2],
+    /// The people inside it last frame, and how many got in and how many got out (still among
+    /// the people: on foot); those gone from the people while inside (put out with the bus,
+    /// `Humans::evict`) are counted apart.
+    aboard: [HashSet<u32>; 2],
+    boarded: [usize; 2],
+    alighted: [usize; 2],
+    gone_aboard: [usize; 2],
+    /// Frames in which the player's claim, filed from the indicator as a user's, and the AI
+    /// bus's own claim differed, by kind (`Simulation::stand_in_apart_frames`, indexed by
+    /// `ClaimsApart`), and the seconds of those frames and the car-s of AI cars waiting for the
+    /// player's claim at a junction meanwhile (what a user's indicator claim would have them
+    /// yield to that the bus does not take), by kind.
+    apart: [u32; 4],
+    apart_s: [f64; 4],
+    apart_yield: [f64; 4],
+    /// AI cars' bodies (`omsi_traffic::Vehicle::obb`) and people on the ground inside the
+    /// player's bus's box by more than `traffic::OVERLAP_DEPTH`: seconds and who.
+    cars_inside: (f64, HashSet<u64>),
+    people_inside: (f64, HashSet<u32>),
+    /// Riders of any bus who stepped off onto the footpath nearest their door (their stop gave
+    /// them no pavement), and riders who rode on as no footpath was within reach
+    /// (`Humans::walked_to_footpath`, `Humans::rode_on`).
+    walked_to_footpath: u32,
+    rode_on: usize,
+}
+
+/// Radius (m) round the player's bus within which the people are listed while it is held by
+/// people (diagnostics): a 12 m bus's half length (6 m) and the people test's reach at a
+/// standstill (8 m, `perception::people_reach`), rounded up.
+const HELD_BY_PEOPLE_LOOK: f64 = 15.0;
+
+/// How far (m) past the place the AI bus stops for people its holder is looked for (a
+/// diagnostic bound, no rule reads it: the people test stops a vehicle short of the person who
+/// holds it, by its clearance and their step; the nearest person to that place within this is
+/// named, so a wider bound names the same one).
+const HOLDER_PAST: f64 = 3.0;
+
+/// The player's id in the traffic (`Traffic::tick`'s view of the player).
+const PLAYER_VIEW: u32 = crate::traffic::PLAYER_VIEW_ID;
 
 impl PlayerWatch {
     /// One frame of `dt` s at run second `t_s`: `player` the player's vehicle, `car` the AI
@@ -392,6 +460,42 @@ impl PlayerWatch {
                 self.hold = Some(Hold { since: t_s, why, other, lane });
             }
         }
+        self.count_round(dt, traffic, humans, player, bus);
+        // (held by people: who is round the player's bus, every second - their
+        // separation from its box, negative inside - and what they do)
+        if let (Some(c), Some(h)) = (bus, humans) {
+            if c.ai.last.why == omsi_traffic::Why::People && (t_s - dt).div_euclid(1.0) != t_s.div_euclid(1.0) {
+                let bb = player.ty.def.bounding_box.unwrap_or(crate::traffic::DEFAULT_BOX);
+                let body = omsi_sim::collision::Obb::from_box(bb, player.position, player.heading);
+                // (the holder as the people test has it: the person on the AI bus's way nearest the
+                // place it stops for, `last.stop` past its front - within its half width and a
+                // person's radius of its axis, from its rear to `HOLDER_PAST` past that place)
+                let st = &c.ai.state;
+                let hd = (c.vehicle.heading as f64).to_radians();
+                let (fwd, right) = (glam::DVec2::new(hd.sin(), hd.cos()), glam::DVec2::new(hd.cos(), -hd.sin()));
+                let stop = c.ai.last.stop.unwrap_or(0.0) as f64;
+                let near = h.describe_near(player.position, HELD_BY_PEOPLE_LOOK);
+                let holder = near
+                    .iter()
+                    .filter_map(|(id, p, ground, _)| {
+                        // (on foot: the people test sees nobody inside a bus)
+                        if !*ground {
+                            return None;
+                        }
+                        let rel = (*p - c.vehicle.position).truncate();
+                        let along = rel.dot(fwd) - st.front as f64;
+                        let across = rel.dot(right).abs();
+                        (along >= -(st.front + st.rear) as f64 && along <= stop + HOLDER_PAST && across <= c.ai.half_width as f64 + omsi_traffic::plan::PERSON_RADIUS as f64).then_some((*id, (along - stop).abs()))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(id, _)| id);
+                for (id, p, _, what) in near {
+                    let sep = omsi_sim::collision::Obb::point(p, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&body);
+                    let tag = if Some(id) == holder { " HOLDER" } else { "" };
+                    log::info!("player watch t={t_s:.1}: held by people (stop {:?} m ahead): #{id}{tag} at ({:.2}, {:.2}) sep {sep:.2} m: {what}", c.ai.last.stop, p.x, p.y);
+                }
+            }
+        }
         // the ground along the route ahead
         if let Some(c) = bus {
             if t_s >= self.tiles_next {
@@ -448,6 +552,113 @@ impl PlayerWatch {
                 player.physics.speed.abs() * 3.6,
                 bus.map(|c| format!(", lane {} s {:.1}", c.ai.state.lane, c.ai.state.s)).unwrap_or_default()
             ));
+        }
+    }
+
+    /// One frame of `Round`: [0] the player, [1] the AI bus `bus` driving it as an AI vehicle.
+    fn count_round(&mut self, dt: f32, traffic: &Traffic, humans: Option<&crate::humans::Humans>, player: &VehicleInstance, bus: Option<&crate::traffic::AiCar>) {
+        use omsi_traffic::sim::{player_claim, PLAYER_ID_BASE};
+        use omsi_traffic::Seen;
+        let dt = dt as f64;
+        let r = &mut self.round;
+        r.apart = traffic.sim.stand_in_apart_frames;
+        let apart = traffic.sim.stand_in_apart.map(|k| k as usize);
+        if let Some(k) = apart {
+            r.apart_s[k] += dt;
+        }
+        let me = PLAYER_ID_BASE + PLAYER_VIEW as u64;
+        let bus_id = bus.map(|c| c.id);
+        let bus_ix = bus_id.and_then(|id| traffic.cars.iter().position(|c| c.id == id));
+        let bb = player.ty.def.bounding_box.unwrap_or(crate::traffic::DEFAULT_BOX);
+        let body = omsi_sim::collision::Obb::from_box(bb, player.position, player.heading);
+        for c in traffic.cars.iter().filter(|c| Some(c.id) != bus_id) {
+            let last = &c.ai.last;
+            for (k, waits) in [last.wait_for == Some(me), bus_id.is_some() && last.wait_for == bus_id].into_iter().enumerate() {
+                if waits {
+                    r.yields[k].0 += dt;
+                    r.yields[k].1.insert(c.id);
+                }
+            }
+            if let (Some(k), true) = (apart, last.wait_for == Some(me)) {
+                r.apart_yield[k] += dt;
+            }
+            let follows = [last.lead_seen == Some(Seen::Player(PLAYER_VIEW)), bus_id.is_some() && last.lead_id == bus_id];
+            for (k, f) in follows.into_iter().enumerate() {
+                if f {
+                    r.follows[k].0 += dt;
+                    r.follows[k].1.insert(c.id);
+                }
+            }
+            if (c.vehicle.position.z - player.position.z).abs() <= 3.0 && c.ai.obb().separation(&body) < -crate::traffic::OVERLAP_DEPTH {
+                r.cars_inside.0 += dt;
+                r.cars_inside.1.insert(c.id);
+                // (diagnostics, once a second of the traffic's clock: the car, the player's box and
+                // the AI bus driving it - what each did)
+                let now = traffic.sim.time;
+                if (now - dt).floor() != now.floor() {
+                    let st = &c.ai.state;
+                    let sb = bus.map(|b| {
+                        let bs = &b.ai.state;
+                        let o = b.ai.obb();
+                        format!("lane {} s {:.1} v {:.2} why {:?} wait_for {:?} lead {:?}; car to its own body {:.2} m; its body centre ({:.2}, {:.2}) hd {:.1} half ({:.2}, {:.2}); the player's box centre ({:.2}, {:.2}) hd {:.1} half ({:.2}, {:.2})", bs.lane, bs.s, bs.speed, b.ai.last.why, b.ai.last.wait_for, b.ai.last.lead_id, c.ai.obb().separation(&o), o.center.x, o.center.y, o.heading.to_degrees(), o.half.x, o.half.y, body.center.x, body.center.y, body.heading.to_degrees(), body.half.x, body.half.y)
+                    });
+                    log::info!(
+                        "player watch t={now:.1}: car #{} inside the player's box by {:.2} m: lane {} s {:.1} v {:.2} hd {:.0} pos ({:.2}, {:.2}) why {:?} lead_seen {:?} lead_id {:?} wait_for {:?} change {:?} passing {}; player ({:.2}, {:.2}) hd {:.0}; the AI bus: {}",
+                        c.id,
+                        -c.ai.obb().separation(&body),
+                        st.lane,
+                        st.s,
+                        st.speed,
+                        c.vehicle.heading,
+                        c.vehicle.position.x,
+                        c.vehicle.position.y,
+                        last.why,
+                        last.lead_seen,
+                        last.lead_id,
+                        last.wait_for,
+                        st.change.map(|ch| (ch.to, ch.bypass)),
+                        c.ai.passing.is_some(),
+                        player.position.x,
+                        player.position.y,
+                        player.heading,
+                        sb.unwrap_or_default()
+                    );
+                }
+            }
+        }
+        for (k, vehicle) in [Some(player_claim(PLAYER_VIEW)), bus_ix].into_iter().enumerate() {
+            let Some(vehicle) = vehicle else { continue };
+            if let Some((_, g)) = traffic.sim.claims.iter().find(|(c, _)| c.vehicle == vehicle) {
+                r.claims[k].0 += dt;
+                if !g.go {
+                    r.claims[k].1 += dt;
+                }
+            }
+        }
+        let Some(h) = humans else { return };
+        (r.walked_to_footpath, r.rode_on) = (h.walked_to_footpath, h.rode_on.len());
+        let present: HashSet<u32> = h.everyone().map(|(id, _, _)| id).collect();
+        for (k, id) in [Some(crate::humans::BusId::Player), bus_id.map(crate::humans::BusId::Ai)].into_iter().enumerate() {
+            let Some(id) = id else { continue };
+            if h.bus_doors_open(id) == Some(true) {
+                r.doors[k] += dt;
+            }
+            let now: HashSet<u32> = h.aboard(id).collect();
+            r.boarded[k] += now.difference(&r.aboard[k]).count();
+            for left in r.aboard[k].difference(&now) {
+                if present.contains(left) {
+                    r.alighted[k] += 1;
+                } else {
+                    r.gone_aboard[k] += 1;
+                }
+            }
+            r.aboard[k] = now;
+        }
+        for (id, p, ground) in h.everyone() {
+            if ground && crate::humans::at_level(player.position.z, p.z) && omsi_sim::collision::Obb::point(p, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&body) < -crate::traffic::OVERLAP_DEPTH {
+                r.people_inside.0 += dt;
+                r.people_inside.1.insert(id);
+            }
         }
     }
 
@@ -525,6 +736,38 @@ impl PlayerWatch {
             None if self.tiles_probes > 0 => format!("player watch: unloaded ground along the route ahead: none within the load radius, {} probes", self.tiles_probes),
             None => "player watch: unloaded ground along the route ahead: no route (standing)".to_string(),
         });
+        let r = &self.round;
+        for (k, who) in ["the player (box and claim; the player's bus for the people)", "the AI bus as an AI vehicle"].into_iter().enumerate() {
+            out.push(format!(
+                "player watch: seen as {who}: AI cars yielding to it {:.1} car-s by {} cars, following it {:.1} car-s by {}; its claim filed {:.1} s, refused {:.1} s; doors open {:.1} s; boarded {} alighted {} (gone from the people while aboard {})",
+                r.yields[k].0,
+                r.yields[k].1.len(),
+                r.follows[k].0,
+                r.follows[k].1.len(),
+                r.claims[k].0,
+                r.claims[k].1,
+                r.doors[k],
+                r.boarded[k],
+                r.alighted[k],
+                r.gone_aboard[k],
+            ));
+        }
+        out.push(format!(
+            "player watch: inside the player's bus's box: AI cars {:.1} car-s ({:?}), people on the ground {:.1} person-s ({} people)",
+            r.cars_inside.0,
+            r.cars_inside.1,
+            r.people_inside.0,
+            r.people_inside.1.len(),
+        ));
+        out.push(format!(
+            "player watch: riders of any bus who stepped off onto the footpath nearest their door (no stop pavement): {}; who rode on with none within reach: {}",
+            r.walked_to_footpath, r.rode_on
+        ));
+        let kinds = ["another junction", "another way through the junction", "the player's claim only", "the AI bus's own only"];
+        out.push(format!(
+            "player watch: the player's claim (from the indicator, as a user's) against the AI bus's own: {}",
+            (0..4).map(|k| format!("{} {} frames {:.1} s, AI cars yielding to the player meanwhile {:.1} car-s", kinds[k], r.apart[k], r.apart_s[k], r.apart_yield[k])).collect::<Vec<_>>().join("; ")
+        ));
         if !self.holds_s.is_empty() {
             out.push(format!("player watch: the bus's holds (s by reason): {}", self.holds_s.iter().map(|(k, v)| format!("{k} {v:.1}")).collect::<Vec<_>>().join(", ")));
             for &(since, secs, why, other, lane) in &self.episodes {
@@ -674,7 +917,9 @@ mod tests {
     /// from there on, the station behind it none of them); `Traffic::tick` drives it (its
     /// `BusService`, the light, its body) and `LineFollower::pose` puts the player's bus where
     /// it is: within its lane, at its stop with the doors open, at the red light, through the
-    /// bend after the green. The traffic's network, the light and the stop objects come from
+    /// bend after the green - with the traffic seeing the player's bus there and the AI bus as
+    /// the player (`traffic_link::player_seen`): it files no claim of its own and never waits
+    /// for the player, itself. The traffic's network, the light and the stop objects come from
     /// a world as its tiles bring them (`World::lanes`, `traffic_lights`, `object_positions`).
     #[test]
     fn the_follower_puts_the_players_trip_on_where_its_bus_stands_and_drives_it_to_its_stop_and_the_light() {
@@ -722,8 +967,17 @@ mod tests {
         let half_lane = 3.5 / 2.0;
         let (mut worst, mut served_at, mut stood_at_red, mut on_red) = (0.0f64, None, false, false);
         let mut t = 0.0f32;
+        let (mut own_claims, mut waits_for_itself) = (0usize, 0usize);
         loop {
-            traffic.tick(DT, None);
+            // (the traffic sees the player there and the AI bus as the player, as the harness
+            // gives it: `traffic_link::player_seen`)
+            let stand_in = traffic.cars.iter().find(|c| c.id == id);
+            let seen = crate::traffic_link::player_seen(Some(&player), &[], stand_in);
+            let player_box = crate::traffic_link::show_player(&mut traffic, seen);
+            traffic.tick(DT, player_box);
+            let k = traffic.cars.iter().position(|c| c.id == id).unwrap();
+            own_claims += usize::from(traffic.sim.claims.iter().any(|(c, _)| c.vehicle == k));
+            waits_for_itself += usize::from(traffic.cars[k].ai.last.wait_for == Some(omsi_traffic::sim::PLAYER_ID_BASE));
             assert!(follower.pose(t, &traffic, &mut player), "lost at {t:.1} s: {:?}", follower.lost);
             let c = traffic.cars.iter().find(|c| c.id == id).unwrap();
             let st = &c.ai.state;
@@ -752,5 +1006,6 @@ mod tests {
         assert!((y - 60.0).abs() < 3.0, "served its stop at y {y:.1} ({when:.1} s)");
         assert!(stood_at_red, "never stood at the red light");
         assert!(!on_red, "drove past the red light");
+        assert_eq!((own_claims, waits_for_itself), (0, 0), "the AI bus filed a claim of its own or waited for the player, itself");
     }
 }

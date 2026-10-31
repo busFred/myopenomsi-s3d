@@ -666,11 +666,9 @@ impl ApplicationHandler for App {
                     t.daylight = Some(daylight);
                     let __t2 = Instant::now();
                     t.others = lan_outlines(&self.remotes);
-                    t.others.extend(own_outlines(self.player.as_ref(), &self.placed));
+                    let player_box = show_player(t, player_seen(self.player.as_ref().map(|p| &p.vehicle), &self.placed, None));
                     if !self.paused {
-                        t.player_priority = self.player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
-                        t.player_blinker = self.player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
-                        t.tick(dt, self.player.as_ref().map(|p| player_outline(p)));
+                        t.tick(dt, player_box);
                         // [ROLLBACK r4d-B1] the riders of the timetable buses taken off the road
                         let out = std::mem::take(&mut t.riders_out);
                         if let (Some(h), Some(w)) = (self.humans.as_mut(), self.world.as_ref()) {

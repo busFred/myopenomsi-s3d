@@ -61,11 +61,17 @@ struct CarLinks {
 }
 
 impl CarLinks {
-    fn of(cars: &[AiCar]) -> Self {
+    /// The links of `cars`; the bus driving the player's (`Traffic::stand_in`) follows nobody
+    /// in them: the others' queue tests see the player's box there (`player_behind`,
+    /// `player_close`), not an AI follower besides.
+    fn of(cars: &[AiCar], stand_in: Option<u64>) -> Self {
         let mut links = CarLinks::default();
         for (k, c) in cars.iter().enumerate() {
             // (the first car of an id, as `iter().find` took it)
             links.by_id.entry(c.id).or_insert(k);
+            if Some(c.id) == stand_in {
+                continue;
+            }
             if let Some(lead) = c.ai.last.lead_id {
                 links.followers.entry(lead).or_default().push(k);
             }
@@ -481,6 +487,10 @@ impl Footprint {
         true
     }
 }
+
+/// The player's id among the drivers' views (`omsi_traffic::PlayerView::id`; the LAN
+/// players' are their session ids).
+pub(crate) const PLAYER_VIEW_ID: u32 = 0;
 
 /// The player's vehicle as the traffic sees it: centre, heading (deg), half length, half
 /// width, speed along the heading (m/s, negative when reversing).
@@ -1102,6 +1112,14 @@ pub struct Traffic {
     pub player_blinker: u8,
     /// How long the player's bus has been indicating towards the traffic (s).
     player_signalling: f32,
+    /// The timetable bus that drives the player's vehicle (the harness's `--follow-line`;
+    /// `traffic_link::player_seen`), set before each `tick`: the drivers see it as the player
+    /// (`omsi_traffic::StandIn`), and here it is neither behind nor in front of itself, no
+    /// follower in the other buses' queue tests (`CarLinks::of`) nor a car of their fan
+    /// (`fan_queue`) - the player's box is - and it is never taken off and put back on its
+    /// timetable (`respawn_at`: the player's bus would jump with it). The recording has it once,
+    /// as the player.
+    pub stand_in: Option<u64>,
     /// The LAN players' vehicles (their session ids and boxes as for the player), set
     /// before each `tick`: the cars stop behind them and go round them as round the
     /// player's bus.
@@ -1208,7 +1226,7 @@ fn hhmmss() -> String {
 /// Two bodies count as inside each other past this depth (m): a touch of 20 cm is the
 /// bodies' rounding (`Traffic::overlaps`, the recordings' "overlap" trigger and the
 /// `OMSI_CHECK_OVERLAP` log).
-const OVERLAP_DEPTH: f64 = 0.2;
+pub(crate) const OVERLAP_DEPTH: f64 = 0.2;
 
 /// How far (m) a vehicle put on the road keeps its bodies from every other vehicle's
 /// (`Traffic::spawn_clear`): the stricter of the two tests it replaces (footprints with 1 m
@@ -1826,6 +1844,7 @@ impl Traffic {
             player_priority: false,
             player_blinker: 0,
             player_signalling: 0.0,
+            stand_in: None,
             others: Vec::new(),
             drivers: HashMap::new(),
             driver_pool: Vec::new(),
@@ -3888,7 +3907,8 @@ impl Traffic {
         let others: Vec<crate::bus_service::FanOther> = self
             .cars
             .iter()
-            .filter(|o| o.id != me && o.standing())
+            // (not the bus driving the player's, `stand_in`: the player is no car of the fan)
+            .filter(|o| o.id != me && o.standing() && Some(o.id) != self.stand_in)
             .map(|o| {
                 let st = &o.ai.state;
                 let way: Vec<(usize, f32)> = omsi_traffic::perception::way_lanes(&self.net, st, reach + st.front).into_iter().map(|(l, d)| (l, d - st.front)).collect();
@@ -3958,6 +3978,11 @@ impl Traffic {
             (c.vehicle.position, r, c.id, stop, depart, c.vehicle.ty.clone(), c.ai.state.route.clone())
         };
         if route.get(stop.ri).is_none() {
+            return None;
+        }
+        // (never the bus driving the player's, `stand_in`: the player's bus would jump with it)
+        if self.stand_in == Some(id) {
+            self.respawn_refuse(i, "it drives the player's bus");
             return None;
         }
         // (not again for a while: the tour's bus put back for its departure was taken off
@@ -4073,7 +4098,7 @@ impl Traffic {
         self.player_signalling = if self.player_blinker == out_side || self.player_blinker == 3 { self.player_signalling + dt } else { 0.0 };
         let mut views: Vec<PlayerView> = Vec::new();
         if let Some((c, h, hl, hw, v)) = player {
-            views.push(PlayerView { id: 0, pos: c, heading: h as f32, half_len: hl, half_width: hw, speed: v, still: self.player_still, blinker: self.player_blinker, signalling: self.player_signalling, priority: self.player_priority });
+            views.push(PlayerView { id: PLAYER_VIEW_ID, pos: c, heading: h as f32, half_len: hl, half_width: hw, speed: v, still: self.player_still, blinker: self.player_blinker, signalling: self.player_signalling, priority: self.player_priority });
         }
         for &(id, (c, h, hl, hw, v)) in &others {
             let still = self.others_still.entry(id).or_insert(0.0);
@@ -4082,6 +4107,7 @@ impl Traffic {
         }
         self.others_still.retain(|id, _| others.iter().any(|o| o.0 == *id));
         self.sim.players = views;
+        self.sim.stand_in = self.stand_in.filter(|_| player.is_some()).map(|vehicle| omsi_traffic::StandIn { vehicle, player: PLAYER_VIEW_ID });
         self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb, waits_at, id, approach)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb, waits_at, id: Some(id), approach }).collect();
         // (indexed now: a bus put back on its route below asks the people test, `people_hold_here`)
         self.sim.index_people();
@@ -4093,10 +4119,12 @@ impl Traffic {
         self.note_through_lanes();
         // buses taken off the road this frame as the last resort
         let mut respawn: Vec<usize> = Vec::new();
-        self.links = CarLinks::of(&self.cars);
+        self.links = CarLinks::of(&self.cars, self.stand_in);
         let t_pre = std::time::Instant::now();
         for i in 0..self.cars.len() {
             let way = omsi_traffic::perception::way_lanes(&self.net, &self.cars[i].ai.state, 200.0);
+            // (the player's bus as this bus sees it: none when this bus is the one driving it)
+            let player = player.filter(|_| self.stand_in != Some(self.cars[i].id));
             let (lead_close, follower_close) = if self.cars[i].bus.is_some() { self.bus_queue_flags(i, player) } else { (false, false) };
             // how long somebody has stood right behind this bus (a roadside layover gives
             // way to the traffic it holds up)
@@ -4246,14 +4274,18 @@ impl Traffic {
                         d.bound_left,
                         d.boarders_left
                     );
-                    self.recorder.dwell(self.sim.time, car.id, &d);
+                    // (the bus driving the player's is recorded as the player only, `stand_in`)
+                    if Some(car.id) != self.stand_in {
+                        self.recorder.dwell(self.sim.time, car.id, &d);
+                    }
                 }
                 // the stops whose waiters it pulls in beside
                 ext.serves = [service.stops.front().map(|s| s.id), service.served];
                 // its trip over at the end of its track: on off the route's end
                 ext.trip_over = service.drives_off();
-                if std::mem::take(&mut service.rerouted) {
-                    // (the route it drives now, for the recording)
+                if std::mem::take(&mut service.rerouted) && Some(car.id) != self.stand_in {
+                    // (the route it drives now, for the recording; not the bus driving the
+                    // player's, recorded as the player only, `stand_in`)
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);
                 }
                 // ahead of its timetable: slower
@@ -4313,7 +4345,19 @@ impl Traffic {
         let t_rec = std::time::Instant::now();
         let cars = &self.cars;
         self.recorder.note_people_gone(&std::mem::take(&mut self.people_gone));
-        self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &|i| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default());
+        let type_of = |i: usize| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default();
+        // (the bus driving the player's, `stand_in`, is recorded once, as the player - the
+        // player's box the frame carries: a replay knows no stand-in and would have two bodies
+        // there)
+        match self.sim.stand_in.and_then(|s| cars.iter().position(|c| c.id == s.vehicle)) {
+            Some(si) => {
+                let kept: Vec<usize> = (0..drivers.len()).filter(|&i| i != si).collect();
+                let recorded: Vec<AiVehicle> = kept.iter().map(|&i| drivers[i].clone()).collect();
+                let steer: Vec<_> = steer.iter().filter(|(id, _)| Some(*id) != self.stand_in).cloned().collect();
+                self.recorder.frame(&self.sim, dt, &recorded, &self.people_records, &steer, &|k| type_of(kept[k]));
+            }
+            None => self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &type_of),
+        }
         let t_sim = std::time::Instant::now();
         self.sim.tick(&self.net, dt, &mut drivers);
         self.tick_inner = [(t_rec - t_pre).as_secs_f64(), (t_sim - t_rec).as_secs_f64(), t_sim.elapsed().as_secs_f64()];
@@ -4582,9 +4626,10 @@ impl Traffic {
     }
 
     /// The game changed car `ci`'s way between frames (a timetable bus given its next trip,
-    /// let go, its route extended): into the recording.
+    /// let go, its route extended): into the recording - not the bus driving the player's,
+    /// recorded as the player only (`stand_in`).
     pub fn note_vehicle_changed(&mut self, ci: usize) {
-        if let Some(c) = self.cars.get(ci) {
+        if let Some(c) = self.cars.get(ci).filter(|c| Some(c.id) != self.stand_in) {
             self.recorder.vehicle_changed(self.sim.time, &c.ai);
         }
     }
@@ -4638,9 +4683,11 @@ impl Traffic {
 
     /// Every two bodies inside each other by more than `OVERLAP_DEPTH`: (car, other car or
     /// `usize::MAX` for the player box `Some(k)` of `player` then `others`, where). The AI
-    /// cars by their `footprints` (coupled parts too), the players by their boxes.
+    /// cars by their `footprints` (coupled parts too), the players by their boxes; the bus
+    /// that drives the player's vehicle (`stand_in`) by the player's box only.
     fn overlaps(&self, player: Option<PlayerBox>, others: &[(u32, PlayerBox)]) -> Vec<(usize, usize, Option<usize>, DVec2)> {
-        let feet = self.footprints();
+        let stand_in = self.stand_in.filter(|_| player.is_some()).and_then(|id| self.cars.iter().position(|c| c.id == id));
+        let feet: Vec<Footprint> = self.footprints().into_iter().filter(|f| Some(f.car) != stand_in).collect();
         let boxes: Vec<Footprint> = player
             .iter()
             .chain(others.iter().map(|(_, b)| b))

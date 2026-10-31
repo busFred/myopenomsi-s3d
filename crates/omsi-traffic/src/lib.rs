@@ -33,4 +33,4 @@ pub use junction::{Cut, Foe, FoeKind, Junction, Junctions, Movement, PedCrossing
 pub use perception::{Headway, JunctionView, NeighbourView, Perception, Seen, SignalView};
 pub use plan::{Plan, Start, Why};
 pub use reservation::{Claim, Grant, Hold};
-pub use sim::{Decision, External, Parked, Passing, Person, PlayerView, Simulation, Vehicle};
+pub use sim::{Decision, External, Parked, Passing, Person, PlayerView, Simulation, StandIn, Vehicle};

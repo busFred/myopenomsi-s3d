@@ -1687,8 +1687,10 @@ fn reentry_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     let hr = (me.heading as f64).to_radians();
     let fwd = DVec2::new(hr.sin(), hr.cos());
     let reach = (left + st.front + st.rear) as f64;
+    // (a stand-in is its player, below: `sim::StandIn`)
+    let stand_in = sim.stand_in.map(|s| s.vehicle);
     for o in vehicles {
-        if o.id == me.id || (o.pos.z - me.pos.z).abs() > 3.0 {
+        if o.id == me.id || Some(o.id) == stand_in || (o.pos.z - me.pos.z).abs() > 3.0 {
             continue;
         }
         if (o.pos - me.pos).truncate().length() > reach + (o.state.front + o.half_width) as f64 {

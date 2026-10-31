@@ -8,7 +8,8 @@
 //! stands where it starts; with `--follow-line` it drives its duty's trip as an AI timetable
 //! bus drives one (`follow_line::LineFollower`: the departure's own AI vehicle, of its AI
 //! group, takes the player's departure on where the player's bus stands, and the player's
-//! vehicle is put where that bus's body is every frame, its own physics not run). With
+//! vehicle is put where that bus's body is every frame, its own physics not run; the traffic
+//! and the people see the player's bus there, and that bus only as its driver). With
 //! `--watch-player` (and `--follow-line`) the summary tells what appeared, vanished and held
 //! round the player (`follow_line::PlayerWatch`).
 
@@ -425,6 +426,8 @@ pub(crate) fn run_offscreen(
         log::warn!("--follow-line needs --drive, --schedule with traffic and a duty (--line/--tour or a situation's): the player's bus stands");
     }
     let mut watch = (args.follow_line || args.watch_player).then(crate::follow_line::PlayerWatch::default);
+    // (the player's doors last set by the AI bus driving it: shut when it is lost)
+    let mut doors_by_stand_in = false;
     for i in 0..total_frames {
         let t_s = i as f32 * dt;
         if server {
@@ -702,13 +705,12 @@ pub(crate) fn run_offscreen(
                 f.place(t_s, s, d, &world, t, &renderer, &mut scene, &p.vehicle);
             }
             t.others = lan_outlines(&remotes_off);
-            // (the player's bus driven by an AI bus, `--follow-line`: the drivers see that bus
-            // in its place, not a player's outline over it)
-            let driven = follower.as_ref().is_some_and(|f| f.driving());
-            t.others.extend(own_outlines(player.as_ref().filter(|_| !driven), &[]));
-            t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
-            t.player_blinker = player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
-            t.tick(dt, player.as_ref().filter(|_| !driven).map(|p| player_outline(p)));
+            // (the player's bus driven by an AI bus, `--follow-line`: the drivers see the player
+            // there, and that bus only as the player, `traffic_link::player_seen`)
+            let stand_in = follower.as_ref().filter(|f| f.driving()).and_then(|f| f.car).and_then(|id| t.cars.iter().find(|c| c.id == id));
+            let seen = player_seen(player.as_ref().map(|p| &p.vehicle), &[], stand_in);
+            let player_box = show_player(t, seen);
+            t.tick(dt, player_box);
             // the riders of the timetable buses taken off the road
             let out = std::mem::take(&mut t.riders_out);
             if let Some(h) = humans_off.as_mut() {
@@ -1113,22 +1115,30 @@ pub(crate) fn run_offscreen(
             };
             h.eye = Some(humans::Eye::of(&eye_cam, view_aspect).widened(triple_extent(&settings, &eye_cam, size.0, size.1)));
             h.set_remote_buses(remotes_off.remotes.iter().map(|(id, r)| (*id, r.vehicle())));
-            // (`--follow-line`: while the AI bus drives the player's trip it is the bus the people
-            // see and board there; the player's bus, its doors shut in the same place, is none
-            // of theirs, nor is the duty - else its waiters held the AI bus at its doors to the
-            // boarding cap, waiting to board the player's)
-            let driven = follower.as_ref().is_some_and(|f| f.driving());
-            let duty_seen = duty.as_ref().filter(|_| !driven);
-            h.set_duty(duty_seen);
-            h.set_player_next_stop(duty_seen.and_then(|d| d.trip().stops.get(d.next_stop)));
+            // (`--follow-line`: while the AI bus drives the player's trip the people see the
+            // player's bus there, on its duty, and that bus only as the player's driver,
+            // `Humans::stand_in`)
+            h.stand_in = follower.as_ref().filter(|f| f.driving()).and_then(|f| f.car);
+            h.set_duty(duty.as_ref());
+            h.set_player_next_stop(duty.as_ref().and_then(|d| d.trip().stops.get(d.next_stop)));
             let took = h.tick(
                 dt,
                 &world,
-                player.as_ref().filter(|_| !driven).map(|p| &p.vehicle),
+                player.as_ref().map(|p| &p.vehicle),
                 traffic.as_ref(),
                 &renderer,
                 &mut scene,
             );
+            // ... and its doors open as that bus's do at its stops (`Humans::stand_in_doors`; the
+            // player's scripts do not run while it drives), shut once it is lost
+            if let Some(p) = player.as_mut() {
+                if h.stand_in.is_some() {
+                    h.set_player_doors(&mut p.vehicle, h.stand_in_doors);
+                    doors_by_stand_in = true;
+                } else if std::mem::take(&mut doors_by_stand_in) {
+                    h.set_player_doors(&mut p.vehicle, (false, false));
+                }
+            }
             // validators used: the bus's `ev_Stamper` sound
             for bus in h.take_stamped() {
                 match bus {
