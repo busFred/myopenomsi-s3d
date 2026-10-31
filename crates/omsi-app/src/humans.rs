@@ -6686,7 +6686,7 @@ impl Humans {
     /// Everybody within `radius` of `at` (diagnostics, the harness's `follow_line::PlayerWatch`):
     /// id, position, on the ground, and what they do (their state - `Standing` apart from a
     /// stroller - their task, bus and stop as a passenger, standing time).
-    pub(crate) fn describe_near(&self, at: DVec3, radius: f64) -> Vec<(u32, DVec3, String)> {
+    pub(crate) fn describe_near(&self, at: DVec3, radius: f64) -> Vec<(u32, DVec3, bool, String)> {
         self.people
             .iter()
             .filter(|p| !p.remote && (p.position - at).length() <= radius)
@@ -6696,7 +6696,7 @@ impl Humans {
                     State::Pax(x) => format!("{} bus {:?} inside {:?} stop {:?} st {}", x.task.name(), x.bus, x.inside, x.stop, x.st),
                     s => s.name().to_string(),
                 };
-                (p.id, p.position, format!("{what} on the ground {} for {:.1} s", p.place == Place::Ground, p.t_state))
+                (p.id, p.position, p.place == Place::Ground, format!("{what} on the ground {} for {:.1} s", p.place == Place::Ground, p.t_state))
             })
             .collect()
     }

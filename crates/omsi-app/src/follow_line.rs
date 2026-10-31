@@ -477,7 +477,11 @@ impl PlayerWatch {
                 let near = h.describe_near(player.position, HELD_BY_PEOPLE_LOOK);
                 let holder = near
                     .iter()
-                    .filter_map(|(id, p, _)| {
+                    .filter_map(|(id, p, ground, _)| {
+                        // (on foot: the people test sees nobody inside a bus)
+                        if !*ground {
+                            return None;
+                        }
                         let rel = (*p - c.vehicle.position).truncate();
                         let along = rel.dot(fwd) - st.front as f64;
                         let across = rel.dot(right).abs();
@@ -485,7 +489,7 @@ impl PlayerWatch {
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(id, _)| id);
-                for (id, p, what) in near {
+                for (id, p, _, what) in near {
                     let sep = omsi_sim::collision::Obb::point(p, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&body);
                     let tag = if Some(id) == holder { " HOLDER" } else { "" };
                     log::info!("player watch t={t_s:.1}: held by people (stop {:?} m ahead): #{id}{tag} at ({:.2}, {:.2}) sep {sep:.2} m: {what}", c.ai.last.stop, p.x, p.y);
