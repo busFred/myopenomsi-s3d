@@ -220,20 +220,32 @@ fn run_entry(zebra: bool, headway: f32, secs: f32, warm: f32, seed: u64) -> Entr
     run
 }
 
-/// The extra critical headway (s) the car-following model (IDM) asks of this ring over HCM 6's
-/// drivers, and so the lower bound of the entry's flow over the HCM capacity: the HCM 6 single-lane
-/// entry model c = 1380 exp(-1.02e-3 v_c) is c = (3600/tf) exp(-v_c (tc - tf/2)/3600) with
-/// follow-up tf = 2.6 s and critical headway tc = 5.0 s (A = 3600/tf, B = (tc - tf/2)/3600; ALDOT
-/// Roundabout Planning, Design, and Operations Manual (Dec 2015), Table 2.3 and Equation 2.3,
+/// The ring's circulating speed (m/s): sqrt of the drivers' bend acceleration times its 12.5 m radius.
+const RING_SPEED: f32 = 4.8;
+/// The IDM room (m) a circulating car at `RING_SPEED` needs behind an entrant moving off from rest
+/// to follow it braking no harder than comfortably (`reservation::follow_room`): s* sqrt(a/b) with
+/// s* = s0 + v T + v Δv / (2 sqrt(a b)), a = 1.8, b = 2.0 m/s², s0 = 2 m, T = 1.3 s.
+const FOLLOW_ROOM: f32 = 13.6;
+/// The entrant's length (m): `car`'s body.
+const ENTRANT_LEN: f32 = 4.4;
+/// The time gap (s) the entrant keeps behind the circulating car it lets by: it reaches the merge's
+/// start no sooner than this after that car's rear (SUMO's `MSLink::getZipperSpeed`, tTarget = tf +
+/// headwayTime; the drivers' T).
+const ENTRANT_TAU: f32 = 1.3;
+
+/// The extra critical headway (s) the model asks of this ring over HCM 6's drivers, and so the
+/// lower bound of the entry's flow over the HCM capacity: the HCM 6 single-lane entry model
+/// c = 1380 exp(-1.02e-3 v_c) is c = (3600/tf) exp(-v_c (tc - tf/2)/3600) with follow-up tf = 2.6 s
+/// and critical headway tc = 5.0 s (A = 3600/tf, B = (tc - tf/2)/3600; ALDOT Roundabout Planning,
+/// Design, and Operations Manual (Dec 2015), Table 2.3 and Equation 2.3,
 /// https://www.dot.state.al.us/publications/Design/pdf/TrafficSafetyOp/RoundaboutPlanningDesignOpManual.pdf).
-/// A longer critical headway tc + d scales it by exp(-v_c d / 3600). Here
-/// d = 4.1 s: this ring circulates at ~4.8 m/s (sqrt of the drivers' bend acceleration times its
-/// 12.5 m radius), where the IDM lets a car in ahead of a circulating one only if that is
-/// `reservation::follow_room` behind it, s* sqrt(a/b) with s* = s0 + v T + v Δv / (2 sqrt(a b))
-/// = 13.6 m for a = 1.8, b = 2.0 m/s², s0 = 2 m, T = 1.3 s and an entrant from rest: 2.8 s at
-/// 4.8 m/s; and the entrant itself keeps its time gap T = 1.3 s behind the car it lets by. The
-/// flow is held to between exp(-v_c d / 3600) of HCM's capacity and HCM's capacity itself.
-const IDM_LAG: f32 = 2.8 + 1.3;
+/// A longer critical headway tc + d scales it by exp(-v_c d / 3600). The model lets an entrant in
+/// ahead of a circulating car only when that car is `FOLLOW_ROOM` behind the entrant's rear, i.e.
+/// `FOLLOW_ROOM` + `ENTRANT_LEN` behind the merge's start where the entrant's front waits, and the
+/// entrant moves off from there `ENTRANT_TAU` after the car it lets by: d = (`FOLLOW_ROOM` +
+/// `ENTRANT_LEN`) / `RING_SPEED` + `ENTRANT_TAU` = 5.05 s. The flow is held to between
+/// exp(-v_c d / 3600) of HCM's capacity and HCM's capacity itself.
+const IDM_LAG: f32 = (FOLLOW_ROOM + ENTRANT_LEN) / RING_SPEED + ENTRANT_TAU;
 
 fn check(zebra: bool) {
     let seed = std::env::var("R11R_SEED").ok().and_then(|e| e.parse().ok()).unwrap_or(11);
