@@ -2573,7 +2573,7 @@ mod crossing_tests {
 
 #[cfg(test)]
 mod signal_tests {
-    use super::signal_ahead;
+    use super::{line_before_walks, signal_ahead};
     use crate::sim::Simulation;
     use glam::DVec3;
     use omsi_sim::traffic::{LaneBuilder, LaneKey, LaneKind, Network, TrafficLightController};
@@ -2600,6 +2600,29 @@ mod signal_tests {
         let ctl = TrafficLightController::new(vec![vec![(6, 50.0), (0, 10.0)], vec![(0, 60.0)]], 60.0);
         let sim = Simulation::new(&net, vec![ctl]);
         (net, sim)
+    }
+
+    #[test]
+    fn j4_d1_a_red_line_laid_after_a_crosswalk_is_waited_at_before_the_crosswalk() {
+        // an approach x 0..20, its lit piece x 20..30 (the line at 20), a 3 m crosswalk
+        let lane = |x0: f64, x1: f64, kind: LaneKind, w: f32| LaneBuilder::polyline(vec![DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)], kind, w);
+        let mut net = Network { lanes: vec![lane(0.0, 20.0, LaneKind::Street, 3.5), lane(20.0, 30.0, LaneKind::Street, 3.5), lane(18.5, 18.5 + 1e-3, LaneKind::Sidewalk, 3.0)], ..Default::default() };
+        let way = [(0usize, 0.0f32), (1, 20.0)];
+        let walk_at = |net: &mut Network, lane: usize, sa: f32| {
+            net.walks = vec![Vec::new(); 3];
+            net.walks[lane].push((2, sa, 0.0));
+        };
+        // cut 1.5 m before the line: a 4.4 m body on the line stands on it - the zebra stop instead
+        walk_at(&mut net, 0, 18.5);
+        assert_eq!(line_before_walks(&net, &way, 20.0, 4.4), 18.5 - crate::plan::ZEBRA_STOP);
+        // 10 m before the line: out of the waiting body's reach - the line stays
+        walk_at(&mut net, 0, 10.0);
+        assert_eq!(line_before_walks(&net, &way, 20.0, 4.4), 20.0);
+        // ... but under a 12 m bus's body
+        assert_eq!(line_before_walks(&net, &way, 20.0, 12.0), 10.0 - crate::plan::ZEBRA_STOP);
+        // past the line: the line stays
+        walk_at(&mut net, 1, 2.0);
+        assert_eq!(line_before_walks(&net, &way, 20.0, 4.4), 20.0);
     }
 
     #[test]
