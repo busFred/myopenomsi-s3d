@@ -12,6 +12,7 @@
 //! traffic_cases converge <fixture>... [--all]
 //! traffic_cases watch <fixture> --ids 1,2 [--from t] [--to t] [--every 0.5] [--reset] [--people]
 //! traffic_cases foes <fixture> <lane>...
+//! traffic_cases lines-on-walks <fixture> --len 4.4,11.8
 //! traffic_cases people <rec>... [--every 0.2] [--radius 200] [--until S] [--json out.json]
 //! traffic_cases viewer <trace.json> <out.html> [--title ...]
 //! traffic_cases viewer2 <left-trace.json> <right-trace.json> <out.html> [--title T] [--left-label L] [--right-label R]
@@ -118,6 +119,7 @@ fn main() {
         Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
+        Some("lines-on-walks") if args.len() >= 3 => lines_on_walks(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
         Some("viewer") if args.len() >= 4 => {
             viewer(Path::new(&args[2]), Path::new(&args[3]), &args[4..])
@@ -6353,6 +6355,40 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
             println!("  wide lane {ol} {:?} yields {} apart {:.2} mine {:.1}..{:.1} theirs {:.1}..{:.1}", f.kind, f.yields, f.apart, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1);
         }
     }
+    Ok(())
+}
+
+/// `lines-on-walks <fixture>`: the lit lanes (a light's stop line at the lane's start) with a
+/// crosswalk cutting a lane leading in so near the line that a body waiting with its front on the line
+/// stands on it (the walk's width either side of its cut, `Network::walks`): the lines
+/// `perception::line_before_walks` moves to the walk's zebra stop (user decision J4-D1), for a lane
+/// leading straight in (a walk two lanes back is not looked for here). Counted for the shortest and the
+/// longest of the body lengths `--len` names (m).
+fn lines_on_walks(fixture: &Path, args: &[String]) -> Res<()> {
+    let (r, _) = grown(fixture, true)?;
+    let net = &r.net;
+    let lens: Vec<f32> = opt(args, "--len").ok_or("--len a,b needed")?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let (short, long) = (lens.iter().copied().fold(f32::INFINITY, f32::min), lens.iter().copied().fold(0.0f32, f32::max));
+    let (mut n_short, mut n_long) = (0usize, 0usize);
+    for (l, lane) in net.lanes.iter().enumerate() {
+        let Some((ctl, li)) = lane.traffic_light else { continue };
+        for &p in net.prev.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let plen = net.lanes[p].length();
+            for &(w, sa, _) in net.walks.get(p).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let before = plen - sa;
+                let half = net.lanes.get(w).map(|wl| wl.width * 0.5).unwrap_or(0.0);
+                let near = before - half;
+                if near < short {
+                    n_short += 1;
+                }
+                if near < long {
+                    n_long += 1;
+                    println!("lit lane {l} (light {ctl}.{li}) from lane {p}: walk {w} cut {before:.1} m before the line, its near edge {near:.1} m{}", if near < short { " [every body]" } else { "" });
+                }
+            }
+        }
+    }
+    println!("lines with a walk under a waiting body: {n_short} for the shortest body ({short:.1} m), {n_long} for the longest ({long:.1} m)");
     Ok(())
 }
 
