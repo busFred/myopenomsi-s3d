@@ -1093,6 +1093,80 @@ mod tests {
         }
     }
 
+    /// A straight north to y = 50, a quarter turn right of radius `r` (centre (r, 50)), then a
+    /// straight east: the point `s` m along it.
+    fn quarter(r: f64, s: f64) -> DVec3 {
+        let arc = r * std::f64::consts::FRAC_PI_2;
+        if s < 50.0 + arc {
+            bend(r, s)
+        } else {
+            DVec3::new(r + (s - 50.0 - arc), 50.0 + r, 10.0)
+        }
+    }
+
+    /// Drive `body` through `quarter(r, _)` at `speed` in a lane `lane` m wide with its edges
+    /// set: how far the body's inner and outer sides pass the lane's edges (m, + = past) while
+    /// the rotation point is before the bend's end and after it: ((inner, outer) entering and
+    /// on the arc, (inner, outer) leaving it).
+    fn through_a_quarter_turn(body: &mut AiBody, (front, rear, half): (f32, f32, f32), r: f64, speed: f32, lane: f64) -> ((f64, f64), (f64, f64)) {
+        let dt = 1.0 / 30.0;
+        let arc = r * std::f64::consts::FRAC_PI_2;
+        let mut s = 20.0f64;
+        let heading = move |x: f64| if x < 50.0 { 0.0 } else if x < 50.0 + arc { ((x - 50.0) / r).to_degrees() as f32 } else { 90.0 };
+        body.place_in_lane(&|d| quarter(r, s + d as f64), Some(&|d| heading(s + d as f64)), None, None, speed);
+        let centre = DVec2::new(r, 50.0);
+        let (mut on, mut off) = ((f64::MIN, f64::MIN), (f64::MIN, f64::MIN));
+        while s < 50.0 + arc + 40.0 {
+            s += (speed * dt) as f64;
+            let at = s;
+            body.step_in_lane(dt, speed, &|d| quarter(r, at + d as f64), Some(&|d| heading(at + d as f64)), None, None);
+            let fwd = dir(body.heading);
+            let right = DVec2::new(fwd.y, -fwd.x);
+            let o = body.position.truncate();
+            let leaving = s + body.rot_long as f64 >= 50.0 + arc;
+            for (long, lat) in [(front, half), (front, -half), (-rear, half), (-rear, -half), (body.rot_long, half), (body.rot_long, -half)] {
+                let p = o + fwd * long as f64 + right * lat as f64;
+                // (beside the first straight: x = +-lane/2; round the centre; beside the last
+                // straight: y = 50 + r -+ lane/2, the inside to the south)
+                let (inner, outer) = if p.y < 50.0 {
+                    (p.x - lane * 0.5, -p.x - lane * 0.5)
+                } else if p.x < r {
+                    let d = (p - centre).length();
+                    ((r - lane * 0.5) - d, d - (r + lane * 0.5))
+                } else {
+                    ((50.0 + r - lane * 0.5) - p.y, p.y - (50.0 + r + lane * 0.5))
+                };
+                let m = if leaving { &mut off } else { &mut on };
+                m.0 = m.0.max(inner);
+                m.1 = m.1.max(outer);
+            }
+        }
+        (on, off)
+    }
+
+    /// Through a bend and out of it (K2-D3): BJ6123 swinging wide in a 3.5 m lane at R 10, 15,
+    /// 25 and 40 and a car at R 12, a straight, a quarter turn and a straight: entering and on
+    /// the arc the inner side never passes the lane's inner edge, and leaving it the body
+    /// comes back to its lane without running over either edge by more than it did on the arc
+    /// (the steering takes the line's curvature at the rotation point, `AiBody::drive`; taken
+    /// ahead by as far as the vehicle runs while the wheel turns half way to the bend's lock at
+    /// its rate, it turned in early and put the BJ6123's inner side 0.43 m past at R 10).
+    #[test]
+    fn through_a_bend_and_out_the_inner_side_keeps_to_the_edge() {
+        let lane = 3.5f64;
+        for (name, body_def, r, speed) in [("BJ6123", bj6123(), 10.0f64, 3.0f32), ("BJ6123", bj6123(), 15.0, 4.0), ("BJ6123", bj6123(), 25.0, 5.0), ("BJ6123", bj6123(), 40.0, 7.0), ("BJ6123", bj6123(), 40.0, 11.0), ("car", golf_body(), 12.0, 6.0), ("car", golf_body(), 25.0, 10.0), ("car", golf_body(), 60.0, 15.0)] {
+            let (def, front, rear, half) = body_def;
+            let mut body = AiBody::new(&def, MotionKind::Road);
+            body.keep_swept_in_lane(front, half);
+            body.set_lane_edges(lane as f32 * 0.5, lane as f32 * 0.5);
+            let (on, off) = through_a_quarter_turn(&mut body, (front, rear, half), r, speed, lane);
+            eprintln!("{name} R {r} at {speed} m/s: entering and on the arc inner {:.3} outer {:.3}; leaving inner {:.3} outer {:.3}", on.0, on.1, off.0, off.1);
+            assert!(on.0 < 0.05, "{name} R {r}: inner side {:.3} m past the edge entering the bend", on.0);
+            assert!(off.0 < 0.05, "{name} R {r}: inner side {:.3} m past the edge leaving the bend", off.0);
+            assert!(off.1 <= on.1.max(0.0) + 0.05, "{name} R {r}: outer side {:.3} m past the edge leaving the bend, {:.3} on it", off.1, on.1);
+        }
+    }
+
     /// The careful driver's line takes the lane's curvature only up to the way's own and 0
     /// where their signs differ: a lane heading that turns left while the way's points go
     /// straight or right, and one that turns more than the way, do not move the body.
