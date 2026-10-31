@@ -4309,9 +4309,19 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
                     place = behind_the_queue(net, at.queues, area, &longer, me.id, me.pos).map(behind);
                 }
             }
+            // (a place they would reach only across or along a lane is not theirs: they walk to a
+            // place on the people's network, never a straight line through a lane - SUMO's persons
+            // move on sidewalks, walking areas and crossings only - and take one on their own side,
+            // the no-place chain below, whose places are all reached off the lanes)
+            let kerb_z = next.at(net, 0.0).0.z;
+            let off_lanes = |q: DVec2| !within_lanes(net, q.extend(kerb_z), &footprint_reach);
+            let unreached = place.is_some_and(|(q, _, _)| off_lanes(me.pos) && !way_off_lanes(&[me.pos, q], &off_lanes));
+            if unreached {
+                place = None;
+            }
             // (a stroller with no place at this kerb - a junction's corner of crossing pieces, full -
             // goes another way on from here, as a stroll picks one at a node, `PedNet::next_leg`)
-            if let (None, true, Some(p)) = (place, walk.roam, ped) {
+            if let (None, true, Some(p), false) = (place, walk.roam, ped, unreached) {
                 let here = walk.legs[walk.leg];
                 if let Some(node) = p.end_node(net, &here) {
                     for _ in 0..p.out.get(node).map(|v| v.len()).unwrap_or(0) {
