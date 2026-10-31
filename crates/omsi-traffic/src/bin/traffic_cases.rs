@@ -118,6 +118,7 @@ fn main() {
         Some("sides") if args.len() >= 3 => sides(&args[2..]),
         Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
+        Some("lanecount") if args.len() >= 4 => lanecount(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lines-on-walks") if args.len() >= 3 => lines_on_walks(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -6192,6 +6193,55 @@ fn converge(args: &[String]) -> Res<()> {
         total += lines.len();
     }
     println!("TOTAL {total}");
+    Ok(())
+}
+
+/// `lanecount <fixture> --lanes a,b [--from t] [--to t]`: the reset-at-keyframes replay of a
+/// recording, counting per named lane the distinct vehicles that were on it between the times
+/// (the replay's clock), and by the lane each came from (the lane it was on the frame before it
+/// first stood on the named one; `-` seen there first) - a route's traffic volume, read alike
+/// from recordings made under different rules.
+fn lanecount(fixture: &Path, args: &[String]) -> Res<()> {
+    let lanes: Vec<usize> = opt(args, "--lanes").unwrap_or("").split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let from: f64 = opt(args, "--from").map(|s| s.parse()).transpose()?.unwrap_or(f64::NEG_INFINITY);
+    let to: f64 = opt(args, "--to").map(|s| s.parse()).transpose()?.unwrap_or(f64::INFINITY);
+    let mut r = Replay::load(fixture)?;
+    r.free_run = false;
+    if !r.at(0) {
+        return Err("the fixture has no keyframe".into());
+    }
+    let mut last: HashMap<u64, usize> = HashMap::new();
+    let mut seen: HashMap<usize, HashMap<u64, Option<usize>>> = HashMap::new();
+    let mut classes: HashMap<(u64, usize), (String, bool)> = HashMap::new();
+    while r.step() {
+        let t = r.sim.time;
+        if t > to {
+            break;
+        }
+        for v in &r.vehicles {
+            let lane = v.state.lane;
+            let prev = last.insert(v.id, lane);
+            if t >= from && lanes.contains(&lane) {
+                seen.entry(lane).or_default().entry(v.id).or_insert(prev.filter(|&p| p != lane));
+                classes.entry((v.id, lane)).or_insert_with(|| (format!("{:?}", v.class), omsi_traffic::access::is_open_at(&r.net, lane, v)));
+            }
+        }
+    }
+    for l in &lanes {
+        let m = seen.get(l).cloned().unwrap_or_default();
+        let mut via: BTreeMap<String, usize> = BTreeMap::new();
+        for p in m.values() {
+            *via.entry(p.map_or("-".to_string(), |p| p.to_string())).or_default() += 1;
+        }
+        println!("LANE {l} vehicles {} via {:?}", m.len(), via);
+        // (`--list`: each one, its class and whether the lane was open to it, `access::is_open_at`)
+        if args.iter().any(|a| a == "--list") {
+            for (id, p) in &m {
+                let (class, open) = classes.get(&(*id, *l)).cloned().unwrap_or_default();
+                println!("  #{id} from {p:?} {class} open {open}");
+            }
+        }
+    }
     Ok(())
 }
 
