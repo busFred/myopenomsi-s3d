@@ -2934,6 +2934,23 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     }
                 }
             }
+            // a foe's body standing across my way at the junction ahead (`Seen::Body`: not on my
+            // lanes; under `STANDING_SPEED` - one moving across clears my way by itself) that
+            // moves off from there by itself: refused at this junction last frame, waiting for its
+            // go, or serving its stop (`Simulation::claims`; one standing for anything else is an
+            // obstacle, passed round, `squeeze`): I rest
+            // at the last place short of where following it brings me to rest with my body on no
+            // band of the way through (`wait_bands`, `legal_before`), as behind a zipper foe -
+            // never in a meeting place, where the foe needs the room to move off (a left turner
+            // standing across a lead-in has its swept place over the lead-in's end). SUMO
+            // measures the gap to a foe on a crossing link to the conflict area, not to the foe's
+            // body (`MSLink::getLeaderInfo`)
+            if let (Seen::Body(o), Some(j)) = (l.what, p.junction.as_ref()) {
+                let waiting = l.speed < STANDING_SPEED && sim.claims.iter().any(|(c, g)| c.vehicle == o && c.junction == j.junction && (!g.go || c.serving));
+                if let Some(at) = legal_before(&wait_bands(net, sim, j), me, my_front).filter(|&at| waiting && at < my_front) {
+                    min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
+                }
+            }
         }
     }
 

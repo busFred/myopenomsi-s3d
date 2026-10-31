@@ -225,3 +225,53 @@ fn k3_a_turner_in_a_lead_ins_swept_place_does_not_wait_for_the_lead_ins_queue() 
     let g = resolve(&js, &[up, short]);
     assert_eq!(g.iter().find(|g| g.vehicle == 2).unwrap().wait_for, Some(1), "{g:?}");
 }
+
+/// A car rolling on its go behind a body standing across its way rests short of the meeting
+/// places of its way through, not on one (SUMO measures the gap to a foe on a crossing link to
+/// the conflict area, `MSLink::getLeaderInfo`): eastbound piece 0 crosses northbound piece 2 at
+/// x 0, where a 12 m bus stands serving its stop, its body across piece 0, and piece 1 (northbound)
+/// at x -6. Following the bus's body the car would rest with its body over piece 1's crossing; it
+/// rests before it (viz2 j40: #40312 stood in the turner #38817's swept place, each held by the
+/// other's body).
+#[test]
+fn k3_a_car_behind_a_body_across_its_way_rests_short_of_the_meeting_places() {
+    use omsi_sim::traffic::AiState;
+    use omsi_traffic::{Simulation, Vehicle, VehicleClass};
+    let mut net = Network::default();
+    net.lanes.push(keyed(line((-60.0, 0.0), (40.0, 0.0)), 2, 9, 0));
+    net.lanes.push(keyed(line((-6.0, -40.0), (-6.0, 40.0)), 2, 9, 1));
+    net.lanes.push(keyed(line((0.0, -40.0), (0.0, 40.0)), 2, 9, 2));
+    for l in &mut net.lanes {
+        l.priority = 128.0;
+    }
+    net.link(1.5);
+    net.compute_conflicts();
+    let mut sim = Simulation::new(&net, Vec::new());
+    let (j, m0) = sim.junctions.of_lane[&0];
+    let m1 = sim.junctions.of_lane[&1].1;
+    let band = sim.junctions.nodes[j].movements[m0].foes.iter().find(|f| f.movement == m1).expect("piece 0 crosses piece 1").mine.0 - 1.0;
+    let mk = |id: u64, lane: usize, s: f32, speed: f32, half: f32| {
+        let mut st = AiState::new(lane, s, id);
+        st.speed = speed;
+        st.front = half;
+        st.rear = half;
+        st.length = 2.0 * half;
+        st.max_speed_kmh = 50.0;
+        let mut v = Vehicle::new(id, VehicleClass::Car, st, 1.25, id * 7919);
+        v.fresh = 0.0;
+        v
+    };
+    // the bus: its front 1 m past piece 0, standing at its stop
+    let mut bus = mk(1, 2, 40.0 + 1.0 - 6.0, 0.0, 6.0);
+    bus.external.stop_at = Some(bus.state.front + 0.1);
+    bus.external.at_stop = true;
+    let car = mk(2, 0, 20.0, 8.0, 2.3);
+    let mut cars = vec![bus, car];
+    for _ in 0..(12.0 * 30.0) as usize {
+        cars[0].external.stop_at = Some(cars[0].state.front + 0.1);
+        sim.tick(&net, 1.0 / 30.0, &mut cars);
+    }
+    let c = cars.iter().find(|v| v.id == 2).unwrap();
+    assert!(c.state.speed < 0.3, "the car stands: {:?}", c.state);
+    assert!(c.state.s + c.state.front <= band + 0.3, "its front at {:.1} m, piece 1's band from {band:.1} m", c.state.s + c.state.front);
+}
