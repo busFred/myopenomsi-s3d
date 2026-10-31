@@ -112,7 +112,8 @@ pub fn people_reach(v: f32) -> f32 {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalView {
-    /// Distance from the origin to the stop line.
+    /// Distance from the origin to the line the car stops at: the light's stop line, or the zebra stop
+    /// before a crosswalk the body waiting there would stand on (`line_before_walks`).
     pub dist: f32,
     pub ctl: usize,
     pub light: usize,
@@ -1684,7 +1685,31 @@ const TURNED_LINE_DEG: f32 = 45.0;
 /// own light at the first line). Of the lines ahead, the first that does not let the car go is
 /// the one it reads (SUMO checks every link of its look-ahead, not the first): a green line
 /// before a red one holds nobody; with every line letting it go, the first.
-fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32) -> Option<SignalView> {
+/// The line the car stops at for the light whose stop line lies `line` m along its way, for a body
+/// `length` m long: a crosswalk cutting the way before the line that the body at rest with its front
+/// on the line would stand on (the walk's width either side of its cut, `Network::walks`) moves it to
+/// that walk's zebra stop (`plan::ZEBRA_STOP` before the cut), the earliest such walk's. The map
+/// puts some lights' lines past a crosswalk (viz2 j17: walk 4415 across lane 4391 just before 4503,
+/// the lit piece of light 5.1); road law and SUMO (whose stop line lies before the crossing) keep a
+/// car waiting at red off the crosswalk (user decision J4-D1).
+fn line_before_walks(net: &Network, way: &[(usize, f32)], line: f32, length: f32) -> f32 {
+    let mut at = line;
+    for &(l, d0) in way {
+        if d0 > line {
+            break;
+        }
+        for &(w, sa, _) in net.walks.get(l).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let cut = d0 + sa;
+            let half = net.lanes.get(w).map(|wl| wl.width * 0.5).unwrap_or(0.0);
+            if cut - half < line && cut + half > line - length {
+                at = at.min(cut - crate::plan::ZEBRA_STOP);
+            }
+        }
+    }
+    at
+}
+
+fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32, length: f32) -> Option<SignalView> {
     let mut seen_object: Option<(((i32, i32), i64), f32, (usize, usize))> = None;
     let mut first: Option<SignalView> = None;
     for &(l, d0) in way {
@@ -1710,7 +1735,7 @@ fn signal_ahead(net: &Network, sim: &Simulation, way: &[(usize, f32)], rear: f32
             continue;
         }
         let Some(c) = sim.lights.get(ctl) else { continue };
-        let view = SignalView { dist: d0, ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) };
+        let view = SignalView { dist: line_before_walks(net, way, d0, length), ctl, light: li, aspect: TrafficLightController::aspect(c.state(li)), until_go: c.time_until_go(li) };
         if !matches!(view.aspect, Aspect::Green | Aspect::GreenYellow | Aspect::Dark) {
             return Some(view);
         }
@@ -2209,7 +2234,7 @@ fn oncoming(net: &Network, sim: &Simulation, me: &Vehicle, occupants: &dyn Fn(us
     };
     for (l, off, _) in net.upstream(opp, os, look, 48) {
         occupants(l, &mut |s, o| {
-            let red_for = (o.last.why == crate::plan::Why::Light).then(|| signal_ahead(net, sim, &way_lanes(net, &o.state, 160.0), o.state.rear).and_then(|s| s.until_go).unwrap_or(f32::INFINITY));
+            let red_for = (o.last.why == crate::plan::Why::Light).then(|| signal_ahead(net, sim, &way_lanes(net, &o.state, 160.0), o.state.rear, o.state.front + o.state.rear).and_then(|s| s.until_go).unwrap_or(f32::INFINITY));
             note(s + off, o.state.speed, o.state.accel, red_for);
         });
         for &(k, s, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -2411,7 +2436,7 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             Some((_, stop)) => stop,
             None => people_stop,
         };
-        p.signal = signal_ahead(net, sim, &p.way, st.rear);
+        p.signal = signal_ahead(net, sim, &p.way, st.rear, st.front + st.rear);
         p.junction = junction_ahead(net, sim, vehicles, i, &p.way);
         p.letting_out = letting_out(sim, me);
         if lane.kind == LaneKind::Street && !me.is_rail() {
@@ -2582,18 +2607,18 @@ mod signal_tests {
         let (net, sim) = waiting_area((0, 1));
         // short of both: the green first line holds nobody, the red one beyond is read
         let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
-        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        let s = signal_ahead(&net, &sim, &way, 2.0, 4.0).expect("a light ahead");
         assert_eq!((s.light, s.dist), (1, 17.0));
         // past the first line: the second, red, is the car's
         let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
-        let s = signal_ahead(&net, &sim, &way, 2.0).expect("the second light");
+        let s = signal_ahead(&net, &sim, &way, 2.0, 4.0).expect("the second light");
         assert_eq!((s.light, s.dist), (1, 3.0));
         // the same light repeated on the second line: the car has passed its line
         let (net, sim) = waiting_area((0, 0));
-        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        assert!(signal_ahead(&net, &sim, &way, 2.0, 4.0).is_none());
         // short of the first, every line green: the first
         let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
-        let s = signal_ahead(&net, &sim, &way, 2.0).expect("a light ahead");
+        let s = signal_ahead(&net, &sim, &way, 2.0, 4.0).expect("a light ahead");
         assert_eq!((s.light, s.dist), (0, 5.0));
     }
 
@@ -2603,13 +2628,13 @@ mod signal_tests {
         // the cross street's line is not the turner's, short of its own line or past it
         let (net, sim) = object((0, 1), true);
         let way = [(0usize, 5.0f32), (1, 6.0), (2, 17.0)];
-        let s = signal_ahead(&net, &sim, &way, 2.0).expect("its own light");
+        let s = signal_ahead(&net, &sim, &way, 2.0, 4.0).expect("its own light");
         assert_eq!((s.light, s.dist), (0, 5.0));
         let way = [(0usize, -9.0f32), (1, -8.0), (2, 3.0)];
-        assert!(signal_ahead(&net, &sim, &way, 2.0).is_none());
+        assert!(signal_ahead(&net, &sim, &way, 2.0, 4.0).is_none());
         // the same red line on the straight run holds it (the left-turn waiting area)
         let (net, sim) = object((0, 1), false);
-        assert_eq!(signal_ahead(&net, &sim, &way, 2.0).map(|s| s.light), Some(1));
+        assert_eq!(signal_ahead(&net, &sim, &way, 2.0, 4.0).map(|s| s.light), Some(1));
     }
 }
 
