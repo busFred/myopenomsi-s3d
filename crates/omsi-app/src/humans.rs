@@ -4389,7 +4389,13 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
     // (arrived at their place exactly: the last step the remaining distance, within a frame)
     let to = spot.pos - me.pos;
     let vel = if to.length() < KERB_ARRIVE && dt > 0.0 { to / dt as f64 } else { arrive(me.pos, spot.pos, me.pace * 0.6) };
-    Want { vel, face: Some(h), give: 0.5, corridor: None, idle: Activity::Stand }
+    // (they give way to nothing on the way to their place and at it: the queue's places lie off
+    // every street lane's waiter reach and are reached off the lanes, so no vehicle comes their
+    // way - SUMO's people on the walking area do not interact with the vehicles. Giving way to the
+    // vehicles' boxes, a waiter at the corner kerb of lane 2916 was held 0.10 m off their place
+    // for 60 s by the turning cars passing 2-5 m away, c08 #1307. The walkers are ghosts to each
+    // other: `give` acts on the boxes' force only)
+    Want { vel, face: Some(h), give: 0.0, corridor: None, idle: Activity::Stand }
 }
 
 /// `arrive` stops within this of its target (m); a kerb waiter takes that last step at once, else
@@ -10150,26 +10156,6 @@ impl Humans {
             }
             let fixed = matches!(p.state, State::Pax(_));
             let w = &wants[i];
-            // (in a street lane's people strip, or stepping into one this frame: the vehicles act
-            // on their avoidance; on the pavement off every strip only a vehicle whose body has
-            // left the strips does - SUMO's sidewalk walkers do not interact with the vehicles on
-            // the road. The walkers are ghosts, which the crowd's contact pass leaves alone: what
-            // keeps a car's body off them is its own people test (`perception::people_ahead`). A
-            // kerb waiter at their place by a turning stream was pushed 0.10 m off it for 60 s,
-            // c08 #1307)
-            let here = p.position;
-            let step = here + (w.vel * dt as f64).extend(0.0);
-            // (asked only with a box within the crowd's reach of them, `CrowdParams::sense`)
-            let sense = CrowdParams::default().sense;
-            let boxed = block_grid.any_near(here.truncate(), |k| blocks[k].near(here.truncate(), sense));
-            // (and anybody a vehicle's body comes near off the strips: one cutting a corner over
-            // the pavement, pulling out over it - a vehicle off the road is in their way as any box)
-            let in_traffic = !boxed
-                || net.is_none_or(|n| {
-                    within_lanes(n, here, &strip_reach)
-                        || within_lanes(n, step, &strip_reach)
-                        || block_grid.any_near(here.truncate(), |k| blocks[k].near(here.truncate(), sense) && !within_lanes(n, blocks[k].closest(here.truncate()).0.extend(here.z), &strip_reach))
-                });
             walkers.push(Walker {
                 pos: p.position.truncate(),
                 vel: p.vel,
@@ -10184,7 +10170,6 @@ impl Humans {
                 ghost: true,
                 solid: VEHICLE_COLLISIONS,
                 through: p.boxes.through.filter(|_| p.boxes.jammed).map(|b| b.center),
-                in_traffic,
                 // (on a pavement the path holds them even on the way past a box: widened
                 // by what `along_box` lets a route lie off it)
                 corridor: match (p.detour > 0.0, pavement_walker(p)) {

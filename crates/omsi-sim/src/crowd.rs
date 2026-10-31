@@ -44,18 +44,11 @@ pub struct Walker {
     /// pedestrian ignores the obstacle it is jammed at, `MSPModel_Striping` PState::walk): no
     /// force from it; every other box, moving vehicles among them, stays solid.
     pub through: Option<DVec2>,
-    /// In a street lane's people strip, about to step into one, or near a vehicle whose body has
-    /// left the strips (the caller's test): the vehicles' boxes act on this walker's avoidance
-    /// (the anticipatory force); otherwise they feel none of them - a non-ghost walker is still
-    /// pushed out of a box by the contact pass, a ghost (the game's people on foot) not at all:
-    /// the cars' own people test keeps the vehicles off them (SUMO: pedestrians on a sidewalk do
-    /// not interact with the vehicles on the road).
-    pub in_traffic: bool,
 }
 
 impl Walker {
     pub fn new(pos: DVec2, radius: f64, space: u64) -> Walker {
-        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, solid: false, corridor: None, through: None, in_traffic: true }
+        Walker { pos, vel: DVec2::ZERO, radius, want: DVec2::ZERO, give: 1.0, space, fixed: false, ghost: false, solid: false, corridor: None, through: None }
     }
 }
 
@@ -361,7 +354,7 @@ pub fn step(walkers: &mut [Walker], blocks: &[Block], params: &CrowdParams, dt: 
         }
         // (a ghost goes through vehicles too - the last way out of a jam - unless they are
         // solid to it)
-        if me.space == 0 && (!me.ghost || me.solid) && me.in_traffic {
+        if me.space == 0 && (!me.ghost || me.solid) {
             block_grid.for_each_near(me.pos, |k| {
                 let b = &blocks[k];
                 if !b.near(me.pos, params.sense) || me.through == Some(b.center) {
@@ -797,7 +790,7 @@ mod tests {
     use super::*;
 
     fn walker(x: f64, y: f64, want: DVec2) -> Walker {
-        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, solid: false, corridor: None, through: None, in_traffic: true }
+        Walker { pos: DVec2::new(x, y), vel: want, radius: 0.25, want, give: 1.0, space: 0, fixed: false, ghost: false, solid: false, corridor: None, through: None }
     }
 
     #[test]
@@ -839,25 +832,6 @@ mod tests {
         assert!(w[0].pos.y > 3.0 && w[1].pos.y < -3.0, "{:?} {:?}", w[0].pos, w[1].pos);
         // and they did not swerve wildly
         assert!(w[0].pos.x.abs() < 1.5 && w[1].pos.x.abs() < 1.5);
-    }
-
-    #[test]
-    fn a_walker_off_the_traffic_feels_no_vehicle_coming_by() {
-        // somebody standing 0.27 m off a car's side (within the avoidance's body and 0.05 m, outside the contact pass's radius) as it comes by: in traffic they flinch,
-        // on the pavement off every strip they stand
-        let run = |in_traffic: bool| {
-            // (a ghost solid to vehicles, as the game's people on foot)
-            let mut w = [Walker { in_traffic, ghost: true, solid: true, ..walker(0.0, 1.17, DVec2::ZERO) }];
-            let p = CrowdParams::default();
-            for k in 0..60 {
-                let x = -15.0 + k as f64 * 0.5;
-                let b = Block { center: DVec2::new(x, 0.0), half: DVec2::new(0.9, 2.3), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::new(15.0, 0.0) };
-                step(&mut w, &[b], &p, 1.0 / 30.0);
-            }
-            w[0].pos
-        };
-        assert!((run(false) - DVec2::new(0.0, 1.17)).length() < 1e-9);
-        assert!((run(true) - DVec2::new(0.0, 1.17)).length() > 1e-4);
     }
 
     #[test]
