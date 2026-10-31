@@ -303,8 +303,16 @@ fn planned_window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
         let front = c.s + c.front;
         // (when the lead's rear has gone `d` m from where it is: my front `d` m further on)
         let lead_at = |p: f32| arrival_time(p + c.min_gap - (front + gap), v_lead, c.accel, c.v_max.max(v_lead)) + c.tau;
-        t_in = t_in.max(lead_at(from));
-        t_out = t_out.max(lead_at(to + c.rear + c.front));
+        // (only for a place my front has still to reach: one already behind it I am at or past
+        // now, whatever my lead does - counted `tau` away, a car well inside a merge took a foe
+        // standing behind it at the stretch's start for one there first)
+        if from > front {
+            t_in = t_in.max(lead_at(from));
+        }
+        let out_at = to + c.rear + c.front;
+        if out_at > front {
+            t_out = t_out.max(lead_at(out_at));
+        }
     }
     (t_in, t_out)
 }
@@ -3164,6 +3172,26 @@ mod tests {
                 assert!(capped_by(&g, held, holder) && !capped_by(&g, holder, held), "A {da} m, B {db} m, #{held} held: {g:?}");
             }
         }
+    }
+
+    /// A yielding merger already well inside the merge stretch, rolling behind its lead, is
+    /// not capped by a foe standing at the stretch's start behind it: its planned arrival at a
+    /// place its front has passed is now, not its lead's time gap `tau` away (`planned_window`).
+    #[test]
+    fn a_merger_past_the_stretch_start_is_not_capped_by_a_foe_standing_behind_it_at_the_start() {
+        let (mut net, _) = zipper_object();
+        net.lanes[1].priority = 192.0;
+        let js = Junctions::compile(&net);
+        assert!(js.nodes[0].movements[0].foes[0].yields);
+        let f = *js.nodes[0].movements[0].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap();
+        // the merger (A): front 3 m past the stretch's end at 2 m/s, its lead 3 m ahead at 2 m/s
+        let mut a = zip_claim(&js, 1, 0, -3.0, 2.0);
+        a.lead_gap = Some((3.0, 2.0));
+        // the foe (B): standing with its front half a metre into the stretch
+        let b = zip_claim(&js, 2, 1, (f.theirs.1 - f.theirs.0) - 0.5, 0.0);
+        assert!((a.s + a.front - f.mine.0) - (b.s + b.front - f.theirs.0) > a.front + a.rear);
+        let g = resolve(&js, &[a, b]);
+        assert!(!capped_by(&g, 1, 2), "{g:?}");
     }
 
     /// At a zipper: a merger that gives way never goes in front of a main
