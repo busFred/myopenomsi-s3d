@@ -1570,19 +1570,11 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     None
 }
 
-/// My lead when it would stand within the road a lane change `(wait, len)` takes from now at
-/// speed `v` - the signal's road (`wait` seconds left) and the move (`len` metres; `change_clear`)
-/// - were it to brake to rest now at its maximal deceleration (`stop_reach`; SUMO's secure gap
-/// reads a leader by its maximal braking whatever its speed): one standing, or creeping and about
-/// to stand, is the same lead to the start check and to the re-sweep while the change signals.
-fn near_standing_lead(p: &Perception, vehicles: &[Vehicle], v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
-    p.own_leader.filter(|l| {
-        let b = match l.what {
-            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.state.decel.max(o.params.comfort_brake)),
-            _ => None,
-        };
-        l.gap + stop_reach(l.speed, b) < len + v * wait
-    })
+/// My own leader (`Perception::own_leader`, read alike by the start check and the re-sweep) when
+/// it stands within the road a lane change `(wait, len)` takes from now at speed `v`: the signal's
+/// road (`wait` seconds left) and the move (`len` metres; `change_clear`).
+fn near_standing_lead(p: &Perception, v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
+    p.own_leader.filter(|l| l.speed < STANDING_SPEED && l.gap < len + v * wait)
 }
 
 /// How far (m) a body at `speed` m/s runs on braking to rest at `brake` m/s² (its maximal
@@ -2334,9 +2326,8 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     // stands a moment later: beside me, carried on at its speed (the rear's swing); ahead of my
     // front, off my own way, where it would stand braking now at its maximal deceleration (the
     // least it will have moved on, SUMO's secure gap); ahead on my own way, standing where it
-    // stands, moving the car following's - and once a lead would stand within the move
-    // (`near_standing_lead`, which reads a creeping lead by the same bound, `others`) every body
-    // ahead by that bound; behind
+    // stands, moving the car following's - and with a lead standing within the move
+    // (`near_standing_lead`, `others`) every body ahead by that bound; behind
     // my rear, standing where it is, moving the gap rule's, or where it is with `others`)
     let swept = |speed: f32, lane: Option<usize>, brake: Option<f32>, b: &Obb| -> Option<Carry> {
         let moving = speed.abs() >= STANDING_SPEED;
@@ -3090,7 +3081,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 let mut before = me.clone();
                 before.state.drop_change();
                 (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
-                let near = near_standing_lead(p, vehicles, v, (c.wait, c.length));
+                let near = near_standing_lead(p, v, (c.wait, c.length));
                 if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
                     match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
                         Some(step_out) if out.start.is_none() => out.start = Some(step_out),
@@ -3168,7 +3159,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (under way the move itself must clear the parked cars, the people, the standing
             // bodies near and the moving ones beside me where they will be, `change_clear`)
             let mv = (me.params.signal_before_change, omsi_sim::traffic::change_length(v.max(0.0)));
-            let near = near_standing_lead(p, vehicles, v, mv);
+            let near = near_standing_lead(p, v, mv);
             // (the move swept from the pose the car has on its own lane's way, `sim::way_pose`, as the
             // re-sweep while it signals sweeps it: a car still easing back into its lane - a change
             // just dropped - was checked from where it stood out and re-swept from its lane)
