@@ -8077,15 +8077,18 @@ impl Humans {
         let strolling = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count();
         let limit = self.pedestrians.min((self.max_people + strolling).saturating_sub(self.pool_used()));
         let target = (wanted.round() as usize).min(limit);
-        // (the strollers within the radius on the target's own paths count against it: those on a closed path, in a
-        // pocket or on a crossing piece stand on pavement the target leaves out - counted, each
-        // one put down nobody on the open paths, and at Wuluju the placer stood idle from 510 s
-        // with its paths lacking 687-710; whoever walked off behind the bus no longer counts)
-        let mut target_lanes: Vec<usize> = targets.iter().map(|t| t.lane).collect();
-        target_lanes.sort_unstable();
-        target_lanes.dedup();
-        let on_target = |p: &Person| matches!(&p.state, State::Strolling(w) if w.legs.get(w.leg).is_some_and(|l| target_lanes.binary_search(&l.lane).is_ok()));
-        let have = self.people.iter().filter(|p| (p.position - center).length() < STROLL_RADIUS && on_target(p)).count();
+        // (the strollers within the radius count against it, but for those on a path the map-parked
+        // cars close or in a pocket they make: the target leaves that pavement out, and counted they
+        // each put down nobody on the open paths - at Wuluju the placer stood idle from 510 s with
+        // its paths lacking 687-710. The walkers on a crossing's pieces or a short junction piece
+        // count: they walk the open network, and left out the circle filled to half again its
+        // target, 3190 within the radius for 1977. Whoever walked off behind the bus no longer
+        // counts)
+        let closed_now = |p: &Person| match &p.state {
+            State::Strolling(w) => w.pocket || w.legs.get(w.leg).is_some_and(|l| !stroll_path_open(Some(&*ped), net, l.lane)),
+            _ => false,
+        };
+        let have = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS && !closed_now(p)).count();
         let within = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS).count();
         let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
         // (and the setting bounds every stroller of this game's, past the radius and about the
@@ -8248,7 +8251,7 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted on its paths ({within} within the radius; {} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
+                "t={:.1} strollers: {have} of {target} wanted, off the closed paths ({within} within the radius; {} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
