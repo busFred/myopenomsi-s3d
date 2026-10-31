@@ -1813,8 +1813,15 @@ fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
 /// `on_path` for the walk `walk`: on the path of its current leg or of the next, or holding a place
 /// in a kerb's queue (the queue's places lie on the footpaths and the walking areas; one behind
 /// the queue may lie on a path behind the leg they walked up).
-fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec3) -> bool {
-    walk.spot.is_some() || walk.legs[walk.leg..].iter().take(2).any(|l| on_path(net, l, pos))
+/// Taken in the plane, at each leg's own height there (the walkers' heights follow the ground and
+/// a bridge's deck, the paths' their splines: a footpath on a ramp lay 4 m under its walkers, who
+/// were then never on it and stood for good).
+fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec2) -> bool {
+    walk.spot.is_some()
+        || walk.legs[walk.leg..].iter().take(2).enumerate().any(|(k, l)| {
+            let s = if k == 0 { walk.s.min(l.len()) } else { 0.0 };
+            on_path(net, l, pos.extend(l.at(net, s).0.z))
+        })
 }
 
 /// A walk along the pavement network.
@@ -3738,7 +3745,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let leg = walk.legs[walk.leg];
     // (on the path of their leg, `on_path`: off it they walk to the leg first - no verdict at a
     // kerb ahead, no leg's end)
-    let here_on_path = walk_on_path(net, walk, pos2.extend(leg.at(net, walk.s).0.z));
+    let here_on_path = walk_on_path(net, walk, pos2);
     // the verdict on the crossing ahead is taken on the way to its kerb, `kerb_look`
     // short of it (SUMO: a pedestrian waits at the crossing's start, on the walking area, never
     // on the carriageway; OMSI's crossings start at the lane's edge, so the start of the
@@ -10391,7 +10398,7 @@ impl Humans {
             match &mut p.state {
                 State::Strolling(walk) => {
                     // (not off the path: there they walk to the leg, `on_path`)
-                    if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(net, walk, pos)) {
+                    if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(net, walk, pos.truncate())) {
                         walk.s = leg.project(net, pos, walk.s).max(walk.s - 0.3);
                     }
                 }
