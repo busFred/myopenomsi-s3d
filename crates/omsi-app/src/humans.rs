@@ -464,6 +464,28 @@ fn turn_capped(state: &State) -> bool {
     !matches!(state, State::Strolling(w) if w.spot.is_some())
 }
 
+/// One frame of the turn cap for somebody wanting `vel` (set to nothing when the cap holds them):
+/// beside a standing box (`near_box`), not on a crossing (turned back by the change, they go at
+/// once), and capped (`turn_capped`), nobody turns round - their way reversed, more than a right
+/// angle - more than once in PED_TURN_EVERY s; `want_dir` and `turned` are their last way and the
+/// seconds since they last turned.
+fn turn_step(want_dir: &mut DVec2, turned: &mut f32, vel: &mut DVec2, near_box: bool, on_crossing: bool, state: &State, dt: f32) {
+    *turned += dt;
+    let speed = vel.length();
+    if speed < 0.2 {
+        return;
+    }
+    let dir = *vel / speed;
+    if want_dir.dot(dir) < -0.2 {
+        if near_box && !on_crossing && turn_capped(state) && !may_turn(*turned) {
+            *vel = DVec2::ZERO;
+            return;
+        }
+        *turned = 0.0;
+    }
+    *want_dir = dir;
+}
+
 /// Whether somebody who last turned round `since` s ago may turn again.
 fn may_turn(since: f32) -> bool {
     since >= PED_TURN_EVERY
@@ -1417,7 +1439,8 @@ impl Cabin {
 
 }
 
-/// How far from a stop object its pavement is looked for (m): the stop's own pavement, where
+/// How far from a stop object its pavement is looked for (m), and from a rider's door at the
+/// pole the pavement they step onto (`kerb_doors`): the stop's own pavement, where
 /// people wait and riders step off (`build_pax_stop` for the people's table, `kerb_doors` for
 /// a stop not in it).
 const STOP_PAVEMENT_REACH: f64 = 12.0;
@@ -2300,8 +2323,8 @@ struct SeenCar {
     stood: f32,
     /// The height it stands at (m), for whose level it is at (`at_level`).
     z: f64,
-    /// The lane it drives (the player's bus: none): where its way meets a crossing, the height
-    /// of that lane there (`SeenCar::level_at`).
+    /// The lane it drives (the player's bus: the street lane under it, `lane_under`): where its
+    /// way meets a crossing, the height of that lane there (`SeenCar::level_at`).
     lane: Option<usize>,
 }
 
@@ -2311,7 +2334,7 @@ impl SeenCar {
     /// level there however far up it is now; one on a bridge over it, or in a cutting under it,
     /// is not (`kerb_verdict`, `steps_into_traffic`).
     fn level_at(&self, net: &Network, x: DVec3) -> f64 {
-        self.lane.and_then(|l| net.lanes.get(l)).and_then(|l| l.nearest_point(x)).map(|(s, _)| net.lanes[self.lane.unwrap()].at(s).0.z).unwrap_or(self.z)
+        self.lane.and_then(|l| net.lanes.get(l)).and_then(|l| l.nearest_point(x).map(|(s, _)| l.at(s).0.z)).unwrap_or(self.z)
     }
 }
 
@@ -5545,6 +5568,30 @@ const KERB_STEP_OFF: f64 = 1.0;
 /// The gap (s) an unsignalled kerb asks of a coming car beyond the time across, at first
 /// (`kerb_verdict`: less after 20 s and none after 45 s of waiting).
 const KERB_MARGIN: f64 = 2.5;
+
+/// The street lane a vehicle at `pos` (the player's bus, which has no lane of the traffic's) drives
+/// on: the nearest one at its level (`at_level`) whose surface (half its width, `LANE_MIN_WIDTH` at
+/// least) it stands on.
+fn lane_under(net: &Network, pos: DVec3) -> Option<usize> {
+    let (cx, cy) = ((pos.x / 50.0).floor() as i32, (pos.y / 50.0).floor() as i32);
+    let mut best: Option<(f64, usize)> = None;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for &i in net.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let l = &net.lanes[i];
+                if l.kind != LaneKind::Street {
+                    continue;
+                }
+                if let Some((s, d)) = l.nearest_point(pos) {
+                    if d < (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 && at_level(l.at(s).0.z, pos.z) && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, i));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|b| b.1)
+}
 
 /// A kerb waiting for a car to come by (an unsignalled crossing, `kerb_verdict`, or the first
 /// step into a lane off a crossing, `steps_into_traffic`).
@@ -9805,11 +9852,13 @@ impl Humans {
         if let Some(pb) = bus_ix.get(&BusId::Player).map(|&i| &buses[i]) {
             let bodies = pb.blocks();
             let first = cars.len();
-            cars.push(SeenCar { id: PLAYER_CAR, pos: pb.pos.truncate(), vel: pb.fwd() * pb.speed, half_len: pb.half.y, body: bodies[0], yielding: false, stood: 0.0, z: pb.pos.z, lane: None });
+            // (the street lane it drives on, for its height where it meets a crossing, `level_at`)
+            let lane = net.and_then(|n| lane_under(n, pb.pos));
+            cars.push(SeenCar { id: PLAYER_CAR, pos: pb.pos.truncate(), vel: pb.fwd() * pb.speed, half_len: pb.half.y, body: bodies[0], yielding: false, stood: 0.0, z: pb.pos.z, lane });
             for (k, t) in pb.trailers.iter().enumerate() {
                 let h = t.heading.to_radians();
                 let body = bodies.get(k + 1).copied().unwrap_or(bodies[0]);
-                cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0, z: pb.pos.z, lane: None });
+                cars.push(SeenCar { id: PLAYER_CAR - 1 - k as u64, pos: t.pos.truncate(), vel: DVec2::new(h.sin(), h.cos()) * pb.speed, half_len: t.half.y, body, yielding: false, stood: 0.0, z: pb.pos.z, lane });
             }
             block_car.extend((0..bodies.len()).map(|k| Some((first + k).min(cars.len() - 1))));
             block_z.extend(std::iter::repeat_n(pb.pos.z, bodies.len()));
@@ -10049,22 +10098,7 @@ impl Humans {
             let here = self.people[i].position.truncate();
             let near_box = block_grid.any_near(here, |k| blocks[k].vel.length() < 0.5 && blocks[k].near(here, TURN_BOX_REACH));
             let p = &mut self.people[i];
-            p.turned += dt;
-            let v = wants[i].vel;
-            let speed = v.length();
-            if speed < 0.2 {
-                continue;
-            }
-            let dir = v / speed;
-            if p.want_dir.dot(dir) < -0.2 {
-                // (not on a crossing: turned back by the change, they go at once)
-                if near_box && !p.on_crossing && turn_capped(&p.state) && !may_turn(p.turned) {
-                    wants[i].vel = DVec2::ZERO;
-                    continue;
-                }
-                p.turned = 0.0;
-            }
-            p.want_dir = dir;
+            turn_step(&mut p.want_dir, &mut p.turned, &mut wants[i].vel, near_box, p.on_crossing, &p.state, dt);
         }
         stage!("ped.turns");
         // the crowd of the pavements (passengers outside stand in it as they are)
@@ -15636,7 +15670,21 @@ mod ped_tests {
         let mut walk = across();
         assert!(turn_capped(&State::Strolling(walk.clone())));
         walk.spot = Some(KerbPlace { leg: 0, next: 3, pos: DVec2::ZERO, row: 0, lat: 0.0, key: 0 });
-        assert!(!turn_capped(&State::Strolling(walk)));
+        assert!(!turn_capped(&State::Strolling(walk.clone())));
+        // the cap's frame: a pacer beside a standing box turns once, then stands every frame it
+        // would turn back within PED_TURN_EVERY; a kerb waiter going to their place turns freely
+        let pace = |state: State| {
+            let (mut dir, mut turned) = (DVec2::X, PED_TURN_EVERY);
+            let mut stood = 0;
+            for k in 0..40 {
+                let mut vel = if k % 2 == 0 { DVec2::new(-1.0, 0.0) } else { DVec2::new(1.0, 0.0) };
+                turn_step(&mut dir, &mut turned, &mut vel, true, false, &state, 0.1);
+                stood += (vel == DVec2::ZERO) as u32;
+            }
+            stood
+        };
+        assert_eq!(pace(State::Strolling(across())), 20, "a pacer is capped: every way back after the first turn");
+        assert_eq!(pace(State::Strolling(walk)), 0, "a waiter going to their place is not");
     }
 
     #[test]
