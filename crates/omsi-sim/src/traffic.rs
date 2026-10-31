@@ -4915,16 +4915,32 @@ impl AiState {
         best
     }
 
+    /// How fast the car can be going `ahead` m on along its way (from its origin) and take every
+    /// bend of the stretch after that place as `curve_speed` does from where it is: the speed it
+    /// comes to a place ahead with when nothing holds it back (the bends before that place it has
+    /// left behind by then).
+    pub fn bend_speed_at(&self, net: &Network, ahead: f32) -> f32 {
+        self.curve_speed_on_from(net, &self.seq(), self.s, ahead.max(0.0))
+    }
+
     fn curve_speed_on(&self, net: &Network, q: &LaneSeq, s: f32) -> f32 {
-        let reach = (self.speed * self.speed / 4.0 + 12.0).min(90.0);
+        self.curve_speed_on_from(net, q, s, 0.0)
+    }
+
+    /// `curve_speed_on` for the place `from` m on from `s`.
+    fn curve_speed_on_from(&self, net: &Network, q: &LaneSeq, s: f32, from: f32) -> f32 {
+        let reach = from + (self.speed * self.speed / 4.0 + 12.0).min(90.0);
         let mut best = f32::MAX;
         // The samples lie at fixed places of the road (every 2.5 m of the odometer), not at
         // fixed distances ahead of the car: moving with the car, the sample that caught a
         // bend jumped 2.5 m nearer every 2.5 m, the allowed speed fell in steps of 4 m²/s²
         // and the car braked hard, let go and braked hard again with nothing in front of it.
         let first = 2.5 - self.odometer.rem_euclid(2.5);
-        let mut d = 0.0f32;
+        let mut d = from;
         let mut next = first;
+        while next <= from {
+            next += 2.5;
+        }
         while d <= reach {
             let (i, u) = q.locate(net, s, d);
             let turn = wrap_deg(q.heading(net, s, d + 3.0) - q.heading(net, s, d - 3.0)).abs().to_radians() / 6.0;
@@ -4934,7 +4950,7 @@ impl AiState {
                 // (a bend may begin anywhere up to a sample's spacing before the sample
                 // that finds it: the speed is taken from there, or the car met the start of
                 // a tight turn half a metre after its profile had allowed 1 m/s more)
-                best = best.min((v * v + 2.0 * 2.0 * (d - 2.5).max(0.0)).sqrt());
+                best = best.min((v * v + 2.0 * 2.0 * (d - from - 2.5).max(0.0)).sqrt());
             }
             d = next;
             next += 2.5;

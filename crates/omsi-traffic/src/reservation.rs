@@ -32,6 +32,9 @@ pub struct Claim {
     pub half_width: f32,
     pub speed: f32,
     pub accel: f32,
+    /// The most it speeds up to (m/s): its lane's limit times its desire; for an approach filed
+    /// at a later junction (`foe_only`), no more than its bends let it come there
+    /// (`AiState::bend_speed_at`), the speed it is judged to follow a lead there at (`follow_room`).
     pub v_max: f32,
     /// From the origin to the front and the rear bumper (m).
     pub front: f32,
@@ -454,10 +457,17 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
 /// The room (m) the car-following model (IDM) needs behind a lead at `lead_speed` to follow it
 /// braking no harder than comfortably: its braking a (s*/s)² is within the comfortable brake b
 /// for s >= s* sqrt(a/b), s* = s0 + v T + v Δv / (2 sqrt(a b)) (SUMO's `couldBrakeForLeader` asks
-/// the same of its Krauss model).
+/// the same of its Krauss model). v is its speed; for an approach filed at a later junction
+/// (`Claim::foe_only`), the speed it comes to that junction with, no more than its `v_max` there:
+/// the braking its own bends ask of it on the way is its own, not braking for the lead (SUMO judges
+/// two that merge at the speeds they pass the link at, `blockedByFoe`'s `unsafeMergeSpeeds` of the
+/// approach's arrival and leave speeds, and the arrival speed it registers, `vLinkPass`, is at
+/// most the link lane's speed, which netconvert limits by the turning radius, `NBEdge`
+/// `junctions.limit-turn-speed`).
 fn follow_room(x: &Claim, lead_speed: f32) -> f32 {
     let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
-    let s_star = x.min_gap + (x.speed * x.tau + x.speed * (x.speed - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
+    let v = if x.foe_only { x.speed.min(x.v_max) } else { x.speed };
+    let s_star = x.min_gap + (v * x.tau + v * (v - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
     s_star * (a / b).sqrt()
 }
 
@@ -481,7 +491,8 @@ pub fn zipper_reach(c: &Claim) -> f32 {
 /// short of it the one there first is ahead (`their_in` the foe's arrival as the resolver has shifted it, at its
 /// green; a tie: the one further along, then the lower index). The table orders the rest: one
 /// giving way (`i_yield`) also lets a later foe go first that could not stop behind it with its
-/// comfortable brake (a 14 m/s main road car must not brake hard for a merger),
+/// comfortable brake (a 14 m/s main road car must not brake hard for a merger; judged at the speed
+/// the foe comes to the merge with, `follow_room`),
 /// and the one with the right of way takes an earlier yielding foe as ahead only when it could
 /// stop behind it so (the same pair from the other side: exactly one of the two is ahead);
 /// between equals the order of arrival alone (SUMO: a later foe that can brake for me is

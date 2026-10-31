@@ -1632,6 +1632,10 @@ impl Simulation {
                         let committed = (next_ahead.is_infinite() && nj.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, next - st.front - 0.6, brake);
                         Claim {
                             foe_only: true,
+                            // (it comes to that junction no faster than its bends let it, `AiState::bend_speed_at`
+                            // its first meeting place: SUMO's approach registers its `vLinkPass`, at most the
+                            // link lane's speed, which netconvert limits by the turning radius)
+                            v_max: claim.v_max.min(st.bend_speed_at(net, nj.conflict_start)),
                             chain: nj.chain.clone(),
                             junction: nj.junction,
                             movement: nj.movement,
