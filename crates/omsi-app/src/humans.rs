@@ -4756,7 +4756,7 @@ fn loaded_point(d0: f32, d1: f32, stretches: &[(f32, f32)], u: f32) -> f32 {
 
 /// Whether `q` lies on a street lane's drawn surface: within half its width (`LANE_MIN_WIDTH`
 /// at least) of its axis. Nobody leaves at the edge of the ground there (the user's decision P-D2:
-/// never in a lane).
+/// never in a lane), and no stroller is put down there (`populate_on_foot_with`).
 fn on_lane_surface(net: &Network, q: DVec3) -> bool {
     within_lanes(net, q, &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5)
 }
@@ -8115,7 +8115,7 @@ impl Humans {
         // (and the setting bounds every stroller of this game's, past the radius and about the
         // other LAN players too: the setting is the most this game walks)
         let room = room.min(self.pedestrians.saturating_sub(strolling));
-        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap, mut rej_queue, mut rej_wall) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut placed, mut rej_seen, mut rej_near, mut rej_ground, mut rej_spawn, mut rej_gap, mut rej_queue, mut rej_wall, mut rej_lane) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         if room > 0 && !targets.is_empty() {
             // weighted by lying ahead of the player: somebody put down beside or behind a
             // moving bus never gets in front of it, and the street ahead looked empty until
@@ -8180,6 +8180,16 @@ impl Humans {
                     rej_ground += 1;
                     continue;
                 }
+                // (nobody is put down on a street lane's surface, `on_lane_surface`, where a map's
+                // footpath runs over the carriageway: SUMO's pedestrians depart on a lane that
+                // admits them, the sidewalk, never on the vehicles' lane beside it, and the people
+                // leave nowhere there either (P-D2). Put down there, they stand in the body of a car
+                // passing the frame they come: Jiangzhaikou moving, #3586/#3587 on path 1530, 0.8 m
+                // off the axis of lane 1159, inside car #4673 at 4.4 m/s)
+                if on_lane_surface(net, p) {
+                    rej_lane += 1;
+                    continue;
+                }
                 // (nobody is put down in a kerb's waiting area whose every place is taken)
                 if self.queues.in_full_area(p.truncate()) {
                     rej_queue += 1;
@@ -8221,7 +8231,7 @@ impl Humans {
                         }
                     }
                     let (p, _) = l.at(at_s);
-                    if k > 0 && (!self.may_appear(world, p) || !world.has_ground(p.x, p.y) || self.queues.in_full_area(p.truncate())) {
+                    if k > 0 && (!self.may_appear(world, p) || !world.has_ground(p.x, p.y) || on_lane_surface(net, p) || self.queues.in_full_area(p.truncate())) {
                         continue;
                     }
                     let leg = if fwd {
@@ -8272,7 +8282,7 @@ impl Humans {
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
             let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
             log::info!(
-                "t={:.1} strollers: {have} of {target} wanted, off the closed paths ({within} within the radius; {} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
+                "t={:.1} strollers: {have} of {target} wanted, off the closed paths ({within} within the radius; {} asked at most, curve {:.2}, {rho:.2} per m2; pavement in the circle {all_m2:.0} m2 of {metres:.0} m on {} paths, in sight {seen_m2:.0} m2 wanting {:.0}, sources {sources:.0} on {} places), lacking {deficit:.0}, {placed} put down; past the radius {} ({past_seen} in sight, {past_still} still, {past_box} of them behind a box, {past_standing} looking for a path, {past_far} past twice it); refused: seen {rej_seen}, distance {rej_near}, no ground {rej_ground}, too near another {rej_gap}, in a full kerb queue {rej_queue}, on a closed path or a pocket {rej_wall}, on a street lane {rej_lane}, no figure {rej_spawn}; turned at a parked car {} ({}), walled paths {}, in a pocket {}, left at the edge of the ground {} in sight, {} out of sight (paths onto unloaded ground {})",
                 self.time, self.pedestrians, self.density, candidates.len(), seen_m2 * rho, targets.iter().filter(|t| t.source).count(), past.len(),
                 self.wall_turns.values().sum::<u32>(),
                 {
@@ -11628,14 +11638,16 @@ impl Humans {
 mod tests {
     use super::*;
 
-    /// The strollers the placer puts down are out of sight where the frame shows them. A
-    /// pavement 30 m ahead of the eye runs out of its 40 deg cone
+    /// The strollers the placer puts down are out of sight where the frame shows them, and off
+    /// every street lane's surface. A pavement 30 m ahead of the eye runs out of its 40 deg cone
     /// 3.5 m before either end: everybody put down there is put down after the frame's walking,
     /// so none of them, walking into the cone, is in it the first time they are drawn
     /// (Jiangzhaikou standing: #1705 21 m off, in sight the frame it came). A footpath 5 m ahead
-    /// of the eye, out of the cone past 20 m either side, gets strollers too.
+    /// of the eye, out of the cone past 20 m either side, runs 0.8 m off the axis of a 2.3 m
+    /// street lane for its western half: nobody is put down on that half (Jiangzhaikou moving:
+    /// #3586/#3587 put down on path 1530 inside car #4673 on lane 1159).
     #[test]
-    fn p3_b_strollers_are_put_down_out_of_sight_as_drawn() {
+    fn p3_bc_strollers_are_put_down_out_of_sight_as_drawn_and_off_the_street_lanes() {
         use crate::traffic::Traffic;
         let root = std::env::temp_dir().join(format!("openomsi-put-down-{}", std::process::id()));
         let man = root.join("Humans/Man");
@@ -11670,6 +11682,7 @@ mod tests {
         h.map_humans_done = true;
         (h.density, h.max_people, h.pedestrians) = (1.0, 2000, 2000);
         h.eye = Some(Eye { pos: DVec3::new(0.0, 0.0, 1.8), fwd: DVec3::Y, cos_half: 40f64.to_radians().cos() });
+        let net = &traffic.net;
         let (mut put, mut put_ahead, mut put_beside) = (0, 0, 0);
         let mut known: HashSet<u32> = HashSet::new();
         // (half a second a frame: a first step of 0.6 m or so, of the order of the stretch out of
@@ -11684,6 +11697,7 @@ mod tests {
                     put_beside += 1;
                 }
                 assert_ne!(h.figure_sight(&world, p.position), FigureSight::In, "#{} in sight at {:?} the first time it is drawn", p.id, p.position);
+                assert!(!on_lane_surface(net, p.position), "#{} put down on the street lane at {:?}", p.id, p.position);
             }
             known.extend(h.people.iter().map(|p| p.id));
         }
