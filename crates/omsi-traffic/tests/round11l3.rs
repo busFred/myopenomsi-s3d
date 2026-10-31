@@ -468,7 +468,7 @@ fn a_lane_beside_only_on_a_short_last_piece_is_no_way_to_the_trip_end() {
     net.compute_reach();
     assert_eq!(net.lanes[1].right, Some(2));
     assert_eq!(net.lanes[1].next.len(), 2);
-    assert!(omsi_sim::traffic::change_space(13.0, 1.0) > 15.0);
+    assert!(omsi_sim::traffic::change_space(13.0, 1.0, omsi_sim::traffic::SIGNAL_BEFORE_CHANGE) > 15.0);
     for id in 1..=40u64 {
         let mut sim = Simulation::new(&net, vec![]);
         let mut cars = vec![car(id, 0, 40.0, 13.0)];
@@ -967,4 +967,16 @@ fn a_blocked_urgent_change_indicates_while_it_waits_and_moves_over_as_the_gap_op
     assert!(shown != 0 && shown == dir, "indicates the side of its change while it waits: shown {shown}, change dir {dir}");
     assert!(since < 25.0, "and has done so for long: since {since:.1} s");
     assert!(at >= 30.0 && wait == 0.0, "the change starts once the gap is there, nothing left to signal: at {at:.2} s, wait {wait:.2} s");
+}
+
+/// Final review S1: the road a change takes (`change_space`, SUMO's `LCA_INSUFFICIENT_SPACE` test,
+/// the lane-end fit, the trip end's lanes beside) reads the driver's own signalling time: at
+/// 14 m/s a driver who signals 3.6 s needs 14 * 1.6 + 1.0 * (3.6^2 - 2^2) / 2 = 26.9 m more road
+/// than one who signals 2 s; a spawned car's state carries its driver's time.
+#[test]
+fn the_road_a_change_takes_reads_the_drivers_own_signalling_time() {
+    let d = omsi_sim::traffic::change_space(14.0, 1.0, 3.6) - omsi_sim::traffic::change_space(14.0, 1.0, 2.0);
+    assert!((d - (14.0 * 1.6 + 0.5 * (3.6f32 * 3.6 - 4.0))).abs() < 1e-3, "{d}");
+    let c = car(1, 0, 0.0, 0.0);
+    assert_eq!(c.state.signal_before_change, c.params.signal_before_change);
 }

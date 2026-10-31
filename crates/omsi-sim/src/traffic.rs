@@ -3749,6 +3749,12 @@ pub struct AiState {
     /// (`STRATEGIC_GAVE_UP`). Cleared with the next draw.
     #[serde(default)]
     pub strategic_gave_up: bool,
+    /// The driver's own signalling time before a lane change moves over (s;
+    /// `omsi_traffic::DriverParams::signal_before_change`, copied by its `apply`): the road a
+    /// change takes, `change_space`, reads it. A state recorded without it reads
+    /// `SIGNAL_BEFORE_CHANGE` (the replay sets it from the driver again).
+    #[serde(default = "default_signal_before_change")]
+    pub signal_before_change: f32,
     /// A throwaway copy of a car as it would be put down, for a test of where it would stand
     /// (the game's `spawn_probe`): it plans its way without drawing a trip end (`goal_way`), so
     /// `GOAL_PICKED` counts real cars only; it chooses at random among the best tier.
@@ -3857,12 +3863,17 @@ pub fn change_length(speed: f32) -> f32 {
     (speed * (4.0 - speed * 0.04).clamp(2.8, 4.0)).max(12.0)
 }
 
-/// The road a lane change started at `v` m/s takes (m): the signalling before
-/// it moves (`SIGNAL_BEFORE_CHANGE`, speeding up at `a` meanwhile) and the move
-/// (`change_length`).
-pub fn change_space(v: f32, a: f32) -> f32 {
-    let w = SIGNAL_BEFORE_CHANGE;
+/// The road a lane change started at `v` m/s takes (m): the driver's signalling before it
+/// moves (`w` s, `DriverParams::signal_before_change`, `AiState::signal_before_change`;
+/// speeding up at `a` meanwhile) and the move (`change_length`).
+pub fn change_space(v: f32, a: f32, w: f32) -> f32 {
+    let w = w.max(0.0);
     v * w + 0.5 * a.max(0.0) * w * w + change_length(v)
+}
+
+/// `AiState::signal_before_change` where a recorded state lacks it.
+fn default_signal_before_change() -> f32 {
+    SIGNAL_BEFORE_CHANGE
 }
 
 /// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so the
@@ -4213,7 +4224,7 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, strategic_gave_up: false, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, strategic_gave_up: false, signal_before_change: SIGNAL_BEFORE_CHANGE, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     /// A random car woken after a time out of range (the game's dormant cars): it leaves the
@@ -4564,7 +4575,7 @@ impl AiState {
     /// onto it in time and would miss the fork.
     fn reachable_beside(&self, net: &Network, way: &[usize], s: f32) -> Vec<usize> {
         let Some(&lane) = way.last() else { return Vec::new() };
-        let space = change_space(self.speed, self.accel);
+        let space = change_space(self.speed, self.accel, self.signal_before_change);
         net.road_beside(lane).into_iter().filter(|&b| net.beside_run(way, s, b) >= space).collect()
     }
 

@@ -478,7 +478,7 @@ pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
 /// away, LC2013's floor - fell short of it and the wish, and the stop, were gone.
 fn last_stop_room(net: &Network, me: &Vehicle, nb: &NeighbourView) -> f32 {
     let side = (net.lanes[me.state.lane].width + net.lanes[nb.lane].width) * 0.5;
-    change_space(0.0, me.state.accel).max(bypass_min_len(me.length(), side))
+    change_space(0.0, me.state.accel, me.params.signal_before_change).max(bypass_min_len(me.length(), side))
 }
 
 /// May the driver change onto `nb` because its own lane ends for it (`Perception::
@@ -755,7 +755,7 @@ fn change_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     // slows to its last-resort stop, which leaves the room to move over from standing)
     // (the move's whole road, `change_space`, within the end, less what the car's stop control
     // lands either side of a stop, `REST_SHORT`: the last-resort stop leaves the space from rest)
-    let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel) <= e.dist + REST_SHORT);
+    let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel, me.params.signal_before_change) <= e.dist + REST_SHORT);
     let end_ok = |ok: bool| ok && !(end > 0.0 && (people_on_move(net, sim, me, nb) || !fits));
     // the car's lane does not lead to its trip end and `nb` is the way there: SUMO LC2013's
     // urgent strategic change, first in its order, before speed gain and keeping to the side
@@ -769,7 +769,7 @@ fn change_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Veh
     // on through the fork on its own lane, and its trip end is drawn again (`STRATEGIC_MISSED`)
     if let Some((strategic, dist)) = strategic_desire(net, sim, vehicles, me, nb).filter(|s| s.0 > 0.0 && s.0 >= end) {
         if may_change_for_lane_end(net, sim, me, nb) {
-            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel) <= dist + REST_SHORT;
+            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel, me.params.signal_before_change) <= dist + REST_SHORT;
             return (strategic, ok, ChangeWhy::Strategic);
         }
     }

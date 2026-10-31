@@ -181,11 +181,15 @@ impl Replay {
             match rec {
                 Record::Keyframe { vehicles, .. } => vehicles.iter_mut().for_each(|v| {
                     v.params.fill_missing(v.class);
+                    v.state.signal_before_change = v.params.signal_before_change;
                     if fill_waiting {
                         v.waiting = waiting_of_old(v);
                     }
                 }),
-                Record::Spawn { vehicle, .. } | Record::VehicleChanged { vehicle, .. } => vehicle.params.fill_missing(vehicle.class),
+                Record::Spawn { vehicle, .. } | Record::VehicleChanged { vehicle, .. } => {
+                    vehicle.params.fill_missing(vehicle.class);
+                    vehicle.state.signal_before_change = vehicle.params.signal_before_change;
+                }
                 _ => {}
             }
         }
