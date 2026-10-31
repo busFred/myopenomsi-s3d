@@ -784,3 +784,39 @@ fn a_blocked_strategic_change_is_given_up_after_the_drivers_patience() {
         }
     }
 }
+
+/// Fix 5-2: a car signalling a plain change follows the nearer of its own lane's leader and the
+/// target lane's (SUMO's `MSVehicle::planMoveInternal` adapts to the shadow lane's leaders too while
+/// a change is under way). Car 1 at 10 m/s on the left lane of `two_lanes`, signalling a change to
+/// the free right lane, a car crawling at 2 m/s 14 m ahead on its own lane: it brakes behind that
+/// car while it signals (following only the target lane's leader, none, it drove on at 10 m/s) and
+/// its body never touches it.
+#[test]
+fn a_signalling_car_follows_its_own_lanes_leader() {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 100.0, 10.0);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    me.state.start_change(&net, 1, 2);
+    assert!(me.state.change.is_some_and(|c| c.wait > 0.0));
+    let mut slow = car(2, 0, 118.0, 2.0);
+    slow.state.max_speed_kmh = 2.0 * 3.6;
+    slow.state.change_cooldown = 1000.0;
+    let cars_init = vec![me, slow];
+    let mut cars = cars_init;
+    let (mut least, mut t, mut sig_least) = (f32::INFINITY, 0.0f32, f32::INFINITY);
+    while t < 8.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        let a = cars.iter().find(|c| c.id == 1).unwrap();
+        let b = cars.iter().find(|c| c.id == 2).unwrap();
+        let sep = a.obb().separation(&b.obb()) as f32;
+        least = least.min(sep);
+        if a.state.change.is_some_and(|c| c.wait > 0.0) {
+            sig_least = sig_least.min(sep);
+        }
+        t += DT;
+    }
+    assert!(least > 0.0 && sig_least > 0.5, "no contact with the leader standing on its own lane: least {least:.2}, while signalling {sig_least:.2}");
+}

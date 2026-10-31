@@ -2433,6 +2433,19 @@ fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usi
     lead.map(|lead| Bypassed { lead, ahead: cor.ahead })
 }
 
+/// The lead of vehicle `i` along its own lane's way without its signalling change laid on it, from
+/// the pose it has on that way (`sim::way_pose`): a vehicle on that way, the player's bus or a
+/// parked car, by the corridor's tests (`corridor`).
+fn own_lane_leader(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
+    let mut me = vehicles[i].clone();
+    me.state.drop_change();
+    (me.pos, me.heading) = crate::sim::way_pose(net, &me.state);
+    let look = look_ahead(me.state.speed);
+    let lanes = way_lanes(net, &me.state, 220.0);
+    let cor = corridor(net, sim, vehicles, i, &me, &lanes, look);
+    Headway::nearer(Headway::nearer(cor.on_lane, cor.player), cor.parked)
+}
+
 /// Everything vehicle `i` sees this frame.
 pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Perception {
     let me = &vehicles[i];
@@ -2461,6 +2474,15 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             }
         }
         p.leader = Headway::nearer(p.leader, parked);
+        // a plain change that signals follows the nearer of the target lane's leader (the way with
+        // the change laid on it, above) and its own lane's leader (the way without it, from the
+        // pose the car has on that way): it is still in its lane until it moves over. SUMO:
+        // `MSVehicle::planMoveInternal` adapts also to the leaders on the shadow lane while a
+        // change is under way ("also slow down for leaders on the shadowLane relative to the
+        // current lane")
+        if st.change.is_some_and(|c| !c.bypass && c.wait > 0.0 && c.t <= 0.0) {
+            p.leader = Headway::nearer(p.leader, own_lane_leader(net, sim, vehicles, i));
+        }
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
         // the shift past people beside the lane, towards the middle only while the oncoming lane
         // is clear for it (`people_shift_clear`)
