@@ -388,23 +388,35 @@ pub fn lane_drivable(def: &Spline, path_index: usize, mirror: bool, reversed: bo
 /// next street path of the spline on that side (two paths of one road side are a lane width
 /// apart and the painted line between them lies midway; BeijingCity's `Andingmn_1.sli`: paths
 /// at -8.65 and -5.5, its lane line at -7.1; the oncoming lane's path likewise puts the
-/// centre line midway), and no further than the drawn road goes (the kerb or the asphalt's
-/// end, [`CrossSection::drivable_extent`]) on the side with no path beyond. 0 on a side
-/// neither tells: a path over no drawn road (an invisible helper spline, a Human_path) with
-/// no street path beside it on that side. `mirror` and `reversed` as for [`lane_drivable`].
+/// centre line midway), no further than the near side of a pedestrian or rail path on that
+/// side (`x ± width/2` of its `[path]`: BeijingCity's non-motor strips and `_noside` pavements
+/// are drawn as asphalt flush with the road, with the people's paths on them -
+/// TaijichangS.sli's lanes at ±1.7 m reached 4.1 m to the kerb over the paths at ∓4.4 and
+/// 4.5), and no further than the drawn road goes (the kerb or the asphalt's end,
+/// [`CrossSection::drivable_extent`]) on the side with no path beyond. 0 on a side neither
+/// tells: a path over no drawn road (an invisible helper spline, a Human_path) with no path
+/// beside it on that side (and a pedestrian path over the axis itself). `mirror` and
+/// `reversed` as for [`lane_drivable`].
 pub fn lane_edges(def: &Spline, path_index: usize, mirror: bool, reversed: bool) -> (f32, f32) {
     let Some(p) = def.paths.get(path_index) else { return (0.0, 0.0) };
     let (x, z) = (p.start[0], p.start[2]);
     let (mut neg, mut pos) = cross_section(def).drivable_extent(x, z).unwrap_or((f32::INFINITY, f32::INFINITY));
     for (i, o) in def.paths.iter().enumerate() {
-        if i == path_index || o.kind != 0 || (o.start[2] - z).abs() > PATH_ON_STRIP_DZ || (o.start[0] - x).abs() < SAME_X {
+        if i == path_index || (o.start[2] - z).abs() > PATH_ON_STRIP_DZ {
             continue;
         }
-        let half_gap = (o.start[0] - x).abs() * 0.5;
+        let gap = (o.start[0] - x).abs();
+        let edge = match o.kind {
+            // the next street lane: the line midway
+            0 if gap >= SAME_X => gap * 0.5,
+            // a pedestrian or rail path: its near side
+            1 | 2 => (gap - o.width * 0.5).max(0.0),
+            _ => continue,
+        };
         if o.start[0] > x {
-            pos = pos.min(half_gap);
+            pos = pos.min(edge);
         } else {
-            neg = neg.min(half_gap);
+            neg = neg.min(edge);
         }
     }
     let known = |v: f32| if v.is_finite() { v } else { 0.0 };
@@ -572,6 +584,16 @@ mod tests {
         assert!((l - 1.75).abs() < 1e-5 && (r - 1.325).abs() < 1e-5, "{l} {r}");
         // mirrored and running backwards: the same lane, the same edges
         assert_eq!(lane_edges(&def, 0, true, true), lane_edges(&def, 0, false, false));
+        // a pedestrian path on the drawn road beside the kerb lane (0.6 m wide at -3.2): its
+        // near side at -2.9 ends the lane there (0.3 m), not the kerb at -3.5 (0.9 m)
+        let mut people = def.clone();
+        people.paths.push(PathDef { kind: 1, ..path(-3.2, 0.0, 0.6, 2) });
+        let (l, r) = lane_edges(&people, 0, false, false);
+        assert!((l - 0.3).abs() < 1e-5 && (r - 0.85).abs() < 1e-5, "{l} {r}");
+        // one on a raised pavement beyond the kerb changes nothing
+        let mut kerbside = def.clone();
+        kerbside.paths.push(PathDef { kind: 1, ..path(-4.75, 0.12, 2.0, 2) });
+        assert_eq!(lane_edges(&kerbside, 0, false, false), lane_edges(&def, 0, false, false));
         // over no drawn road: only the side with a path beside it is known
         let mut bare = Spline::default();
         bare.paths = vec![path(0.0, 0.0, 1.0, 0), path(3.0, 0.0, 1.0, 0)];
