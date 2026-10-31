@@ -9800,17 +9800,15 @@ impl Humans {
             pn.mark_unloaded(n, generation, omsi_map::tile_size(), &|x, y| world.has_ground(x, y));
         }
         stage!("pedestrian network");
+        // (the strollers are put down after the frame's walking, below)
+        let mut put_down = false;
         if let Some(n) = net {
             self.stroll_timer -= dt;
             if self.stroll_timer <= 0.0 {
                 self.stroll_timer = 1.0;
                 let c = self.center;
                 self.populate_with(world, Some(n), renderer, scene, c);
-                if !self.mirror {
-                    let lights = traffic.map(|t| t as &dyn PedLights);
-                    self.populate_on_foot(world, n, lights, renderer, scene, 1.0);
-                    self.populate_lan_centers(world, n, lights, renderer, scene);
-                }
+                put_down = !self.mirror;
             }
         }
         stage!("populate");
@@ -10281,6 +10279,17 @@ impl Humans {
             }
         }
         stage!("ped.apply");
+        // the strollers put down once a second, after the frame's walking: where `may_appear`
+        // finds them out of sight is where the frame shows them. Put down before it, they take
+        // their first step in the frame they come, and one put down at the edge of the view cone
+        // walking into it is in sight the first time it is drawn (Jiangzhaikou standing, #1705
+        // 21 m from the player on pavement 3047)
+        if let (true, Some(n)) = (put_down, net) {
+            let lights = traffic.map(|t| t as &dyn PedLights);
+            self.populate_on_foot(world, n, lights, renderer, scene, 1.0);
+            self.populate_lan_centers(world, n, lights, renderer, scene);
+        }
+        stage!("ped.populate");
         self.animate(dt, world, &buses, &bus_ix);
         remove.sort_unstable();
         remove.dedup();
@@ -11618,6 +11627,68 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The strollers the placer puts down are out of sight where the frame shows them. A
+    /// pavement 30 m ahead of the eye runs out of its 40 deg cone
+    /// 3.5 m before either end: everybody put down there is put down after the frame's walking,
+    /// so none of them, walking into the cone, is in it the first time they are drawn
+    /// (Jiangzhaikou standing: #1705 21 m off, in sight the frame it came). A footpath 5 m ahead
+    /// of the eye, out of the cone past 20 m either side, gets strollers too.
+    #[test]
+    fn p3_b_strollers_are_put_down_out_of_sight_as_drawn() {
+        use crate::traffic::Traffic;
+        let root = std::env::temp_dir().join(format!("openomsi-put-down-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        std::fs::write(root.join("global.cfg"), "[name]\nPutDown\n").unwrap();
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        for x in -1..=0 {
+            for y in -1..=0 {
+                world.terrains.write().insert((x, y), Arc::new(omsi_map::Terrain::flat()));
+            }
+        }
+        let walk = |a: DVec3, b: DVec3, w: f32| omsi_sim::traffic::LaneBuilder::polyline((0..=20).map(|k| a + (b - a) * (k as f64 / 20.0)).collect(), LaneKind::Sidewalk, w);
+        let mut street = omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(-60.0, 5.8, 0.0), DVec3::new(0.0, 5.8, 0.0)], LaneKind::Street, 2.3);
+        street.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 3, path: 0 });
+        let mut ahead = walk(DVec3::new(-30.0, 30.0, 0.0), DVec3::new(30.0, 30.0, 0.0), 3.0);
+        ahead.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 1, path: 0 });
+        let mut beside = walk(DVec3::new(-60.0, 5.0, 0.0), DVec3::new(60.0, 5.0, 0.0), 1.0);
+        beside.key = Some(omsi_sim::traffic::LaneKey { tile: (0, 0), id: 2, path: 0 });
+        world.lanes.lock().extend([ahead, beside, street]);
+        world.lane_tiles.lock().push((0, 0));
+        let traffic = Traffic::new(&root, &world, 0).unwrap();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let mut h = Humans::new(&root);
+        h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+        h.map_humans_done = true;
+        (h.density, h.max_people, h.pedestrians) = (1.0, 2000, 2000);
+        h.eye = Some(Eye { pos: DVec3::new(0.0, 0.0, 1.8), fwd: DVec3::Y, cos_half: 40f64.to_radians().cos() });
+        let (mut put, mut put_ahead, mut put_beside) = (0, 0, 0);
+        let mut known: HashSet<u32> = HashSet::new();
+        // (half a second a frame: a first step of 0.6 m or so, of the order of the stretch out of
+        // the cone)
+        for _ in 0..120 {
+            h.tick(0.5, &world, None, Some(&traffic), &renderer, &mut scene);
+            for p in h.people.iter().filter(|p| p.place == Place::Ground && !known.contains(&p.id)) {
+                put += 1;
+                if p.position.y > 20.0 {
+                    put_ahead += 1;
+                } else {
+                    put_beside += 1;
+                }
+                assert_ne!(h.figure_sight(&world, p.position), FigureSight::In, "#{} in sight at {:?} the first time it is drawn", p.id, p.position);
+            }
+            known.extend(h.people.iter().map(|p| p.id));
+        }
+        assert!(put_ahead > 20 && put_beside > 20, "put down {put}: {put_ahead} ahead, {put_beside} beside");
+    }
 
     /// The harness's stand-in (`Humans::stand_in`, `--follow-line`): the player's bus stands at
     /// a stop on its duty, its doors opened as the AI bus driving it opens its own
