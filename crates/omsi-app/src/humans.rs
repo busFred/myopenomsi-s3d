@@ -1805,9 +1805,25 @@ impl Leg {
 /// legs do not advance (`stroll`, the progress by projection): persons move on the people's network
 /// only (SUMO), and somebody still in the road stepped on to the next legs and their kerbs, and
 /// walked 20 s along lane 2833 to a queue place there (BeijingCity c08, riders off bus 217).
+/// Taken over the leg's own stretch of its lane (from `a` to `b`), not the whole lane: near
+/// another stretch of a long or looping lane they are not on this leg's path.
 fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
     let lane = &net.lanes[leg.lane];
-    lane.nearest_point(pos).is_some_and(|(_, d)| d <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND)
+    let (lo, hi) = (leg.a.min(leg.b), leg.a.max(leg.b));
+    let mut best = f64::MAX;
+    for k in 0..lane.points.len().saturating_sub(1) {
+        let (d0, d1) = (lane.dist[k], lane.dist[k + 1]);
+        if d1 < lo || d0 > hi {
+            continue;
+        }
+        let seg = (d1 - d0).max(1e-6);
+        let (t0, t1) = (((lo - d0) / seg).clamp(0.0, 1.0) as f64, ((hi - d0) / seg).clamp(0.0, 1.0) as f64);
+        let (a, b) = (lane.points[k], lane.points[k + 1]);
+        let ab = b - a;
+        let t = ((pos - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(t0, t1);
+        best = best.min((a + ab * t - pos).length());
+    }
+    best <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND
 }
 
 /// `on_path` for the walk `walk`: on the path of its current leg or of the next, holding a place
@@ -1870,9 +1886,10 @@ struct PedWalk {
     /// Caught in a pocket between closed ends (`closed_ends` 2): they stand idle there, off SUMO's jam
     /// clock (nothing they wait for will move), until the out-of-sight removal takes them.
     pocket: bool,
-    /// Seconds waited off the paths at a lane's edge (`steps_into_traffic`): the kerb's margin
-    /// shrinks with it; apart from `held`, which makes a kerb waiter of somebody at a crossing's
-    /// kerb with a place in its queue.
+    /// Seconds waited off the paths at the edge of the lane they are about to step into
+    /// (`steps_into_traffic`): the kerb's margin shrinks with it. Per edge, as `held` is per kerb:
+    /// back to 0 once they step on (the test lets them) or are on the path again. Apart from
+    /// `held`, which makes a kerb waiter of somebody at a crossing's kerb with a place in its queue.
     edge_wait: f32,
 }
 
@@ -4014,6 +4031,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         me.why = WAITS_FOR_A_CAR;
         return Want::stand(Some(h), Activity::Stand);
     }
+    walk.edge_wait = 0.0;
     // stay on the path: the lane locally, as wide as it is
     let (a, _) = leg.at(net, (walk.s - 2.0).max(0.0));
     let (b, _) = leg.at(net, (walk.s + 2.5).min(len));
@@ -4334,9 +4352,14 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
     let frame = KerbFrame::of(net, next, &stripes);
     let key = ped.and_then(|p| kerb_node(p, next)).unwrap_or(usize::MAX);
     let kept = walk.spot.filter(|s| s.leg == walk.leg && s.next == next.lane);
+    // (a place they would reach only across or along a lane is not theirs, the move-up's as a
+    // fresh one's below)
+    let kerb_z = next.at(net, 0.0).0.z;
+    let off_lanes = |q: DVec2| !within_lanes(net, q.extend(kerb_z), &footprint_reach);
+    let reached = |q: DVec2| !off_lanes(me.pos) || way_off_lanes(&[me.pos, q], &off_lanes);
     let spot = match kept {
         Some(s) => {
-            let up = (s.row > 0).then(|| at.queues.areas.get(&key)).flatten().and_then(|a| a.pick(at.queues, me.id, me.pos, s.row, &frame));
+            let up = (s.row > 0).then(|| at.queues.areas.get(&key)).flatten().and_then(|a| a.pick(at.queues, me.id, me.pos, s.row, &frame)).filter(|(q, _, _)| reached(*q));
             match up {
                 Some((q, row, lat)) => KerbPlace { pos: q, row, lat, ..s },
                 None => s,
@@ -4398,9 +4421,7 @@ fn wait_at_kerb(ped: Option<&PedNet>, at: &Around, me: &Me, walk: &mut PedWalk, 
             // place on the people's network, never a straight line through a lane - SUMO's persons
             // move on sidewalks, walking areas and crossings only - and take one on their own side,
             // the no-place chain below, whose places are all reached off the lanes)
-            let kerb_z = next.at(net, 0.0).0.z;
-            let off_lanes = |q: DVec2| !within_lanes(net, q.extend(kerb_z), &footprint_reach);
-            let unreached = place.is_some_and(|(q, _, _)| off_lanes(me.pos) && !way_off_lanes(&[me.pos, q], &off_lanes));
+            let unreached = place.is_some_and(|(q, _, _)| !reached(q));
             if unreached {
                 place = None;
             }
