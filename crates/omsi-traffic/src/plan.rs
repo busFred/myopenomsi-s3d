@@ -1462,24 +1462,70 @@ fn shift_clears(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     other.separation(&b) >= SQUEEZE_CLEARANCE as f64
 }
 
-/// Is a foe of my way through junction `j` moving in a meeting stretch (`Foe::mine`, in my way's
-/// distances) that lies within my way from `from` to `to`: a vehicle on the foe's lane whose
-/// body reaches into that lane's side of the stretch (`Foe::theirs`), or a player's vehicle
-/// there, at `STANDING_SPEED` or more (an in-lane squeeze inside a junction; SUMO: a foe occupying
-/// the conflict area that has not passed it).
+/// Is a foe of my way through junction `j` in a meeting stretch (`Foe::mine`, in my way's
+/// distances) that lies within my way from `from` to `to`, or coming to it before my body has
+/// cleared it (an in-lane squeeze inside a junction; SUMO: a foe occupying the conflict area that
+/// has not passed it, and an approaching one by its arrival, `MSLink::blockedAtTime` with
+/// `jmTimegapMinor`)?
+/// - in it: a vehicle on the foe's lane whose body reaches into that lane's side of the stretch
+///   (`Foe::theirs`), or a player's vehicle there, at `STANDING_SPEED` or more (a foe standing
+///   there is no conflict for a move its body is clear of, which the squeeze's sweep keeps);
+/// - coming: a moving vehicle on the foe's lane short of the stretch, or on the lanes leading into
+///   it as far as one at that lane's limit covers in my time, whose front reaches the stretch
+///   (`arrival_time` at its speed, acceleration and limit) before my rear has left it (mine from
+///   my speed at my acceleration up to my lane's limit) and `perception::JM_TIMEGAP_MINOR`.
 fn squeeze_foe_moving(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, from: f32, to: f32) -> bool {
+    let st = &me.state;
     let node = &sim.junctions.nodes[j.junction];
+    let my_limit = net.lanes.get(st.lane).map_or(st.max_speed_kmh, |l| l.speed_limit_kmh.min(st.max_speed_kmh)).max(1.0) / 3.6;
     sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| j.entry + f.mine.0 < to && j.entry + f.mine.1 > from).any(|f| {
         let lane = node.movements[f.movement].lane;
         let (a, b) = f.theirs;
         let on = sim.occupancy.get(&lane).into_iter().flatten().any(|o| {
             vehicles.get(o.vehicle).is_some_and(|v| v.id != me.id && v.state.speed.abs() >= STANDING_SPEED && o.s - v.state.rear < b && o.s + v.state.front > a)
         });
-        on || net.lanes.get(lane).is_some_and(|l| {
+        let player_on = || net.lanes.get(lane).is_some_and(|l| {
             sim.players.iter().filter(|pl| pl.speed.abs() >= STANDING_SPEED && (pl.pos.z - me.pos.z).abs() <= 3.0).any(|pl| {
                 l.nearest_point(pl.pos).is_some_and(|(ps, d)| ps - pl.half_len < b && ps + pl.half_len > a && (d as f32) < l.width * 0.5 + pl.half_width)
             })
-        })
+        });
+        // (coming: my rear out of the stretch, and the foes short of it by their arrival)
+        let my_out = omsi_sim::traffic::arrival_time((j.entry + f.mine.1 + st.rear).max(0.0), st.speed.max(0.0), st.accel, my_limit);
+        let coming = || {
+            let mut todo: Vec<(usize, f32)> = vec![(lane, 0.0)];
+            let mut seen: Vec<usize> = Vec::new();
+            while let Some((l, before)) = todo.pop() {
+                if seen.contains(&l) {
+                    continue;
+                }
+                seen.push(l);
+                let Some(ln) = net.lanes.get(l) else { continue };
+                // (`before`: the road from this lane's end to the stretch's start, 0 on the foe's lane)
+                let to_a = |s: f32| if l == lane { a - s } else { before + ln.length() - s };
+                let hit = sim.occupancy.get(&l).into_iter().flatten().any(|o| {
+                    vehicles.get(o.vehicle).is_some_and(|v| {
+                        let d = to_a(o.s + v.state.front);
+                        v.id != me.id && v.state.speed >= STANDING_SPEED && d > 0.0 && {
+                            let lim = (ln.speed_limit_kmh.min(v.state.max_speed_kmh).max(1.0)) / 3.6;
+                            omsi_sim::traffic::arrival_time(d, v.state.speed, v.state.accel, lim) < my_out + crate::perception::JM_TIMEGAP_MINOR
+                        }
+                    })
+                });
+                if hit {
+                    return true;
+                }
+                // (back along the lanes leading in, as far as a foe at their limit covers in my time)
+                let next_before = if l == lane { a } else { before + ln.length() };
+                for &q in net.prev.get(l).into_iter().flatten() {
+                    let lim = net.lanes.get(q).map_or(1.0, |x| x.speed_limit_kmh.max(1.0)) / 3.6;
+                    if next_before < lim * (my_out + crate::perception::JM_TIMEGAP_MINOR) {
+                        todo.push((q, next_before));
+                    }
+                }
+            }
+            false
+        };
+        on || player_on() || coming()
     })
 }
 
@@ -3657,11 +3703,11 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 return false;
             }
             // (inside a junction a squeeze keeps off a stretch where the ways meet while a foe
-            // there is in use - one moving in it - since its body out of its lane's middle there
-            // would be where that foe is not reckoned with: SUMO's foe-lane occupancy, a vehicle
-            // waits while a foe occupies the conflict area and has not passed it. A foe standing
-            // there is no conflict for a move its body is clear of, which the squeeze's own sweep
-            // keeps by its clearance, `squeeze_clear`)
+            // there is in use - one moving in it, or one coming that reaches it before my body has
+            // left it - since its body out of its lane's middle there would be where that foe is
+            // not reckoned with: SUMO's foe-lane occupancy and approaching foes by their arrival.
+            // A foe standing there is no conflict for a move its body is clear of, which the
+            // squeeze's own sweep keeps by its clearance, `squeeze_clear`)
             if squeeze && (j.inside || j.line < real + st.front) {
                 return squeeze_foe_moving(net, sim, vehicles, me, j, -st.rear, squeeze_run);
             }

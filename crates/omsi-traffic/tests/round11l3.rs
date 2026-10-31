@@ -980,3 +980,66 @@ fn the_road_a_change_takes_reads_the_drivers_own_signalling_time() {
     let c = car(1, 0, 0.0, 0.0);
     assert_eq!(c.state.signal_before_change, c.params.signal_before_change);
 }
+
+/// Final review item 6: inside a junction a squeeze keeps off a meeting stretch a foe is coming to
+/// before the body has left it (SUMO: an approaching foe by its arrival, `MSLink::blockedAtTime`),
+/// not only one moving in it. The junction of
+/// `a_car_squeezes_round_a_body_across_its_way_inside_a_junction`, the car standing on piece 1 at
+/// x 124, so the squeeze round it runs over the crossing with piece 3 (x 130); car 1 from rest at
+/// x 98, and car 3 coming north on lane 4 into piece 3 at 8 m/s from y -104. Without the rule car
+/// 1 squeezed at 9.6 s, before car 3 was through (13.6 s); now it begins no squeeze while car 3
+/// would reach the crossing before car 1 has cleared it, and goes on along lane 2 after.
+#[test]
+fn a_squeeze_inside_a_junction_waits_for_a_foe_coming_to_the_meeting_stretch() {
+    let wide_piece = |pts: &[(f64, f64)], path: u16| {
+        let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.5);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+        l.priority = 128.0;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1, 0, 0.0)); // 0
+    net.lanes.push(wide_piece(&[(100.0, 0.0), (160.0, 0.0)], 0)); // 1
+    net.lanes.push(road(&[(160.0, 0.0), (400.0, 0.0)], 2, 0, 0.0)); // 2
+    net.lanes.push(wide_piece(&[(130.0, -40.0), (130.0, 40.0)], 1)); // 3
+    net.lanes.push(road(&[(130.0, -200.0), (130.0, -40.0)], 3, 0, 0.0)); // 4, leads into 3
+    net.lanes.push(road(&[(130.0, 40.0), (130.0, 300.0)], 4, 0, 0.0)); // 5
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net.build_grid();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 98.0, 0.0);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    let mut ob = standing(2, 1, 24.0);
+    ob.stopped = 60.0;
+    ob.state.lateral = 2.0;
+    ob.state.lateral_target = 2.0;
+    ob.state.lateral_ramp = (2.0, 2.0, 0.0, 1.0);
+    let mut foe = car(3, 4, 96.0, 8.0);
+    foe.state.max_speed_kmh = 8.0 * 3.6;
+    foe.state.change_cooldown = 1000.0;
+    let mut cars = vec![me, ob, foe];
+    let (mut first_squeeze, mut foe_through, mut least, mut t) = (None, None, f32::INFINITY, 0.0f32);
+    while t < 40.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        if first_squeeze.is_none() && me.passing.is_some_and(|p| p.lane.is_none()) {
+            first_squeeze = Some(t);
+        }
+        if let Some(f) = cars.iter().find(|c| c.id == 3) {
+            if foe_through.is_none() && f.pos.y - f.state.rear as f64 > 1.75 + 0.9 {
+                foe_through = Some(t);
+            }
+            least = least.min(me.obb().separation(&f.obb()) as f32);
+        }
+        t += DT;
+    }
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    let (sq, through) = (first_squeeze.expect("squeezes in the end"), foe_through.expect("the foe goes through"));
+    assert!(sq >= through - 0.5, "no squeeze before the coming foe is through: squeeze at {sq:.2} s, foe through at {through:.2} s");
+    assert!(least > 0.3 && me.state.lane == 2, "least {least:.2} m to the foe, lane {}", me.state.lane);
+}

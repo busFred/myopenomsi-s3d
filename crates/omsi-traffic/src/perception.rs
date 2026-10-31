@@ -1159,7 +1159,7 @@ const CROSSING_STANDING_WAIT: f32 = 2.0;
 /// SUMO's `jmTimegapMinor` default (1 s, `MSLink::myLookaheadTime`): an approaching
 /// person's window on the crossing and mine conflict within this of each other
 /// (`MSLink::blockedAtTime`).
-const JM_TIMEGAP_MINOR: f32 = 1.0;
+pub(crate) const JM_TIMEGAP_MINOR: f32 = 1.0;
 /// The fastest a person crosses (m/s, `humans::PED_HURRY_MAX`: hurried, caught by the
 /// change): an approaching person's time on the crossing times this bounds its length.
 const APPROACH_PACE_MAX: f32 = 2.5;
