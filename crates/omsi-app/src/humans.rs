@@ -1799,6 +1799,23 @@ impl Leg {
     }
 }
 
+/// Whether somebody at `pos` is on the path of leg `leg`: no farther from its lane than the
+/// stroll's corridor draws anybody back (half its width, a metre at least, and `STROLL_BAND`).
+/// Off it - a rider off a bus walking to their pavement - they walk to the leg's point and their
+/// legs do not advance (`stroll`, the progress by projection): persons move on the people's network
+/// only (SUMO), and somebody still in the road stepped on to the next legs and their kerbs, and
+/// walked 20 s along lane 2833 to a queue place there (BeijingCity c08, riders off bus 217).
+fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
+    let lane = &net.lanes[leg.lane];
+    lane.nearest_point(pos).is_some_and(|(_, d)| d <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND)
+}
+
+/// `on_path` for the walk `walk`: on the path of its current leg or of the next (a kerb waiter's
+/// place lies in the waiting area ahead of the leg they walked up to it).
+fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec3) -> bool {
+    walk.legs[walk.leg..].iter().take(2).any(|l| on_path(net, l, pos))
+}
+
 /// A walk along the pavement network.
 #[derive(Debug, Clone)]
 struct PedWalk {
@@ -3713,6 +3730,9 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         }
     }
     let leg = walk.legs[walk.leg];
+    // (on the path of their leg, `on_path`: off it they walk to the leg first - no verdict at a
+    // kerb ahead, no leg's end)
+    let here_on_path = walk_on_path(net, walk, pos2.extend(leg.at(net, walk.s).0.z));
     // the verdict on the crossing ahead is taken on the way to its kerb, `kerb_look`
     // short of it (SUMO: a pedestrian waits at the crossing's start, on the walking area, never
     // on the carriageway; OMSI's crossings start at the lane's edge, so the start of the
@@ -3723,7 +3743,7 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let to_end = leg.len() - walk.s;
     // (behind a queue at that kerb: at its tail, `Queues::tail`, and the stopping distance)
     let look = walk.legs.get(walk.leg + 1).and_then(|n| ped.and_then(|p| kerb_node(p, n))).and_then(|k| at.queues.tail.get(&k)).map(|t| *t as f32 + kerb_stop(me.pace)).unwrap_or(0.0).max(kerb_look(me.pace));
-    if walk.held == 0.0 && !walk.cross.is_some_and(|c| c.on(walk.leg)) && to_end > KERB_AT && to_end <= look {
+    if here_on_path && walk.held == 0.0 && !walk.cross.is_some_and(|c| c.on(walk.leg)) && to_end > KERB_AT && to_end <= look {
         if walk.leg + 1 >= walk.legs.len() && walk.roam {
             plan_next_leg(ped, net, walk, rng);
         }
@@ -3760,8 +3780,9 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
         _ => None,
     };
     // (at the leg's end - or held there, or arrived there and deciding the way on, `kerb_hold`,
-    // whatever the projection of their position along the leg says from frame to frame)
-    if walk.s >= leg.len() - KERB_AT || walk.held > 0.0 || walk.kerb_hold {
+    // whatever the projection of their position along the leg says from frame to frame; only on
+    // the path, `on_path`: off it they walk to the leg first)
+    if here_on_path && (walk.s >= leg.len() - KERB_AT || walk.held > 0.0 || walk.kerb_hold) {
         match walk.cross {
             // between two pieces of the crossing: on, no decision on the carriageway
             Some(c) if walk.leg >= c.from && walk.leg < c.to => walk.step_on(),
@@ -3898,14 +3919,11 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let right = DVec2::new(hr.cos(), -hr.sin());
     let target = p.truncate() + right * side;
     let vel = (target - pos2).normalize_or_zero() * pace;
-    // somebody off the paths - farther from their leg's path than its corridor draws anybody back
-    // (half its width and STROLL_BAND): a rider off a bus walking to their pavement - not on a
+    // somebody off the paths (`on_path`: a rider off a bus walking to their pavement), not on a
     // crossing: the first step into a lane is decided as at an unsignalled kerb
-    // (`steps_into_traffic`), the wait counted on `walk.held`. (The point leg `walk_street_on`
-    // gives them is replaced by the path's own leg once planned: no test of the leg's length.)
+    // (`steps_into_traffic`), the wait counted on `walk.held`
     let here3 = pos2.extend(p.z);
-    let off_path = lane.nearest_point(here3).is_none_or(|(_, d)| d > width * 0.5 + STROLL_BAND);
-    if off_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
+    if !here_on_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
         walk.held += dt;
         me.decision = Some(WAITS_FOR_A_CAR);
         me.why = WAITS_FOR_A_CAR;
@@ -10368,7 +10386,8 @@ impl Humans {
             let pos = p.position;
             match &mut p.state {
                 State::Strolling(walk) => {
-                    if let Some(leg) = walk.legs.get(walk.leg) {
+                    // (not off the path: there they walk to the leg, `on_path`)
+                    if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(net, walk, pos)) {
                         walk.s = leg.project(net, pos, walk.s).max(walk.s - 0.3);
                     }
                 }
@@ -15721,6 +15740,18 @@ mod ped_tests {
         assert!(!steps(&[SeenCar { stood: PED_OCCUPIED_CAP + 10.0, ..car(0.5, 0.0) }], kerb), "standing past the cap");
         assert!(steps_after(&[car(-50.0, 10.0)], kerb, 0.0), "5 s off, just come");
         assert!(!steps_after(&[car(-50.0, 10.0)], kerb, 46.0), "5 s off, after 46 s");
+    }
+
+    #[test]
+    fn p3_5_off_the_path_legs_do_not_advance() {
+        // a 2 m path along x at y 0; somebody 1 m off it is on it, 5 m off it (in the road) is not:
+        // their leg neither ends nor moves on by projection there
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(20.0, 0.0)], LaneKind::Sidewalk, 2.0));
+        net.build_grid();
+        let leg = Leg { lane: 0, a: 10.0, b: 10.0 };
+        assert!(on_path(&net, &leg, p(10.0, 1.0)));
+        assert!(!on_path(&net, &leg, p(10.0, 5.0)));
     }
 
     #[test]
