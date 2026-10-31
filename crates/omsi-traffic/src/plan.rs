@@ -1570,10 +1570,40 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     None
 }
 
-/// My lead when it stands within the road a lane change `(wait, len)` takes from now at speed
-/// `v`: the signal's road (`wait` seconds left) and the move (`len` metres; `change_clear`).
-fn near_standing_lead(p: &Perception, v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
-    p.leader.filter(|l| l.speed < STANDING_SPEED && l.gap < len + v * wait)
+/// My lead when it would stand within the road a lane change `(wait, len)` takes from now at
+/// speed `v` - the signal's road (`wait` seconds left) and the move (`len` metres; `change_clear`)
+/// - were it to brake to rest now at its comfortable deceleration (`stop_reach`; SUMO's gap rule
+/// reads a leader by its braking whatever its speed): one standing, or creeping and about to
+/// stand, is the same lead to the start check and to the re-sweep while the change signals.
+fn near_standing_lead(p: &Perception, vehicles: &[Vehicle], v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
+    p.leader.filter(|l| {
+        let b = match l.what {
+            Seen::Vehicle(j) | Seen::Body(j) => vehicles.get(j).map(|o| o.params.comfort_brake),
+            _ => None,
+        };
+        l.gap + stop_reach(l.speed, b) < len + v * wait
+    })
+}
+
+/// How far (m) a body at `speed` m/s runs on braking to rest at `brake` m/s² (its comfortable
+/// deceleration; a preset car's where it is not known): where a leader would stand were it to
+/// stop now - the least it will be ahead of where it is (SUMO's secure gap assumes the leader
+/// brakes).
+fn stop_reach(speed: f32, brake: Option<f32>) -> f32 {
+    let b = brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake).max(0.1);
+    speed.max(0.0).powi(2) / (2.0 * b)
+}
+
+/// How a body near is swept by a moving body's sweep (`body_sweep_clear`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Carry {
+    /// Where it is now.
+    Now,
+    /// Carried on along its heading at its speed for the time my body takes there.
+    AtSpeed,
+    /// Carried on at its speed but no further than where it would stand braking at the given
+    /// deceleration (`stop_reach`): the least it will have moved on.
+    ToStop(f32),
 }
 
 /// How far across (m, + right of my heading) the lane `nb` lies from me: a bypass's move.
@@ -2258,24 +2288,50 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let along = b.corners().map(|c| (c - me.pos.truncate()).dot(f0));
         along.iter().cloned().fold(f64::INFINITY, f64::min) < st.front as f64 && along.iter().cloned().fold(f64::NEG_INFINITY, f64::max) > -(st.rear as f64)
     };
-    // (whether a body of this speed is swept: `Some(true)` carried on to where it will be when
-    // my body reaches the sample, `Some(false)` where it is now)
-    let swept = |speed: f32, b: &Obb| match bodies {
-        _ if speed.abs() < STANDING_SPEED => Some(false),
-        Bodies::All => Some(false),
-        Bodies::Over { .. } if bodies.time_to(0.0).is_some() && beside(b) => Some(true),
-        Bodies::Over { others, .. } => others.then_some(false),
+    // (wholly ahead of my front along my heading)
+    let ahead_of_me = |b: &Obb| b.corners().map(|c| (c - me.pos.truncate()).dot(f0)).iter().cloned().fold(f64::INFINITY, f64::min) >= st.front as f64;
+    // (the lanes of my own way: a body on them ahead of me is my lead's or the car following's)
+    let own_way: Vec<usize> = match bodies {
+        Bodies::Over { .. } => crate::perception::way_lanes(net, st, level + 30.0).into_iter().map(|w| w.0).collect(),
+        Bodies::All => Vec::new(),
     };
-    // (a body where it is when my body is `d` metres on: carried on along its heading at its
-    // speed for the time my body takes there, `Bodies::time_to`)
-    let at = |mut b: Obb, heading: f32, speed: f32, carried: bool, d: f32| {
-        if let (true, Some(t)) = (carried, bodies.time_to(d)) {
+    // (how a body of this speed, on this lane, is swept - one rule whatever its speed, so the start
+    // check and the re-sweep while the change signals make the same test of a car creeping that
+    // stands a moment later: beside me, carried on at its speed (the rear's swing); ahead of my
+    // front, off my own way, where it would stand braking now at its comfortable deceleration (the
+    // least it will have moved on, SUMO's secure gap); ahead on my own way, the car following's,
+    // and so too once a lead would stand within the move (`near_standing_lead`, `others`); behind
+    // my rear, standing where it is, moving the gap rule's, or where it is with `others`)
+    let swept = |speed: f32, lane: Option<usize>, brake: Option<f32>, b: &Obb| -> Option<Carry> {
+        let moving = speed.abs() >= STANDING_SPEED;
+        match bodies {
+            Bodies::All => Some(Carry::Now),
+            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::AtSpeed } else { Carry::Now }),
+            Bodies::Over { others, .. } if ahead_of_me(b) => {
+                let to_stop = Carry::ToStop(brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake));
+                (others || !lane.is_some_and(|l| own_way.contains(&l))).then_some(to_stop)
+            }
+            Bodies::Over { others, .. } => (!moving || others).then_some(Carry::Now),
+        }
+    };
+    // (a body where it is when my body is `d` metres on, `Carry`, over the time my body takes there,
+    // `Bodies::time_to`)
+    let at = |mut b: Obb, heading: f32, speed: f32, carry: Carry, d: f32| {
+        let run = match (carry, bodies.time_to(d)) {
+            (Carry::AtSpeed, Some(t)) => speed * t,
+            (Carry::ToStop(brake), Some(t)) => (speed.max(0.0) * t).min(stop_reach(speed, Some(brake))),
+            _ => 0.0,
+        };
+        if run != 0.0 {
             let h = (heading as f64).to_radians();
-            b.center += DVec2::new(h.sin(), h.cos()) * (speed * t) as f64;
+            b.center += DVec2::new(h.sin(), h.cos()) * run as f64;
         }
         b
     };
-    let near: Vec<(usize, bool)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| swept(vehicles[j].state.speed, &vehicles[j].obb()).map(|c| (j, c))).collect();
+    let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| {
+        let o = &vehicles[j];
+        swept(o.state.speed, Some(o.state.lane), Some(o.params.comfort_brake), &o.obb()).map(|c| (j, c))
+    }).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
     // (my body's pose `d` metres on and its least separation from what is swept)
     let pose_sep = |d: f32| -> (Obb, f64) {
@@ -2310,8 +2366,8 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         }
         for pl in sim.players.iter().filter(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0) {
             let pb = pl.obb(0.0, 0.0);
-            if let Some(carried) = swept(pl.speed, &pb) {
-                sep = sep.min(at(pb, pl.heading, pl.speed, carried, d).separation(&b));
+            if let Some(carry) = swept(pl.speed, None, None, &pb) {
+                sep = sep.min(at(pb, pl.heading, pl.speed, carry, d).separation(&b));
             }
         }
         for o in parked.iter().chain(people) {
@@ -2337,7 +2393,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
                     if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
                         let sp = at(o.obb(), o.heading, o.state.speed, carried, d).separation(&b);
                         if sp < best.0 {
-                            best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried, sp as f32, d)));
+                            best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried != Carry::Now, sp as f32, d)));
                         }
                     }
                 }
@@ -2993,10 +3049,15 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 let mut before = me.clone();
                 before.state.drop_change();
                 (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
-                let near = near_standing_lead(p, v, (c.wait, c.length));
+                let near = near_standing_lead(p, vehicles, v, (c.wait, c.length));
                 if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
                     match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
                         Some(step_out) if out.start.is_none() => out.start = Some(step_out),
+                        // (a lead that will stand within the move while the car can still stop at
+                        // the room to turn out behind it, `change_keep_room`: the change goes on -
+                        // the car brakes to that room and steps out from there, as it would once
+                        // the lead stands; dropped only where it no longer can)
+                        _ if near.is_some() && change_keep_room(net, me, p).is_some() => {}
                         _ => {
                             (out.abort_change, out.abort_why) = (true, Some(AbortWhy::PlainSweep));
                             out.abort_detail = SWEEP_BLOCKER.with(|c| c.get());
@@ -3066,7 +3127,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (under way the move itself must clear the parked cars, the people, the standing
             // bodies near and the moving ones beside me where they will be, `change_clear`)
             let mv = (me.params.signal_before_change, omsi_sim::traffic::change_length(v.max(0.0)));
-            let near = near_standing_lead(p, v, mv);
+            let near = near_standing_lead(p, vehicles, v, mv);
             out.start = match near {
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None),
                 Some(l) => change_clear(net, sim, vehicles, me, p, &nb, Some(&l), mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
