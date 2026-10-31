@@ -4096,3 +4096,30 @@ mod free_road_tests {
         assert!((free_road(0.0, 2.0, 10.0, 1.0) - 1.0).abs() < 1e-4, "from rest");
     }
 }
+
+#[cfg(test)]
+mod impatience_tests {
+    use super::{impatient_gap, LC_IMPATIENCE_GAIN};
+    use crate::driver::VehicleClass;
+    use crate::sim::Vehicle;
+    use omsi_sim::traffic::AiState;
+
+    /// L3-D4 (final review M2): SUMO SL2015's `getSafetyFactor` - the gap divided by `1 + 0.5 x
+    /// impatience` - with the floor: a calm driver takes the whole gap, a fully impatient one the
+    /// gap over 1.5 but never less than the floor (the standing gap and the braking at comfort),
+    /// and a floor above the gap leaves the gap as it is.
+    #[test]
+    fn lane_change_impatience_shrinks_the_gap_by_at_most_one_and_a_half_and_never_below_the_floor() {
+        let mut me = Vehicle::new(1, VehicleClass::Car, AiState::new(0, 0.0, 1), 0.9, 1);
+        me.lc_impatience = 0.0;
+        assert_eq!(impatient_gap(&me, 12.0, 3.0), 12.0);
+        me.lc_impatience = 1.0;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 12.0 / (1.0 + LC_IMPATIENCE_GAIN)).abs() < 1e-5);
+        assert_eq!(impatient_gap(&me, 12.0, 9.0), 9.0, "the floor holds");
+        assert_eq!(impatient_gap(&me, 6.0, 9.0), 6.0, "a floor above the gap: the gap");
+        me.lc_impatience = 0.5;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 12.0 / 1.25).abs() < 1e-5);
+        me.lc_impatience = 3.0;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 8.0).abs() < 1e-5, "impatience is read at most 1");
+    }
+}

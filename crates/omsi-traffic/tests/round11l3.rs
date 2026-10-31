@@ -1043,3 +1043,48 @@ fn a_squeeze_inside_a_junction_waits_for_a_foe_coming_to_the_meeting_stretch() {
     assert!(sq >= through - 0.5, "no squeeze before the coming foe is through: squeeze at {sq:.2} s, foe through at {through:.2} s");
     assert!(least > 0.3 && me.state.lane == 2, "least {least:.2} m to the foe, lane {}", me.state.lane);
 }
+
+/// L3-D4 (final review M2): the lane-change impatience grows over the driver's `strategic_patience`
+/// while its urgent change is blocked and is 0 again once the change has moved over (ours: no
+/// growth for speed-gain changes and no slow decay, where SL2015 grows it for both and lets it
+/// decay at the same rate). Car 1 of `a_blocked_strategic_change_stops_before_the_dead_lanes_end_and_waits`
+/// with a patience of 40 s: after 20 s blocked its impatience is near half; the jam gone, it
+/// changes, and once on lane 1 its impatience is 0.
+#[test]
+fn lane_change_impatience_grows_while_an_urgent_change_is_blocked_and_resets_after() {
+    let net = fork_ahead();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 200.0, 13.0);
+    me.state.change_cooldown = 0.0;
+    me.state.goal = Some(3);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    me.params.strategic_patience = 40.0;
+    let mut cars = vec![me];
+    for k in 0..12u64 {
+        cars.push(standing(10 + k, 1, 220.0 + 6.5 * k as f32));
+    }
+    let (mut blocked_since, mut mid, mut after, mut t) = (None, None, None, 0.0f32);
+    while t < 45.0 {
+        if t >= 30.0 {
+            cars.retain(|c| c.id == 1);
+        }
+        sim.tick(&net, DT, &mut cars);
+        let me = cars.iter().find(|c| c.id == 1).expect("car 1");
+        if blocked_since.is_none() && me.lc_impatience > 0.0 {
+            blocked_since = Some(t);
+        }
+        if let Some(b) = blocked_since {
+            if mid.is_none() && t - b >= 20.0 {
+                mid = Some(me.lc_impatience);
+            }
+        }
+        if me.state.lane != 0 && me.state.change.is_none() && after.is_none() {
+            after = Some(me.lc_impatience);
+        }
+        t += DT;
+    }
+    let mid = mid.expect("blocked 20 s");
+    assert!((mid - 0.5).abs() < 0.05, "half its patience blocked: impatience {mid:.3}");
+    assert_eq!(after, Some(0.0), "moved over: impatience back to 0");
+}
