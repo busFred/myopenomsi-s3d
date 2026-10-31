@@ -907,8 +907,7 @@ pub(super) fn best_bus(buses: impl Iterator<Item = (BusId, Fit, f64)>) -> Option
 /// Not at another object of the stop's name - another line's platform, often in the same
 /// kerb: its people wait for their own line (Omsi.exe's line record of their stop does not
 /// list this trip's terminus; SUMO: a person waits at their own busStop and boards only a
-/// vehicle stopping there), and taken by the duty they walked up to the player's bus where
-/// it served no stop of theirs and were left behind or stood in its way.
+/// vehicle stopping there).
 pub(super) fn fit(
     id: i64,
     dest: Option<&str>,

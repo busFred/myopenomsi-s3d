@@ -92,7 +92,7 @@ struct Seen {
     other_min_speed: f32,
     /// Frames the player's claim (filed from the indicator, as a user's) and the stand-in's
     /// own named another junction or way, or only one was filed (`stand_in_apart_frames`).
-    unmatched: u32,
+    unmatched: [u32; 4],
 }
 
 /// Run the stand-in `own` (index 0) and the other car (index 1) for `secs`, the player's view
@@ -103,7 +103,7 @@ fn run(net: &Network, mut vehicles: Vec<Vehicle>, secs: f32, stand_in: bool) -> 
     let own_id = vehicles[0].id;
     let other_id = vehicles[1].id;
     sim.stand_in = stand_in.then_some(StandIn { vehicle: own_id, player: 0 });
-    let mut seen = Seen { other_waits_player: 0, other_waits_vehicle: 0, own_waits_self: 0, own_waits_other: 0, player_claims: 0, own_claims: 0, nearest: f32::INFINITY, own_min_speed: f32::INFINITY, other_min_speed: f32::INFINITY, unmatched: 0 };
+    let mut seen = Seen { other_waits_player: 0, other_waits_vehicle: 0, own_waits_self: 0, own_waits_other: 0, player_claims: 0, own_claims: 0, nearest: f32::INFINITY, own_min_speed: f32::INFINITY, other_min_speed: f32::INFINITY, unmatched: [0; 4] };
     let mut still = 0.0f32;
     let mut t = 0.0;
     // (the pose the first view is built from)
@@ -132,7 +132,7 @@ fn run(net: &Network, mut vehicles: Vec<Vehicle>, secs: f32, stand_in: bool) -> 
         }
         t += DT;
     }
-    seen.unmatched = sim.stand_in_apart_frames.iter().sum();
+    seen.unmatched = sim.stand_in_apart_frames;
     seen
 }
 
@@ -149,13 +149,14 @@ fn h2_a_side_road_car_gives_way_to_the_stand_in_as_to_the_player() {
     assert!(plain.other_waits_vehicle > 0 && plain.own_claims > 0, "as a plain AI bus it is waited for as one");
     let s = run(&net, vehicles, 15.0, true);
     eprintln!(
-        "h2 main: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {} frames",
+        "h2 main: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {:?} frames",
         s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed, s.unmatched
     );
     assert!(s.other_waits_player > 0, "the side road car gave way to the player's claim");
     assert_eq!(s.other_waits_vehicle, 0, "the stand-in is no AI vehicle to the others");
     assert_eq!(s.own_waits_self, 0, "the stand-in never waits for itself");
     assert!(s.player_claims > 0, "the player's claim is filed");
+    assert_eq!(s.unmatched[..2], [0, 0], "straight on with no indicator: the player's claim names the stand-in's junction and way (frames apart by kind {:?})", s.unmatched);
     assert_eq!(s.own_claims, 0, "no AI claim of the stand-in's own");
     assert!(s.own_min_speed > 8.0, "the stand-in went through on its right of way: {:.1}", s.own_min_speed);
     assert!(s.other_min_speed < 8.0, "the side road car slowed for it: {:.1}", s.other_min_speed);
@@ -170,11 +171,12 @@ fn h2_the_stand_in_gives_way_by_its_own_grant() {
     let vehicles = vec![bus(1, 3, net.lanes[3].length() - 45.0, 10.0), car(2, 0, net.lanes[0].length() - 40.0, 11.0)];
     let s = run(&net, vehicles, 15.0, true);
     eprintln!(
-        "h2 side: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {} frames",
+        "h2 side: other waits for the player {} / the AI bus {} frames, own waits for itself {} / the car {}, player claims {} own {}, nearest {:.2} m, own min speed {:.1}, other min speed {:.1}, claims apart {:?} frames",
         s.other_waits_player, s.other_waits_vehicle, s.own_waits_self, s.own_waits_other, s.player_claims, s.own_claims, s.nearest, s.own_min_speed, s.other_min_speed, s.unmatched
     );
     assert!(s.own_waits_other > 0, "the stand-in waited for the car at the junction");
     assert_eq!(s.own_waits_self, 0, "the stand-in never waits for itself");
+    assert_eq!(s.unmatched[..2], [0, 0], "straight on with no indicator: the player's claim names the stand-in's junction and way (frames apart by kind {:?})", s.unmatched);
     assert_eq!(s.other_waits_player + s.other_waits_vehicle, 0, "the car on the main road waits for nobody");
     assert_eq!(s.own_claims, 0, "no AI claim of the stand-in's own among the others'");
     assert!(s.other_min_speed > 8.0, "the car went through: {:.1}", s.other_min_speed);

@@ -5901,14 +5901,13 @@ pub struct Humans {
     /// The stop `stand_in` boards at as its own `BusNow` names it (`boarding_stop`: its
     /// timetable's at its station standing, else a stop object it stands at; as of the last
     /// tick): the player's bus names it too, so that the doors' pavements are worked out as for
-    /// a timetable bus (`kerb_doors`). Riders stepping off with none - the next stop object of
-    /// their destination's name has no pavement (`walk_street`) - stood at the door inside the
-    /// player's bus's box (`State::Standing`, until the player is gone) and held the stand-in.
+    /// that timetable bus (`kerb_doors`: in the stop object's box the stop's own pavement).
     pub(crate) stand_in_boarding: Option<i64>,
     /// The buses whose riders step off this frame onto the footpath nearest their door, not a
     /// stop's own pavement (`kerb_doors`, `door_footpath`), and the riders who stepped off so
-    /// (counted at the door); the riders who rode on as no footpath was within reach of any open
-    /// exit (rider, bus; `kerb_doors`).
+    /// (counted at the door); the riders carried past their stop as no footpath was within
+    /// reach of any open exit - on their way out, or bound for the stop by its name (rider, bus;
+    /// `kerb_doors`).
     door_walk: HashSet<BusId>,
     pub(crate) walked_to_footpath: u32,
     pub(crate) rode_on: HashSet<(u32, BusId)>,
@@ -8303,7 +8302,11 @@ impl Humans {
             }
             if exit_was_open && !bn.exit_open.iter().any(|o| *o) {
                 let id = bn.id;
-                let leaving: Vec<u32> = self.people.iter().filter(|p| matches!(&p.state, State::Pax(x) if x.inside == Some(id) && x.task == Task::InBusToExit)).map(|p| p.id).collect();
+                // (on their way out, or bound for this stop - its name their destination: with
+                // every exit shut for them they never set off for the door)
+                let here = stop.and_then(|s| self.stops.get(&s));
+                let bound = |x: &Pax| x.task == Task::InBusToExit || here.is_some_and(|ps| x.dest.as_deref().is_some_and(|d| ps.is_named(d)));
+                let leaving: Vec<u32> = self.people.iter().filter(|p| matches!(&p.state, State::Pax(x) if x.inside == Some(id) && bound(x))).map(|p| p.id).collect();
                 self.rode_on.extend(leaving.into_iter().map(|p| (p, id)));
             }
             if !(in_box && stop_pavement.is_some()) {

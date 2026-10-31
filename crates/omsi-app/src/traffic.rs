@@ -4274,14 +4274,18 @@ impl Traffic {
                         d.bound_left,
                         d.boarders_left
                     );
-                    self.recorder.dwell(self.sim.time, car.id, &d);
+                    // (the bus driving the player's is recorded as the player only, `stand_in`)
+                    if Some(car.id) != self.stand_in {
+                        self.recorder.dwell(self.sim.time, car.id, &d);
+                    }
                 }
                 // the stops whose waiters it pulls in beside
                 ext.serves = [service.stops.front().map(|s| s.id), service.served];
                 // its trip over at the end of its track: on off the route's end
                 ext.trip_over = service.drives_off();
-                if std::mem::take(&mut service.rerouted) {
-                    // (the route it drives now, for the recording)
+                if std::mem::take(&mut service.rerouted) && Some(car.id) != self.stand_in {
+                    // (the route it drives now, for the recording; not the bus driving the
+                    // player's, recorded as the player only, `stand_in`)
                     self.recorder.vehicle_changed(self.sim.time, &car.ai);
                 }
                 // ahead of its timetable: slower
@@ -4622,9 +4626,10 @@ impl Traffic {
     }
 
     /// The game changed car `ci`'s way between frames (a timetable bus given its next trip,
-    /// let go, its route extended): into the recording.
+    /// let go, its route extended): into the recording - not the bus driving the player's,
+    /// recorded as the player only (`stand_in`).
     pub fn note_vehicle_changed(&mut self, ci: usize) {
-        if let Some(c) = self.cars.get(ci) {
+        if let Some(c) = self.cars.get(ci).filter(|c| Some(c.id) != self.stand_in) {
             self.recorder.vehicle_changed(self.sim.time, &c.ai);
         }
     }

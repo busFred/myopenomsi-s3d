@@ -22,8 +22,8 @@
 //! the player (`omsi_traffic::StandIn`: it is on no lane for them and they see no claim of its
 //! own; it drives by the grant of its own claim, resolved against theirs, and does not see the
 //! player's vehicle, itself; the bus service's queue tests of the other buses do not count it
-//! either, `Traffic::stand_in`). A recording of such a run has the AI bus as a vehicle and the
-//! player's box both (the replay knows no stand-in): its replay has two bodies there.
+//! either, `Traffic::stand_in`). A recording of such a run has the AI bus once, as the player
+//! (its box; `Traffic::stand_in`), not as a vehicle.
 //! When the bus is lost (taken off the road, its trip over and let go) the player's bus
 //! stands where it was left.
 //!
@@ -305,6 +305,12 @@ struct Round {
 /// standstill (8 m, `perception::people_reach`), rounded up.
 const HELD_BY_PEOPLE_LOOK: f64 = 15.0;
 
+/// How far (m) past the place the AI bus stops for people its holder is looked for (a
+/// diagnostic bound, no rule reads it: the people test stops a vehicle short of the person who
+/// holds it, by its clearance and their step; the nearest person to that place within this is
+/// named, so a wider bound names the same one).
+const HOLDER_PAST: f64 = 3.0;
+
 /// The player's id in the traffic (`Traffic::tick`'s view of the player).
 const PLAYER_VIEW: u32 = crate::traffic::PLAYER_VIEW_ID;
 
@@ -461,9 +467,28 @@ impl PlayerWatch {
             if c.ai.last.why == omsi_traffic::Why::People && (t_s - dt).div_euclid(1.0) != t_s.div_euclid(1.0) {
                 let bb = player.ty.def.bounding_box.unwrap_or(crate::traffic::DEFAULT_BOX);
                 let body = omsi_sim::collision::Obb::from_box(bb, player.position, player.heading);
-                for (id, p, what) in h.describe_near(player.position, HELD_BY_PEOPLE_LOOK) {
+                // (the holder as the people test has it: the person on the AI bus's way nearest the
+                // place it stops for, `last.stop` past its front - within its half width and a
+                // person's radius of its axis, from its rear to `HOLDER_PAST` past that place)
+                let st = &c.ai.state;
+                let hd = (c.vehicle.heading as f64).to_radians();
+                let (fwd, right) = (glam::DVec2::new(hd.sin(), hd.cos()), glam::DVec2::new(hd.cos(), -hd.sin()));
+                let stop = c.ai.last.stop.unwrap_or(0.0) as f64;
+                let near = h.describe_near(player.position, HELD_BY_PEOPLE_LOOK);
+                let holder = near
+                    .iter()
+                    .filter_map(|(id, p, _)| {
+                        let rel = (*p - c.vehicle.position).truncate();
+                        let along = rel.dot(fwd) - st.front as f64;
+                        let across = rel.dot(right).abs();
+                        (along >= -(st.front + st.rear) as f64 && along <= stop + HOLDER_PAST && across <= c.ai.half_width as f64 + omsi_traffic::plan::PERSON_RADIUS as f64).then_some((*id, (along - stop).abs()))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(id, _)| id);
+                for (id, p, what) in near {
                     let sep = omsi_sim::collision::Obb::point(p, omsi_traffic::plan::PERSON_RADIUS as f64).separation(&body);
-                    log::info!("player watch t={t_s:.1}: held by people (stop {:?} m ahead): #{id} at ({:.2}, {:.2}) sep {sep:.2} m: {what}", c.ai.last.stop, p.x, p.y);
+                    let tag = if Some(id) == holder { " HOLDER" } else { "" };
+                    log::info!("player watch t={t_s:.1}: held by people (stop {:?} m ahead): #{id}{tag} at ({:.2}, {:.2}) sep {sep:.2} m: {what}", c.ai.last.stop, p.x, p.y);
                 }
             }
         }

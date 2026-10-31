@@ -244,6 +244,9 @@ pub const PLAYER_ID_BASE: u64 = 1 << 62;
 /// grant it drives by; nobody else sees that claim. The frames where the player's claim names
 /// another junction or way through than the stand-in's own are counted by kind (`ClaimsApart`):
 /// there a user's claim, filed from the indicator, says other than where the bus goes.
+/// Known limit: the stand-in has no claim among the others' (`claim_of` None), so the mutual-wait
+/// negotiation (`negotiate`, `eased_claims`) never eases it or a car for it: an AI car yielding to
+/// the player's indicator claim while the stand-in yields to that car by its own would hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StandIn {
     /// The vehicle's id (`Vehicle::id`).
