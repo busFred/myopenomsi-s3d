@@ -507,7 +507,10 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // (the fronts past the stretch's start; negative short of it)
     let p_e = (c.s + c.front) - foe.mine.0;
     let p_f = (o.s + o.front) - foe.theirs.0;
-    let t_e = window(c, foe.mine.0, foe.mine.1).0;
+    // (my arrival at the stretch no sooner than my lead lets me, `planned_window`: an entrant that
+    // rolls up behind a circulating car it follows in cannot be at the start before that car's rear
+    // has gone by, so it does not count itself first against the next car coming)
+    let t_e = planned_window(c, foe.mine.0, foe.mine.1).0;
     let t_f = their_in;
     // (short of the stretch, its plan stops it before it: at its red, or behind a standing lead,
     // `Claim::lead_rest`)
