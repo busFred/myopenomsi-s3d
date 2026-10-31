@@ -3679,7 +3679,9 @@ const JOINT_BLEND: f32 = 6.0;
 /// measured central value was found - Lee, Olsen & Wierwille 2004 (NHTSA DOT HS 809 702,
 /// literature review) give only the range of signal onset, -2.42 to 3.62 s from the change's
 /// start (Hetrick 1997), and road codes ask for signalling in good time without a
-/// figure (StVO 7(5): "rechtzeitig und deutlich anzukündigen"). The start test plans through it (`omsi_traffic::plan`'s `signal_plan`).
+/// figure (StVO 7(5): "rechtzeitig und deutlich anzukündigen"). The preset driver's; each driver's
+/// own is `omsi_traffic::DriverParams::signal_before_change` (1.0-3.6 s), which the start test plans
+/// through (`omsi_traffic::plan`'s `signal_plan`).
 pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is

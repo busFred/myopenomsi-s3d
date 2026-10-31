@@ -2358,6 +2358,10 @@ impl Simulation {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    // (the driver's own signalling time, `DriverParams::signal_before_change`)
+                    if let Some(c) = v.state.change.as_mut() {
+                        c.wait = v.params.signal_before_change;
+                    }
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
                     v.change_for = plan.change_why;

@@ -3065,7 +3065,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // body steers out round the one in front)
             // (under way the move itself must clear the parked cars, the people, the standing
             // bodies near and the moving ones beside me where they will be, `change_clear`)
-            let mv = (omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, omsi_sim::traffic::change_length(v.max(0.0)));
+            let mv = (me.params.signal_before_change, omsi_sim::traffic::change_length(v.max(0.0)));
             let near = near_standing_lead(p, v, mv);
             out.start = match near {
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None),
@@ -3094,7 +3094,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // is there now but not at the end of its signal is blocked by that vehicle too)
             let (ok_behind, ok_ahead) = {
                 let (b0, a0) = if ok { (true, true) } else { gap_parts(me, &nb) };
-                let (b1, a1) = gap_parts_through_signal(me, p, &nb, omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
+                let (b1, a1) = gap_parts_through_signal(me, p, &nb, me.params.signal_before_change);
                 (b0 && b1, a0 && a1)
             };
             let remaining = end_dist / v.max(STANDING_SPEED);
