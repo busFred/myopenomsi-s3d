@@ -3898,11 +3898,14 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let right = DVec2::new(hr.cos(), -hr.sin());
     let target = p.truncate() + right * side;
     let vel = (target - pos2).normalize_or_zero() * pace;
-    // a rider off a bus walking off the paths to their pavement (the point leg `walk_street_on`
-    // gives them), not on a crossing: the first step into a lane is decided as at an unsignalled
-    // kerb (`steps_into_traffic`), the wait counted on `walk.held`
+    // somebody off the paths - farther from their leg's path than its corridor draws anybody back
+    // (half its width and STROLL_BAND): a rider off a bus walking to their pavement - not on a
+    // crossing: the first step into a lane is decided as at an unsignalled kerb
+    // (`steps_into_traffic`), the wait counted on `walk.held`. (The point leg `walk_street_on`
+    // gives them is replaced by the path's own leg once planned: no test of the leg's length.)
     let here3 = pos2.extend(p.z);
-    if len < 0.05 && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
+    let off_path = lane.nearest_point(here3).is_none_or(|(_, d)| d > width * 0.5 + STROLL_BAND);
+    if off_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
         walk.held += dt;
         me.decision = Some(WAITS_FOR_A_CAR);
         me.why = WAITS_FOR_A_CAR;
@@ -5636,8 +5639,8 @@ fn kerb_margin(held: f32) -> f64 {
     }
 }
 
-/// The first step of a rider off a bus walking off the paths to their pavement (`stroll`) into a
-/// street lane they are not in: decided as at an unsignalled kerb by `kerb_verdict`'s own tests -
+/// The first step of somebody walking off the paths to their pavement (`stroll`: a rider off a
+/// bus) into a street lane they are not in: decided as at an unsignalled kerb by `kerb_verdict`'s own tests -
 /// they do not step in while a vehicle at their level stands over the part of the lane they would
 /// cross (`stands_in_the_way`: not one yielding, not past PED_OCCUPIED_CAP) or comes to it before
 /// they would be across (`car_comes`, with the margin that shrinks with their wait,
