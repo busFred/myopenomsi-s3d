@@ -873,3 +873,54 @@ fn a_car_squeezes_round_a_body_across_its_way_inside_a_junction() {
     assert!(squeezed && me.state.lane == 2, "squeezes round the body inside the junction and goes on: squeezed {squeezed}, lane {}", me.state.lane);
     assert!(least > 0.3 && max_lat < 1.75 - 0.9, "least {least:.2} m to the body, swung {max_lat:.2} m (drawn road 1.75 m, half width 0.9)");
 }
+
+/// Fix 7-2: the rule against overtaking a vehicle on the side it indicates is about passing it
+/// alongside (road rule, ours); a car whose way crosses in front of the indicating vehicle's nose is
+/// not barred by it. As viz2 j17: car 1 goes east along lane 0 into a junction piece; a car stands on
+/// the crossing piece heading south, its nose 1.1 m left of car 1's axis, indicating right (west, its
+/// turn). Car 1 squeezes right past its nose at the least offset (L3-D6) and goes on, never within
+/// `SQUEEZE_CLEARANCE` of it.
+#[test]
+fn a_car_passes_in_front_of_a_turning_vehicles_nose_whatever_it_indicates() {
+    let wide_piece = |pts: &[(f64, f64)], path: u16| {
+        let mut l = LaneBuilder::polyline(pts.iter().map(|p| DVec3::new(p.0, p.1, 0.0)).collect(), LaneKind::Street, 3.5);
+        l.source = 2;
+        l.key = Some(LaneKey { tile: (0, 0), id: 9, path });
+        l.priority = 128.0;
+        l
+    };
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (100.0, 0.0)], 1, 0, 0.0)); // 0
+    net.lanes.push(wide_piece(&[(100.0, 0.0), (160.0, 0.0)], 0)); // 1
+    net.lanes.push(road(&[(160.0, 0.0), (400.0, 0.0)], 2, 0, 0.0)); // 2
+    net.lanes.push(wide_piece(&[(106.0, 40.0), (106.0, -40.0)], 1)); // 3, southbound
+    net.link(1.5);
+    net.compute_conflicts();
+    net.compute_reach();
+    net.build_grid();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 0, 88.0, 0.0);
+    me.params.lc_speed_gain = 0.0;
+    me.params.lc_keep_right = 0.0;
+    // (its front 2.0 m ahead of its middle: the nose at y 1.1)
+    let mut ob = standing(2, 3, 40.0 - 3.1);
+    ob.stopped = 60.0;
+    ob.blinker_shown = (2, 0.0);
+    let mut cars = vec![me, ob];
+    let (mut squeezed, mut least, mut t) = (false, f32::INFINITY, 0.0f32);
+    while t < 70.0 {
+        sim.tick(&net, DT, &mut cars);
+        sim.update_positions(&net, &mut cars);
+        if let Some(o) = cars.iter_mut().find(|c| c.id == 2) {
+            o.blinker_shown = (2, 0.0);
+        }
+        let me = cars.iter().find(|c| c.id == 1).unwrap();
+        let o = cars.iter().find(|c| c.id == 2).unwrap();
+        squeezed |= me.passing.is_some_and(|p| p.lane.is_none());
+        least = least.min(me.obb().separation(&o.obb()) as f32);
+        t += DT;
+    }
+    let me = cars.iter().find(|c| c.id == 1).unwrap();
+    assert!(squeezed && me.state.lane == 2, "passes in front of the nose: squeezed {squeezed}, lane {}", me.state.lane);
+    assert!(least > 0.3, "least {least:.2} m to the indicating car");
+}
