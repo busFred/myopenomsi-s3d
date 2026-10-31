@@ -1689,7 +1689,7 @@ const TURNED_LINE_DEG: f32 = 45.0;
 /// `length` m long: a crosswalk cutting the way before the line that the body at rest with its front
 /// on the line would stand on (the walk's width either side of its cut, `Network::walks`) moves it to
 /// that walk's zebra stop (`plan::ZEBRA_STOP` before the cut), the earliest such walk's. The map
-/// puts some lights' lines past a crosswalk (viz2 j17: walk 4415 across lane 4391 just before 4503,
+/// puts some lights' lines past a crosswalk (viz2 j17: walks 4419/4420 across lane 4391 just before 4503,
 /// the lit piece of light 5.1); road law and SUMO (whose stop line lies before the crossing) keep a
 /// car waiting at red off the crosswalk (user decision J4-D1).
 fn line_before_walks(net: &Network, way: &[(usize, f32)], line: f32, length: f32) -> f32 {
