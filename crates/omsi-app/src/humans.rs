@@ -4944,7 +4944,7 @@ const KERB_SPREAD_MAX: f64 = 0.9;
 
 /// The width a carriageway lane is taken to have at least (m): the pieces
 /// inside junctions say 1 m, and a bus is 2.5 m wide.
-pub(crate) const LANE_MIN_WIDTH: f64 = 2.5;
+const LANE_MIN_WIDTH: f64 = 2.5;
 
 /// Whether `q` lies inside the footprint of a carriageway lane: within half
 /// its width and `KERB_CLEAR` of its axis.
