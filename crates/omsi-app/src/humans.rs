@@ -198,8 +198,12 @@ fn way_round_off_lanes(here: DVec2, wp: &[DVec2; 2], off_lanes: &dyn Fn(DVec2) -
 }
 
 /// How far beside a box's flank (m) a walker passes it where the usual half metre would
-/// take them into a street lane: their body (BODY_OUTSIDE).
-const PASS_BY: f64 = BODY_OUTSIDE;
+/// take them into a street lane: the vehicles' people strip (`traffic::PEOPLE_STRIP`), outside
+/// which a car holds for nobody (SUMO: a vehicle waits only for persons in its path). With a
+/// body's width (0.28 m) the walkers passing a car pulled out over a footpath, the street lane
+/// beside, walked inside its 0.30 m strip ahead of its front, and a stream held it (Wuluju lane
+/// 3243, #3490, 110 s).
+const PASS_BY: f64 = crate::traffic::PEOPLE_STRIP;
 /// How far off the line of the way past a box (m) the crowd may push a pavement walker:
 /// none, they walk the line.
 const ROUTE_DEV: f64 = 0.0;
@@ -14766,6 +14770,19 @@ mod ped_tests {
         // the lane too close for a body beside the car: no room
         let tight = |q: DVec2| q.y > -1.2 + 1.25 + 0.28;
         assert_eq!(along_box_off(&parked, DVec2::new(1.0, 0.0), DVec2::X, Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.0)), &tight), Along::NoRoom);
+    }
+
+    #[test]
+    fn p3_3490_the_way_past_a_car_beside_a_lane_keeps_out_of_its_people_strip() {
+        // a car pulled out over a 3 m footpath, the street lane 2.6 m off (Wuluju lane 3243): the
+        // half metre does not fit on the lane's side, the way past hugs the car on the other - and
+        // stays outside the strip the car holds for people in (its half width and PEOPLE_STRIP)
+        let car = Block { center: DVec2::new(5.0, 0.3), half: DVec2::new(0.95, 2.3), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::ZERO };
+        let corridor = Some((DVec2::new(-50.0, 0.0), DVec2::new(50.0, 0.0), 1.5));
+        let off = |q: DVec2| q.y > -2.6 + 1.25 + 0.28;
+        let Along::Route(wp) = along_box_off(&car, DVec2::new(1.0, 0.0), DVec2::X, corridor, &off) else { panic!("no way past") };
+        let side = car.center.y + car.half.x;
+        assert!(wp.iter().all(|q| q.y - side >= crate::traffic::PEOPLE_STRIP - 1e-9), "inside the car's people strip: {wp:?}");
     }
 
     #[test]
