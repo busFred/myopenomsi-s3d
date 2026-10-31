@@ -352,12 +352,17 @@ pub struct Bypassed {
     pub ahead: Vec<(f32, f32, f32)>,
 }
 
+/// The car's lane change is far enough on that its way is the target lane's (`way_lanes`).
+pub fn change_committed(st: &AiState) -> bool {
+    st.change.map(|c| c.t > 0.4 || (c.bypass && c.wait <= 0.0)).unwrap_or(false)
+}
+
 /// The lanes ahead along the car's way with the distance from the origin to each one's
 /// start, within `within` metres. The lane being changed onto replaces the current one
-/// once the move is under way.
+/// once the move is under way (`change_committed`).
 pub fn way_lanes(net: &Network, st: &AiState, within: f32) -> Vec<(usize, f32)> {
     let mut out = Vec::new();
-    let committed = st.change.map(|c| c.t > 0.4 || (c.bypass && c.wait <= 0.0)).unwrap_or(false);
+    let committed = change_committed(st);
     let (first, s, rest): (usize, f32, Vec<usize>) = match (committed, st.change) {
         (true, Some(c)) => (c.to, c.s_to, st.change_plan.clone()),
         _ => (st.lane, st.s, st.upcoming().collect()),

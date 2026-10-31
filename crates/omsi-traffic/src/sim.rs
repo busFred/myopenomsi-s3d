@@ -1573,7 +1573,7 @@ impl Simulation {
                 let standing = st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0);
                 let claim = Claim {
                     foe_only: false,
-                    pass_speed: st.bend_speed_at(net, j.conflict_start),
+                    pass_speed: st.bend_speed_at(net, j.conflict_start, crate::perception::change_committed(st)),
                     chain: j.chain.clone(),
                     half_width: v.half_width,
                     was_standing,
@@ -1650,7 +1650,7 @@ impl Simulation {
                         let committed = (next_ahead.is_infinite() && nj.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, next - st.front - 0.6, brake);
                         Claim {
                             foe_only: true,
-                            pass_speed: st.bend_speed_at(net, nj.conflict_start),
+                            pass_speed: st.bend_speed_at(net, nj.conflict_start, crate::perception::change_committed(st)),
                             chain: nj.chain.clone(),
                             junction: nj.junction,
                             movement: nj.movement,

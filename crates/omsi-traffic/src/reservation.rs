@@ -37,9 +37,10 @@ pub struct Claim {
     pub v_max: f32,
     /// The most it comes to the junction's first meeting place at (m/s): what its bends let it
     /// (`AiState::bend_speed_at`; INFINITY: not known, a player). It is judged to follow a lead
-    /// there at no more than this (`follow_room`): SUMO registers every approach with its arrival
-    /// speed, `vLinkPass`, at most the link lane's speed (netconvert limits it by the turning
-    /// radius, `NBEdge` `junctions.limit-turn-speed`).
+    /// there at no more than this (`follow_room`, where SUMO's zipper uses the current speed): the
+    /// arrival speed SUMO registers for an approach, `vLinkPass`, at most the link lane's speed
+    /// (netconvert limits it by the turning radius, `NBEdge` `junctions.limit-turn-speed`). On the
+    /// target lane of a committed lane change, its bends.
     pub pass_speed: f32,
     /// From the origin to the front and the rear bumper (m).
     pub front: f32,
@@ -470,11 +471,17 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
 /// The room (m) the car-following model (IDM) needs behind a lead at `lead_speed` to follow it
 /// braking no harder than comfortably: its braking a (s*/s)² is within the comfortable brake b
 /// for s >= s* sqrt(a/b), s* = s0 + v T + v Δv / (2 sqrt(a b)) (SUMO's `couldBrakeForLeader` asks
-/// the same of its Krauss model). v is the speed it comes to the meeting place with, its speed but
-/// no more than its bends let it there (`Claim::pass_speed`): the braking its own bends ask of it
-/// on the way is its own, not braking for the lead (SUMO judges two that merge at the speeds they
-/// pass the link at, `blockedByFoe`'s `unsafeMergeSpeeds` of the registered arrival and leave
-/// speeds).
+/// whether the follower could brake for one second to stay behind). v is the speed it comes to the
+/// meeting place with, its speed but no more than its bends let it there (`Claim::pass_speed`):
+/// the braking its own bends ask of it on the way is its own, not braking for the lead. SUMO's
+/// zipper does not do this: its `couldBrakeForLeader` takes the follower's current speed
+/// (`MSLink.cpp`, `follow->getSpeed()`). Ours differs for an OMSI reason: the room asked is the
+/// IDM's comfortable following, far longer than SUMO's one second of braking, and at its current
+/// speed a car still 40-70 m off and slowing for a bend before the merge was taken for one that
+/// could not follow an entrant (round11r: #143 at 12.8 m/s, need 48 m against 41.8 m, arriving at
+/// 5.4 m/s). The speed taken is SUMO's `vLinkPass`, the arrival speed it registers for the link
+/// (at most the link lane's speed, which netconvert limits by the turning radius), applied to the
+/// follow room.
 fn follow_room(x: &Claim, lead_speed: f32) -> f32 {
     let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
     let v = x.speed.min(x.pass_speed);

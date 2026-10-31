@@ -4918,9 +4918,13 @@ impl AiState {
     /// How fast the car can be going `ahead` m on along its way (from its origin) and take every
     /// bend of the stretch after that place as `curve_speed` does from where it is: the speed it
     /// comes to a place ahead with when nothing holds it back (the bends before that place it has
-    /// left behind by then).
-    pub fn bend_speed_at(&self, net: &Network, ahead: f32) -> f32 {
-        self.curve_speed_on_from(net, &self.seq(), self.s, ahead.max(0.0))
+    /// left behind by then). On the lane change's target lane and its plan when `on_target` (the
+    /// way a committed change has taken, `perception::change_committed`), else on its own lanes.
+    pub fn bend_speed_at(&self, net: &Network, ahead: f32, on_target: bool) -> f32 {
+        match self.change.filter(|c| on_target && c.to < net.lanes.len()) {
+            Some(c) => self.curve_speed_on_from(net, &self.change_seq(c.to), c.s_to, ahead.max(0.0)),
+            None => self.curve_speed_on_from(net, &self.seq(), self.s, ahead.max(0.0)),
+        }
     }
 
     fn curve_speed_on(&self, net: &Network, q: &LaneSeq, s: f32) -> f32 {
@@ -5337,6 +5341,22 @@ mod tests {
         let mut net = Network { lanes: vec![a, bend, c], ..Default::default() };
         net.link(1.5);
         net
+    }
+
+    /// `bend_speed_at` is `curve_speed`'s profile from a place ahead: from the car itself the same,
+    /// in the 14 m bend its bend speed sqrt(lat_accel 14), and past the bend nothing to slow for.
+    #[test]
+    fn bend_speed_at_reads_the_bends_from_the_place_ahead() {
+        let net = junction();
+        let mut car = AiState::new(0, 0.0, 7);
+        car.speed = 14.0;
+        car.plan_next(&net);
+        assert_eq!(car.bend_speed_at(&net, 0.0, false), car.curve_speed(&net));
+        let in_bend = car.bend_speed_at(&net, 62.5, false);
+        assert!((in_bend - (car.lat_accel * 14.0).sqrt()).abs() < 0.6, "{in_bend}");
+        // (no lane change: the target lanes are its own)
+        assert_eq!(car.bend_speed_at(&net, 62.5, true), in_bend);
+        assert_eq!(car.bend_speed_at(&net, 150.0, false), f32::MAX);
     }
 
     #[test]
