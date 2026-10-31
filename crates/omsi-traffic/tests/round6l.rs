@@ -214,27 +214,35 @@ fn r6l2_a_queue_coming_up_behind_a_bus_at_its_stop_keeps_the_room_to_steer_round
     let mut sim = Simulation::new(&net, vec![]);
     // (per car: the least gap to the vehicle ahead in its lane while standing, whether it
     // got round onto the left lane, the least to any body)
-    let mut closest = [f32::INFINITY; 3];
+    // (per car standing: its gap less the room it needs to steer round what it stands behind,
+    // `plan::steer_round_room` - the smoothstep's shortest move round the bus's width - at its least)
+    let mut short = [f32::INFINITY; 3];
+    let mut rooms = [f32::NAN; 3];
     let mut round = [false; 3];
     let mut least = f32::INFINITY;
-    run(&net, &mut sim, &mut cars, 40.0, |_, _, cars| {
+    run(&net, &mut sim, &mut cars, 40.0, |_, sim, cars| {
         for k in 0..3u64 {
-            let Some(me) = cars.iter().find(|c| c.id == 1 + k) else { continue };
+            let Some(i) = cars.iter().position(|c| c.id == 1 + k) else { continue };
+            let me = &cars[i];
             for o in cars.iter().filter(|o| o.id != me.id) {
                 least = least.min(me.obb().separation(&o.obb()) as f32);
             }
             round[k as usize] |= me.state.lane == 0;
             if me.state.lane == 1 && me.state.speed < 0.1 {
-                if let Some(l) = me.last.lead {
-                    closest[k as usize] = closest[k as usize].min(l.gap);
+                if let (Some(l), Some(room)) = (me.last.lead, omsi_traffic::plan::steer_round_room(&net, sim, cars, i)) {
+                    if l.gap - room < short[k as usize] {
+                        short[k as usize] = l.gap - room;
+                        rooms[k as usize] = room;
+                    }
                 }
             }
         }
     });
-    eprintln!("queue: closest standing gaps {closest:?} round {round:?} least {least:.2}");
+    eprintln!("queue: standing gap less the room to steer round {short:?} (rooms {rooms:?}) round {round:?} least {least:.2}");
     assert!(least > 0.3, "came {least:.2} m to a body");
     assert!(round[0], "the first car never went round the bus");
-    assert!(closest.iter().all(|g| !g.is_finite() || *g > 4.0), "the queue packed: {closest:?}");
+    // (the keep-back's stop lands within `BYPASS_HOLD_SLACK` of where it is aimed)
+    assert!(short.iter().all(|g| !g.is_finite() || *g >= -omsi_traffic::plan::BYPASS_HOLD_SLACK), "the queue packed: standing short of the room to steer round by {short:?} (rooms {rooms:?})");
 }
 
 #[test]

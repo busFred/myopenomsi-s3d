@@ -1733,6 +1733,16 @@ fn bypass_need(me: &Vehicle, lead: &crate::perception::Headway, dir: f32) -> f32
 /// (where its way reaches `bypass_need` across, less my front) and my body's front corners,
 /// turned along it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than
 /// the full-lock room cannot get out without reversing.
+/// The room (m) vehicle `i` needs behind its lead to steer round it into the lane beside (the
+/// smoothstep's shortest move, `bypass_room`), towards the side the lead can be passed: what the
+/// keep-back behind a standing obstacle keeps (diagnostics and tests). None without a lead or a
+/// lane beside it can steer into.
+pub fn steer_round_room(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<f32> {
+    let p = crate::perception::perceive(net, sim, vehicles, i);
+    let l = p.leader?;
+    [p.left, p.right].into_iter().flatten().filter_map(|nb| bypass_room(net, &vehicles[i], &nb, &l, false, None)).reduce(f32::min)
+}
+
 fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool, len: Option<f32>) -> Option<f32> {
     let st = &me.state;
     let target = &net.lanes[nb.lane];
