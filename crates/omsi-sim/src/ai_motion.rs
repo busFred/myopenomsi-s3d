@@ -250,6 +250,9 @@ pub struct AiBody {
     pub heading: f64,
     /// Front wheel angle of the bicycle model (deg, + = right), rate limited and smoothed.
     pub steer: f32,
+    /// The feed-forward part of the last steering command (deg, + = right): the bicycle model's
+    /// angle for the line's curvature at the rotation point (`drive`); for the harness.
+    pub steer_ff: f32,
     steer_cmd: f32,
     last_speed: f32,
     /// Longitudinal and lateral acceleration (m/s², forward / right positive).
@@ -368,6 +371,7 @@ impl AiBody {
             rear: DVec2::ZERO,
             heading: 0.0,
             steer: 0.0,
+            steer_ff: 0.0,
             steer_cmd: 0.0,
             last_speed: 0.0,
             a_long: 0.0,
@@ -620,6 +624,7 @@ impl AiBody {
         }
         // feed-forward (the line's curvature, + = right) plus pure pursuit's correction
         let k_cmd = -k_line as f32 + (2.0 * alpha.sin() / reach - ideal);
+        self.steer_ff = (self.wheelbase * -k_line as f32).atan().to_degrees();
         let want = if reversing { 0.0 } else { (self.wheelbase * k_cmd).atan().to_degrees().clamp(-limit, limit) };
         if dt > 0.0 {
             let rate = self.steer_rate * dt * if limit > self.max_steer { 1.5 } else { 1.0 };
