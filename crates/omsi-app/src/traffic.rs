@@ -1390,18 +1390,25 @@ fn rail_behind(trail: &std::collections::VecDeque<(f64, DVec3)>, state: &AiState
     crate::rail_drive::point_at(trail, u).unwrap_or_else(|| state.way_point(net, -d as f32))
 }
 
-/// Where the lanes `body` steers over end left and right of their axes (m) for the careful
-/// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edges`
-/// (a spline lane midway to the paths beside it and at the kerb beyond, a junction path or an
-/// editor-only spline's lane as the road pieces it joins), side by side the narrowest of the
-/// lanes from the vehicle's rear end (its last section's, `AiState::rear`) to where it steers
-/// to (`AiBody::steer_span`, `AiState::lane_edges_between`): the body and its sections lie on
-/// those pieces, a narrower one ahead is kept to before the rotation point reaches it, and one
-/// the rear is still on until the rear has left it. Where the map does not tell, no edge: the
-/// swept band centred on the way.
+/// Where the lanes `body` steers over end left and right of its way (m) for the careful
+/// driver's line (`AiBody::set_lane_edges`): from the map's geometry, `Network::lane_edge_sides`
+/// (a spline lane midway to the street paths beside it, at a pedestrian path's near side and
+/// at the kerb beyond, a junction path or an editor-only spline's lane as the road pieces it
+/// joins), side by side the narrowest of the lanes from the vehicle's rear end (its last
+/// section's, `AiState::rear`) to where it steers to (`AiBody::steer_span`,
+/// `AiState::lane_edges_between`): the body and its sections lie on those pieces, a narrower one
+/// ahead is kept to before the rotation point reaches it, and one the rear is still on until the
+/// rear has left it. The edges are the lanes' axes'; the way runs off the axis by its sideways
+/// offset (a bus bay, a swerve round a parked car, `AiState::lateral_ahead`, + = right), so the
+/// room on each side is the edge less the most the way leans towards it at the stretch's ends and
+/// the rotation point (never below 0). A side the map does not tell is 0: the way's line.
 fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
-    let (from, to) = body.steer_span(state.speed);
-    state.lane_edges_between(net, from.min(-state.rear), to)
+    let (rot, to) = body.steer_span(state.speed);
+    let from = rot.min(-state.rear);
+    let (left, right) = state.lane_edges_between(net, from, to);
+    let lat = [from, rot, to].map(|d| state.lateral_ahead(d));
+    let (most_left, most_right) = (lat.iter().copied().fold(0.0f32, f32::min), lat.iter().copied().fold(0.0f32, f32::max));
+    ((left + most_left).max(0.0), (right - most_right).max(0.0))
 }
 
 /// A body for a vehicle that has just been put on the way `state` describes, with the
@@ -6728,5 +6735,33 @@ mod spawn_people_tests {
         assert_eq!(seen(0, true).len(), 1, "on its own lane");
         assert_eq!(seen(1, true), vec![95.0], "on the lane it moves onto, where its body is");
         assert!(seen(1, false).is_empty() && seen(0, false).is_empty(), "gone since the frame");
+    }
+}
+
+#[cfg(test)]
+mod careful_line_edge_tests {
+    use super::lane_edges;
+    use glam::DVec3;
+    use omsi_sim::ai_motion::{AiBody, MotionKind};
+    use omsi_sim::traffic::{AiState, LaneBuilder, LaneKind, Network};
+
+    /// The room the careful line keeps to is measured from the way: a way moved 0.8 m to the
+    /// right of its lane's axis (a bus bay) has 0.8 m less on the right and no more on the left;
+    /// a side the map does not tell is 0 (the way's line).
+    #[test]
+    fn the_edges_are_taken_from_the_way_less_its_sideways_offset() {
+        let mut l = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 200.0, 0.0)], LaneKind::Street, 1.0);
+        l.source = 1;
+        l.edges = (1.5, 2.0);
+        let mut net = Network { lanes: vec![l], ..Default::default() };
+        net.link(1.5);
+        let body = AiBody::new(&omsi_vehicle::Vehicle::default(), MotionKind::Road);
+        let mut st = AiState::new(0, 50.0, 1);
+        assert_eq!(lane_edges(&net, &st, &body), (1.5, 2.0));
+        st.lateral_ramp = (0.8, 0.8, 0.0, 1.0);
+        let (left, right) = lane_edges(&net, &st, &body);
+        assert!((left - 1.5).abs() < 1e-5 && (right - 1.2).abs() < 1e-5, "{left} {right}");
+        net.lanes[0].edges = (1.5, 0.0);
+        assert_eq!(lane_edges(&net, &st, &body).1, 0.0);
     }
 }
