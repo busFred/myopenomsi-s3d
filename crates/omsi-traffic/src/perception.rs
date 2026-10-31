@@ -1162,7 +1162,7 @@ const CROSSING_STANDING_WAIT: f32 = 2.0;
 const JM_TIMEGAP_MINOR: f32 = 1.0;
 /// The fastest a person crosses (m/s, `humans::PED_HURRY_MAX`: hurried, caught by the
 /// change): an approaching person's time on the crossing times this bounds its length.
-const APPROACH_PACE_MAX: f32 = 2.5;
+pub(crate) const APPROACH_PACE_MAX: f32 = 2.5;
 /// SUMO's `jmStoplineCrossingGap` default (1 m, `MSPModel::SAFETY_GAP`): a vehicle on the
 /// junction braking for an approaching person stops this far before the crossing
 /// (`MSLink::getLeaderInfo`, `distToPeds`).

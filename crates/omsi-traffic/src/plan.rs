@@ -1645,7 +1645,7 @@ fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: 
         None => pre + out_len,
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
-    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    let people = people_discs(sim, me, level + st.front, 0.0);
     body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All)
 }
 
@@ -1677,7 +1677,9 @@ fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         None => pre + out_len,
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
-    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    // (people near enough to walk into the move's road before it is done, `people_discs`)
+    let horizon = Bodies::Over { speed: v_move, accel: st.accel, others: false, pre, wait }.time_to(level).unwrap_or(0.0);
+    let people = people_discs(sim, me, level + st.front, horizon);
     // (the move swept from where the plan has it begin and from nearer: the car may cover less of
     // the signal's road than planned - braking harder for its leader - and the re-sweep while it
     // signals then sweeps a move beginning nearer, `SIGNAL_SPREAD`; checked over that spread the
@@ -2367,11 +2369,20 @@ impl Bodies {
     }
 }
 
+/// The people near me a swept move is tested against (`body_sweep_clear`): each one's disc and
+/// velocity, those within `reach` metres and, for a move timed over `horizon` seconds
+/// (`Bodies::Over`), as far again as the fastest walker covers in that time
+/// (`perception::APPROACH_PACE_MAX`) - one who walks into the move's road before it is done.
+fn people_discs(sim: &Simulation, me: &Vehicle, reach: f32, horizon: f32) -> Vec<(Obb, DVec2)> {
+    let r = reach + crate::perception::APPROACH_PACE_MAX * horizon.max(0.0);
+    sim.people_near(me.pos, r as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| (Obb::point(q.pos, PERSON_RADIUS as f64), q.vel)).collect()
+}
+
 /// Does my body, turned along a move `side` metres over `out_len` metres (`profile`), clear
 /// the vehicles and players near that `bodies` names, the parked cars (`parked`) and people's
 /// discs (`people`) by `SQUEEZE_CLEARANCE`, up to `level` metres on?
 #[allow(clippy::too_many_arguments)]
-fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[Obb], side: f32, out_len: f32, level: f32, profile: Profile, bodies: Bodies) -> bool {
+fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, parked: &[Obb], people: &[(Obb, DVec2)], side: f32, out_len: f32, level: f32, profile: Profile, bodies: Bodies) -> bool {
     let st = &me.state;
     // (beside: the body's reach along my heading overlaps mine, from my rear to my front)
     let h0 = (me.heading as f64).to_radians();
@@ -2439,6 +2450,20 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         swept(o.state.speed, Some(o.state.lane), Some(o.state.decel.max(o.params.comfort_brake)), &o.obb()).map(|c| (j, c))
     }).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
+    // (a person where they are and, timed over the move (`Bodies::time_to`), where they will be when
+    // my body is `d` metres on, walking on at their velocity - as a pull-out's strip tests them,
+    // `on_pull_out_strip`; the least of the two)
+    let person_sep = |o: &Obb, vel: DVec2, d: f32, b: &Obb| -> f64 {
+        let now = o.separation(b);
+        match bodies.time_to(d) {
+            Some(t) if vel.length_squared() > 0.0 => {
+                let mut later = *o;
+                later.center += vel * t as f64;
+                now.min(later.separation(b))
+            }
+            _ => now,
+        }
+    };
     // (my body's pose `d` metres on and its least separation from what is swept)
     let pose_sep = |d: f32| -> (Obb, f64) {
         let (lat, slope) = match profile {
@@ -2476,8 +2501,11 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
                 sep = sep.min(sep_of(pb, pl.heading, pl.speed, carry, d, &b));
             }
         }
-        for o in parked.iter().chain(people) {
+        for o in parked {
             sep = sep.min(o.separation(&b));
+        }
+        for (o, vel) in people {
+            sep = sep.min(person_sep(o, *vel, d, &b));
         }
         (b, sep)
     };
@@ -2503,8 +2531,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
                         }
                     }
                 }
-                for (kind, o) in parked.iter().map(|o| (1u8, o)).chain(people.iter().map(|o| (2u8, o))) {
-                    let sp = o.separation(&b);
+                for (kind, sp) in parked.iter().map(|o| (1u8, o.separation(&b))).chain(people.iter().map(|(o, vel)| (2u8, person_sep(o, *vel, d, &b)))) {
                     if sp < best.0 {
                         best = (sp, Some((kind, 0, 0, 0.0, false, sp as f32, d)));
                     }
@@ -3715,7 +3742,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             let level = real + obstacle_len + st.front + st.rear + 2.0;
             let parked = parked_boxes(net, sim, me, level + st.front);
-            let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+            let people = people_discs(sim, me, level + st.front, 0.0);
             body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, pass_out_len, level, Profile::Smooth { pre: 0.0 }, Bodies::All)
         };
         if pass_possible && ready && pass_swept() {

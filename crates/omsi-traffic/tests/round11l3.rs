@@ -968,3 +968,48 @@ fn a_blocked_urgent_change_indicates_while_it_waits_and_moves_over_as_the_gap_op
     assert!(since < 25.0, "and has done so for long: since {since:.1} s");
     assert!(at >= 30.0 && wait == 0.0, "the change starts once the gap is there, nothing left to signal: at {at:.2} s, wait {wait:.2} s");
 }
+
+/// Car 1 at 6 m/s on the right lane of `two_lanes` at x 100 signals a plain change left; a person
+/// at x 130, `y0` m left of the left lane's axis, walks across the road at `vy` m/s (moved on by
+/// the test each frame: the traffic does not walk people). Runs 8 s: (the change dropped with the
+/// body still on its lane, the least separation between the body and the person).
+fn plain_change_with_a_walker(y0: f64, vy: f64) -> (bool, f64) {
+    let net = two_lanes();
+    let mut sim = Simulation::new(&net, vec![]);
+    let mut me = car(1, 1, 100.0, 6.0);
+    me.state.max_speed_kmh = 21.6;
+    me.state.start_change(&net, 0, 1);
+    if let Some(c) = me.state.change.as_mut() {
+        c.wait = me.params.signal_before_change;
+    }
+    let mut cars = vec![me];
+    let mut pos = glam::DVec3::new(130.0, y0, 0.0);
+    let vel = glam::DVec2::new(0.0, vy);
+    let (mut dropped, mut least, mut t) = (false, f64::INFINITY, 0.0f32);
+    while t < 8.0 {
+        sim.people = vec![omsi_traffic::Person { pos, vel, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None }];
+        sim.tick(&net, DT, &mut cars);
+        let me = &cars[0];
+        if me.state.change.is_none() && me.state.lane == 1 && me.state.lateral.abs() < 0.05 {
+            dropped = true;
+        }
+        let disc = omsi_sim::collision::Obb::point(pos, 0.28);
+        least = least.min(me.obb().separation(&disc));
+        pos += (vel * DT as f64).extend(0.0);
+        t += DT;
+    }
+    (dropped, least)
+}
+
+/// Pass 8 item 2: the people a change's move is swept against are carried on at their velocity over
+/// the time the body takes to each place (`body_sweep_clear`'s `person_sep`, as a pull-out's strip
+/// tests them): a walker 6 m off the road crossing towards it at 1.5 m/s - out of the move's road
+/// while the car signals, in it when the body gets there - drops the change while it still
+/// signals; the same person standing there does not.
+#[test]
+fn a_change_is_dropped_for_a_walker_who_will_be_in_its_road() {
+    let (dropped, least) = plain_change_with_a_walker(6.0, -1.5);
+    assert!(dropped, "a walker crossing into the move's road: dropped {dropped}, least {least:.2}");
+    let (dropped, least) = plain_change_with_a_walker(6.0, 0.0);
+    assert!(!dropped && least > 1.0, "the same person standing off the road: dropped {dropped}, least {least:.2}");
+}
