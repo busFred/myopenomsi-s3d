@@ -592,6 +592,38 @@ impl PlayerWatch {
             if (c.vehicle.position.z - player.position.z).abs() <= 3.0 && c.ai.obb().separation(&body) < -crate::traffic::OVERLAP_DEPTH {
                 r.cars_inside.0 += dt;
                 r.cars_inside.1.insert(c.id);
+                // (diagnostics, once a second of the traffic's clock: the car, the player's box and
+                // the AI bus driving it - what each did)
+                let now = traffic.sim.time;
+                if (now - dt).floor() != now.floor() {
+                    let st = &c.ai.state;
+                    let sb = bus.map(|b| {
+                        let bs = &b.ai.state;
+                        let o = b.ai.obb();
+                        format!("lane {} s {:.1} v {:.2} why {:?} wait_for {:?} lead {:?}; car to its own body {:.2} m; its body centre ({:.2}, {:.2}) hd {:.1} half ({:.2}, {:.2}); the player's box centre ({:.2}, {:.2}) hd {:.1} half ({:.2}, {:.2})", bs.lane, bs.s, bs.speed, b.ai.last.why, b.ai.last.wait_for, b.ai.last.lead_id, c.ai.obb().separation(&o), o.center.x, o.center.y, o.heading.to_degrees(), o.half.x, o.half.y, body.center.x, body.center.y, body.heading.to_degrees(), body.half.x, body.half.y)
+                    });
+                    log::info!(
+                        "player watch t={now:.1}: car #{} inside the player's box by {:.2} m: lane {} s {:.1} v {:.2} hd {:.0} pos ({:.2}, {:.2}) why {:?} lead_seen {:?} lead_id {:?} wait_for {:?} change {:?} passing {}; player ({:.2}, {:.2}) hd {:.0}; the AI bus: {}",
+                        c.id,
+                        -c.ai.obb().separation(&body),
+                        st.lane,
+                        st.s,
+                        st.speed,
+                        c.vehicle.heading,
+                        c.vehicle.position.x,
+                        c.vehicle.position.y,
+                        last.why,
+                        last.lead_seen,
+                        last.lead_id,
+                        last.wait_for,
+                        st.change.map(|ch| (ch.to, ch.bypass)),
+                        c.ai.passing.is_some(),
+                        player.position.x,
+                        player.position.y,
+                        player.heading,
+                        sb.unwrap_or_default()
+                    );
+                }
             }
         }
         for (k, vehicle) in [Some(player_claim(PLAYER_VIEW)), bus_ix].into_iter().enumerate() {
