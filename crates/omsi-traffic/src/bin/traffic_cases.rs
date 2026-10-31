@@ -6347,6 +6347,11 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
             let back = js.nodes[j].movements[f.movement].foes.iter().find(|g| g.movement == m).map(|g| g.yields);
             println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" }, if f.side { " [side]" } else { "" });
         }
+        // (the wide side merges, `Movement::wide`: met only by bodies wider than their apart)
+        for f in &mv.wide {
+            let ol = js.nodes[j].movements[f.movement].lane;
+            println!("  wide lane {ol} {:?} yields {} apart {:.2} mine {:.1}..{:.1} theirs {:.1}..{:.1}", f.kind, f.yields, f.apart, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1);
+        }
     }
     Ok(())
 }
