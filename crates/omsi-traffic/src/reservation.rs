@@ -32,10 +32,13 @@ pub struct Claim {
     pub half_width: f32,
     pub speed: f32,
     pub accel: f32,
-    /// The most it speeds up to (m/s): its lane's limit times its desire; for an approach filed
-    /// at a later junction (`foe_only`), no more than its bends let it come there
-    /// (`AiState::bend_speed_at`), the speed it is judged to follow a lead there at (`follow_room`).
     pub v_max: f32,
+    /// The most it comes to the junction's first meeting place at (m/s): what its bends let it
+    /// (`AiState::bend_speed_at`; INFINITY: not known, a player). It is judged to follow a lead
+    /// there at no more than this (`follow_room`): SUMO registers every approach with its arrival
+    /// speed, `vLinkPass`, at most the link lane's speed (netconvert limits it by the turning
+    /// radius, `NBEdge` `junctions.limit-turn-speed`).
+    pub pass_speed: f32,
     /// From the origin to the front and the rear bumper (m).
     pub front: f32,
     pub rear: f32,
@@ -457,16 +460,14 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
 /// The room (m) the car-following model (IDM) needs behind a lead at `lead_speed` to follow it
 /// braking no harder than comfortably: its braking a (s*/s)² is within the comfortable brake b
 /// for s >= s* sqrt(a/b), s* = s0 + v T + v Δv / (2 sqrt(a b)) (SUMO's `couldBrakeForLeader` asks
-/// the same of its Krauss model). v is its speed; for an approach filed at a later junction
-/// (`Claim::foe_only`), the speed it comes to that junction with, no more than its `v_max` there:
-/// the braking its own bends ask of it on the way is its own, not braking for the lead (SUMO judges
-/// two that merge at the speeds they pass the link at, `blockedByFoe`'s `unsafeMergeSpeeds` of the
-/// approach's arrival and leave speeds, and the arrival speed it registers, `vLinkPass`, is at
-/// most the link lane's speed, which netconvert limits by the turning radius, `NBEdge`
-/// `junctions.limit-turn-speed`).
+/// the same of its Krauss model). v is the speed it comes to the meeting place with, its speed but
+/// no more than its bends let it there (`Claim::pass_speed`): the braking its own bends ask of it
+/// on the way is its own, not braking for the lead (SUMO judges two that merge at the speeds they
+/// pass the link at, `blockedByFoe`'s `unsafeMergeSpeeds` of the registered arrival and leave
+/// speeds).
 fn follow_room(x: &Claim, lead_speed: f32) -> f32 {
     let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
-    let v = if x.foe_only { x.speed.min(x.v_max) } else { x.speed };
+    let v = x.speed.min(x.pass_speed);
     let s_star = x.min_gap + (v * x.tau + v * (v - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
     s_star * (a / b).sqrt()
 }
@@ -1637,7 +1638,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { foe_only: false, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.

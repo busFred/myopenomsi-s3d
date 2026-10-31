@@ -37,7 +37,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
     js.of_lane.insert(0, (0, 0));
     js.of_lane.insert(1, (0, 1));
     sim.junctions = js;
-    let claim = Claim { foe_only: false,
+    let claim = Claim { foe_only: false, pass_speed: f32::INFINITY,
         half_width: 0.9,
         yields_now: None,
         clear_ahead: f32::INFINITY,

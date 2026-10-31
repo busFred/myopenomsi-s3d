@@ -1560,6 +1560,7 @@ impl Simulation {
                 let standing = st.speed < STANDING_SPEED || (was_standing && st.speed <= 1.0);
                 let claim = Claim {
                     foe_only: false,
+                    pass_speed: st.bend_speed_at(net, j.conflict_start),
                     chain: j.chain.clone(),
                     half_width: v.half_width,
                     was_standing,
@@ -1632,10 +1633,7 @@ impl Simulation {
                         let committed = (next_ahead.is_infinite() && nj.conflict_start - st.front <= 0.5) || plan::cannot_stop(st.speed, next - st.front - 0.6, brake);
                         Claim {
                             foe_only: true,
-                            // (it comes to that junction no faster than its bends let it, `AiState::bend_speed_at`
-                            // its first meeting place: SUMO's approach registers its `vLinkPass`, at most the
-                            // link lane's speed, which netconvert limits by the turning radius)
-                            v_max: claim.v_max.min(st.bend_speed_at(net, nj.conflict_start)),
+                            pass_speed: st.bend_speed_at(net, nj.conflict_start),
                             chain: nj.chain.clone(),
                             junction: nj.junction,
                             movement: nj.movement,
@@ -1831,6 +1829,7 @@ impl Simulation {
                 .flatten();
             claims.push(Claim {
                 foe_only: false,
+                pass_speed: f32::INFINITY,
                 chain,
                 half_width: p.half_width,
                 was_standing: false,
@@ -2651,7 +2650,7 @@ mod ease_ring_tests {
     use super::*;
 
     fn claim(vehicle: usize) -> Claim {
-        Claim { foe_only: false, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement: 0, s: 0.0, speed: 0.0, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: true, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: f32::INFINITY, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: true, light_red: false, until_go: None, chain: vec![(0, 0.0)], lead: None, was_standing: true, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64 + 100, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// The ring of viz5 case02 j0: A (0) eased off for B (1), B standing 2 m behind its lead C (2),
