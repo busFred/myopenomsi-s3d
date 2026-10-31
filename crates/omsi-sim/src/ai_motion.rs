@@ -97,6 +97,11 @@ pub fn rear_off_tracking(parts: &[&crate::vehicle::VehicleType]) -> f32 {
     pull
 }
 
+/// Steps the steering lays the lane's line in from its headings over the look-ahead
+/// (`AiBody::drive`): with the midpoint rule the chord of a bend of R 10 over a 12 m look-ahead
+/// is off by about a centimetre (the error goes as look³ / (24 R² steps²)).
+const LANE_LINE_STEPS: usize = 8;
+
 /// Clearance a vehicle pulling out keeps from the corner of what it goes round (m).
 pub const PULL_OUT_CLEARANCE: f64 = 0.25;
 /// Seconds a driver standing behind something turns the wheels before moving off round it
@@ -474,15 +479,18 @@ impl AiBody {
     /// Steering Methods for Autonomous Automobile Path Tracking", CMU-RI-TR-09-08, 2009, the
     /// control law δ = -Kx + δ_ff of its "Optimal Control with Feed Forward Term", and its
     /// kinematic bicycle model's δ = atan(κL)). The feed-forward is the bicycle model's steer
-    /// angle atan(wheelbase · k) for the line's curvature k at the rotation point (the circle
-    /// through the way half a wheelbase either side of it). The feedback is
-    /// pure pursuit (looking further ahead the faster the car goes) less what pure pursuit
-    /// would steer from the line itself (the rotation point on it, the body along its
-    /// tangent): zero on the line, so it corrects only the tracking error, and pure
-    /// pursuit's own look-ahead no longer cuts the inside where the bend tightens.
+    /// angle atan(wheelbase · k) for the curvature k of the lane's bend at the rotation point
+    /// (its headings half a wheelbase either side of it, up to the way's own curvature there
+    /// and 0 where the signs differ). The feedback is pure pursuit (looking further ahead the
+    /// faster the car goes) less what pure pursuit would steer on the lane's bend itself (the
+    /// rotation point on its line, the body along its tangent): on a bend of the lane it
+    /// corrects only the tracking error, and pure pursuit's own look-ahead no longer cuts the
+    /// inside where the bend tightens; a lane change's, a pull-out's or a swerve's S-curve
+    /// (the way off the lane's axis) is steered by pure pursuit itself, which turns the wheel
+    /// back in time. Without `lane` the bend is the way's.
     /// The line is the way, moved inside a bend of the lane (`lane`, else the way) by
-    /// `careful_line_offset` where the body is given (`keep_swept_in_lane`); its curvature
-    /// is the way's there, tighter by the offset (the parallel curve
+    /// `careful_line_offset` where the body is given (`keep_swept_in_lane`); the bend fed
+    /// forward is tighter by the offset (the parallel curve
     /// `side` inside: k / (1 - side · k)), which carries the rear sections' pull of an
     /// articulated vehicle (`rear_pull`) as the offset does.
     fn drive(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, lane: Option<&dyn Fn(f32) -> f32>) {
@@ -526,26 +534,45 @@ impl AiBody {
             DVec2::new(-t.y, t.x) * side
         };
         let (target, aim) = if side != 0.0 { (a + inside(u, -0.5 * turn_signed), c + inside(w, 0.5 * turn_signed)) } else { (a, c) };
-        // The line's curvature at the rotation point (+ = left): the way's, from the circle
-        // through its points half a wheelbase behind the rotation point, at it and half a
-        // wheelbase ahead (the curvature where the rotation point is, on the body's own
-        // scale), tighter by the offset inside it. On that circle the tangent at the middle
-        // point lies along the chord between the outer two: the line's tangent there, along
-        // which a body on the line would stand.
-        let (k_line, tangent) = {
-            let (p, r) = (way(self.rot_long - 0.5 * self.wheelbase).truncate(), way(self.rot_long + 0.5 * self.wheelbase).truncate());
-            let (u1, w1) = (a - p, r - a);
-            let turn1 = (u1.x * w1.y - u1.y * w1.x).atan2(u1.dot(w1));
-            let k_way = 2.0 * turn1 / self.wheelbase as f64;
-            (k_way / (1.0 - side * k_way).max(f64::EPSILON), (r - p).normalize_or_zero())
+        // The way's curvature at the rotation point (+ = left), from the circle through its
+        // points half a wheelbase behind the rotation point, at it and half a wheelbase ahead
+        // (the curvature where the rotation point is, on the body's own scale). On that circle
+        // the tangent at the middle point lies along the chord between the outer two.
+        let (p_back, p_ahead) = (way(self.rot_long - 0.5 * self.wheelbase).truncate(), way(self.rot_long + 0.5 * self.wheelbase).truncate());
+        let k_way_here = {
+            let (u1, w1) = (a - p_back, p_ahead - a);
+            2.0 * (u1.x * w1.y - u1.y * w1.x).atan2(u1.dot(w1)) / self.wheelbase as f64
         };
-        // The pure pursuit that a body standing on the line along it would steer (+ = right,
-        // as `alpha` below).
-        let ideal = {
-            let g = aim - target;
-            let r = DVec2::new(tangent.y, -tangent.x);
-            let alpha = (g.dot(r) as f32).atan2(g.dot(tangent) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
+        // The pure pursuit that a body standing on a line along it would steer (+ = right, as
+        // `alpha` below): `g` from its rotation point to its aim, `t` its tangent there.
+        let pursuit = |g: DVec2, t: DVec2| {
+            let r = DVec2::new(t.y, -t.x);
+            let alpha = (g.dot(r) as f32).atan2(g.dot(t) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
             2.0 * alpha.sin() / (g.length() as f32).max(1.0)
+        };
+        // The feed-forward and what it replaces of pure pursuit are the lane's bend only (its
+        // headings `lane`: the way without its lane change and sideways moves), the parallel
+        // line `side` inside it: a lane change's, a pull-out's or a swerve's S-curve is steered
+        // by pure pursuit, whose look-ahead turns the wheel back before the S's second half (fed
+        // forward, the rate-limited wheel lagged the S and the body ran on past it into the next
+        // lane: a car changing lanes at 2.5 m/s at a red light stood 1.9 m over, beside the car
+        // there). The lane's curvature counts as the careful line's does: up to the way's own
+        // and 0 where their signs differ. Without `lane`, the way's.
+        let (k_line, ideal) = match lane {
+            Some(l) => {
+                let (s0, hw) = (self.rot_long, 0.5 * self.wheelbase);
+                let k_lane = -wrap((l(s0 + hw) - l(s0 - hw)) as f64).to_radians() / self.wheelbase as f64;
+                let k = if k_lane * k_way_here > 0.0 { k_lane.abs().min(k_way_here.abs()).copysign(k_lane) } else { 0.0 };
+                // the lane's line from the rotation point to the aim, laid from its headings
+                // (midpoint rule over the steps of `LANE_LINE_STEPS`)
+                let step = look / LANE_LINE_STEPS as f32;
+                let along: DVec2 = (0..LANE_LINE_STEPS).map(|i| dir(l(s0 + (i as f32 + 0.5) * step) as f64) * step as f64).sum();
+                let (t0, t1) = (dir(l(s0) as f64), dir(l(s0 + look) as f64));
+                let left = |t: DVec2| DVec2::new(-t.y, t.x);
+                let g = along + (left(t1) - left(t0)) * side;
+                (k / (1.0 - side * k).max(f64::EPSILON), pursuit(g, t0))
+            }
+            None => (k_way_here / (1.0 - side * k_way_here).max(f64::EPSILON), pursuit(aim - target, (p_ahead - p_back).normalize_or_zero())),
         };
         if !self.started || (target - self.rear).length() > 8.0 {
             // spawned, or put somewhere else: stand on the line, straight along the way
@@ -802,7 +829,8 @@ impl AiBody {
     /// before moving off) and speeds up at `accel` to at most `v_max`. The steering is the real one -
     /// its rate limit, its lock and the pure pursuit that cuts in on a steep S-bend - which
     /// is what decides whether a car standing a few metres behind a bus can get its front
-    /// corner past the bus's.
+    /// corner past the bus's. The way's S-curve is laid on a straight lane along the way's
+    /// start (`drive`'s lane: a pull-out's S is steered by pure pursuit, as in the game).
     #[allow(clippy::too_many_arguments)]
     pub fn sweep_clearance(&self, way: &dyn Fn(f32) -> DVec3, speed: f32, wait: f32, accel: f32, v_max: f32, distance: f32, extent: (f32, f32, f32), obstacles: &[crate::collision::Obb]) -> f64 {
         let mut body = self.clone();
@@ -815,9 +843,12 @@ impl AiBody {
             obstacles.iter().map(|o| me.separation(o)).fold(f64::MAX, f64::min)
         };
         let mut best = gap(&body);
+        let start = (way(1.0) - way(0.0)).truncate();
+        let lane_heading = start.x.atan2(start.y).to_degrees() as f32;
+        let lane = |_d: f32| lane_heading;
         if v < 0.05 {
             for _ in 0..(wait / dt).round() as usize {
-                body.drive(dt, 0.0, way, None);
+                body.drive(dt, 0.0, way, Some(&lane));
             }
         }
         // (at most a minute of simulated time: a car that cannot move is not getting past)
@@ -829,7 +860,7 @@ impl AiBody {
             let ds = v * dt;
             x += ds;
             let at = x;
-            body.drive(dt, v, &|d| way(at + d), None);
+            body.drive(dt, v, &|d| way(at + d), Some(&lane));
             best = best.min(gap(&body));
         }
         best
@@ -1314,8 +1345,9 @@ mod tests {
     }
 
     /// On a straight lane the careful driver's line is the way: the pose is the same, bit
-    /// for bit, as a body driven on the way - on a straight way, and on a pull-out's S-curve
-    /// (round a bus standing ahead) laid on a straight lane, whose bend is not the lane's.
+    /// for bit, as a body driven on the way without it (the same lane given to both) - on a
+    /// straight way, and on a pull-out's S-curve (round a bus standing ahead) laid on a
+    /// straight lane, whose bend is not the lane's.
     #[test]
     fn on_a_straight_lane_the_line_is_the_way() {
         let (def, front, _, half) = bj6123();
@@ -1326,14 +1358,14 @@ mod tests {
             let mut plain = AiBody::new(&def, MotionKind::Road);
             let mut line = AiBody::new(&def, MotionKind::Road);
             line.keep_swept_in_lane(front, half);
-            plain.place(way, None, None, 0.0);
+            plain.place_in_lane(way, Some(&north), None, None, 0.0);
             line.place_in_lane(way, Some(&north), None, None, 0.0);
             let (mut s, mut v) = (0.0f32, 0.0f32);
             for _ in 0..600 {
                 v = (v + 0.05).min(12.0);
                 s += v / 30.0;
                 let at = s;
-                plain.step(1.0 / 30.0, v, &|d| way(at + d), None, None);
+                plain.step_in_lane(1.0 / 30.0, v, &|d| way(at + d), Some(&north), None, None);
                 line.step_in_lane(1.0 / 30.0, v, &|d| way(at + d), Some(&north), None, None);
                 assert_eq!((plain.position, plain.heading, plain.steer), (line.position, line.heading, line.steer));
             }
@@ -1440,18 +1472,51 @@ mod tests {
         assert!((body.position.x + 3.3).abs() < 0.2, "ended at x {}", body.position.x);
     }
 
+    /// A lane change's S-curve is steered by pure pursuit, not fed forward: a car pulling
+    /// away from a standstill into the next lane 3.1 m over in 4 m (the game's case at
+    /// Jiangzhaikou, a car changing lanes at a red light) runs past the new lane's axis by
+    /// 1.9 m when the S's curvature is fed forward (the rate-limited wheel lags the S's turn
+    /// back) and stands there beside the car in that lane; steered by pure pursuit it comes to
+    /// rest within `PULL_OUT_CLEARANCE` of the axis and never passes it.
+    #[test]
+    fn a_lane_change_s_curve_does_not_overshoot_the_new_lane() {
+        let def = golf();
+        let north = |_d: f32| 0.0f32;
+        let side = 3.1f32;
+        let way = straight_pull_out(side, 4.0);
+        let run = |lane: Option<&dyn Fn(f32) -> f32>| {
+            let mut body = AiBody::new(&def, MotionKind::Road);
+            body.place_in_lane(&way, lane, None, None, 0.0);
+            let (dt, mut s, mut v, mut past) = (1.0 / 30.0, 0.0f32, 0.0f32, f64::MIN);
+            for i in 0..240 {
+                // pulling away at 0.8 m/s² up to 3.3 m/s for 5 s, then standing
+                v = if i < 150 { (v + 0.8 * dt).min(3.3) } else { 0.0 };
+                s += v * dt;
+                let at = s;
+                body.step_in_lane(dt, v, &|d| way(at + d), lane, None, None);
+                past = past.max(-body.rear.x - side as f64);
+            }
+            (past, -body.rear.x - side as f64)
+        };
+        let (past_pp, rest_pp) = run(Some(&north));
+        let (past_ff, rest_ff) = run(None);
+        eprintln!("lane change: past the new lane's axis at most {past_pp:.3} m, at rest {rest_pp:.3} (fed forward {past_ff:.3}, {rest_ff:.3})");
+        assert!(past_pp <= 0.0, "past the new lane's axis by {past_pp:.3} m");
+        assert!(rest_pp.abs() < PULL_OUT_CLEARANCE, "at rest {rest_pp:.3} m off the new lane's axis");
+        assert!(past_ff > 1.0, "the fed-forward S no longer overshoots ({past_ff:.3}): the test lost its case");
+    }
+
     #[test]
     fn room_to_pull_out_depends_on_the_steering() {
         let car = pull_out_room(&golf(), (2.1, 2.2, 0.85), 1.25, 3.3);
         let lorry = pull_out_room(&lorry(), (3.6, 3.4, 1.25), 1.25, 3.3);
-        // a bus standing a little further over (or wider) needs no less room; the lorry, with
-        // its longer wheelbase and smaller lock, more (the steering takes the S-curve's own
-        // curvature up to the lock from the start, so the room is the steepest curve's that
-        // the lock can follow: car 3.25, wide 3.25, lorry 3.75 m)
+        // a bus standing a little further over (or wider) needs more room; the lorry, with its
+        // longer wheelbase and smaller lock, more again
         let wide = pull_out_room(&golf(), (2.1, 2.2, 0.85), 1.6, 3.3);
-        assert!(wide >= car, "{wide} against {car}");
+        eprintln!("room: car {car} wide {wide} lorry {lorry}");
+        assert!(wide > car, "{wide} against {car}");
         assert!(car > 1.5 && car < 6.0, "car {car}");
-        assert!(lorry > car && lorry < 12.5, "lorry {lorry}, car {car}");
+        assert!(lorry > car + 0.5 && lorry < 12.5, "lorry {lorry}, car {car}");
         // what it found works: from that room less the half metre of slack one of the
         // curves clears, from a metre less none does
         let clears = |gap: f32| {
