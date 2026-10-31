@@ -43,10 +43,11 @@ pub struct Walker {
     /// pedestrian ignores the obstacle it is jammed at, `MSPModel_Striping` PState::walk): no
     /// force from it; every other box, moving vehicles among them, stays solid.
     pub through: Option<DVec2>,
-    /// In a street lane's people strip, or about to step into one: the vehicles' boxes act on
-    /// this walker's avoidance (the anticipatory force); one on the pavement off every strip
-    /// feels none of them, only the contact pass keeps them out of a box (SUMO: pedestrians on
-    /// a sidewalk do not interact with vehicles, only on a crossing or the road).
+    /// In a street lane's people strip, about to step into one, or near a vehicle whose body has
+    /// left the strips (the caller's test): the vehicles' boxes act on this walker's avoidance
+    /// (the anticipatory force); otherwise they feel none of them, only the contact pass keeps
+    /// them out of a box (SUMO: pedestrians on a sidewalk do not interact with the vehicles on
+    /// the road).
     pub in_traffic: bool,
 }
 
