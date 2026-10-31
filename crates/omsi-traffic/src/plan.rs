@@ -1648,15 +1648,16 @@ fn near_standing_lead(p: &Perception, v: f32, (wait, len): (f32, f32)) -> Option
     p.own_leader.filter(|l| l.speed < STANDING_SPEED && l.gap < len + v * wait)
 }
 
-/// How far (m) a body at `speed` m/s runs on braking to rest at `brake` m/s² (its maximal
-/// deceleration, `AiState::decel`; a preset car's comfortable one where it is not known): where a
-/// leader would stand were it to stop now as hard as it can - the least it will be ahead of where
-/// it is (SUMO's secure gap: `getSecureGap` with the leader's maximal deceleration). Braking only
-/// comfortably it was no bound: a car in a queue stopped short of it and a change let through by the
-/// start check was dropped by the re-sweep.
-fn stop_reach(speed: f32, brake: Option<f32>) -> f32 {
-    let b = brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake).max(0.1);
-    speed.max(0.0).powi(2) / (2.0 * b)
+/// How far (m) a body at `speed` m/s has run `t` seconds on braking at `brake` m/s² from now:
+/// `v t - b t² / 2` until it stands, `v² / 2b` after - the least it will be ahead of where it is
+/// were it to brake at once that hard. With the maximal deceleration (`omsi_sim::traffic::MAX_BRAKE`,
+/// an AI driver's emergency stop) it is SUMO's secure-gap bound: `getSecureGap` reckons with the
+/// leader braking at its maximal deceleration. (Braking only comfortably it was no bound: a car in
+/// a queue stopped short of it and a change let through by the start check was dropped by the
+/// re-sweep.)
+fn braking_run(speed: f32, brake: f32, t: f32) -> f32 {
+    let (v, b, t) = (speed.max(0.0), brake.max(0.1), t.max(0.0));
+    if t < v / b { v * t - 0.5 * b * t * t } else { v * v / (2.0 * b) }
 }
 
 /// How a body near is swept by a moving body's sweep (`body_sweep_clear`).
@@ -1666,11 +1667,11 @@ enum Carry {
     Now,
     /// Carried on along its heading at its speed for the time my body takes there.
     AtSpeed,
-    /// Carried on at its speed but no further than where it would stand braking at the given
-    /// deceleration (`stop_reach`): the least it will have moved on.
+    /// Where it will be braking from now at the given deceleration (`braking_run`): the least it
+    /// will have moved on.
     ToStop(f32),
-    /// Anywhere between the two: where it would stand braking at the given deceleration and where
-    /// it would be at its speed (a body beside me, which may brake or roll on as my rear swings).
+    /// Anywhere between the two: where it will be braking at the given deceleration and where it
+    /// would be at its speed (a body beside me, which may brake or roll on as my rear swings).
     Span(f32),
 }
 
@@ -2453,18 +2454,20 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     // (how a body of this speed, on this lane, is swept - one rule whatever its speed, so the start
     // check and the re-sweep while the change signals make the same test of a car creeping that
     // stands a moment later: beside me, carried on at its speed (the rear's swing); ahead of my
-    // front, off my own way, where it would stand braking now at its maximal deceleration (the
+    // front, off my own way, where it will be braking from now at the maximal deceleration (the
     // least it will have moved on, SUMO's secure gap); ahead on my own way, standing where it
     // stands, moving the car following's - and with a lead standing within the move
     // (`near_standing_lead`, `others`) every body ahead by that bound; behind
     // my rear, standing where it is, moving the gap rule's, or where it is with `others`)
-    let swept = |speed: f32, lane: Option<usize>, brake: Option<f32>, b: &Obb| -> Option<Carry> {
+    // (braking, every body at the maximal deceleration, `braking_run`)
+    let brake = omsi_sim::traffic::MAX_BRAKE;
+    let swept = |speed: f32, lane: Option<usize>, b: &Obb| -> Option<Carry> {
         let moving = speed.abs() >= STANDING_SPEED;
         match bodies {
             Bodies::All => Some(Carry::Now),
-            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::Span(brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake)) } else { Carry::Now }),
+            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::Span(brake) } else { Carry::Now }),
             Bodies::Over { others, .. } if ahead_of_me(b) => {
-                let to_stop = Carry::ToStop(brake.unwrap_or_else(|| crate::driver::DriverParams::preset(crate::driver::VehicleClass::Car).comfort_brake));
+                let to_stop = Carry::ToStop(brake);
                 if others || !lane.is_some_and(|l| own_way.contains(&l)) {
                     Some(to_stop)
                 } else {
@@ -2480,7 +2483,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     let at = |mut b: Obb, heading: f32, speed: f32, carry: Carry, d: f32| {
         let run = match (carry, bodies.time_to(d)) {
             (Carry::AtSpeed, Some(t)) => speed * t,
-            (Carry::ToStop(brake), Some(t)) => (speed.max(0.0) * t).min(stop_reach(speed, Some(brake))),
+            (Carry::ToStop(brake), Some(t)) => braking_run(speed, brake, t),
             (Carry::Span(_), _) => unreachable!("a span is swept at both its ends, `sep_of`"),
             _ => 0.0,
         };
@@ -2499,7 +2502,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
     };
     let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, reach as f64).into_iter().filter_map(|j| {
         let o = &vehicles[j];
-        swept(o.state.speed, Some(o.state.lane), Some(o.state.decel.max(o.params.comfort_brake)), &o.obb()).map(|c| (j, c))
+        swept(o.state.speed, Some(o.state.lane), &o.obb()).map(|c| (j, c))
     }).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
     // (my body's pose `d` metres on and its least separation from what is swept)
@@ -2535,7 +2538,7 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         }
         for pl in sim.players.iter().filter(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0) {
             let pb = pl.obb(0.0, 0.0);
-            if let Some(carry) = swept(pl.speed, None, None, &pb) {
+            if let Some(carry) = swept(pl.speed, None, &pb) {
                 sep = sep.min(sep_of(pb, pl.heading, pl.speed, carry, d, &b));
             }
         }
