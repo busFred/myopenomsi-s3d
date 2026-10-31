@@ -1810,10 +1810,11 @@ fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
     lane.nearest_point(pos).is_some_and(|(_, d)| d <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND)
 }
 
-/// `on_path` for the walk `walk`: on the path of its current leg or of the next (a kerb waiter's
-/// place lies in the waiting area ahead of the leg they walked up to it).
+/// `on_path` for the walk `walk`: on the path of its current leg or of the next, or holding a place
+/// in a kerb's queue (the queue's places lie on the footpaths and the walking areas; one behind
+/// the queue may lie on a path behind the leg they walked up).
 fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec3) -> bool {
-    walk.legs[walk.leg..].iter().take(2).any(|l| on_path(net, l, pos))
+    walk.spot.is_some() || walk.legs[walk.leg..].iter().take(2).any(|l| on_path(net, l, pos))
 }
 
 /// A walk along the pavement network.
@@ -1856,6 +1857,10 @@ struct PedWalk {
     /// Caught in a pocket between closed ends (`closed_ends` 2): they stand idle there, off SUMO's jam
     /// clock (nothing they wait for will move), until the out-of-sight removal takes them.
     pocket: bool,
+    /// Seconds waited off the paths at a lane's edge (`steps_into_traffic`): the kerb's margin
+    /// shrinks with it; apart from `held`, which makes a kerb waiter of somebody at a crossing's
+    /// kerb with a place in its queue.
+    edge_wait: f32,
 }
 
 impl PedWalk {
@@ -1874,6 +1879,7 @@ impl PedWalk {
             from_wall: false,
             closed_ends: 0,
             pocket: false,
+            edge_wait: 0.0,
         }
     }
 
@@ -3921,10 +3927,10 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let vel = (target - pos2).normalize_or_zero() * pace;
     // somebody off the paths (`on_path`: a rider off a bus walking to their pavement), not on a
     // crossing: the first step into a lane is decided as at an unsignalled kerb
-    // (`steps_into_traffic`), the wait counted on `walk.held`
+    // (`steps_into_traffic`), the wait counted on `walk.edge_wait`
     let here3 = pos2.extend(p.z);
-    if !here_on_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
-        walk.held += dt;
+    if !here_on_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.edge_wait) {
+        walk.edge_wait += dt;
         me.decision = Some(WAITS_FOR_A_CAR);
         me.why = WAITS_FOR_A_CAR;
         return Want::stand(Some(h), Activity::Stand);
@@ -5672,7 +5678,7 @@ fn kerb_margin(held: f32) -> f64 {
 /// they do not step in while a vehicle at their level stands over the part of the lane they would
 /// cross (`stands_in_the_way`: not one yielding, not past PED_OCCUPIED_CAP) or comes to it before
 /// they would be across (`car_comes`, with the margin that shrinks with their wait,
-/// `kerb_margin`, `held` s); SUMO: a pedestrian enters the road only where no vehicle is in or
+/// `kerb_margin`, after `held` s); SUMO: a pedestrian enters the road only where no vehicle is in or
 /// coming into its path. Yes when they must wait.
 fn steps_into_traffic(at: &Around, here: DVec3, dir: DVec2, pace: f64, held: f32) -> bool {
     let net = at.net;
