@@ -437,6 +437,14 @@ pub const BLOCKER_IS_BLOCKED_TIME: f32 = 5.0;
 /// SUMO LC2013's `HELP_OVERTAKE` (10 km/h, m/s): a follower on the target lane that must overtake
 /// the changer may pass at the changer's speed plus this (`vhelp`, `informFollower`).
 pub const HELP_OVERTAKE: f32 = 10.0 / 3.6;
+/// SUMO LC2013's `URGENCY`: a blocked urgent change counts the time left to its lane's end as
+/// half the time its look-ahead speed takes to get there (`_wantsChange`'s `remainingSeconds =
+/// MAX2(TS, myLeftSpace / MAX2(myLookAheadSpeed, NUMERICAL_EPS) / remainingLanes / URGENCY)`).
+pub const URGENCY: f32 = 2.0;
+/// SUMO's default step length (`--step-length` 1 s), the least `remainingSeconds` (`MAX2(TS, ...)`).
+const SUMO_STEP: f32 = 1.0;
+/// SUMO's `NUMERICAL_EPS` (StdDefs.h), the least look-ahead speed `remainingSeconds` divides by.
+const NUMERICAL_EPS: f32 = 0.001;
 /// SUMO LC2013's `lcCooperative` (default 1.0; `lcCooperativeSpeed` defaults to it): the weight of
 /// a cooperative speed advice against the speed the follower would drive otherwise
 /// (`_patchSpeed`: `coopWeight = clamp(lcCooperativeSpeed, 0, 1)`, `v * coopWeight + (1 - coopWeight)
@@ -3237,7 +3245,12 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 let (b1, a1) = gap_parts_through_signal(me, p, &nb, signal_left(me, nb.dir, sim.time));
                 (b0 && b1, a0 && a1)
             };
-            let remaining = end_dist / v.max(STANDING_SPEED);
+            // (the time left to the end as LC2013 counts it, `URGENCY`: by the look-ahead speed,
+            // which falls slowly, not the speed now - a car crawling up behind its own standing
+            // leader at its lane's end counted a minute left, and the follower beside it was asked
+            // to brake for a change that could not come, standing at the junction's exit behind it,
+            // game run p3p81 #74 for #3312 on 1666/1668)
+            let remaining = (end_dist / me.look_ahead_speed.max(NUMERICAL_EPS) / URGENCY).max(SUMO_STEP);
             // (to fall in behind a vehicle there: how far I must drop back, and its speed; SUMO
             // takes the least of the speed advices to itself)
             let mut drop_back: Vec<(f32, f32)> = Vec::new();
