@@ -32,9 +32,10 @@ pub struct Walker {
     /// Passes through other walkers for a moment: the way out of a deadlock in a doorway
     /// or a narrow aisle (two people who have pushed against each other for seconds).
     pub ghost: bool,
-    /// Vehicles are solid to this walker even as a ghost: a ghost
-    /// passes through people, never through a car (people walked into the cars in front
-    /// of them).
+    /// Vehicles act on this walker's avoidance even as a ghost (the anticipatory force from the
+    /// boxes; people walked into the cars in front of them). The contact pass, which pushes a
+    /// walker out of a box, skips ghosts: what keeps a ghost walker and a car body apart is the
+    /// avoidance and, on the car's side, its people test (`omsi_traffic::perception`).
     pub solid: bool,
     /// Keeps to within `.2` of the segment `.0`-`.1` (an aisle): avoidance may move a walker
     /// sideways, never into the seats.
@@ -45,9 +46,10 @@ pub struct Walker {
     pub through: Option<DVec2>,
     /// In a street lane's people strip, about to step into one, or near a vehicle whose body has
     /// left the strips (the caller's test): the vehicles' boxes act on this walker's avoidance
-    /// (the anticipatory force); otherwise they feel none of them, only the contact pass keeps
-    /// them out of a box (SUMO: pedestrians on a sidewalk do not interact with the vehicles on
-    /// the road).
+    /// (the anticipatory force); otherwise they feel none of them - a non-ghost walker is still
+    /// pushed out of a box by the contact pass, a ghost (the game's people on foot) not at all:
+    /// the cars' own people test keeps the vehicles off them (SUMO: pedestrians on a sidewalk do
+    /// not interact with the vehicles on the road).
     pub in_traffic: bool,
 }
 
@@ -842,9 +844,10 @@ mod tests {
     #[test]
     fn a_walker_off_the_traffic_feels_no_vehicle_coming_by() {
         // somebody standing 0.27 m off a car's side (within the avoidance's body and 0.05 m, outside the contact pass's radius) as it comes by: in traffic they flinch,
-        // on the pavement off every strip they stand (the contact pass alone keeps boxes out)
+        // on the pavement off every strip they stand
         let run = |in_traffic: bool| {
-            let mut w = [Walker { in_traffic, ..walker(0.0, 1.17, DVec2::ZERO) }];
+            // (a ghost solid to vehicles, as the game's people on foot)
+            let mut w = [Walker { in_traffic, ghost: true, solid: true, ..walker(0.0, 1.17, DVec2::ZERO) }];
             let p = CrowdParams::default();
             for k in 0..60 {
                 let x = -15.0 + k as f64 * 0.5;

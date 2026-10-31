@@ -10074,9 +10074,11 @@ impl Humans {
             let w = &wants[i];
             // (in a street lane's people strip, or stepping into one this frame: the vehicles act
             // on their avoidance; on the pavement off every strip only a vehicle whose body has
-            // left the strips does, and the contact pass keeps them out of a box - SUMO's sidewalk
-            // walkers do not interact with the vehicles on the road. A kerb waiter at their place by
-            // a turning stream was pushed 0.10 m off it for 60 s, c08 #1307)
+            // left the strips does - SUMO's sidewalk walkers do not interact with the vehicles on
+            // the road. The walkers are ghosts, which the crowd's contact pass leaves alone: what
+            // keeps a car's body off them is its own people test (`perception::people_ahead`). A
+            // kerb waiter at their place by a turning stream was pushed 0.10 m off it for 60 s,
+            // c08 #1307)
             let here = p.position;
             let step = here + (w.vel * dt as f64).extend(0.0);
             // (asked only with a box within the crowd's reach of them, `CrowdParams::sense`)
