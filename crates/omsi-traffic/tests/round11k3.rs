@@ -181,3 +181,47 @@ fn k3_a_car_on_a_lane_only_a_bus_sweeps_stops_at_its_red_line() {
     }
     assert!(furthest <= len + 0.3, "its front got {:.1} m past lane 2's start, its line at {len:.1}", furthest);
 }
+
+/// A hand-made junction: a lead-in (movement 0, lane 0, 105.2 m) whose last half metre a turn's
+/// swept path covers, the way on (movement 1, lane 1) and the turn (movement 2, lane 2), which
+/// gives way to both: it meets the lead-in at its start (0..0.7) and the way on 2..4.5 m on.
+fn lead_in_and_turn() -> Junctions {
+    use omsi_traffic::junction::{Foe, FoeKind, Junction, Movement};
+    let foe = |movement: usize, mine: (f32, f32), theirs: (f32, f32), yields: bool| Foe { movement, kind: FoeKind::Cross, mine, theirs, yields, side: false, apart: 0.0, classes: None, shift: 0.0 };
+    let mv = |lane: usize, continues: Vec<usize>, foes: Vec<Foe>| {
+        let (start, end) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
+        Movement { lane, kind: LaneKind::Street, entries: Vec::new(), exits: Vec::new(), continues, light: None, foes, conflict_end: end, conflict_start: start, converge: Vec::new(), converge_with: Vec::new(), wide: Vec::new() }
+    };
+    let movements = vec![
+        mv(0, vec![1], vec![foe(2, (104.7, 105.2), (0.0, 0.7), false)]),
+        mv(1, Vec::new(), vec![foe(2, (0.0, 3.0), (2.0, 4.5), false)]),
+        mv(2, Vec::new(), vec![foe(0, (0.0, 0.7), (104.7, 105.2), true), foe(1, (2.0, 4.5), (0.0, 3.0), true)]),
+    ];
+    let mut js = Junctions::default();
+    js.nodes.push(Junction { key: ((0, 0), 9), movements, crossings: Vec::new(), class_meets: Vec::new() });
+    for m in 0..3 {
+        js.of_lane.insert(m, (0, m));
+    }
+    js
+}
+
+/// SUMO's `willPass`: a turner standing with its front in the swept place over a lead-in's end,
+/// refused there for the stream it gives way to further on, does not wait for a car standing up
+/// the lead-in: that car cannot reach the crossing further on before the turner has left the
+/// place at the lead-in's end (x10 j787: #34764 at 33467's end, #33787 13 m up lane 33466, both
+/// refused for each other and one eased off).
+#[test]
+fn k3_a_turner_in_a_lead_ins_swept_place_does_not_wait_for_the_lead_ins_queue() {
+    let js = lead_in_and_turn();
+    let mut up = standing(&js, 0, 1, 91.3, SWEPT_CAR);
+    up.chain = vec![(0, 0.0), (1, 105.2)];
+    let turner = standing(&js, 2, 2, -0.9, SWEPT_CAR);
+    let g = resolve(&js, &[up.clone(), turner.clone()]);
+    let (gu, gt) = (g.iter().find(|g| g.vehicle == 1).unwrap(), g.iter().find(|g| g.vehicle == 2).unwrap());
+    assert!(gt.go, "the turner waits for the car up the lead-in: {gt:?}");
+    assert!(gu.go || gu.wait_for == Some(2), "{gu:?}");
+    // (the turner short of the place: the car up the lead-in comes first, as the table says)
+    let short = standing(&js, 2, 2, -4.0, SWEPT_CAR);
+    let g = resolve(&js, &[up, short]);
+    assert_eq!(g.iter().find(|g| g.vehicle == 2).unwrap().wait_for, Some(1), "{g:?}");
+}

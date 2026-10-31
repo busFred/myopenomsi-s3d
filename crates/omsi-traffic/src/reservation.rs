@@ -869,8 +869,14 @@ pub fn meets(f: &crate::junction::Foe, a: &Claim, b: &Claim) -> bool {
 /// `Junctions::for_bodies`): `b` cannot pass before `a` has left it, as `will_pass` counts a foe in
 /// the meeting place (`their_inside`).
 fn in_way_of(js: &Junctions, a: &Claim, b: &Claim) -> bool {
+    in_way_before(js, a, b, f32::INFINITY)
+}
+
+/// [`in_way_of`], over the meeting places of `b`'s way that begin at or before `at` (a distance
+/// along `b`'s way through, its chain's): `b` cannot reach `at` before `a` has left the place.
+fn in_way_before(js: &Junctions, a: &Claim, b: &Claim, at: f32) -> bool {
     a.junction == b.junction
-        && js.foes_along_wide(b.junction, &b.chain).iter().filter_map(|(_, f)| js.for_bodies(b.junction, f, b.body, Some(a.body))).any(|f| {
+        && js.foes_along_wide(b.junction, &b.chain).iter().filter(|(_, f)| f.mine.0 <= at).filter_map(|(_, f)| js.for_bodies(b.junction, f, b.body, Some(a.body))).any(|f| {
             meets(&f, a, b) && a.chain.iter().any(|&(m, off)| {
                 let s = a.s - off;
                 m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
@@ -1201,6 +1207,14 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     }
     if me_in && !their_inside {
         return Pass::Not("me_in");
+    }
+    // SUMO's `willPass` (a vehicle that cannot pass before me registers no competing request): a
+    // foe standing outside this meeting place, not committed to it, whose way runs at or before
+    // it through a meeting place my body stands in (`in_way_before`) cannot come here before I
+    // have left that place (a turner waiting with its front in the swept place over the end of a
+    // lead-in, for that lead-in's queue at a crossing further on)
+    if !their_inside && !o.committed && o.standing() && in_way_before(js, c, &claims[ok], foe.theirs.0 + (claims[ok].s - o.s)) {
+        return Pass::Not("my_body");
     }
     // behind me (in my own lane, merging in behind me, or on a piece both our ways
     // take): it comes after me at any speed, `behind_me`
