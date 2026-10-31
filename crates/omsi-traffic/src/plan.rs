@@ -165,8 +165,6 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
     ok_behind && ok_ahead && !nb.foreign
 }
 
-/// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
-/// (the follower need not brake hard). (`informFollower` asks for it, .)
 /// The gap (m) a follower asked to make room opens (LC2013's `informFollower`: the secure gap,
 /// without the changer's impatience - SUMO applies `getSafetyFactor` to the changer's acceptance in
 /// `checkChange`, not to the gap it asks the follower for): `gap_needed_behind` of a calm driver.
@@ -179,16 +177,18 @@ fn help_gap_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
     gap_needed_behind(&calm, nb, vb, v)
 }
 
+/// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
+/// (`accepted_gap` with the follower's standing gap).
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
     accepted_gap(me, nb.behind_min_gap, vb, v)
 }
 
 /// The gap (m) I accept in front of a follower whose standing gap is `min_gap`, coming at `vb`
 /// m/s while I go at `v`: its standing gap, my accepted time gap at its speed and what it
-/// sheds braking at my comfort to my speed (`gap_needed_behind`'s; the way back
-/// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`),
-/// divided by my lane-change impatience's factor (`lc_impatience_factor`, SUMO SL2015) but never
-/// below the standing gap and the braking at comfort (`impatient_gap`).
+/// sheds braking to my speed at *my* comfortable brake - the changer's, not the follower's
+/// (`gap_needed_behind`'s; the way back into the lane from out of it asks each follower's own
+/// secure gap instead, `pull_out_clear`), divided by my lane-change impatience's factor (SUMO
+/// SL2015's safety factor, `impatient_gap`) but never below the standing gap and that braking.
 pub(crate) fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
     // (the follower's own standing gap, not a fixed 2 m: the helper opens exactly
@@ -209,11 +209,14 @@ fn ahead_needed(me: &Vehicle, v: f32, va: f32) -> f32 {
 /// SUMO SL2015's lane-change impatience (`MSLCM_SL2015::getSafetyFactor`, `1 / ((1 + 0.5 x
 /// myImpatience) x myAssertive)`, the factor `MSLaneChanger::checkChange` multiplies the secure gaps
 /// by; `lcAssertive` 1): the gap `full` divided by `1 + LC_IMPATIENCE_GAIN x lc_impatience`, at
-/// least `floor` - the standing gap and the braking at comfort, so an impatient driver takes a
-/// tighter gap but never one that has the follower brake harder than comfortably or stand closer
-/// than its standing gap (SUMO's gaps are net of the standing gap; its secure gap is the
-/// follower's braking at its maximal deceleration, ours at its comfortable one: OMSI's drivers do
-/// not force emergency braking on others).
+/// least `floor` - the standing gap and the braking the caller reckons (the follower's speed down
+/// to mine at the changer's comfortable brake, `accepted_gap`; my speed down to the leader's at
+/// mine, `ahead_needed`). An impatient driver so takes a gap at most 1.5 times tighter and never
+/// one under that floor; whether the follower then brakes more than comfortably depends on its own
+/// brake against the changer's (not checked here). SUMO's gaps are net of the standing gap and its
+/// secure gap reckons the follower's maximal deceleration; ours a comfortable one.
+/// Ours differs from SL2015 in how the impatience moves (the user's decision L3-D4,
+/// `Vehicle::lc_impatience`).
 fn impatient_gap(me: &Vehicle, full: f32, floor: f32) -> f32 {
     // (the floor bounds how far impatience lowers the gap: a calm driver's gap is `full`)
     (full / (1.0 + LC_IMPATIENCE_GAIN * me.lc_impatience.clamp(0.0, 1.0))).max(floor.min(full))
@@ -689,6 +692,11 @@ fn strategic_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
 /// (`dead_run`, `neighLeftPlace`) - over the changes then needed (`bestLaneOffset` from my lane
 /// plus two) is under the strategic distance towards `nb` (`currentDistDisallows(neighLeftPlace,
 /// |bestLaneOffset| + 2, laDist)`; `stay_place`). Only while my road leads there.
+/// LC2013's second stay (MSLCM_LC2013.cpp l.1438: on the best lane, `bestLaneOffset == 0 &&
+/// neighLeftPlace * 2 < laDist`, "could not change back and forth in time (2)") is not ported
+/// on its own: on the best lane the first one reads `neighLeftPlace / 2 < laDist`
+/// (`currentDistDisallows` divides by `|bestLaneOffset| + 2` = 2), which holds wherever the
+/// second's `neighLeftPlace * 2 < laDist` does - so in SUMO too the second never decides alone.
 fn strategic_stay(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> bool {
     stay_place(net, me, p, nb).is_some_and(|(place, mine)| place / ((mine + 2) as f32) < strategic_look(sim, me, nb.dir))
 }
@@ -1696,8 +1704,9 @@ fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: 
 }
 
 /// Does a lane change into `nb` clear what is near, its move `(wait, len)` - beginning after
-/// `wait` more seconds of signalling, `len` metres long (at its start `SIGNAL_BEFORE_CHANGE` and
-/// `change_length` at this speed; while it signals, what is left and `LaneChange::length`, the
+/// `wait` more seconds of signalling, `len` metres long (at its start the signal still owed,
+/// `signal_left` - the driver's own `signal_before_change` less what its indicator has shown for a
+/// blocked urgent wish - and `change_length` at this speed; while it signals, what is left and `LaneChange::length`, the
 /// move the car drives): the body turned along the change's smoothstep over `len` after the road
 /// the signalling takes as the car will drive it (`signal_plan`: braking for its leader), swept by
 /// `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars, the people, the standing
@@ -1784,7 +1793,8 @@ pub fn signal_left(me: &Vehicle, dir: i32, now: f64) -> f32 {
     }
 }
 
-/// How the car drives the `wait` seconds of a change's signal (`SIGNAL_BEFORE_CHANGE`, OMSI's
+/// How the car drives the `wait` seconds of a change's signal (`signal_left`: the driver's own
+/// `signal_before_change`, the user's decision L3-D5, less what it has already shown; OMSI's
 /// driver signals before it moves over where SUMO's change starts in the step it is decided -
 /// `lanechange.duration` 0): the road it covers and its speed when the move begins. On at its
 /// speed, as far as its leader lets it: that one's rear carried on over the time at its speed and
@@ -1855,12 +1865,6 @@ fn bypass_need(me: &Vehicle, lead: &crate::perception::Headway, dir: f32) -> f32
     dir * lead.lateral + lead.half_width + me.half_width + crate::perception::LEAD_MARGIN as f32 + SQUEEZE_CLEARANCE
 }
 
-/// The gap (m) behind the standing `lead` from which a move from rest into `nb` - `len` metres
-/// long, else the shortest of its kind: the smoothstep (`bypass_min_len`) or with `full_lock` the
-/// two arcs (`full_lock_len`) - takes the lead out of my corridor before my front gets there
-/// (where its way reaches `bypass_need` across, less my front) and my body's front corners,
-/// turned along it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than
-/// the full-lock room cannot get out without reversing.
 /// The room (m) vehicle `i` needs behind its lead to steer round it into the lane beside (the
 /// smoothstep's shortest move, `bypass_room`), towards the side the lead can be passed: what the
 /// keep-back behind a standing obstacle keeps (diagnostics and tests). None without a lead or a
@@ -1871,6 +1875,12 @@ pub fn steer_round_room(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i
     [p.left, p.right].into_iter().flatten().filter_map(|nb| bypass_room(net, &vehicles[i], &nb, &l, false, None)).reduce(f32::min)
 }
 
+/// The gap (m) behind the standing `lead` from which a move from rest into `nb` - `len` metres
+/// long, else the shortest of its kind: the smoothstep (`bypass_min_len`) or with `full_lock` the
+/// two arcs (`full_lock_len`) - takes the lead out of my corridor before my front gets there
+/// (where its way reaches `bypass_need` across, less my front) and my body's front corners,
+/// turned along it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than
+/// the full-lock room cannot get out without reversing.
 fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool, len: Option<f32>) -> Option<f32> {
     let st = &me.state;
     let target = &net.lanes[nb.lane];

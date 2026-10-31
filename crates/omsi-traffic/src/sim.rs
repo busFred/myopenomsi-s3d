@@ -400,11 +400,13 @@ pub struct Vehicle {
     /// `STRATEGIC_HOLD_MS`, `STRATEGIC_LONG_HOLDS`).
     #[serde(default)]
     pub dead_end_held: f32,
-    /// SUMO SL2015's lane-change impatience, 0..1 (`plan::impatient_gap`): grows over the driver's
-    /// `strategic_patience` while an urgent lane-end or strategic change is wished and not started
-    /// (`Plan::urgent_blocked`; SUMO: over `lcTimeToImpatience` while a strategic change is
-    /// blocked), kept while the change signals, back to 0 once it moves over or the wish ends
-    /// (the user's decision L3-D4).
+    /// Lane-change impatience after SUMO SL2015, 0..1 (`plan::impatient_gap`): grows over the
+    /// driver's `strategic_patience` while an urgent lane-end or strategic change is wished and not
+    /// started (`Plan::urgent_blocked`), kept while the change signals, back to 0 at once when it
+    /// moves over or the wish ends - the user's decision L3-D4. SL2015 differs
+    /// (`MSLCM_SL2015::setOwnState`): it grows over `lcTimeToImpatience` while a strategic *or
+    /// speed-gain* change is blocked, and otherwise decays at the same rate down to the driver's
+    /// `lcImpatience`; ours does not grow for speed-gain changes and does not decay.
     #[serde(default)]
     pub lc_impatience: f32,
     /// The side of the blocked urgent change it waited for last frame (`Plan::urgent_side`, 0
