@@ -3871,12 +3871,12 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     let right = DVec2::new(hr.cos(), -hr.sin());
     let target = p.truncate() + right * side;
     let vel = (target - pos2).normalize_or_zero() * pace;
-    // off the paths (a rider off a bus walking to their pavement, `walk_street_on`), not on a
-    // crossing: the first step into a lane is decided as at an unsignalled kerb
-    // (`steps_into_traffic`)
+    // a rider off a bus walking off the paths to their pavement (the point leg `walk_street_on`
+    // gives them), not on a crossing: the first step into a lane is decided as at an unsignalled
+    // kerb (`steps_into_traffic`), the wait counted on `walk.held`
     let here3 = pos2.extend(p.z);
-    let off_path = len < 0.05 || lane.nearest_point(here3).is_none_or(|(_, d)| d > width * 0.5 + STROLL_BAND);
-    if off_path && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace) {
+    if len < 0.05 && !me.on_crossing && !crossing && steps_into_traffic(at, here3, vel.normalize_or_zero(), pace, walk.held) {
+        walk.held += dt;
         me.decision = Some(WAITS_FOR_A_CAR);
         me.why = WAITS_FOR_A_CAR;
         return Want::stand(Some(h), Activity::Stand);
@@ -5420,13 +5420,7 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
             // (the "abandoned car" exemption past the cap is for one that stands: a car that
             // stood 19 s on the cut and then crept 2.2 m at 0.4-0.7 m/s kept its clock past
             // the cap and people stepped on at a lit green)
-            .any(|car| {
-                let speed = car.vel.length();
-                speed < PED_CREEP_SPEED
-                    && !car.yielding
-                    && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5)
-                    && (near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)) || covers_path(&car.body, from.truncate(), way, 1.5))
-            })
+            .any(|car| stands_in_the_way(car) && (near_cuts.iter().any(|x| car.body.near(*x, KERB_CLEAR)) || covers_path(&car.body, from.truncate(), way, 1.5)))
     };
     // nor while a vehicle on the junction, or coming to it, will pass the crossing and can
     // no longer stop short of it (SUMO addCrossingVehs: on a prioritised crossing a vehicle whose
@@ -5465,7 +5459,7 @@ fn kerb_verdict(ped: &PedNet, at: &Around, walk: &PedWalk, c: &Cross, me: &Me, y
     // takes, never less): a steady stream does not hold them for ever, but nobody walks
     // out in front of a car that is about to be there (after 45 s they used to ignore
     // the cars altogether)
-    let margin = if held > 45.0 { 0.0 } else if held > 20.0 { 1.0 } else { KERB_MARGIN };
+    let margin = kerb_margin(held);
     // a vehicle that has stood at the crossing for a while, held by a stream
     // of people that never gaps (a station's crossing: heads stood 75 and 90 s): the people
     // arriving let it pass, for a few seconds; those on the carriageway go on across
@@ -5567,14 +5561,38 @@ fn car_comes(car: &SeenCar, x: DVec2, t: f64) -> bool {
     along > -car.half_len && rel.perp_dot(dir).abs() < 3.5 && along / speed < t
 }
 
-/// The first step of somebody walking off the paths (straight to their leg: a rider off a bus at
-/// a stop whose only pavement lies across a lane) into a street lane they are not in: the
-/// kerb decision of an unsignalled crossing for that lane - they do not step in while a vehicle
-/// stands over the part of it they would cross or comes to it before they would be across
-/// (`car_comes`, the time to cross the lane's width and `KERB_MARGIN`); SUMO: a pedestrian
-/// enters the road only where no vehicle is in or coming into its path. The vehicles at their
-/// level only (`at_level`). Yes when they must wait.
-fn steps_into_traffic(at: &Around, here: DVec3, dir: DVec2, pace: f64) -> bool {
+/// Whether a vehicle standing at a kerb's way holds the people there (`kerb_verdict`'s
+/// `occupied`, `steps_into_traffic`): under PED_CREEP_SPEED, not stopping for people (a car that
+/// yields is let pass), and stood under PED_OCCUPIED_CAP (one that stood past it and creeps on
+/// keeps its clock: a car that stood 19 s on the cut and then crept 2.2 m at 0.4-0.7 m/s held
+/// people at a lit green; an abandoned car is stepped round after the cap).
+fn stands_in_the_way(car: &SeenCar) -> bool {
+    let speed = car.vel.length();
+    speed < PED_CREEP_SPEED && !car.yielding && (car.stood < PED_OCCUPIED_CAP || speed >= 0.5)
+}
+
+/// The gap (s) a kerb asks of a coming car beyond the time across after `held` s of waiting:
+/// `KERB_MARGIN` at first, 1 s after 20 s, none after 45 s - somebody who has waited long
+/// accepts a shorter gap, never less than the time across (a steady stream does not hold them
+/// for ever).
+fn kerb_margin(held: f32) -> f64 {
+    if held > 45.0 {
+        0.0
+    } else if held > 20.0 {
+        1.0
+    } else {
+        KERB_MARGIN
+    }
+}
+
+/// The first step of a rider off a bus walking off the paths to their pavement (`stroll`) into a
+/// street lane they are not in: decided as at an unsignalled kerb by `kerb_verdict`'s own tests -
+/// they do not step in while a vehicle at their level stands over the part of the lane they would
+/// cross (`stands_in_the_way`: not one yielding, not past PED_OCCUPIED_CAP) or comes to it before
+/// they would be across (`car_comes`, with the margin that shrinks with their wait,
+/// `kerb_margin`, `held` s); SUMO: a pedestrian enters the road only where no vehicle is in or
+/// coming into its path. Yes when they must wait.
+fn steps_into_traffic(at: &Around, here: DVec3, dir: DVec2, pace: f64, held: f32) -> bool {
     let net = at.net;
     let ahead = here + (dir * BOX_LOOK[0]).extend(0.0);
     let (cx, cy) = ((ahead.x / 50.0).floor() as i32, (ahead.y / 50.0).floor() as i32);
@@ -5596,10 +5614,10 @@ fn steps_into_traffic(at: &Around, here: DVec3, dir: DVec2, pace: f64) -> bool {
                 if !at_level(x.z, here.z) {
                     continue;
                 }
-                let t = 2.0 * reach / pace.max(0.5) + KERB_STEP_OFF + KERB_MARGIN;
+                let t = 2.0 * reach / pace.max(0.5) + KERB_STEP_OFF + kerb_margin(held);
                 let x = x.truncate();
                 let x3 = x.extend(here.z);
-                if at.cars.iter().any(|c| (c.vel.length() < 0.5 && at_level(c.z, here.z) && c.body.near(x, reach)) || (at_level(c.level_at(net, x3), here.z) && car_comes(c, x, t))) {
+                if at.cars.iter().any(|c| (stands_in_the_way(c) && at_level(c.z, here.z) && c.body.near(x, reach)) || (at_level(c.level_at(net, x3), here.z) && car_comes(c, x, t))) {
                     return true;
                 }
             }
@@ -15614,10 +15632,11 @@ mod ped_tests {
             let body = Block { center: DVec2::new(x, 0.0), half: DVec2::new(0.95, 2.3), heading: std::f64::consts::FRAC_PI_2, vel: DVec2::new(v, 0.0) };
             SeenCar { id: 5, pos: body.center, vel: body.vel, half_len: 2.3, body, yielding: false, stood: 0.0, z: 0.0, lane: None }
         };
-        let steps = |cars: &[SeenCar], from: DVec2| {
+        let steps_after = |cars: &[SeenCar], from: DVec2, held: f32| {
             let at = Around { net: &net, lights: None, cars, streams: &streams, queues: &queues, time: 0.0 };
-            steps_into_traffic(&at, from.extend(0.0), DVec2::Y, 1.3)
+            steps_into_traffic(&at, from.extend(0.0), DVec2::Y, 1.3, held)
         };
+        let steps = |cars: &[SeenCar], from: DVec2| steps_after(cars, from, 0.0);
         let kerb = DVec2::new(0.0, -2.5);
         assert!(!steps(&[], kerb), "nothing coming");
         assert!(steps(&[car(-20.0, 10.0)], kerb), "a car 2 s off");
@@ -15626,6 +15645,12 @@ mod ped_tests {
         assert!(steps(&[car(0.5, 0.0)], kerb), "one standing over their way");
         // already in the lane: the decision was taken at its edge
         assert!(!steps(&[car(-20.0, 10.0)], DVec2::new(0.0, -0.5)));
+        // nobody waits for ever (the kerb's own escapes): a car stopping for people, or standing
+        // past PED_OCCUPIED_CAP, is stepped past; a gap shrinks to the time across after 45 s
+        assert!(!steps(&[SeenCar { yielding: true, ..car(0.5, 0.0) }], kerb), "a car yielding");
+        assert!(!steps(&[SeenCar { stood: PED_OCCUPIED_CAP + 10.0, ..car(0.5, 0.0) }], kerb), "standing past the cap");
+        assert!(steps_after(&[car(-50.0, 10.0)], kerb, 0.0), "5 s off, just come");
+        assert!(!steps_after(&[car(-50.0, 10.0)], kerb, 46.0), "5 s off, after 46 s");
     }
 
     #[test]
@@ -15647,7 +15672,7 @@ mod ped_tests {
         assert!((ramp.level_at(&net, DVec3::ZERO) - 0.0).abs() < 1e-6 && (bridge.level_at(&net, DVec3::ZERO) - 6.0).abs() < 1e-6);
         let steps = |cars: &[SeenCar]| {
             let at = Around { net: &net, lights: None, cars, streams: &streams, queues: &queues, time: 0.0 };
-            steps_into_traffic(&at, DVec3::new(0.0, -2.5, 0.0), DVec2::Y, 1.3)
+            steps_into_traffic(&at, DVec3::new(0.0, -2.5, 0.0), DVec2::Y, 1.3, 0.0)
         };
         assert!(steps(&[ramp]), "a car 50 m up a 5 % ramp, 3.6 s off");
         assert!(!steps(&[bridge]), "a car on the bridge above");
