@@ -104,6 +104,15 @@ pub const AT_STOP_OBSTACLE_STAND: f32 = 0.5;
 /// going to lift soon).
 pub const HELD_OBSTACLE_STAND: f32 = 25.0;
 
+/// Somebody on foot more than this (m) above or below a vehicle is on another level - a
+/// footbridge, a footpath over a cutting or under a bridge - and is never in its way (the people
+/// tests here and in `plan`: the hold, the rest point, the clearances): OMSI's maps
+/// lay such paths over the carriageway in 2-D (BeijingCity's footbridge 2294485 6 m over lane 723,
+/// footpaths 1.3 m over the cutting of lanes 1616-1633 at -3.8 m); a ramp's rise along a body's
+/// length (0.9 m beside a 6 m half-length on 15 %) stays well inside it. The people on foot use
+/// the same value for the vehicles in their way (omsi-app's `humans::at_level`).
+pub const LEVEL_APART: f64 = 2.5;
+
 /// How far ahead of its front (m) a driver at `v` m/s looks for people on its way: a stop
 /// and some, 8 m at least, 45 m at most (`people_ahead`, `perceive`).
 pub fn people_reach(v: f32) -> f32 {
@@ -1248,7 +1257,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let lat = st.lateral_ahead(z.along);
         if on_walks.iter().any(|&k| {
             let p = &sim.people[k];
-            !p.at_kerb && !p.waiting_for_bus && (p.pos.z - me.pos.z).abs() <= 2.5 && z.blocked_by(net, p, me.half_width, lat)
+            !p.at_kerb && !p.waiting_for_bus && (p.pos.z - me.pos.z).abs() <= LEVEL_APART && z.blocked_by(net, p, me.half_width, lat)
         }) {
             // (SUMO's waiting position: not with the body over an earlier crossing of the
             // way - two walks a few metres apart, the zebra stop of the second lies over the
@@ -1319,7 +1328,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
         let rel = p.pos - me.pos;
-        if rel.truncate().length() > radius || rel.z.abs() > 2.5 {
+        if rel.truncate().length() > radius || rel.z.abs() > LEVEL_APART {
             continue;
         }
         // a car pulling out of a parking space: not the walkers under

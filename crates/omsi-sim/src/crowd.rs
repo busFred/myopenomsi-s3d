@@ -32,9 +32,10 @@ pub struct Walker {
     /// Passes through other walkers for a moment: the way out of a deadlock in a doorway
     /// or a narrow aisle (two people who have pushed against each other for seconds).
     pub ghost: bool,
-    /// Vehicles are solid to this walker even as a ghost: a ghost
-    /// passes through people, never through a car (people walked into the cars in front
-    /// of them).
+    /// Vehicles act on this walker's avoidance even as a ghost (the anticipatory force from the
+    /// boxes; people walked into the cars in front of them). The contact pass, which pushes a
+    /// walker out of a box, skips ghosts: what keeps a ghost walker and a car body apart is the
+    /// avoidance and, on the car's side, its people test (`omsi_traffic::perception`).
     pub solid: bool,
     /// Keeps to within `.2` of the segment `.0`-`.1` (an aisle): avoidance may move a walker
     /// sideways, never into the seats.
