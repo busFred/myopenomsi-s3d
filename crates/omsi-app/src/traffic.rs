@@ -1433,6 +1433,16 @@ fn lane_edges(net: &Network, state: &AiState, body: &AiBody) -> (f32, f32) {
     ((left + most_left).max(0.0), (right - most_right).max(0.0))
 }
 
+/// The body class of the junctions' meeting places for `vehicle` (`omsi_sim::traffic::swept_class`)
+/// from its type and the parts coupled behind it, as its careful driver's line drives it
+/// (`place_body`): its half width, the reach from its rotation point to its front bumper `front`
+/// and the rear sections' off-tracking.
+fn swept_class_of(vehicle: &VehicleInstance, front: f32, half_width: f32) -> u8 {
+    let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*vehicle.ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
+    let reach = front - omsi_sim::ai_motion::rotation_point(&vehicle.ty.def).0;
+    omsi_sim::traffic::swept_class(half_width, reach, omsi_sim::ai_motion::rear_off_tracking(&parts)) as u8
+}
+
 /// A body for a vehicle that has just been put on the way `state` describes, with the
 /// vehicle posed on it. A road vehicle drives the careful driver's line in bends with the
 /// traffic's extent of it (`AiBody::keep_swept_in_lane_with`: its front bumper `state.front`,
@@ -3473,6 +3483,7 @@ impl Traffic {
         // each that the IDM and the plan both read)
         let (max_kmh, speed) = (state.max_speed_kmh, state.speed);
         let mut ai = AiVehicle::new(id, class, state, half_width, seed);
+        ai.body = Some(swept_class_of(&vehicle, ai.state.front, half_width));
         // (a van of the car class over 6 t bends like a lorry: the preset by mass)
         ai.params = ai.params.by_mass(ty.def.mass);
         ai.params.apply(&mut ai.state);
@@ -6061,6 +6072,7 @@ impl Traffic {
         let parts: Vec<&omsi_sim::vehicle::VehicleType> = std::iter::once(&*ty).chain(vehicle.trailers.iter().map(|t| &*t.ty)).collect();
         body.keep_swept_in_lane_with(front, half_width, &parts);
         let mut ai = AiVehicle::new(id, if scheduled { VehicleClass::ScheduledBus } else { VehicleClass::Car }, state, half_width, id);
+        ai.body = Some(swept_class_of(&vehicle, front, half_width));
         ai.fresh = 0.0;
         self.cars.push(AiCar {
             id,

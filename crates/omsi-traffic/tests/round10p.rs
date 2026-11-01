@@ -33,7 +33,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
         wide: Vec::new(),
     };
     let mut js = Junctions::default();
-    js.nodes.push(Junction { key: ((0, 0), 1), movements: vec![arm(0), arm(1)], crossings: Vec::new() });
+    js.nodes.push(Junction { key: ((0, 0), 1), movements: vec![arm(0), arm(1)], crossings: Vec::new(), class_meets: Vec::new() });
     js.of_lane.insert(0, (0, 0));
     js.of_lane.insert(1, (0, 1));
     sim.junctions = js;
@@ -43,6 +43,7 @@ fn sim_on(m: usize, s: f32, speed: f32) -> (Network, Simulation) {
         clear_ahead: f32::INFINITY,
         serving: false,
         brake: 5.6,
+        body: omsi_sim::traffic::SWEPT_CAR,
         vehicle: 0,
         junction: 0,
         movement: m,

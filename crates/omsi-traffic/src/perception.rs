@@ -147,9 +147,10 @@ pub struct JunctionView {
     pub entry: f32,
     /// Distance from the origin to where the junction begins on this way:
     /// the movement's lane's start (`entry`), but for a lane that is a movement only by
-    /// joining another way (a spline lane, `Junctions::extend`) a metre before its first
-    /// meeting place - up to there it is an approach lane like any lane leading in (the
-    /// claim horizon applies, the line is there), from there on it is inside.
+    /// joining another way or by lying in a turn's swept path (a spline lane,
+    /// `Junctions::extend`) a metre before its body's first meeting place - up to there it is an
+    /// approach lane like any lane leading in (the claim horizon applies, the line is there),
+    /// from there on it is inside.
     pub line: f32,
     /// The origin is past `line`.
     pub inside: bool,
@@ -190,6 +191,18 @@ pub struct JunctionView {
     pub clearing: bool,
     /// The way through's length (m, along the chain's pieces).
     pub way_len: f32,
+    /// The vehicle's body class (`Vehicle::swept_class`): the meeting places above are its body's
+    /// (`Junctions::foes_along_for`) - where its claim begins and ends against the classes on the
+    /// road, its line, light line and box against its own class - and so is every band its plan
+    /// keeps the body out of (its own class's: a bus coming waits for a car standing in a place only
+    /// the bus's swing makes, as for anybody in its meeting place).
+    pub body: usize,
+    /// The body classes its waiting bands are against (bit `1 << class`): its own and those of the
+    /// vehicles that claimed this junction in the last frame (`Simulation::claims`). A place only a
+    /// larger body's swing makes is no band of a car's while no such body is at the junction (a bus
+    /// coming waits for the car standing in it); while one is, the car keeps out of it (SUMO: a
+    /// vehicle does not enter a conflict area a foe occupies, `MSLink::blockedByFoe`).
+    pub bands_for: u16,
 }
 
 impl JunctionView {
@@ -1810,19 +1823,31 @@ fn junction_ahead_at(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: u
             break;
         }
         let Some(&(j, m)) = js.of_lane.get(&l) else { continue };
+        let body = me.swept_class();
+        // (my class and those that claimed this junction in the last frame: my line and waiting
+        // bands keep out of their places, `JunctionView::bands_for`)
+        let bands_for = sim.claims.iter().filter(|(c, _)| c.junction == j).fold(1u16 << body, |m, (c, _)| m | 1 << c.body);
+        // (the first meeting place of my body on this lane with my class or one at the junction,
+        // the line's, as the waiting bands, `plan::hold_bands`)
         let approach = match net.lanes.get(l) {
             Some(lane) if lane.source != 2 => {
-                let first = js.nodes[j].movements[m].conflict_start;
-                if first.is_finite() { (first - 1.0).max(0.0) } else { 0.0 }
+                // (none for my class - a lane leading in that only a larger body's sweep made a
+                // movement, `Junctions::extend` - it is an approach to its end, the line there, as
+                // any lane leading in: its light holds me at its own line)
+                let first = js.nodes[j].movements[m].foes.iter().filter_map(|f| js.for_bodies_among(j, f, body, bands_for)).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+                if first.is_finite() { (first - 1.0).max(0.0) } else { lane.length() }
             }
             _ => 0.0,
         };
         let line = d0 + approach;
         let inside = line <= 0.0;
-        // the pieces my way takes through the object, and where their meeting places
+        // the pieces my way takes through the object, and where my body's meeting places
         // begin and end in my way's distances (they may lie on the pieces after this one)
         let chain = js.chain_along(j, &way[k..]);
-        let foes = js.foes_along(j, &chain);
+        // (with whoever of the classes on the road may come: where my claim begins and ends; with
+        // my own class: my lines and the box I keep clear, as my waiting bands)
+        let foes = js.foes_along_for(j, &chain, body, sim.fleet.present());
+        let own = js.foes_along_for(j, &chain, body, 1 << body);
         let way_len: f32 = chain.iter().map(|&(mm, _)| net.lanes[js.nodes[j].movements[mm].lane].length()).sum();
         // (the room past the conflicts is measured from the end of the last crossing or
         // joint; a stretch where the way runs side by side with another lane, `Foe::side`, is
@@ -1837,7 +1862,7 @@ fn junction_ahead_at(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: u
         // a box to keep clear: a crossing on the way through, or a zebra cut; a
         // merge-only lane join has no box, and the queue-place term below (`EXIT_NEAR`) does not
         // apply there, only the ordinary room
-        let crosses = foes.iter().any(|f| f.kind == FoeKind::Cross) || chain.iter().any(|&(mm, _)| net.walks.get(js.nodes[j].movements[mm].lane).is_some_and(|w| !w.is_empty()));
+        let crosses = own.iter().any(|f| f.kind == FoeKind::Cross) || chain.iter().any(|&(mm, _)| net.walks.get(js.nodes[j].movements[mm].lane).is_some_and(|w| !w.is_empty()));
         let mut room = f32::INFINITY;
         for &(wl, wd) in &way[k..] {
             if wd > clear_from + 40.0 {
@@ -1904,8 +1929,8 @@ fn junction_ahead_at(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: u
             let fork = |mm: usize| net.lanes.get(node.movements[mm].lane).is_some_and(|l| !l.points.is_empty() && starts.iter().any(|p| (l.start() - *p).truncate().length() <= 0.5));
             // (nor where it runs side by side with another lane before the light, `Foe::side`:
             // the queue at the light stands there on both)
-            let first = foes.iter().filter(|f| !chain.iter().any(|&(mm, _)| mm == f.movement) && !fork(f.movement) && !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
-            let any = foes.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let first = own.iter().filter(|f| !chain.iter().any(|&(mm, _)| mm == f.movement) && !fork(f.movement) && !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
+            let any = own.iter().filter(|f| !f.side).map(|f| f.mine.0).fold(f32::INFINITY, f32::min);
             if first.is_finite() {
                 d0 + first
             } else if any.is_finite() {
@@ -1936,7 +1961,7 @@ fn junction_ahead_at(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: u
         let cannot_stop = crate::plan::cannot_stop(me.state.speed, to_line, crate::plan::HARD_BRAKE);
         let in_box_at_turn = past_line && turned && light.map(|(c, l, _)| (c, l)) == me.passed_on_go;
         let clearing = in_box_at_turn && (cannot_stop || light_line - me.state.front <= 0.5);
-        let mut jv = JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, in_box_at_turn, clearing, way_len };
+        let mut jv = JunctionView { junction: j, movement: m, entry: d0, line, inside, chain, conflict_start, conflict_end: clear_from, exit_room: room >= need, light_line, light, past_line, in_box_at_turn, clearing, way_len, body, bands_for };
         // (the room past the junction keeps a box clear - SUMO's junction blocking, a car does not
         // enter where it would come to rest in a foe's way. A way through that crosses nothing -
         // no crossing meeting place, walk or convergence, `plan::wait_bands`; only merges, which
@@ -2203,7 +2228,7 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
         }
         if let Some(&(j, m)) = sim.junctions.of_lane.get(&l) {
             let node = &sim.junctions.nodes[j];
-            for f in &node.movements[m].foes {
+            for f in node.movements[m].foes.iter().filter_map(|f| sim.junctions.for_bodies_among(j, f, me.swept_class(), sim.fleet.present())) {
                 if f.kind != FoeKind::Merge || !f.yields || f.side {
                     continue;
                 }

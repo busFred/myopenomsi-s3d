@@ -499,7 +499,7 @@ fn may_change_for_lane_end(net: &Network, sim: &Simulation, me: &Vehicle, nb: &N
         return true;
     }
     match (sim.junctions.of_lane.get(&me.state.lane), sim.junctions.of_lane.get(&nb.lane)) {
-        (Some(&(j, m)), Some(&(j2, m2))) if j == j2 => !sim.junctions.nodes[j].movements[m].foes.iter().any(|f| f.movement == m2 && f.kind != crate::junction::FoeKind::Merge),
+        (Some(&(j, m)), Some(&(j2, m2))) if j == j2 => !sim.junctions.nodes[j].movements[m].foes.iter().any(|f| f.movement == m2 && f.kind != crate::junction::FoeKind::Merge && sim.junctions.for_bodies(j, f, me.swept_class(), Some(me.swept_class())).is_some()),
         _ => false,
     }
 }
@@ -919,7 +919,7 @@ fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &Neighb
     // come within `MEET_DIST` of each other)
     let meets = |mi: usize, other: usize, lane: usize, (a, b): (f32, f32)| {
         let mm = &sim.junctions.nodes[j].movements[mi];
-        mm.foes.iter().any(|f| f.mine.0 < b && f.mine.1 > a)
+        mm.foes.iter().filter_map(|f| sim.junctions.for_bodies(j, f, me.swept_class(), Some(me.swept_class()))).any(|f| f.mine.0 < b && f.mine.1 > a)
             || mm.converge.iter().zip(&mm.converge_with).any(|(c, &w)| w != other && c.0 < b && c.1 > a)
             || net.walks.get(lane).is_some_and(|w| w.iter().any(|&(fp, sa, _)| {
                 // (the walk's band: its half width either side of where its axis cuts my lane)
@@ -2177,7 +2177,7 @@ fn rest_clear_of_bands(net: &Network, sim: &Simulation, me: &Vehicle, s: f32) ->
     let mut bands: Vec<(f32, f32)> = net.walks.get(st.lane).map(|w| w.iter().map(|&(_, sa, _)| (sa - ZEBRA_STOP, sa + ZEBRA_PAST)).collect()).unwrap_or_default();
     if let Some(&(j, m)) = sim.junctions.of_lane.get(&st.lane) {
         let mv = &sim.junctions.nodes[j].movements[m];
-        bands.extend(mv.foes.iter().map(|f| (f.mine.0 - 1.0, f.mine.1)));
+        bands.extend(mv.foes.iter().filter_map(|f| sim.junctions.for_bodies(j, f, me.swept_class(), Some(me.swept_class()))).map(|f| (f.mine.0 - 1.0, f.mine.1)));
         bands.extend(mv.converge.iter().map(|&(a, b)| (a - 1.0, b)));
     }
     !bands.iter().any(|b| b.0 < to && b.1 > from)
@@ -2707,9 +2707,11 @@ fn hold_point(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView, w
 }
 
 /// The bands of the way through a held car keeps its body out of (`hold_point`): the meeting
-/// places (from a metre before), the pedestrian crossings and the convergences.
+/// places of its body with its own class and those at the junction (`JunctionView::bands_for`,
+/// `Junctions::foes_along_for`, from a metre before), the pedestrian crossings and the
+/// convergences.
 fn hold_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
-    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
+    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along_for(j.junction, &j.chain, j.body, j.bands_for).iter().map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
     bands.extend(walk_bands(net, sim, j));
     bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
     bands
@@ -2809,11 +2811,12 @@ fn refused_stop(net: &Network, sim: &Simulation, me: &Vehicle, j: &JunctionView,
 
 /// The bands a waiting car's body may not lie on (SUMO waits at link ends and
 /// internal junctions, never on a crossing link): the crossings with other ways (`Cross`, `Block`
-/// meeting places, from a metre before), the pedestrian crossings and the convergences - not the
+/// meeting places of its body with its own class and those at the junction,
+/// `JunctionView::bands_for`, from a metre before), the pedestrian crossings and the convergences - not the
 /// merges, where the zipper puts the two one behind the other; a queue stands in a side
 /// merge as in a lane).
 pub(crate) fn wait_bands(net: &Network, sim: &Simulation, j: &JunctionView) -> Vec<(f32, f32)> {
-    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| f.kind != crate::junction::FoeKind::Merge).map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
+    let mut bands: Vec<(f32, f32)> = sim.junctions.foes_along_for(j.junction, &j.chain, j.body, j.bands_for).iter().filter(|f| f.kind != crate::junction::FoeKind::Merge).map(|f| (j.entry + f.mine.0 - 1.0, j.entry + f.mine.1)).collect();
     bands.extend(walk_bands(net, sim, j));
     bands.extend(converge_bands(sim, j).into_iter().map(|(a, b, _)| (a, b)));
     bands
@@ -2929,6 +2932,23 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                     if let Some(at) = zebra_queue_stop(me, cut) {
                         min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
                     }
+                }
+            }
+            // a foe's body standing across my way at the junction ahead (`Seen::Body`: not on my
+            // lanes; under `STANDING_SPEED` - one moving across clears my way by itself) that
+            // moves off from there by itself: refused at this junction last frame, waiting for its
+            // go, or serving its stop (`Simulation::claims`; one standing for anything else is an
+            // obstacle, passed round, `squeeze`): I rest
+            // at the last place short of where following it brings me to rest with my body on no
+            // band of the way through (`wait_bands`, `legal_before`), as behind a zipper foe -
+            // never in a meeting place, where the foe needs the room to move off (a left turner
+            // standing across a lead-in has its swept place over the lead-in's end). SUMO
+            // measures the gap to a foe on a crossing link to the conflict area, not to the foe's
+            // body (`MSLink::getLeaderInfo`)
+            if let (Seen::Body(o), Some(j)) = (l.what, p.junction.as_ref()) {
+                let waiting = l.speed < STANDING_SPEED && sim.claims.iter().any(|(c, g)| c.vehicle == o && c.junction == j.junction && (!g.go || c.serving));
+                if let Some(at) = legal_before(&wait_bands(net, sim, j), me, my_front).filter(|&at| waiting && at < my_front) {
+                    min_stop(&mut out.stop, &mut out.why, Some(at), Why::Lead);
                 }
             }
         }

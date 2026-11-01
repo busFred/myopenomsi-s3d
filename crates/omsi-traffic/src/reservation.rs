@@ -144,6 +144,9 @@ pub struct Claim {
     /// The brake (m/s²) its committed test reckons with (`Simulation::tick`: the vehicle's
     /// own `decel * 1.5` inside the object, `plan::HARD_BRAKE` before it).
     pub brake: f32,
+    /// Its body class (`omsi_sim::traffic::SWEPT_CLASSES`, `Vehicle::swept_class`): the meeting
+    /// places it has with a foe are the two classes' (`Junctions::for_bodies`).
+    pub body: usize,
 }
 
 /// What the resolver reads besides the claims: the light programs' signal groups.
@@ -153,6 +156,16 @@ pub struct Context {
     /// the same time (`TrafficLightController::never_together`). A pair not in the map is
     /// not known to be exclusive.
     pub exclusive: hashbrown::HashMap<(usize, usize, usize), bool>,
+    /// The vehicles of each body class on the road this frame (`FleetBounds::bodies`; None: every
+    /// class): a claimant's meeting places with whoever may come (`Junctions::foes_along_for`).
+    pub bodies: Option<[u32; omsi_sim::traffic::SWEPT_CLASSES.len()]>,
+}
+
+impl Context {
+    /// The body classes on the road (`FleetBounds::present`).
+    pub fn present(&self) -> u16 {
+        crate::sim::FleetBounds { bodies: self.bodies, ..Default::default() }.present()
+    }
 }
 
 impl Context {
@@ -753,10 +766,12 @@ fn standing_order(js: &Junctions, claims: &[Claim], plain: &[Grant]) -> Vec<Stan
         let n = members.len();
         // yields[a][b]: a gives way to b by the table (None: not foes)
         let foes: Vec<Vec<crate::junction::Foe>> = members.iter().map(|&k| js.foes_along_wide(j, &claims[k].chain).into_iter().map(|(_, f)| f).collect()).collect();
+        // (foes whose meeting place the two bodies have: `meets`, `Junctions::for_bodies`)
         let yields = |a: usize, b: usize| -> Option<bool> {
             let mut hit = None;
+            let (ca, cb) = (&claims[members[a]], &claims[members[b]]);
             for f in &foes[a] {
-                if meets(f, &claims[members[a]], &claims[members[b]]) && claims[members[b]].chain.iter().any(|&(m, _)| m == f.movement) {
+                if meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && js.for_bodies(j, f, ca.body, Some(cb.body)).is_some() {
                     hit = Some(hit.unwrap_or(false) || f.yields);
                 }
             }
@@ -850,12 +865,19 @@ pub fn meets(f: &crate::junction::Foe, a: &Claim, b: &Claim) -> bool {
 }
 
 /// Claim `a`'s body is inside a meeting place of `b`'s way at their junction (its front past the
-/// stretch's start on `a`'s own piece, its rear not past the end): `b` cannot pass before `a`
-/// has left it, as `will_pass` counts a foe in the meeting place (`their_inside`).
+/// stretch's start on `a`'s own piece, its rear not past the end; the two bodies' meeting place,
+/// `Junctions::for_bodies`): `b` cannot pass before `a` has left it, as `will_pass` counts a foe in
+/// the meeting place (`their_inside`).
 fn in_way_of(js: &Junctions, a: &Claim, b: &Claim) -> bool {
+    in_way_before(js, a, b, f32::INFINITY)
+}
+
+/// [`in_way_of`], over the meeting places of `b`'s way that begin at or before `at` (a distance
+/// along `b`'s way through, its chain's): `b` cannot reach `at` before `a` has left the place.
+fn in_way_before(js: &Junctions, a: &Claim, b: &Claim, at: f32) -> bool {
     a.junction == b.junction
-        && js.foes_along_wide(b.junction, &b.chain).iter().any(|(_, f)| {
-            meets(f, a, b) && a.chain.iter().any(|&(m, off)| {
+        && js.foes_along_wide(b.junction, &b.chain).iter().filter(|(_, f)| f.mine.0 <= at).filter_map(|(_, f)| js.for_bodies(b.junction, f, b.body, Some(a.body))).any(|f| {
+            meets(&f, a, b) && a.chain.iter().any(|&(m, off)| {
                 let s = a.s - off;
                 m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
             })
@@ -1070,6 +1092,13 @@ fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     }
 }
 
+/// The start of the first meeting place of `foes` (along `c`'s way through, the chain's) still
+/// ahead of `c`'s front by more than the half metre of the committed test (`Simulation::tick`'s
+/// `next_ahead`); INFINITY: none.
+fn next_place<'a>(c: &Claim, foes: impl Iterator<Item = &'a crate::junction::Foe>) -> f32 {
+    foes.map(|f| f.mine.0).filter(|&d| d - (c.s + c.front) > 0.5).fold(f32::INFINITY, f32::min)
+}
+
 /// Does the refused claim `ok` (its grant `g`) come to rest short of `before` (a distance along
 /// its own way through, the chain's)? It stops at the last place short of the stretch it waits for
 /// (`Grant::at`) where its body lies on none of its crossing meeting places, from a metre before
@@ -1082,7 +1111,9 @@ fn rests_short(js: &Junctions, claims: &[Claim], ok: usize, g: &Grant, before: f
     let Some(at) = g.at else { return true };
     let o = &claims[ok];
     let len = o.front + o.rear;
-    let bands: Vec<(f32, f32)> = js.foes_along(o.junction, &o.chain).iter().filter(|f| f.kind != FoeKind::Merge).map(|f| (f.mine.0 - 1.0, f.mine.1)).collect();
+    // (its own class and those claiming the junction, as `JunctionView::bands_for`)
+    let at_junction = claims.iter().filter(|c| c.junction == o.junction).fold(1u16 << o.body, |m, c| m | 1 << c.body);
+    let bands: Vec<(f32, f32)> = js.foes_along_for(o.junction, &o.chain, o.body, at_junction).iter().filter(|f| f.kind != FoeKind::Merge).map(|f| (f.mine.0 - 1.0, f.mine.1)).collect();
     // (the front's place at rest, pulled back a band at a time, as `plan::legal_before`)
     let mut p = at - 1.0;
     for _ in 0..64 {
@@ -1183,6 +1214,14 @@ fn will_pass(ctx: &Context, js: &Junctions, claims: &[Claim], claim_of: &hashbro
     }
     if me_in && !their_inside {
         return Pass::Not("me_in");
+    }
+    // SUMO's `willPass` (a vehicle that cannot pass before me registers no competing request): a
+    // foe standing outside this meeting place, not committed to it, whose way runs at or before
+    // it through a meeting place my body stands in (`in_way_before`) cannot come here before I
+    // have left that place (a turner waiting with its front in the swept place over the end of a
+    // lead-in, for that lead-in's queue at a crossing further on)
+    if !their_inside && !o.committed && o.standing() && in_way_before(js, c, &claims[ok], foe.theirs.0 + (claims[ok].s - o.s)) {
+        return Pass::Not("my_body");
     }
     // behind me (in my own lane, merging in behind me, or on a piece both our ways
     // take): it comes after me at any speed, `behind_me`
@@ -1342,7 +1381,10 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
             continue;
         }
         let node = &js.nodes[c.junction];
-        let my_foes = js.foes_along_wide(c.junction, &c.chain);
+        // (my body's meeting places with any class on the road, the wide ones too,
+        // `Junctions::for_bodies_among`: each foe below is then the meeting place of my body and the
+        // foe vehicle's)
+        let my_foes: Vec<(usize, crate::junction::Foe)> = js.foes_along_wide(c.junction, &c.chain).into_iter().filter_map(|(m, f)| js.for_bodies_among(c.junction, &f, c.body, ctx.present()).map(|f| (m, f))).collect();
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
         // (held at my red I am held by my light, and no foe matters: the plan stops me at
         // the line, before any meeting place)
@@ -1377,31 +1419,37 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
         // the first stretch waited for (the car stops just before it)
         let mut hold_at = f32::INFINITY;
         let (mut follower_go, mut leader_go) = (0u16, 0u16);
-        for (my_piece, foe) in &my_foes {
+        for (my_piece, foe_any) in &my_foes {
             // a foe movement that is a piece of my own way through is ahead
             // of me on my own chain (a lane and its successor): whoever is on it is my lead,
             // never my junction foe (it would wait for a car standing ahead on its own successor)
-            if c.chain.iter().any(|&(m, _)| m == foe.movement) {
+            if c.chain.iter().any(|&(m, _)| m == foe_any.movement) {
                 continue;
             }
             // past the red line that holds me: I stop at the line before it
-            if c.light_red && foe.mine.0 >= c.red_at {
+            if c.light_red && foe_any.mine.0 >= c.red_at {
                 continue;
             }
             let my_piece = *my_piece;
-            // a meeting place I am in already: I am in the way of those coming, not they in
-            // mine (a car standing in the box short of a later stretch it waits for is
-            // committed to the stretches it is in, not to the later ones: `Claim::committed`)
-            // (a crossing: two lanes running into one another negotiate who is first at the end
-            // of their merge, however long the stretch where they converge)
-            // (in it as a foe sees one in it, `their_inside`: a front half a metre short of it
-            // counted as in, the foe saw it out, and both went)
-            let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
-            // (one it cannot wait short of, `Claim::next_wait`: it holds its way
-            // through it unless the foe is in it or arriving while it would be - then it waits)
-            let wait_short_of = foe.kind != FoeKind::Merge && !me_in && foe.mine.0 < c.next_wait;
-            let (my_in, _) = window(c, foe.mine.0, foe.mine.1);
-            for &(ok, shift) in expanded.get(&(c.junction, foe.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle && Some(claims[k].vehicle) != eased_for && meets(foe, c, &claims[k])) {
+            for &(ok, shift) in expanded.get(&(c.junction, foe_any.movement)).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&(k, _)| claims[k].vehicle != c.vehicle && Some(claims[k].vehicle) != eased_for) {
+                // the meeting place of my body and this one's (none: the two never touch)
+                let Some(pair) = js.for_bodies(c.junction, foe_any, c.body, Some(claims[ok].body)) else { continue };
+                if !meets(&pair, c, &claims[ok]) {
+                    continue;
+                }
+                let foe = &pair;
+                // a meeting place I am in already: I am in the way of those coming, not they in
+                // mine (a car standing in the box short of a later stretch it waits for is
+                // committed to the stretches it is in, not to the later ones: `Claim::committed`)
+                // (a crossing: two lanes running into one another negotiate who is first at the end
+                // of their merge, however long the stretch where they converge)
+                // (in it as a foe sees one in it, `their_inside`: a front half a metre short of it
+                // counted as in, the foe saw it out, and both went)
+                let me_in = foe.kind != FoeKind::Merge && c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
+                // (one it cannot wait short of, `Claim::next_wait`: it holds its way
+                // through it unless the foe is in it or arriving while it would be - then it waits)
+                let wait_short_of = foe.kind != FoeKind::Merge && !me_in && foe.mine.0 < c.next_wait;
+                let (my_in, _) = window(c, foe.mine.0, foe.mine.1);
                 // (one eased off for me in a mutual hold: not in my way at the junction; its
                 // body still is, to the plan)
                 if claims[ok].yields_now == Some(c.vehicle) {
@@ -1417,7 +1465,9 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // two ways running into one another (or side by side) that cross nowhere
                 // else: SUMO's zipper (`getZipperSpeed`), never a refusal, the foe ahead caps my
                 // speed (`zipper_cap`)
-                let zip_pair = foe.kind == FoeKind::Merge && !my_foes.iter().any(|(_, g)| g.kind != FoeKind::Merge && claims[ok].chain.iter().any(|&(m, _)| m == g.movement));
+                // (the crossings of these two bodies: a swept place only a bus's swing makes is no
+                // crossing of two cars, `Junctions::for_bodies`)
+                let zip_pair = foe.kind == FoeKind::Merge && !my_foes.iter().any(|(_, g)| g.kind != FoeKind::Merge && claims[ok].chain.iter().any(|&(m, _)| m == g.movement) && js.for_bodies(c.junction, g, c.body, Some(claims[ok].body)).is_some());
                 if go_anyway && !zip_pair {
                     continue;
                 }
@@ -1451,7 +1501,7 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                     // that neither has left decides, for every stretch of the two - per-stretch
                     // answers put either first at two stretches of one pair)
                     let decisive = my_foes.iter().find(|(_, f)| f.kind == FoeKind::Merge && meets(f, c, &claims[ok]) && c.s - c.rear <= f.mine.1 && claims[ok].chain.iter().any(|&(m, off)| m == f.movement && claims[ok].s - off - claims[ok].rear <= f.theirs.1)).map(|(_, f)| *f);
-                    if decisive.is_some_and(|d| d != *foe) {
+                    if decisive.is_some_and(|d| d != *foe_any) {
                         note("zipper_later_stretch", None);
                         continue;
                     }
@@ -1579,11 +1629,38 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // opposing left-turner standing in the box at the end of its green). Inside both is geometry, the same from
                 // either side, so exactly one of the two goes.
                 let me_inside = c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
+                // Commitment is per meeting place (SUMO's per link: a vehicle that can no longer
+                // brake before its link is committed to it): of two inside one place, neither can
+                // stop short of it, so the one that can still stop short of its next meeting place
+                // (`next_place`, `plan::cannot_stop` with the claim's brake and the 0.6 m of the
+                // committed test, `Simulation::tick`) waits for the other - there, at that next
+                // place's waiting position, not at this place behind its front (the plan gives a
+                // waiting place behind the front no stop, `plan::STOP_BEHIND_FRONT`, and the car
+                // rolled on into the foe: viz4 case04 j10 #16578/#19779); the other leads.
                 if me_inside && their_inside && !o.absolute && !c.absolute {
                     let they_yield = node.movements[foe.movement].foes.iter().chain(&node.movements[foe.movement].wide).any(|f| f.movement == my_piece && f.yields);
                     let (my_left, their_left) = (foe.mine.1 - (c.s - c.rear), foe.theirs.1 - (o.s - o.rear));
-                    let i_lead = if foe.yields != they_yield { they_yield } else { my_left < their_left || (my_left == their_left && c.vehicle < o.vehicle) };
+                    let oc = &claims[ok];
+                    let their_foes: Vec<crate::junction::Foe> = js.foes_along_wide(oc.junction, &oc.chain).into_iter().filter_map(|(_, f)| js.for_bodies_among(oc.junction, &f, oc.body, ctx.present())).collect();
+                    let my_next = next_place(c, my_foes.iter().map(|(_, f)| f));
+                    let their_next = next_place(oc, their_foes.iter());
+                    let can_wait = |x: &Claim, next: f32| !crate::plan::cannot_stop(x.speed, next - (x.s + x.front) - 0.6, x.brake);
+                    let (i_can, they_can) = (can_wait(c, my_next), can_wait(oc, their_next));
+                    let i_lead = if i_can != they_can {
+                        !i_can
+                    } else if foe.yields != they_yield {
+                        they_yield
+                    } else {
+                        my_left < their_left || (my_left == their_left && c.vehicle < o.vehicle)
+                    };
                     if i_lead {
+                        continue;
+                    }
+                    if i_can && my_next.is_finite() {
+                        if wait_for.map(|w| their_out < w.1).unwrap_or(true) {
+                            wait_for = Some((o.vehicle, their_out));
+                        }
+                        hold_at = hold_at.min(my_next);
                         continue;
                     }
                 }
@@ -1655,7 +1732,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false, body: omsi_sim::traffic::SWEPT_CAR }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -2891,7 +2968,7 @@ mod tests {
         }
         // (stretches of different lengths sharing their end at 20 m: mine from 12, theirs from 16;
         // the foe 3 m before the end, in its stretch; I am 9 m before it)
-        let foe = crate::junction::Foe { movement: 1, kind: FoeKind::Merge, mine: (12.0, 20.0), theirs: (16.0, 20.0), yields: true, side: false, apart: 0.0 };
+        let foe = crate::junction::Foe { movement: 1, kind: FoeKind::Merge, mine: (12.0, 20.0), theirs: (16.0, 20.0), yields: true, side: false, apart: 0.0, classes: None, shift: 0.0 };
         let (c, o) = (claim(1, 0, 20.0 - 9.0 - 2.0, 6.0), claim(2, 1, 20.0 - 3.0 - 2.0, 6.0));
         let z = zipper_cap(&c, &o, &foe, 0.0, 0.0, true, false).expect("capped behind the foe in the stretch");
         assert!((z.gap - 2.0).abs() < 1e-3, "gap {:.3}, body to body 2.0", z.gap);

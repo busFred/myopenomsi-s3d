@@ -5702,6 +5702,52 @@ fn crossings(args: &[String]) -> Res<()> {
             }
         }
         println!("  other crossings between lanes of no one object (swept paths): {swept}, in no junction table {swept_untabled}");
+        // (the swept places by the body classes they hold for, `Crossing::classes`: a car standing
+        // and a car turning, or only a bus's swing)
+        let car = omsi_sim::traffic::SWEPT_CAR * omsi_sim::traffic::SWEPT_CLASSES.len() + omsi_sim::traffic::SWEPT_CAR;
+        let (mut all_swept, mut for_cars) = (0usize, 0usize);
+        for a in 0..net.crossings.len() {
+            for c in net.crossings[a].iter().filter(|c| c.swept && c.other > a) {
+                all_swept += 1;
+                if c.classes.and_then(|k| net.class_meets.get(k as usize)).is_none_or(|m| m[car].is_some()) {
+                    for_cars += 1;
+                }
+            }
+        }
+        println!("  swept places: {all_swept}, for two cars {for_cars}, for larger bodies only {}", all_swept - for_cars);
+        // (the swept places between two pieces of one object - the turn's sweep over a sibling
+        // piece's end - per pair of body classes, mine on the sweeping piece first: car-car,
+        // car-bus (a car standing, a rigid bus sweeping), bus-bus)
+        {
+            let obj = |l: usize| net.lanes[l].key.filter(|_| net.lanes[l].source == 2).map(|k| (k.tile, k.id));
+            let n = omsi_sim::traffic::SWEPT_CLASSES.len();
+            let (car, rigid) = (omsi_sim::traffic::SWEPT_CAR, omsi_sim::traffic::SWEPT_RIGID);
+            let (mut total, mut cc, mut bc, mut bb) = (0usize, 0usize, 0usize, 0usize);
+            for a in 0..net.crossings.len() {
+                for c in net.crossings[a].iter().filter(|c| c.swept && c.other > a && obj(a).is_some() && obj(a) == obj(c.other)) {
+                    total += 1;
+                    let m = c.classes.and_then(|k| net.class_meets.get(k as usize));
+                    let has = |p: usize, q: usize| m.is_none_or(|m| m[p * n + q].is_some() || m[q * n + p].is_some());
+                    cc += usize::from(has(car, car));
+                    bc += usize::from(has(rigid, car));
+                    bb += usize::from(has(rigid, rigid));
+                }
+            }
+            println!("  swept places between two pieces of one object: {total}; holding for car-car {cc}, car-rigid bus {bc}, rigid bus-rigid bus {bb}");
+        }
+
+        // (by the smallest pair of the same class they hold for: car, rigid, articulated, semi)
+        let n = omsi_sim::traffic::SWEPT_CLASSES.len();
+        for (what, pick) in [("swept", true)] {
+            let mut by = vec![0usize; n + 1];
+            for a in 0..net.crossings.len() {
+                for c in net.crossings[a].iter().filter(|c| c.other > a && if pick { c.swept } else { c.side }) {
+                    let Some(m) = c.classes.and_then(|k| net.class_meets.get(k as usize)) else { continue };
+                    by[(0..n).find(|&k| m[k * n + k].is_some()).unwrap_or(n)] += 1;
+                }
+            }
+            println!("  {what} places by the smallest class pair alike they hold for (car, rigid, articulated, semi, none alike): {by:?}");
+        }
         // (the side merges between lanes of no one object: before a join, `compile_joins`, or
         // anywhere, `compile_outside_converging`)
         let side = (0..net.crossings.len()).map(|a| net.crossings[a].iter().filter(|c| c.side && c.other > a && !(net.lanes[a].source == 2 && net.lanes[c.other].source == 2 && net.lanes[a].key.map(|k| (k.tile, k.id)) == net.lanes[c.other].key.map(|k| (k.tile, k.id)))).count()).sum::<usize>();
@@ -6533,7 +6579,10 @@ fn foes(fixture: &Path, args: &[String]) -> Res<()> {
             let ol = js.nodes[j].movements[f.movement].lane;
             let conv = omsi_sim::traffic::converging_stretch(ln, &r.net.lanes[ol]).is_some() && f.kind == omsi_traffic::FoeKind::Merge && (ln.end() - r.net.lanes[ol].end()).truncate().length() >= 1.5;
             let back = js.nodes[j].movements[f.movement].foes.iter().find(|g| g.movement == m).map(|g| g.yields);
-            println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}{}", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" }, if f.side { " [side]" } else { "" });
+            // (per pair of body classes: mine first, `Junctions::for_bodies`; - where they never touch)
+            let n = omsi_sim::traffic::SWEPT_CLASSES.len();
+            let classes = if f.classes.is_some() { (0..n * n).map(|k| js.for_bodies(j, f, k / n, Some(k % n)).map_or("-".to_string(), |g| format!("{:.1}..{:.1}", g.mine.0, g.mine.1))).collect::<Vec<_>>().join(" ") } else { "all alike".into() };
+            println!("  foe lane {ol} {:?} yields {} (they yield {:?}) mine {:.1}..{:.1} theirs {:.1}..{:.1}{}{} classes [{classes}]", f.kind, f.yields, back, f.mine.0, f.mine.1, f.theirs.0, f.theirs.1, if conv { " [converging]" } else { "" }, if f.side { " [side]" } else { "" });
         }
         // (the wide side merges, `Movement::wide`: met only by bodies wider than their apart)
         for f in &mv.wide {
