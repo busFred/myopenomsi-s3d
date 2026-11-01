@@ -194,7 +194,7 @@ fn crossing_past_a_stuck_foe(stand_in: bool, secs: f32) -> Option<f32> {
     let mut sim = Simulation::new(&net, vec![]);
     sim.stand_in = stand_in.then_some(StandIn { vehicle: 1, player: 0 });
     // (in the main road's lane 21 m short of the crossing's middle, standing)
-    sim.people = vec![omsi_traffic::sim::Person { pos: DVec3::new(-21.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+    sim.people = vec![omsi_traffic::sim::Person { pos: DVec3::new(-21.0, 0.0, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 30.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None, leg: None }];
     sim.update_positions(&net, &mut vehicles);
     let (mut t, mut still) = (0.0f32, 0.0f32);
     while t < secs {

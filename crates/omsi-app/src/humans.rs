@@ -7131,9 +7131,9 @@ impl Humans {
 
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
     /// whether they wait at a stop (a bus pulls up right beside those), their standing
-    /// time, crossing and kerb flags, the stop they wait at, their id and their approach to a
-    /// crossing.
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>)> {
+    /// time, crossing and kerb flags, the stop they wait at, their id, their approach to a
+    /// crossing and the footpath lane of the leg a stroller walks.
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>, Option<usize>)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
@@ -7144,7 +7144,11 @@ impl Humans {
                     State::Pax(x) if x.inside.is_none() => x.stop,
                     _ => None,
                 };
-                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at, p.id, p.approach)
+                let leg = match &p.state {
+                    State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| leg.lane),
+                    _ => None,
+                };
+                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at, p.id, p.approach, leg)
             })
             .collect()
     }

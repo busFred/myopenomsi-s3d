@@ -177,7 +177,7 @@ fn past_an_approaching_person(front_x: f64, speed: f32, arrive: Option<f32>, sec
     let mut t = 0.0f32;
     while t < secs {
         let approach = arrive.map(|a| (DVec2::new(23.0, -8.0), (a - t).max(0.0), a + 12.0 - t));
-        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, -8.6, 0.0), vel: DVec2::new(0.0, 0.0), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(3), approach }];
+        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, -8.6, 0.0), vel: DVec2::new(0.0, 0.0), on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(3), approach, leg: None }];
         sim.tick(&net, DT, &mut cars);
         far = far.max(cars[0].pos.x + 2.0);
         stood |= cars[0].last.why == omsi_traffic::Why::People && cars[0].state.speed < 0.1;
@@ -213,7 +213,7 @@ fn p92_a_far_kerb_approacher_on_a_wide_crossing_is_seen() {
     while t < 6.0 {
         // (the crossing runs y -8..8; they step on at its far end, y = 12 being 12 m off my cut)
         let approach = Some((DVec2::new(23.0, 12.0), (1.0 - t).max(0.0), 1.0 + 16.0 / 1.3 - t));
-        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, 12.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(4), approach }];
+        sim.people = vec![omsi_traffic::Person { pos: DVec3::new(23.0, 12.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(4), approach, leg: None }];
         sim.tick(&net, DT, &mut cars);
         far = far.max(cars[0].pos.x + 2.0);
         t += DT;

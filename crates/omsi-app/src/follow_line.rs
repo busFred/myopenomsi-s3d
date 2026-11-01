@@ -934,7 +934,7 @@ impl PlayerWatch {
         }
         // people held at a kerb in sight within the radius (`Traffic::people`: the people's
         // own `at_kerb`; in sight by the people's own test, `Humans::figure_sight`)
-        for &(p, _, _, _, _, at_kerb, _, id, _) in &traffic.people {
+        for &(p, _, _, _, _, at_kerb, _, id, _, _) in &traffic.people {
             let seen = humans.is_some_and(|h| matches!(h.figure_sight(world, p), crate::humans::FigureSight::In | crate::humans::FigureSight::Far));
             if at_kerb && near(p) && seen {
                 self.held_s += dt as f64;
