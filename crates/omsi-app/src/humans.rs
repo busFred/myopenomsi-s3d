@@ -1799,8 +1799,10 @@ impl Leg {
     }
 }
 
-/// Whether somebody at `pos` is on the path of leg `leg`: no farther from its lane than the
-/// stroll's corridor draws anybody back (half its width, a metre at least, and `STROLL_BAND`).
+/// Whether somebody on the network at `pos` is on the path of leg `leg`: no farther from its lane
+/// than the stroll's corridor draws anybody back (half its width, a metre at least, and
+/// `STROLL_BAND`); somebody walking onto the network is on it only on the path's own surface
+/// (`walk_on_path`, `on_path_surface`).
 /// Off it - a rider off a bus walking to their pavement - they walk to the leg's point and their
 /// legs do not advance (`stroll`, the progress by projection): persons move on the people's network
 /// only (SUMO), and somebody still in the road stepped on to the next legs and their kerbs, and
@@ -1808,6 +1810,19 @@ impl Leg {
 /// Taken over the leg's own stretch of its lane (from `a` to `b`), not the whole lane: near
 /// another stretch of a long or looping lane they are not on this leg's path.
 fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
+    let lane = &net.lanes[leg.lane];
+    within_leg(net, leg, pos, (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND)
+}
+
+/// Whether `pos` lies on the path's own surface along leg `leg`: within half its width (a metre
+/// at least, as `on_path`) of the leg's stretch. Where somebody walking onto the network from off
+/// it (`PedWalk::joining`) has arrived.
+fn on_path_surface(net: &Network, leg: &Leg, pos: DVec3) -> bool {
+    within_leg(net, leg, pos, (net.lanes[leg.lane].width as f64).max(1.0) * 0.5)
+}
+
+/// Whether `pos` lies within `reach` of the stretch of leg `leg`'s lane from `a` to `b`.
+fn within_leg(net: &Network, leg: &Leg, pos: DVec3, reach: f64) -> bool {
     let lane = &net.lanes[leg.lane];
     let (lo, hi) = (leg.a.min(leg.b), leg.a.max(leg.b));
     let mut best = f64::MAX;
@@ -1823,7 +1838,7 @@ fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
         let t = ((pos - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(t0, t1);
         best = best.min((a + ab * t - pos).length());
     }
-    best <= (lane.width as f64).max(1.0) * 0.5 + STROLL_BAND
+    best <= reach
 }
 
 /// `on_path` for the walk `walk`: on the path of its current leg or of the next, holding a place
@@ -1837,12 +1852,19 @@ fn on_path(net: &Network, leg: &Leg, pos: DVec3) -> bool {
 /// Taken in the plane, at each leg's own height there (the walkers' heights follow the ground and
 /// a bridge's deck, the paths' their splines: a footpath on a ramp lay 4 m under its walkers, who
 /// were then never on it and stood for good).
+/// Somebody walking onto the network from off it (`PedWalk::joining`) is on it once they stand on
+/// the path's own surface (`on_path_surface`), not within the corridor band: the band is how far a
+/// walker already on the path may be pushed off it, and taken as the arrival it stopped riders off
+/// a bus 2 m short of the pavement, in the road, where they stood (Wuluju moving, #572/#577 off the
+/// player's bus at stop 2294078: at (471.2, -2438.8), 1.0 m from the axis of parking lane 1863,
+/// between two cars parked over footpath 1864, a pocket, 23-30 s to the run's end).
 fn walk_on_path(net: &Network, walk: &PedWalk, pos: DVec2, round_box: bool) -> bool {
     round_box
         || walk.spot.is_some()
         || walk.legs[walk.leg..].iter().take(2).enumerate().any(|(k, l)| {
             let s = if k == 0 { walk.s.min(l.len()) } else { 0.0 };
-            on_path(net, l, pos.extend(l.at(net, s).0.z))
+            let at = pos.extend(l.at(net, s).0.z);
+            if walk.joining { on_path_surface(net, l, at) } else { on_path(net, l, at) }
         })
 }
 
@@ -1891,6 +1913,11 @@ struct PedWalk {
     /// back to 0 once they step on (the test lets them) or are on the path again. Apart from
     /// `held`, which makes a kerb waiter of somebody at a crossing's kerb with a place in its queue.
     edge_wait: f32,
+    /// Walking onto the network from off it, to the point of their first leg (a rider off a bus,
+    /// somebody sent on from a stop, somebody standing who found a pavement beside them): off the
+    /// paths until they first stand on the path's own surface (`walk_on_path`). SUMO: persons move
+    /// on the pedestrian network only and enter it at a position on a lane.
+    joining: bool,
 }
 
 impl PedWalk {
@@ -1910,7 +1937,14 @@ impl PedWalk {
             closed_ends: 0,
             pocket: false,
             edge_wait: 0.0,
+            joining: false,
         }
+    }
+
+    /// A walk onto the network from off it: to the point `s` of pavement lane `lane`, and on from
+    /// there as a stroll goes on (`joining`).
+    fn joining(lane: usize, s: f32) -> PedWalk {
+        PedWalk { joining: true, ..PedWalk::new(vec![Leg { lane, a: s, b: s }], true, 0.0) }
     }
 
     /// On to the next leg.
@@ -2707,8 +2741,7 @@ impl DecideCtx<'_> {
                         _ => None,
                     };
                     if let Some((lane, s)) = found {
-                        let leg = Leg { lane, a: s, b: s };
-                        d.state = Some(State::Strolling(PedWalk::new(vec![leg], true, 0.0)));
+                        d.state = Some(State::Strolling(PedWalk::joining(lane, s)));
                         d.t_state = 0.0;
                         return d;
                     }
@@ -3809,6 +3842,9 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
     // (on the path of their leg, `on_path`: off it they walk to the leg first - no verdict at a
     // kerb ahead, no leg's end)
     let here_on_path = walk_on_path(net, walk, pos2, me.round_box);
+    if here_on_path {
+        walk.joining = false;
+    }
     // the verdict on the crossing ahead is taken on the way to its kerb, `kerb_look`
     // short of it (SUMO: a pedestrian waits at the crossing's start, on the walking area, never
     // on the carriageway; OMSI's crossings start at the lane's edge, so the start of the
@@ -16040,6 +16076,47 @@ mod ped_tests {
         let leg = Leg { lane: 0, a: 10.0, b: 10.0 };
         assert!(on_path(&net, &leg, p(10.0, 1.0)));
         assert!(!on_path(&net, &leg, p(10.0, 5.0)));
+    }
+
+    #[test]
+    fn z1_somebody_walking_onto_the_network_arrives_on_the_path_surface() {
+        // Wuluju moving: riders off the player's bus at stop 2294078 walked west from their door to
+        // footpath 1864 (3 m wide) and were taken as on it 3.5 m from its axis (the corridor band),
+        // 1 m from the axis of parking lane 1863; two stood there for good (a pocket between parked
+        // cars). Here a 3 m path runs along y at x 0, and a rider joins it at y 0 from x 9
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(0.0, -20.0), p(0.0, 20.0)], LaneKind::Sidewalk, 3.0));
+        net.build_grid();
+        net.link(1.5);
+        let ped = PedNet::build(&net);
+        let streams: Streams = HashMap::new();
+        let queues = Queues::default();
+        let at = Around { net: &net, lights: None, cars: &[], streams: &streams, queues: &queues, time: 0.0 };
+        // (the x where their walk first counts as on the path)
+        let arrive = |joining: bool| -> f64 {
+            let mut walk = PedWalk::joining(0, 20.0);
+            walk.joining = joining;
+            let mut m = me(572, DVec2::new(9.0, 0.0), 1.3);
+            let mut rng = 5u64;
+            for _ in 0..400 {
+                if walk_on_path(&net, &walk, m.pos, false) {
+                    return m.pos.x;
+                }
+                let w = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+                m.pos += w.vel * 0.05;
+            }
+            f64::MAX
+        };
+        // joining, they arrive on the path's own surface (half its width, 1.5 m)
+        assert!(arrive(true) <= 1.5, "{}", arrive(true));
+        // taken by the corridor band, 3.5 m off its axis (the old rule)
+        assert!(arrive(false) > 3.0, "{}", arrive(false));
+        // and the flag goes once they are on it: on the network the band applies again
+        let mut walk = PedWalk::joining(0, 20.0);
+        let mut m = me(572, DVec2::new(1.0, 0.0), 1.3);
+        let _ = stroll(Some(&ped), &at, &mut m, &mut walk, &mut 5u64, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
+        assert!(!walk.joining);
+        assert!(walk_on_path(&net, &walk, DVec2::new(3.0, 0.0), false));
     }
 
     #[test]

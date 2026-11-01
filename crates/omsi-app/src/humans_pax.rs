@@ -3294,12 +3294,7 @@ impl Humans {
         p.vel = DVec2::ZERO;
         match (lane, self.ped.as_ref()) {
             (Some((l, s)), Some(_)) => {
-                let leg = Leg {
-                    lane: l,
-                    a: s,
-                    b: s,
-                };
-                p.state = State::Strolling(PedWalk::new(vec![leg], true, 0.0));
+                p.state = State::Strolling(PedWalk::joining(l, s));
             }
             _ => {
                 p.state = State::Standing;
