@@ -3700,7 +3700,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
             if sign == towards_middle {
-                if let Some((opp, _, oside)) = net.opposite(st.lane, st.s) {
+                if let Some((opp, _, oside)) = *p.opposite.get_or_init(|| net.opposite(st.lane, st.s)) {
                     cap = cap.min(omsi_scenery::profile::neighbour_edge(oside.abs(), net.lanes[opp].width));
                 }
             }
