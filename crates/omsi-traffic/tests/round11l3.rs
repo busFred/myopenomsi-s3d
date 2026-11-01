@@ -1088,3 +1088,56 @@ fn lane_change_impatience_grows_while_an_urgent_change_is_blocked_and_resets_aft
     assert!((mid - 0.5).abs() < 0.05, "half its patience blocked: impatience {mid:.3}");
     assert_eq!(after, Some(0.0), "moved over: impatience back to 0");
 }
+
+/// The user's decision L3-D7: a lane end follows the route. Lane 8 forks into lane 1 and lane 9
+/// (density 0 for the car's group, a dead end); lane 1 runs beside lane 0 to x 600 and on over
+/// lane 3, 20 m at the editor's 0.001 for the group (closed to it, longer than its body), into
+/// lane 5, the only trip end the group can reach; lane 0 goes on into lane 2 and lane 6 (density 0,
+/// a dead end). The car's route to lane 5 can only be over the lanes closed by density
+/// (`GoalAccess::Driven`), which the choice at the fork ranks as open (`AiState::route_may_use`);
+/// at lane 1's end the same rule holds, so lane 3 is no lane end for it: it does not change onto
+/// lane 0 (the j8 exit at Jiangzhaikou, 1668 into 1716) and drives on over lane 3 into lane 5.
+#[test]
+fn a_lane_end_follows_the_route_a_driven_route_over_a_near_closure_is_no_end() {
+    let mut net = Network::default();
+    net.lanes.push(road(&[(0.0, 0.0), (600.0, 0.0)], 1, 0, 0.0)); // 0
+    net.lanes.push(road(&[(200.0, -3.5), (600.0, -3.5)], 1, 1, 3.5)); // 1
+    net.lanes.push(road(&[(600.0, 0.0), (700.0, 0.0)], 2, 0, 0.0)); // 2
+    net.lanes.push(road(&[(600.0, -3.5), (620.0, -3.5)], 3, 0, 0.0)); // 3
+    net.lanes.push(road(&[(700.0, 0.0), (800.0, 40.0)], 4, 0, 0.0)); // 4 (unused index keeper)
+    net.lanes.push(road(&[(620.0, -3.5), (1500.0, -3.5)], 5, 0, 0.0)); // 5
+    net.lanes.push(road(&[(700.0, 0.0), (800.0, 40.0)], 6, 0, 0.0)); // 6
+    net.lanes.push(road(&[(-300.0, 50.0), (-200.0, 60.0)], 7, 0, 0.0)); // 7 (apart)
+    net.lanes.push(road(&[(0.0, -3.5), (200.0, -3.5)], 8, 0, 0.0)); // 8
+    net.lanes.push(road(&[(200.0, -3.5), (300.0, -60.0)], 9, 0, 0.0)); // 9
+    net.lanes[3].group_density = vec![(0, 0.001), (3, 1.0)];
+    for l in [6usize, 9, 4, 7] {
+        net.lanes[l].group_density = vec![(0, 0.0), (3, 1.0)];
+    }
+    net.link(1.5);
+    net.lanes[2].next = vec![6];
+    net.lanes[4].next.clear();
+    net.compute_conflicts();
+    net.compute_reach();
+    assert_eq!(net.lanes[8].next.len(), 2, "lane 8 forks: {:?}", net.lanes[8].next);
+    assert_eq!(net.lanes[1].next, vec![3]);
+    let mut sim = Simulation::new(&net, vec![]);
+    let defaults = std::sync::Arc::new(vec![1, 2, 1, 1]);
+    let mut me = car(1, 8, 100.0, 12.0);
+    me.state.traffic_pool = Some((0, defaults));
+    me.state.max_speed_kmh = 50.0;
+    let mut cars = vec![me];
+    let (mut lanes, mut changed, mut t) = (vec![8usize], false, 0.0f32);
+    while t < 90.0 {
+        sim.tick(&net, DT, &mut cars);
+        let Some(me) = cars.iter().find(|c| c.id == 1) else { break };
+        changed |= me.state.change.is_some();
+        if lanes.last() != Some(&me.state.lane) {
+            lanes.push(me.state.lane);
+        }
+        t += DT;
+    }
+    let me = cars.iter().find(|c| c.id == 1);
+    assert_eq!(me.and_then(|m| m.state.goal), Some(5), "the trip end is lane 5");
+    assert!(!changed && lanes.starts_with(&[8, 1, 3, 5]), "no change before lane 3, on over it into lane 5: lanes {lanes:?}, changed {changed}");
+}

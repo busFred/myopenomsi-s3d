@@ -2196,7 +2196,9 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
         // density 0 for the normal cars so that nothing is put down at the line, and lead on
         // into the junction): it is crossed, not stopped short of, `Network::closed_marker`
         // (SUMO: a lane is dead for a vehicle only where its route cannot go on).
-        if k > 0 && lane.source != 2 && !crate::access::is_open_at(net, l, me) {
+        // (nor a lane the car's route may use, `AiState::route_may_use`: the user's decision L3-D7,
+        // a lane end follows the route - the rule the choice at a fork ranks by)
+        if k > 0 && lane.source != 2 && !crate::access::is_open_at(net, l, me) && !st.route_may_use(net, l) {
             return Some(LaneEnd { dist: d0 - st.front, kind: LaneEndKind::Closed, toward: None });
         }
         if let Some(&(j, m)) = sim.junctions.of_lane.get(&l) {

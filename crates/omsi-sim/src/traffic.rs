@@ -4316,8 +4316,11 @@ impl AiState {
         // route needed and the car went round for ever. A lane at density 0 for the group keeps
         // its tier (X-D3). What the car took is counted by the lane's own tier)
         let driven = field.as_ref().is_some_and(|f| f.key.access == GoalAccess::Driven);
+        // (ranked: a lane the route may use is open - `routable` at the route's access, the rule
+        // `route_may_use` gives the lane-end check too, L3-D7)
+        let access = field.as_ref().map_or(GoalAccess::Open, |f| f.key.access);
         let closed = |n: usize, ranked: bool| match self.closed_for(net, n, kind) {
-            Some(Closed::Density) if ranked && driven && self.density_of(net, n) > 0.0 => None,
+            Some(Closed::Density) if ranked && kind == LaneKind::Street && self.routable(net, n, access) => None,
             c => c,
         };
         // (SUMO's bestLanes looks along the route until a lane with a choice: a lane whose way on
@@ -4451,6 +4454,18 @@ impl AiState {
             Some(Closed::Density) => access == GoalAccess::Driven && self.density_of(net, n) > 0.0,
             Some(_) => false,
         }
+    }
+
+    /// May this car's route use lane `n` (`routable` at its route's own access: its trip end's
+    /// field, `GoalAccess::Open` without one)? The one rule the choice at a fork ranks by
+    /// (`choose_after`: a lane its route may use ranks as open) and a lane's end is judged by
+    /// (`omsi_traffic::perception`'s lane end, the user's decision L3-D7: a lane end follows the
+    /// route - a car routed over the lanes closed only by density, `GoalAccess::Driven`, because no
+    /// better way reaches its trip end, does not count such a lane with a density above 0 for its
+    /// group as an end it must change lanes before).
+    pub fn route_may_use(&self, net: &Network, n: usize) -> bool {
+        let access = self.goal_field.as_ref().filter(|f| Some(f.key.goal) == self.goal && self.route.is_empty()).map_or(GoalAccess::Open, |f| f.key.access);
+        self.routable(net, n, access)
     }
 
     /// Is `n` a trip end for this car at `access`: a street lane with no way on (SUMO's fringe
