@@ -295,8 +295,14 @@ enum BoxOutcome {
 /// `PED_JAM_FACTOR` of the pace until the way ahead is clear; meanwhile on a pavement
 /// they wait behind the box in the path (SUMO's sidewalk stripes: posLat never leaves the own
 /// lane), on a crossing they stand `PED_GO_FROZEN` and are planned again (`Stuck`).
+/// Somebody walking onto the network from off it (`joining`, `PedWalk::joining`) is held by no
+/// map-parked car: their point on the pavement is clear of every one (`stand_point`) and the
+/// crowd step's contact pass keeps their body out of the boxes on the way. Held by one 0.55 m off
+/// its corner, riders off the player's bus at stop 2294078 stood in the parking lane beside
+/// footpath 1864 for the jam clock (#3, Jiangzhaikou moving, 30 s and more), or, turned round there
+/// as at a wall, in a pocket (#575, Wuluju moving, 23 s to the run's end).
 #[allow(clippy::too_many_arguments)]
-fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool, on_pavement: bool, turns: bool, want: &mut Want, blocks: &[Block], grid: &crowd::BlockGrid, block_car: &[Option<usize>], cars: &[SeenCar], off_lanes: &dyn Fn(DVec2) -> bool, dt: f32) -> BoxOutcome {
+fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool, on_pavement: bool, turns: bool, joining: bool, want: &mut Want, blocks: &[Block], grid: &crowd::BlockGrid, block_car: &[Option<usize>], cars: &[SeenCar], off_lanes: &dyn Fn(DVec2) -> bool, dt: f32) -> BoxOutcome {
     let wv = want.vel;
     let speed = wv.length();
     if speed < 0.2 {
@@ -320,7 +326,7 @@ fn past_boxes(bw: &mut BoxWait, detour: &mut f32, here: DVec2, on_crossing: bool
     let mut blocker = None;
     let in_way = grid.any_near(ahead, |k| {
         let b = &blocks[k];
-        let hit = b.vel.length() < 0.5 && b.near(ahead, IN_WAY_REACH) && {
+        let hit = !(joining && block_car.get(k) == Some(&None)) && b.vel.length() < 0.5 && b.near(ahead, IN_WAY_REACH) && {
             let (q, inside) = b.closest(ahead);
             inside || (ahead - q).length() < IN_WAY_REACH
         };
@@ -1491,6 +1497,37 @@ fn kerb_beside(ped: &PedNet, net: &Network, at: DVec3) -> Option<(usize, f32)> {
             !crosses_street(net, at.truncate(), q.truncate())
         })
         .map(|(lane, s, _)| (lane, s))
+}
+
+/// Where on pavement lane `lane`, nearest `s` along it, somebody stepping onto the network stands:
+/// the first point every `FOOT_SAMPLE` either way along the lane whose body (`BODY_OUTSIDE`) is
+/// clear of every map-parked car of `parked` at its level (`at_level`); `s` itself when none is.
+/// A point under a car the map parks over the footpath is no place to stand (the box rule takes
+/// such a car over the whole path for a wall, P4-D0): the riders off the player's bus at Wuluju
+/// stop 2294078 were sent to footpath 1864 at s 63.8, 0.3 m inside the car parked over it at s
+/// 65.6, walked into its side from the road and stood there, beside it in parking lane 1863.
+/// SUMO: a person departs at a position on a lane that admits them.
+fn stand_point(net: &Network, lane: usize, s: f32, parked: &[omsi_sim::collision::Obb]) -> f32 {
+    let l = &net.lanes[lane];
+    let len = l.length();
+    let free = |d: f32| {
+        let q = l.at(d).0;
+        let me = omsi_sim::collision::Obb::point(q, BODY_OUTSIDE);
+        parked.iter().all(|o| (o.center - q.truncate()).length() > o.half.length() + WAITER_SQUARE_REACH || !at_level(o.z0, q.z) || me.separation(o) >= 0.0)
+    };
+    let mut k = 0.0f32;
+    loop {
+        let (back, on) = (s - k, s + k);
+        if back < 0.0 && on > len {
+            return s;
+        }
+        for d in [back, on] {
+            if (0.0..=len).contains(&d) && free(d) {
+                return d;
+            }
+        }
+        k += FOOT_SAMPLE as f32;
+    }
 }
 
 /// Whether the straight way from `a` to `b` goes over a carriageway: across the centre
@@ -2737,7 +2774,7 @@ impl DecideCtx<'_> {
                 let t = p.t_state;
                 if t % 1.0 < dt || t == 0.0 {
                     let found = match (net, self.ped) {
-                        (Some(net), Some(pn)) => kerb_beside(pn, net, p.position),
+                        (Some(net), Some(pn)) => kerb_beside(pn, net, p.position).map(|(l, s)| (l, stand_point(net, l, s, &world.parked_boxes.lock()))),
                         _ => None,
                     };
                     if let Some((lane, s)) = found {
@@ -3595,14 +3632,6 @@ impl PedNet {
         (out, crossed)
     }
 
-    /// Where on pavement lane `lane` its walkers keep off the carriageway, when the map
-    /// lays it along a street lane, its width partly inside that lane's footprint (half the
-    /// street lane's width, `LANE_MIN_WIDTH` at least, from its axis; Wuluju: footpath 1033/1034
-    /// 0.9 m off the 3 m street lane 1127, whose cars stood 275 s for the walkers on it): the
-    /// strip of the path's width left beyond the footprint and a body, as (from, to) offsets
-    /// right of the lane's direction. None where the path stays off every street lane, cuts one
-    /// (a crossing), or leaves no strip (then it is walked as drawn). OMSI geometry: the
-    /// pavement drawn over the lane; SUMO's sidewalk is never part of a vehicle lane.
     /// Whether the point `s` m along pavement lane `lane` lies on a street lane's surface: within
     /// one of its stretches there (`in_lane`, sampled every `FOOT_SAMPLE`, each sample standing
     /// for half a sample either side).
@@ -3635,6 +3664,14 @@ impl PedNet {
         }
     }
 
+    /// Where on pavement lane `lane` its walkers keep off the carriageway, when the map
+    /// lays it along a street lane, its width partly inside that lane's footprint (half the
+    /// street lane's width, `LANE_MIN_WIDTH` at least, from its axis; Wuluju: footpath 1033/1034
+    /// 0.9 m off the 3 m street lane 1127, whose cars stood 275 s for the walkers on it): the
+    /// strip of the path's width left beyond the footprint and a body, as (from, to) offsets
+    /// right of the lane's direction. None where the path stays off every street lane, cuts one
+    /// (a crossing), or leaves no strip (then it is walked as drawn). OMSI geometry: the
+    /// pavement drawn over the lane; SUMO's sidewalk is never part of a vehicle lane.
     fn free_strip(&self, net: &Network, lane: usize) -> Option<(f64, f64)> {
         match self.strips.get(lane) {
             Some(c) => *c.get_or_init(|| PedNet::strip_of(self, net, lane)),
@@ -8874,6 +8911,16 @@ impl Humans {
             }
             bn.kerb = Some((exits, entries));
         }
+        // (every pavement point a rider steps onto or walks from to a door lies where they can
+        // stand, `stand_point`)
+        let parked = world.parked_boxes.lock().clone();
+        for bn in buses.iter_mut() {
+            if let Some((exits, entries)) = bn.kerb.as_mut() {
+                for k in exits.iter_mut().chain(entries.iter_mut()).flatten() {
+                    k.1 = stand_point(net, k.0, k.1, &parked);
+                }
+            }
+        }
     }
 
     /// The buses passengers deal with this frame.
@@ -10338,9 +10385,11 @@ impl Humans {
                 None => (blocks.as_slice(), &block_grid, block_car.as_slice()),
             };
             let off_lanes = |q: DVec2| net.is_none_or(|n| !within_lanes(n, q.extend(z), &|l| (l.width as f64).max(LANE_MIN_WIDTH) * 0.5 + WAITER_BODY));
-            // (a stroller may turn round at a wall; somebody walking somewhere waits it out)
+            // (a stroller may turn round at a wall; somebody walking somewhere waits it out;
+            // somebody walking onto the network from off it meets no map-parked car, `joining`)
             let turns = matches!(&p.state, State::Strolling(w) if w.roam);
-            let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, &mut wants[i], blocks, block_grid, block_car, &cars, &off_lanes, dt);
+            let joining = matches!(&p.state, State::Strolling(w) if w.joining);
+            let outcome = past_boxes(&mut p.boxes, &mut p.detour, here, on_crossing, on_pavement, turns, joining, &mut wants[i], blocks, block_grid, block_car, &cars, &off_lanes, dt);
             if outcome == BoxOutcome::Wall {
                 if let (State::Strolling(walk), Some(net)) = (&mut p.state, net) {
                     if let (Some(pn), Some(l)) = (self.ped.as_mut(), walk.legs.get(walk.leg)) {
@@ -15097,7 +15146,7 @@ mod ped_tests {
         for _ in 0..frames {
             let mut want = Want { vel: DVec2::new(1.3, -pos.y), face: None, give: 1.0, corridor, idle: Activity::Stand };
             want.vel = want.vel.normalize() * 1.3;
-            past_boxes(&mut bw, &mut detour, pos, false, true, false, &mut want, blocks, &grid, block_car, cars, &|_| true, 0.1);
+            past_boxes(&mut bw, &mut detour, pos, false, true, false, false, &mut want, blocks, &grid, block_car, cars, &|_| true, 0.1);
             pos += want.vel * 0.1;
             let dev = if detour > 0.0 { 0.75 + ALONG_FIT } else { 0.75 };
             pos.y = pos.y.clamp(-dev, dev);
@@ -15177,7 +15226,7 @@ mod ped_tests {
         let run = |off: &dyn Fn(DVec2) -> bool| {
             let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
             let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
-            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, false, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
+            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, false, false, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
             (bw, want)
         };
         let (bw, want) = run(&|q: DVec2| q.x.abs() < 3.0);
@@ -15193,6 +15242,31 @@ mod ped_tests {
     }
 
     #[test]
+    fn z1c_somebody_walking_onto_the_network_is_held_by_no_map_parked_car() {
+        // Jiangzhaikou moving (stop 2294078): a rider walking west from the road to their point
+        // between two cars parked over the footpath came 0.55 m off the corner of one and stood
+        // there, in the parking lane. A car parked with its corner 0.3 m off their next 0.9 m
+        let car = Block { center: DVec2::new(-1.5, 1.4), half: DVec2::new(0.875, 2.3), heading: 0.0, vel: DVec2::ZERO };
+        let blocks = [car];
+        let grid = crowd::BlockGrid::new(&blocks, box_grid_margin(), crowd::BLOCK_CELL);
+        let run = |turns: bool, joining: bool| {
+            let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
+            let mut want = Want { vel: DVec2::new(-1.3, 0.0), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+            let o = past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 4.0), false, true, turns, joining, &mut want, &blocks, &grid, &[None], &[], &|_| true, 0.1);
+            (o, want.vel)
+        };
+        // on the network, a stroller or somebody walking somewhere: the box rule takes them (a
+        // wall, a way round it, or held)
+        for turns in [true, false] {
+            let (o, vel) = run(turns, false);
+            assert!(o == BoxOutcome::Wall || vel != DVec2::new(-1.3, 0.0), "{o:?} {vel:?}");
+        }
+        // joining: on, as wanted (the contact pass keeps the body out of the box)
+        let (o, vel) = run(true, true);
+        assert_eq!((o, vel), (BoxOutcome::Done, DVec2::new(-1.3, 0.0)));
+    }
+
+    #[test]
     fn p11_5_the_way_round_a_box_on_a_pavement_keeps_off_the_lanes_from_the_walker_to_the_first_corner() {
         // the box of p4_the_way_round... lying across the way at (0, 2.5); its corners lie at
         // x = +-6.2, y 0.5 and 4.5. Two street lanes of 1 m end at the path beside the walker,
@@ -15205,7 +15279,7 @@ mod ped_tests {
         let run = |off: &dyn Fn(DVec2) -> bool| {
             let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
             let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
-            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, false, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
+            past_boxes(&mut bw, &mut detour, DVec2::new(0.0, 0.0), false, true, false, false, &mut want, &blocks, &grid, &[None], &[], off, 0.1);
             (bw, want)
         };
         let stub = |q: DVec2, x: f64| {
@@ -15224,7 +15298,7 @@ mod ped_tests {
         assert!(!off(DVec2::new(2.5, 0.0)));
         let (mut bw, mut detour) = (BoxWait::default(), 0.0f32);
         let mut want = Want { vel: DVec2::new(0.0, 1.3), face: None, give: 1.0, corridor: None, idle: Activity::Stand };
-        past_boxes(&mut bw, &mut detour, DVec2::new(2.5, 0.0), false, true, false, &mut want, &blocks, &grid, &[None], &[], &off, 0.1);
+        past_boxes(&mut bw, &mut detour, DVec2::new(2.5, 0.0), false, true, false, false, &mut want, &blocks, &grid, &[None], &[], &off, 0.1);
         let wp = bw.around.expect("round it from the kerb side").0;
         assert!(off(wp[0]) && off(wp[1]) && way_off_lanes(&wp, &off), "{wp:?}");
         assert!(way_round_off_lanes(DVec2::new(2.5, 0.0), &wp, &off) && !way_round_off_lanes(DVec2::ZERO, &wp, &off));
@@ -16120,6 +16194,25 @@ mod ped_tests {
     }
 
     #[test]
+    fn z1b_somebody_stepping_onto_the_network_stands_clear_of_a_parked_car() {
+        // Wuluju stop 2294078: the riders' point on footpath 1864 lay 0.3 m inside a car parked
+        // over it. Here a 3 m path along y at x 0, a car (1.75 x 4.6 m) parked over it at y 12
+        let mut net = Network::default();
+        net.lanes.push(lane(vec![p(0.0, 0.0), p(0.0, 40.0)], LaneKind::Sidewalk, 3.0));
+        net.build_grid();
+        let car = omsi_sim::collision::Obb { center: DVec2::new(0.0, 12.0), half: DVec2::new(0.875, 2.3), heading: 0.0, z0: 0.0, z1: 1.5, velocity: DVec2::ZERO, mass: 0.0, pole: None, id: -1 };
+        let s = stand_point(&net, 0, 13.0, &[car]);
+        // the nearest sample whose body is clear of it: past its end at 14.3 + 0.28, within a sample
+        assert!(s >= 14.58 && s < 14.58 + FOOT_SAMPLE as f32, "{s}");
+        // a point clear of it stays; with no car, any stays
+        assert_eq!(stand_point(&net, 0, 20.0, &[car]), 20.0);
+        assert_eq!(stand_point(&net, 0, 12.0, &[]), 12.0);
+        // a car at another level (a deck over the path) is none
+        let deck = omsi_sim::collision::Obb { z0: 5.0, z1: 6.5, ..car };
+        assert_eq!(stand_point(&net, 0, 12.0, &[deck]), 12.0);
+    }
+
+    #[test]
     fn p3_n2_a_walker_on_a_path_in_the_lane_steps_out_of_the_strip_for_a_car_on_their_way() {
         // Jiangzhaikou path 1529/1530 (1 m wide) runs 0.8 m off the axis of lane 1159 (2.3 m), on
         // its surface; walkers going south on it met a car standing in the lane and stood 1.2 m
@@ -16208,7 +16301,7 @@ mod ped_tests {
             for _ in 0..1200 {
                 m.round_box = round_box_on_path && bw.around.is_some();
                 let mut want = stroll(Some(&ped), &at, &mut m, &mut walk, &mut rng, &mut YieldBook::Book(&mut HashMap::new()), 0.05);
-                past_boxes(&mut bw, &mut detour, m.pos, true, false, false, &mut want, &blocks, &grid, &[None], &[], &|_| true, 0.05);
+                past_boxes(&mut bw, &mut detour, m.pos, true, false, false, false, &mut want, &blocks, &grid, &[None], &[], &|_| true, 0.05);
                 m.pos += want.vel * 0.05;
                 detour = (detour - 0.05).max(0.0);
                 if let Some(leg) = walk.legs.get(walk.leg).filter(|_| walk_on_path(&net, &walk, m.pos, round_box_on_path && bw.around.is_some())) {
@@ -16291,7 +16384,7 @@ mod ped_tests {
             let mut last = BoxOutcome::Done;
             for _ in 0..300 {
                 let mut want = Want { vel: DVec2::new(1.3, 0.0), face: None, give: 1.0, corridor, idle: Activity::Stand };
-                last = past_boxes(&mut bw, &mut detour, pos, false, true, turns, &mut want, &blocks, &grid, block_car, cars, &|_| true, 0.1);
+                last = past_boxes(&mut bw, &mut detour, pos, false, true, turns, false, &mut want, &blocks, &grid, block_car, cars, &|_| true, 0.1);
                 if last == BoxOutcome::Wall {
                     break;
                 }
@@ -16313,7 +16406,7 @@ mod ped_tests {
         let mut want = Want { vel: DVec2::new(1.3, 0.0), face: None, give: 1.0, corridor: wide, idle: Activity::Stand };
         let near = [car_box(2.0, 0.6)];
         let g = crowd::BlockGrid::new(&near, box_grid_margin(), crowd::BLOCK_CELL);
-        assert_eq!(past_boxes(&mut bw, &mut detour, DVec2::ZERO, false, true, true, &mut want, &near, &g, &[None], &[], &|_| true, 0.1), BoxOutcome::Done);
+        assert_eq!(past_boxes(&mut bw, &mut detour, DVec2::ZERO, false, true, true, false, &mut want, &near, &g, &[None], &[], &|_| true, 0.1), BoxOutcome::Done);
         assert!(bw.around.is_some() && want.vel.length() > 1.0, "{bw:?}");
         // turning round: back along the leg from where they stand to the end it came from
         let mut walk = PedWalk::new(vec![Leg { lane: 2, a: 10.0, b: 20.0 }], true, 0.3);
