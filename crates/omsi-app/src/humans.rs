@@ -3102,8 +3102,7 @@ const CROSSING_MEDIAN_MAX: f32 = 6.0;
 
 /// The crossing starting with `walk.legs[start]`: the pieces on from it that
 /// cut a carriageway or carry a light, with short pieces between them (a median); a stroll
-/// is planned on straight across where its legs run out, and from a piece ending on the
-/// carriageway over the crossing piece there that turns least. None when no such piece follows.
+/// is planned on straight across where its legs run out. None when no such piece follows.
 fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, walk: &mut PedWalk, start: usize) -> Option<Cross> {
     const SHORT: f32 = CROSSING_MEDIAN_MAX;
     if start >= walk.legs.len() {
@@ -3126,20 +3125,8 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
             }
             let prev = walk.legs[k - 1];
             // (onto unloaded ground too: they walk the crossing to its end and leave at the edge
-            // beyond it, `at_edge`; from a piece whose end lies on the carriageway - in a
-            // vehicle's reach, not `clear_for_waiting` - with no piece straight on, over the
-            // crossing piece there that turns least: a crossing ends off the carriageway, where
-            // the next verdict is taken, never in a lane - SUMO's crossings end at a walking area.
-            // Jiangzhaikou's corner (509.7, -2884.1) between pieces 2082 and 2176, 1.8 m from turn
-            // lane 2031's axis, ended a crossing, and its walkers were asked there whether to go
-            // on: they stood in the lane's reach and the cars on 2031 met them there)
-            let on_road = || !clear_for_waiting(net, prev.at(net, prev.len()).0);
-            let Some(n) = ped
-                .straight_on(net, &prev, PED_STRAIGHT_ON_TURN, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT)
-                .or_else(|| on_road().then(|| ped.straight_on(net, &prev, PED_ANY_TURN, |p, l| core_piece(p, net, lights, l))).flatten())
-            else {
-                break;
-            };
+            // beyond it, `at_edge`)
+            let Some(n) = ped.straight_on(net, &prev, PED_STRAIGHT_ON_TURN, |p, l| core_piece(p, net, lights, l) || net.lanes[l].length() <= SHORT) else { break };
             walk.legs.push(n);
         }
         let leg = walk.legs[k];
@@ -3194,9 +3181,6 @@ fn crossing_span(ped: &PedNet, net: &Network, lights: Option<&dyn PedLights>, wa
 /// The most a path that goes on "straight" from another turns (degrees, `PedNet::straight_on`):
 /// the way on over a crossing's pieces, and back along the pavement behind a kerb queue.
 const PED_STRAIGHT_ON_TURN: f64 = 60.0;
-/// Any turn (degrees, `PedNet::straight_on`): the way on over a crossing from a piece whose end
-/// lies on the carriageway (`crossing_span`).
-const PED_ANY_TURN: f64 = 180.0;
 
 /// Path ends closer than this (m) are one node of the walking network (the grid of
 /// `PedNet::cells` is 1.5 m, so a search of the 3x3 cells around finds them all).
@@ -3990,34 +3974,21 @@ fn stroll(ped: Option<&PedNet>, at: &Around, me: &mut Me, walk: &mut PedWalk, rn
                     plan_next_leg(ped, net, walk, rng);
                 }
                 let next = walk.legs[walk.leg + 1];
-                // (on a crossing piece with no crossing walked and no kerb hold - somebody put
-                // down on a crossing, which no longer happens: the span from this piece steps
-                // them off it without a kerb decision)
+                // (on a crossing piece, not at a kerb: at the end of a crossing's last piece
+                // every crosser is here - `walk.cross` was just taken - and the span from this
+                // piece steps them off it without a kerb decision; once also somebody put
+                // down on a crossing, which no longer happens)
                 let mid = !walk.kerb_hold && ped.map(|p| core_piece(p, net, at.lights, leg.lane)).unwrap_or(false);
                 // (back at the near end after turning round on a crossing with
                 // no pavement leg to stand on: decided as at a kerb - the light and the cars
                 // looked at - not "go" without a verdict, which looped on red)
                 let at_kerb = (next.from_end(net) || walk.kerb_hold) && !mid;
-                // (at the end of a crossing piece where that end lies on the carriageway - in a
-                // vehicle's reach, not `clear_for_waiting` - and an unlit crossing joins: on
-                // across it without a kerb decision. A person on a crossing does not stop for the
-                // vehicles, the vehicles yield to them (SUMO: a crossing ends at a walking area,
-                // which never lies in a lane; a vehicle stops for a person on or approaching the
-                // crossing, `MSLink::getLeaderInfo`, and the crossing itself has no response
-                // bits). A stroll's crossing runs on past such an end (`crossing_span`), so this
-                // is a walk whose way on over the next crossing was added there. Asked there as at a
-                // kerb, the walkers of Jiangzhaikou's corner (509.7, -2884.1) between crossing pieces
-                // 2082 and 2176, 1.8 m from turn lane 2031's axis, stood in the lane's reach and went
-                // again within 0.3-2 s. A lit crossing joined there is still decided by its light,
-                // as at a kerb; an end off the carriageway is a kerb or a walking area, where the
-                // verdict is taken.)
-                let on_road = walk.kerb_hold && ped.is_some_and(|p| core_piece(p, net, at.lights, leg.lane)) && !clear_for_waiting(net, leg.at(net, leg.len()).0);
                 let span = match ped {
                     Some(p) => crossing_span(p, net, at.lights, walk, if mid { walk.leg } else { walk.leg + 1 }),
                     None => None,
                 };
                 match span {
-                    Some(c) if at_kerb && !(on_road && c.light.is_none()) => {
+                    Some(c) if at_kerb => {
                         // (asked once more at the kerb: what changed since the last verdict on the
                         // way - a red, a vehicle that will pass - holds them here; for the stripe
                         // they would take from where they stand)
@@ -16721,93 +16692,6 @@ mod ped_tests {
         assert!(room_for(&net, &ped, &lights, &full(1), kerb, 1, 0, 0.0), "those coming back leave");
         assert!(!room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, 0.0), "those bound elsewhere stay");
         assert!(room_for(&net, &ped, &lights, &full(2), kerb, 1, 0, PED_JAM_TIME), "refused the jam time: on");
-    }
-
-    /// Two unlit crossings joined at a junction's corner (0, 0): a stroller walks a pavement east
-    /// along y = -12, the first crossing north over street A (axis y = -8) and a corner piece of the
-    /// object's crossing (lane 2, cutting no lane) up to the corner, where the second crossing turns
-    /// off east-north-east (lane 3, 63 degrees: not straight on, as at Jiangzhaikou) over street B
-    /// (axis y = `street_b`, cars driving west) to the pavement beyond (lane 4). A car 26 m short of
-    /// the second crossing's cut at 8 m/s, not yielding, always (`car_from_start`) or once they are
-    /// on the corner piece. `planned_at_corner`: the walk is no stroll and has its way on over the
-    /// second crossing added once they are on the corner piece (the first crossing was decided
-    /// without it); else a stroll with its legs up to the corner. Returns: whether they stepped onto
-    /// the first crossing, whether they got onto the pavement beyond, the frames they spent off the
-    /// crossing flag in between, and the decisions taken within 1.5 m of the corner.
-    fn joined_crossings_with_a_car(street_b: f64, car_from_start: bool, planned_at_corner: bool) -> (bool, bool, u32, Vec<&'static str>) {
-        let mut net = Network::default();
-        let street = |y: f64, from: f64, to: f64| (0..=24).map(|k| p(from + (to - from) * k as f64 / 24.0, y)).collect::<Vec<_>>();
-        let beyond = p(2.0 * (street_b + 1.0), street_b + 1.0);
-        net.lanes.push(lane(vec![p(-20.0, -12.0), p(0.0, -12.0)], LaneKind::Sidewalk, 2.5));
-        net.lanes.push(lane(vec![p(0.0, -12.0), p(0.0, -3.0)], LaneKind::Sidewalk, 2.0));
-        net.lanes.push(lane(vec![p(0.0, -3.0), p(0.0, 0.0)], LaneKind::Sidewalk, 2.0));
-        net.lanes.push(lane(vec![p(0.0, 0.0), beyond], LaneKind::Sidewalk, 2.0));
-        net.lanes.push(lane(vec![beyond, beyond + DVec3::new(0.0, 20.0, 0.0)], LaneKind::Sidewalk, 2.5));
-        net.lanes.push(lane(street(-8.0, -60.0, 60.0), LaneKind::Street, 3.5));
-        net.lanes.push(lane(street(street_b, 60.0, -60.0), LaneKind::Street, 3.5));
-        net.build_grid();
-        net.link(1.5);
-        let mut ped = PedNet::build(&net);
-        let mut lights = FakeLights::new(GREEN, 60.0);
-        lights.pieces = vec![2];
-        lights.unlit = true;
-        let cut = DVec2::new(2.0 * street_b, street_b);
-        let body = Block { center: cut + DVec2::new(26.0, 0.0), half: DVec2::new(0.9, 2.25), heading: -std::f64::consts::FRAC_PI_2, vel: DVec2::new(-8.0, 0.0) };
-        let car = SeenCar { id: 9, pos: body.center, vel: body.vel, half_len: 2.25, body, yielding: false, stood: 0.0, z: 0.0, lane: Some(6) };
-        let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 10.0, b: 20.0 }, Leg { lane: 1, a: 0.0, b: 9.0 }, Leg { lane: 2, a: 0.0, b: 3.0 }], !planned_at_corner, 0.0);
-        let mut m = me(7, DVec2::new(-10.0, -12.0), 1.35);
-        let (mut on_first, mut done, mut off, mut said) = (false, false, 0u32, Vec::new());
-        for k in 0..800 {
-            let on_corner_piece = walk.legs.get(walk.leg).is_some_and(|l| l.lane == 2);
-            if planned_at_corner && on_corner_piece && walk.legs.len() == 3 {
-                walk.legs.push(Leg { lane: 3, a: 0.0, b: net.lanes[3].length() });
-                walk.legs.push(Leg { lane: 4, a: 0.0, b: 20.0 });
-            }
-            let cars: &[SeenCar] = if car_from_start || on_corner_piece || on_first { std::slice::from_ref(&car) } else { &[] };
-            frame(&net, &mut ped, Some(&lights), cars, k as f64 * 0.05, &mut m, &mut walk, 0.05);
-            let lane_now = walk.legs.get(walk.leg).map(|l| l.lane);
-            on_first |= m.on_crossing && lane_now == Some(1);
-            done |= lane_now == Some(4);
-            if on_first && !done {
-                off += (!m.on_crossing) as u32;
-                if m.pos.length() < 1.5 {
-                    if let Some(d) = m.decision {
-                        if !said.contains(&d) {
-                            said.push(d);
-                        }
-                    }
-                }
-            }
-        }
-        (on_first, done, off, said)
-    }
-
-    #[test]
-    fn z_a_crossing_ends_off_the_carriageway_and_nobody_stops_in_the_road_between_two() {
-        // BeijingCity, Jiangzhaikou (509.7, -2884.1): the corner between crossing pieces 2082 and
-        // 2176 lies 1.8 m from turn lane 2031's axis. A crossing ended there, its walkers were asked
-        // there as at a kerb, stood ("waits for a car to pass", "a vehicle clears the junction over
-        // the crossing", "yields to a standing vehicle") and went again within 0.3-2 s, 2-19 times a
-        // run. Here the corner lies 2 m from street B's axis (in a vehicle's reach).
-        // A stroll's crossing runs on over the second one (`crossing_span`): the car coming once
-        // they are on it holds nobody at the corner
-        let (stepped, beyond, off, said) = joined_crossings_with_a_car(2.0, false, false);
-        assert!(stepped && beyond, "never across the second crossing: {said:?}");
-        assert_eq!(off, 0, "the crossing flag dropped at the corner: {said:?}");
-        assert!(said.iter().all(|d| *d == "go"), "{said:?}");
-        // ... and the car coming from the start holds them at the kerb, off the carriageway
-        let (stepped, _, _, _) = joined_crossings_with_a_car(2.0, true, false);
-        assert!(!stepped, "stepped onto a crossing whose way on a car is coming to");
-        // a walk whose crossing ended at the corner all the same (its way on added there): on
-        // across, no kerb decision in the road (`stroll`)
-        let (stepped, beyond, off, said) = joined_crossings_with_a_car(2.0, false, true);
-        assert!(stepped && beyond, "never across the second crossing: {said:?}");
-        assert_eq!(off, 0, "the crossing flag dropped at the corner: {said:?}");
-        // the corner 5 m from street B's axis is off the carriageway (a walking area): the crossing
-        // ends there and the car coming holds them there as at a kerb
-        let (stepped, beyond, _, said) = joined_crossings_with_a_car(5.0, false, false);
-        assert!(stepped && !beyond, "{said:?}");
-        assert!(said.contains(&WAITS_FOR_A_CAR), "{said:?}");
     }
 
     #[test]
