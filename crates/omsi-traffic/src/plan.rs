@@ -97,12 +97,39 @@ pub struct Plan {
     /// What the lane change of the driver's own it starts is for (`ChangeWhy`).
     pub change_why: Option<ChangeWhy>,
     /// The lane change of the driver's own that signals is dropped before it moves over: its
-    /// gap rule fails again (`gap_accepted` against `change_target_view`) or somebody is on the
-    /// move (`people_on_move`; counted, `sim::CHANGES_ABORTED`).
+    /// gap rule fails again (`gap_accepted` against `change_target_view`), somebody is on the
+    /// move (`people_on_move`), or its committed move swept again no longer clears and no step-out
+    /// from there does either (a plain change that has one goes on as that, `start`; counted,
+    /// `sim::CHANGES_ABORTED`).
     pub abort_change: bool,
-    /// The last-resort stop before a lane's end placed this frame (the odometer where the
-    /// front stops, `Vehicle::lane_end_stop`).
+    /// Which check dropped it (`AbortWhy`; diagnostics, `sim::CHANGES_ABORTED_BY`).
+    pub abort_why: Option<AbortWhy>,
+    /// What the failing re-sweep met (diagnostics: `traffic_cases ab`'s ABORT events): kind
+    /// (0 vehicle, 1 parked, 2 person), its id and lane, its speed, carried on or not, the least
+    /// separation, and where along the move.
+    pub abort_detail: Option<SweepBlocker>,
+    /// The last-resort stop before a lane's end, or a dead lane's end for a blocked urgent
+    /// strategic change, placed this frame (the odometer where the front stops,
+    /// `Vehicle::lane_end_stop`).
     pub lane_end_stop: Option<f32>,
+    /// The car stands at that stop before a dead lane's end, its urgent strategic change blocked
+    /// (`sim::STRATEGIC_HOLD_MS`).
+    pub dead_end_hold: bool,
+    /// An urgent lane-end or strategic change is wished and not started this frame: the driver's
+    /// lane-change impatience grows (`Vehicle::lc_impatience`).
+    pub urgent_blocked: bool,
+    /// The side of that blocked urgent change (`Start::Change`'s `dir`, 0 none): the car shows its
+    /// indicator there while it waits for the gap (SUMO: `MSLaneChanger::change` keeps a blocked
+    /// wish in the vehicle's own state, `setOwnState`, and `MSVehicle::setBlinkerInformation`
+    /// switches the blinker on for it; `Vehicle::urgent_side`).
+    pub urgent_side: i32,
+    /// The seconds a change started this frame still signals before it moves over: the driver's
+    /// `signal_before_change` less what its indicator has already shown that side while the change
+    /// waited for its gap (`signal_left`); `None`: the whole of it.
+    pub signal_wait: Option<f32>,
+    /// The change started this frame took a gap the driver would not have taken without its
+    /// lane-change impatience (`sim::CHANGES_IMPATIENT`; diagnostics).
+    pub impatient_start: bool,
     /// Backing up out of a packed queue (`queue_escape`): (the odometer where it
     /// is to stand, stopping: a committed stop - the strip behind no longer clear or the queue
     /// moving).
@@ -138,23 +165,66 @@ fn gap_accepted(me: &Vehicle, nb: &NeighbourView) -> bool {
     ok_behind && ok_ahead && !nb.foreign
 }
 
+/// The gap (m) a follower asked to make room opens (LC2013's `informFollower`: the secure gap,
+/// without the changer's impatience - SUMO applies `getSafetyFactor` to the changer's acceptance in
+/// `checkChange`, not to the gap it asks the follower for): `gap_needed_behind` of a calm driver.
+fn help_gap_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
+    if me.lc_impatience <= 0.0 {
+        return gap_needed_behind(me, nb, vb, v);
+    }
+    let mut calm = me.clone();
+    calm.lc_impatience = 0.0;
+    gap_needed_behind(&calm, nb, vb, v)
+}
+
 /// The gap (m) the change needs from a follower at `vb` m/s there while I go at `v`: [`gap_accepted`]'s
-/// (the follower need not brake hard). (`informFollower` asks for it, .)
+/// (`accepted_gap` with the follower's standing gap).
 fn gap_needed_behind(me: &Vehicle, nb: &NeighbourView, vb: f32, v: f32) -> f32 {
     accepted_gap(me, nb.behind_min_gap, vb, v)
 }
 
 /// The gap (m) I accept in front of a follower whose standing gap is `min_gap`, coming at `vb`
 /// m/s while I go at `v`: its standing gap, my accepted time gap at its speed and what it
-/// sheds braking at my comfort to my speed (`gap_needed_behind`'s; the way back
-/// into the lane from out of it asks each follower's own secure gap instead, `pull_out_clear`).
+/// sheds braking to my speed at *my* comfortable brake - the changer's, not the follower's
+/// (`gap_needed_behind`'s; the way back into the lane from out of it asks each follower's own
+/// secure gap instead, `pull_out_clear`), divided by my lane-change impatience's factor (SUMO
+/// SL2015's safety factor, `impatient_gap`) but never below the standing gap and that braking.
 pub(crate) fn accepted_gap(me: &Vehicle, min_gap: f32, vb: f32, v: f32) -> f32 {
     let dp = &me.params;
     // (the follower's own standing gap, not a fixed 2 m: the helper opens exactly
     // this gap, `informFollower`, one function on both sides; a follower resting at its 1.57 m
     // standing gap behind the changer was never accepted, and both stood)
-    min_gap + me.impatience.gap(dp.lc_gap) * vb + (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake)
+    let brake = (vb - v).max(0.0).powi(2) / (2.0 * dp.comfort_brake);
+    impatient_gap(me, min_gap + me.impatience.gap(dp.lc_gap) * vb + brake, min_gap + brake)
 }
+
+/// The room (m) I accept ahead of me to a leader there at `va` m/s while I go at `v`: 2 m and 1.5 s
+/// of what I close on it, divided by my lane-change impatience's factor but never below my
+/// standing gap and what I shed braking at comfort to its speed (`impatient_gap`).
+fn ahead_needed(me: &Vehicle, v: f32, va: f32) -> f32 {
+    let dv = (v - va).max(0.0);
+    impatient_gap(me, 2.0 + dv * 1.5, me.state.min_gap.max(dv * dv / (2.0 * me.params.comfort_brake)))
+}
+
+/// SUMO SL2015's lane-change impatience (`MSLCM_SL2015::getSafetyFactor`, `1 / ((1 + 0.5 x
+/// myImpatience) x myAssertive)`, the factor `MSLaneChanger::checkChange` multiplies the secure gaps
+/// by; `lcAssertive` 1): the gap `full` divided by `1 + LC_IMPATIENCE_GAIN x lc_impatience`, at
+/// least `floor` - the standing gap and the braking the caller reckons (the follower's speed down
+/// to mine at the changer's comfortable brake, `accepted_gap`; my speed down to the leader's at
+/// mine, `ahead_needed`). An impatient driver so takes a gap at most 1.5 times tighter and never
+/// one under that floor; whether the follower then brakes more than comfortably depends on its own
+/// brake against the changer's (not checked here). SUMO's gaps are net of the standing gap and its
+/// secure gap reckons the follower's maximal deceleration; ours a comfortable one.
+/// Ours differs from SL2015 in how the impatience moves (the user's decision L3-D4,
+/// `Vehicle::lc_impatience`).
+fn impatient_gap(me: &Vehicle, full: f32, floor: f32) -> f32 {
+    // (the floor bounds how far impatience lowers the gap: a calm driver's gap is `full`)
+    (full / (1.0 + LC_IMPATIENCE_GAIN * me.lc_impatience.clamp(0.0, 1.0))).max(floor.min(full))
+}
+
+/// SUMO SL2015's `0.5` in `getSafetyFactor`: at full lane-change impatience the gap needed shrinks
+/// by a factor 1.5.
+pub const LC_IMPATIENCE_GAIN: f32 = 0.5;
 
 /// The lane beside that a signalling change of my own onto `to` (side `dir`) is checked
 /// against (`gap_accepted`, the follower looked up back over the lanes leading in,
@@ -170,7 +240,7 @@ fn change_target_view(p: &Perception, to: usize, dir: i32) -> Option<NeighbourVi
 fn gap_parts(me: &Vehicle, nb: &NeighbourView) -> (bool, bool) {
     let v = me.state.speed;
     let ok_behind = nb.behind.map(|(g, vb)| g >= gap_needed_behind(me, nb, vb, v)).unwrap_or(true);
-    let ok_ahead = nb.ahead.map(|(g, va)| g > 2.0 + (v - va).max(0.0) * 1.5).unwrap_or(true);
+    let ok_ahead = nb.ahead.map(|(g, va)| g > ahead_needed(me, v, va)).unwrap_or(true);
     (ok_behind, ok_ahead)
 }
 
@@ -360,26 +430,58 @@ pub const LC_LOOK_FORWARD: f32 = 10.0;
 /// SUMO LC2013's `LOOK_AHEAD_SPEED_MEMORY`: the look-ahead speed falls by this
 /// factor per second (`Vehicle::look_ahead_speed`).
 pub const LOOK_AHEAD_SPEED_MEMORY: f32 = 0.9;
-/// ... times this towards the overtaking side (SUMO's `lcLookaheadLeft` default; the
-/// side mirrors on a left-hand-traffic map).
-pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
 /// SUMO LC2013's `HELP_DECEL_FACTOR`: a follower asked to make room for a lane change
 /// brakes no harder than its comfortable brake times this.
 pub const HELP_DECEL_FACTOR: f32 = 1.0;
+/// SUMO LC2013's `BLOCKER_IS_BLOCKED_TIME_THRESHOLD` (s): a leader on the target lane that has
+/// stood longer than this is treated as a stopped vehicle - the changer drives on past it where
+/// both lengths with their standing gaps fit in what is left to its lane's end (`informLeader`).
+pub const BLOCKER_IS_BLOCKED_TIME: f32 = 5.0;
+/// SUMO LC2013's `HELP_OVERTAKE` (10 km/h, m/s): a follower on the target lane that must overtake
+/// the changer may pass at the changer's speed plus this (`vhelp`, `informFollower`).
+pub const HELP_OVERTAKE: f32 = 10.0 / 3.6;
+/// SUMO LC2013's `URGENCY`: a blocked urgent change counts the time left to its lane's end as
+/// half the time its look-ahead speed takes to get there (`_wantsChange`'s `remainingSeconds =
+/// MAX2(TS, myLeftSpace / MAX2(myLookAheadSpeed, NUMERICAL_EPS) / remainingLanes / URGENCY)`).
+pub const URGENCY: f32 = 2.0;
+/// SUMO's default step length (`--step-length` 1 s), the least `remainingSeconds` (`MAX2(TS, ...)`).
+const SUMO_STEP: f32 = 1.0;
+/// SUMO's `NUMERICAL_EPS` (src/config.h.cmake: 0.001), the least look-ahead speed `remainingSeconds` divides by.
+const NUMERICAL_EPS: f32 = 0.001;
+/// SUMO LC2013's `lcCooperative` (default 1.0; `lcCooperativeSpeed` defaults to it): the weight of
+/// a cooperative speed advice against the speed the follower would drive otherwise
+/// (`_patchSpeed`: `coopWeight = clamp(lcCooperativeSpeed, 0, 1)`, `v * coopWeight + (1 - coopWeight)
+/// * wanted`). No driver parameter carries it: every driver has SUMO's default.
+pub const LC_COOPERATIVE: f32 = 1.0;
 
-/// The road a lane change started at `v` m/s takes (m): the signalling before
-/// it moves (`SIGNAL_BEFORE_CHANGE`, speeding up at `a` meanwhile) and the move
-/// (`change_length`).
-pub fn change_space(v: f32, a: f32) -> f32 {
-    let w = omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
-    v * w + 0.5 * a.max(0.0) * w * w + omsi_sim::traffic::change_length(v)
-}
+/// The road a lane change started at `v` m/s takes (m), `omsi_sim::traffic::change_space`.
+pub use omsi_sim::traffic::change_space;
 
 /// SUMO LC2013's strategic distance (`laDist`): the look-ahead speed times
-/// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side) plus two of the
-/// vehicle's lengths with its standing gap.
+/// `LC_LOOK_FORWARD` (times `LC_LOOKAHEAD_LEFT` towards the overtaking side, which mirrors on a
+/// left-hand-traffic map) plus two of the vehicle's lengths with its standing gap: for a lane that
+/// really ends and the keep-side stays. The route changes and the strategic stay use the driver's
+/// own factor (`strategic_look`).
 pub fn lane_end_look(v: f32, overtaking_side: bool, me: &Vehicle) -> f32 {
     v * LC_LOOK_FORWARD * if overtaking_side { LC_LOOKAHEAD_LEFT } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
+}
+
+/// SUMO's `lcLookaheadLeft` default (the strategic look-ahead towards the overtaking side as a
+/// factor of the other side's; sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html):
+/// a lane that really ends keeps it (the user's decision L3-D2 scope; `lane_end_look`).
+pub const LC_LOOKAHEAD_LEFT: f32 = 2.0;
+
+/// The room (m) the last-resort stop keeps before where my lane ends for me, towards `nb`: what
+/// the body needs to move over from standing - a lane change's shortest move from rest
+/// (`change_space`) or what it needs to steer the width over (`bypass_min_len`), whichever is
+/// longer (OMSI geometry: SUMO's vehicle stands at the end itself and changes at once, an OMSI body
+/// steers over from where it stands). The urgent wishes measure the distance left to that stop
+/// (`lane_end_desire`, `strategic_desire`): measured to the end itself, the strategic distance of a
+/// car standing at the stop - two lengths with the standing gap once its look-ahead speed has died
+/// away, LC2013's floor - fell short of it and the wish, and the stop, were gone.
+fn last_stop_room(net: &Network, me: &Vehicle, nb: &NeighbourView) -> f32 {
+    let side = (net.lanes[me.state.lane].width + net.lanes[nb.lane].width) * 0.5;
+    change_space(0.0, me.state.accel, me.params.signal_before_change).max(bypass_min_len(me.length(), side))
 }
 
 /// May the driver change onto `nb` because its own lane ends for it (`Perception::
@@ -453,20 +555,205 @@ fn lane_end_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception
     // here, the lane beside - is under the strategic distance; a step, not a ramp)
     let overtaking = nb.dir == if sim.left_hand { 2 } else { 1 };
     let la = lane_end_look(me.look_ahead_speed.max(st.speed), overtaking, me);
-    if e.dist < la {
+    // (to the last-resort stop where the lane really ends; a merge has none, the zipper's)
+    let room = if e.kind == LaneEndKind::Merge { 0.0 } else { last_stop_room(net, me, nb) };
+    if e.dist - room < la {
         me.params.lc_strategic
     } else {
         0.0
     }
 }
 
+/// A random car's route costs to its trip end (`AiState::goal_field`) while it drives to that
+/// trip end (no timetable route: a route's own changes are `Start::RouteChange`).
+fn trip_field(me: &Vehicle) -> Option<&omsi_sim::traffic::GoalField> {
+    let st = &me.state;
+    st.goal_field.as_deref().filter(|f| st.route.is_empty() && Some(f.key.goal) == st.goal)
+}
+
+/// The lane `k` lanes from `lane` towards side `dir` (1 left, 2 right; `Lane::left`, `Lane::right`
+/// one after the other), its first step `first` where given (the perception's lane beside, which
+/// on a junction object's piece is `Network::piece_beside`).
+fn lane_toward(net: &Network, lane: usize, dir: i32, k: usize, first: Option<usize>) -> Option<usize> {
+    let mut cur = lane;
+    for i in 0..k {
+        cur = match (i, first) {
+            (0, Some(f)) => f,
+            _ => net.lanes.get(cur).and_then(|l| if dir == 1 { l.left } else { l.right })?,
+        };
+    }
+    Some(cur)
+}
+
+/// How many lane changes from `lane` towards `dir` (the first onto `first`) reach the nearest
+/// lane that leads to the trip end (SUMO LC2013's `bestLaneOffset` on that side); None where no
+/// lane of the road on that side does.
+fn changes_to_lead(net: &Network, f: &omsi_sim::traffic::GoalField, lane: usize, dir: i32, first: Option<usize>) -> Option<usize> {
+    (1..=net.road_beside(lane).len().max(1)).find(|&k| lane_toward(net, lane, dir, k, first).is_some_and(|b| f.leads(b)))
+}
+
+/// How far (m, from `s` on the first) a car can drive along `chain` - a dead lane and the lanes it
+/// runs into - while the lane `k` changes towards `dir` beside it (the first step `first`) leads to
+/// the trip end (SUMO's `currentDist` of the dead lane: where it must have left it), at most
+/// `LC_STRATEGIC_LOOKAHEAD`. Walked along the lanes beside, which leads: from the one beside the
+/// car on to a way on of it that leads and still lies beside the chain (it or the chain's lane has
+/// the other as its lane beside), so that a joint of the lane beside that falls short of the
+/// chain's own joint (parallel paths are cut at different places) does not end the run; it ends
+/// where no such way on is left - the lanes part, at the fork where the dead lane turns off.
+fn dead_run(net: &Network, f: &omsi_sim::traffic::GoalField, chain: &[usize], s: f32, dir: i32, k: usize, first: Option<usize>) -> f32 {
+    let Some(&c0) = chain.first() else { return 0.0 };
+    let Some(mut b) = lane_toward(net, c0, dir, k, first).filter(|&b| f.leads(b)) else { return 0.0 };
+    let beside_chain = |n: usize| chain.iter().any(|&c| lane_toward(net, c, dir, k, None) == Some(n)) || lane_toward(net, n, 3 - dir, k, None).is_some_and(|c| chain.contains(&c));
+    let mut d = -net.beside_s(c0, b, s);
+    for _ in 0..OPEN_RUN_LANES {
+        d += net.lanes[b].length();
+        if d >= LC_STRATEGIC_LOOKAHEAD {
+            break;
+        }
+        match net.lanes[b].next.iter().copied().find(|&n| f.leads(n) && beside_chain(n)) {
+            Some(n) => b = n,
+            None => break,
+        }
+    }
+    d.clamp(0.0, LC_STRATEGIC_LOOKAHEAD)
+}
+
+/// SUMO's best-lane occupation (`LaneQ::occupation`, `getBruttoVehLenSum`): the lengths with their
+/// standing gaps of the vehicles on lane `best` and on the lanes it runs into towards the trip end
+/// (the way on of least route cost), as far as `LC_STRATEGIC_LOOKAHEAD`; what jams the room left
+/// for a change onto it (LC2013's `usableDist`, `JAM_FACTOR` 1).
+fn best_occupation(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, f: &omsi_sim::traffic::GoalField, best: usize) -> f32 {
+    let (mut cur, mut run, mut sum) = (best, 0.0f32, 0.0f32);
+    let mut seen: Vec<usize> = Vec::new();
+    for _ in 0..OPEN_RUN_LANES {
+        for o in sim.occupancy.get(&cur).into_iter().flatten() {
+            if !seen.contains(&o.vehicle) && vehicles.get(o.vehicle).is_some_and(|v| v.id != me.id) {
+                seen.push(o.vehicle);
+                sum += vehicles[o.vehicle].length() + vehicles[o.vehicle].state.min_gap;
+            }
+        }
+        run += net.lanes[cur].length();
+        let Some(n) = net.lanes[cur].next.iter().copied().filter(|&n| f.leads(n)).min_by(|&a, &b| f.to_goal(a).total_cmp(&f.to_goal(b))) else { break };
+        if run >= LC_STRATEGIC_LOOKAHEAD {
+            break;
+        }
+        cur = n;
+    }
+    sum
+}
+
+/// SUMO LC2013's strategic distance towards side `dir` (`laDist`): the look-ahead speed times
+/// `LC_LOOK_FORWARD` times `lc_strategic` (times the driver's own `lc_lookahead_left` towards the
+/// overtaking side, the user's decision L3-D2: the route changes and the strategic stay only),
+/// plus two lengths with the standing gap (as `lane_end_look`).
+fn strategic_look(sim: &Simulation, me: &Vehicle, dir: i32) -> f32 {
+    let overtaking = dir == if sim.left_hand { 2 } else { 1 };
+    let v = me.look_ahead_speed.max(me.state.speed) * me.params.lc_strategic.max(0.0);
+    v * LC_LOOK_FORWARD * if overtaking { me.params.lc_lookahead_left } else { 1.0 } + 2.0 * (me.length() + me.state.min_gap)
+}
+
+/// SUMO LC2013's urgent strategic change towards the trip end (sumo.md 3.2, `lcStrategic`): on a
+/// dead lane - one whose ways on do not lead to the random car's trip end (`trip_field`,
+/// `GoalField::leads`) - towards `nb` where `nb` or a lane beyond it on that side leads there
+/// (`changes_to_lead`, `bestLaneOffset`): `lc_strategic` once the distance left to the
+/// last-resort stop before the dead lane's end (`dead_run` along the car's planned way, less
+/// `last_stop_room`) less the occupation of the lane that leads (`best_occupation`), per change
+/// needed, is under the strategic distance (`strategic_look`):
+/// `currentDistDisallows(usableDist, bestLaneOffset, laDist)`; else 0. Also that distance (m).
+/// `lc_strategic` below 0 never (SUMO: -1 disables strategic changes), nor once the driver has
+/// given it up (`AiState::strategic_gave_up`, standing its `strategic_patience` at its stop).
+fn strategic_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, nb: &NeighbourView) -> Option<(f32, f32)> {
+    let st = &me.state;
+    let f = trip_field(me)?;
+    if me.params.lc_strategic < 0.0 || f.leads(st.lane) || st.strategic_gave_up {
+        return None;
+    }
+    let k = changes_to_lead(net, f, st.lane, nb.dir, Some(nb.lane))?;
+    let best = lane_toward(net, st.lane, nb.dir, k, Some(nb.lane))?;
+    // (the car's way: its plan, and past it the single ways on, as far as the look-ahead goes)
+    let mut chain: Vec<usize> = std::iter::once(st.lane).chain(st.planned_next).chain(st.ahead.iter().copied()).collect();
+    while chain.len() < OPEN_RUN_LANES {
+        match net.lanes[*chain.last().expect("the car's lane")].next[..] {
+            [n] if !chain.contains(&n) => chain.push(n),
+            _ => break,
+        }
+    }
+    let dist = dead_run(net, f, &chain, st.s + st.front, nb.dir, k, Some(nb.lane));
+    if dist <= 0.0 {
+        return None;
+    }
+    let usable = dist - last_stop_room(net, me, nb) - best_occupation(net, sim, vehicles, me, f, best);
+    Some((if usable / (k as f32) < strategic_look(sim, me, nb.dir) { me.params.lc_strategic } else { 0.0 }, dist))
+}
+
+/// SUMO LC2013's strategic stay (`LCA_STAY | LCA_STRATEGIC`, "could not change back and forth in
+/// time"): no change for speed or to keep to the side onto `nb` when `nb` does not lead to the
+/// trip end and the room it leaves to get onto a lane that does - its run beside the nearest one
+/// (`dead_run`, `neighLeftPlace`) - over the changes then needed (`bestLaneOffset` from my lane
+/// plus two) is under the strategic distance towards `nb` (`currentDistDisallows(neighLeftPlace,
+/// |bestLaneOffset| + 2, laDist)`; `stay_place`). Only while my road leads there.
+/// LC2013's second stay (MSLCM_LC2013.cpp l.1438: on the best lane, `bestLaneOffset == 0 &&
+/// neighLeftPlace * 2 < laDist`, "could not change back and forth in time (2)") is not ported
+/// on its own: on the best lane the first one reads `neighLeftPlace / 2 < laDist`
+/// (`currentDistDisallows` divides by `|bestLaneOffset| + 2` = 2), which holds wherever the
+/// second's `neighLeftPlace * 2 < laDist` does - so in SUMO too the second never decides alone.
+fn strategic_stay(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> bool {
+    stay_place(net, me, p, nb).is_some_and(|(place, mine)| place / ((mine + 2) as f32) < strategic_look(sim, me, nb.dir))
+}
+
+/// `strategic_stay`'s quantities towards `nb`, a lane that does not lead to the trip end: the room
+/// it leaves to get back onto a lane that does (m, SUMO's `neighLeftPlace`: how far along `nb` and
+/// its single ways on a lane beside it towards one that leads runs on and leads, `dead_run`), and
+/// the changes from my lane to the nearest lane that leads (`bestLaneOffset`). None where `nb`
+/// leads, my road does not lead there, or `nb` lies towards that lane (SUMO's `changeToBest`).
+fn stay_place(net: &Network, me: &Vehicle, p: &Perception, nb: &NeighbourView) -> Option<(f32, usize)> {
+    let st = &me.state;
+    let f = trip_field(me)?;
+    if f.leads(nb.lane) {
+        return None;
+    }
+    let first = |dir: i32| if dir == 1 { p.left.map(|n| n.lane) } else { p.right.map(|n| n.lane) };
+    let mine = if f.leads(st.lane) { Some((0, 0)) } else { [1, 2].into_iter().filter_map(|d| changes_to_lead(net, f, st.lane, d, first(d)).map(|k| (k, d))).min() };
+    let (mine, to_best) = mine?;
+    if mine > 0 && to_best == nb.dir {
+        return None;
+    }
+    // (from `nb`: back past my lane, or on beyond it)
+    let back = 3 - nb.dir;
+    let to_lead = [(back, Some(st.lane)), (nb.dir, None)].into_iter().filter_map(|(d, fst)| changes_to_lead(net, f, nb.lane, d, fst).map(|k| (k, d, fst))).min_by_key(|x| x.0);
+    let place = match to_lead {
+        Some((k, d, fst)) => {
+            let mut chain = vec![nb.lane];
+            while chain.len() < OPEN_RUN_LANES {
+                match net.lanes[*chain.last().expect("nb")].next[..] {
+                    [n] if !chain.contains(&n) => chain.push(n),
+                    _ => break,
+                }
+            }
+            dead_run(net, f, &chain, net.beside_s(st.lane, nb.lane, st.s) + st.front, d, k, fst)
+        }
+        None => 0.0,
+    };
+    Some((place, mine))
+}
+
+/// Diagnostics (`traffic_cases watch --nb`): towards `nb`, the urgent strategic wish and its
+/// distance (`strategic_desire`), the strategic stay's room and changes (`stay_place`) and whether
+/// it holds, the car's way marked by whether each lane leads to its trip end, and the speed-gain
+/// and keep-side accumulators.
+pub fn strategic_debug(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView) -> String {
+    let mark = |l: usize| format!("{l}{}", trip_field(me).map_or("", |f| if f.leads(l) { "+" } else { "-" }));
+    let way: Vec<String> = std::iter::once(me.state.lane).chain(me.state.planned_next).chain(me.state.ahead.iter().copied()).map(mark).collect();
+    format!("stay_place {:?} la {:.0} stay {} strategic {:?} way {way:?} speed_gain {:?} keep_right {:.2} goal {:?}", stay_place(net, me, p, nb), strategic_look(sim, me, nb.dir), strategic_stay(net, sim, me, p, nb), strategic_desire(net, sim, vehicles, me, nb), me.speed_gain, me.keep_right, me.state.goal)
+}
+
 /// The lane-change desire towards a neighbour, 0..1, and whether the gap there is
-/// accepted: SUMO LC2013's motivations (the lane's end and the turn - strategic -, speed gain,
-/// keeping to the side) and an obstacle motive of ours (a standing obstacle).
+/// accepted: SUMO LC2013's motivations (the lane's end, the trip end and the turn - strategic -,
+/// speed gain, keeping to the side) and an obstacle motive of ours (a standing obstacle).
 /// `near_junction`: within the last stretch before a junction, where the lines are solid
 /// and only the turn lane and a standing obstacle are reasons to move over. `ant`: (mine, beside)
 /// from `anticipated_speeds`.
-fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool, ant: (f32, f32)) -> (f32, bool, ChangeWhy) {
+fn change_desire(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, near_junction: bool, ant: (f32, f32)) -> (f32, bool, ChangeWhy) {
     let st = &me.state;
     let dp = &me.params;
     let lane = &net.lanes[st.lane];
@@ -476,8 +763,27 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // slows to its last-resort stop, which leaves the room to move over from standing)
     // (the move's whole road, `change_space`, within the end, less what the car's stop control
     // lands either side of a stop, `REST_SHORT`: the last-resort stop leaves the space from rest)
-    let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel) <= e.dist + REST_SHORT);
+    let fits = p.lane_end.is_none_or(|e| e.kind == LaneEndKind::Merge || change_space(st.speed, st.accel, me.params.signal_before_change) <= e.dist + REST_SHORT);
     let end_ok = |ok: bool| ok && !(end > 0.0 && (people_on_move(net, sim, me, nb) || !fits));
+    // the car's lane does not lead to its trip end and `nb` is the way there: SUMO LC2013's
+    // urgent strategic change, first in its order, before speed gain and keeping to the side
+    // (`strategic_desire`), under the lane-end rules of where a change may be made
+    // (`may_change_for_lane_end`: the lane leads elsewhere, its turn-lane rules do not hold), the
+    // gap rule and nobody on the move; and only a move that fits before the dead lane's end (SUMO's
+    // `LCA_INSUFFICIENT_SPACE`: the change's whole road, `change_space`, less what the car's stop
+    // control lands either side of its stop before that end, `REST_SHORT`, as at a lane's end). A wish whose change is
+    // blocked brings the car to a stop before the dead lane's end, where it waits for a gap
+    // (`plan`'s blocked wish, as at a lane's end); only a car past the point of no return drives
+    // on through the fork on its own lane, and its trip end is drawn again (`STRATEGIC_MISSED`)
+    if let Some((strategic, dist)) = strategic_desire(net, sim, vehicles, me, nb).filter(|s| s.0 > 0.0 && s.0 >= end) {
+        if may_change_for_lane_end(net, sim, me, nb) {
+            let ok = gap_accepted(me, nb) && !people_on_move(net, sim, me, nb) && change_space(st.speed, st.accel, me.params.signal_before_change) <= dist + REST_SHORT;
+            return (strategic, ok, ChangeWhy::Strategic);
+        }
+    }
+    // (and no change for speed or to keep to the side onto a lane that leaves no room to get back
+    // onto one that leads there, `strategic_stay`)
+    let stay = strategic_stay(net, sim, me, p, nb);
     if !may_change_to(net, sim, me, nb) {
         return (end, end > 0.0 && end_ok(gap_accepted(me, nb)), ChangeWhy::LaneEnd);
     }
@@ -518,7 +824,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     let threshold = if towards_keep { SPEED_GAIN_THRESHOLD / SPEED_GAIN_RIGHT } else { SPEED_GAIN_THRESHOLD };
     let gained = me.speed_gain[(nb.dir as usize).clamp(1, 2) - 1] > threshold && (towards_keep || nb_safe > this_safe);
     let remains = nb.runs_on / st.speed.max(0.1) > SPEED_GAIN_REMAIN_TIME;
-    if gained && remains && !blocked && !near_junction && open_on(net, me, nb.lane, st.s) {
+    if gained && remains && !blocked && !near_junction && !stay && open_on(net, me, nb.lane, st.s) {
         wish(dp.lc_speed_gain, ChangeWhy::SpeedGain);
     }
     // keep to the side: SUMO LC2013's keepRight layer - the accumulated wish
@@ -526,7 +832,7 @@ fn change_desire(net: &Network, sim: &Simulation, me: &Vehicle, p: &Perception, 
     // hold (`stays_on_best`, over the lanes open to me: no `open_on` window); a speed-
     // gain, obstacle or turn wish, or a lane-end wish over `lc_keep_right`, outweighs it (how long the driver could keep
     // its speed there is the accumulator's rate)
-    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) {
+    if nb.dir == keep_side(sim) && me.keep_right >= KEEP_RIGHT_THRESHOLD && !stays_on_best(net, sim, me, nb) && !stay {
         wish(dp.lc_keep_right, ChangeWhy::KeepSide);
     }
     (desire, end_ok(gap_accepted(me, nb)), why)
@@ -541,6 +847,21 @@ pub enum ChangeWhy {
     Obstacle = 2,
     SpeedGain = 3,
     KeepSide = 4,
+    /// Towards the lane that leads to a random car's trip end (`strategic_desire`).
+    Strategic = 5,
+}
+
+/// Which check dropped a signalling lane change (`Plan::abort_why`): the follower there misses
+/// the accepted gap, the leader there is too close (or the lane is another way's), somebody is on
+/// the move, a plain change's move swept again no longer clears (no step-out from there does), a
+/// bypass's swept again no longer clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortWhy {
+    GapBehind = 0,
+    GapAhead = 1,
+    People = 2,
+    PlainSweep = 3,
+    BypassSweep = 4,
 }
 
 /// A turn lane is never left within this many metres (m) of its junction, nor one taken
@@ -574,7 +895,7 @@ fn may_change_to(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// an internal lane, whose stretch is where the ways of the junction meet (`mayChange`, sumo.md
 /// 3.1). An OMSI object also lays plain road as paths, so the move is allowed where it touches no
 /// meeting place: the stretch the body covers - from beside my rear to my front, plus what the car
-/// drives while it signals (`SIGNAL_BEFORE_CHANGE` at its speed, as `change_clear` lays it) and the
+/// drives while it signals (the driver's `signal_before_change` at its speed) and the
 /// move's length (`change_length`) - must stay on both pieces and touch, on either piece, no foe's
 /// stretch (`Foe::mine`), no stretch converging with a third way (`Movement::converge`) and no
 /// people's crossing (`Network::walks`, the cuts the perception's zebra rule reads; SUMO's
@@ -586,7 +907,7 @@ fn piece_change_clear(net: &Network, sim: &Simulation, me: &Vehicle, nb: &Neighb
     if j != j2 {
         return false;
     }
-    let pre = st.speed.max(0.0) * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
+    let pre = st.speed.max(0.0) * me.params.signal_before_change;
     let mv = omsi_sim::traffic::change_length(st.speed);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
     let mine = (st.s - st.rear, st.s + st.front + pre + mv);
@@ -683,9 +1004,8 @@ pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
 /// considered to be a turn-lane that must be avoided" - a driver on the lane that runs on does not
 /// leave it for a keep-right onto one that runs on less than this (`stays_on_best`).
 pub const TURN_LANE_DIST: f32 = 200.0;
-/// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so
-/// the distance a lane beside runs on (`neighDist`), are looked along.
-pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
+/// SUMO's `lcStrategicLookahead` (m), `omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD`.
+pub use omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD;
 /// SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
 /// allowed (`avoidOvertakeRight` is false), above it the time on the lane beside is bounded by
 /// catching up with my own leader.
@@ -718,8 +1038,10 @@ fn stays_on_best(net: &Network, sim: &Simulation, me: &Vehicle, nb: &NeighbourVi
 /// at a fork the way on that runs furthest. A random car's trip end (`AiState::goal`) is not
 /// looked at here: the way it takes at the fork is chosen when its plan reaches it
 /// (`AiState::choose_after`), from whichever lane it is on then, the least route cost to the
-/// trip end from there (`AiState::route_cost`: travel time over the group's relative density). (`NeighbourView::runs_on` is the network's reach, which counts no closed lane
-/// out and stops counting at `REACH_MAX`.)
+/// trip end from there (`AiState::route_cost`: travel time over the group's relative density),
+/// and its change onto a lane that leads there is the strategic one (`strategic_desire`).
+/// (`NeighbourView::runs_on` is the network's reach, which counts no closed lane out and stops
+/// counting at `REACH_MAX`.)
 fn open_run(net: &Network, me: &Vehicle, lane: usize, s: f32, cap: f32) -> f32 {
     // (at most `OPEN_RUN_LANES` lanes looked at: past that the way is taken to run on)
     fn walk(net: &Network, me: &Vehicle, lane: usize, d: f32, cap: f32, budget: &mut usize) -> f32 {
@@ -1068,6 +1390,7 @@ fn shifted_body(net: &Network, me: &Vehicle, d: f32, side: f32) -> Obb {
 /// level with the obstacle to `level` metres ahead of the origin, and easing back to the axis
 /// over `back` metres more? (Sampled from the start of the way, so a car standing level or just
 /// ahead on the squeeze side is met.)
+#[allow(clippy::too_many_arguments)]
 fn squeeze_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, way: &[(usize, f32)], side: f32, out_len: f32, level: f32, back: f32) -> bool {
     let to = level + back;
     let from = 0.0f32;
@@ -1145,6 +1468,73 @@ fn shift_clears(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     let d = l.gap + me.state.front + l.length * 0.5;
     let b = shifted_body(net, me, d, side);
     other.separation(&b) >= SQUEEZE_CLEARANCE as f64
+}
+
+/// Is a foe of my way through junction `j` in a meeting stretch (`Foe::mine`, in my way's
+/// distances) that lies within my way from `from` to `to`, or coming to it before my body has
+/// cleared it (an in-lane squeeze inside a junction; SUMO: a foe occupying the conflict area that
+/// has not passed it, and an approaching one by its arrival, `MSLink::blockedAtTime` with
+/// `jmTimegapMinor`)?
+/// - in it: a vehicle on the foe's lane whose body reaches into that lane's side of the stretch
+///   (`Foe::theirs`), or a player's vehicle there, at `STANDING_SPEED` or more (a foe standing
+///   there is no conflict for a move its body is clear of, which the squeeze's sweep keeps);
+/// - coming: a moving vehicle on the foe's lane short of the stretch, or on the lanes leading into
+///   it as far as one at that lane's limit covers in my time, whose front reaches the stretch
+///   (`arrival_time` at its speed, acceleration and limit) before my rear has left it (mine from
+///   my speed at my acceleration up to my lane's limit) and `perception::JM_TIMEGAP_MINOR`.
+fn squeeze_foe_moving(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, j: &JunctionView, from: f32, to: f32) -> bool {
+    let st = &me.state;
+    let node = &sim.junctions.nodes[j.junction];
+    let my_limit = net.lanes.get(st.lane).map_or(st.max_speed_kmh, |l| l.speed_limit_kmh.min(st.max_speed_kmh)).max(1.0) / 3.6;
+    sim.junctions.foes_along(j.junction, &j.chain).iter().filter(|f| j.entry + f.mine.0 < to && j.entry + f.mine.1 > from).any(|f| {
+        let lane = node.movements[f.movement].lane;
+        let (a, b) = f.theirs;
+        let on = sim.occupancy.get(&lane).into_iter().flatten().any(|o| {
+            vehicles.get(o.vehicle).is_some_and(|v| v.id != me.id && v.state.speed.abs() >= STANDING_SPEED && o.s - v.state.rear < b && o.s + v.state.front > a)
+        });
+        let player_on = || net.lanes.get(lane).is_some_and(|l| {
+            sim.players.iter().filter(|pl| pl.speed.abs() >= STANDING_SPEED && (pl.pos.z - me.pos.z).abs() <= 3.0).any(|pl| {
+                l.nearest_point(pl.pos).is_some_and(|(ps, d)| ps - pl.half_len < b && ps + pl.half_len > a && (d as f32) < l.width * 0.5 + pl.half_width)
+            })
+        });
+        // (coming: my rear out of the stretch, and the foes short of it by their arrival)
+        let my_out = omsi_sim::traffic::arrival_time((j.entry + f.mine.1 + st.rear).max(0.0), st.speed.max(0.0), st.accel, my_limit);
+        let coming = || {
+            let mut todo: Vec<(usize, f32)> = vec![(lane, 0.0)];
+            let mut seen: Vec<usize> = Vec::new();
+            while let Some((l, before)) = todo.pop() {
+                if seen.contains(&l) {
+                    continue;
+                }
+                seen.push(l);
+                let Some(ln) = net.lanes.get(l) else { continue };
+                // (`before`: the road from this lane's end to the stretch's start, 0 on the foe's lane)
+                let to_a = |s: f32| if l == lane { a - s } else { before + ln.length() - s };
+                let hit = sim.occupancy.get(&l).into_iter().flatten().any(|o| {
+                    vehicles.get(o.vehicle).is_some_and(|v| {
+                        let d = to_a(o.s + v.state.front);
+                        v.id != me.id && v.state.speed >= STANDING_SPEED && d > 0.0 && {
+                            let lim = (ln.speed_limit_kmh.min(v.state.max_speed_kmh).max(1.0)) / 3.6;
+                            omsi_sim::traffic::arrival_time(d, v.state.speed, v.state.accel, lim) < my_out + crate::perception::JM_TIMEGAP_MINOR
+                        }
+                    })
+                });
+                if hit {
+                    return true;
+                }
+                // (back along the lanes leading in, as far as a foe at their limit covers in my time)
+                let next_before = if l == lane { a } else { before + ln.length() };
+                for &q in net.prev.get(l).into_iter().flatten() {
+                    let lim = net.lanes.get(q).map_or(1.0, |x| x.speed_limit_kmh.max(1.0)) / 3.6;
+                    if next_before < lim * (my_out + crate::perception::JM_TIMEGAP_MINOR) {
+                        todo.push((q, next_before));
+                    }
+                }
+            }
+            false
+        };
+        on || player_on() || coming()
+    })
 }
 
 /// The player's bus pausing in the lane: squeezed past inside the lane after
@@ -1231,11 +1621,7 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if obstacle.and_then(|ob| obstacle_bus(sim, vehicles, ob)).is_some_and(|(bus, signals, moves)| moves || (bus && signals)) {
         return None;
     }
-    let target = &net.lanes[nb.lane];
-    let (ts, _) = target.nearest_point(me.pos)?;
-    let hr = (me.heading as f64).to_radians();
-    let right = DVec2::new(hr.cos(), -hr.sin());
-    let side = (target.at(ts).0 - me.pos).truncate().dot(right) as f32;
+    let side = bypass_side(net, me, nb)?;
     // (the gentle smoothstep first; the two arcs at full lock only where it does not clear;
     // the move begins after the signalling, `BYPASS_SIGNAL`, the car stopping meanwhile where it
     // can, `pre` on; its way must take the lead out of my corridor before my front is there,
@@ -1248,45 +1634,220 @@ fn bypass_start(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
         if bypass_lateral(lead.gap + st.front - pre, out_len, side.abs(), full_lock) < need {
             continue;
         }
-        let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
-        let (obstacle_len, _) = obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM);
-        let level = lead.gap + obstacle_len + st.front + st.rear + 2.0;
-        let parked = parked_boxes(net, sim, me, level + st.front);
-        let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-        if body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All) {
+        if bypass_move_clear(net, sim, vehicles, me, ahead, road_left, side, Some(lead), out_len, full_lock) {
             return Some(Start::Bypass { to: nb.lane, dir: nb.dir, out_len, full_lock, round: obstacle });
         }
     }
     None
 }
 
-/// Does a lane change into `nb` started now, at speed, clear what is near: the body turned
-/// along the change's smoothstep (`change_length`) after the signalling (`SIGNAL_BEFORE_CHANGE`
-/// at this speed), swept by `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars, the
-/// people, the standing vehicles and players near and the moving ones beside me on either side,
-/// each where it will be when my body gets there at this speed (`Bodies::Over`: a standing one
-/// where it is, a moving one beside carried on at its speed), and with a `lead` standing within
+/// My own leader (`Perception::own_leader`, read alike by the start check and the re-sweep) when
+/// it stands within the road a lane change `(wait, len)` takes from now at speed `v`: the signal's
+/// road (`wait` seconds left) and the move (`len` metres; `change_clear`).
+fn near_standing_lead(p: &Perception, v: f32, (wait, len): (f32, f32)) -> Option<crate::perception::Headway> {
+    p.own_leader.filter(|l| l.speed < STANDING_SPEED && l.gap < len + v * wait)
+}
+
+/// How far (m) a body at `speed` m/s has run `t` seconds on braking at `brake` m/s² from now:
+/// `v t - b t² / 2` until it stands, `v² / 2b` after - the least it will be ahead of where it is
+/// were it to brake at once that hard. With the maximal deceleration (`omsi_sim::traffic::MAX_BRAKE`,
+/// an AI driver's emergency stop) it is SUMO's secure-gap bound: `getSecureGap` reckons with the
+/// leader braking at its maximal deceleration. (Braking only comfortably it was no bound: a car in
+/// a queue stopped short of it and a change let through by the start check was dropped by the
+/// re-sweep.)
+fn braking_run(speed: f32, brake: f32, t: f32) -> f32 {
+    let (v, b, t) = (speed.max(0.0), brake.max(0.1), t.max(0.0));
+    if t < v / b { v * t - 0.5 * b * t * t } else { v * v / (2.0 * b) }
+}
+
+/// How a body near is swept by a moving body's sweep (`body_sweep_clear`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Carry {
+    /// Where it is now.
+    Now,
+    /// Carried on along its heading at its speed for the time my body takes there.
+    AtSpeed,
+    /// Where it will be braking from now at the given deceleration (`braking_run`): the least it
+    /// will have moved on.
+    ToStop(f32),
+    /// Anywhere between the two: where it will be braking at the given deceleration and where it
+    /// would be at its speed (a body beside me, which may brake or roll on as my rear swings).
+    Span(f32),
+}
+
+/// How far across (m, + right of my heading) the lane `nb` lies from me: a bypass's move.
+fn bypass_side(net: &Network, me: &Vehicle, nb: &NeighbourView) -> Option<f32> {
+    let target = &net.lanes[nb.lane];
+    let (ts, _) = target.nearest_point(me.pos)?;
+    let hr = (me.heading as f64).to_radians();
+    let right = DVec2::new(hr.cos(), -hr.sin());
+    Some((target.at(ts).0 - me.pos).truncate().dot(right) as f32)
+}
+
+/// Does a bypass's move from rest - `side` metres over `out_len` metres, the two arcs at full
+/// lock with `full_lock` else the smoothstep, after what the car rolls on braking to rest - clear
+/// every vehicle, player, parked car and person near by `SQUEEZE_CLEARANCE` (`body_sweep_clear`,
+/// `Bodies::All`)? Swept up to level with the far end of the thing passed, `lead`, and what stands
+/// beyond it in my corridor (`ahead`, `obstacle_run_in`) and past my rear; with no `lead` (it has
+/// gone from my way) over the move itself.
+#[allow(clippy::too_many_arguments)]
+fn bypass_move_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, ahead: &[(f32, f32, f32)], road_left: f32, side: f32, lead: Option<&crate::perception::Headway>, out_len: f32, full_lock: bool) -> bool {
+    let st = &me.state;
+    let pre = st.speed.max(0.0).powi(2) / (2.0 * me.params.comfort_brake.max(0.1));
+    let profile = if full_lock { Profile::FullLock { pre } } else { Profile::Smooth { pre } };
+    let level = match lead {
+        Some(lead) => lead.gap + obstacle_run_in(ahead, road_left, lead, me.length() + out_len + PASS_ROOM).0 + st.front + st.rear + 2.0,
+        None => pre + out_len,
+    };
+    let parked = parked_boxes(net, sim, me, level + st.front);
+    let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
+    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, profile, Bodies::All)
+}
+
+/// Does a lane change into `nb` clear what is near, its move `(wait, len)` - beginning after
+/// `wait` more seconds of signalling, `len` metres long (at its start the signal still owed,
+/// `signal_left` - the driver's own `signal_before_change` less what its indicator has shown for a
+/// blocked urgent wish - and `change_length` at this speed; while it signals, what is left and `LaneChange::length`, the
+/// move the car drives): the body turned along the change's smoothstep over `len` after the road
+/// the signalling takes as the car will drive it (`signal_plan`: braking for its leader), swept by
+/// `SQUEEZE_CLEARANCE` (`body_sweep_clear`) past the parked cars, the people, the standing
+/// vehicles and players near and the moving ones beside me on either side, each where it will be
+/// when my body gets there - over the signal's road in its time, then at the speed the move
+/// begins with, or from rest at the car's acceleration (`Bodies::Over`: a
+/// standing one where it is, a moving one beside carried on at its speed), and with a `lead` standing within
 /// the move, run on past it and what stands beyond it, the other moving ones too where they are
 /// now (without one those are the gap rule's). OMSI geometry: the body turns as it moves over,
 /// its rear swinging out the other way - into a car on the lane or piece on that side, standing
 /// or rolling on level with it - where SUMO's change is a jump; SUMO's sublane model checks the
 /// vehicle's lateral extent against the neighbours on both sides.
-fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: Option<&crate::perception::Headway>) -> bool {
+fn change_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehicle, p: &Perception, nb: &NeighbourView, lead: Option<&crate::perception::Headway>, (wait, len): (f32, f32)) -> bool {
     let st = &me.state;
-    let v = st.speed.max(0.0);
     let Some((ts, _)) = net.lanes[nb.lane].nearest_point(me.pos) else { return false };
     let hr = (me.heading as f64).to_radians();
     let right = DVec2::new(hr.cos(), -hr.sin());
     let side = (net.lanes[nb.lane].at(ts).0 - me.pos).truncate().dot(right) as f32;
-    let pre = v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE;
-    let out_len = omsi_sim::traffic::change_length(v);
+    let (pre, v_move) = signal_plan(me, p, nb, wait);
+    let out_len = len;
     let level = match lead {
         Some(lead) => lead.gap + obstacle_run(p, lead, me.length() + PASS_ROOM).0 + st.front + st.rear + 2.0,
         None => pre + out_len,
     };
     let parked = parked_boxes(net, sim, me, level + st.front);
     let people: Vec<Obb> = sim.people_near(me.pos, (level + st.front) as f64).into_iter().map(|k| &sim.people[k]).filter(|q| (q.pos.z - me.pos.z).abs() <= crate::perception::LEVEL_APART).map(|q| Obb::point(q.pos, PERSON_RADIUS as f64)).collect();
-    body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level, Profile::Smooth { pre }, Bodies::Over { speed: v, others: lead.is_some() })
+    // (the move swept from where the plan has it begin and from nearer: the car may cover less of
+    // the signal's road than planned - braking harder for its leader - and the re-sweep while it
+    // signals then sweeps a move beginning nearer, `SIGNAL_SPREAD`; checked over that spread the
+    // start covers every move the re-sweep can later sweep, and the two are one test)
+    // (up to the road the signal takes undelayed, `free`: the re-sweep's own plan reads its leaders
+    // from the perception with the change laid, the target lane's no longer limiting it, and may plan
+    // the move further on than the start did - d26 #5610 at 812.68 s: 6.72 m against 6.26 - so the
+    // start sweeps the moves beginning anywhere from here to there)
+    // (and as far as the car gets if it speeds up meanwhile, `free_road`: the start assumed its speed
+    // kept, and a car accelerating while it signalled was re-swept from beyond what the start had
+    // covered - viz4 #24004 at 972.79 s, 1.21 -> 1.29 m/s, its road 2.20 -> 2.28 m)
+    // (no further than its own lane's leader lets it, as `signal_plan` reads that one: the
+    // re-sweep's plan is bound by it still)
+    let own_room = p.own_leader.map_or(f32::INFINITY, |l| {
+        let vl = l.speed.max(0.0);
+        let run = if l.acc < 0.0 && vl + l.acc * wait < 0.0 { vl * vl / (-2.0 * l.acc) } else { vl * wait + 0.5 * l.acc * wait * wait };
+        (l.gap + run.max(0.0) - st.min_gap).max(0.0)
+    });
+    let free = free_road(st.speed, st.accel, p.v_want, wait).min(own_room).max(st.speed.max(0.0) * wait);
+    SIGNAL_SPREAD.iter().map(|k| k * pre).chain([free, 0.5 * (pre + free)].into_iter().filter(|&f| f > pre)).all(|p0| {
+        body_sweep_clear(net, sim, vehicles, me, &parked, &people, side, out_len, level.max(p0 + out_len), Profile::Smooth { pre: p0 }, Bodies::Over { speed: v_move, accel: st.accel, others: lead.is_some(), pre: p0, wait })
+    })
+}
+
+/// The road (m) a car at `v` m/s covers in `wait` seconds undelayed: speeding up at its
+/// acceleration `accel` (`AiState::accel`) to its wanted speed `v_want` (`Perception::v_want`) and
+/// on at that - the most of the signal's road it can drive, whatever its leaders do.
+fn free_road(v: f32, accel: f32, v_want: f32, wait: f32) -> f32 {
+    let (v, w) = (v.max(0.0), wait.max(0.0));
+    if v >= v_want || accel <= 0.0 {
+        return v * w;
+    }
+    let t_up = (v_want - v) / accel;
+    if t_up >= w {
+        v * w + 0.5 * accel * w * w
+    } else {
+        v * t_up + 0.5 * accel * t_up * t_up + v_want * (w - t_up)
+    }
+}
+
+/// Where along the signal's planned road a change's move is swept from (`change_clear`): the
+/// planned start, halfway, and the car's place now - the ends and the middle of the range of starts
+/// a car braking harder than planned can reach (sampled, as the move itself is).
+const SIGNAL_SPREAD: [f32; 3] = [1.0, 0.5, 0.0];
+
+/// The seconds a change towards `dir` still signals before it moves over, at `now`: the driver's
+/// own signalling time (`DriverParams::signal_before_change`) less the time its indicator has
+/// already shown that side for a blocked urgent change it waited for there (`Vehicle::urgent_side`;
+/// SUMO's blocked wish lights the blinker, `MSVehicle::setBlinkerInformation`, and a driver who has
+/// signalled while waiting at a merge moves over as the gap opens - not the whole time again once
+/// it is there, the follower that stopped for it standing meanwhile).
+pub fn signal_left(me: &Vehicle, dir: i32, now: f64) -> f32 {
+    let full = me.params.signal_before_change;
+    if me.urgent_side == dir && me.blinker_shown.0 == dir {
+        (full - (now - me.blinker_shown.1).max(0.0) as f32).max(0.0)
+    } else {
+        full
+    }
+}
+
+/// How the car drives the `wait` seconds of a change's signal (`signal_left`: the driver's own
+/// `signal_before_change`, the user's decision L3-D5, less what it has already shown; OMSI's
+/// driver signals before it moves over where SUMO's change starts in the step it is decided -
+/// `lanechange.duration` 0): the road it covers and its speed when the move begins. On at its
+/// speed, as far as its leader lets it: that one's rear carried on over the time at its speed and
+/// acceleration (to rest where it brakes), less my standing gap behind it; held short of that, it
+/// brakes evenly over the road it has, to rest where the road runs out before the time does
+/// (car-following's way of closing up on a leader that slows or stands). The move's sweep and the
+/// target lane's gaps are checked from there (`change_clear`, `gaps_through_signal`), so a change
+/// is begun only when it is clear for the whole of what the car drives before and during it.
+fn signal_plan(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> (f32, f32) {
+    let st = &me.state;
+    let v = st.speed.max(0.0);
+    let free = v * wait;
+    if wait <= 0.0 {
+        return (free, v);
+    }
+    // (the leaders it follows while it signals: its own lane's and the target lane's, the nearer
+    // binding - `perception`'s signalling car follows both, SUMO's shadow-lane leaders - each read
+    // the same way at the start and in the re-sweep: its own lane's as `Perception::own_leader`, the
+    // target lane's as the lane beside's leader)
+    let leads = p.own_leader.map(|l| (l.gap, l.speed, l.acc)).into_iter().chain(nb.ahead.map(|(g, va)| (g, va, 0.0)));
+    let room = leads
+        .map(|(gap, vl, acc)| {
+            let vl = vl.max(0.0);
+            // (the leader's rear over the time: braking to rest within it if it brakes that hard)
+            let lead_run = if acc < 0.0 && vl + acc * wait < 0.0 { vl * vl / (-2.0 * acc) } else { vl * wait + 0.5 * acc * wait * wait };
+            (gap + lead_run.max(0.0) - st.min_gap).max(0.0)
+        })
+        .fold(f32::INFINITY, f32::min);
+    if room >= free {
+        return (free, v);
+    }
+    // (even braking over `room`: at rest before the time runs out where it would end slower than 0)
+    (room, (2.0 * room / wait - v).max(0.0))
+}
+
+/// Do the target lane's gaps still hold where the move begins - after the signal's `wait`
+/// seconds driven as `signal_plan` has it, the follower and leader there carried on at their
+/// speeds - by the gap rule at the speed I have then (`gap_parts`' tests: the follower need not
+/// brake hard, `accepted_gap`; room ahead)? With the gap rule now, a change is begun only when
+/// its gaps hold over the signal too (SUMO checks the gaps in the step the change is made; the
+/// OMSI driver signals first).
+fn gaps_through_signal(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> bool {
+    let (behind, ahead) = gap_parts_through_signal(me, p, nb, wait);
+    behind && ahead
+}
+
+/// `gaps_through_signal`'s two halves: (the follower there, the leader there).
+fn gap_parts_through_signal(me: &Vehicle, p: &Perception, nb: &NeighbourView, wait: f32) -> (bool, bool) {
+    let (pre, v_end) = signal_plan(me, p, nb, wait);
+    let behind = nb.behind.is_none_or(|(g, vb)| g + pre - vb * wait >= gap_needed_behind(me, nb, vb, v_end));
+    let ahead = nb.ahead.is_none_or(|(g, va)| g + va * wait - pre > ahead_needed(me, v_end, va));
+    (behind, ahead)
 }
 
 /// How far across (m) a bypass `side` metres over `len` metres long has got `x` metres along
@@ -1305,13 +1866,23 @@ fn bypass_need(me: &Vehicle, lead: &crate::perception::Headway, dir: f32) -> f32
     dir * lead.lateral + lead.half_width + me.half_width + crate::perception::LEAD_MARGIN as f32 + SQUEEZE_CLEARANCE
 }
 
-/// The gap (m) behind the standing `lead` from which a bypass into `nb` - the shortest move of
-/// its kind, the smoothstep (`bypass_min_len`) or with `full_lock` the two arcs
-/// (`full_lock_len`) - takes the lead out of my corridor before my front gets there (where its
-/// way reaches `bypass_need` across, less my front) and my body's front corners, turned along
-/// it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than the
-/// full-lock room cannot get out without reversing.
-fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool) -> Option<f32> {
+/// The room (m) vehicle `i` needs behind its lead to steer round it into the lane beside (the
+/// smoothstep's shortest move, `bypass_room`), towards the side the lead can be passed: what the
+/// keep-back behind a standing obstacle keeps (diagnostics and tests). None without a lead or a
+/// lane beside it can steer into.
+pub fn steer_round_room(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<f32> {
+    let p = crate::perception::perceive(net, sim, vehicles, i);
+    let l = p.leader?;
+    [p.left, p.right].into_iter().flatten().filter_map(|nb| bypass_room(net, &vehicles[i], &nb, &l, false, None)).reduce(f32::min)
+}
+
+/// The gap (m) behind the standing `lead` from which a move from rest into `nb` - `len` metres
+/// long, else the shortest of its kind: the smoothstep (`bypass_min_len`) or with `full_lock` the
+/// two arcs (`full_lock_len`) - takes the lead out of my corridor before my front gets there
+/// (where its way reaches `bypass_need` across, less my front) and my body's front corners,
+/// turned along it, clear the lead's box by `SQUEEZE_CLEARANCE`. A car that closes up nearer than
+/// the full-lock room cannot get out without reversing.
+fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::perception::Headway, full_lock: bool, len: Option<f32>) -> Option<f32> {
     let st = &me.state;
     let target = &net.lanes[nb.lane];
     let (ts, _) = target.nearest_point(me.pos)?;
@@ -1323,7 +1894,7 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     if side <= need {
         return None;
     }
-    let len = if full_lock { full_lock_len(me.length(), side) } else { bypass_min_len(me.length(), side) };
+    let len = len.unwrap_or_else(|| if full_lock { full_lock_len(me.length(), side) } else { bypass_min_len(me.length(), side) });
     // (the profile rises: halving finds where it is `need` across)
     let (mut lo, mut hi) = (0.0f32, len);
     for _ in 0..24 {
@@ -1368,6 +1939,39 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     let corner = hi2 + st.front;
     Some((hi.max(corner) - st.front).max(0.0))
 }
+
+/// Where a plain lane change signalling stops behind its leader (m from my front): where that one
+/// comes to rest, less the room the body needs to turn out of the lane from rest - the full-lock
+/// room the bypass keeps (`bypass_room` with the two arcs at full lock: the gap from which that
+/// move takes the leader out of my corridor and my body turned along it clears the leader's box;
+/// OMSI geometry: a body turns as it moves over, it does not slide sideways as SUMO's changes
+/// do), from which the change goes on as a step-out (`plan`'s re-sweep). Closed up to its standing
+/// gap, the body could not turn out at all and the change was dropped. Only where the car can
+/// still stop there at the keep-back's gentle brake (`KEEP_BACK_BRAKE`); nearer already, None: it
+/// follows as any car does.
+fn change_keep_room(net: &Network, me: &Vehicle, p: &Perception) -> Option<f32> {
+    let st = &me.state;
+    let c = st.change.filter(|c| !c.bypass && c.wait > 0.0)?;
+    let l = p.leader?;
+    let coming = l.rest.is_some() || l.speed < QUEUE_SPEED || (l.held && l.speed < QUEUE_COMING);
+    if !coming {
+        return None;
+    }
+    let nb = change_target_view(p, c.to, c.dir)?;
+    let room = bypass_room(net, me, &nb, &l, true, None)?;
+    let lead_rear = l.rest.unwrap_or(st.front + l.gap + l.speed.max(0.0).powi(2) / (2.0 * QUEUE_BRAKE));
+    let dist = lead_rear - room - st.front;
+    let v = st.speed.max(0.0);
+    (dist > 0.0 && v * v / (2.0 * dist) <= me.params.comfort_brake * KEEP_BACK_BRAKE).then_some(dist)
+}
+
+/// The keep-back behind a standing lead (room to pull out again) is placed only where the car can
+/// still stop there braking at most this many times its comfortable brake (a gentle stop, not an
+/// emergency one). No source gives it: it is the code's one gentle-stop factor,
+/// `INSIDE_BRAKE_FACTOR` (the stop at a junction's line, `refused_stop`, and `gentle_stop`), which
+/// the keep-back used inline before L3 - so the keep-back ends where the other gentle stops do
+/// (3 m/s² for the car preset's 2.0, under `HARD_BRAKE`).
+pub const KEEP_BACK_BRAKE: f32 = INSIDE_BRAKE_FACTOR;
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
 /// stop lands within half a metre of where it was aimed).
@@ -1602,7 +2206,7 @@ fn queue_escape(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &Vehi
     if queue_head(net, sim, vehicles, &l) != Some(QueueHead::ForGood) {
         return None;
     }
-    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l, true)).fold(f32::INFINITY, f32::min);
+    let need = [p.left, p.right].into_iter().flatten().filter(|nb| could_bypass(net, sim, me, nb, &l)).filter_map(|nb| bypass_room(net, me, &nb, &l, true, None)).fold(f32::INFINITY, f32::min);
     // (any short of the room: the bypass starts from the room, `bypass_start`, not from inside it)
     if !need.is_finite() || l.gap >= need {
         return None;
@@ -1745,7 +2349,7 @@ enum Profile {
     FullLock { pre: f32 },
 }
 
-/// One more sample of a swept move (`body_sweep_clear`, `bypass_room`): the body's pose `b`, its
+/// One more sample of a swept move (`bypass_room`; `sweep_step_clear` the same bound): the body's pose `b`, its
 /// least separation `sep` from what is swept, after the sample `prev` (updated). Between two
 /// samples no point of the body moves further than the largest corner displacement `shift`
 /// between the two poses (a rigid move displaces a box's points most at a corner), so a pose a
@@ -1764,19 +2368,63 @@ fn sample_clear(prev: &mut Option<(Obb, f64)>, b: Obb, sep: f64, clearance: f64)
     ok
 }
 
+/// Do the poses of a swept move between two samples `a` and `b` (where along it, the pose, its
+/// least separation; `body_sweep_clear`) keep `clearance`: by `sample_clear`'s bound (no point of
+/// the body moves further than the largest corner displacement between the two), and where that
+/// bound is not enough but both samples are clear, by the two halves of the step, the pose
+/// between taken from `pose_sep` - the bound gives away up to half the displacement (a body
+/// driven straight past another 0.55 m beside it at half-metre samples kept only 0.3 by the
+/// bound), which halving the step halves - until the step is no longer than `BOX_ROUNDING`.
+fn sweep_step_clear(pose_sep: &dyn Fn(f32) -> (Obb, f64), a: (f32, Obb, f64), b: (f32, Obb, f64), clearance: f64) -> bool {
+    if b.2 < clearance {
+        return false;
+    }
+    let shift = a.1.corners().iter().zip(b.1.corners().iter()).map(|(p, q)| p.distance(*q)).fold(0.0f64, f64::max);
+    if 0.5 * (a.2 + b.2 - shift) >= clearance {
+        return true;
+    }
+    if b.0 - a.0 <= BOX_ROUNDING {
+        return false;
+    }
+    let m = 0.5 * (a.0 + b.0);
+    let (mb, ms) = pose_sep(m);
+    sweep_step_clear(pose_sep, a, (m, mb, ms), clearance) && sweep_step_clear(pose_sep, (m, mb, ms), b, clearance)
+}
+
 /// Which vehicles and players a swept move is checked against, and where (`body_sweep_clear`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Bodies {
     /// Every one near, where it is now (a move from rest or at a crawl: a bypass, a pass).
     All,
     /// The standing ones near where they are, and the moving ones beside me (level with my
-    /// body now, on either side) where they will be when my body, driving on at `speed` (m/s),
-    /// reaches the sample: carried on along their heading at their speed for that time (a lane
-    /// change under way: the body turns as it moves over and its rear swings out the other way,
-    /// into a car beside on that side that rolls on level with it). The other moving ones (ahead
-    /// of my front, behind my rear; at no speed of mine every one) where they are now with
-    /// `others`, else not swept: the gap rule's and the car following's.
-    Over { speed: f32, others: bool },
+    /// body now, on either side) where they will be when my body reaches the sample: carried on
+    /// along their heading at their speed for that time (`Bodies::time_to`: the signal's `pre`
+    /// metres in its `wait` seconds, then the move at `speed` m/s, or from rest speeding up at
+    /// `accel` m/s²) (a lane change: the body turns as it moves over and its rear swings out the
+    /// other way, into a car beside on that side that rolls on level with it). The other moving
+    /// ones (ahead of my front, behind my rear) where they are now with `others`, else not swept:
+    /// the gap rule's and the car following's.
+    Over { speed: f32, accel: f32, others: bool, pre: f32, wait: f32 },
+}
+
+impl Bodies {
+    /// The time (s) my body takes to drive `d` metres on (`Bodies::Over`): over the signal's
+    /// `pre` metres its `wait` seconds pro rata, past them at its speed, or from rest at its
+    /// acceleration (`d = a t² / 2`); None where it does not move at all.
+    fn time_to(self, d: f32) -> Option<f32> {
+        let Bodies::Over { speed, accel, pre, wait, .. } = self else { return None };
+        if d < pre {
+            return Some(wait * d.max(0.0) / pre);
+        }
+        let rest = d - pre;
+        if speed > 0.0 {
+            Some(wait + rest / speed)
+        } else if accel > 0.0 {
+            Some(wait + (2.0 * rest / accel).sqrt())
+        } else {
+            None
+        }
+    }
 }
 
 /// Does my body, turned along a move `side` metres over `out_len` metres (`profile`), clear
@@ -1792,29 +2440,73 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let along = b.corners().map(|c| (c - me.pos.truncate()).dot(f0));
         along.iter().cloned().fold(f64::INFINITY, f64::min) < st.front as f64 && along.iter().cloned().fold(f64::NEG_INFINITY, f64::max) > -(st.rear as f64)
     };
-    // (whether a body of this speed is swept: `Some(true)` carried on to where it will be when
-    // my body reaches the sample, `Some(false)` where it is now)
-    let swept = |speed: f32, b: &Obb| match bodies {
-        _ if speed.abs() < STANDING_SPEED => Some(false),
-        Bodies::All => Some(false),
-        Bodies::Over { speed: v, .. } if v > 0.0 && beside(b) => Some(true),
-        Bodies::Over { others, .. } => others.then_some(false),
+    // (wholly ahead of my front along my heading)
+    let ahead_of_me = |b: &Obb| b.corners().map(|c| (c - me.pos.truncate()).dot(f0)).iter().cloned().fold(f64::INFINITY, f64::min) >= st.front as f64;
+    // (the vehicles swept are those whose origin lies within `reach` of mine - the move's road and
+    // 20 m, as before L3; the lanes of my own way: a body on them ahead of me is my lead's or the
+    // car following's - as far along my way as that: a gathered body's origin is no further along
+    // its lane than it is from me in a straight line, so every one on my way is on these lanes)
+    let reach = level + 20.0;
+    let own_way: Vec<usize> = match bodies {
+        Bodies::Over { .. } => crate::perception::way_lanes(net, st, reach).into_iter().map(|w| w.0).collect(),
+        Bodies::All => Vec::new(),
     };
-    // (a body where it is when my body is `d` metres on: carried on along its heading at its
-    // speed for the time my body takes there at the speed `Bodies::Over` names)
-    let at = |mut b: Obb, heading: f32, speed: f32, carried: bool, d: f32| {
-        if let (true, Bodies::Over { speed: v, .. }) = (carried, bodies) {
+    // (how a body of this speed, on this lane, is swept - one rule whatever its speed, so the start
+    // check and the re-sweep while the change signals make the same test of a car creeping that
+    // stands a moment later: beside me, carried on at its speed (the rear's swing); ahead of my
+    // front, off my own way, where it will be braking from now at the maximal deceleration (the
+    // least it will have moved on, SUMO's secure gap); ahead on my own way, standing where it
+    // stands, moving the car following's - and with a lead standing within the move
+    // (`near_standing_lead`, `others`) every body ahead by that bound; behind
+    // my rear, standing where it is, moving the gap rule's, or where it is with `others`)
+    // (braking, every body at the maximal deceleration, `braking_run`)
+    let brake = omsi_sim::traffic::MAX_BRAKE;
+    let swept = |speed: f32, lane: Option<usize>, b: &Obb| -> Option<Carry> {
+        let moving = speed.abs() >= STANDING_SPEED;
+        match bodies {
+            Bodies::All => Some(Carry::Now),
+            Bodies::Over { .. } if beside(b) => Some(if moving && bodies.time_to(0.0).is_some() { Carry::Span(brake) } else { Carry::Now }),
+            Bodies::Over { others, .. } if ahead_of_me(b) => {
+                let to_stop = Carry::ToStop(brake);
+                if others || !lane.is_some_and(|l| own_way.contains(&l)) {
+                    Some(to_stop)
+                } else {
+                    // (on my own way: standing, where it stands; moving, the car following's)
+                    (!moving).then_some(Carry::Now)
+                }
+            }
+            Bodies::Over { others, .. } => (!moving || others).then_some(Carry::Now),
+        }
+    };
+    // (a body where it is when my body is `d` metres on, `Carry`, over the time my body takes there,
+    // `Bodies::time_to`)
+    let at = |mut b: Obb, heading: f32, speed: f32, carry: Carry, d: f32| {
+        let run = match (carry, bodies.time_to(d)) {
+            (Carry::AtSpeed, Some(t)) => speed * t,
+            (Carry::ToStop(brake), Some(t)) => braking_run(speed, brake, t),
+            (Carry::Span(_), _) => unreachable!("a span is swept at both its ends, `sep_of`"),
+            _ => 0.0,
+        };
+        if run != 0.0 {
             let h = (heading as f64).to_radians();
-            b.center += DVec2::new(h.sin(), h.cos()) * (speed * d / v) as f64;
+            b.center += DVec2::new(h.sin(), h.cos()) * run as f64;
         }
         b
     };
-    let near: Vec<(usize, bool)> = sim.vehicles_near(me.pos, (level + 20.0) as f64).into_iter().filter_map(|j| swept(vehicles[j].state.speed, &vehicles[j].obb()).map(|c| (j, c))).collect();
+    // (the least separation of a body so carried from my pose `b`: a span at both its ends)
+    let sep_of = |o: Obb, heading: f32, speed: f32, carry: Carry, d: f32, b: &Obb| -> f64 {
+        match carry {
+            Carry::Span(brake) => at(o, heading, speed, Carry::AtSpeed, d).separation(b).min(at(o, heading, speed, Carry::ToStop(brake), d).separation(b)),
+            c => at(o, heading, speed, c, d).separation(b),
+        }
+    };
+    let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, reach as f64).into_iter().filter_map(|j| {
+        let o = &vehicles[j];
+        swept(o.state.speed, Some(o.state.lane), &o.obb()).map(|c| (j, c))
+    }).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
-    // (the last sample's pose and its least separation)
-    let mut prev: Option<(Obb, f64)> = None;
-    let mut d = 0.0f32;
-    while d <= level {
+    // (my body's pose `d` metres on and its least separation from what is swept)
+    let pose_sep = |d: f32| -> (Obb, f64) {
         let (lat, slope) = match profile {
             Profile::Smooth { pre } => {
                 let t = ((d - pre) / out_len.max(0.1)).clamp(0.0, 1.0);
@@ -1841,25 +2533,66 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         for &(j, carried) in &near {
             let o = &vehicles[j];
             if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
-                sep = sep.min(at(o.obb(), o.heading, o.state.speed, carried, d).separation(&b));
+                sep = sep.min(sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b));
             }
         }
         for pl in sim.players.iter().filter(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0) {
             let pb = pl.obb(0.0, 0.0);
-            if let Some(carried) = swept(pl.speed, &pb) {
-                sep = sep.min(at(pb, pl.heading, pl.speed, carried, d).separation(&b));
+            if let Some(carry) = swept(pl.speed, None, &pb) {
+                sep = sep.min(sep_of(pb, pl.heading, pl.speed, carry, d, &b));
             }
         }
         for o in parked.iter().chain(people) {
             sep = sep.min(o.separation(&b));
         }
-        if !sample_clear(&mut prev, b, sep, clearance) {
+        (b, sep)
+    };
+    // (the last sample: where, its pose and its least separation)
+    let mut prev: Option<(f32, Obb, f64)> = None;
+    let mut d = 0.0f32;
+    while d <= level {
+        let (b, sep) = pose_sep(d);
+        let ok = match prev {
+            Some(a) => sweep_step_clear(&pose_sep, a, (d, b, sep), clearance),
+            None => sep >= clearance,
+        };
+        if !ok {
+            // (diagnostics: what the failing pose meets, `Plan::abort_detail`)
+            SWEEP_BLOCKER.with(|c| {
+                let mut best: (f64, Option<SweepBlocker>) = (f64::INFINITY, None);
+                for &(j, carried) in &near {
+                    let o = &vehicles[j];
+                    if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
+                        let sp = sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b);
+                        if sp < best.0 {
+                            best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried != Carry::Now, sp as f32, d)));
+                        }
+                    }
+                }
+                for (kind, o) in parked.iter().map(|o| (1u8, o)).chain(people.iter().map(|o| (2u8, o))) {
+                    let sp = o.separation(&b);
+                    if sp < best.0 {
+                        best = (sp, Some((kind, 0, 0, 0.0, false, sp as f32, d)));
+                    }
+                }
+                c.set(best.1);
+            });
             return false;
         }
+        prev = Some((d, b, sep));
         // (the arcs' bends turn the body fast: sampled finer)
         d += if matches!(profile, Profile::FullLock { .. }) { 0.05 } else { 0.5 };
     }
     true
+}
+
+/// What a failing swept move met (diagnostics, `Plan::abort_detail`): (kind 0 vehicle, 1 parked,
+/// 2 person; id; lane; speed; carried on; separation; where along the move).
+pub type SweepBlocker = (u8, u64, usize, f32, bool, f32, f32);
+
+thread_local! {
+    /// What the last failing swept move met (diagnostics, `Plan::abort_detail`).
+    static SWEEP_BLOCKER: std::cell::Cell<Option<SweepBlocker>> = const { std::cell::Cell::new(None) };
 }
 
 /// What the driver does about the light ahead this frame.
@@ -2284,21 +3017,32 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         }
     }
 
-    // asked to make room for a car whose lane ends beside me (SUMO's cooperative
-    // follower, `informFollower`): its rear my lead, braking no harder than my comfortable
-    // brake times `HELP_DECEL_FACTOR` (`Vehicle::help_for`)
+    // asked to make room for a car whose lane ends beside me, or whose urgent strategic change
+    // into my lane is blocked (SUMO's cooperative follower, `informFollower`, `LCA_AMBLOCKINGFOLLOWER`):
+    // its rear my lead, braking no harder than my comfortable brake times `HELP_DECEL_FACTOR`
+    // (`Vehicle::help_for`), the advice weighed by `LC_COOPERATIVE` against the speed I would
+    // drive otherwise (LC2013's `_patchSpeed`)
     // (it keeps its own standing gap behind the place the changer's acceptance
     // needs it to be: its lead is the changer's rear less that gap - following the rear itself it
     // came to rest at its standing gap, which the acceptance at rest never takes, and both stood)
-    if let Some((_, gap, v_r, need)) = me.help_for.filter(|h| h.3 <= 0.0) {
+    // (not while an urgent lane-end or strategic wish of my own stands: LC2013's order of
+    // motivations puts my own urgent strategic change before cooperation, sumo.md 3.2)
+    let own_urgent = me.help_for.is_some()
+        && [p.left, p.right].into_iter().flatten().any(|nb| lane_end_desire(net, sim, me, p, &nb) > 0.0 || strategic_desire(net, sim, vehicles, me, &nb).is_some_and(|s| s.0 > 0.0));
+    let coop = LC_COOPERATIVE.clamp(0.0, 1.0);
+    if let Some((_, gap, v_r, need)) = me.help_for.filter(|h| h.3 <= 0.0 && !own_urgent) {
         // (asked only not to speed up: the changer is faster and cuts in as the gap opens)
         let _ = (gap, v_r, need);
-        out.accel_cap = Some(out.accel_cap.map_or(0.0, |c| c.min(0.0)));
-    } else if let Some((_, gap, v_r, need)) = me.help_for {
-        // (it rests at its own standing gap behind the place the acceptance needs, so the gap it
-        // opens is the one the changer accepts, `gap_needed_behind`)
-        let lead = Lead { gap: (gap - (need - st.min_gap)).max(0.05), speed: v_r, acc: 0.0 };
-        let cap = st.desired_accel(net, Some(lead), None).max(-dp.comfort_brake * HELP_DECEL_FACTOR);
+        let cap = (1.0 - coop) * st.accel;
+        out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
+    } else if let Some((_, gap, v_r, need)) = me.help_for.filter(|_| !own_urgent) {
+        // (its lead is the changer's rear less the whole of `need`, `gap_needed_behind`, as said
+        // above: led by the rear less only `need`'s speed terms, at rest it followed the rear
+        // itself, stood a few millimetres inside the standing gap the acceptance needs, and the
+        // two stood for as long as the changer did - viz2 case08 #24323 behind #24021, 50 s)
+        let lead = Lead { gap: (gap - need).max(0.05), speed: v_r, acc: 0.0 };
+        let help = st.desired_accel(net, Some(lead), None).max(-dp.comfort_brake * HELP_DECEL_FACTOR);
+        let cap = coop * help + (1.0 - coop) * st.accel;
         if cap < st.accel {
             out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
         }
@@ -2422,22 +3166,33 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
     }
 
     // a lane change of the driver's own (a bypass too) checks its gap again on every frame of
-    // its signal, and that nobody is on the target lane over the move (`people_on_move`) - a
-    // bypass also that its move is still clear (below) - and is dropped if any fails before the
+    // its signal, and that nobody is on the target lane over the move (`people_on_move`) - and that its
+    // move is still clear of the bodies near (below) - and is dropped if any fails before the
     // car moves over (SUMO's `checkChange` runs every step
     // until the change is carried out, and blocks it for a pedestrian on the target lane within
-    // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end asks for keeps
-    // informing the follower there (LC2013's `informFollower`, every step the strategic change
+    // the brake gap, `MSLaneChanger::checkChange` `nextBlocking`); a change the lane's end or an
+    // urgent strategic wish (`strategic_desire`) asks for keeps informing the follower there (LC2013's `informFollower`, every step the strategic change
     // is wanted and not yet carried out: SUMO carries it out in the step it is accepted, the
     // OMSI driver signals first, and the follower that made room is not let go meanwhile)
     if let Some(c) = st.change.filter(|c| c.wait > 0.0 && c.t <= 0.0 && st.route.is_empty()) {
         if let Some(nb) = change_target_view(p, c.to, c.dir) {
-            if let (true, Some(f), Some((gap, vb))) = (lane_end_desire(net, sim, me, p, &nb) > 0.0, nb.behind_id, nb.behind) {
+            let urgent = lane_end_desire(net, sim, me, p, &nb) > 0.0 || strategic_desire(net, sim, vehicles, me, &nb).is_some_and(|s| s.0 > 0.0);
+            if let (true, Some(f), Some((gap, vb))) = (urgent, nb.behind_id, nb.behind) {
                 if gap > 0.0 {
-                    out.help = Some((f, gap, v, gap_needed_behind(me, &nb, vb, v)));
+                    out.help = Some((f, gap, v, help_gap_behind(me, &nb, vb, v)));
                 }
             }
-            out.abort_change = !gap_accepted(me, &nb) || people_on_move(net, sim, me, &nb);
+            let (ok_behind, ok_ahead) = gap_parts(me, &nb);
+            out.abort_why = if !ok_behind {
+                Some(AbortWhy::GapBehind)
+            } else if !ok_ahead || nb.foreign {
+                Some(AbortWhy::GapAhead)
+            } else if people_on_move(net, sim, me, &nb) {
+                Some(AbortWhy::People)
+            } else {
+                None
+            };
+            out.abort_change = out.abort_why.is_some();
             // (a bypass from rest also sweeps its move again, as it did at its start,
             // `bypass_start`: every body near, not only the target lane's follower - one that came
             // to stand in the swept band or alongside since; SUMO checks every sublane it moves
@@ -2448,15 +3203,50 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // beyond it there (`Perception::bypassed`; not the lead, which with the change laid
             // on the way can be the target lane's car), while it stands; it sweeps the kind of
             // move started, the smoothstep or the two arcs at full lock, as the car drives that one
-            // and not whichever clears now. Once that thing has moved off or gone from my way, the
-            // car still drives the bypass move it started, checked only by the gap and people
-            // rules above, as it always was when its lead left)
+            // and not whichever clears now. Once that thing has moved off, or gone from my way, the
+            // car still drives the move it committed to, so that move - its length and kind as
+            // started - is swept the same way from the same pose, up to level with the thing and
+            // what stands beyond it while it is on my way, over the move itself once it is gone;
+            // a sweep that fails drops the change, counted as every drop, `sim::CHANGES_ABORTED`)
+            // (a plain change sweeps its move again as `change_clear` swept it at the start, its
+            // move beginning after the signal still to run, from the pose the car has on its own
+            // lane's way: a car that came beside since, standing or rolling level with my body
+            // where the rear swings, drops it; counted as every drop, `sim::CHANGES_ABORTED`)
+            // (where that move no longer clears a leader standing within it - the car closed up on
+            // a leader that came to rest - the change goes on as the step-out a change started
+            // from here would be, `bypass_start` from the change-less pose: the car stops and steps
+            // out round it from the room it kept, `change_keep_room`; OMSI geometry, a body turns
+            // as it moves over. Dropped only where that does not clear either)
+            if !out.abort_change && !c.bypass {
+                let mut before = me.clone();
+                before.state.drop_change();
+                (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
+                let near = near_standing_lead(p, v, (c.wait, c.length));
+                if !change_clear(net, sim, vehicles, &before, p, &nb, near.as_ref(), (c.wait, c.length)) {
+                    match near.and_then(|l| bypass_start(net, sim, vehicles, &before, &p.ahead, p.road_left, &nb, &l, None)) {
+                        Some(step_out) if out.start.is_none() => out.start = Some(step_out),
+                        // (a lead that will stand within the move while the car can still stop at
+                        // the room to turn out behind it, `change_keep_room`: the change goes on -
+                        // the car brakes to that room and steps out from there, as it would once
+                        // the lead stands; dropped only where it no longer can)
+                        _ if near.is_some() && change_keep_room(net, me, p).is_some() => {}
+                        _ => {
+                            (out.abort_change, out.abort_why) = (true, Some(AbortWhy::PlainSweep));
+                            out.abort_detail = SWEEP_BLOCKER.with(|c| c.get());
+                        }
+                    }
+                }
+            }
             if !out.abort_change && c.bypass {
-                if let Some(b) = p.bypassed.as_ref().filter(|b| b.lead.speed < STANDING_SPEED) {
-                    let mut before = me.clone();
-                    before.state.drop_change();
-                    (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
-                    out.abort_change = bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none();
+                let mut before = me.clone();
+                before.state.drop_change();
+                (before.pos, before.heading) = crate::sim::way_pose(net, &before.state);
+                out.abort_change = match p.bypassed.as_ref() {
+                    Some(b) if b.lead.speed < STANDING_SPEED => bypass_start(net, sim, vehicles, &before, &b.ahead, p.road_left, &nb, &b.lead, Some(c.full_lock)).is_none(),
+                    b => !bypass_side(net, &before, &nb).is_some_and(|side| bypass_move_clear(net, sim, vehicles, &before, b.map_or(&[][..], |b| &b.ahead[..]), p.road_left, side, b.map(|b| &b.lead), c.length, c.full_lock)),
+                };
+                if out.abort_change {
+                    out.abort_why = Some(AbortWhy::BypassSweep);
                 }
             }
         }
@@ -2469,22 +3259,36 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         min_stop(&mut out.stop, &mut out.why, Some(st.front + v * v / (2.0 * dp.comfort_brake.max(0.1))), Why::Lead);
     }
 
+    // a plain change signalling keeps the room to turn out behind its leader (`change_keep_room`)
+    if let Some(dist) = change_keep_room(net, me, p) {
+        min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);
+    }
+
     // 7. a lane change of the driver's own: round something standing, for speed, to keep
     //    to the side, into the lane of the turn ahead
     let free_to_change = st.change.is_none() && st.route.is_empty() && st.change_cooldown <= 0.0 && me.passing.is_none() && out.start.is_none() && !me.is_rail() && lane.length() - st.s > 9.0;
     if free_to_change {
         let near_junction = p.junction.as_ref().map(|j| !j.inside && j.line < JUNCTION_KEEP).unwrap_or(false);
         let mut best: Option<(f32, NeighbourView, ChangeWhy)> = None;
-        // the strongest lane-end wish whose gap is not there
-        let mut blocked_end: Option<(f32, NeighbourView)> = None;
+        // the strongest lane-end or urgent strategic wish: (desire, the lane beside, the distance
+        // from my front to where my lane ends for me - the lane's end, `Perception::lane_end`, or
+        // the dead lane's end, `strategic_desire` - and whether the car stops before it for the
+        // change: not at a merge, the zipper's; whether that end is a dead lane's, which runs on;
+        // and whether its gap is there)
+        let mut urgent_end: Option<(f32, NeighbourView, f32, bool, bool, bool)> = None;
         for nb in [p.left, p.right].into_iter().flatten() {
-            let (d, ok, why) = change_desire(net, sim, me, p, &nb, near_junction, ant(&nb));
+            let (d, ok, why) = change_desire(net, sim, vehicles, me, p, &nb, near_junction, ant(&nb));
             if ok && d > 0.0 && best.map(|b| d > b.0).unwrap_or(true) {
                 best = Some((d, nb, why));
             }
             let end = lane_end_desire(net, sim, me, p, &nb);
-            if !ok && end > 0.0 && blocked_end.map(|b| end > b.0).unwrap_or(true) {
-                blocked_end = Some((end, nb));
+            let urgent = match p.lane_end {
+                Some(e) if end > 0.0 => Some((end, nb, e.dist, e.kind != LaneEndKind::Merge, false, ok)),
+                _ if d > 0.0 && why == ChangeWhy::Strategic => strategic_desire(net, sim, vehicles, me, &nb).map(|(_, dist)| (d, nb, dist, true, true, ok)),
+                _ => None,
+            };
+            if let Some(b) = urgent.filter(|b| urgent_end.map(|o| b.0 > o.0).unwrap_or(true)) {
+                urgent_end = Some(b);
             }
         }
         let threshold = 0.4 - 0.2 * me.impatience.value;
@@ -2494,27 +3298,80 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // body steers out round the one in front)
             // (under way the move itself must clear the parked cars, the people, the standing
             // bodies near and the moving ones beside me where they will be, `change_clear`)
-            let near = p.leader.filter(|l| l.speed < STANDING_SPEED && l.gap < omsi_sim::traffic::change_length(v.max(0.0)) + v * omsi_sim::traffic::SIGNAL_BEFORE_CHANGE);
+            let mv = (signal_left(me, nb.dir, sim.time), omsi_sim::traffic::change_length(v.max(0.0)));
+            let near = near_standing_lead(p, v, mv);
+            // (the move swept from the pose the car has on its own lane's way, `sim::way_pose`, as the
+            // re-sweep while it signals sweeps it: a car still easing back into its lane - a change
+            // just dropped - was checked from where it stood out and re-swept from its lane)
+            let mut on_way = me.clone();
+            (on_way.pos, on_way.heading) = crate::sim::way_pose(net, &on_way.state);
             out.start = match near {
                 Some(l) if v < 1.0 => bypass_start(net, sim, vehicles, me, &p.ahead, p.road_left, &nb, &l, None),
-                Some(l) => change_clear(net, sim, vehicles, me, p, &nb, Some(&l)).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
-                None => change_clear(net, sim, vehicles, me, p, &nb, None).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
-            };
+                Some(l) => change_clear(net, sim, vehicles, &on_way, p, &nb, Some(&l), mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
+                None => change_clear(net, sim, vehicles, &on_way, p, &nb, None, mv).then_some(Start::Change { to: nb.lane, dir: nb.dir }),
+            }
+            .filter(|s| matches!(s, Start::Bypass { .. }) || gaps_through_signal(me, p, &nb, mv.0));
+            out.signal_wait = Some(mv.0);
             out.change_why = Some(why);
-        } else if let Some((_, nb)) = blocked_end.filter(|b| b.0 >= threshold) {
-            // SUMO LC2013's cooperation (`informFollower`, sumo.md 3.3): the follower there,
-            // when only it is in the way (room ahead there), is asked to make room
-            // the gap my acceptance needs from it (`gap_needed_behind`); one level with me or ahead
-            // (no gap behind my rear) is not asked to brake: it must be overtaken - I slow so it
-            // passes by the lane's end (LC2013's `needDV = overtakeDist / remainingSeconds`)
-            let (ok_behind, ok_ahead) = gap_parts(me, &nb);
-            // (to fall in behind a vehicle there: how far I must drop back, and its speed)
-            let mut drop_back: Option<(f32, f32)> = None;
+            if out.start.is_some() && me.lc_impatience > 0.0 {
+                let mut calm = me.clone();
+                calm.lc_impatience = 0.0;
+                out.impatient_start = !(gap_accepted(&calm, &nb) && gaps_through_signal(&calm, p, &nb, mv.0));
+            }
+        }
+        // an urgent lane-end or strategic change not started this frame - its gap not there, or
+        // its gap there and its move not clear - keeps the car to its last-resort stop before the
+        // end (SUMO: while the urgent change is wanted, the planned speed is at most the speed that
+        // stops at the end of the lane, `informLeader`'s `stopSpeed(myLeftSpace - ...)`)
+        if let Some((_, nb, end_dist, stop_for, dead, ok)) = urgent_end.filter(|b| b.0 >= threshold && out.start.is_none()) {
+            out.urgent_blocked = true;
+            out.urgent_side = nb.dir;
+            // SUMO LC2013's speed advice for a blocked urgent change (sumo.md 3.3, `_wantsChange`'s
+            // urgent branch): first the leader there (`informLeader`), then - unless I overtake
+            // that leader - the follower there with the speed I plan (`informFollower`), both every
+            // frame the change stays blocked; none where the gap is there
+            // (the gap now and where the move would begin, `gaps_through_signal`: a change whose gap
+            // is there now but not at the end of its signal is blocked by that vehicle too)
+            let (ok_behind, ok_ahead) = {
+                let (b0, a0) = if ok { (true, true) } else { gap_parts(me, &nb) };
+                let (b1, a1) = gap_parts_through_signal(me, p, &nb, signal_left(me, nb.dir, sim.time));
+                (b0 && b1, a0 && a1)
+            };
+            // (the time left to the end as LC2013 counts it, `URGENCY`: by the look-ahead speed,
+            // which falls slowly, not the speed now - a car crawling up behind its own standing
+            // leader at its lane's end counted a minute left, and the follower beside it was asked
+            // to brake for a change that could not come, standing at the junction's exit behind it,
+            // game run p3p81 #74 for #3312 on 1666/1668)
+            // (over the changes still needed, SUMO's `remainingLanes = MAX2(1, abs(bestLaneOffset))`:
+            // a dead lane's, `changes_to_lead`; a lane's end, one)
+            let lanes = if dead { trip_field(me).and_then(|f| changes_to_lead(net, f, st.lane, nb.dir, Some(nb.lane))).unwrap_or(1).max(1) } else { 1 };
+            let remaining = (end_dist / me.look_ahead_speed.max(NUMERICAL_EPS) / lanes as f32 / URGENCY).max(SUMO_STEP);
+            // (to fall in behind a vehicle there: how far I must drop back, and its speed; SUMO
+            // takes the least of the speed advices to itself)
+            let mut drop_back: Vec<(f32, f32)> = Vec::new();
+            // (I overtake the leader there: the follower is not informed, SUMO's `informLeader`
+            // returning -1)
+            let mut overtakes = false;
             if let (false, Some((g, va))) = (ok_ahead, nb.ahead) {
-                // the one ahead there too close (LC2013 `informLeader`: I cannot overtake it, I
-                // stay behind it)
-                drop_back = Some(((2.0 + (v - va).max(0.0) * 1.5) - g, va));
-            } else if let (false, Some(f), Some((gap, vb))) = (ok_behind, nb.behind_id, nb.behind) {
+                // the one ahead there too close (LC2013 `informLeader`): one that has stood longer
+                // than `BLOCKER_IS_BLOCKED_TIME` is overtaken where both lengths with their standing
+                // gaps fit in what is left to my lane's end - I drive on towards my stop and get
+                // ahead of it; else I cannot overtake it and stay behind it
+                let blocker = nb.ahead_id.and_then(|k| vehicles.get(k));
+                overtakes = blocker.is_some_and(|o| o.stopped > BLOCKER_IS_BLOCKED_TIME && me.length() + st.min_gap + o.length() + o.params.min_gap <= end_dist);
+                if !overtakes {
+                    drop_back.push((ahead_needed(me, v, va) - g, va));
+                }
+            }
+            // (the speed I plan: my own, or the one that drops me back behind the leader there,
+            // LC2013's `plannedSpeed` handed to `informFollower`)
+            let advice = |(overtake, v_other): (f32, f32)| (v_other - overtake / remaining).max(0.0);
+            let planned = drop_back.iter().map(|&d| advice(d)).fold(v, f32::min);
+            if let (false, false, Some(f), Some((gap, vb))) = (overtakes, ok_behind, nb.behind_id, nb.behind) {
+                // the follower there, when it misses the gap my acceptance needs from it, is asked to
+                // make room (`gap_needed_behind`); one level with me or ahead (no gap behind my rear)
+                // that I do not get ahead of in time must overtake me - I slow so it passes by the
+                // lane's end (LC2013's `needDV = overtakeDist / remainingSeconds`)
                 // (SUMO's `neededGap`/`decelGap` test before the `helpDecel` branch:
                 // asked to brake only if it can still open the gap from where it is - braking at
                 // its comfortable brake (times `HELP_DECEL_FACTOR`) to rest while I go on to my
@@ -2522,33 +3379,52 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 // else it is told not to brake and I change in behind it. Asked when it could
                 // not, the second follower of a chain would stand behind my rear closer than the
                 // gap the acceptance needs at rest, and all would stand)
-                let reach = p.lane_end.map_or(f32::INFINITY, |e| {
-                    let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
-                    (e.dist - change_space(0.0, st.accel).max(bypass_min_len(me.length(), side))).max(0.0)
-                });
+                // (a changer that stands goes on to no stop: held at its last-resort stop within
+                // `REST_SHORT` of it, or behind what stands before it, it does not creep the rest -
+                // SUMO's decelGap reads the changer's planned speed, here 0 - so a follower already
+                // standing inside the gap is not asked to open it: asked, it stood behind the
+                // changer for as long as the changer stood, a queue back over the junction behind,
+                // the Jiangzhaikou exit hold, game run p3p32 #2260 behind #2261 on 1666/1668)
+                let reach = if planned < STANDING_SPEED { 0.0 } else { (end_dist - last_stop_room(net, me, &nb)).max(0.0) };
                 let b_f = vehicles.get(f).map_or(dp.comfort_brake, |o| o.params.comfort_brake) * HELP_DECEL_FACTOR;
                 let can_open = gap + reach - vb * vb / (2.0 * b_f.max(0.1)) >= nb.behind_min_gap;
                 if gap > 0.0 && can_open {
                     // (SUMO's first branch: faster than the follower so that the gap opens by itself
                     // before the lane ends, I cut in - it is only asked not to speed up, `need` 0;
                     // else it is asked to open the gap)
-                    let need = gap_needed_behind(me, &nb, vb, v);
-                    let opens = p.lane_end.is_some_and(|e| v > vb && gap + (v - vb) * e.dist / v.max(STANDING_SPEED) >= need);
+                    let need = help_gap_behind(me, &nb, vb, planned);
+                    let opens = planned > vb && gap + (planned - vb) * end_dist / planned.max(STANDING_SPEED) >= need;
                     let need = if opens { 0.0 } else { need };
-                    out.help = Some((f, gap, v, need));
+                    out.help = Some((f, gap, planned, need));
                 } else if let Some(o) = vehicles.get(f) {
-                    drop_back = Some((me.length() + o.length() + gap + st.min_gap, vb));
+                    // (SUMO's "eventually" branch: faster than the follower after it has braked a
+                    // second at its help brake - `neighNewSpeed1s` - I get ahead of it before the end,
+                    // the gap growing by that difference: it is asked to brake, I drive on;
+                    // a follower level with me or ahead included - one standing beside me is
+                    // passed, not waited for)
+                    let vb1 = (vb - b_f).max(0.0);
+                    let dv = planned - vb1;
+                    let need = help_gap_behind(me, &nb, vb1, planned);
+                    if dv > 0.0 && dv * remaining > need - (gap + dv) {
+                        out.help = Some((f, gap, planned, need));
+                    } else {
+                        // (else it must overtake me: LC2013 lets it pass at `vhelp`, its speed or
+                        // mine and `HELP_OVERTAKE`, whichever is more, and I slow by what that
+                        // overtaking needs over the time left, `needDV`)
+                        drop_back.push((me.length() + o.length() + gap + st.min_gap, vb.max(v + HELP_OVERTAKE)));
+                    }
                 }
             }
-            if let (Some((overtake, v_other)), Some(e)) = (drop_back, p.lane_end) {
-                let remaining = e.dist / v.max(STANDING_SPEED);
-                let target = (v_other - overtake / remaining).max(0.0);
+            if let Some(target) = drop_back.into_iter().map(advice).reduce(f32::min) {
                 if target < v {
                     let cap = ((target - v) / st.headway.max(0.1)).max(-dp.comfort_brake * HELP_DECEL_FACTOR);
                     out.accel_cap = Some(out.accel_cap.map_or(cap, |c| c.min(cap)));
                 }
             }
-            // ... and the last resort where the lane really ends (a merge is the zipper's): the
+            // ... and the last resort where the lane really ends (a merge is the zipper's) or
+            // where a dead lane ends for an urgent strategic change (SUMO LC2013: while the
+            // change is blocked the vehicle adapts its speed to stop at the end of the lane, and
+            // waits there for a gap, sumo.md 3.2-3.3): the
             // car stops before the end with the room to move over from standing (the cleanup's
             // keep-back for a bypass: a lane change's shortest move, or what the body needs to
             // steer the lane's width over, whichever is longer) - braking for it only once it
@@ -2558,14 +3434,32 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (once placed it is kept - a latch, `Vehicle::lane_end_stop` - until the change
             // starts or the car stands: placed and dropped by the brake test frame by frame, it
             // flicked on and off in the last metre, an 8 m/s² brake-light flicker)
-            if let Some(e) = p.lane_end.filter(|e| e.kind != LaneEndKind::Merge) {
-                let side = (lane.width + net.lanes[nb.lane].width) * 0.5;
-                let room = change_space(0.0, st.accel).max(bypass_min_len(me.length(), side));
+            // (a dead lane runs on: a car that can no longer stop before its end at its
+            // comfortable brake is past the point of no return and drives on through the fork,
+            // `omsi_sim::traffic::STRATEGIC_MISSED`; so is one past the stop's place, as at a
+            // lane's end. Nor does it stop for it on a junction object's piece: SUMO changes lanes
+            // on the edges and no vehicle stands on an internal lane for its change - standing
+            // there it holds the junction's foes - so a change still blocked there is missed)
+            let room = last_stop_room(net, me, &nb);
+            let on_piece = |at: f32| p.way.iter().take_while(|w| w.1 <= at).last().is_some_and(|w| net.lanes[w.0].source == 2);
+            if stop_for && !(dead && on_piece(st.front + end_dist - room)) {
                 let latched = me.lane_end_stop.filter(|_| v >= STANDING_SPEED).map(|o| st.front + (o - st.odometer));
-                let at = latched.unwrap_or(st.front + e.dist - room);
-                if latched.is_some() || (at > st.front - 0.3 && at - st.front <= v * v / (2.0 * dp.comfort_brake)) {
+                let at = latched.unwrap_or(st.front + end_dist - room);
+                let brake = v * v / (2.0 * dp.comfort_brake);
+                let returns = !dead || end_dist >= brake;
+                // (standing there it stays - the stop alone holds it, landed within `REST_SHORT`
+                // either side of it: from rest the brake test places no stop a centimetre ahead,
+                // the car crept on, stopped again past it, and each creep took it further until it
+                // was past the stop's place and drove on to the end, round7j q84 at 75 s)
+                // (a car standing further short of it - behind its own lead in a queue, or behind
+                // a leader there it drops back behind - is held by that, not by the stop: no hold,
+                // and none counted, `sim::STRATEGIC_HOLD_MS`)
+                let holds = v < STANDING_SPEED && (at - st.front).abs() <= REST_SHORT;
+                let at = if holds { at.max(st.front) } else { at };
+                if latched.is_some() || holds || (returns && at > st.front - 0.3 && at - st.front <= brake) {
                     min_stop(&mut out.stop, &mut out.why, Some(at), Why::Merge);
                     out.lane_end_stop = Some(st.odometer + (at - st.front));
+                    out.dead_end_hold = holds && dead;
                 }
             }
         }
@@ -2659,8 +3553,25 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         // overtaken there (SUMO: a vehicle does not overtake within the lane one that has
         // announced a change into its path, the sublane model's blinker; as the bus and the
         // player above)
+        // (only one I would pass alongside: a vehicle standing across my way - its heading nearer my
+        // way's crosswise axis than its lengthwise one - whose nose is what reaches into my way is
+        // crossed in front of, not passed alongside, and its indicator says where it will turn, not
+        // that it will move into my path beside it: the road rule against overtaking on the side a
+        // vehicle indicates is about passing it alongside, ours; viz2 j17, a car going straight past
+        // a right-turning lorry's front)
+        let alongside = |o: &Vehicle| {
+            let h = (me.heading as f64).to_radians();
+            let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
+            let ho = (o.heading as f64).to_radians();
+            let of = DVec2::new(ho.sin(), ho.cos());
+            let across = of.dot(right).abs() > of.dot(fwd).abs();
+            // (its nose nearer my way's axis than its tail)
+            let nose = o.pos.truncate() + of * o.state.front as f64 - me.pos.truncate();
+            let tail = o.pos.truncate() - of * o.state.rear as f64 - me.pos.truncate();
+            !(across && nose.dot(right).abs() < tail.dot(right).abs())
+        };
         let vehicle_out = |side: f32| match l.what {
-            Seen::Vehicle(j) | Seen::Body(j) => side != 0.0 && vehicles.get(j).is_some_and(|o| o.blinker_shown.0 == if side < 0.0 { 1 } else { 2 }),
+            Seen::Vehicle(j) | Seen::Body(j) => side != 0.0 && vehicles.get(j).is_some_and(|o| o.blinker_shown.0 == if side < 0.0 { 1 } else { 2 } && alongside(o)),
             Seen::Player(_) | Seen::Parked => false,
         };
         // a bus does not pass what stands at its own next stop
@@ -2676,13 +3587,45 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let towards_middle = sim.oncoming_sign();
         let (lo, hi) = body_across(net, sim, vehicles, me, &l);
         let away = if l.lateral * towards_middle > 0.3 { -towards_middle } else { towards_middle };
+        // the squeeze's offset: the least sideways move that keeps `MIN_GAP_LAT` from the thing
+        // passed (SUMO's sublane `minGapLat`, the only bound: the user's decision L3-D1). Where the
+        // corridor at that offset does not clear (from close behind, the move's shortest steerable
+        // length meets the thing's near corner before the body is out), there is no squeeze: the
+        // car waits, or changes lane or passes by the other rules
         let squeeze_side = if away < 0.0 { lo - MIN_GAP_LAT - me.half_width } else { hi + MIN_GAP_LAT + me.half_width };
-        // (a junction object's piece has no edge data: its lane reaches halfway to the piece
-        // laid beside it, `Network::piece_beside` - the paths tile the carriageway - and no
-        // further than its half width where none lies beside)
+        // (the move the squeeze starts with: the usual one, or from nearer than that the
+        // shortest the body can steer, `bypass_min_len` - the out length the start uses below -
+        // and the stretch it runs level with what stands, to its end)
+        let squeeze_move = |side: f32| {
+            let out_len = squeeze_out(me, &l, side);
+            let (obstacle_len, _) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
+            (out_len, obstacle_len, real + obstacle_len + st.front + st.rear + 2.0)
+        };
+        // (nobody on the lane beside `nb` over the squeeze - ahead past what is passed and the
+        // way back in, behind the gap the driver accepts)
+        let empty_over = |nb: &NeighbourView, side: f32| {
+            let (out_len, obstacle_len, _) = squeeze_move(side);
+            nb.ahead.is_none_or(|a| a.0 > real + obstacle_len + out_len + PASS_ROOM) && gap_accepted(me, nb)
+        };
+        // (a junction object's piece: its drivable extent is the object's drawn road. The
+        // network holds no outline of the object's tarmac - its meshes' road faces are read only
+        // where the scene cuts the terrain - but the object's paths are drawn on its road (they
+        // tile its carriageway), so the drawn road reaches across the piece laid beside,
+        // `Network::piece_beside`: halfway to one the car may drive, the rest is that one's
+        // traffic's; over the whole width of one closed to the car while nobody is on it over the
+        // squeeze - it lends its width, the wheels cross the paint and the body keeps off its axis,
+        // `traffic_cap` below: the car does not drive in it; no further than its half width
+        // where none lies beside)
         let (drivable_left, drivable_right) = if lane.source == 2 {
-            let half = |nb: Option<NeighbourView>| nb.and_then(|nb| net.lanes[nb.lane].nearest_point(me.pos)).map_or(lane.width * 0.5, |(_, d)| (d as f32 * 0.5).max(lane.width * 0.5));
-            (half(p.left), half(p.right))
+            let half = |nb: Option<NeighbourView>| {
+                nb.and_then(|nb| net.lanes[nb.lane].nearest_point(me.pos).map(|(_, d)| (nb, d as f32))).map_or(lane.width * 0.5, |(nb, d)| {
+                    let lends = !nb.allowed && !nb.foreign && empty_over(&nb, squeeze_side);
+                    (if lends { d + net.lanes[nb.lane].width * 0.5 } else { d * 0.5 }).max(lane.width * 0.5)
+                })
+            };
+            // (and as far as the piece's lane edges where the map tells them, L3-D6)
+            let (el, er) = net.lane_edge_sides(st.lane);
+            (el.map_or(half(p.left), |e| e.max(half(p.left))), er.map_or(half(p.right), |e| e.max(half(p.right))))
         } else {
             lane.drivable()
         };
@@ -2705,31 +3648,46 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             }
             cap
         };
-        let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum()));
+        // (and over the squeeze's stretch the drivable road of every lane of my way on that side -
+        // a squeeze round a body inside the junction runs over its pieces, never past the kerb
+        // face or into another way's traffic, L3-D6)
+        let (_, _, squeeze_reach) = squeeze_move(squeeze_side);
+        // (a junction object's piece reaches as far as its lane's edges, `Network::lane_edge_sides`:
+        // the narrower edges of the lanes it joins; a piece whose edges are not known keeps its
+        // drawn width, `Lane::drivable`)
+        let side_extent = |w: usize| -> f32 {
+            let l = &net.lanes[w];
+            let (dl, dr) = l.drivable();
+            let (el, er) = if l.source == 2 { net.lane_edge_sides(w) } else { (None, None) };
+            if squeeze_side < 0.0 { el.map_or(dl, |e| e.max(dl)) } else { er.map_or(dr, |e| e.max(dr)) }
+        };
+        let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane && w.0 < net.lanes.len()).map(|w| side_extent(w.0)).fold(f32::INFINITY, f32::min);
+        let extent = (if squeeze_side < 0.0 { drivable_left } else { drivable_right }).min(traffic_cap(squeeze_side.signum())).min(way_extent);
+        // (the bent corridor - out, past what stands and back - touches no body now)
+        let corridor_clear = |side: f32| {
+            let (out_len, _, end) = squeeze_move(side);
+            squeeze_clear(net, sim, vehicles, me, &p.way, side, out_len, end, Passing::back_len_for(side))
+        };
         let reach = squeeze_side.abs() + me.half_width;
+        let (_, _, squeeze_end) = squeeze_move(squeeze_side);
         // not quite enough drawn road: the driver-side wheels may go `WHEELS_OVER_LINE` over
         // the line into the neighbour lane on that side when it is the car's to drive, nobody
         // passes on it the wrong way, no solid line, and it is free for the squeeze's length
-        // (ahead past what is passed and the way back in, behind the gap the driver accepts)
-        // (the move the squeeze starts with: the usual one, or from nearer than that the
-        // shortest the body can steer, `bypass_min_len` - the out length the start uses below)
-        let squeeze_out_len = squeeze_out(me, &l, squeeze_side);
-        let (squeeze_obstacle_len, _) = obstacle_run(p, &l, me.length() + squeeze_out_len + PASS_ROOM);
+        // (`empty_over`)
         let over_line = if reach > extent && reach <= extent + WHEELS_OVER_LINE && !solid {
             let nb = if squeeze_side < 0.0 { p.left } else { p.right };
-            nb.filter(|nb| nb.allowed && !nb.foreign && !net.lanes[nb.lane].no_overtaking && nb.ahead.is_none_or(|a| a.0 > real + squeeze_obstacle_len + squeeze_out_len + PASS_ROOM) && gap_accepted(me, nb))
+            nb.filter(|nb| nb.allowed && !nb.foreign && !net.lanes[nb.lane].no_overtaking && empty_over(nb, squeeze_side))
         } else {
             None
         };
-        // (and the bent corridor - out, past what stands and back - touches no body now, no
-        // person stops the car within it, and the thing passed has settled sideways)
-        let squeeze_end = real + squeeze_obstacle_len + st.front + st.rear + 2.0;
+        // (and the corridor clears, no person stops the car within it, and the thing passed has
+        // settled sideways)
         let squeeze = (reach <= extent || over_line.is_some())
             && !player_out
             && !vehicle_out(squeeze_side)
             && lateral_settled(vehicles, &l)
             && p.people_stop.is_none_or(|s| s > squeeze_end + Passing::back_len_for(squeeze_side))
-            && squeeze_clear(net, sim, vehicles, me, &p.way, squeeze_side, squeeze_out_len, squeeze_end, Passing::back_len_for(squeeze_side));
+            && corridor_clear(squeeze_side);
         let side = if squeeze { squeeze_side } else { p.oncoming.map(|o| o.side).unwrap_or(0.0) };
         let out_len = Passing::out_len_for(side);
         let room = out_len + 1.0;
@@ -2742,7 +3700,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let (obstacle_len, room_beyond) = obstacle_run(p, &l, me.length() + out_len + PASS_ROOM);
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
         let zone = if squeeze || !player { SQUEEZE_ZONE } else { PASS_ZONE_PLAYER };
-        let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false);
+        // (a squeeze round a body across my way inside the junction ahead - the user's decision
+        // L3-D6, ours: SUMO changes no lanes on internal lanes, this extends L3-D1's in-lane squeeze
+        // onto the junction's pieces - goes on a light that lets me go; a body standing past the
+        // junction's entry line is "in the junction")
+        let in_junction = squeeze && p.junction.as_ref().is_some_and(|j| j.inside || j.line < real + st.front);
+        let light_go = p.signal.is_some_and(|s| matches!(s.aspect, omsi_sim::traffic::Aspect::Green | omsi_sim::traffic::Aspect::GreenYellow));
+        let light_near = p.signal.map(|s| s.dist < real + st.front + obstacle_len + zone).unwrap_or(false) && !(in_junction && light_go);
         // (an in-lane squeeze is not kept `JUNCTION_KEEP` from a junction when the obstacle
         // stands within `SQUEEZE_NEAR`, and inside the junction already it may go where its
         // stretch - out, past the obstacle and back in - keeps clear of the foe stretches)
@@ -2751,11 +3715,14 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             if matches!(l.what, Seen::Parked) {
                 return false;
             }
-            // (inside a junction a squeeze keeps off the stretch where the ways meet: its
-            // body out of its lane's middle there would be where the junction's foes are
-            // not reckoned to be)
-            if squeeze && j.inside {
-                return squeeze_run > j.conflict_start && j.conflict_end > -st.rear;
+            // (inside a junction a squeeze keeps off a stretch where the ways meet while a foe
+            // there is in use - one moving in it, or one coming that reaches it before my body has
+            // left it - since its body out of its lane's middle there would be where that foe is
+            // not reckoned with: SUMO's foe-lane occupancy and approaching foes by their arrival.
+            // A foe standing there is no conflict for a move its body is clear of, which the
+            // squeeze's own sweep keeps by its clearance, `squeeze_clear`)
+            if squeeze && (j.inside || j.line < real + st.front) {
+                return squeeze_foe_moving(net, sim, vehicles, me, j, -st.rear, squeeze_run);
             }
             let keep = j.line - st.front < JUNCTION_KEEP && !(squeeze && real < SQUEEZE_NEAR);
             j.line < real + st.front + obstacle_len + zone || keep
@@ -2775,7 +3742,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let bypass_possible = standing && !light_near && !junction_near && bypass_nb.is_some();
         // (a bypass needs the room its body can steer round the obstacle in, `bypass_room`)
         let room = match bypass_nb.filter(|_| bypass_possible && !pass_possible) {
-            Some(nb) => bypass_room(net, me, &nb, &l, false).unwrap_or(room),
+            Some(nb) => bypass_room(net, me, &nb, &l, false, None).unwrap_or(room),
             None => room,
         };
         // keep back: room to pull out again, where the car can still stop there gently - only
@@ -2789,7 +3756,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         if (pass_possible || bypass_possible) && !(me.serves_stops() && l.at_stop) && l.gap > room + slack {
             let dist = (l.gap - room).max(0.0);
             let need_brake = v * v / (2.0 * dist.max(0.1));
-            if need_brake <= dp.comfort_brake * 1.5 {
+            if need_brake <= dp.comfort_brake * KEEP_BACK_BRAKE {
                 min_stop(&mut out.stop, &mut out.why, Some(st.front + dist), Why::Lead);
             }
         }
@@ -2960,7 +3927,7 @@ mod piece_change_tests {
 
     fn beside(net: &Network) -> NeighbourView {
         let dir = [1, 2].into_iter().find(|&d| net.piece_beside(0, 50.0, d) == Some(1)).expect("piece 1 lies beside piece 0");
-        NeighbourView { lane: 1, dir, ahead: None, behind: None, behind_id: None, behind_min_gap: 2.0, runs_on: 150.0, turn: 0, foreign: false, allowed: true }
+        NeighbourView { lane: 1, dir, ahead: None, ahead_id: None, behind: None, behind_id: None, behind_min_gap: 2.0, runs_on: 150.0, turn: 0, foreign: false, allowed: true }
     }
 
     /// Where the crossing first touches piece 0 (m), whatever crosses it.
@@ -3056,7 +4023,7 @@ mod piece_change_tests {
             let them = body(&net, 2, other.0, other.1, other.2, (2.0, 2.0, 0.9));
             let vehicles = vec![me, them];
             sim.build_occupancy(&net, &vehicles);
-            change_clear(&net, &sim, &vehicles, &vehicles[0], &Perception::default(), &nb, None)
+            change_clear(&net, &sim, &vehicles, &vehicles[0], &Perception::default(), &nb, None, (omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, omsi_sim::traffic::change_length(vehicles[0].state.speed)))
         };
         let gap = |y: f64| y - 1.25 - 0.9;
         assert!((gap(2.55) - 0.4).abs() < 1e-6);
@@ -3064,6 +4031,35 @@ mod piece_change_tests {
         assert!(!run(2.55, (2, 40.0, 1.0)), "so does one rolling on level with it");
         assert!(run(1.25 + 0.9 + 2.5, (2, 40.0, 1.0)), "2.5 m beside, past the rear's swing, it starts");
         assert!(run(30.0, (0, 40.0 + 3.5 + 2.0 + 6.0, 2.0)), "a slower car 6 m ahead on my own piece is not swept");
+    }
+
+    /// L3-2: the same change started from rest projects the car rolling on beside it on the far
+    /// side by the time its body takes - the signal's seconds (`signal_plan`), then from rest at its
+    /// acceleration (`Bodies::time_to`) - not by no time at all: a car 0.4 m beside, 6 m back,
+    /// rolling at 1 m/s, rolls on into the rear's swing and bars the change (at speed 0 it was not
+    /// swept), and so does one standing there; 2.5 m beside it starts.
+    #[test]
+    fn a_change_from_rest_projects_the_car_rolling_beside_it_on_the_far_side() {
+        let mut net = Network::default();
+        net.lanes.push(path((0.0, 0.0), (150.0, 0.0), 0, LaneKind::Street));
+        net.lanes.push(path((0.0, -3.0), (150.0, -3.0), 1, LaneKind::Street));
+        let run = |y: f64, speed: f32, at: f32| {
+            let mut net = net.clone();
+            net.lanes.push(path((0.0, y), (150.0, y), 2, LaneKind::Street));
+            net.link(1.5);
+            net.compute_conflicts();
+            let mut sim = Simulation::new(&net, vec![]);
+            let nb = beside(&net);
+            let me = body(&net, 1, 0, 40.0, 0.0, (3.5, 8.5, 1.25));
+            assert!(me.state.accel > 0.0);
+            let them = body(&net, 2, 2, at, speed, (2.0, 2.0, 0.9));
+            let vehicles = vec![me, them];
+            sim.build_occupancy(&net, &vehicles);
+            change_clear(&net, &sim, &vehicles, &vehicles[0], &Perception::default(), &nb, None, (omsi_sim::traffic::SIGNAL_BEFORE_CHANGE, omsi_sim::traffic::change_length(vehicles[0].state.speed)))
+        };
+        assert!(!run(2.55, 1.0, 34.0), "a car rolling on 0.4 m beside on the far side, behind my middle, bars a change from rest: over the signal it rolls on into the swing");
+        assert!(!run(2.55, 0.0, 40.0), "so does one standing there");
+        assert!(run(1.25 + 0.9 + 2.5, 1.0, 34.0), "2.5 m beside, past the rear's swing, it starts");
     }
 }
 
@@ -3093,5 +4089,50 @@ mod stop_place_tests {
         assert_eq!(zebra_queue_stop(&me, cut), Some(comfortable));
         // with room for the gentle stop short of the cut, that one
         assert_eq!(zebra_queue_stop(&me, front + 2.0), Some(gentle_stop(&me) + 0.3));
+    }
+}
+
+#[cfg(test)]
+mod free_road_tests {
+    use super::free_road;
+
+    /// Pass 8 item 1: the undelayed signal road counts the car speeding up - the start check sweeps
+    /// a move beginning as far as the re-sweep can later plan it (viz4 #24004, 1.21 -> 1.29 m/s
+    /// over its signal): at its speed `v·w + a·w²/2`, capped at its wanted speed and on at that.
+    #[test]
+    fn the_free_signal_road_counts_the_car_speeding_up_to_its_wanted_speed() {
+        assert!((free_road(1.2, 1.5, 10.0, 2.0) - (2.4 + 3.0)).abs() < 1e-4);
+        // (up to 2 m/s in 0.8 s, on at it for 1.2 s)
+        let up = 1.2 * 0.8 + 0.5 * 1.0 * 0.64;
+        assert!((free_road(1.2, 1.0, 2.0, 2.0) - (up + 2.0 * 1.2)).abs() < 1e-4);
+        assert!((free_road(5.0, 1.5, 4.0, 2.0) - 10.0).abs() < 1e-4, "at or over its wanted speed: on at its speed");
+        assert!((free_road(0.0, 2.0, 10.0, 1.0) - 1.0).abs() < 1e-4, "from rest");
+    }
+}
+
+#[cfg(test)]
+mod impatience_tests {
+    use super::{impatient_gap, LC_IMPATIENCE_GAIN};
+    use crate::driver::VehicleClass;
+    use crate::sim::Vehicle;
+    use omsi_sim::traffic::AiState;
+
+    /// L3-D4 (final review M2): SUMO SL2015's `getSafetyFactor` - the gap divided by `1 + 0.5 x
+    /// impatience` - with the floor: a calm driver takes the whole gap, a fully impatient one the
+    /// gap over 1.5 but never less than the floor (the standing gap and the braking at comfort),
+    /// and a floor above the gap leaves the gap as it is.
+    #[test]
+    fn lane_change_impatience_shrinks_the_gap_by_at_most_one_and_a_half_and_never_below_the_floor() {
+        let mut me = Vehicle::new(1, VehicleClass::Car, AiState::new(0, 0.0, 1), 0.9, 1);
+        me.lc_impatience = 0.0;
+        assert_eq!(impatient_gap(&me, 12.0, 3.0), 12.0);
+        me.lc_impatience = 1.0;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 12.0 / (1.0 + LC_IMPATIENCE_GAIN)).abs() < 1e-5);
+        assert_eq!(impatient_gap(&me, 12.0, 9.0), 9.0, "the floor holds");
+        assert_eq!(impatient_gap(&me, 6.0, 9.0), 6.0, "a floor above the gap: the gap");
+        me.lc_impatience = 0.5;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 12.0 / 1.25).abs() < 1e-5);
+        me.lc_impatience = 3.0;
+        assert!((impatient_gap(&me, 12.0, 3.0) - 8.0).abs() < 1e-5, "impatience is read at most 1");
     }
 }

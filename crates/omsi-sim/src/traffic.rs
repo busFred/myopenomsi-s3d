@@ -726,6 +726,18 @@ impl GoalField {
     pub fn to_goal(&self, lane: usize) -> f32 {
         self.dist.get(lane).copied().unwrap_or(f32::INFINITY)
     }
+
+    /// Does `lane` lead to the trip end (a finite route cost)? One that does not is a dead lane
+    /// for the car (SUMO LC2013: a lane without a connection to the route's next edge).
+    pub fn leads(&self, lane: usize) -> bool {
+        self.to_goal(lane).is_finite()
+    }
+
+    /// Does `lane`'s road lead to the trip end: the lane itself or a lane beside it the car may
+    /// change onto (`Network::road_beside`; SUMO's bestLanes over the lanes of the edge)?
+    pub fn road_leads(&self, net: &Network, lane: usize) -> bool {
+        self.leads(lane) || net.road_beside(lane).into_iter().any(|b| self.leads(b))
+    }
 }
 
 impl std::fmt::Debug for GoalField {
@@ -1100,6 +1112,48 @@ impl Network {
         // second carriageway as splines of their own, and Novi Sad's tracks change onto
         // them 30 m before the lane they come in on ends)
         self.beside(la, lb)
+    }
+
+    /// The lanes of `lane`'s road beside it the same way (`Lane::left`, `Lane::right`, one after
+    /// the other across the road), nearest first on each side: what a car on `lane` can change
+    /// onto (SUMO: the lanes of the vehicle's edge). A junction object's piece has none here.
+    pub fn road_beside(&self, lane: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for left in [true, false] {
+            let mut cur = lane;
+            while let Some(n) = self.lanes.get(cur).and_then(|l| if left { l.left } else { l.right }) {
+                if n == lane || out.contains(&n) {
+                    break;
+                }
+                out.push(n);
+                cur = n;
+            }
+        }
+        out
+    }
+
+    /// How far (m) a car at `s` on `way[0]`, driving along `way`, runs beside lane `b` - a lane
+    /// beside `way`'s last lane (`road_beside`) - and the lanes beside `way` that lead into it, up
+    /// to the end of `way`'s last lane: the road on which it can change onto `b` before that
+    /// lane's end (SUMO's bestLanes: a lane of the vehicle's edges, as far as it is continued by
+    /// lanes of the next edges). Walked back from the last lane: each lane of `way` counts from
+    /// where the lane beside starts along it (`beside_delta`), and the walk goes on to the lane
+    /// before only where the lane beside starts with this one and a lane beside the one before
+    /// leads into it.
+    pub fn beside_run(&self, way: &[usize], s: f32, b: usize) -> f32 {
+        let (mut run, mut cur) = (0.0f32, b);
+        for i in (0..way.len()).rev() {
+            let x = way[i];
+            let starts = (-self.beside_delta(x, cur)).max(0.0);
+            let from = if i == 0 { starts.max(s) } else { starts };
+            run += (self.lanes[x].length() - from).max(0.0);
+            if i == 0 || starts > 0.0 {
+                break;
+            }
+            let Some(p) = self.road_beside(way[i - 1]).into_iter().find(|&p| self.lanes[p].next.contains(&cur)) else { break };
+            cur = p;
+        }
+        run
     }
 
     /// Does lane `b` run beside `a` (a lane's width or so to the side, the same way) along
@@ -3620,8 +3674,14 @@ pub fn claim_horizon(speed: f32) -> f32 {
 /// Linked lanes may end up to 1.5 m apart; over this many metres on either side of a joint
 /// the way is bent so that it has no step (half the gap on each side).
 const JOINT_BLEND: f32 = 6.0;
-/// Seconds of signalling before a lane change begins to move sideways.
-// (two seconds of signal before the car moves over)
+/// Seconds of signalling before a lane change begins to move sideways (OMSI: the driver signals
+/// first; SUMO's change starts in the step it is decided, `lanechange.duration` 0). Unsourced: no
+/// measured central value was found - Lee, Olsen & Wierwille 2004 (NHTSA DOT HS 809 702,
+/// literature review) give only the range of signal onset, -2.42 to 3.62 s from the change's
+/// start (Hetrick 1997), and road codes ask for signalling in good time without a
+/// figure (StVO 7(5): "rechtzeitig und deutlich anzukündigen"). The preset driver's; each driver's
+/// own is `omsi_traffic::DriverParams::signal_before_change` (1.0-3.6 s), which the start test plans
+/// through (`omsi_traffic::plan`'s `signal_plan`).
 pub const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
@@ -3665,9 +3725,15 @@ pub struct AiState {
     /// without successors, where `randomTrips` starts and ends trips), open to the car (closed
     /// only by density, at a density above 0 for its group, where no open one is reachable,
     /// `GoalAccess`) and not a loaded-tile edge in sight (`Network::ends_at_loaded_edge`). Drawn
-    /// at random among the ends reachable from the fork where the car's plan first meets a
-    /// choice, by the density its group has on each (`AiState::goal_way`), drawn again where it
-    /// is gone or out of reach (`GOAL_REPICKED`). At a fork the car takes, among the ways on of
+    /// at random among the ends reachable from the first fork on the car's way within
+    /// `LC_STRATEGIC_LOOKAHEAD` (`goal_ahead`; else where its plan meets one) - its ways on and
+    /// the lanes beside the fork's lane the car can still change onto (`reachable_beside`) - by the density
+    /// its group has on each (`AiState::goal_way`), drawn again where it is gone or the car's road
+    /// no longer reaches it (`GOAL_REPICKED`, `GOAL_UNREACHABLE`). A car on a lane that does not
+    /// lead there while a lane beside does changes onto that one (SUMO LC2013's strategic change,
+    /// `omsi_traffic::plan`; blocked, it stops before the dead lane's end and waits for a gap);
+    /// one past the point of no return misses the fork, counted (`STRATEGIC_MISSED`), and draws
+    /// again where it enters the way it took. At a fork the car takes, among the ways on of
     /// the best tier, the one with the least route cost to it (`choose_after`, `route_cost`;
     /// SUMO: the route the router computes to the trip's end decides the way on). None: no fork
     /// met yet, a timetable route, or no end reachable over lanes its group has a density above
@@ -3677,6 +3743,18 @@ pub struct AiState {
     /// speeds and group (`Network::goal_fields`); not recorded, computed again on need.
     #[serde(skip)]
     pub goal_field: Option<std::sync::Arc<GoalField>>,
+    /// The driver gave up its blocked urgent strategic change after standing its patience at the
+    /// last-resort stop before the dead lane's end (`omsi_traffic::sim`, the user's decision
+    /// L3-D3): it drives on through the fork on its own lane, where its trip end is drawn again
+    /// (`STRATEGIC_GAVE_UP`). Cleared with the next draw.
+    #[serde(default)]
+    pub strategic_gave_up: bool,
+    /// The driver's own signalling time before a lane change moves over (s;
+    /// `omsi_traffic::DriverParams::signal_before_change`, copied by its `apply`): the road a
+    /// change takes, `change_space`, reads it. A state recorded without it reads
+    /// `SIGNAL_BEFORE_CHANGE` (the replay sets it from the driver again).
+    #[serde(default = "default_signal_before_change")]
+    pub signal_before_change: f32,
     /// A throwaway copy of a car as it would be put down, for a test of where it would stand
     /// (the game's `spawn_probe`): it plans its way without drawing a trip end (`goal_way`), so
     /// `GOAL_PICKED` counts real cars only; it chooses at random among the best tier.
@@ -3785,6 +3863,25 @@ pub fn change_length(speed: f32) -> f32 {
     (speed * (4.0 - speed * 0.04).clamp(2.8, 4.0)).max(12.0)
 }
 
+/// The road a lane change started at `v` m/s takes (m): the driver's signalling before it
+/// moves (`w` s, `DriverParams::signal_before_change`, `AiState::signal_before_change`;
+/// speeding up at `a` meanwhile) and the move (`change_length`).
+pub fn change_space(v: f32, a: f32, w: f32) -> f32 {
+    let w = w.max(0.0);
+    v * w + 0.5 * a.max(0.0) * w * w + change_length(v)
+}
+
+/// `AiState::signal_before_change` where a recorded state lacks it.
+fn default_signal_before_change() -> f32 {
+    SIGNAL_BEFORE_CHANGE
+}
+
+/// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so the
+/// distance a lane beside runs on (`neighDist`), are looked along; a random car with no trip end
+/// draws one at the first fork within it (`AiState::plan_next`), where SUMO's best lanes would
+/// see the route's split.
+pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
+
 /// The road (m) an S-curve sideways by `offset` metres takes (`AiState::lateral_ramp`): 8 m
 /// per metre across, 8 m at least, 30 m at most.
 pub fn s_curve_len(offset: f32) -> f32 {
@@ -3861,6 +3958,23 @@ pub static GOAL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// (`AiState::goal_way`; the others are drawn by that density), whole process. Only a closed
 /// marker (`Network::closed_marker`) is a trip end at density 0.
 pub static GOAL_UNWEIGHTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Trip ends drawn again because the car's road could no longer reach its own (a subset of
+/// `GOAL_REPICKED`; the rest were gone: their tile linked on, their edge come into sight), whole
+/// process (`AiState::goal_way`).
+pub static GOAL_UNREACHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Strategic lane changes missed: a random car on a dead lane - its trip end reachable only from
+/// a lane beside it (`GoalField::road_leads`) - that drove through the fork onto a way of its own
+/// lane from whose road the trip end cannot be reached, whole process. Counted where the car
+/// enters that way (`AiState::advance`; a car whose urgent change is blocked stops before the
+/// dead lane's end, so one counted here could no longer stop there at its comfortable brake, or
+/// its change was not urgent in time), where its trip end is drawn again among those its road
+/// reaches and its way planned afresh (`goal_way`; SUMO's vehicle re-routes).
+pub static STRATEGIC_MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Strategic changes given up: a car that stood its patience at its last-resort stop before a
+/// dead lane's end (`AiState::strategic_gave_up`) and drove on through the fork on its own lane,
+/// counted where it enters that way as `STRATEGIC_MISSED` is (and not counted there), whole
+/// process; its trip end is drawn again the same way.
+pub static STRATEGIC_GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Forks a random car met with no trip end reachable over the lanes its group has a density
 /// above 0 on (`AiState::goal_way` found none: a pocket its group's traffic does not lead out
 /// of), whole process; per fork met, not per car (a car with no trip end tries again at each
@@ -3949,8 +4063,9 @@ pub struct LaneChange {
     pub full_lock: bool,
     /// A bypass's: the vehicle it pulls out round (its id; a player's `PLAYER_ID_BASE` + its id,
     /// as `omsi_traffic::sim::Decision::wait_for`), `None` round a parked car (which has no id
-    /// and does not move). Its move is swept again round that body on every frame of the
-    /// signal while that body stands (`omsi_traffic::plan`).
+    /// and does not move). Its move is swept again on every frame of the signal: round that
+    /// body while it stands, and as committed (`length`, `full_lock`) once it has moved off or
+    /// gone (`omsi_traffic::plan`).
     #[serde(default)]
     pub round: Option<u64>,
 }
@@ -4109,7 +4224,7 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, route: Vec::new(), route_index: 0, goal: None, goal_field: None, strategic_gave_up: false, signal_before_change: SIGNAL_BEFORE_CHANGE, probe: false, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None, settled_offset: false }
     }
 
     /// A random car woken after a time out of range (the game's dormant cars): it leaves the
@@ -4157,7 +4272,10 @@ impl AiState {
     /// A random car (no `route`) on a street chooses among the ways on that lead to its trip end
     /// (`goal_way`; SUMO: the vehicle's route decides which link it takes, a lane without a
     /// connection to the route's next edge is a dead lane, sumo.md 3 `lcStrategic`; one that
-    /// cannot reach it is never taken while one that can exists) among the ways on of the best
+    /// cannot reach it is never taken while one that can exists; where none does and the trip end
+    /// lies off a lane beside, the car chooses as with no trip end among its own lane's ways, and
+    /// its strategic lane change, `omsi_traffic::plan`, takes it onto that lane, whose ways are
+    /// chosen afresh when the change begins, `start_change`) among the ways on of the best
     /// tier present, and takes the one with the least route cost to it (`route_cost`, travel
     /// time over the group's relative density; SUMO's router: the route is the least-cost path),
     /// equal ones at random. The tier comes first (user decision X-D3, OMSI: the map's density
@@ -4174,12 +4292,15 @@ impl AiState {
     /// reachable (`GOAL_NONE_POCKET`: a ring whose exits are all at density 0 for the group is
     /// lapped, as in OMSI, `LaneRevisits` counts it), takes one of the best tier at random: a car of a traffic pool weighted by its
     /// pool's density on each, among ways only another group drives by their density.
+    /// `way`: the car's way to `lane` from where it is, at `s` on `way[0]`, `lane` last.
     fn choose_after(
         &mut self,
         net: &Network,
-        lane: usize,
+        way: &[usize],
+        s: f32,
         avoid: &dyn Fn(usize) -> bool,
     ) -> Option<usize> {
+        let lane = *way.last().expect("the lane chosen after");
         let l = &net.lanes[lane];
         // the ways that lead back round a loop of short lanes are not
         // among the choices (the others are: a street goes on where it has a way on)
@@ -4187,7 +4308,7 @@ impl AiState {
         let kind = l.kind;
         // a random car's choice is the ways on that lead to its trip end (SUMO: a lane with no
         // connection to the route's next edge is a dead lane, no way on for the vehicle)
-        let field = if self.route.is_empty() && !self.probe && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, &next) } else { None };
+        let field = if self.route.is_empty() && !self.probe && kind == LaneKind::Street && next.len() > 1 { self.goal_way(net, way, s, &next, true) } else { None };
         // (a car routed over the lanes closed only by density, `GoalAccess::Driven`, has its route
         // computed over those its group has a density above 0 on: for its choice they rank as
         // open, `ranked` - SUMO routes over every lane the class may use and the vehicle follows
@@ -4195,8 +4316,11 @@ impl AiState {
         // route needed and the car went round for ever. A lane at density 0 for the group keeps
         // its tier (X-D3). What the car took is counted by the lane's own tier)
         let driven = field.as_ref().is_some_and(|f| f.key.access == GoalAccess::Driven);
+        // (ranked: a lane the route may use is open - `routable` at the route's access, the rule
+        // `route_may_use` gives the lane-end check too, L3-D7)
+        let access = field.as_ref().map_or(GoalAccess::Open, |f| f.key.access);
         let closed = |n: usize, ranked: bool| match self.closed_for(net, n, kind) {
-            Some(Closed::Density) if ranked && driven && self.density_of(net, n) > 0.0 => None,
+            Some(Closed::Density) if ranked && kind == LaneKind::Street && self.routable(net, n, access) => None,
             c => c,
         };
         // (SUMO's bestLanes looks along the route until a lane with a choice: a lane whose way on
@@ -4332,6 +4456,18 @@ impl AiState {
         }
     }
 
+    /// May this car's route use lane `n` (`routable` at its route's own access: its trip end's
+    /// field, `GoalAccess::Open` without one)? The one rule the choice at a fork ranks by
+    /// (`choose_after`: a lane its route may use ranks as open) and a lane's end is judged by
+    /// (`omsi_traffic::perception`'s lane end, the user's decision L3-D7: a lane end follows the
+    /// route - a car routed over the lanes closed only by density, `GoalAccess::Driven`, because no
+    /// better way reaches its trip end, does not count such a lane with a density above 0 for its
+    /// group as an end it must change lanes before).
+    pub fn route_may_use(&self, net: &Network, n: usize) -> bool {
+        let access = self.goal_field.as_ref().filter(|f| Some(f.key.goal) == self.goal && self.route.is_empty()).map_or(GoalAccess::Open, |f| f.key.access);
+        self.routable(net, n, access)
+    }
+
     /// Is `n` a trip end for this car at `access`: a street lane with no way on (SUMO's fringe
     /// edge), one it may route over (`routable`), and not a loaded-tile edge in sight (one the
     /// car is routed away from, `Network::ends_at_loaded_edge`: it would stand there in view)?
@@ -4339,20 +4475,32 @@ impl AiState {
         net.lanes.get(n).is_some_and(|l| l.kind == LaneKind::Street && l.next.is_empty() && !(l.loaded_edge && l.edge_in_sight)) && self.routable(net, n, access)
     }
 
-    /// The trip end's route costs for a choice among the ways on `next` of a fork, over the open
-    /// lanes first (`GoalAccess::Open`): the car's own trip end while it still is one and one of
-    /// `next` leads to it; else a trip end drawn at random among those reachable from `next`,
-    /// weighted by the density the map gives the car's group on each (SUMO's `randomTrips`: a
-    /// trip from or to the fringe, edges drawn by custom weights, a trip whose end cannot be
-    /// reached is dropped), counted (`GOAL_PICKED`, `GOAL_REPICKED`, `GOAL_UNWEIGHTED`). Only where no trip end is
+    /// The trip end's route costs for a choice among the ways on `next` of the fork at the end of
+    /// `way`'s last lane (the fork's lane), `way` the car's way there from where it is, at `s` on
+    /// `way[0]`, over the open lanes first (`GoalAccess::Open`): the car's own trip end while it
+    /// still is one and the car's road can reach it - one of `next`, a lane beside the fork's lane
+    /// it can still change onto (`reachable_beside`), or a lane of the car's own road (the lane it is
+    /// on and those beside it, `GoalField::road_leads`: SUMO LC2013's strategic change takes the car
+    /// onto the lane that leads there; where none of `next` does, the choice is one its own lane
+    /// has); else a trip end drawn at random among those reachable from `next` and from the lanes
+    /// beside the fork's lane it can still change onto (`reachable_beside`: the car's road, SUMO's
+    /// edge), weighted by the density the map gives
+    /// the car's group on each (SUMO's `randomTrips`: a trip from or to the fringe, edges drawn by
+    /// custom weights, a trip whose end cannot be reached is dropped), counted (`GOAL_PICKED`,
+    /// `GOAL_REPICKED`, of these `GOAL_UNREACHABLE` where the old end was still one but the road
+    /// no longer reached it, `GOAL_UNWEIGHTED`). Only where no trip end is
     /// reachable over open lanes, the same over the lanes closed only by density on which the
     /// group still has a density above 0 (`GoalAccess::Driven`): `choose_after`'s own fallback
     /// for a car in a quarter its group drives at the map's "almost none" (such a density is
     /// OMSI's demand weight, no permission: SUMO's router routes over every lane the vehicle
     /// class may use). A lane at density 0 for the group is on neither (X-D3). None: no trip
-    /// end reachable, counted (`GOAL_NONE_POCKET`).
-    fn goal_way(&mut self, net: &Network, next: &[usize]) -> Option<std::sync::Arc<GoalField>> {
+    /// end reachable, counted (`GOAL_NONE_POCKET`) where the car meets the fork (`at_fork`; a draw
+    /// ahead of it, `plan_next`, leaves the count to the fork itself).
+    fn goal_way(&mut self, net: &Network, way: &[usize], s: f32, next: &[usize], at_fork: bool) -> Option<std::sync::Arc<GoalField>> {
+        let lane = *way.last().expect("the fork's lane");
+        let beside = self.reachable_beside(net, way, s);
         let had = self.goal.is_some();
+        let was_end = self.goal.is_some_and(|g| self.is_trip_end(net, g, GoalAccess::Open) || self.is_trip_end(net, g, GoalAccess::Driven));
         for access in [GoalAccess::Open, GoalAccess::Driven] {
             if let Some(g) = self.goal.filter(|&g| self.is_trip_end(net, g, access)) {
                 let key = self.goal_key(net, g, access);
@@ -4360,15 +4508,16 @@ impl AiState {
                     Some(f) => f,
                     None => net.goal_field(key, |n| self.routable(net, n, access), self.route_cost(net)),
                 };
-                if next.iter().any(|&n| f.to_goal(n).is_finite()) {
+                if next.iter().any(|&n| f.leads(n)) || f.leads(lane) || beside.iter().any(|&b| f.leads(b)) || f.road_leads(net, self.lane) {
                     self.goal_field = Some(f.clone());
                     return Some(f);
                 }
             }
-            // (the trip ends reachable from the ways on, nearest first as met)
+            // (the trip ends reachable from the ways on and from the lanes beside the fork's
+            // lane the car can still change onto, nearest first as met)
             let mut seen = vec![false; net.lanes.len()];
             let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-            for &n in next {
+            for &n in next.iter().chain(&beside) {
                 if n < seen.len() && !seen[n] && self.routable(net, n, access) {
                     seen[n] = true;
                     queue.push_back(n);
@@ -4415,16 +4564,34 @@ impl AiState {
                 ends[(self.rand() % ends.len() as u64) as usize]
             };
             if had { &GOAL_REPICKED } else { &GOAL_PICKED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if had && was_end {
+                GOAL_UNREACHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let key = self.goal_key(net, g, access);
             let f = net.goal_field(key, |n| self.routable(net, n, access), self.route_cost(net));
             self.goal = Some(g);
+            self.strategic_gave_up = false;
             self.goal_field = Some(f.clone());
             return Some(f);
         }
-        GOAL_NONE_POCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if at_fork {
+            GOAL_NONE_POCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.goal = None;
         self.goal_field = None;
         None
+    }
+
+    /// The lanes beside the fork's lane - `way`'s last, the car at `s` on `way[0]` - that the car
+    /// can still change onto before the fork: those it runs beside (`Network::beside_run`) for at
+    /// least the road a lane change takes at its speed (`change_space`; SUMO LC2013's
+    /// `LCA_INSUFFICIENT_SPACE`, a change that does not fit before the dead lane's end is not
+    /// made). A lane beside only on a short last piece does not count: the car could not change
+    /// onto it in time and would miss the fork.
+    fn reachable_beside(&self, net: &Network, way: &[usize], s: f32) -> Vec<usize> {
+        let Some(&lane) = way.last() else { return Vec::new() };
+        let space = change_space(self.speed, self.accel, self.signal_before_change);
+        net.road_beside(lane).into_iter().filter(|&b| net.beside_run(way, s, b) >= space).collect()
     }
 
     /// The `GoalKey` of trip end `goal` for this car at `access`.
@@ -4499,8 +4666,43 @@ impl AiState {
         }
         let mut plan: Vec<usize> = self.upcoming().collect();
         self.extend_plan(net, self.lane, rest, &mut plan);
+        if self.goal.is_none() && !self.probe {
+            self.goal_ahead(net, &plan);
+        }
         self.planned_next = plan.first().copied();
         self.ahead = plan.into_iter().skip(1).collect();
+    }
+
+    /// A random car with no trip end draws one at the first fork on its way within
+    /// `LC_STRATEGIC_LOOKAHEAD` (`goal_way`), past its plan `plan` along the single ways on: SUMO's
+    /// vehicle knows its route as far as its best lanes look, so its strategic change towards
+    /// the lane that leads there begins where `lcStrategic`'s urgency asks, not only once the
+    /// plan reaches the fork (`PLAN_AHEAD`). The way there is the car's for the lanes beside
+    /// it can still change onto (`reachable_beside`). A loop of single ways on, a dead end or a
+    /// lane that is not a street ends the look.
+    fn goal_ahead(&mut self, net: &Network, plan: &[usize]) {
+        let mut way: Vec<usize> = std::iter::once(self.lane).chain(plan.iter().copied()).collect();
+        let mut d: f32 = way.iter().map(|&l| net.lanes[l].length()).sum::<f32>() - self.s;
+        loop {
+            let cur = *way.last().expect("the car's lane");
+            let l = &net.lanes[cur];
+            if l.kind != LaneKind::Street {
+                return;
+            }
+            match l.next[..] {
+                [] => return,
+                [n] if d < LC_STRATEGIC_LOOKAHEAD && !way.contains(&n) => {
+                    d += net.lanes[n].length();
+                    way.push(n);
+                }
+                [_] => return,
+                _ => {
+                    let next = l.next.clone();
+                    self.goal_way(net, &way, self.s, &next, false);
+                    return;
+                }
+            }
+        }
     }
 
     /// Choose lanes after `from` (which has `rest` metres left) until `plan` covers
@@ -4509,7 +4711,6 @@ impl AiState {
         let mut dist = rest + plan.iter().map(|&l| net.lanes[l].length()).sum::<f32>();
         let ahead = self.plan_ahead();
         while dist < ahead && plan.len() <= PLAN_LANES {
-            let last = plan.last().copied().unwrap_or(from);
             // not round a loop of short lanes to fill the plan (two
             // lanes of no length leading into each other made a plan of twenty), nor back
             // onto the lane the car came from: those ways are left out of the choice, so the
@@ -4529,7 +4730,8 @@ impl AiState {
                 }
                 plan.is_empty() && from == lane0 && prev0 == Some(n) && len(from) + len(n) < SHORT_LOOP
             };
-            match self.choose_after(net, last, &avoid) {
+            let way: Vec<usize> = std::iter::once(from).chain(plan.iter().copied()).collect();
+            match self.choose_after(net, &way, net.lanes[from].length() - rest, &avoid) {
                 Some(n) => {
                     dist += net.lanes[n].length();
                     plan.push(n);
@@ -5287,12 +5489,23 @@ impl AiState {
                 return false; // dead end: despawn
             };
             self.s -= l.length();
+            // (a strategic change missed: the car drove off a dead lane whose road led to its trip
+            // end onto a way from whose road it does not, `STRATEGIC_MISSED`)
+            let missed = self.goal_field.as_ref().filter(|f| self.route.is_empty() && Some(f.key.goal) == self.goal).is_some_and(|f| !f.leads(self.lane) && f.road_leads(net, self.lane) && !f.road_leads(net, next));
             self.prev_lane = Some(self.lane);
             self.lane = next;
             if self.goal == Some(next) {
                 GOAL_REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if self.route.is_empty() {
+            if missed {
+                // (its trip end drawn again among those its road now reaches, and its way planned
+                // afresh from here towards it: SUMO's vehicle re-routes from where it is)
+                if self.strategic_gave_up { &STRATEGIC_GAVE_UP } else { &STRATEGIC_MISSED }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.strategic_gave_up = false;
+                self.goal_way(net, &[next], self.s, &[next], true);
+                self.planned_next = None;
+                self.ahead.clear();
+            } else if self.route.is_empty() {
                 self.planned_next = if self.ahead.is_empty() { None } else { Some(self.ahead.remove(0)) };
             } else {
                 // the plan may have stepped over a lane-change entry of the route

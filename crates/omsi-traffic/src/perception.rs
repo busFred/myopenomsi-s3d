@@ -258,6 +258,9 @@ pub struct NeighbourView {
     /// longer look here is ours, so that the speed anticipated there (`plan::anticipated_speeds`)
     /// sees a queue standing further on.
     pub ahead: Option<(f32, f32)>,
+    /// That vehicle's index, when it is an AI vehicle (how long it has stood, `Vehicle::stopped`:
+    /// SUMO's `getWaitingSeconds` in `plan`'s blocked change, `BLOCKER_IS_BLOCKED_TIME`).
+    pub ahead_id: Option<usize>,
     /// The vehicle behind there that misses the most of the gap my change accepts from it
     /// (`plan::accepted_gap`, SUMO's `MSCriticalFollowerDistanceInfo`: the largest missing rear
     /// gap): (gap to my rear, its speed) - on that lane, or back over the lanes leading into it as
@@ -298,6 +301,10 @@ pub struct Perception {
     /// Lanes ahead: (lane, distance from the origin to its start).
     pub way: Vec<(usize, f32)>,
     pub leader: Option<Headway>,
+    /// The lead along my own lane's way without a signalling change laid on it (`own_lane_leader`;
+    /// with no change signalling, `leader`): what a change's start check and its re-sweep read as
+    /// the car's own leader (`plan`'s `near_standing_lead`, `signal_plan`).
+    pub own_leader: Option<Headway>,
     /// A vehicle's body across the way that held the car (its id), for mutual waits.
     pub body_block: Option<u64>,
     pub signal: Option<SignalView>,
@@ -1152,7 +1159,7 @@ const CROSSING_STANDING_WAIT: f32 = 2.0;
 /// SUMO's `jmTimegapMinor` default (1 s, `MSLink::myLookaheadTime`): an approaching
 /// person's window on the crossing and mine conflict within this of each other
 /// (`MSLink::blockedAtTime`).
-const JM_TIMEGAP_MINOR: f32 = 1.0;
+pub(crate) const JM_TIMEGAP_MINOR: f32 = 1.0;
 /// The fastest a person crosses (m/s, `humans::PED_HURRY_MAX`: hurried, caught by the
 /// change): an approaching person's time on the crossing times this bounds its length.
 const APPROACH_PACE_MAX: f32 = 2.5;
@@ -1950,6 +1957,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     let allowed = crate::access::is_open_at(net, nb, me);
     let s_b = net.beside_s(st.lane, nb, st.s);
     let mut ahead: Option<(f32, f32)> = None;
+    let mut ahead_id: Option<usize> = None;
     let behind: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
     let mut behind_id: Option<usize> = None;
     let player_min_gap = crate::driver::DriverParams::preset(crate::sim::PLAYER_PRESET).min_gap;
@@ -1968,6 +1976,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
             let gap = d_rel - rear - st.front;
             if ahead.map(|a| gap < a.0).unwrap_or(true) {
                 ahead = Some((gap, speed));
+                ahead_id = who;
             }
         } else {
             let gap = -d_rel - front - st.rear;
@@ -2017,25 +2026,25 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
     // keep right compare); at a fork the branch with the most room (the branch the car will take
     // there is not chosen yet)
     if ahead.is_none_or(|a| a.0 + st.front < REACT_TO_STOPPED_DISTANCE) {
-        let first = |l: usize, offset: f32| -> Option<(f32, f32)> {
-            let mut best: Option<(f32, f32)> = None;
-            let mut put = |d_rel: f32, rear: f32, speed: f32| {
+        let first = |l: usize, offset: f32| -> Option<(f32, f32, Option<usize>)> {
+            let mut best: Option<(f32, f32, Option<usize>)> = None;
+            let mut put = |d_rel: f32, rear: f32, speed: f32, who: Option<usize>| {
                 if d_rel >= 0.0 {
                     let gap = d_rel - rear - st.front;
                     if best.is_none_or(|b| gap < b.0) {
-                        best = Some((gap, speed));
+                        best = Some((gap, speed, who));
                     }
                 }
             };
             for occ in sim.occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
                 if occ.vehicle != i {
                     let o = &vehicles[occ.vehicle];
-                    put(occ.s + offset - s_b, o.state.rear, o.state.speed);
+                    put(occ.s + offset - s_b, o.state.rear, o.state.speed, Some(occ.vehicle));
                 }
             }
             for &(k, ps, _) in sim.player_occupancy.get(&l).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let pl = &sim.players[k];
-                put(ps + offset - s_b, pl.half_len, pl.speed);
+                put(ps + offset - s_b, pl.half_len, pl.speed, None);
             }
             best
         };
@@ -2043,7 +2052,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         // vehicle; else the furthest vehicle)
         let reach = s_b + REACT_TO_STOPPED_DISTANCE;
         let starts: Vec<(usize, f32)> = lane.next.iter().map(|&n| (n, lane.length())).collect();
-        let (mut free, mut most) = (false, None::<(f32, f32)>);
+        let (mut free, mut most) = (false, None::<(f32, f32, Option<usize>)>);
         walk_ahead(net, &starts, NEIGHBOUR_AHEAD_LANES, |l, at, last| {
             if free {
                 return false;
@@ -2062,7 +2071,8 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         });
         if let Some(a) = most.filter(|_| !free) {
             if ahead.is_none_or(|x| a.0 < x.0) {
-                ahead = Some(a);
+                ahead = Some((a.0, a.1));
+                ahead_id = a.2;
             }
         }
     }
@@ -2077,7 +2087,7 @@ fn neighbour(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, nb
         d += net.lanes[n].length();
         cur = n;
     }
-    Some(NeighbourView { lane: nb, dir, ahead, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
+    Some(NeighbourView { lane: nb, dir, ahead, ahead_id, behind: behind.get(), behind_id, behind_min_gap, runs_on, turn, foreign, allowed })
 }
 
 /// Walks every way on from the lanes `starts` (each a lane and the metres to its start), at
@@ -2186,7 +2196,9 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
         // density 0 for the normal cars so that nothing is put down at the line, and lead on
         // into the junction): it is crossed, not stopped short of, `Network::closed_marker`
         // (SUMO: a lane is dead for a vehicle only where its route cannot go on).
-        if k > 0 && lane.source != 2 && !crate::access::is_open_at(net, l, me) {
+        // (nor a lane the car's route may use, `AiState::route_may_use`: the user's decision L3-D7,
+        // a lane end follows the route - the rule the choice at a fork ranks by)
+        if k > 0 && lane.source != 2 && !crate::access::is_open_at(net, l, me) && !st.route_may_use(net, l) {
             return Some(LaneEnd { dist: d0 - st.front, kind: LaneEndKind::Closed, toward: None });
         }
         if let Some(&(j, m)) = sim.junctions.of_lane.get(&l) {
@@ -2427,6 +2439,19 @@ fn bypassed_on_way(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usi
     lead.map(|lead| Bypassed { lead, ahead: cor.ahead })
 }
 
+/// The lead of vehicle `i` along its own lane's way without its signalling change laid on it, from
+/// the pose it has on that way (`sim::way_pose`): a vehicle on that way, the player's bus or a
+/// parked car, by the corridor's tests (`corridor`).
+fn own_lane_leader(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Option<Headway> {
+    let mut me = vehicles[i].clone();
+    me.state.drop_change();
+    (me.pos, me.heading) = crate::sim::way_pose(net, &me.state);
+    let look = look_ahead(me.state.speed);
+    let lanes = way_lanes(net, &me.state, 220.0);
+    let cor = corridor(net, sim, vehicles, i, &me, &lanes, look);
+    Headway::nearer(Headway::nearer(cor.on_lane, cor.player), cor.parked)
+}
+
 /// Everything vehicle `i` sees this frame.
 pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize) -> Perception {
     let me = &vehicles[i];
@@ -2455,6 +2480,18 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             }
         }
         p.leader = Headway::nearer(p.leader, parked);
+        // a plain change that signals follows the nearer of the target lane's leader (the way with
+        // the change laid on it, above) and its own lane's leader (the way without it, from the
+        // pose the car has on that way): it is still in its lane until it moves over. SUMO:
+        // `MSVehicle::planMoveInternal` adapts also to the leaders on the shadow lane while a
+        // change is under way ("also slow down for leaders on the shadowLane relative to the
+        // current lane")
+        if st.change.is_some_and(|c| !c.bypass && c.wait > 0.0 && c.t <= 0.0) {
+            p.own_leader = own_lane_leader(net, sim, vehicles, i);
+            p.leader = Headway::nearer(p.leader, p.own_leader);
+        } else {
+            p.own_leader = p.leader;
+        }
         let (people_stop, shifted) = people_ahead(net, sim, me, &p.way, &way, swerve);
         // the shift past people beside the lane, towards the middle only while the oncoming lane
         // is clear for it (`people_shift_clear`)

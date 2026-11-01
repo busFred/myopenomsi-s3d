@@ -390,11 +390,41 @@ pub struct Vehicle {
     /// stop; stopping); kept with the vehicle.
     #[serde(default)]
     pub reversing: Option<(f32, bool)>,
-    /// The last-resort stop before the end of a lane that ends for the driver, once placed
-    /// (the odometer where the front stops, `Plan::lane_end_stop`): kept until the change starts or
-    /// the car stands - a latch, not a margin.
+    /// The last-resort stop before the end of a lane that ends for the driver, or of a dead lane
+    /// for a blocked urgent strategic change, once placed (the odometer where the front stops,
+    /// `Plan::lane_end_stop`): kept until the change starts or the car stands - a latch, not a
+    /// margin (standing before a dead lane's end, the stop itself holds it there).
     #[serde(default)]
     pub lane_end_stop: Option<f32>,
+    /// Seconds standing at its stop before a dead lane's end without a break (`Plan::dead_end_hold`;
+    /// `STRATEGIC_HOLD_MS`, `STRATEGIC_LONG_HOLDS`).
+    #[serde(default)]
+    pub dead_end_held: f32,
+    /// Lane-change impatience after SUMO SL2015, 0..1 (`plan::impatient_gap`): grows over the
+    /// driver's `strategic_patience` while an urgent lane-end or strategic change is wished and not
+    /// started (`Plan::urgent_blocked`), kept while the change signals, back to 0 at once when it
+    /// moves over or the wish ends - the user's decision L3-D4. SL2015 differs
+    /// (`MSLCM_SL2015::setOwnState`): it grows over `lcTimeToImpatience` while a strategic *or
+    /// speed-gain* change is blocked, and otherwise decays at the same rate down to the driver's
+    /// `lcImpatience`; ours does not grow for speed-gain changes and does not decay.
+    #[serde(default)]
+    pub lc_impatience: f32,
+    /// The side of the blocked urgent change it waited for last frame (`Plan::urgent_side`, 0
+    /// none): its indicator shows there, and what it has shown counts towards the change's signal
+    /// (`plan::signal_left`).
+    #[serde(default)]
+    pub urgent_side: i32,
+    /// What the last lane change of the driver's own it started was for (`Plan::change_why`;
+    /// diagnostics: `traffic_cases watch` and its hold events).
+    #[serde(skip)]
+    pub change_for: Option<crate::plan::ChangeWhy>,
+    /// The check that dropped the driver's last lane change this frame (`Plan::abort_why`;
+    /// diagnostics: `traffic_cases ab`'s ABORT events).
+    #[serde(skip)]
+    pub aborted_for: Option<crate::plan::AbortWhy>,
+    /// What its failing re-sweep met (`Plan::abort_detail`; diagnostics).
+    #[serde(skip)]
+    pub aborted_detail: Option<crate::plan::SweepBlocker>,
     /// Seconds standing held by nothing (its decision's `held` false: no stop of
     /// any kind - people, junction, light, its stop - and no lead near): the queue-head time
     /// (`plan::queue_head`); 0 while moving or held. Kept with the vehicle.
@@ -674,6 +704,7 @@ impl Vehicle {
             external: External::default(),
             last: Decision::default(),
             blinker_shown: (0, 0.0),
+            urgent_side: 0,
             pos: DVec3::ZERO,
             heading: 0.0,
             claim_standing: false,
@@ -685,6 +716,11 @@ impl Vehicle {
             speed_gain: [0.0; 2],
             reversing: None,
             lane_end_stop: None,
+            dead_end_held: 0.0,
+            lc_impatience: 0.0,
+            change_for: None,
+            aborted_for: None,
+            aborted_detail: None,
             unheld_for: 0.0,
             zip_behind: None,
             refused_last: false,
@@ -777,14 +813,34 @@ fn cell(p: DVec3) -> (i32, i32) {
 }
 
 /// Lane changes of the drivers' own started, by what won them (`plan::ChangeWhy`: lane
-/// end, turn, obstacle, speed gain, keep side), every simulation of the process (diagnostics,
+/// end, turn, obstacle, speed gain, keep side, trip end), every simulation of the process (diagnostics,
 /// `traffic_cases ab`, as `omsi_sim::traffic::FORK_FALLBACKS`).
-pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub static CHANGES_BY_WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Milliseconds driven (moving) out of the lane's middle on an in-lane squeeze (`Passing`
 /// with no lane: the lateral offset within the lane, SUMO's sublane `posLat`), every simulation
 /// of the process (diagnostics, `traffic_cases ab`'s `lane_offset_s`).
 pub static LANE_OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds cars stood at their stop before a dead lane's end, their urgent strategic change
+/// blocked (`plan::Plan::dead_end_hold`; SUMO LC2013's stop at the end of the lane), every
+/// simulation of the process (`traffic_cases ab`'s `strategic_hold_s`).
+pub static STRATEGIC_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A hold before a dead lane's end at least this long (s) is counted (`STRATEGIC_LONG_HOLDS`):
+/// the review's mark for a standing car blocking its lane for long.
+pub const STRATEGIC_LONG_HOLD: f32 = 60.0;
+/// Holds before a dead lane's end that lasted `STRATEGIC_LONG_HOLD` or longer, every simulation
+/// of the process (`traffic_cases ab`'s `strategic_long_holds`).
+pub static STRATEGIC_LONG_HOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The drops of `CHANGES_ABORTED` by the check that dropped them (`plan::AbortWhy`) and what the
+/// change was for (`plan::ChangeWhy`, 6: not known), every simulation of the process (diagnostics,
+/// `traffic_cases ab`).
+pub static CHANGES_ABORTED_BY: [[std::sync::atomic::AtomicU64; 7]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 5];
+
+/// Lane changes of the drivers' own started on a gap the driver took only for its lane-change
+/// impatience (`Plan::impatient_start`), every simulation of the process (`traffic_cases ab`).
+pub static CHANGES_IMPATIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lane changes of the drivers' own dropped while signalling because their gap check failed
 /// again (`Plan::abort_change`; SUMO's `checkChange` every step), every simulation of the process
@@ -2251,6 +2307,34 @@ impl Simulation {
         // the last-resort stop's latch: dropped with a start or standing (the plan places it
         // afresh only while the wish is blocked)
         v.lane_end_stop = plan.lane_end_stop.filter(|_| plan.start.is_none() && v.state.speed >= STANDING_SPEED);
+        // (standing before a dead lane's end for a blocked strategic change: counted, and each
+        // hold once it lasts `STRATEGIC_LONG_HOLD`)
+        if plan.dead_end_hold {
+            let before = v.dead_end_held;
+            v.dead_end_held += dt;
+            STRATEGIC_HOLD_MS.fetch_add((dt * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+            if before < STRATEGIC_LONG_HOLD && v.dead_end_held >= STRATEGIC_LONG_HOLD {
+                STRATEGIC_LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // (standing its patience there, the driver gives up the change and drives on through
+            // the fork on its own lane: the user's decision L3-D3; only a dead lane, which runs on -
+            // a lane that really ends keeps its stop)
+            if v.dead_end_held >= v.params.strategic_patience {
+                v.state.strategic_gave_up = true;
+                v.lane_end_stop = None;
+                v.dead_end_held = 0.0;
+            }
+        } else {
+            v.dead_end_held = 0.0;
+        }
+        v.urgent_side = plan.urgent_side;
+        if plan.urgent_blocked {
+            v.lc_impatience = (v.lc_impatience + dt / v.params.strategic_patience.max(dt)).min(1.0);
+        } else if plan.start.is_none() && v.state.change.is_none_or(|c| c.wait <= 0.0 || c.t > 0.0) {
+            // (not in the frame the change starts: the re-check while it signals reads the same
+            // impatient gap the start took, so the start check and the re-check are one test)
+            v.lc_impatience = 0.0;
+        }
         // held out of its lane on the way back in: the ramp back begins where
         // the body would first feel it once let go - its start kept a heading chord ahead of
         // the standing body, so the body is not drawn turned into the lane while it waits
@@ -2271,16 +2355,32 @@ impl Simulation {
             self.changes_started.push((to, s_to));
             true
         };
+        v.aborted_for = None;
         if plan.abort_change && v.state.change.is_some_and(|c| c.wait > 0.0 && c.t <= 0.0) {
             v.state.drop_change();
             CHANGES_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(w) = plan.abort_why {
+                CHANGES_ABORTED_BY[w as usize][v.change_for.map_or(6, |c| c as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            v.aborted_for = plan.abort_why;
+            v.aborted_detail = plan.abort_detail;
         }
         match plan.start {
             Some(Start::Change { to, dir }) => {
                 if change_into(to, net.beside_s(v.state.lane, to, v.state.s)) {
                     v.state.start_change(net, to, dir);
+                    // (the driver's own signalling time, `DriverParams::signal_before_change`)
+                    // (less what its indicator showed while the change waited for its gap,
+                    // `plan::signal_left`, as the start check planned it)
+                    if let Some(c) = v.state.change.as_mut() {
+                        c.wait = plan.signal_wait.unwrap_or(v.params.signal_before_change);
+                    }
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
+                    v.change_for = plan.change_why;
+                    if plan.impatient_start {
+                        CHANGES_IMPATIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -2292,6 +2392,10 @@ impl Simulation {
                     v.keep_right = 0.0;
                     v.speed_gain = [0.0; 2];
                     v.stopped = 0.0;
+                    v.change_for = plan.change_why;
+                    if plan.impatient_start {
+                        CHANGES_IMPATIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(w) = plan.change_why {
                         CHANGES_BY_WHY[w as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -2531,6 +2635,11 @@ impl Simulation {
                 v.state.signal = if v.state.lateral > 0.0 { 1 } else { 2 };
                 v.state.signal_time = 0.25;
             }
+        }
+        // (a blocked urgent change shows its side while it waits for the gap, `Plan::urgent_side`)
+        if plan.urgent_side != 0 && v.state.change.is_none() && v.passing.is_none() {
+            v.state.signal = plan.urgent_side;
+            v.state.signal_time = 0.25;
         }
         v.state.update_blinker(net);
         let want = if v.external.blinker_off { 0 } else { v.state.blinker };

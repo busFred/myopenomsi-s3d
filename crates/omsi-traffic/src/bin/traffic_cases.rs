@@ -118,6 +118,7 @@ fn main() {
         Some("sides") if args.len() >= 3 => sides(&args[2..]),
         Some("converge_outside") if args.len() >= 3 => converge_outside(&args[2..]),
         Some("watch") if args.len() >= 4 => watch(Path::new(&args[2]), &args[3..]),
+        Some("lanecount") if args.len() >= 4 => lanecount(Path::new(&args[2]), &args[3..]),
         Some("foes") if args.len() >= 4 => foes(Path::new(&args[2]), &args[3..]),
         Some("lines-on-walks") if args.len() >= 3 => lines_on_walks(Path::new(&args[2]), &args[3..]),
         Some("lights") if args.len() >= 3 => lights(Path::new(&args[2]), &args[3..]),
@@ -4495,6 +4496,10 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut open: BTreeMap<u64, Vec<HeadTally>> = BTreeMap::new();
     let mut prev_odo: HashMap<u64, f32> = HashMap::new();
     let mut gain: BTreeMap<u64, f32> = BTreeMap::new();
+    // (diagnostics: per vehicle the seconds near the player, standing by what held it, on stderr: THRU)
+    let mut thru: BTreeMap<u64, (f32, BTreeMap<String, f32>, usize, f64, f64)> = BTreeMap::new();
+    let mut thru_t = r.sim.time;
+    let mut thru_root: BTreeMap<u64, (f32, usize, String)> = BTreeMap::new();
     let mut prev_front: HashMap<u64, glam::DVec2> = HashMap::new();
     let mut lit: Vec<StopLine> = Vec::new();
     let mut lit_lanes = 0;
@@ -4530,6 +4535,8 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     let mut prev_people: Vec<(glam::DVec3, f64)> = Vec::new();
     // (pairs already listed as `CAPRED` events)
     let mut capped_seen: HashSet<(u64, u64)> = HashSet::new();
+    // (holds before a dead lane's end per car: (start time, lane, s, last held seconds))
+    let mut dead_holds: HashMap<u64, (f64, usize, f32, f32)> = HashMap::new();
     // (an eased-off car standing: since when; the last frame's time)
     let mut ease_still: HashMap<u64, f64> = HashMap::new();
     let mut last_frame = r.sim.time;
@@ -4571,6 +4578,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 }
             }
             ex.lane_revisits = revisits.entries;
+            for v in r.vehicles.iter().filter(|v| v.aborted_for.is_some() && near(v.pos)) {
+                ex.events.push(format!("ABORT {} t={now:.1} #{} lane {} s {:.1} v {:.1} by {:?} for {:?} lead {:?} gap {:?} met {:?}", sc.name, v.id, v.state.lane, v.state.s, v.state.speed, v.aborted_for, v.change_for, v.last.lead_id, v.last.lead.map(|l| l.gap), v.aborted_detail));
+            }
             ex.revisit_vehicles = revisits.vehicles.len() as u64;
             for (i, v) in r.vehicles.iter().enumerate() {
                 if v.ease_for.is_none() || v.state.speed >= 0.3 {
@@ -4636,6 +4646,37 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                 if v > 1.0 {
                     ex.end_moving += 1;
                     ex.events.push(format!("END-MOVING {} t={t:.1} #{id} v {v:.1} at ({:.0}, {:.0})", sc.name, pos.x, pos.y));
+                }
+            }
+            // (a hold before a dead lane's end of `STRATEGIC_LONG_HOLD` or more: where and how it ended)
+            let mut marks: Vec<usize> = Vec::new();
+            for (i, v) in r.vehicles.iter().enumerate() {
+                if v.dead_end_held > 0.0 {
+                    let e = dead_holds.entry(v.id).or_insert((now, v.state.lane, v.state.s, 0.0));
+                    if e.3 < omsi_traffic::sim::STRATEGIC_LONG_HOLD && v.dead_end_held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+                        marks.push(i);
+                    }
+                    e.3 = v.dead_end_held;
+                }
+            }
+            // (at the mark: what it waits beside - the lanes beside as it reads them, with the
+            // occupancy built again as the junction trace does, its lead, who is asked to make room)
+            if !marks.is_empty() {
+                r.sim.build_occupancy(&r.net, &r.vehicles);
+            }
+            for i in marks {
+                let v = &r.vehicles[i];
+                let p = omsi_traffic::perception::perceive(&r.net, &r.sim, &r.vehicles, i);
+                let nbs: Vec<String> = [p.left, p.right].into_iter().flatten().map(|nb| format!("lane {} ahead {:?} behind {:?} by {:?}", nb.lane, nb.ahead.map(|(g, s)| ((g * 10.0).round() / 10.0, (s * 10.0).round() / 10.0)), nb.behind.map(|(g, s)| ((g * 10.0).round() / 10.0, (s * 10.0).round() / 10.0)), nb.behind_id.map(|k| r.vehicles[k].id))).collect();
+                let helpers: Vec<u64> = r.vehicles.iter().filter(|o| o.help_for.is_some_and(|h| h.0 == v.id)).map(|o| o.id).collect();
+                ex.events.push(format!("DEAD-HOLD-60 {} t={now:.1} #{} lane {} s {:.1} stop {:?} lead {:?} at {:?} v {:?}; beside: {}; asked {:?}", sc.name, v.id, v.state.lane, v.state.s, v.last.stop.map(|x| (x - v.state.front) * 10.0).map(|x| x.round() / 10.0), v.last.lead_id, v.last.lead.map(|l| (l.gap * 10.0).round() / 10.0), v.last.lead.map(|l| (l.speed * 10.0).round() / 10.0), nbs.join(" | "), helpers));
+            }
+            let ended: Vec<u64> = dead_holds.keys().copied().filter(|id| r.vehicles.iter().find(|v| v.id == *id).is_none_or(|v| v.dead_end_held <= 0.0)).collect();
+            for id in ended {
+                let (t0, lane, s0, held) = dead_holds.remove(&id).unwrap();
+                if held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+                    let then = r.vehicles.iter().find(|v| v.id == id).map(|v| format!("lane {} change {:?} for {:?} v {:.1}", v.state.lane, v.state.change.map(|c| c.to), v.change_for, v.state.speed));
+                    ex.events.push(format!("DEAD-HOLD {} t={t0:.1} #{id} lane {lane} s {s0:.1} held {held:.1} s, then {}", sc.name, then.unwrap_or_else(|| "gone".into())));
                 }
             }
             change_since.retain(|id, _| ids.contains(id));
@@ -4744,6 +4785,9 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
         } else {
             Vec::new()
         };
+        let tdt = (r.sim.time - thru_t).clamp(0.0, 1.0) as f32;
+        let thru_ids: HashMap<u64, usize> = r.vehicles.iter().enumerate().map(|(k, v)| (v.id, k)).collect();
+        thru_t = r.sim.time;
         // ---- every frame: the odometers and the stop lines
         for ll in &lit {
             let Some(state) = r.sim.lights.get(ll.light.0).map(|c| c.state(ll.light.1)) else { continue };
@@ -4780,6 +4824,39 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             prev_odo.insert(v.id, st.odometer);
             if !near(v.pos) {
                 continue;
+            }
+            {
+                let e = thru.entry(v.id).or_insert((0.0, BTreeMap::new(), 0, r.sim.time, 0.0));
+                e.0 += tdt;
+                if st.speed < 0.1 {
+                    let label = |o: &omsi_traffic::sim::Vehicle| format!("{}{}{}", why_name(o.last.why), if o.state.change.is_some() { "+chg" } else { "" }, if o.lane_end_stop.is_some() { "+les" } else { "" });
+                    let mut key = label(v);
+                    if v.last.why == Why::Lead {
+                        let (mut cur, mut hops) = (v, 0);
+                        loop {
+                            hops += 1;
+                            match cur.last.lead_id.and_then(|id| thru_ids.get(&id)).map(|&k| &r.vehicles[k]) {
+                                Some(l) if hops < 40 && l.state.speed < 0.1 && l.last.why == Why::Lead => cur = l,
+                                Some(l) if l.state.speed < 0.1 => {
+                                    key = format!("lead>{}", label(l));
+                                    let q = thru_root.entry(l.id).or_insert((0.0, l.state.lane, String::new()));
+                                    q.0 += tdt;
+                                    q.1 = l.state.lane;
+                                    q.2 = label(l);
+                                    break;
+                                }
+                                Some(_) => {
+                                    key = "lead>moving".to_string();
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    *e.1.entry(key).or_default() += tdt;
+                }
+                e.2 = st.lane;
+                e.4 = r.sim.time;
             }
             // (`--pedtouch`, the round-6 reviewers' probe: a moving vehicle's body over a
             // person's disc, 0.28 m, every frame, on stderr)
@@ -5061,7 +5138,18 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     for (_, run) in std::mem::take(&mut open) {
         close(&mut sc, run);
     }
+    for (id, (t0, lane, s0, held)) in dead_holds {
+        if held >= omsi_traffic::sim::STRATEGIC_LONG_HOLD {
+            ex.events.push(format!("DEAD-HOLD {} t={t0:.1} #{id} lane {lane} s {s0:.1} held {held:.1} s, still at the end", sc.name));
+        }
+    }
     sc.throughput = gain.values().filter(|g| **g > 20.0).count() as u64;
+    for (id, (near_s, stood, lane, t0, t1)) in &thru {
+        eprintln!("THRU {} #{id} gain {:.0} near {:.0} t {:.0}-{:.0} lane {lane} stood {:?}", sc.name, gain.get(id).copied().unwrap_or(0.0), near_s, t0, t1, stood);
+    }
+    for (id, (q, lane, why)) in thru_root.iter().filter(|x| x.1 .0 >= 5.0) {
+        eprintln!("ROOT {} #{id} queue_s {q:.0} lane {lane} why {why}", sc.name);
+    }
     // (the network's crossings of two lanes of no crossing object, `Network::compile_lane_crossings`,
     // as loaded at the end of the run: how many such places the map has here)
     {
@@ -5369,12 +5457,21 @@ fn ab(args: &[String]) -> Res<()> {
         // [X11-1] the random cars' trip ends (`AiState::goal`), whole map, all fixtures, and the
         // lane revisits (column `lane_revisits`)
         let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-        use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNWEIGHTED};
+        use omsi_sim::traffic::{GOAL_NONE_POCKET, GOAL_PICKED, GOAL_REACHED, GOAL_REPICKED, GOAL_UNREACHABLE, GOAL_UNWEIGHTED, STRATEGIC_MISSED};
         println!("(trip ends, whole map: goal_picked {} goal_repicked {} goal_reached {} goal_unweighted {} goal_none_pocket {}; lane_revisits {} by {} vehicles)", g(&GOAL_PICKED), g(&GOAL_REPICKED), g(&GOAL_REACHED), g(&GOAL_UNWEIGHTED), g(&GOAL_NONE_POCKET), total.extra.lane_revisits, total.extra.revisit_vehicles);
+        // [L3-3] trip ends drawn again because the car's road no longer reached them (of
+        // goal_repicked), and strategic changes missed at the fork
+        println!("(trip-end lane use, whole map: goal_unreachable {} strategic_missed {} strategic_hold_s {} strategic_long_holds {} strategic_gave_up {})", g(&GOAL_UNREACHABLE), g(&STRATEGIC_MISSED), g(&omsi_traffic::sim::STRATEGIC_HOLD_MS) / 1000, g(&omsi_traffic::sim::STRATEGIC_LONG_HOLDS), g(&omsi_sim::traffic::STRATEGIC_GAVE_UP));
         // [J7-3] lane changes of the drivers' own started, by what won them
         let c = |k: usize| omsi_traffic::sim::CHANGES_BY_WHY[k].load(std::sync::atomic::Ordering::Relaxed);
-        println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {})", c(0), c(1), c(2), c(3), c(4));
+        println!("(lane changes of the drivers' own, whole map: lane end {}, turn {}, obstacle {}, speed gain {}, keep side {}, strategic {})", c(0), c(1), c(2), c(3), c(4), c(5));
         println!("(lane changes dropped while signalling, whole map: change_aborted {})", omsi_traffic::sim::CHANGES_ABORTED.load(std::sync::atomic::Ordering::Relaxed));
+        println!("(lane changes started on a gap taken for lane-change impatience, whole map: changes_impatient {})", omsi_traffic::sim::CHANGES_IMPATIENT.load(std::sync::atomic::Ordering::Relaxed));
+        {
+            let by = &omsi_traffic::sim::CHANGES_ABORTED_BY;
+            let row = |k: usize| by[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/");
+            println!("(change_aborted by check, each by what the change was for le/tu/ob/sg/ks/st/unknown: gap_behind {} gap_ahead {} people {} plain_sweep {} bypass_sweep {})", row(0), row(1), row(2), row(3), row(4));
+        }
         println!("(in-lane offset, whole map: lane_offset_s {:.0})", omsi_traffic::sim::LANE_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
     }
     {
@@ -6099,6 +6196,55 @@ fn converge(args: &[String]) -> Res<()> {
     Ok(())
 }
 
+/// `lanecount <fixture> --lanes a,b [--from t] [--to t]`: the reset-at-keyframes replay of a
+/// recording, counting per named lane the distinct vehicles that were on it between the times
+/// (the replay's clock), and by the lane each came from (the lane it was on the frame before it
+/// first stood on the named one; `-` seen there first) - a route's traffic volume, read alike
+/// from recordings made under different rules.
+fn lanecount(fixture: &Path, args: &[String]) -> Res<()> {
+    let lanes: Vec<usize> = opt(args, "--lanes").unwrap_or("").split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let from: f64 = opt(args, "--from").map(|s| s.parse()).transpose()?.unwrap_or(f64::NEG_INFINITY);
+    let to: f64 = opt(args, "--to").map(|s| s.parse()).transpose()?.unwrap_or(f64::INFINITY);
+    let mut r = Replay::load(fixture)?;
+    r.free_run = false;
+    if !r.at(0) {
+        return Err("the fixture has no keyframe".into());
+    }
+    let mut last: HashMap<u64, usize> = HashMap::new();
+    let mut seen: HashMap<usize, HashMap<u64, Option<usize>>> = HashMap::new();
+    let mut classes: HashMap<(u64, usize), (String, bool)> = HashMap::new();
+    while r.step() {
+        let t = r.sim.time;
+        if t > to {
+            break;
+        }
+        for v in &r.vehicles {
+            let lane = v.state.lane;
+            let prev = last.insert(v.id, lane);
+            if t >= from && lanes.contains(&lane) {
+                seen.entry(lane).or_default().entry(v.id).or_insert(prev.filter(|&p| p != lane));
+                classes.entry((v.id, lane)).or_insert_with(|| (format!("{:?}", v.class), omsi_traffic::access::is_open_at(&r.net, lane, v)));
+            }
+        }
+    }
+    for l in &lanes {
+        let m = seen.get(l).cloned().unwrap_or_default();
+        let mut via: BTreeMap<String, usize> = BTreeMap::new();
+        for p in m.values() {
+            *via.entry(p.map_or("-".to_string(), |p| p.to_string())).or_default() += 1;
+        }
+        println!("LANE {l} vehicles {} via {:?}", m.len(), via);
+        // (`--list`: each one, its class and whether the lane was open to it, `access::is_open_at`)
+        if args.iter().any(|a| a == "--list") {
+            for (id, p) in &m {
+                let (class, open) = classes.get(&(*id, *l)).cloned().unwrap_or_default();
+                println!("  #{id} from {p:?} {class} open {open}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `watch <fixture> --ids a,b [--from t] [--to t] [--every 0.5] [--reset] [--player]`: the free run
 /// (or with `--reset` the reset-at-keyframes replay) of a fixture, printing the named vehicles'
 /// state every `--every` seconds between the times (the replay's clock): lane, place, speed,
@@ -6131,7 +6277,19 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             next += every;
         }
         r.sim.update_positions(&r.net, &mut r.vehicles);
-        let found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        let mut found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        // (`--chain`: the watched vehicles' leads, one after the other, to the head of the queue)
+        if args.iter().any(|a| a == "--chain") {
+            let mut k = 0;
+            while k < found.len() && found.len() < 40 {
+                if let Some(j) = r.vehicles[found[k]].last.lead_id.and_then(|id| r.vehicles.iter().position(|v| v.id == id)) {
+                    if !found.contains(&j) {
+                        found.push(j);
+                    }
+                }
+                k += 1;
+            }
+        }
         if args.iter().any(|a| a == "--player") {
             for p in &r.sim.players {
                 let pb = p.obb(0.0, 0.0);
@@ -6154,7 +6312,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
             let st = &v.state;
             let d = &v.last;
             println!(
-                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {} body {:.1}/{:.1}",
+                "t={t:.1} #{} lane {} s {:.1} v {:.2} lat {:+.2} pos ({:.1},{:.1}) hd {:.0} change {:?} pass {:?} why {} stop {:?} lead {:?} lead_id {:?} wf {:?} hold {:?} bb {:?} blink {:?} stopped {:.1} serves {:?} stop_at {:?} at_stop {} for {:?} held_dead {:.1} help_for {:?} end_stop {:?} cap {:?} held {} body {:.1}/{:.1}",
                 v.id,
                 st.lane,
                 st.s,
@@ -6177,9 +6335,33 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
                 v.external.serves,
                 v.external.stop_at.map(|x| x - st.front),
                 v.external.at_stop,
+                v.change_for,
+                v.dead_end_held,
+                v.help_for,
+                v.lane_end_stop.map(|o| o - st.odometer),
+                st.accel_cap,
+                st.held,
                 st.front,
                 st.rear
             );
+        }
+        // (`--nb`: the lanes beside a watched vehicle as its perception reads them now)
+        if args.iter().any(|a| a == "--nb") {
+            r.sim.build_occupancy(&r.net, &r.vehicles);
+            for &i in &found {
+                let p = omsi_traffic::perception::perceive(&r.net, &r.sim, &r.vehicles, i);
+                for nb in [p.left, p.right].into_iter().flatten() {
+                    println!("t={t:.1}   nb of #{}: lane {} dir {} ahead {:?} behind {:?} by {:?} runs_on {:.1} foreign {} allowed {}", r.vehicles[i].id, nb.lane, nb.dir, nb.ahead, nb.behind, nb.behind_id.map(|k| r.vehicles[k].id), nb.runs_on, nb.foreign, nb.allowed);
+                    println!("t={t:.1}   nb of #{}: lane {} {}", r.vehicles[i].id, nb.lane, omsi_traffic::plan::strategic_debug(&r.net, &r.sim, &r.vehicles, &r.vehicles[i], &p, &nb));
+                }
+            }
+        }
+        // (the vehicles asked to make room for a watched one this frame, `Vehicle::help_for`)
+        for &i in &found {
+            let me = r.vehicles[i].id;
+            for o in r.vehicles.iter().filter(|o| o.help_for.is_some_and(|h| h.0 == me)) {
+                println!("t={t:.1}   helper of #{me}: #{} lane {} s {:.1} v {:.2} help {:?} why {} lead_id {:?}", o.id, o.state.lane, o.state.s, o.state.speed, o.help_for, why_name(o.last.why), o.last.lead_id);
+            }
         }
         // ([P8-5] `--people`: everybody on foot within 25 m of a watched vehicle: where, the
         // body's separation from its box, the step, and what the people test reads of them)
@@ -6221,7 +6403,7 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         // (`--ctl N`: light controller N's clock, its requests this frame and its stop points)
         if let Some(n) = opt(args, "--ctl").and_then(|x| x.parse::<usize>().ok()) {
             if let Some(c) = r.sim.lights.get(n) {
-                println!("t={t:.1}   ctl {n} time {:.1} requests {:?} stops {:?}", c.time, c.request, c.stops);
+                println!("t={t:.1}   ctl {n} time {:.1} requests {:?} stops {:?} states {:?}", c.time, c.request, c.stops, (0..c.request.len()).map(|k| c.state(k)).collect::<Vec<_>>());
             }
         }
         // (`--cuts`: the footpaths crossing the watched vehicle's way within 60 m, as distances

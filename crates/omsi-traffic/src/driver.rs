@@ -89,21 +89,54 @@ pub struct DriverParams {
     /// Gap accepted in the lane changed into (s, to the car behind there).
     pub lc_gap: f32,
     /// Lane-change motivation weights (LMRS / LC2013): the route needing it, a faster
-    /// lane, keeping right. (LC2013's cooperative weight has no rule here yet.)
+    /// lane, keeping right. (LC2013's cooperative weight is SUMO's default for every driver,
+    /// `plan::LC_COOPERATIVE`.)
     pub lc_strategic: f32,
     pub lc_speed_gain: f32,
     pub lc_keep_right: f32,
     /// How fast impatience grows while waiting (per second) and where it caps.
     pub impatience_rate: f32,
     pub impatience_max: f32,
+    /// SUMO's vType `lcLookaheadLeft`: the strategic look-ahead towards the overtaking side as a
+    /// factor of the other side's, for the route changes and the strategic stay (`plan`'s
+    /// `strategic_look`; a lane that really ends keeps SUMO's 2.0, `plan::LC_LOOKAHEAD_LEFT`; SUMO's default 2.0,
+    /// sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html). Ours is 1.0 for
+    /// the preset, drawn per driver over 0.65..1.35 from the driver's hurry
+    /// (`LOOKAHEAD_LEFT_HURRY`; the user's decision L3-D2: the low end near AASHTO's decision sight
+    /// distance for maneuver E, urban, t = 14.0-14.5 s, against LC2013's 2 x 10 s, INDOT Design
+    /// Manual ch. 42; centre and spread the user's choice).
+    pub lc_lookahead_left: f32,
+    /// Seconds a driver stands at its last-resort stop before a dead lane's end, its urgent
+    /// strategic change blocked, before it gives up and drives on through the fork on its own
+    /// lane (`plan`'s blocked strategic wish, `omsi_sim::traffic::STRATEGIC_GAVE_UP`), and over
+    /// which its lane-change impatience grows to 1. 30 s for the preset, `30 x (1 - hurry)`, 0..60 s,
+    /// per driver (the user's decision L3-D3).
+    pub strategic_patience: f32,
+    /// Seconds a driver signals before its lane change moves over (`LaneChange::wait`; the start
+    /// test plans through them, `plan`'s `signal_plan`). 2.0 for the preset
+    /// (`omsi_sim::traffic::SIGNAL_BEFORE_CHANGE`), per driver `2.3 - 1.3 x hurry`, 1.0..3.6 s (the
+    /// user's decision L3-D5: Lee, Olsen & Wierwille 2004, NHTSA DOT HS 809 702, give up to about
+    /// 3.6 s of signal before the move, citing Hetrick 1997; the 1.0 s floor and the link to hurry
+    /// are the user's choices).
+    pub signal_before_change: f32,
 }
+
+/// The middle (s) of the drivers' `signal_before_change`, drawn as `SIGNAL_MEAN - SIGNAL_HURRY x
+/// hurry` (the user's decision L3-D5: 1.0 s for the most hurried, 3.6 s for the calmest).
+pub const SIGNAL_MEAN: f32 = 2.3;
+/// How much a driver's hurry shortens its `signal_before_change` (s per unit of hurry, L3-D5).
+pub const SIGNAL_HURRY: f32 = 1.3;
+
+/// How much a driver's hurry (-1 slow .. +1 quick) shortens its `lc_lookahead_left` (the user's
+/// decision L3-D2: 1.0 x (1 - 0.35 x hurry), 0.65..1.35).
+pub const LOOKAHEAD_LEFT_HURRY: f32 = 0.35;
 
 impl Default for DriverParams {
     /// Every field unknown (NaN): what a field a recording lacks is read as, until
     /// `fill_missing` gives it the vehicle's class's preset.
     fn default() -> DriverParams {
         let n = f32::NAN;
-        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n }
+        DriverParams { tau: n, min_gap: n, accel: n, comfort_brake: n, speed_factor: n, lat_accel: n, reaction: n, lc_gap: n, lc_strategic: n, lc_speed_gain: n, lc_keep_right: n, impatience_rate: n, impatience_max: n, lc_lookahead_left: n, strategic_patience: n, signal_before_change: n }
     }
 }
 
@@ -115,7 +148,7 @@ impl DriverParams {
         macro_rules! fill {
             ($($f:ident),*) => { $( if self.$f.is_nan() { self.$f = p.$f; } )* };
         }
-        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max);
+        fill!(tau, min_gap, accel, comfort_brake, speed_factor, lat_accel, reaction, lc_gap, lc_strategic, lc_speed_gain, lc_keep_right, impatience_rate, impatience_max, lc_lookahead_left, strategic_patience, signal_before_change);
     }
 
     /// The preset of a class, before jitter.
@@ -136,6 +169,9 @@ impl DriverParams {
             lc_keep_right: 0.45,
             impatience_rate: 1.0 / 30.0,
             impatience_max: 1.0,
+            lc_lookahead_left: 1.0,
+            strategic_patience: 30.0,
+            signal_before_change: omsi_sim::traffic::SIGNAL_BEFORE_CHANGE,
         };
         // (buses and lorries take bends more gently than cars: the app's 1.6 for every
         // heavy vehicle, until round 7)
@@ -188,6 +224,9 @@ impl DriverParams {
             // for every driver, or a slow driver sits behind a crawler for ever)
             lc_speed_gain: j(p.lc_speed_gain, 0.2),
             impatience_rate: j(p.impatience_rate, 0.5),
+            lc_lookahead_left: j(p.lc_lookahead_left, -LOOKAHEAD_LEFT_HURRY),
+            strategic_patience: j(p.strategic_patience, -1.0),
+            signal_before_change: SIGNAL_MEAN - SIGNAL_HURRY * hurry,
             ..p
         }
     }
@@ -211,6 +250,7 @@ impl DriverParams {
         st.desire = self.speed_factor;
         st.lat_accel = self.lat_accel;
         st.reaction = self.reaction;
+        st.signal_before_change = self.signal_before_change;
     }
 }
 
@@ -301,5 +341,34 @@ mod tests {
         }
         assert!(imp.value < 0.7);
         assert!(imp.claims_after().is_none());
+    }
+}
+
+#[cfg(test)]
+mod per_driver_tests {
+    use super::*;
+
+    /// L3-D2, D3, D5 (final review M2): each driver's own lane-change parameters, drawn from its
+    /// `hurry` in -1..1 by `seeded`: the look-ahead towards the overtaking side 1 * (1 - 0.35 hurry)
+    /// (0.65-1.35), the patience at a dead lane's stop 30 * (1 - hurry) (0-60 s), the signal before a
+    /// change 2.3 - 1.3 hurry (1.0-3.6 s) - one hurry for all three, so a quicker driver looks less
+    /// far, waits less and signals shorter; the presets keep the class's values.
+    #[test]
+    fn each_driver_draws_its_own_lookahead_patience_and_signal_from_one_hurry() {
+        let mut seen = (f32::INFINITY, f32::NEG_INFINITY);
+        for seed in 1..4000u64 {
+            let p = DriverParams::seeded(VehicleClass::Car, seed * 7919);
+            let hurry = (1.0 - p.lc_lookahead_left) / LOOKAHEAD_LEFT_HURRY;
+            assert!((-1.0 - 1e-4..=1.0 + 1e-4).contains(&hurry), "hurry {hurry}");
+            assert!((0.65 - 1e-4..=1.35 + 1e-4).contains(&p.lc_lookahead_left), "lookahead {}", p.lc_lookahead_left);
+            assert!((0.0..=60.0 + 1e-3).contains(&p.strategic_patience), "patience {}", p.strategic_patience);
+            assert!((1.0 - 1e-4..=3.6 + 1e-4).contains(&p.signal_before_change), "signal {}", p.signal_before_change);
+            assert!((p.strategic_patience - 30.0 * (1.0 - hurry)).abs() < 1e-2, "patience from the same hurry");
+            assert!((p.signal_before_change - (SIGNAL_MEAN - SIGNAL_HURRY * hurry)).abs() < 1e-3, "signal from the same hurry");
+            seen = (seen.0.min(p.signal_before_change), seen.1.max(p.signal_before_change));
+        }
+        assert!(seen.0 < 1.4 && seen.1 > 2.7, "the draws spread over the range (bell-shaped: its ends are rare): {seen:?}");
+        let preset = DriverParams::preset(VehicleClass::Car);
+        assert_eq!((preset.lc_lookahead_left, preset.strategic_patience), (1.0, 30.0));
     }
 }
