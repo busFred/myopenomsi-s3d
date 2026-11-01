@@ -430,7 +430,7 @@ fn a_car_waiting_for_its_strategic_change_beside_a_slow_row_is_let_in() {
     assert!(least >= 0.3, "bodies {least:.2} m apart");
 }
 
-/// The trip end of a car with none is drawn at the first fork within SUMO's strategic look-ahead
+/// The trip end of a car with none is drawn at the first fork within the strategic look-ahead
 /// (`LC_STRATEGIC_LOOKAHEAD`), not only once its plan (`PLAN_AHEAD`) reaches the fork: car 1 260 m
 /// before the fork of `fork_ahead` has one after its first frame, and over 40 cars some draw lane 3,
 /// the end reached only from the lane beside.

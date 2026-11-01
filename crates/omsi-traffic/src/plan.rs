@@ -1027,7 +1027,8 @@ pub const KEEP_RIGHT_FASTER: f32 = 5.0 / 3.6;
 /// considered to be a turn-lane that must be avoided" - a driver on the lane that runs on does not
 /// leave it for a keep-right onto one that runs on less than this (`stays_on_best`).
 pub const TURN_LANE_DIST: f32 = 200.0;
-/// SUMO's `lcStrategicLookahead` (m), `omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD`.
+/// The strategic look-ahead (m), `omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD` (SUMO's motorway
+/// bound on its best lanes' look; see there).
 pub use omsi_sim::traffic::LC_STRATEGIC_LOOKAHEAD;
 /// SUMO's `MSVehicle::congested` (m/s, 60 km/h): below it overtaking on the keep side is
 /// allowed (`avoidOvertakeRight` is false), above it the time on the lane beside is bounded by
@@ -1204,7 +1205,8 @@ pub fn keep_right_rate(net: &Network, vehicles: &[Vehicle], me: &Vehicle, p: &Pe
     let (b, tau) = (dp.comfort_brake, dp.tau);
     let v_max = p.v_want.max(0.1);
     // (SUMO's `currentDist` and `neighDist`: the best lanes' length, the lanes open to
-    // the car, up to `lcStrategicLookahead` - `open_run`, not the network's capped reach)
+    // the car, up to our strategic look-ahead `LC_STRATEGIC_LOOKAHEAD` - `open_run`, not the
+    // network's capped reach)
     let runs = open_run(net, me, nb.lane, net.beside_s(st.lane, nb.lane, st.s), LC_STRATEGIC_LOOKAHEAD);
     let (this_safe, nb_safe) = ant;
     if this_safe - KEEP_RIGHT_FASTER > nb_safe {
@@ -2700,10 +2702,12 @@ pub fn light_call(me: &Vehicle, p: &Perception, sig: &SignalView) -> LightCall {
             // nor into a box whose exit is not free - SUMO's no-block check,
             // sumo.md - unless it cannot stop at all)
             let exit_free = p.junction.as_ref().is_none_or(|j| j.exit_room);
-            // (SUMO's yellow rule, re-tested every step (`MSVehicle::planMoveInternal`:
-            // `yellow && canBrake`, canBrake = the brake gap at the vehicle's decel - here its
-            // comfortable brake or `--tls.yellow.min-decel` 3 m/s², whichever is more - within the
-            // distance to the line): a car that slowed for anything and can then stop, stops; the
+            // (SUMO's yellow rule, re-tested every step (`MSVehicle::processLinkApproaches`:
+            // `yellow && canBrake`, canBrake = `brakeGap(v, getMaxDecel())` within the distance to
+            // the line, MSVehicle.cpp:3779-3784; `planMoveInternal` plans the stop at the larger of
+            // `decel` and `--tls.yellow.min-decel`, MSVehicle.cpp:2804) - here the test is
+            // `stops_comfortably`, at the driver's comfortable brake or `YELLOW_MIN_DECEL`,
+            // whichever is more, ours: a car that slowed for anything and can then stop, stops; the
             // decision is not kept from the amber onset. The line is the stop place: no 0.5 m past
             // it)
             let _ = held;
