@@ -3682,7 +3682,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 })
             };
             // (and as far as the piece's lane edges where the map tells them, L3-D6)
-            let (el, er) = net.lane_edge_sides(st.lane);
+            let (el, er) = sim.lane_edge_sides(net, st.lane);
             (el.map_or(half(p.left), |e| e.max(half(p.left))), er.map_or(half(p.right), |e| e.max(half(p.right))))
         } else {
             lane.drivable()
@@ -3716,7 +3716,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let side_extent = |w: usize| -> f32 {
             let l = &net.lanes[w];
             let (dl, dr) = l.drivable();
-            let (el, er) = if l.source == 2 { net.lane_edge_sides(w) } else { (None, None) };
+            let (el, er) = if l.source == 2 { sim.lane_edge_sides(net, w) } else { (None, None) };
             if squeeze_side < 0.0 { el.map_or(dl, |e| e.max(dl)) } else { er.map_or(dr, |e| e.max(dr)) }
         };
         let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane && w.0 < net.lanes.len()).map(|w| side_extent(w.0)).fold(f32::INFINITY, f32::min);
