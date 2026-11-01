@@ -4421,6 +4421,8 @@ impl Traffic {
         let t_rec = std::time::Instant::now();
         let cars = &self.cars;
         self.recorder.note_people_gone(&std::mem::take(&mut self.people_gone));
+        // (handed to the recording: the people's records are made anew every frame)
+        let people_records = std::mem::take(&mut self.people_records);
         let type_of = |i: usize| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default();
         // (the bus driving the player's, `stand_in`, is recorded once, as the player - the
         // player's box the frame carries: a replay knows no stand-in and would have two bodies
@@ -4430,9 +4432,9 @@ impl Traffic {
                 let kept: Vec<usize> = (0..drivers.len()).filter(|&i| i != si).collect();
                 let recorded: Vec<AiVehicle> = kept.iter().map(|&i| drivers[i].clone()).collect();
                 let steer: Vec<_> = steer.iter().filter(|(id, _)| Some(*id) != self.stand_in).cloned().collect();
-                self.recorder.frame(&self.sim, dt, &recorded, &self.people_records, &steer, &|k| type_of(kept[k]));
+                self.recorder.frame(&self.sim, dt, &recorded, people_records, &steer, &|k| type_of(kept[k]));
             }
-            None => self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &type_of),
+            None => self.recorder.frame(&self.sim, dt, &drivers, people_records, &steer, &type_of),
         }
         let t_sim = std::time::Instant::now();
         self.sim.tick(&self.net, dt, &mut drivers);

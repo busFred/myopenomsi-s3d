@@ -609,8 +609,9 @@ impl Recorder {
     /// it. Writes what changed in the fleet (`type_name` names vehicle `i` of a new one)
     /// and in the parked cars, a keyframe when one is due, and the frame's inputs.
     /// `people` has the frame's people in `sim.people`'s order (with what the game knows
-    /// about them besides); `steer`, the ways the game set itself this frame.
-    pub fn frame(&mut self, sim: &Simulation, dt: f32, vehicles: &[Vehicle], people: &[PersonRecord], steer: &[(u64, Steer)], type_name: &dyn Fn(usize) -> String) {
+    /// about them besides), handed over to the frame written (the game makes them anew each
+    /// frame); `steer`, the ways the game set itself this frame.
+    pub fn frame(&mut self, sim: &Simulation, dt: f32, vehicles: &[Vehicle], people: Vec<PersonRecord>, steer: &[(u64, Steer)], type_name: &dyn Fn(usize) -> String) {
         let time = sim.time;
         let keyframe_due = time - self.last_keyframe >= KEYFRAME_SECS;
         // the fleet: vehicles new since the last frame, and gone (at the very first frame
@@ -650,13 +651,7 @@ impl Recorder {
         }
         self.externals.clear();
         self.externals.extend(vehicles.iter().filter(|v| v.external != External::default()).map(|v| (v.id, v.external)));
-        let people_fallback: Vec<PersonRecord>;
-        let people = if people.len() == sim.people.len() {
-            people
-        } else {
-            people_fallback = sim.people.iter().map(PersonRecord::from_person).collect();
-            &people_fallback
-        };
+        let people = if people.len() == sim.people.len() { people } else { sim.people.iter().map(PersonRecord::from_person).collect() };
         // (copied, not written: the recorder's thread serialises it, `Record::Frame` as
         // `RecordRef::Frame` would have)
         let frame = Frame {
@@ -665,9 +660,9 @@ impl Recorder {
             day_time: sim.day_time,
             time_scale: sim.time_scale,
             players: sim.players.clone(),
-            people: people.to_vec(),
             // (not with the people's legs: the replay rebuilds the list from them)
             walkers: if people.iter().any(|p| p.leg.is_some()) { Vec::new() } else { sim.walkers.clone() },
+            people,
             externals: self.externals.clone(),
             steer: steer.to_vec(),
             light_clocks: sim.lights.iter().map(|c| (c.time, c.held, c.request.clone())).collect(),
