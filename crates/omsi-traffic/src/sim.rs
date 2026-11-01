@@ -2270,7 +2270,7 @@ impl Simulation {
                 continue;
             }
             let j = ca.junction;
-            let meet = self.junctions.foes_along_wide(j, &ca.chain).iter().any(|(_, f)| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && self.junctions.for_bodies(j, f, ca.body, Some(cb.body)).is_some());
+            let meet = self.junctions.foes_along_wide_any(j, &ca.chain, |_, f| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && self.junctions.for_bodies(j, f, ca.body, Some(cb.body)).is_some());
             if !meet {
                 continue;
             }
