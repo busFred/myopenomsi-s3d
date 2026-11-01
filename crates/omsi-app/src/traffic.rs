@@ -849,9 +849,37 @@ impl Viewer {
     }
 }
 
-/// How far from the player cars are kept (m) and how far out of sight one may be before it
-/// is taken off (m); in plain view a car stays until it is too small to see.
-const DESPAWN_FACTOR: f64 = 1.6;
+/// Out of sight a car is taken off beyond `spawn_radius` times this (m); in plain view a car
+/// stays until it is too small to see (`Viewer::beyond_horizon`).
+pub(crate) const DESPAWN_FACTOR: f64 = 1.6;
+/// `spawn_radius` (m) where no screen sets it (the replays, the tools, the tests), and the
+/// default on a 1080-line screen.
+pub const KEEP_RADIUS_DEFAULT: f64 = 400.0;
+/// The default's bounds (m): a short window keeps no fewer cars than 300 m round the player,
+/// a tall screen no more than 600 m (the cost of the cars simulated grows with the circle).
+const KEEP_RADIUS_MIN: f64 = 300.0;
+const KEEP_RADIUS_MAX: f64 = 600.0;
+
+/// The radius (m) the random cars are made and counted within (`Traffic::spawn_radius`; out
+/// of sight they go beyond it times `DESPAWN_FACTOR`), from the player's setting
+/// `traffic_radius` (`setting`, m; not positive: not set) and the picture's height in lines
+/// (`lines`, 0: unknown). A player performance setting (fewer cars simulated on a slower
+/// computer), not a model of the traffic.
+///
+/// Not set: `KEEP_RADIUS_DEFAULT` scaled by the height over 1080 lines, within 300-600 m, to
+/// 10 m (`settings::by_screen`): in sight a car is kept until it is two pixels tall
+/// (`Viewer::two_pixels`, which scales with the height the same way), so a car leaving the
+/// circle out of sight is as small on that screen as one leaving 400 m on a 1080-line screen.
+/// A chosen value is taken as it is, but never under `NEVER_VANISH_WITHIN`: no car appears or
+/// vanishes within that of the camera, so a smaller circle would leave no ground to make
+/// cars on.
+pub fn keep_radius(setting: f32, lines: u32) -> f64 {
+    if setting > 0.0 {
+        (setting as f64).max(NEVER_VANISH_WITHIN)
+    } else {
+        crate::settings::by_screen(KEEP_RADIUS_DEFAULT, KEEP_RADIUS_MIN, KEEP_RADIUS_MAX, lines)
+    }
+}
 /// Further off than this (m) a random car may appear in plain view.
 const APPEAR_IN_VIEW_BEYOND: f64 = 300.0;
 
@@ -1008,6 +1036,9 @@ pub struct Traffic {
     /// Made only so that the light programs run (no traffic, no timetable): nobody is put
     /// on the roads - no aircraft, no parked car pulling out - while `target` is 0.
     pub lights_only: bool,
+    /// The random cars are made and counted within this of the player (m); out of sight they
+    /// go beyond it times `DESPAWN_FACTOR`. `KEEP_RADIUS_DEFAULT` until the window sets it
+    /// from the settings each frame (`keep_radius`).
     pub spawn_radius: f64,
     pub time: f32,
     /// Renders of cars that have gone, given back at the next `sync`.
@@ -1839,7 +1870,7 @@ impl Traffic {
             rng: 0x9E37_79B9_7F4A_7C15,
             target,
             lights_only: false,
-            spawn_radius: 400.0,
+            spawn_radius: KEEP_RADIUS_DEFAULT,
             time: 0.0,
             released: Vec::new(),
             camera: None,
@@ -6442,6 +6473,40 @@ mod group_density_tests {
 }
 
 
+
+#[cfg(test)]
+mod keep_radius_tests {
+    use super::{keep_radius, KEEP_RADIUS_DEFAULT, NEVER_VANISH_WITHIN};
+
+    #[test]
+    fn the_keep_radius_follows_the_screen_and_the_setting() {
+        // not set: 400 m on 1080 lines, scaled by the height, within 300-600 m, to 10 m
+        assert_eq!(keep_radius(-1.0, 1080), 400.0);
+        assert_eq!(keep_radius(-1.0, 1440), 530.0);
+        assert_eq!(keep_radius(-1.0, 1200), 440.0);
+        assert_eq!(keep_radius(-1.0, 900), 330.0);
+        assert_eq!(keep_radius(-1.0, 720), 300.0);
+        assert_eq!(keep_radius(-1.0, 2160), 600.0);
+        // no screen (the replays, the tools): today's 400 m
+        assert_eq!(keep_radius(-1.0, 0), KEEP_RADIUS_DEFAULT);
+        assert_eq!(KEEP_RADIUS_DEFAULT, 400.0);
+        // chosen: metres as set, whatever the screen, never under NEVER_VANISH_WITHIN
+        assert_eq!(keep_radius(250.0, 2160), 250.0);
+        assert_eq!(keep_radius(800.0, 720), 800.0);
+        assert_eq!(keep_radius(50.0, 1080), NEVER_VANISH_WITHIN);
+    }
+
+    #[test]
+    fn the_stroll_radius_follows_the_screen_and_the_setting() {
+        use crate::humans::{stroll_radius_for, STROLL_RADIUS};
+        assert_eq!(stroll_radius_for(-1.0, 1080), 200.0);
+        assert_eq!(stroll_radius_for(-1.0, 0), STROLL_RADIUS);
+        assert_eq!(stroll_radius_for(-1.0, 1440), 270.0);
+        assert_eq!(stroll_radius_for(-1.0, 720), 150.0);
+        assert_eq!(stroll_radius_for(-1.0, 2160), 300.0);
+        assert_eq!(stroll_radius_for(100.0, 2160), 100.0);
+    }
+}
 
 #[cfg(test)]
 mod respawn_sight_tests {

@@ -1930,6 +1930,15 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             "mirror_size" => v[&k] = json!(val.parse::<i64>().map(|x| if x == 0 { 0 } else { x.clamp(64, 2048) }).unwrap_or(256)),
             "mirror_refresh" => v[&k] = json!(mirror_refresh(val)),
             "max_fps" => v[&k] = json!(val.parse::<f64>().map(|x| x as i64).unwrap_or(0)),
+            // whole metres round the player the random cars are kept in and the people
+            // stroll in, once chosen; not set (left out) the game takes its screen's
+            "traffic_radius" | "ped_radius" => {
+                if let Ok(m) = val.parse::<f64>() {
+                    if m.is_finite() && m > 0.0 {
+                        v[&k] = json!((m.round() as i64).to_string());
+                    }
+                }
+            }
             "max_obj_dist" => v[&k] = if val.eq_ignore_ascii_case("auto") { json!("auto") } else { json!(val.parse::<f64>().map(|m| (m.round() as i64).to_string()).unwrap_or_else(|_| "auto".into())) },
             "ssao" | "shadows" | "shadow_blobs" | "navigator" | "enhanced" | "triple_screen" | "triple_span" | "triple_hud_center" | "vr" | "vr_desktop_mirror" | "fullscreen" | "vsync" | "exact_fare" | "pax_greet" | "pax_ticket" | "pax_complain" | "trip_summary" | "detail_textures" | "texture_compression" | "chat" | "tooltips" | "name_tags" | "show_fps" | "clouds" | "doppler" | "driver" | "use_real_time" | "use_real_date" | "use_real_year" | "collision_vehicles" | "collision_objects" | "collision_pedestrians" | "head_movement" | "driverview_smooth" | "hands_in_cab" | "alt_view" | "precision_zoom" => v[&k] = json!(b(val)),
             "maintenance" | "ai_unsched_factor" | "ai_max_scheduled" => v[&k] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| x.max(0.0) as i64).unwrap_or(0)),
@@ -2128,9 +2137,9 @@ pub fn save_settings(v: &Value) -> Result<()> {
 
 /// The settings a graphics profile holds: what the Graphics tab shows, except the machine's
 /// own (fullscreen, graphics API).
-pub const GRAPHICS_PROFILE_KEYS: [&str; 21] = [
+pub const GRAPHICS_PROFILE_KEYS: [&str; 23] = [
     "graphics", "msaa", "render_scale", "anisotropy", "shadow_size", "ssao", "shadows", "shadow_casters", "detail_textures", "led_glow", "led_mips", "reflections", "clouds",
-    "vsync", "max_fps", "view_distance", "max_obj_dist", "min_obj_size", "mirror_size", "texture_memory", "texture_compression",
+    "vsync", "max_fps", "view_distance", "max_obj_dist", "min_obj_size", "mirror_size", "texture_memory", "texture_compression", "traffic_radius", "ped_radius",
 ];
 
 fn graphics_profiles_path() -> PathBuf {
@@ -2357,6 +2366,17 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
     text.push_str(&format!("rt_unlocked={}\n", b("rt_unlocked", false)));
     text.push_str(&format!("rt_shadows={}\nrt_reflections={}\n", if rt_open { b("rt_shadows", false) } else { 0 }, if rt_open { rt_reflections_mode(v.get("rt_reflections").and_then(|x| x.as_str()).unwrap_or("off")) } else { "off" }));
     text.push_str(&format!("lamp_fill={}\n", b("lamp_fill", true)));
+    // metres, only once chosen (left out, the game takes a radius from its picture's height)
+    for k in ["traffic_radius", "ped_radius"] {
+        let m = match v.get(k) {
+            Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+            Some(Value::Number(x)) => x.as_f64(),
+            _ => None,
+        };
+        if let Some(m) = m.filter(|m| m.is_finite() && *m > 0.0) {
+            text.push_str(&format!("{k}={}\n", m.round() as i64));
+        }
+    }
     text.push_str(&format!("triple_left_angle_deg={}\ntriple_right_angle_deg={}\ntriple_eye_height_mm={}\n", f("triple_left_angle_deg", 45.0).clamp(0.0, 90.0), f("triple_right_angle_deg", 45.0).clamp(0.0, 90.0), f("triple_eye_height_mm", 0.0).clamp(-500.0, 500.0)));
     let written: Vec<String> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k.trim().to_ascii_lowercase()).collect();
     for line in old.unwrap_or("").lines() {
@@ -3268,6 +3288,22 @@ mod tests {
         assert!(!now.iter().any(|l| l == "5 & 5N") && now.iter().any(|l| l == "130 & N30"), "{now:?}");
         assert!(names("1991-06-01").iter().any(|l| l == "5 & 5N") && !names("1991-06-02").iter().any(|l| l == "5 & 5N"));
         assert!(lines_on(&map, "someday").is_err());
+    }
+
+    #[test]
+    fn the_radii_are_written_only_once_chosen() {
+        // not chosen: not in the file (the game takes its screen's), and not made up on saving
+        let v = settings_from_text(Some("msaa=4\n"));
+        assert!(v.get("traffic_radius").is_none() && v.get("ped_radius").is_none());
+        let text = settings_to_text(&v, None);
+        assert!(!text.contains("traffic_radius") && !text.contains("ped_radius"), "{text}");
+        // chosen (the select's string, or a number from the game's options): kept as metres
+        let v = settings_from_text(Some("traffic_radius=530\nped_radius=150\n"));
+        assert_eq!((v["traffic_radius"].as_str(), v["ped_radius"].as_str()), (Some("530"), Some("150")));
+        let text = settings_to_text(&json!({ "traffic_radius": 250, "ped_radius": "100" }), None);
+        assert!(text.contains("\ntraffic_radius=250\n") && text.contains("\nped_radius=100\n"), "{text}");
+        // nonsense is not chosen
+        assert!(settings_from_text(Some("traffic_radius=auto\nped_radius=-5\n")).get("traffic_radius").is_none());
     }
 
     #[test]

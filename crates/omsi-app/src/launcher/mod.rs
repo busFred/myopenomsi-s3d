@@ -399,6 +399,8 @@ impl ApplicationHandler for Launcher {
             }
             return;
         }
+        // (the screen, for the radii the game takes by its picture's height)
+        crate::startup::note_primary_screen(event_loop);
         // (`OMSI_LAUNCHER_SIZE=WxH`: another window size, for looking at the layout)
         let asked = omsi_cfg::env::var("OMSI_LAUNCHER_SIZE").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))));
         let (fit, at) = match asked {

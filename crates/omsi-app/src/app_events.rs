@@ -326,6 +326,10 @@ impl ApplicationHandler for App {
             // a finger (a phone; see touch.rs)
             WindowEvent::Touch(t) => self.on_touch(event_loop, t),
             WindowEvent::RedrawRequested => {
+                // (the picture's height, whose default radii the options list shows)
+                if let Some(sf) = self.surface.as_ref() {
+                    crate::settings::RENDER_LINES.store(sf.config.height, std::sync::atomic::Ordering::Relaxed);
+                }
                 if self.vr_nav_edit.is_some() && (!self.vr_active() || self.view != "driver") {
                     self.finish_vr_nav_edit();
                 }
@@ -599,6 +603,13 @@ impl ApplicationHandler for App {
                         &r.options,
                         self.streamer.as_ref().map_or(0.0, |s| s.load_radius),
                     );
+                    // the player's `traffic_radius` (or the default for the window's height),
+                    // every frame: a change in the options or a resized window applies at once
+                    let radius = traffic::keep_radius(self.settings.traffic_radius, px_height);
+                    if radius != t.spawn_radius {
+                        log::info!("traffic: random cars kept within {radius:.0} m, out of sight taken off beyond {:.0} m (traffic_radius {}, picture {px_height} lines)", radius * traffic::DESPAWN_FACTOR, if self.settings.traffic_radius > 0.0 { self.settings.traffic_radius.to_string() } else { "not set".to_string() });
+                        t.spawn_radius = radius;
+                    }
                     // [ROLLBACK clockjump-93] a time set by hand: the timetable's buses are put out anew
                     if let Some(s) = self.schedule.as_mut().filter(|_| self.args.schedule) {
                         if s.note_clock(t.day_time, dt as f64, self.settings.time_speed) {
@@ -1429,6 +1440,9 @@ impl ApplicationHandler for App {
                         self.humans_populate_t = 2.0;
                         h.populate(w, r, scene, center);
                     }
+                    // the player's `ped_radius` (or the default for the window's height), every
+                    // frame as the traffic's
+                    h.set_stroll_radius(humans::stroll_radius_for(self.settings.ped_radius, self.surface.as_ref().map_or(0, |s| s.config.height)));
                     if let (Some(cam), Some(s)) = (self.camera.as_ref(), self.surface.as_ref()) {
                         h.eye = Some(humans::Eye::of(
                             cam,
