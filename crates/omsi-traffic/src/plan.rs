@@ -1967,11 +1967,11 @@ fn change_keep_room(net: &Network, me: &Vehicle, p: &Perception) -> Option<f32> 
 
 /// The keep-back behind a standing lead (room to pull out again) is placed only where the car can
 /// still stop there braking at most this many times its comfortable brake (a gentle stop, not an
-/// emergency one). No source gives it: it is the gentle-stop factor this code already used before
-/// L3 - a junction line is held only where the car stops `<= comfort_brake * 1.5`
-/// (`refused_stop`'s `gently`), and the keep-back behind a standing lead in `plan` itself used it inline - named here and kept, so the keep-back
-/// ends where the other gentle stops do (3 m/s² for the car preset's 2.0, under `HARD_BRAKE`).
-pub const KEEP_BACK_BRAKE: f32 = 1.5;
+/// emergency one). No source gives it: it is the code's one gentle-stop factor,
+/// `INSIDE_BRAKE_FACTOR` (the stop at a junction's line, `refused_stop`, and `gentle_stop`), which
+/// the keep-back used inline before L3 - so the keep-back ends where the other gentle stops do
+/// (3 m/s² for the car preset's 2.0, under `HARD_BRAKE`).
+pub const KEEP_BACK_BRAKE: f32 = INSIDE_BRAKE_FACTOR;
 
 /// A car closing in on the room a bypass needs holds there from this far inside it (m: the
 /// stop lands within half a metre of where it was aimed).
