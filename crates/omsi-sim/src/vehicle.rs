@@ -1485,12 +1485,8 @@ impl VehicleInstance {
     /// Omsi.exe takes a number as that index (the scenery objects' `[texttexture]` do the same,
     /// see `resolve_scenery_freetex_name`); taken for a variable's name it matches nothing and
     /// the plate stays empty. See `Program::text_texture_var`.
-    pub fn text_texture_string(&self, field: &str) -> String {
-        self.ty
-            .program
-            .text_texture_var(field)
-            .map(|i| self.state.str_vars[i as usize].clone())
-            .unwrap_or_default()
+    pub fn text_texture_str(&self, field: &str) -> &str {
+        self.ty.program.text_texture_var(field).map_or("", |i| self.state.str_vars[i as usize].as_str())
     }
 
     /// Re-render changed text textures; returns the indices with a pending image.
@@ -1500,13 +1496,15 @@ impl VehicleInstance {
         if let Some(id) = self.ty.program.var("Refresh_Strings") {
             self.state.vars[id as usize] = 0.0;
         }
-        for i in 0..self.text_textures.len() {
-            let field = self.text_textures[i].def.variable.clone();
-            let text = self.text_texture_string(&field);
-            if self.text_textures[i].update(&text) {
+        // (each string read where it stands, `text_texture_str`, not copied out: drawn again only
+        // when it changed, `TextTexture::update`)
+        let mut tts = std::mem::take(&mut self.text_textures);
+        for (i, t) in tts.iter_mut().enumerate() {
+            if t.update(self.text_texture_str(&t.def.variable)) {
                 changed.push(i);
             }
         }
+        self.text_textures = tts;
         changed
     }
 
@@ -3957,8 +3955,7 @@ impl TrailerPart {
     pub fn update_text_textures(&mut self, main: &VehicleInstance) -> Vec<usize> {
         let mut changed = Vec::new();
         for (i, t) in self.text_textures.iter_mut().enumerate() {
-            let text = main.text_texture_string(&t.def.variable);
-            if t.update(&text) {
+            if t.update(main.text_texture_str(&t.def.variable)) {
                 changed.push(i);
             }
         }
