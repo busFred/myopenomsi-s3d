@@ -1503,8 +1503,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // crowd stepping onto a short walk a turn crosses 3 m on - goes through the ordinary
         // strip and body tests below like anybody; those
         // still walking up to it are approaching persons, above)
-        let on_covered_walk = covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
-        if on_covered_walk && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
+        // (asked only of somebody on a crossing near enough)
+        let on_covered_walk = || covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
+        if on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS && on_covered_walk() {
             if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
@@ -1554,9 +1555,10 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // whose cut of my way the network does not list (viz2 j19 crossing 0 across #19609's
         // way). For a timed walker their projected step is not also taken by the strip and body
         // tests below (it stopped a car that passes first late, with its body across their path).
-        let on_cut_walk = zebras.iter().any(|z| net.lanes.get(z.walk).and_then(|wl| wl.nearest_point(p.pos)).is_some_and(|(_, dd)| (dd as f32) < net.lanes[z.walk].width * 0.5 + crate::plan::PERSON_RADIUS));
+        // (asked only of a walker whose leg is a crossing's)
+        let on_cut_walk = || zebras.iter().any(|z| net.lanes.get(z.walk).and_then(|wl| wl.nearest_point(p.pos)).is_some_and(|(_, dd)| (dd as f32) < net.lanes[z.walk].width * 0.5 + crate::plan::PERSON_RADIUS));
         let crossing_leg = p.leg.is_some_and(|l| sim.junctions.of_foot_lane.contains_key(&l));
-        let across = (crossing_leg && !on_crossing && !on_cut_walk && !p.at_kerb && !p.waiting_for_bus && p.approach.is_none() && !at_kerb_of_stop && !my_waiter && p.vel.length() >= STEP_SPEED as f64)
+        let across = (crossing_leg && !on_crossing && !on_cut_walk() && !p.at_kerb && !p.waiting_for_bus && p.approach.is_none() && !at_kerb_of_stop && !my_waiter && p.vel.length() >= STEP_SPEED as f64)
             .then(|| walk_across(way, p.pos.truncate(), p.vel, half, st.rear + crate::plan::PERSON_RADIUS, reach + st.front))
             .flatten();
         let mut timed = false;
