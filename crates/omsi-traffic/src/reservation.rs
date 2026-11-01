@@ -13,6 +13,12 @@ use omsi_sim::traffic::{arrival_time, APPROACH_WINDOW, MAX_BRAKE};
 /// A vehicle asking for its way through a junction this frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
+    /// An approach filed at a junction after the one the vehicle's own claim is at, so that the
+    /// cars waiting there see it coming (`perception::ENTRY_SIGHT_TIME`): a foe of theirs, never
+    /// decided for itself. AI vehicles only: a player's vehicle files none (the cars at the
+    /// junction after its first do not see it coming), and a stand-in's are dropped with its claim
+    /// (`StandIn`), nor does its grant see the others' (it is resolved on the claims alone).
+    pub foe_only: bool,
     /// The pieces of the junction the way runs through, each with how far along the way
     /// its start lies (`Junctions::chain_along`): the claim stands for all of them.
     pub chain: Vec<(usize, f32)>,
@@ -29,6 +35,13 @@ pub struct Claim {
     pub speed: f32,
     pub accel: f32,
     pub v_max: f32,
+    /// The most it comes to the junction's first meeting place at (m/s): what its bends let it
+    /// (`AiState::bend_speed_at`; INFINITY: not known, a player). It is judged to follow a lead
+    /// there at no more than this (`follow_room`, where SUMO's zipper uses the current speed): the
+    /// arrival speed SUMO registers for an approach, `vLinkPass`, at most the link lane's speed
+    /// (netconvert limits it by the turning radius, `NBEdge` `junctions.limit-turn-speed`). On the
+    /// target lane of a committed lane change, its bends.
+    pub pass_speed: f32,
     /// From the origin to the front and the rear bumper (m).
     pub front: f32,
     pub rear: f32,
@@ -293,8 +306,16 @@ fn planned_window(c: &Claim, from: f32, to: f32) -> (f32, f32) {
         let front = c.s + c.front;
         // (when the lead's rear has gone `d` m from where it is: my front `d` m further on)
         let lead_at = |p: f32| arrival_time(p + c.min_gap - (front + gap), v_lead, c.accel, c.v_max.max(v_lead)) + c.tau;
-        t_in = t_in.max(lead_at(from));
-        t_out = t_out.max(lead_at(to + c.rear + c.front));
+        // (only for a place my front has still to reach: one already behind it I am at or past
+        // now, whatever my lead does - counted `tau` away, a car well inside a merge took a foe
+        // standing behind it at the stretch's start for one there first)
+        if from > front {
+            t_in = t_in.max(lead_at(from));
+        }
+        let out_at = to + c.rear + c.front;
+        if out_at > front {
+            t_out = t_out.max(lead_at(out_at));
+        }
     }
     (t_in, t_out)
 }
@@ -450,10 +471,21 @@ fn foe_times(c: &Claim, o: &Claim, mine: (f32, f32), theirs: (f32, f32), their_w
 /// The room (m) the car-following model (IDM) needs behind a lead at `lead_speed` to follow it
 /// braking no harder than comfortably: its braking a (s*/s)² is within the comfortable brake b
 /// for s >= s* sqrt(a/b), s* = s0 + v T + v Δv / (2 sqrt(a b)) (SUMO's `couldBrakeForLeader` asks
-/// the same of its Krauss model).
+/// whether the follower could brake for one second to stay behind). v is the speed it comes to the
+/// meeting place with, its speed but no more than its bends let it there (`Claim::pass_speed`):
+/// the braking its own bends ask of it on the way is its own, not braking for the lead. SUMO's
+/// zipper does not do this: its `couldBrakeForLeader` takes the follower's current speed
+/// (`MSLink.cpp`, `follow->getSpeed()`). Ours differs for an OMSI reason: the room asked is the
+/// IDM's comfortable following, far longer than SUMO's one second of braking, and at its current
+/// speed a car still 40-70 m off and slowing for a bend before the merge was taken for one that
+/// could not follow an entrant (round11r: #143 at 12.8 m/s, need 48 m against 41.8 m, arriving at
+/// 5.4 m/s). The speed taken is SUMO's `vLinkPass`, the arrival speed it registers for the link
+/// (at most the link lane's speed, which netconvert limits by the turning radius), applied to the
+/// follow room.
 fn follow_room(x: &Claim, lead_speed: f32) -> f32 {
     let (a, b) = (x.accel.max(0.1), x.decel.max(0.1));
-    let s_star = x.min_gap + (x.speed * x.tau + x.speed * (x.speed - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
+    let v = x.speed.min(x.pass_speed);
+    let s_star = x.min_gap + (v * x.tau + v * (v - lead_speed) / (2.0 * (a * b).sqrt())).max(0.0);
     s_star * (a / b).sqrt()
 }
 
@@ -477,7 +509,8 @@ pub fn zipper_reach(c: &Claim) -> f32 {
 /// short of it the one there first is ahead (`their_in` the foe's arrival as the resolver has shifted it, at its
 /// green; a tie: the one further along, then the lower index). The table orders the rest: one
 /// giving way (`i_yield`) also lets a later foe go first that could not stop behind it with its
-/// comfortable brake (a 14 m/s main road car must not brake hard for a merger),
+/// comfortable brake (a 14 m/s main road car must not brake hard for a merger; judged at the speed
+/// the foe comes to the merge with, `follow_room`),
 /// and the one with the right of way takes an earlier yielding foe as ahead only when it could
 /// stop behind it so (the same pair from the other side: exactly one of the two is ahead);
 /// between equals the order of arrival alone (SUMO: a later foe that can brake for me is
@@ -507,7 +540,10 @@ fn zipper_cap(c: &Claim, o: &Claim, foe: &crate::junction::Foe, their_in: f32, r
     // (the fronts past the stretch's start; negative short of it)
     let p_e = (c.s + c.front) - foe.mine.0;
     let p_f = (o.s + o.front) - foe.theirs.0;
-    let t_e = window(c, foe.mine.0, foe.mine.1).0;
+    // (my arrival at the stretch no sooner than my lead lets me, `planned_window`: an entrant that
+    // rolls up behind a circulating car it follows in cannot be at the start before that car's rear
+    // has gone by, so it does not count itself first against the next car coming)
+    let t_e = planned_window(c, foe.mine.0, foe.mine.1).0;
     let t_f = their_in;
     // (short of the stretch, its plan stops it before it: at its red, or behind a standing lead,
     // `Claim::lead_rest`)
@@ -1298,9 +1334,13 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
         }
     }
     // claim of each vehicle, for following a chain of leads
-    let claim_of: hashbrown::HashMap<usize, usize> = claims.iter().enumerate().map(|(k, c)| (c.vehicle, k)).collect();
+    let claim_of: hashbrown::HashMap<usize, usize> = claims.iter().enumerate().filter(|(_, c)| !c.foe_only).map(|(k, c)| (c.vehicle, k)).collect();
     for &k in &order {
         let c = &claims[k];
+        if c.foe_only {
+            out[k] = Some(Grant::go(c.vehicle));
+            continue;
+        }
         let node = &js.nodes[c.junction];
         let my_foes = js.foes_along_wide(c.junction, &c.chain);
         let squeeze = if plain.is_some() { c.impatience.claims_after() } else { None };
@@ -1615,7 +1655,7 @@ mod tests {
     }
 
     fn claim(vehicle: usize, movement: usize, s: f32, speed: f32) -> Claim {
-        Claim { half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
+        Claim { foe_only: false, pass_speed: f32::INFINITY, half_width: 0.9, yields_now: None, clear_ahead: f32::INFINITY, serving: false, brake: 5.6, vehicle, junction: 0, movement, s, speed, accel: 1.8, v_max: 13.0, front: 2.0, rear: 2.0, decel: 2.0, waiting: 0.0, lead_gap: None, zip_behind: None, refused_last: false, body_block: None, next_wait: f32::NEG_INFINITY, tau: 1.3, min_gap: 2.0, red_at: 0.0, committed: false, exit_room: true, impatience: Impatience::default(), absolute: false, held: false, light_red: false, until_go: None, chain: vec![(movement, 0.0)], lead: None, was_standing: false, blocked: false, lanes: Vec::new(), light: None, id: vehicle as u64, stuck: false, clearing: false, in_box_at_turn: false }
     }
 
     /// A crossing object of `pieces` (polylines; each with its turn), equal priorities.
@@ -3141,6 +3181,26 @@ mod tests {
                 assert!(capped_by(&g, held, holder) && !capped_by(&g, holder, held), "A {da} m, B {db} m, #{held} held: {g:?}");
             }
         }
+    }
+
+    /// A yielding merger already well inside the merge stretch, rolling behind its lead, is
+    /// not capped by a foe standing at the stretch's start behind it: its planned arrival at a
+    /// place its front has passed is now, not its lead's time gap `tau` away (`planned_window`).
+    #[test]
+    fn a_merger_past_the_stretch_start_is_not_capped_by_a_foe_standing_behind_it_at_the_start() {
+        let (mut net, _) = zipper_object();
+        net.lanes[1].priority = 192.0;
+        let js = Junctions::compile(&net);
+        assert!(js.nodes[0].movements[0].foes[0].yields);
+        let f = *js.nodes[0].movements[0].foes.iter().find(|f| f.kind == FoeKind::Merge).unwrap();
+        // the merger (A): front 3 m past the stretch's end at 2 m/s, its lead 3 m ahead at 2 m/s
+        let mut a = zip_claim(&js, 1, 0, -3.0, 2.0);
+        a.lead_gap = Some((3.0, 2.0));
+        // the foe (B): standing with its front half a metre into the stretch
+        let b = zip_claim(&js, 2, 1, (f.theirs.1 - f.theirs.0) - 0.5, 0.0);
+        assert!((a.s + a.front - f.mine.0) - (b.s + b.front - f.theirs.0) > a.front + a.rear);
+        let g = resolve(&js, &[a, b]);
+        assert!(!capped_by(&g, 1, 2), "{g:?}");
     }
 
     /// At a zipper: a merger that gives way never goes in front of a main

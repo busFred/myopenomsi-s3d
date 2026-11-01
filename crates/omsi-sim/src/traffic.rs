@@ -3913,7 +3913,10 @@ impl LaneRevisits {
 /// Hardest braking of an AI driver (m/s²): an emergency stop.
 pub const MAX_BRAKE: f32 = 8.0;
 /// Gap a car leaves before a stop line or a stop point (m).
-const STOP_LINE_GAP: f32 = 0.6;
+pub const STOP_LINE_GAP: f32 = 0.6;
+/// The stop controller brakes this much over the constant deceleration that stops the car at the
+/// stop point.
+pub const STOP_BRAKE_MARGIN: f32 = 1.05;
 /// A car backing up out of a packed queue does so at walking pace (m/s,
 /// `AiState::reverse_step`): 5 km/h, which the Austrian Supreme Court's decision
 /// OGH 23.03.2007, 2Ob262/05a equates with "Schrittgeschwindigkeit" in the lower court's findings
@@ -4912,16 +4915,36 @@ impl AiState {
         best
     }
 
+    /// How fast the car can be going `ahead` m on along its way (from its origin) and take every
+    /// bend of the stretch after that place as `curve_speed` does from where it is: the speed it
+    /// comes to a place ahead with when nothing holds it back (the bends before that place it has
+    /// left behind by then). On the lane change's target lane and its plan when `on_target` (the
+    /// way a committed change has taken, `perception::change_committed`), else on its own lanes.
+    pub fn bend_speed_at(&self, net: &Network, ahead: f32, on_target: bool) -> f32 {
+        match self.change.filter(|c| on_target && c.to < net.lanes.len()) {
+            Some(c) => self.curve_speed_on_from(net, &self.change_seq(c.to), c.s_to, ahead.max(0.0)),
+            None => self.curve_speed_on_from(net, &self.seq(), self.s, ahead.max(0.0)),
+        }
+    }
+
     fn curve_speed_on(&self, net: &Network, q: &LaneSeq, s: f32) -> f32 {
-        let reach = (self.speed * self.speed / 4.0 + 12.0).min(90.0);
+        self.curve_speed_on_from(net, q, s, 0.0)
+    }
+
+    /// `curve_speed_on` for the place `from` m on from `s`.
+    fn curve_speed_on_from(&self, net: &Network, q: &LaneSeq, s: f32, from: f32) -> f32 {
+        let reach = from + (self.speed * self.speed / 4.0 + 12.0).min(90.0);
         let mut best = f32::MAX;
         // The samples lie at fixed places of the road (every 2.5 m of the odometer), not at
         // fixed distances ahead of the car: moving with the car, the sample that caught a
         // bend jumped 2.5 m nearer every 2.5 m, the allowed speed fell in steps of 4 m²/s²
         // and the car braked hard, let go and braked hard again with nothing in front of it.
         let first = 2.5 - self.odometer.rem_euclid(2.5);
-        let mut d = 0.0f32;
+        let mut d = from;
         let mut next = first;
+        while next <= from {
+            next += 2.5;
+        }
         while d <= reach {
             let (i, u) = q.locate(net, s, d);
             let turn = wrap_deg(q.heading(net, s, d + 3.0) - q.heading(net, s, d - 3.0)).abs().to_radians() / 6.0;
@@ -4931,7 +4954,7 @@ impl AiState {
                 // (a bend may begin anywhere up to a sample's spacing before the sample
                 // that finds it: the speed is taken from there, or the car met the start of
                 // a tight turn half a metre after its profile had allowed 1 m/s more)
-                best = best.min((v * v + 2.0 * 2.0 * (d - 2.5).max(0.0)).sqrt());
+                best = best.min((v * v + 2.0 * 2.0 * (d - from - 2.5).max(0.0)).sqrt());
             }
             d = next;
             next += 2.5;
@@ -5129,7 +5152,7 @@ impl AiState {
             let room = (d - self.front - STOP_LINE_GAP).max(0.02);
             let need = v * v / (2.0 * room);
             let idm = (acc + interaction(d - self.front, 0.0, STOP_LINE_GAP, 0.2)).max(-0.5 * b);
-            let constant = -need * 1.05;
+            let constant = -need * STOP_BRAKE_MARGIN;
             let k = ((need - 0.35 * b) / (0.15 * b)).clamp(0.0, 1.0);
             let a_stop = idm + (constant - idm) * k;
             out = out.min(a_stop);
@@ -5318,6 +5341,22 @@ mod tests {
         let mut net = Network { lanes: vec![a, bend, c], ..Default::default() };
         net.link(1.5);
         net
+    }
+
+    /// `bend_speed_at` is `curve_speed`'s profile from a place ahead: from the car itself the same,
+    /// in the 14 m bend its bend speed sqrt(lat_accel 14), and past the bend nothing to slow for.
+    #[test]
+    fn bend_speed_at_reads_the_bends_from_the_place_ahead() {
+        let net = junction();
+        let mut car = AiState::new(0, 0.0, 7);
+        car.speed = 14.0;
+        car.plan_next(&net);
+        assert_eq!(car.bend_speed_at(&net, 0.0, false), car.curve_speed(&net));
+        let in_bend = car.bend_speed_at(&net, 62.5, false);
+        assert!((in_bend - (car.lat_accel * 14.0).sqrt()).abs() < 0.6, "{in_bend}");
+        // (no lane change: the target lanes are its own)
+        assert_eq!(car.bend_speed_at(&net, 62.5, true), in_bend);
+        assert_eq!(car.bend_speed_at(&net, 150.0, false), f32::MAX);
     }
 
     #[test]
