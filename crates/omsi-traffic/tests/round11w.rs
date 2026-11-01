@@ -247,8 +247,9 @@ fn w3_a_slow_car_on_a_limited_lane_does_not_stop_across_the_walkers_line() {
     // review F1 (`review-r11-w-probe.rs`): a car at 3 m/s on an 11 km/h lane, its top speed
     // 100 km/h; a walker crosses from the middle of the left lane at 1.2 m/s, their line 2-2.5 m
     // ahead of its front. Timed at its top speed the car "cleared first", rolled on and stood across
-    // their line (the walker 1.08-1.23 m into its body); timed at its present speed (SUMO's
-    // `distToCrossing / max(v, 1)`) it stands short of them
+    // their line (the walker 1.08-1.23 m into its body); timed at its arrival up to its lane's
+    // limit (`crossing_time`; SUMO's `getMinimalArrivalTime` to the speed it may pass at) it
+    // stands short of them
     for g in [2.0f64, 2.5] {
         let net = two_lanes(11.0, 100.0 + 2.42 + g);
         let mut sim = Simulation::new(&net, vec![]);

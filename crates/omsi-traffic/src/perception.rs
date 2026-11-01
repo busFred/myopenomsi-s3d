@@ -1111,30 +1111,60 @@ const STEP_NEAR: f32 = 1.5;
 /// beside standing cars at arm's length; the replay gates are taken on it.
 const PERSON_STOP_SHORT: f32 = 1.5;
 
-/// SUMO's floor on the speed a vehicle is timed at to a crossing (m/s): `MSLink::getLeaderInfo`
-/// times a vehicle to an approaching person's crossing at `distToCrossing / MAX2(ego->getSpeed(),
-/// 1.0)`.
+/// SUMO's floor on the speed a vehicle already inside the junction is timed at to a crossing
+/// (m/s): `MSLink::getLeaderInfo` (MSLink.cpp:1940-1945), for ego on an internal lane of the
+/// crossing's junction ("a person might step on the crossing at any moment, since ego is already
+/// on the junction"), takes `distToCrossing / MAX2(ego->getSpeed(), 1.0)`.
 const CROSSING_TIMING_SPEED: f32 = 1.0;
 
-/// When (s from now) a vehicle at `v` m/s comes `dist` m on, timed as SUMO times a vehicle to a
-/// crossing: at its present speed, `CROSSING_TIMING_SPEED` at least (no speeding up it may not
-/// do: its top speed is not its lane's limit, its leader's or its plan's).
-fn crossing_time(dist: f32, v: f32) -> f32 {
+/// How a vehicle is timed to a crossing on its way (`crossing_time`): its present and highest
+/// speed and its acceleration, and whether it is inside the junction.
+#[derive(Clone, Copy)]
+struct CrossingTiming {
+    v: f32,
+    accel: f32,
+    v_max: f32,
+    inside: bool,
+}
+
+impl CrossingTiming {
+    /// `me`'s timing: inside when its lane is a junction's piece (SUMO's internal lane); its
+    /// highest speed its lane's limit as it drives it (the limit times its desire, at most its top
+    /// speed), as `lead_by_bodies` times my arrival behind a body crossing my way.
+    fn of(net: &Network, sim: &Simulation, me: &Vehicle) -> CrossingTiming {
+        let st = &me.state;
+        let v_max = net.lanes.get(st.lane).map_or(st.max_speed_kmh / 3.6, |l| (l.speed_limit_kmh / 3.6 * st.desire).min(st.max_speed_kmh / 3.6));
+        CrossingTiming { v: st.speed, accel: st.accel, v_max, inside: sim.junctions.of_lane.contains_key(&st.lane) }
+    }
+}
+
+/// When (s from now) a vehicle comes `dist` m on, timed as SUMO times it to a crossing. Inside
+/// the junction: at its present speed, `CROSSING_TIMING_SPEED` at least (`getLeaderInfo`).
+/// Approaching it: its arrival speeding up at its acceleration to its lane's limit as it drives
+/// it (`arrival_time`; SUMO's arrival time in `MSLink::opened` and `blockedAtTime` is
+/// `MSVehicle::getArrivalTime`, `MSCFModel::getMinimalArrivalTime` to the speed it may pass
+/// the link at), never its top speed, which is not its lane's limit.
+fn crossing_time(dist: f32, t: CrossingTiming) -> f32 {
     if dist <= 0.0 {
         return 0.0;
     }
-    dist / v.max(CROSSING_TIMING_SPEED)
+    if t.inside {
+        dist / t.v.max(CROSSING_TIMING_SPEED)
+    } else {
+        arrival_time(dist, t.v, t.accel, t.v_max)
+    }
 }
 
 /// When (s from now) a vehicle at `v` m/s covers `dist` m at the motion it is making: braking
 /// (`acc` < 0, the last step's) it goes on braking at that rate, and never gets there when it
-/// stops short (infinity); otherwise at its present speed (`crossing_time`).
-fn rear_clears(dist: f32, v: f32, acc: f32) -> f32 {
+/// stops short (infinity); otherwise as it is timed to a crossing (`crossing_time`).
+fn rear_clears(dist: f32, t: CrossingTiming, acc: f32) -> f32 {
     if dist <= 0.0 {
         return 0.0;
     }
+    let v = t.v;
     if acc >= 0.0 {
-        return crossing_time(dist, v);
+        return crossing_time(dist, t);
     }
     let disc = v * v + 2.0 * acc * dist;
     if disc < 0.0 {
@@ -1361,6 +1391,7 @@ fn zebra_cuts(net: &Network, me: &Vehicle, lanes: &[(usize, f32)]) -> Vec<ZebraC
 fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, f32)], way: &WayPts, parked_swerve: Option<f32>) -> (Option<f32>, Option<(f32, Option<f32>)>) {
     let st = &me.state;
     let v = st.speed;
+    let timing = CrossingTiming::of(net, sim, me);
     let reach = people_reach(v, me.params.comfort_brake);
     let radius = (st.front + reach + 6.0) as f64;
     // who holds the car on its way, and who would on the lane's axis (the shift's candidates)
@@ -1442,11 +1473,12 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // `APPROACH_PACE_MAX`, and is at least `JM_CROSSING_GAP`, so a far-kerb approacher on a road
     // wider than 10 m is seen too; they are looked for within `ZEBRA_WAY` beyond my strip's
     // reach) holds me (1) short of the zebra stop while their window on the
-    // crossing overlaps mine - my front reaching the cut to my rear leaving it, at my present
-    // speed (`crossing_time`) - within `JM_TIMEGAP_MINOR` and I can still brake for the stop at my comfortable deceleration
-    // (`MSLink::blockedAtTime`'s persons); (2) past the zebra stop, short of the cut, when I
-    // reach the cut later than they step on (`getLeaderInfo`: "breaking for approaching
-    // person", the time to the crossing at max(v, 1 m/s)), `JM_STOPLINE_CROSSING_GAP` before it
+    // crossing overlaps mine - my front reaching the cut to my rear leaving it, as I am timed to
+    // a crossing (`crossing_time`: inside the junction at max(v, 1 m/s), approaching it at my
+    // arrival up to my lane's limit) - within `JM_TIMEGAP_MINOR` and I can still brake for the
+    // stop at my comfortable deceleration (`MSLink::blockedAtTime`'s persons); (2) past the zebra
+    // stop, short of the cut, when I reach the cut (`crossing_time`) later than they step on
+    // (`getLeaderInfo`: "breaking for approaching person"), `JM_STOPLINE_CROSSING_GAP` before it
     let approaching = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + ZEBRA_WAY as f64).into_iter().filter(|&k| sim.people[k].approach.is_some()).collect::<Vec<_>>() };
     for z in zebras.iter().filter(|z| z.along > st.front) {
         let Some(walk) = net.lanes.get(z.walk) else { continue };
@@ -1459,15 +1491,15 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         let mut stop = None;
         for (_, arrive, leave) in comes {
             if zebra_stop > st.front {
-                let my_arrive = crossing_time(z.along - st.front, v);
-                let my_leave = crossing_time(z.along + st.rear, v);
+                let my_arrive = crossing_time(z.along - st.front, timing);
+                let my_leave = crossing_time(z.along + st.rear, timing);
                 let overlap = !(my_arrive > leave + JM_TIMEGAP_MINOR || my_leave + JM_TIMEGAP_MINOR < arrive);
                 let can_brake = zebra_stop - st.front > v * v / (2.0 * me.params.comfort_brake.max(0.1));
                 if overlap && can_brake {
                     stop = Some(zebra_stop);
                     break;
                 }
-            } else if (z.along - st.front) / v.max(1.0) > arrive {
+            } else if crossing_time(z.along - st.front, timing) > arrive {
                 stop = Some(z.along - JM_STOPLINE_CROSSING_GAP);
                 break;
             }
@@ -1539,8 +1571,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // on the walk of a crossing my way cuts (those have the crossing rules above, whose holds
         // take no braking test), and outside my strip is timed as SUMO times an approaching person: their window in my
         // strip (`walk_across`, at their present step) against mine on their line - my front
-        // reaching it to my rear leaving it, at my present speed (`crossing_time`, SUMO's
-        // `distToCrossing / max(v, 1)`; braking, at my braking, `rear_clears`). Where they reach my strip ahead of
+        // reaching it to my rear leaving it, as I am timed to a crossing (`crossing_time`: inside
+        // the junction SUMO's `distToCrossing / max(v, 1)`, approaching it my arrival up to my
+        // lane's limit; braking, at my braking, `rear_clears`). Where they reach my strip ahead of
         // my front, the two windows within `JM_TIMEGAP_MINOR` of each other
         // (`MSLink::blockedAtTime`'s persons) hold me `PERSON_STOP_SHORT` short of that point
         // while I can brake for it at my comfortable deceleration; past that point they hold me
@@ -1563,12 +1596,12 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             .flatten();
         let mut timed = false;
         if let Some(a) = across {
-            let my_arrive = crossing_time(a.along - crate::plan::PERSON_RADIUS - st.front, v);
-            let my_leave = crossing_time(a.along + crate::plan::PERSON_RADIUS + st.rear, v);
+            let my_arrive = crossing_time(a.along - crate::plan::PERSON_RADIUS - st.front, timing);
+            let my_leave = crossing_time(a.along + crate::plan::PERSON_RADIUS + st.rear, timing);
             // (whether my rear clears their line before they reach my strip, at the motion I am
             // making: braking now - for them, or for anything else - it is my braking that takes
             // me there, or I stop short; SUMO's arrival times come from the vehicle's planned move)
-            let clears_first = rear_clears(a.along + crate::plan::PERSON_RADIUS + st.rear, v, st.acc) < a.t_in;
+            let clears_first = rear_clears(a.along + crate::plan::PERSON_RADIUS + st.rear, timing, st.acc) < a.t_in;
             if a.along - crate::plan::PERSON_RADIUS > st.front {
                 timed = true;
                 let overlap = !(my_arrive > a.t_out + JM_TIMEGAP_MINOR || my_leave + JM_TIMEGAP_MINOR < a.t_in);
