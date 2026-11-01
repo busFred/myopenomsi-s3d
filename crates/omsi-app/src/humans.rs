@@ -749,6 +749,11 @@ fn stand_at(world: &World, p: DVec3) -> DVec3 {
     }
 }
 
+/// One person on foot as the traffic reads them (`Humans::for_traffic`): position, velocity,
+/// waiting at a stop, standing time, on a crossing, at a kerb, the stop waited at, id, approach to
+/// a crossing, the footpath lane of a stroller's leg.
+pub type OnFoot = (DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>, Option<usize>);
+
 impl Humans {
     /// The people within `range` of `from`, with what they are doing, where they go and how
     /// (the lines and the planned way, for the AI debug overlays).
@@ -7253,92 +7258,77 @@ impl Humans {
         self.last_buses.iter().find(|b| b.id == bus).map(|b| b.entry_open.iter().chain(&b.exit_open).any(|o| *o))
     }
 
-    /// Everybody on foot on the ground, for the traffic to stop for: position, velocity,
-    /// whether they wait at a stop (a bus pulls up right beside those), their standing
-    /// time, crossing and kerb flags, the stop they wait at, their id, their approach to a
-    /// crossing and the footpath lane of the leg a stroller walks.
-    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>, Option<usize>)> {
-        self.people
-            .iter()
-            .filter(|p| p.place == Place::Ground)
-            .map(|p| {
-                let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                // (the stop a waiter waits at, `Person::waits_at`)
-                let waits_at = match &p.state {
+    /// What the traffic reads of the people every frame (`traffic_link::traffic_inputs`), taken
+    /// in one pass over them:
+    /// - everybody on foot on the ground, for the traffic to stop for (`OnFoot`): position,
+    ///   velocity, whether they wait at a stop (a bus pulls up right beside those), their standing
+    ///   time, crossing and kerb flags, the stop they wait at, their id, their approach to a
+    ///   crossing and the footpath lane of the leg a stroller walks;
+    /// - the same people (same order) with what they do besides, for the traffic recording: their
+    ///   task, the footpath leg they walk (lane, distance along it, the leg's length) and their
+    ///   last decision at a kerb;
+    /// - who walks the footpaths, for the traffic's walkers list: the lane and distance along it
+    ///   of each stroller's leg. Not somebody standing at a kerb on a red light: off the
+    ///   carriageway, they hold nobody (one at a 3 m kerb stub held the exit of a green junction);
+    ///   one standing inside a lane's footprint the cars' people check still catches.
+    pub fn for_traffic(&self) -> (Vec<OnFoot>, Vec<omsi_traffic::record::PersonRecord>, Vec<(usize, f32)>) {
+        use std::borrow::Cow;
+        let (mut on_foot, mut records, mut strollers) = (Vec::new(), Vec::new(), Vec::new());
+        for p in &self.people {
+            if !(p.at_kerb() && p.last_decision == Some("red light")) {
+                if let State::Strolling(walk) = &p.state {
+                    if let Some(leg) = walk.legs.get(walk.leg) {
+                        strollers.push((leg.lane, leg.dist(walk.s)));
+                    }
+                }
+            }
+            if p.place != Place::Ground {
+                continue;
+            }
+            let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
+            // (the stop a waiter waits at, `Person::waits_at`)
+            let waits_at = match &p.state {
+                State::Pax(x) if x.inside.is_none() => x.stop,
+                _ => None,
+            };
+            let leg = match &p.state {
+                State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| leg.lane),
+                _ => None,
+            };
+            on_foot.push((p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at, p.id, p.approach, leg));
+            let state: Cow<'static, str> = match &p.state {
+                State::Pax(x) => Cow::Owned(format!("{} ({})", p.state.name(), if x.inside.is_some() { "aboard" } else { "waiting" })),
+                s => Cow::Borrowed(s.name()),
+            };
+            let leg = match &p.state {
+                State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| (leg.lane, leg.dist(walk.s), leg.len())),
+                _ => None,
+            };
+            records.push(omsi_traffic::record::PersonRecord {
+                pos: p.position,
+                vel: p.vel,
+                state,
+                still: p.still,
+                on_crossing: p.on_crossing,
+                waiting_for_bus: waiting,
+                leg,
+                decision: p.last_decision.map(Cow::Borrowed),
+                pace: if matches!(p.state, State::Strolling(_)) { p.walk_pace as f32 } else { p.pace as f32 },
+                at_kerb: p.at_kerb(),
+                waits_at: match &p.state {
                     State::Pax(x) if x.inside.is_none() => x.stop,
                     _ => None,
-                };
-                let leg = match &p.state {
-                    State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| leg.lane),
+                },
+                id: Some(p.id),
+                approach: p.approach,
+                kerb_fallback: p.at_kerb() && matches!(&p.state, State::Strolling(w) if w.spot.is_some_and(|s| s.row == WHERE_THEY_STAND)),
+                kerb_place: match &p.state {
+                    State::Strolling(w) if p.at_kerb() => w.spot.filter(|s| s.row != WHERE_THEY_STAND).map(|s| s.pos),
                     _ => None,
-                };
-                (p.position, p.vel, waiting, p.still, p.on_crossing, p.at_kerb(), waits_at, p.id, p.approach, leg)
-            })
-            .collect()
-    }
-
-    /// `on_foot` (same people, same order) with what they do besides: their task, the
-    /// footpath leg they walk (lane, distance along it, the leg's length) and their last
-    /// decision at a kerb - for the traffic recording.
-    pub fn records(&self) -> Vec<omsi_traffic::record::PersonRecord> {
-        use std::borrow::Cow;
-        self.people
-            .iter()
-            .filter(|p| p.place == Place::Ground)
-            .map(|p| {
-                let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                let state: Cow<'static, str> = match &p.state {
-                    State::Pax(x) => Cow::Owned(format!("{} ({})", p.state.name(), if x.inside.is_some() { "aboard" } else { "waiting" })),
-                    s => Cow::Borrowed(s.name()),
-                };
-                let leg = match &p.state {
-                    State::Strolling(walk) => walk.legs.get(walk.leg).map(|leg| (leg.lane, leg.dist(walk.s), leg.len())),
-                    _ => None,
-                };
-                omsi_traffic::record::PersonRecord {
-                    pos: p.position,
-                    vel: p.vel,
-                    state,
-                    still: p.still,
-                    on_crossing: p.on_crossing,
-                    waiting_for_bus: waiting,
-                    leg,
-                    decision: p.last_decision.map(Cow::Borrowed),
-                    pace: if matches!(p.state, State::Strolling(_)) { p.walk_pace as f32 } else { p.pace as f32 },
-                    at_kerb: p.at_kerb(),
-                    waits_at: match &p.state {
-                        State::Pax(x) if x.inside.is_none() => x.stop,
-                        _ => None,
-                    },
-                    id: Some(p.id),
-                    approach: p.approach,
-                    kerb_fallback: p.at_kerb() && matches!(&p.state, State::Strolling(w) if w.spot.is_some_and(|s| s.row == WHERE_THEY_STAND)),
-                    kerb_place: match &p.state {
-                        State::Strolling(w) if p.at_kerb() => w.spot.filter(|s| s.row != WHERE_THEY_STAND).map(|s| s.pos),
-                        _ => None,
-                    },
-                }
-            })
-            .collect()
-    }
-
-    /// Who walks the footpaths, for the traffic's walkers list (`traffic_link`): the
-    /// lane and distance along it of each stroller's leg. Not somebody standing at a kerb on
-    /// a red light: off the carriageway, they hold nobody (one at a 3 m kerb stub held the
-    /// exit of a green junction);
-    /// one standing inside a lane's footprint the cars' people check still catches.
-    pub fn strollers(&self) -> Vec<(usize, f32)> {
-        self.people
-            .iter()
-            .filter(|p| !(p.at_kerb() && p.last_decision == Some("red light")))
-            .filter_map(|p| match &p.state {
-                State::Strolling(walk) => walk
-                    .legs
-                    .get(walk.leg)
-                    .map(|leg| (leg.lane, leg.dist(walk.s))),
-                _ => None,
-            })
-            .collect()
+                },
+            });
+        }
+        (on_foot, records, strollers)
     }
 
     /// Seats of the player's bus from its `[passengercabin]`, and the engine's side of the
