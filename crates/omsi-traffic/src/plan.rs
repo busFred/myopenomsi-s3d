@@ -1121,7 +1121,6 @@ fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Percept
     let (b, tau) = (me.params.comfort_brake, me.params.tau);
     let v_max = p.v_want.max(0.1);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
-    let runs = open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD);
     // (SUMO's `stopSpeed` before the person less the driver's standing gap)
     let person_cap = |lane: usize, s: f32| person_ahead(net, sim, me, lane, s).map_or(f32::INFINITY, |d| safe_speed(d - st.min_gap, 0.0, b, tau));
     let this_safe = *own.get_or_insert_with(|| {
@@ -1133,7 +1132,7 @@ fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Percept
     let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
     let nb_safe = nb_max.min(person_cap(nb.lane, s_b)).min(match nb.ahead {
         Some((g, vl)) => safe_speed(g, vl, b, tau),
-        None => safe_speed(runs, 0.0, b, tau),
+        None => safe_speed(open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD), 0.0, b, tau),
     });
     (this_safe, nb_safe)
 }
