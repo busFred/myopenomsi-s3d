@@ -494,6 +494,9 @@ impl SoundSet {
             return;
         }
         let ctx = self.ctx(engine);
+        // (which of the voices are playing, taken once for all the entries: no entry's update
+        // starts or stops another entry's voice)
+        let playing = engine.playing_now();
         for s in self.sounds.iter_mut() {
             // How the exe plays an entry (`TSound` update, 2.2.032):
             // * with a `[trigger]`: once each time the trigger fires, from the start, never
@@ -536,7 +539,7 @@ impl SoundSet {
                 let params = ctx.params(s, &e, true, object_to_world);
                 match (s.voice, e.audible) {
                     (Some(id), true) => {
-                        if engine.is_playing(id) {
+                        if playing.contains(id) {
                             engine.set_params(id, params);
                         } else {
                             s.voice = Some(engine.play_from_random_place(clip, params));
@@ -557,7 +560,7 @@ impl SoundSet {
             let params = ctx.params(s, &e, false, object_to_world);
             if (fired || rising) && e.audible {
                 if let Some(id) = s.voice {
-                    if s.def.only_one && engine.is_playing(id) {
+                    if s.def.only_one && playing.contains(id) {
                         engine.set_params(id, params);
                         continue;
                     }
@@ -569,7 +572,7 @@ impl SoundSet {
                 // after a door's hit), which silenced the sound within a frame of its start
                 s.latched = (fired && triggered && LATCH_TRIGGERED).then_some(params.gain);
             } else if let Some(id) = s.voice {
-                if engine.is_playing(id) {
+                if playing.contains(id) {
                     let mut params = params;
                     if let Some(g) = s.latched {
                         params.gain = g;
