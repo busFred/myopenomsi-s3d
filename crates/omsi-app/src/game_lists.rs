@@ -2514,6 +2514,12 @@ fn settings_file() -> serde_json::Value {
         .clone();
     let pending = PENDING_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     apply_pending(&mut v, &pending.0);
+    // (a radius not chosen shows as the one the game takes: never written from here)
+    for k in ["traffic_radius", "ped_radius"] {
+        if v.get(k).is_none_or(|x| x.is_null()) {
+            v[k] = serde_json::json!(default_radius(k).to_string());
+        }
+    }
     v
 }
 
@@ -2541,6 +2547,8 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
         "shadow_casters" => vec![("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")],
         "max_fps" => vec![("0", "Screen refresh rate"), ("30", "30 fps"), ("45", "45 fps"), ("60", "60 fps"), ("120", "120 fps"), ("144", "144 fps"), ("1000", "Unlimited")],
         "view_distance" => vec![("auto", "Default (1200 m)"), ("600", "600 m - fastest"), ("900", "900 m"), ("1200", "1200 m"), ("1500", "1500 m"), ("2000", "2000 m"), ("2500", "2500 m")],
+        "traffic_radius" => radius_options(crate::launcher::pages::TRAFFIC_RADII, default_radius("traffic_radius")),
+        "ped_radius" => radius_options(crate::launcher::pages::PED_RADII, default_radius("ped_radius")),
         "max_obj_dist" => vec![("auto", "Automatic"), ("500", "500 m"), ("750", "750 m"), ("900", "900 m"), ("1500", "1500 m"), ("3000", "3000 m")],
         "min_obj_size" => vec![("0.005", "All"), ("0.013", "Normal"), ("0.02", "Fewer (faster)"), ("0.03", "Few (fastest)")],
         "mirror_size" => vec![("0", "Off"), ("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")],
@@ -2568,6 +2576,23 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// The radius (m) the game takes for `traffic_radius` or `ped_radius` while the player has
+/// chosen none: the default for the picture's height now (`settings::RENDER_LINES`).
+fn default_radius(key: &str) -> f64 {
+    let lines = crate::settings::render_lines();
+    if key == "ped_radius" { crate::humans::stroll_radius_for(-1.0, lines) } else { crate::traffic::keep_radius(-1.0, lines) }
+}
+
+/// The fixed choices of a radius, with `default` (m) among them when it is not one of them.
+fn radius_options(fixed: &'static [(&'static str, &'static str)], default: f64) -> Vec<(&'static str, &'static str)> {
+    let mut o = fixed.to_vec();
+    if !o.iter().any(|x| same_value(x.0, &default.to_string())) {
+        o.extend(crate::launcher::pages::radius_choice(default));
+        o.sort_by(|a, b| a.0.parse::<f64>().unwrap_or(0.0).total_cmp(&b.0.parse::<f64>().unwrap_or(0.0)));
+    }
+    o
+}
+
 fn select_state(file: &serde_json::Value, key: &str) -> (Vec<(&'static str, &'static str)>, Option<usize>, String) {
     let options = select_options(key);
     let cur = value_text(file.get(key).unwrap_or(&serde_json::Value::Null));
@@ -2586,10 +2611,10 @@ fn select_row(file: &serde_json::Value, key: &str, name: &str, desc: &str) -> Op
 
 fn presets() -> [(&'static str, serde_json::Value); 4] {
     [
-        ("Low", serde_json::json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "render_scale": "0.75", "texture_memory": 800})),
-        ("Medium", serde_json::json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "render_scale": "auto", "texture_memory": 1200})),
-        ("High", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 2048, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "auto", "min_obj_size": 0.013, "max_obj_dist": "auto", "mirror_size": 256, "render_scale": "auto", "texture_memory": 0})),
-        ("Ultra", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 4096, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "2000", "min_obj_size": 0.005, "max_obj_dist": "1500", "mirror_size": 512, "render_scale": "auto", "texture_memory": 0})),
+        ("Low", serde_json::json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "render_scale": "0.75", "texture_memory": 800, "traffic_radius": "250", "ped_radius": "100"})),
+        ("Medium", serde_json::json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "render_scale": "auto", "texture_memory": 1200, "traffic_radius": "300", "ped_radius": "150"})),
+        ("High", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 2048, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "auto", "min_obj_size": 0.013, "max_obj_dist": "auto", "mirror_size": 256, "render_scale": "auto", "texture_memory": 0, "traffic_radius": default_radius("traffic_radius").to_string(), "ped_radius": default_radius("ped_radius").to_string()})),
+        ("Ultra", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 4096, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "2000", "min_obj_size": 0.005, "max_obj_dist": "1500", "mirror_size": 512, "render_scale": "auto", "texture_memory": 0, "traffic_radius": "600", "ped_radius": "300"})),
     ]
 }
 
@@ -2775,6 +2800,8 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "imperial", "Imperial units", "Speeds in mph, distances in yards and miles and the odometer in miles on the information bar, the navigator and the touch panel"),
         pick("view_distance", "View distance", later),
         pick("max_obj_dist", "Object distance", later),
+        pick("traffic_radius", "AI traffic distance", "How far round you the other cars are kept: nearer is lighter on the computer. Until chosen: 400 m on a 1080-line screen, scaled by the screen's height (300-600 m)"),
+        pick("ped_radius", "Pedestrian distance", "How far round you people walk the streets: nearer is lighter on the computer. Until chosen: 200 m on a 1080-line screen, scaled by the screen's height (150-300 m)"),
         pick("min_obj_size", "Small objects", later),
         pick("mirror_size", "Mirrors", later),
         pick("texture_memory", "Texture memory", later),

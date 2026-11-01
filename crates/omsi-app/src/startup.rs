@@ -346,6 +346,21 @@ pub(crate) fn under_gamescope() -> bool {
     std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_ascii_lowercase().contains("gamescope"))
 }
 
+static PRIMARY_SCREEN: std::sync::Mutex<Option<(u32, u32, f64)>> = std::sync::Mutex::new(None);
+
+/// Keep the primary monitor's size (pixels) and scale, for `primary_screen`.
+pub(crate) fn note_primary_screen(event_loop: &winit::event_loop::ActiveEventLoop) {
+    if let Some(m) = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next()) {
+        *PRIMARY_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((m.size().width, m.size().height, m.scale_factor()));
+    }
+}
+
+/// The primary monitor's size (pixels) and scale as last noted (`note_primary_screen`, by the
+/// launcher), for the picture's height the game will open with (`settings::predicted_lines`).
+pub(crate) fn primary_screen() -> Option<(u32, u32, f64)> {
+    *PRIMARY_SCREEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn fit_window(event_loop: &winit::event_loop::ActiveEventLoop, w: f64, h: f64) -> (winit::dpi::LogicalSize<f64>, Option<winit::dpi::PhysicalPosition<i32>>) {
     let Some(m) = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next()) else {
         return (winit::dpi::LogicalSize::new(w, h), None);

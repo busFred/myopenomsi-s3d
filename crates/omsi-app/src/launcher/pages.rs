@@ -265,6 +265,21 @@ fn get<'a>(v: &'a Value, k: &str) -> &'a Value {
     v.get(k).unwrap_or(&Value::Null)
 }
 
+/// The choices of `traffic_radius`: how far round the player the random cars are kept
+/// (`traffic::keep_radius`), smaller for a slower computer; the default for the screen joins
+/// them when it is none of them (`radius_choice`).
+pub(crate) const TRAFFIC_RADII: &[(&str, &str)] = &[("250", "250 m - fastest"), ("300", "300 m"), ("400", "400 m"), ("500", "500 m"), ("600", "600 m"), ("800", "800 m")];
+/// The choices of `ped_radius`: how far round the player people stroll
+/// (`humans::stroll_radius_for`), as `TRAFFIC_RADII`.
+pub(crate) const PED_RADII: &[(&str, &str)] = &[("100", "100 m - fastest"), ("150", "150 m"), ("200", "200 m"), ("250", "250 m"), ("300", "300 m")];
+
+/// The entry (value, label) of a radius `m` (whole 10 m, 100-800) that is no fixed choice:
+/// a default for the screen (`settings::by_screen` gives 150-600 m).
+pub(crate) fn radius_choice(m: f64) -> Option<(&'static str, &'static str)> {
+    static ALL: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let all = ALL.get_or_init(|| (10..=80).map(|k| ((k * 10).to_string(), format!("{} m", k * 10))).collect());
+    all.iter().find(|e| e.0.parse::<f64>().is_ok_and(|x| (x - m).abs() < 1e-6)).map(|e| (e.0.as_str(), e.1.as_str()))
+}
 /// The window sizes the settings offer (`resolution`).
 pub(crate) const RESOLUTIONS: &[(&str, &str)] = &[("auto", "Automatic"), ("1280x720", "1280 x 720"), ("1280x800", "1280 x 800 (Steam Deck)"), ("1366x768", "1366 x 768"), ("1600x900", "1600 x 900"), ("1920x1080", "1920 x 1080"), ("1920x1200", "1920 x 1200"), ("2560x1440", "2560 x 1440"), ("3840x2160", "3840 x 2160")];
 
@@ -294,6 +309,37 @@ fn sel_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect,
             _ => json!(v),
         };
         *dirty = 0.3;
+    }
+}
+
+/// The radii (m) the game takes for `traffic_radius` and `ped_radius` while the player has
+/// chosen none, for the picture the settings `s` will open (`settings::predicted_lines`).
+fn default_radii(s: &Value) -> (f64, f64) {
+    let resolution = get(s, "resolution").as_str().and_then(|r| crate::settings::resolution_of(&format!("resolution={r}")));
+    let lines = crate::settings::predicted_lines(crate::startup::primary_screen(), get(s, "fullscreen").as_bool().unwrap_or(false), resolution);
+    (crate::traffic::keep_radius(-1.0, lines), crate::humans::stroll_radius_for(-1.0, lines))
+}
+
+/// A radius's select (`traffic_radius`, `ped_radius`): the fixed choices and the default for
+/// the screen (`default`, m) among them; while none is chosen the default shows as selected,
+/// and nothing is written until one is picked (then it stays, whatever the screen).
+#[allow(clippy::too_many_arguments)]
+fn radius_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect, label: &str, key: &str, fixed: &'static [(&'static str, &'static str)], default: f64) {
+    let mut options = fixed.to_vec();
+    if !options.iter().any(|o| o.0.parse::<f64>().is_ok_and(|x| (x - default).abs() < 1e-6)) {
+        options.extend(radius_choice(default));
+        options.sort_by(|a, b| a.0.parse::<f64>().unwrap_or(0.0).total_cmp(&b.0.parse::<f64>().unwrap_or(0.0)));
+    }
+    if !get(s, key).is_null() {
+        sel_setting(ui, s, dirty, name, r, label, key, &options);
+        return;
+    }
+    let mut shown = json!({ key: default.to_string() });
+    let mut picked = 0.0;
+    sel_setting(ui, &mut shown, &mut picked, name, r, label, key, &options);
+    if picked > 0.0 {
+        s[key] = shown[key].clone();
+        *dirty = picked;
     }
 }
 
@@ -550,19 +596,29 @@ fn graphics_profiles_block(ui: &mut Ui, s: &mut Value, dirty: &mut f32, c: &mut 
 /// How the game looks and how fast it runs.
 fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f32; 2] {
     let mut c = Col::new(ui, cols[0], "Graphics");
+    // the radii the game takes while none is chosen: by the height of the picture it will
+    // open with (`settings::predicted_lines`)
+    let (traffic_default, ped_default) = default_radii(s);
     // Quality presets, first: they set most of what follows. (OMSI's own
     // option_presets/*.oop are named after the PCs of their day - "PC 2006", "X10 high",
     // "Chicago Recommended" - which read as random words here.)
     let presets: [(&str, serde_json::Value); 4] = [
-        ("Low", json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "mirror_refresh": "eco", "render_scale": "0.75", "texture_memory": 800})),
-        ("Medium", json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "mirror_refresh": "eco", "render_scale": "auto", "texture_memory": 1200})),
-        ("High", json!({"msaa": 4, "anisotropy": 8, "shadow_size": 2048, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "auto", "min_obj_size": 0.013, "max_obj_dist": "auto", "mirror_size": 256, "mirror_refresh": "full", "render_scale": "auto", "texture_memory": 0})),
-        ("Ultra", json!({"msaa": 4, "anisotropy": 8, "shadow_size": 4096, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "2000", "min_obj_size": 0.005, "max_obj_dist": "1500", "mirror_size": 512, "mirror_refresh": "full", "render_scale": "auto", "texture_memory": 0})),
+        ("Low", json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "mirror_refresh": "eco", "render_scale": "0.75", "texture_memory": 800, "traffic_radius": "250", "ped_radius": "100"})),
+        ("Medium", json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "mirror_refresh": "eco", "render_scale": "auto", "texture_memory": 1200, "traffic_radius": "300", "ped_radius": "150"})),
+        ("High", json!({"msaa": 4, "anisotropy": 8, "shadow_size": 2048, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "auto", "min_obj_size": 0.013, "max_obj_dist": "auto", "mirror_size": 256, "mirror_refresh": "full", "render_scale": "auto", "texture_memory": 0, "traffic_radius": traffic_default.to_string(), "ped_radius": ped_default.to_string()})),
+        ("Ultra", json!({"msaa": 4, "anisotropy": 8, "shadow_size": 4096, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "2000", "min_obj_size": 0.005, "max_obj_dist": "1500", "mirror_size": 512, "mirror_refresh": "full", "render_scale": "auto", "texture_memory": 0, "traffic_radius": "600", "ped_radius": "300"})),
     ];
     {
-        // the preset the settings match now, else "Custom"
+        // the preset the settings match now, else "Custom" (a radius not chosen as the one
+        // the game takes)
+        let mut shown = s.clone();
+        for (k, m) in [("traffic_radius", traffic_default), ("ped_radius", ped_default)] {
+            if get(&shown, k).is_null() {
+                shown[k] = json!(m.to_string());
+            }
+        }
         let matches = |p: &serde_json::Value| p.as_object().map(|o| o.iter().all(|(k, v)| {
-            let cur = get(s, k);
+            let cur = get(&shown, k);
             cur == v || cur.as_f64().zip(v.as_f64()).map(|(a, b)| (a - b).abs() < 1e-6).unwrap_or(false) || cur.as_str().zip(v.as_f64()).map(|(a, b)| a.parse::<f64>().map(|a| (a - b).abs() < 1e-6).unwrap_or(false)).unwrap_or(false) || cur.as_f64().zip(v.as_str()).map(|(a, b)| b.parse::<f64>().map(|b| (a - b).abs() < 1e-6).unwrap_or(false)).unwrap_or(false)
         })).unwrap_or(false);
         let mut labels: Vec<String> = presets.iter().map(|p| p.0.to_string()).collect();
@@ -672,6 +728,8 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
     }
     c.section(ui, "World & memory");
     sel_setting(ui, s, dirty, "s-view", c.row(), "View distance", "view_distance", &[("auto", "Default (1200 m)"), ("600", "600 m - fastest"), ("900", "900 m"), ("1200", "1200 m"), ("1500", "1500 m"), ("2000", "2000 m"), ("2500", "2500 m")]);
+    radius_setting(ui, s, dirty, "s-traffic-radius", c.row(), "AI traffic distance", "traffic_radius", TRAFFIC_RADII, traffic_default);
+    radius_setting(ui, s, dirty, "s-ped-radius", c.row(), "Pedestrian distance", "ped_radius", PED_RADII, ped_default);
     sel_setting(ui, s, dirty, "s-maxobj", c.row(), "Object distance", "max_obj_dist", &[("auto", "Automatic"), ("500", "500 m"), ("750", "750 m"), ("900", "900 m"), ("1500", "1500 m"), ("3000", "3000 m")]);
     sel_setting(ui, s, dirty, "s-minobj", c.row(), "Small objects", "min_obj_size", &[("0.005", "All"), ("0.013", "Normal"), ("0.02", "Fewer (faster)"), ("0.03", "Few (fastest)")]);
     sel_setting(ui, s, dirty, "s-mirror", c.row(), "Mirrors", "mirror_size", &[("0", "Off"), ("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")]);
@@ -2751,7 +2809,7 @@ mod settings_tests {
         let mut graphics = vec![
             "s-gp-sel", "s-gp-load", "s-gp-del", "s-gp-name", "s-gp-save",
             "s-preset", "s-graphics", "s-msaa", "s-scale", "s-af", "s-shadow", "set-ssao", "set-shadows", "s-casters", "set-detail_textures", "s-led", "s-led-mip", "set-shadow_blobs", "set-reflections", "set-clouds",
-            "set-fullscreen", "s-res", "set-vsync", "s-fps", "s-view", "s-maxobj", "s-minobj", "s-mirror", "s-mirror-refresh", "s-texmem", "set-texture_compression",
+            "set-fullscreen", "s-res", "set-vsync", "s-fps", "s-view", "s-traffic-radius", "s-ped-radius", "s-maxobj", "s-minobj", "s-mirror", "s-mirror-refresh", "s-texmem", "set-texture_compression",
         ];
         if !cfg!(target_os = "macos") {
             graphics.push("s-api");

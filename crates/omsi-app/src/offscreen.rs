@@ -72,6 +72,9 @@ pub(crate) fn run_offscreen(
     // (and without traffic it still runs the light programs and switches the lamps)
     let mut traffic = {
         let mut t = traffic::Traffic::new(&args.root, &world, args.traffic)?;
+        // (the first fill already at the player's `traffic_radius`, as every frame sets it)
+        t.spawn_radius = traffic::keep_radius(settings.traffic_radius, if args.server.is_some() { 0 } else { h });
+        log::info!("traffic: random cars kept within {:.0} m, out of sight taken off beyond {:.0} m (traffic_radius {}, picture {} lines)", t.spawn_radius, t.spawn_radius * traffic::DESPAWN_FACTOR, if settings.traffic_radius > 0.0 { settings.traffic_radius.to_string() } else { "not set".to_string() }, if args.server.is_some() { 0 } else { h });
         t.lights_only = !(args.traffic > 0 || args.schedule || crate::rail_drive::args_rail(args) || args.lan_join.is_some());
         if let Some(seed) = lan_seed {
             t.set_lan_seed(seed);
@@ -192,8 +195,12 @@ pub(crate) fn run_offscreen(
         .as_deref()
         .map(|d| career::Career::load(&args.root, d))
         .unwrap_or_default();
+    // (the picture's height for the people's default radius; a headless server has none)
+    let lines = if args.server.is_some() { 0 } else { h };
     let mut humans_off = if args.passengers || args.lan_join.is_some() {
         let mut h = humans::Humans::new(&args.root);
+        // (the first fill already at the player's `ped_radius`, as every frame sets it)
+        h.set_stroll_radius(humans::stroll_radius_for(settings.ped_radius, lines));
         if let Some(seed) = lan_seed {
             h.set_lan_seed(seed);
         }
@@ -597,6 +604,9 @@ pub(crate) fn run_offscreen(
                 &renderer.options,
                 streamer.as_ref().map_or(0.0, |s| s.load_radius),
             );
+            // the player's `traffic_radius` at this picture's height (a headless server has no
+            // screen: a radius not chosen keeps the 400 m default there)
+            t.spawn_radius = traffic::keep_radius(settings.traffic_radius, if server { 0 } else { h });
             for c in t.cars.iter() {
                 revisits.see(c.id, &c.ai.state);
             }
@@ -1113,6 +1123,7 @@ pub(crate) fn run_offscreen(
                     far: camera.far,
                 },
             };
+            h.set_stroll_radius(humans::stroll_radius_for(settings.ped_radius, if server { 0 } else { size.1 }));
             h.eye = Some(humans::Eye::of(&eye_cam, view_aspect).widened(triple_extent(&settings, &eye_cam, size.0, size.1)));
             h.set_remote_buses(remotes_off.remotes.iter().map(|(id, r)| (*id, r.vehicle())));
             // (`--follow-line`: while the AI bus drives the player's trip the people see the

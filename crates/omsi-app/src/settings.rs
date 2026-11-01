@@ -153,6 +153,13 @@ pub struct Settings {
     /// (0 = no limit). `auto` (-1) takes `view_distance` when the file sets one, else 900 m
     /// (the original's high presets).
     pub max_obj_dist: f32,
+    /// `traffic_radius` (m): how far round the player the random cars are made and kept
+    /// (`traffic::keep_radius`); -1 when the file has none: then 400 m scaled by the
+    /// picture's height over 1080 lines, within 300-600 m. Smaller is lighter on the computer.
+    pub traffic_radius: f32,
+    /// `ped_radius` (m): how far round the player people stroll (`humans::stroll_radius_for`);
+    /// -1 when the file has none: then 200 m scaled the same way, within 150-300 m.
+    pub ped_radius: f32,
     /// Frames a second at most (the original's `[maxFPS]`); 0 = no limit. The frame waits
     /// asleep, so a limit also saves power and heat, and the CPU time for the rest.
     pub max_fps: u32,
@@ -414,7 +421,7 @@ impl Settings {
     }
     /// The defaults of a computer.
     fn desktop() -> Self {
-        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, trip_summary: true, enhanced: false, graphics: "vanilla_plus".into(), triple: Default::default(), triple_span: true, triple_hud_center: true, vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: false, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), pax_greet: true, pax_ticket: true, pax_complain: false, nav_arrows: false, nav_arrows_auto: false, skip_petrol_check: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, max_fps: 0, chat: true, chat_size: 1.0, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, pedestrians: 100, pax_sit: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_parked_pct: 75, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, precision_zoom: false, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, right_stick_look: true, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, rt_reflections: "off".into(), rt_shadows: false, rt_unlocked: false, lamp_fill: true, led_glow: 6, led_mips: 1.3, night_sky: 1.0, sun_glare: 1.0, aurora: 1.0, new_sky: true, radio_fx_speaker: 0.0, radio_fx_noise: 0.0, radio_fx_dropouts: 0.0, developer_tools: false, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, ff_road_vib: 1.0, ff_engine_vib: 1.0, ff_fade: 0.28, brake_hold: true, mouse_steering: false, mouse_right_off: false, mouse_smooth: true, look_sens: 1.0, look_smoothing_ms: 0.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, head_idle: 0.0, head_idle_pace: 1.0, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], seat_pitch_deg: 0.0, head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new(), voice_chat: true, info_bar: false, imperial: false }
+        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, trip_summary: true, enhanced: false, graphics: "vanilla_plus".into(), triple: Default::default(), triple_span: true, triple_hud_center: true, vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: false, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), pax_greet: true, pax_ticket: true, pax_complain: false, nav_arrows: false, nav_arrows_auto: false, skip_petrol_check: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, traffic_radius: -1.0, ped_radius: -1.0, max_fps: 0, chat: true, chat_size: 1.0, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, pedestrians: 100, pax_sit: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_parked_pct: 75, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, precision_zoom: false, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, right_stick_look: true, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, rt_reflections: "off".into(), rt_shadows: false, rt_unlocked: false, lamp_fill: true, led_glow: 6, led_mips: 1.3, night_sky: 1.0, sun_glare: 1.0, aurora: 1.0, new_sky: true, radio_fx_speaker: 0.0, radio_fx_noise: 0.0, radio_fx_dropouts: 0.0, developer_tools: false, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, ff_road_vib: 1.0, ff_engine_vib: 1.0, ff_fade: 0.28, brake_hold: true, mouse_steering: false, mouse_right_off: false, mouse_smooth: true, look_sens: 1.0, look_smoothing_ms: 0.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, head_idle: 0.0, head_idle_pace: 1.0, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], seat_pitch_deg: 0.0, head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new(), voice_chat: true, info_bar: false, imperial: false }
     }
 }
 
@@ -455,7 +462,7 @@ impl Settings {
         if let Some(n) = omsi_cfg::env::var("OMSI_SAFE_GPU").ok().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0) {
             s.apply_safe_gpu(n);
         }
-        log::info!("settings from {}: msaa {} af {} ssao {} shadows {} ({}) navigator {} graphics {} post aa {} vsync {} render scale {} boarding {} min object size {} max object distance {} max fps {}", p.display(), s.msaa, s.anisotropy, s.ssao, s.shadows, s.shadow_size, s.navigator, s.graphics, s.post_aa, s.vsync, s.render_scale_text(), s.boarding, s.min_obj_size, s.object_distance(), s.max_fps);
+        log::info!("settings from {}: msaa {} af {} ssao {} shadows {} ({}) navigator {} graphics {} post aa {} vsync {} render scale {} boarding {} min object size {} max object distance {} traffic radius {} people radius {} max fps {}", p.display(), s.msaa, s.anisotropy, s.ssao, s.shadows, s.shadow_size, s.navigator, s.graphics, s.post_aa, s.vsync, s.render_scale_text(), s.boarding, s.min_obj_size, s.object_distance(), if s.traffic_radius > 0.0 { format!("{} m", s.traffic_radius) } else { "by the screen".to_string() }, if s.ped_radius > 0.0 { format!("{} m", s.ped_radius) } else { "by the screen".to_string() }, s.max_fps);
         s
     }
 
@@ -590,6 +597,8 @@ impl Settings {
                 "auto_shift" => s.auto_shift = b(v),
                 "min_obj_size" | "performance_minobjsize" => s.min_obj_size = v.parse::<f32>().map(|x| x.clamp(0.0, 0.2)).unwrap_or(s.min_obj_size),
                 "max_obj_dist" | "performance_maxobjdist" => s.max_obj_dist = if v.eq_ignore_ascii_case("off") { 0.0 } else if v.eq_ignore_ascii_case("auto") { -1.0 } else { v.parse::<f32>().map(|x| x.max(0.0)).unwrap_or(s.max_obj_dist) },
+                "traffic_radius" => s.traffic_radius = v.parse::<f32>().ok().filter(|x| x.is_finite() && *x > 0.0).unwrap_or(-1.0),
+                "ped_radius" => s.ped_radius = v.parse::<f32>().ok().filter(|x| x.is_finite() && *x > 0.0).unwrap_or(-1.0),
                 "max_fps" | "maxfps" => {
                     s.max_fps = v.parse::<f32>().map(|x| x.max(0.0) as u32).unwrap_or(s.max_fps);
                     // a phone given the PC OMSI's 30 by the settings import: 60
@@ -786,6 +795,12 @@ impl Settings {
         text.push_str(&format!("triple_screen={}\ntriple_span={}\ntriple_width_mm={}\ntriple_distance_mm={}\ntriple_bezel_mm={}\ntriple_left_angle_deg={}\ntriple_right_angle_deg={}\ntriple_eye_height_mm={}\n", self.triple.enabled as u8, self.triple_span as u8, self.triple.width_mm, self.triple.distance_mm, self.triple.bezel_mm, self.triple.left_angle_deg, self.triple.right_angle_deg, self.triple.eye_height_mm));
         text.push_str(&format!("steer_look={}\nsteer_look_angle={}\nsteer_look_response={}\nhead_idle={}\nhead_idle_pace={}\nlook_sens={}\nlook_smoothing_ms={}\nblinker_cancel={}\n", self.steer_look as u8, self.steer_look_angle, self.steer_look_response, self.head_idle, self.head_idle_pace, self.look_sens, self.look_smoothing_ms, self.blinker_cancel as u8));
         text.push_str(&format!("seat_pitch_deg={}\n", self.seat_pitch_deg));
+        // (written only once chosen: without them the game takes the screen's)
+        for (k, v) in [("traffic_radius", self.traffic_radius), ("ped_radius", self.ped_radius)] {
+            if v > 0.0 {
+                text.push_str(&format!("{k}={v}\n"));
+            }
+        }
         text.push_str(&format!("discord_status={}\ndiscord_app_id={}\n", self.discord_status as u8, self.discord_app_id));
         text.push_str(&format!("auto_shift={}\n", self.auto_shift as u8));
         text.push_str(&format!("right_stick_look={}\n", self.right_stick_look as u8));
@@ -855,6 +870,46 @@ pub fn graphics_mode(v: &str) -> &'static str {
         "vanilla" | "classic" | "original" | "omsi" | "omsi2" | "omsi_2" => "vanilla",
         _ => "vanilla_plus",
     }
+}
+
+/// The height in lines of the picture the game draws (0: not known yet), set every frame by
+/// the window: the default `traffic_radius` and `ped_radius` follow it, and the options
+/// list shows them for it.
+pub static RENDER_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `RENDER_LINES`.
+pub fn render_lines() -> u32 {
+    RENDER_LINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A distance round the player for a picture `lines` tall when the player has not chosen one:
+/// `base` (what a 1080-line screen gets) scaled by `lines` / 1080, within `min`..`max`, to
+/// the nearest 10 m; `base` when the height is not known (0: the replays, the tools). In sight
+/// the cars are kept until they are two pixels tall, which scales with the height the same
+/// way, so what leaves such a circle out of sight is as small on every screen. (A player
+/// performance setting: fewer agents simulated on a slower computer.)
+pub fn by_screen(base: f64, min: f64, max: f64, lines: u32) -> f64 {
+    if lines == 0 {
+        return base;
+    }
+    ((base * lines as f64 / 1080.0).clamp(min, max) / 10.0).round() * 10.0
+}
+
+/// The picture's height (lines) the game will open with, for the launcher, which has no game
+/// window yet: `resolution=WxH`'s height, else in fullscreen (or under gamescope) the
+/// screen's, else the 1600 x 900 window fitted to the screen as `startup::fit_window` does.
+/// `screen`: the primary monitor's size in pixels and its scale; None: not known (0).
+pub fn predicted_lines(screen: Option<(u32, u32, f64)>, fullscreen: bool, resolution: Option<(u32, u32)>) -> u32 {
+    if let Some((_, h)) = resolution {
+        return h;
+    }
+    let Some((sw, sh, scale)) = screen else { return 0 };
+    if fullscreen || crate::startup::under_gamescope() {
+        return sh;
+    }
+    let scale = scale.max(0.5);
+    let ((_, lh), _) = crate::startup::fit_rect((1600.0, 900.0), (sw as f64, sh as f64), scale);
+    (lh * scale).round() as u32
 }
 
 /// The view distance (m) when the settings name none: the launcher's "Default (1200 m)".

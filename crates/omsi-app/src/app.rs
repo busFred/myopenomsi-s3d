@@ -758,6 +758,8 @@ impl App {
                     h.boarding = self.settings.boarding.clone();
                     h.sit_bias = self.settings.pax_sit;
                     h.voices = self.settings.pax_voice_mask();
+                    // (the first fill already at the player's `ped_radius`; every frame sets it again)
+                    h.set_stroll_radius(humans::stroll_radius_for(self.settings.ped_radius, self.surface.as_ref().map_or(0, |s| s.config.height)));
                     if let Some(p) = self.player.as_mut() {
                         h.set_cabin(&mut p.vehicle);
                         h.ticket_key = ticket_key_name(&self.args.root, &p.bindings);
@@ -785,6 +787,9 @@ impl App {
                     match traffic::Traffic::new(&self.args.root, &w, self.args.traffic) {
                         Ok(mut t) => {
                             t.lights_only = !populated;
+                            // (the first fill already at the player's `traffic_radius`; every
+                            // frame sets it again)
+                            t.spawn_radius = traffic::keep_radius(self.settings.traffic_radius, self.surface.as_ref().map_or(0, |s| s.config.height));
                             if let Some(lan) = self.lan.as_ref() {
                                 t.set_lan_seed(lan::population_seed(lan));
                             }

@@ -508,7 +508,8 @@ fn covers_path(b: &Block, from: DVec2, dir: DVec2, ahead: f64) -> bool {
 }
 
 /// Stops within this distance of the player have their people (Omsi.exe: the stop's tile
-/// and the eight round the camera's, sub_61bf94).
+/// and the eight round the camera's, sub_61bf94), at the stroll radius `STROLL_RADIUS`; the
+/// player's `ped_radius` scales it by the same ratio (`Humans::stop_range`).
 const STOP_RANGE: f64 = 450.0;
 /// A stop in range with fewer people than it should have gets one more each frame its refill
 /// clock is past this (ms) plus a random part of `STOP_REFILL_SPREAD_MS` (drawn each frame), 10..15
@@ -526,8 +527,27 @@ struct StopCarry {
     factor: f32,
 }
 
-/// Pedestrians stroll within this distance of the player (m).
-const STROLL_RADIUS: f64 = 200.0;
+/// Pedestrians stroll within this distance of the player (m) where no screen sets it (the
+/// replays, the tools, the tests) and at a 1080-line screen by default; the player's
+/// `ped_radius` sets `Humans::stroll_radius` (`stroll_radius_for`).
+pub(crate) const STROLL_RADIUS: f64 = 200.0;
+/// The default stroll radius's bounds (m) on a short and a tall screen.
+const STROLL_RADIUS_MIN: f64 = 150.0;
+const STROLL_RADIUS_MAX: f64 = 300.0;
+
+/// The stroll radius (m) from the player's setting `ped_radius` (`setting`, m; negative: not
+/// set) and the picture's height in lines (`lines`, 0: unknown). A player performance
+/// setting (fewer people walked on a slower computer), not a model of the pedestrians.
+/// Not set: `STROLL_RADIUS` scaled by the height over 1080 lines, within 150-300 m, to 10 m
+/// (`settings::by_screen`, the same rule as the traffic's `keep_radius`); a person walking
+/// off at its edge is then as small on that screen as one at 200 m on a 1080-line screen.
+pub fn stroll_radius_for(setting: f32, lines: u32) -> f64 {
+    if setting > 0.0 {
+        setting as f64
+    } else {
+        crate::settings::by_screen(STROLL_RADIUS, STROLL_RADIUS_MIN, STROLL_RADIUS_MAX, lines)
+    }
+}
 /// Further off than this (m) somebody may be put down in plain view (`may_appear`). Not derived
 /// from the sight test (`figure_in_sight`): a 1.8 m figure here is drawn some 10-20 pixels tall, so
 /// one put down in the view cone between this and `STROLL_RADIUS` appears in sight; with the sight
@@ -2571,9 +2591,9 @@ fn figure_in_sight(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, ce
 
 /// Whether a stroller at `p` goes: out of the player's sight (`figure_in_sight`) and out of
 /// everybody's stroll radius (`center` and the other players' `others`), because strollers are
-/// put down and counted only within it.
-fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3) -> bool {
-    far_from(center, others, p, STROLL_RADIUS) && !figure_in_sight(eye, viewer, center, p)
+/// put down and counted only within it (`radius`, `Humans::stroll_radius`).
+fn stroller_goes(eye: Option<Eye>, viewer: Option<&crate::traffic::Viewer>, center: DVec3, others: &[DVec3], p: DVec3, radius: f64) -> bool {
+    far_from(center, others, p, radius) && !figure_in_sight(eye, viewer, center, p)
 }
 
 /// Whether somebody at `p` may be taken away: out of the player's sight (`figure_in_sight`) and
@@ -2723,6 +2743,8 @@ struct DecideCtx<'a> {
     center: DVec3,
     lan_centers: &'a [DVec3],
     time: f64,
+    /// `Humans::stroll_radius`.
+    stroll_radius: f64,
 }
 
 impl DecideCtx<'_> {
@@ -2752,7 +2774,7 @@ impl DecideCtx<'_> {
                     d.kept = !d.gone;
                     return d;
                 };
-                if stroller_goes(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position) {
+                if stroller_goes(self.eye, self.viewer.as_ref(), self.center, self.lan_centers, p.position, self.stroll_radius) {
                     d.gone = true;
                     return d;
                 }
@@ -6511,6 +6533,12 @@ pub struct Humans {
     /// setting, an upper bound since : the pavements' area at the hour's target density
     /// decides, `stroll_density`), within the pool.
     pub pedestrians: usize,
+    /// Strollers are put down, counted and kept within this of the player (m): `STROLL_RADIUS`
+    /// until `set_stroll_radius` gives the player's `ped_radius`.
+    stroll_radius: f64,
+    /// Stops within this of the player have their people (m): `STOP_RANGE` scaled with
+    /// `stroll_radius` over `STROLL_RADIUS`.
+    stop_range: f64,
     /// Omsi.exe's people (`[AIMaxCountRandom]`'s second line, the `ai_max_humans` setting):
     /// it makes that many at the start (0x709274) and draws everybody waiting at a stop,
     /// walking the pavements or riding from them - never more; at most half of them walk
@@ -6829,6 +6857,8 @@ impl Humans {
             duty: None,
             stamped: Vec::new(),
             pedestrians: settings.pedestrians as usize,
+            stroll_radius: STROLL_RADIUS,
+            stop_range: STOP_RANGE,
             max_people: settings.ai_max_humans.max(1) as usize,
             stroll_timer: 0.0,
             exact_fare: true,
@@ -7665,7 +7695,7 @@ impl Humans {
             .bus_stops
             .lock()
             .iter()
-            .filter(|s| (s.1 - center).length() < STOP_RANGE + 100.0)
+            .filter(|s| (s.1 - center).length() < self.stop_range + 100.0)
             .map(|s| (s.0, s.1, s.2, s.3.clone()))
             .collect();
         // (a stop taken down on a tile change and out of reach now is set up again as a new
@@ -7912,7 +7942,7 @@ impl Humans {
             let center = self.center;
             let near = {
                 let s = &self.stops[&id];
-                (s.pos - center).length() < STOP_RANGE || self.lan_centers.iter().any(|c| (s.pos - *c).length() < STOP_RANGE)
+                (s.pos - center).length() < self.stop_range || self.lan_centers.iter().any(|c| (s.pos - *c).length() < self.stop_range)
             };
             let changed = {
                 let s = self.stops.get_mut(&id).unwrap();
@@ -8208,7 +8238,8 @@ impl Humans {
         _dt: f32,
     ) {
         let center = self.center;
-        let radius = STROLL_RADIUS * 0.9;
+        let stroll_radius = self.stroll_radius;
+        let radius = stroll_radius * 0.9;
         // strollers: as many as the areas of the pavements in sight hold at the hour's target
         // density (`stroll_density`, walkway level of service), and on the others only those on
         // their way into sight (`stroll_targets`), never more than the `pedestrians`
@@ -8263,7 +8294,7 @@ impl Humans {
             let lane = &net.lanes[l];
             let off = ped.unloaded.get(&l);
             (0..lane.points.len().saturating_sub(1))
-                .filter(|&k| (lane.points[k] - center).truncate().length() < STROLL_RADIUS)
+                .filter(|&k| (lane.points[k] - center).truncate().length() < stroll_radius)
                 .map(|k| match off {
                     None => lane.dist[k + 1] - lane.dist[k],
                     Some(st) => loaded_metres(lane.dist[k], lane.dist[k + 1], st),
@@ -8349,8 +8380,8 @@ impl Humans {
             State::Strolling(w) => w.pocket || w.legs.get(w.leg).is_some_and(|l| !stroll_path_open(Some(&*ped), net, l.lane)),
             _ => false,
         };
-        let have = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS && !closed_now(p)).count();
-        let within = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < STROLL_RADIUS).count();
+        let have = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < stroll_radius && !closed_now(p)).count();
+        let within = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_)) && (p.position - center).length() < stroll_radius).count();
         let (deficit, room) = stroll_room(&targets, &on_path, &on_way, target, have);
         // (and the setting bounds every stroller of this game's, past the radius and about the
         // other LAN players too: the setting is the most this game walks)
@@ -8515,12 +8546,12 @@ impl Humans {
             let sources: f32 = targets.iter().filter(|t| t.source).map(|t| t.want).sum();
             // (the strollers past the radius: in sight, standing still, waiting behind a standing
             // box with no way past (the jam clock running), looking for a path, past twice it)
-            let past: Vec<&Person> = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_) | State::Standing) && (p.position - center).length() >= STROLL_RADIUS).collect();
+            let past: Vec<&Person> = self.people.iter().filter(|p| matches!(p.state, State::Strolling(_) | State::Standing) && (p.position - center).length() >= stroll_radius).collect();
             let past_seen = past.iter().filter(|p| self.seen(p.position)).count();
             let past_still = past.iter().filter(|p| p.vel.length() < 0.1).count();
             let past_box = past.iter().filter(|p| p.vel.length() < 0.1 && p.boxes.jam > 0.0).count();
             let past_standing = past.iter().filter(|p| matches!(p.state, State::Standing)).count();
-            let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * STROLL_RADIUS).count();
+            let past_far = past.iter().filter(|p| (p.position - center).length() >= 2.0 * stroll_radius).count();
             // (what each class of pavement wants and holds: the paths in sight strollers are put
             // down on, the sources, and the rest `have` counts - the crossings' and junctions'
             // pieces and the ring past 0.9 radius - and the density reached over the in-sight
@@ -9375,6 +9406,16 @@ impl Humans {
 
     /// LAN play: the other players' buses this frame, by player id (their riders are drawn
     /// in them, see `remote_bus_id`).
+    /// The stroll radius (m, `stroll_radius_for`), and with it the stops' range in the same
+    /// ratio (`STOP_RANGE` at `STROLL_RADIUS`, exactly as before at 200 m).
+    pub fn set_stroll_radius(&mut self, radius: f64) {
+        if radius != self.stroll_radius {
+            log::info!("people: strollers kept within {radius:.0} m, stops with people within {:.0} m", STOP_RANGE * radius / STROLL_RADIUS);
+        }
+        self.stroll_radius = radius;
+        self.stop_range = STOP_RANGE * radius / STROLL_RADIUS;
+    }
+
     pub fn set_remote_buses<'a>(&mut self, buses: impl Iterator<Item = (u32, &'a VehicleInstance)>) {
         let mut out = Vec::new();
         for (player, v) in buses {
@@ -10338,7 +10379,7 @@ impl Humans {
             p.t_state += dt;
         }
         let decided: Vec<Option<Decision>> = {
-            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+            let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time, stroll_radius: self.stroll_radius };
             let people = &self.people;
             let cars = &cars;
             let lights = traffic.map(LightsOf::of);
@@ -10372,7 +10413,7 @@ impl Humans {
                 let mut d = match d {
                     Some(d) => d,
                     None => {
-                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time };
+                        let ctx = DecideCtx { ped: self.ped.as_ref(), streams: &self.streams, queues: &self.queues, eye: self.eye, viewer: self.viewer, center: self.center, lan_centers: &self.lan_centers, time: self.time, stroll_radius: self.stroll_radius };
                         ctx.decide(&self.people[i], dt, world, net, traffic.map(LightsOf::of).as_ref(), &cars, &mut YieldBook::Book(&mut self.yields))
                     }
                 };
@@ -12400,7 +12441,7 @@ mod tests {
         // standing with no pavement: kept in sight, kept out of sight within the distance,
         // gone out of sight beyond it
         let decide = |h: &Humans, i: usize| {
-            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0 };
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0, stroll_radius: STROLL_RADIUS };
             let mut yields = Yields::new();
             let d = ctx.decide(&h.people[i], DT, &world, None, None, &[], &mut YieldBook::Book(&mut yields));
             (d.gone, d.kept)
@@ -12419,7 +12460,7 @@ mod tests {
             let street = |y: f64| omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(me.x - 50.0, y, me.z), DVec3::new(me.x + 50.0, y, me.z)], LaneKind::Street, 3.0);
             net.lanes.push(street(me.y - 1.0));
             net.build_grid();
-            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.5 };
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.5, stroll_radius: STROLL_RADIUS };
             let mut yields = Yields::new();
             let d = ctx.decide(&h.people[1], DT, &world, Some(&net), None, &[], &mut YieldBook::Book(&mut yields));
             assert!(d.kept && d.want.vel.y > 0.5, "steps away from the lane: {:?}", d.want.vel);
@@ -12436,7 +12477,7 @@ mod tests {
         let mut walk = PedWalk::new(vec![Leg { lane: 0, a: 0.0, b: 20.0 }], true, 0.0);
         h.people[0].state = State::Strolling(walk.clone());
         let edge = |h: &Humans| {
-            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0 };
+            let ctx = DecideCtx { ped: None, streams: &h.streams, queues: &h.queues, eye: h.eye, viewer: None, center: h.center, lan_centers: &h.lan_centers, time: 0.0, stroll_radius: STROLL_RADIUS };
             let mut yields = Yields::new();
             let d = ctx.decide(&h.people[0], DT, &world, None, None, &[], &mut YieldBook::Book(&mut yields));
             (d.gone, d.edge)
@@ -14590,11 +14631,11 @@ mod ped_tests {
         // it, kept; within it, kept; near another player, kept
         let e = Eye { pos: DVec3::ZERO, fwd: DVec3::new(0.0, 1.0, 0.0), cos_half: (35f64).to_radians().cos() };
         let behind = DVec3::new(0.0, -(STROLL_RADIUS + 5.0), 0.0);
-        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], behind));
-        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0)), "short of twice the radius");
-        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0)), "in sight");
-        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0)), "within the radius");
-        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind), "near another player");
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], behind, STROLL_RADIUS));
+        assert!(stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -1.5 * STROLL_RADIUS, 0.0), STROLL_RADIUS), "short of twice the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, STROLL_RADIUS + 5.0, 0.0), STROLL_RADIUS), "in sight");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[], DVec3::new(0.0, -(STROLL_RADIUS - 5.0), 0.0), STROLL_RADIUS), "within the radius");
+        assert!(!stroller_goes(Some(e), None, DVec3::ZERO, &[behind + DVec3::new(0.0, -50.0, 0.0)], behind, STROLL_RADIUS), "near another player");
         // with the traffic's picture (900 lines, 60 degrees: a 1.8 m figure is two pixels at
         // 1.8 x 900 / (2 x 2 tan 30) = 701 m): in frame at 300 m, kept; at 800 m, gone; behind
         // at 300 m, gone; the vehicles' lamps lit change nothing for a person
@@ -14613,12 +14654,12 @@ mod ped_tests {
             loaded: 0.0,
         };
         let ahead = |d: f64| DVec3::new(0.0, d, 0.0);
-        assert!(!stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(300.0)), "in frame at 300 m");
-        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(800.0)), "past the horizon");
-        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(-300.0)), "behind");
+        assert!(!stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(300.0), STROLL_RADIUS), "in frame at 300 m");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(800.0), STROLL_RADIUS), "past the horizon");
+        assert!(stroller_goes(Some(e), Some(&v), DVec3::ZERO, &[], ahead(-300.0), STROLL_RADIUS), "behind");
         let lit = v.with_lamps(true);
-        assert!(stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(800.0)), "lamps lit");
-        assert!(!stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(300.0)));
+        assert!(stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(800.0), STROLL_RADIUS), "lamps lit");
+        assert!(!stroller_goes(Some(e), Some(&lit), DVec3::ZERO, &[], ahead(300.0), STROLL_RADIUS));
     }
 
     #[test]
