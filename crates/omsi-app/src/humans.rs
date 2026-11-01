@@ -713,6 +713,22 @@ fn bus_text(id: BusId) -> String {
     }
 }
 
+/// How far (m) above or below the map's point a placement takes the walking surface found there
+/// for the one the figure stands on (`stand_at`): a pavement or a deck laid over the terrain, not
+/// the next level of a bridge or a building.
+const STAND_SNAP: f64 = 3.0;
+
+/// Where somebody put down at `p` stands: on the surface they will walk on, not on the bare
+/// terrain under a pavement (they stood in the asphalt and climbed out of it when they started
+/// walking): the walking surface near `p`'s height, within `STAND_SNAP` of it, else `p`. Every
+/// placement tests `may_appear` here, where `spawn` puts the figure, not at the map's point.
+fn stand_at(world: &World, p: DVec3) -> DVec3 {
+    match world.walk_height_near(p.x, p.y, p.z) {
+        Some(z) if (z - p.z).abs() < STAND_SNAP => DVec3::new(p.x, p.y, z),
+        _ => p,
+    }
+}
+
 impl Humans {
     /// The people within `range` of `from`, with what they are doing, where they go and how
     /// (the lines and the planned way, for the AI debug overlays).
@@ -7024,8 +7040,13 @@ impl Humans {
     /// takes the whole bounding sphere (`figure_view`) - with the one ray a figure grazing a
     /// corner is hidden, and one step later in plain view (Wuluju moving, #1359 at 104 m: in
     /// sight the frame it was put down, where a step cannot cross the cone's sphere margin). A
-    /// wall between 1.2 m and the head's height hides the rays but not the head. The one rule for every placement of a person: strollers (`populate_on_foot`)
-    /// and the waiters at the stops (`waiting_place`). Not used by the riders put on the seats
+    /// wall between 1.2 m and the head's height hides the rays but not the head. The one rule for
+    /// every placement of a person: strollers (`populate_on_foot`) and the waiters at the stops
+    /// (`waiting_place`), each asked at the point the figure will stand (`stand_at`, where `spawn`
+    /// puts it), not the map's point: the spawn moves three in four figures to the walking surface,
+    /// up to 0.5 m, and a figure on the cone's edge asked at the path's height can stand in the
+    /// cone (Wuluju standing, #1191 put down in sight 43 m off, within 0.03 degrees of the edge;
+    /// 0.15 m lower moves a figure there 0.011 degrees in). Not used by the riders put on the seats
     /// of the player's bus, the LAN players' avatars, or the debug crossing knob
     /// (`OMSI_PAX_CROSS`). A building hides people because
     /// otherwise, while the bus drives, nobody could appear on the street ahead.
@@ -7365,14 +7386,7 @@ impl Humans {
         if self.types.is_empty() {
             return None;
         }
-        // on the surface they will walk on, not on the bare terrain under a pavement
-        // (they stood in the asphalt and climbed out of it when they started walking)
-        let mut position = position;
-        if let Some(z) = world.walk_height_near(position.x, position.y, position.z) {
-            if (z - position.z).abs() < 3.0 {
-                position.z = z;
-            }
-        }
+        let position = stand_at(world, position);
         // Not a twin of somebody standing near: two of the same figure in the same clothes
         // side by side at a stop was the first thing one noticed. A few tries for a figure
         // nobody near wears (then at least other clothes); with few figures installed some
@@ -8000,7 +8014,7 @@ impl Humans {
         }
         // (while the world is still being built nothing is shown yet: the traffic's own
         // `loading_phase` exempts the first fill, as it does the first cars)
-        let open: Vec<usize> = free.into_iter().filter(|&k| self.loading || self.may_appear(world, self.stops[&id].spots[k].pos)).collect();
+        let open: Vec<usize> = free.into_iter().filter(|&k| self.loading || self.may_appear(world, stand_at(world, self.stops[&id].spots[k].pos))).collect();
         if open.is_empty() {
             if self.held_for_sight.insert(id) {
                 self.waiters_held_for_sight += 1;
@@ -8398,7 +8412,7 @@ impl Humans {
                     rej_near += 1;
                     continue;
                 }
-                if !self.may_appear(world, p) {
+                if !self.may_appear(world, stand_at(world, p)) {
                     rej_seen += 1;
                     continue;
                 }
@@ -8457,7 +8471,7 @@ impl Humans {
                         }
                     }
                     let (p, _) = l.at(at_s);
-                    if k > 0 && (!self.may_appear(world, p) || !world.has_ground(p.x, p.y) || on_lane_surface(net, p) || self.queues.in_full_area(p.truncate())) {
+                    if k > 0 && (!self.may_appear(world, stand_at(world, p)) || !world.has_ground(p.x, p.y) || on_lane_surface(net, p) || self.queues.in_full_area(p.truncate())) {
                         continue;
                     }
                     let leg = if fwd {
@@ -12092,6 +12106,78 @@ mod tests {
         h.take_holds();
         h.tick(DT, &world, Some(&v), None, &renderer, &mut scene);
         assert!(h.take_holds().is_empty(), "nobody holds it with the doors shut");
+    }
+
+    /// A placement asks `may_appear` where the figure will stand (`stand_at`), not at the map's
+    /// point: a stop's places drawn 1 m over flat ground 40 m ahead of the eye, a deck from 1.9 to
+    /// 4.5 m over the way between. At the drawn height the rays to the chest pass through the deck
+    /// (hidden); on the ground, where `spawn` puts them, they pass under it (in plain view): the
+    /// stop gets nobody, and nobody put down is in sight.
+    #[test]
+    fn z2_a_placement_is_asked_where_the_figure_stands() {
+        let root = std::env::temp_dir().join(format!("openomsi-stand-sight-{}", std::process::id()));
+        let man = root.join("Humans/Man");
+        std::fs::create_dir_all(&man).unwrap();
+        std::fs::write(man.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(man.join("model.cfg"), "").unwrap();
+        std::fs::write(root.join("global.cfg"), "[name]\nStand\n").unwrap();
+        let world = World::open(&root, &root.join("global.cfg"), 20261001).unwrap();
+        for x in -1..=0 {
+            for y in -1..=0 {
+                world.terrains.write().insert((x, y), Arc::new(omsi_map::Terrain::flat()));
+            }
+        }
+        let mut boxes = omsi_sim::collision::CollisionWorld::default();
+        boxes.add(omsi_sim::collision::Obb { center: DVec2::new(0.0, 20.0), half: DVec2::new(6.0, 3.0), heading: 0.0, z0: 1.9, z1: 4.5, velocity: DVec2::ZERO, mass: 0.0, pole: None, id: -1 });
+        *world.collision.lock() = Arc::new(boxes);
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(&instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb), omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() })).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let mut h = Humans::new(&root);
+        h.types = map_human_types(&root, &["Humans/Man/Man.hum".into()]);
+        h.map_humans_done = true;
+        (h.density, h.max_people) = (1.0, 100);
+        h.eye = Some(Eye { pos: DVec3::new(0.0, 0.0, 2.0), fwd: DVec3::Y, cos_half: 40f64.to_radians().cos() });
+        let drawn = DVec3::new(0.0, 40.0, 1.0);
+        let stands = stand_at(&world, drawn);
+        assert!((stands.z - 0.0).abs() < 1e-6, "{stands:?}");
+        // (the drawn point is hidden by the deck, where they stand is in plain view)
+        assert!(h.may_appear(&world, drawn));
+        assert!(!h.may_appear(&world, stands));
+        let spots: Vec<WaitSpot> = (0..4).map(|k| WaitSpot { pos: drawn + DVec3::new(k as f64 * 0.8, 0.0, 0.0), face: 90.0, height: 0.0 }).collect();
+        h.stops.insert(7, PaxStop {
+            name: "S".into(),
+            alias: String::new(),
+            pos: drawn,
+            heading: 0.0,
+            gather: drawn,
+            spots,
+            taken: vec![false; 4],
+            refused: vec![false; 4],
+            enter_max: 4.0,
+            enter_min: 4.0,
+            length: 30.0,
+            lane: None,
+            was_near: false,
+            near: false,
+            clock_ms: 0.0,
+            want: 0,
+            factor: 1.0,
+            buses: Vec::new(),
+            dests: Vec::new(),
+            lines: Vec::new(),
+            cleared: true,
+            kerb_shift: Some(DVec3::ZERO),
+            kerb_spread: true,
+        });
+        for _ in 0..30 {
+            h.stops_tick(1.0 / 30.0, &world, &renderer, &mut scene);
+        }
+        assert!(h.people.iter().all(|p| h.figure_sight(&world, p.position) != FigureSight::In), "put down in sight");
+        assert_eq!(h.people.len(), 0);
     }
 
     /// The waiters at a stop are put down only where nobody sees them appear (`may_appear`,
