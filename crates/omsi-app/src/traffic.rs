@@ -5711,12 +5711,13 @@ impl Traffic {
                     );
                 }
             }
+            let mesh_xf = c.vehicle.mesh_local_transformer();
             for (i, inst) in c.render.instances.iter().enumerate() {
                 renderer.set_transform(
                     scene,
                     *inst,
                     c.vehicle.position,
-                    c.vehicle.mesh_local_transform(i),
+                    mesh_xf(i),
                 );
                 let p = &c.vehicle.mesh_props[i];
                 let def = &c.vehicle.ty.model.meshes[c.vehicle.ty.meshes[i].def_index];
@@ -5746,8 +5747,9 @@ impl Traffic {
                 renderer.set_interior(scene, *inst, p.interior);
             }
             for (t, r) in c.vehicle.trailers.iter().zip(&c.trailer_renders) {
+                let mesh_xf = t.mesh_local_transformer();
                 for (i, inst) in r.instances.iter().enumerate() {
-                    renderer.set_transform(scene, *inst, t.position, t.mesh_local_transform(i));
+                    renderer.set_transform(scene, *inst, t.position, mesh_xf(i));
                     let p = &t.mesh_props[i];
                     let def = &t.ty.model.meshes[t.ty.meshes[i].def_index];
                     let vp = def.viewpoint;

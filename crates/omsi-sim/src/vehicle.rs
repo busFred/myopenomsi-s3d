@@ -3992,6 +3992,20 @@ impl TrailerPart {
         self.body_rotation() * xf
     }
 
+    /// `mesh_local_transform` of every mesh `i` of the part, its body's rotation made once (a
+    /// sync of all its meshes made it once a mesh).
+    pub fn mesh_local_transformer(&self) -> impl Fn(usize) -> Mat4 + '_ {
+        let rot = self.body_rotation();
+        move |i| {
+            let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
+            if is_shadow_mesh(&self.ty, i) {
+                let lift = if self.ty.def.is_rail() { 0.0 } else { -self.ground_lift };
+                return rot * onto_plane([lift, 0.0, 0.0]) * xf;
+            }
+            rot * xf
+        }
+    }
+
     /// Where this part hangs on the one in front: the coupling point in the frame of the
     /// part in front, and its own coupling point in its own frame (the two meet in the
     /// world). With the parts straight behind each other, a point `p` of this part lies at
@@ -4367,6 +4381,21 @@ impl VehicleInstance {
             return self.body_rotation() * onto_plane(self.contact_plane()) * xf;
         }
         self.body_rotation() * xf
+    }
+
+    /// `mesh_local_transform` of every mesh `i` of the vehicle, its body's rotation made once
+    /// and the plane its wheels stand on (`contact_plane`, the ground asked under every wheel)
+    /// once for all its shadow meshes: a sync of all its meshes made both once a mesh.
+    pub fn mesh_local_transformer(&self) -> impl Fn(usize) -> Mat4 + '_ {
+        let rot = self.body_rotation();
+        let plane = std::cell::OnceCell::new();
+        move |i| {
+            let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
+            if is_shadow_mesh(&self.ty, i) {
+                return rot * onto_plane(*plane.get_or_init(|| self.contact_plane())) * xf;
+            }
+            rot * xf
+        }
     }
 
     /// The plane the wheels stand on, in the body frame: z = p[0] + p[1]·x + p[2]·y (m).
