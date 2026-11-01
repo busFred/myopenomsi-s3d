@@ -427,6 +427,20 @@ struct WayPts {
     chunks: Vec<(DVec2, f64, usize, usize)>,
 }
 
+/// One sample of the way as the people test reads it (`WayPts::samples_within`): distance along
+/// the way, point, heading, its right, the way's offset from the lane's axis there, and the span
+/// behind and ahead of it a point belongs to the sample by.
+#[derive(Clone, Copy)]
+struct WaySample {
+    d: f32,
+    q: DVec2,
+    fwd: DVec2,
+    right: DVec2,
+    lat: f32,
+    span_back: f64,
+    span_ahead: f64,
+}
+
 /// Half the length of the longest vehicle (m), at most (an articulated bus is 18 m): how far
 /// before or past its reference point a body on my way can reach.
 const LONGEST_HALF: f32 = 15.0;
@@ -493,6 +507,22 @@ impl WayPts {
         let half = |a: usize, b: usize| self.pts.get(a).zip(self.pts.get(b)).map(|(p, q)| (q.1 - p.1).length() * 0.5).unwrap_or(WAY_STEP as f64 * 0.5);
         let back = if i == 0 { WAY_STEP as f64 * 0.5 } else { half(i - 1, i) };
         (back + SAMPLE_OVERLAP, half(i, i + 1) + SAMPLE_OVERLAP)
+    }
+
+    /// The samples up to `reach` m along the way (the first past it ends them), each with its
+    /// span (`sample_span`), its right and the way's offset from the lane's axis there
+    /// (`AiState::lateral_ahead` of `st`): what a test of many people against the way reads of
+    /// every sample, taken once for them all.
+    fn samples_within(&self, reach: f32, st: &AiState) -> Vec<WaySample> {
+        let mut out = Vec::new();
+        for (i, &(d, q, fwd)) in self.pts.iter().enumerate() {
+            if d > reach {
+                break;
+            }
+            let (span_back, span_ahead) = self.sample_span(i);
+            out.push(WaySample { d, q, fwd, right: DVec2::new(fwd.y, -fwd.x), lat: st.lateral_ahead(d), span_back, span_ahead });
+        }
+        out
     }
 
     /// Whether a slice of the way starts within `r` of `c`.
@@ -1511,6 +1541,10 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
             holders.push(Holder { stop, along: z.along, axis: 0.0, swervable: false });
         }
     }
+    // (the way's samples within my reach, with what the test of every person reads of them)
+    let samples = way.samples_within(reach + st.front, st);
+    // (my body, for the test of everybody inside it)
+    let body = me.obb();
     for k in sim.people_near(me.pos, radius) {
         let p = &sim.people[k];
         let rel = p.pos - me.pos;
@@ -1541,7 +1575,7 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // (asked only of somebody on a crossing near enough)
         let on_covered_walk = || covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
         if on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS && on_covered_walk() {
-            if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
+            if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&body) < 0.0 {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
             continue;
@@ -1638,7 +1672,6 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // way's samples start at the front and would let a car move off into a walker crossing
         // through its flank, or a coach creep through somebody behind its reference point)
         {
-            let body = me.obb();
             // (where they are; where their step takes them only for one stepping - a shuffle
             // is no step)
             // (and only somebody inside it NOW holds a car whose body already
@@ -1703,40 +1736,41 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 safe = (d, pose);
             }
         }
-        for (i, &(d, q, fwd)) in way.pts.iter().enumerate() {
-            if d > reach + st.front {
-                break;
-            }
-            let (span_back, span_ahead) = way.sample_span(i);
-            let right = DVec2::new(fwd.y, -fwd.x);
-            // (the way's offset from the lane's axis here: across the axis = across the way + it)
-            let lat = st.lateral_ahead(d);
-            let now_way = (p.pos.truncate() - q).dot(right) as f32;
-            let now_axis = now_way + lat;
-            let later_axis = (later - q).dot(right) as f32 + lat;
-            // (where their body is now, off my way: the shift below is for somebody outside my
-            // footprint, which a projected shuffle must not decide)
-            let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
-            // one beside the lane - outside its footprint now and after their
-            // step, their body outside mine (C2 holds one inside it), inside the drawn road -
-            // on the car's own lane: a shift inside the drawn road may clear them (a bus pulls
-            // in beside its people; one on a crossing, or stepping into the lane, holds the car)
-            let strip = if now_axis < 0.0 { drivable_left } else { drivable_right };
-            let swervable = |along: f32| {
-                !me.serves_stops()
-                    && !on_crossing
-                    && outside
-                    && along <= lane_left
-                    && now_axis.abs() > lane_half
-                    && later_axis.abs() > lane_half
-                    && now_axis.abs() < strip
-                    && now_axis.signum() == later_axis.signum()
-            };
+        for &WaySample { d, q, fwd, right, lat, span_back, span_ahead } in &samples {
             for &pos in positions {
                 let r = pos - q;
                 let along = r.dot(fwd);
+                if along < -span_back || along > span_ahead {
+                    continue;
+                }
                 let across_way = r.dot(right) as f32;
                 let across = across_way.abs();
+                // (somebody outside my strip here, across my way and across the lane's axis, is
+                // on neither list below: nothing of theirs is read at this sample)
+                if across >= half && (across_way + lat).abs() >= half {
+                    continue;
+                }
+                let now_way = (p.pos.truncate() - q).dot(right) as f32;
+                let now_axis = now_way + lat;
+                let later_axis = (later - q).dot(right) as f32 + lat;
+                // (where their body is now, off my way: the shift below is for somebody outside my
+                // footprint, which a projected shuffle must not decide)
+                let outside = now_way.abs() >= me.half_width + crate::plan::PERSON_RADIUS;
+                // one beside the lane - outside its footprint now and after their
+                // step, their body outside mine (C2 holds one inside it), inside the drawn road -
+                // on the car's own lane: a shift inside the drawn road may clear them (a bus pulls
+                // in beside its people; one on a crossing, or stepping into the lane, holds the car)
+                let strip = if now_axis < 0.0 { drivable_left } else { drivable_right };
+                let swervable = |along: f32| {
+                    !me.serves_stops()
+                        && !on_crossing
+                        && outside
+                        && along <= lane_left
+                        && now_axis.abs() > lane_half
+                        && later_axis.abs() > lane_half
+                        && now_axis.abs() < strip
+                        && now_axis.signum() == later_axis.signum()
+                };
                 // (outside my footprint at this position - now or where their
                 // step takes them - for the exemptions below: one stepping into my body from
                 // beside it holds the car)
@@ -1745,9 +1779,6 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
                 // their step takes them, whatever their pace)
                 let stepping = on_crossing || p.vel.length() >= STEP_SPEED as f64;
                 let outside_here = outside && (!stepping || across >= me.half_width + crate::plan::PERSON_RADIUS);
-                if along < -span_back || along > span_ahead {
-                    continue;
-                }
                 // somebody waiting at the kerb to cross whose body is outside my
                 // footprint holds nobody (the kerb spot lies outside every lane's waiter reach,
                 // `humans::kerb_spot`): with a stream on the crossing they let the vehicle go
