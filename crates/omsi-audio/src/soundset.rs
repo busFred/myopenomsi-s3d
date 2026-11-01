@@ -519,9 +519,11 @@ impl SoundSet {
                 None
             };
             let fired = fired_by.is_some();
+            // (with the conditions as just tested: an untriggered entry is evaluated on `var`, as
+            // they were, and a triggered one takes none)
             let e = match fired_by {
-                Some(t) => ctx.eval(s, &|n| at_fire(t, n).or_else(|| var(n)), object_to_world),
-                None => ctx.eval(s, var, object_to_world),
+                Some(t) => ctx.eval_holding(s, &|n| at_fire(t, n).or_else(|| var(n)), object_to_world, holds),
+                None => ctx.eval_holding(s, var, object_to_world, holds),
             };
             if e.wrong_view {
                 // "Stopped Sound ... globalstop/wrongview"
@@ -759,6 +761,13 @@ impl Ctx {
     /// One entry this frame (`TSound` update 0x750340): its volume and pitch as DirectSound
     /// takes them, and whether it can be started.
     fn eval(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4) -> Eval {
+        let holds = !s.def.triggers.is_empty() || SoundSet::conditions_hold(&s.def, var);
+        self.eval_holding(s, var, object_to_world, holds)
+    }
+
+    /// `eval` with the entry's `holds` given: triggered, or its conditions holding on `var` (the
+    /// caller has just tested them on the same variables).
+    fn eval_holding(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4, holds: bool) -> Eval {
         // [ROLLBACK introvol-122] An entry that is not playing starts on a buffer of its own, at 0 dB
         // (as `play_file_trigger` has it): the volume a request over 0 dB is refused at is no
         // stale one from a moment before - the engine still starting, the camera changed - and
@@ -795,7 +804,7 @@ impl Ctx {
             (None, _) => 0.0,
         };
         // (an untriggered entry whose conditions fail is at volume 0)
-        let mut vol = if triggered || SoundSet::conditions_hold(def, var) { def.volume * self.master } else { 0.0 };
+        let mut vol = if holds { def.volume * self.master } else { 0.0 };
         for vc in &def.vol_curves {
             if let Some(x) = SoundSet::curve_input(vc, var, active, facing) {
                 vol *= curve(&vc.points, x);
