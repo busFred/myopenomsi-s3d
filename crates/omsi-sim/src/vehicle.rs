@@ -2098,6 +2098,12 @@ impl VehicleInstance {
             .map(|i| self.state.vars[i as usize])
     }
 
+    /// How many variables the vehicle has by name: the table only grows (`set_engine_var`), so a
+    /// slot `var_slot` gave stays the one `var` reads while this is unchanged.
+    pub fn var_count(&self) -> usize {
+        self.var_index.len()
+    }
+
     /// Whether variable `name` was declared in the vehicle's script set (as opposed to built-in host variables).
     pub fn has_script_var(&self, name: &str) -> bool {
         self.ty.program.has_script_var(name)

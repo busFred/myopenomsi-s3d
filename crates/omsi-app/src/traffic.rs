@@ -5034,9 +5034,15 @@ impl Traffic {
                     let vals = &fired_vars.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(t))?.1;
                     v.var_slot(n).and_then(|i| vals.get(i).copied())
                 };
-                ss.update_fired(audio, &|n| v.var(n), &xf, &fired, &at_fire);
-                ss.update_parts_fired(
+                // (the entries' variables read by slot: `var_slot` gives the slot `var` reads, and
+                // the slots stand while the vehicle's table keeps its length, `var_count`)
+                let generation = v.var_count();
+                ss.bind(generation, &|n| v.var_slot(n));
+                ss.update_fired_bound(audio, generation, &v.state.vars, &|n| v.var(n), &xf, &fired, &at_fire);
+                ss.update_parts_fired_bound(
                     audio,
+                    generation,
+                    &v.state.vars,
                     &|n| v.var(n),
                     &|i| v.trailers.get(i).map(|t| t.world_transform()),
                     &fired,
