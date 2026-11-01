@@ -925,6 +925,13 @@ pub struct Simulation {
     /// (indexed by `ClaimsApart as usize`).
     pub stand_in_apart: Option<ClaimsApart>,
     pub stand_in_apart_frames: [u32; 4],
+    /// Each lane's [`Network::lane_edge_sides`] as the plans have asked for it, by lane index: a
+    /// function of the network's lanes and links alone, kept until the network grows
+    /// (`network_grew` empties it, as it compiles the junctions again; a network of another size
+    /// at a tick does too). Read only while a tick makes its plans (`edge_sides_live`); outside,
+    /// [`Simulation::lane_edge_sides`] asks the network.
+    edge_sides: Vec<std::sync::OnceLock<(Option<f32>, Option<f32>)>>,
+    edge_sides_live: bool,
 }
 
 /// How a stand-in's player claim (from the indicator, as a user's) and its own claim differ.
@@ -1064,12 +1071,26 @@ impl Simulation {
             stand_in: None,
             stand_in_apart: None,
             stand_in_apart_frames: [0; 4],
+            edge_sides: Vec::new(),
+            edge_sides_live: false,
         }
     }
 
-    /// Lanes from index `first` on are new: compile their junctions.
+    /// [`Network::lane_edge_sides`] of lane `i`, worked out once while the network stays as it is
+    /// (`edge_sides`).
+    pub fn lane_edge_sides(&self, net: &Network, i: usize) -> (Option<f32>, Option<f32>) {
+        match self.edge_sides.get(i).filter(|_| self.edge_sides_live) {
+            Some(c) => *c.get_or_init(|| net.lane_edge_sides(i)),
+            None => net.lane_edge_sides(i),
+        }
+    }
+
+    /// Lanes from index `first` on are new: compile their junctions, and work the lanes' edge sides
+    /// out again (`edge_sides`).
     pub fn network_grew(&mut self, net: &Network, first: usize) {
         self.junctions.extend(net, first);
+        // (a lane's edges come from the lanes it joins: new ones may join old lanes)
+        self.edge_sides.clear();
     }
 
     /// The side the oncoming traffic is on as a lateral sign: -1 (left) driving on the
@@ -2078,6 +2099,11 @@ impl Simulation {
         // update: all vehicles plan their step from the same state, then all move; no vehicle
         // sees another's move of this frame). A plan reads only the network, the simulation, the
         // vehicles and the perception, so the plans are made in parallel and kept in vehicle order
+        if self.edge_sides.len() != net.lanes.len() {
+            self.edge_sides.clear();
+            self.edge_sides.resize_with(net.lanes.len(), std::sync::OnceLock::new);
+        }
+        self.edge_sides_live = true;
         let mut plans: Vec<Plan> = {
             let (sim, vs): (&Simulation, &[Vehicle]) = (&*self, &*vehicles);
             (0..vs.len()).into_par_iter().map(|i| plan::plan(net, sim, vs, i, &perceptions[i], claim_of[i].map(|k| grants[k]))).collect()
@@ -2086,6 +2112,7 @@ impl Simulation {
             let vs: &[Vehicle] = vehicles;
             plans[si] = self.hide_player(net, pid, |sim| plan::plan(net, sim, vs, si, &perceptions[si], stand_in_grant));
         }
+        self.edge_sides_live = false;
         lap(&mut self.phase_secs[4]);
         // the requests the plans just read are used up; the acts below set the next frame's
         for v in vehicles.iter_mut() {
@@ -2243,7 +2270,7 @@ impl Simulation {
                 continue;
             }
             let j = ca.junction;
-            let meet = self.junctions.foes_along_wide(j, &ca.chain).iter().any(|(_, f)| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && self.junctions.for_bodies(j, f, ca.body, Some(cb.body)).is_some());
+            let meet = self.junctions.foes_along_wide_any(j, &ca.chain, |_, f| reservation::meets(f, ca, cb) && cb.chain.iter().any(|&(m, _)| m == f.movement) && self.junctions.for_bodies(j, f, ca.body, Some(cb.body)).is_some());
             if !meet {
                 continue;
             }

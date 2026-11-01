@@ -513,6 +513,14 @@ impl Junctions {
         self.foes_along_with(j, chain, true)
     }
 
+    /// [`Junctions::foes_along_wide`] in no order and without a list: for a test of whether any
+    /// foe of the way does something, which needs neither (the resolver asks it for many pairs a
+    /// frame).
+    pub fn foes_along_wide_any(&self, j: usize, chain: &[(usize, f32)], mut test: impl FnMut(usize, &Foe) -> bool) -> bool {
+        let node = &self.nodes[j];
+        chain.iter().any(|&(m, off)| node.movements[m].foes.iter().chain(&node.movements[m].wide).any(|f| test(m, &Foe { mine: (f.mine.0 + off, f.mine.1 + off), shift: f.shift + off, ..*f })))
+    }
+
     fn foes_along_with(&self, j: usize, chain: &[(usize, f32)], with_wide: bool) -> Vec<(usize, Foe)> {
         let node = &self.nodes[j];
         let mut out = Vec::new();

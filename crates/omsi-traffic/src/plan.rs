@@ -357,16 +357,30 @@ pub fn pull_out_followers(net: &Network, sim: &Simulation, lane: usize, s: f32, 
 pub fn pull_out_strip_clear(net: &Network, sim: &Simulation, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32) -> bool {
     let Some(l) = net.lanes.get(lane) else { return true };
     let (q, _) = l.at(s.min(l.length()));
-    !sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0).into_iter().any(|k| on_pull_out_strip(net, lane, s, lateral, front, rear, half_width, ramp_len, v, &sim.people[k]))
+    let near = sim.people_near(q, (ramp_len + front + rear) as f64 + 10.0);
+    if near.is_empty() {
+        return true;
+    }
+    // (the strip's poses are the same for everybody near: made once)
+    let poses = pull_out_poses(net, lane, s, lateral, front, rear, half_width, ramp_len, v);
+    !near.into_iter().any(|k| on_strip_poses(&poses, &sim.people[k]))
 }
 
 /// Whether person `p` is on the strip (`pull_out_strip_clear`): where
 /// they are, or where they will be when the body is at that metre - the car driving on from `v`
 /// m/s at `PULL_OUT_ACCEL` up to the lane's limit (`arrival_time`; timed from `v`, not from rest).
 pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32, p: &crate::sim::Person) -> bool {
-    let Some(l) = net.lanes.get(lane) else { return false };
+    on_strip_poses(&pull_out_poses(net, lane, s, lateral, front, rear, half_width, ramp_len, v), p)
+}
+
+/// The body's poses along a pull-out's strip (`on_pull_out_strip`), one a metre: its box with
+/// the box's axes and when the body is there (s from now).
+#[allow(clippy::too_many_arguments)]
+fn pull_out_poses(net: &Network, lane: usize, s: f32, lateral: f32, front: f32, rear: f32, half_width: f32, ramp_len: f32, v: f32) -> Vec<(Obb, [DVec2; 2], f32)> {
+    let Some(l) = net.lanes.get(lane) else { return Vec::new() };
     let len = l.length();
     let v_lim = l.speed_limit_kmh.max(1.0) / 3.6;
+    let mut out = Vec::new();
     let mut d = 0.0f32;
     while d <= ramp_len + 0.01 {
         let at = (s + d).min(len);
@@ -375,13 +389,22 @@ pub fn on_pull_out_strip(net: &Network, lane: usize, s: f32, lateral: f32, front
         let lat = lateral * (1.0 - omsi_sim::traffic::smooth01(d / ramp_len.max(0.1)));
         let c = q.truncate() + DVec2::new(hr.cos(), -hr.sin()) * lat as f64;
         let body = Obb::vehicle(c, h as f64, front as f64, rear as f64, half_width as f64);
-        let later = p.pos.truncate() + p.vel * arrival_time(d, v.max(0.0), omsi_sim::ai_motion::PULL_OUT_ACCEL, v_lim) as f64;
-        if [p.pos.truncate(), later].iter().any(|&x| Obb::point(x.extend(p.pos.z), PERSON_RADIUS as f64).separation(&body) < 0.0) {
-            return true;
-        }
+        out.push((body, body.axes(), arrival_time(d, v.max(0.0), omsi_sim::ai_motion::PULL_OUT_ACCEL, v_lim)));
         d += 1.0;
     }
-    false
+    out
+}
+
+/// Whether person `p` meets one of the strip's `poses` (`pull_out_poses`), where they are or
+/// where they will be when the body is there.
+fn on_strip_poses(poses: &[(Obb, [DVec2; 2], f32)], p: &crate::sim::Person) -> bool {
+    poses.iter().any(|&(body, axes, t)| {
+        let later = p.pos.truncate() + p.vel * t as f64;
+        [p.pos.truncate(), later].iter().any(|&x| {
+            let o = Obb::point(x.extend(p.pos.z), PERSON_RADIUS as f64);
+            o.separation_from(o.axes(), &body, axes, 0.0) < 0.0
+        })
+    })
 }
 
 /// The rest of a pull-out's way out (m): the steerable move from rest
@@ -1098,7 +1121,6 @@ fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Percept
     let (b, tau) = (me.params.comfort_brake, me.params.tau);
     let v_max = p.v_want.max(0.1);
     let s_b = net.beside_s(st.lane, nb.lane, st.s);
-    let runs = open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD);
     // (SUMO's `stopSpeed` before the person less the driver's standing gap)
     let person_cap = |lane: usize, s: f32| person_ahead(net, sim, me, lane, s).map_or(f32::INFINITY, |d| safe_speed(d - st.min_gap, 0.0, b, tau));
     let this_safe = *own.get_or_insert_with(|| {
@@ -1110,7 +1132,7 @@ fn anticipated_speeds(net: &Network, sim: &Simulation, me: &Vehicle, p: &Percept
     let nb_max = net.lanes.get(nb.lane).map_or(v_max, |l| ((l.speed_limit_kmh * st.desire).min(st.max_speed_kmh).max(3.0) / 3.6).max(0.1));
     let nb_safe = nb_max.min(person_cap(nb.lane, s_b)).min(match nb.ahead {
         Some((g, vl)) => safe_speed(g, vl, b, tau),
-        None => safe_speed(runs, 0.0, b, tau),
+        None => safe_speed(open_run(net, me, nb.lane, s_b, LC_STRATEGIC_LOOKAHEAD), 0.0, b, tau),
     });
     (this_safe, nb_safe)
 }
@@ -1910,17 +1932,27 @@ fn bypass_room(net: &Network, me: &Vehicle, nb: &NeighbourView, lead: &crate::pe
     // from the lead's box standing straight at its lateral: the least gap that does, halved for)
     let c = omsi_sim::traffic::HEADING_CHORD as f64;
     let at = |x: f64| bypass_lateral(x as f32, len, side, full_lock) as f64;
+    // (the move's poses do not depend on the gap halved for: made once, each with its axes and
+    // its corners' largest displacement from the pose before, `sample_step_clear`)
+    let mut poses: Vec<(Obb, [DVec2; 2], f64)> = Vec::new();
+    let mut d = 0.0f64;
+    while d <= len as f64 + c {
+        let slope = (at(d + c) - at(d - c)) / (2.0 * c);
+        let b = Obb::vehicle(DVec2::new(at(d), d), slope.atan().to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
+        let shift = poses.last().map_or(0.0, |(pb, _, _)| corner_shift(pb, &b));
+        poses.push((b, b.axes(), shift));
+        d += 0.1;
+    }
     let clears = |gap: f32| {
         let lead_box = Obb::vehicle(DVec2::new(dir as f64 * lead.lateral as f64, (st.front + gap) as f64 + lead.length as f64 * 0.5), 0.0, lead.length as f64 * 0.5, lead.length as f64 * 0.5, lead.half_width as f64);
-        let mut d = 0.0f64;
-        let mut prev = None;
-        while d <= len as f64 + c {
-            let slope = (at(d + c) - at(d - c)) / (2.0 * c);
-            let b = Obb::vehicle(DVec2::new(at(d), d), slope.atan().to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
-            if !sample_clear(&mut prev, b, b.separation(&lead_box), SQUEEZE_CLEARANCE as f64) {
+        let lead_axes = lead_box.axes();
+        let mut prev: Option<f64> = None;
+        for &(b, axes, shift) in &poses {
+            let sep = b.separation_with(axes, &lead_box, lead_axes);
+            if !sample_step_clear(prev, shift, sep, SQUEEZE_CLEARANCE as f64) {
                 return false;
             }
-            d += 0.1;
+            prev = Some(sep);
         }
         true
     };
@@ -2349,27 +2381,28 @@ enum Profile {
     FullLock { pre: f32 },
 }
 
-/// One more sample of a swept move (`bypass_room`; `sweep_step_clear` the same bound): the body's pose `b`, its
-/// least separation `sep` from what is swept, after the sample `prev` (updated). Between two
-/// samples no point of the body moves further than the largest corner displacement `shift`
-/// between the two poses (a rigid move displaces a box's points most at a corner), so a pose a
-/// share u of the way is at least `psep - u shift` and `sep - (1 - u) shift` clear: the poses
-/// between keep `clearance` where `(psep + sep - shift) / 2` does. A sweep sampled every few
-/// centimetres holds between its samples too.
-fn sample_clear(prev: &mut Option<(Obb, f64)>, b: Obb, sep: f64, clearance: f64) -> bool {
-    let ok = match *prev {
-        Some((pb, psep)) => {
-            let shift = pb.corners().iter().zip(b.corners().iter()).map(|(a, c)| a.distance(*c)).fold(0.0f64, f64::max);
-            0.5 * (psep + sep - shift) >= clearance
-        }
+/// One more sample of a swept move (`bypass_room`; `sweep_step_clear` the same bound): the body's
+/// least separation `sep` from what is swept, after the sample with separation `prev` whose pose
+/// lies `shift` from this one (the largest corner displacement between the two poses,
+/// `corner_shift`). Between two samples no point of the body moves further than `shift` (a rigid
+/// move displaces a box's points most at a corner), so a pose a share u of the way is at least
+/// `psep - u shift` and `sep - (1 - u) shift` clear: the poses between keep `clearance` where
+/// `(psep + sep - shift) / 2` does. A sweep sampled every few centimetres holds between its
+/// samples too.
+fn sample_step_clear(prev: Option<f64>, shift: f64, sep: f64, clearance: f64) -> bool {
+    match prev {
+        Some(psep) => 0.5 * (psep + sep - shift) >= clearance,
         None => sep >= clearance,
-    };
-    *prev = Some((b, sep));
-    ok
+    }
+}
+
+/// The largest displacement of a corner from box `a` to box `b` (`sample_step_clear`).
+fn corner_shift(a: &Obb, b: &Obb) -> f64 {
+    a.corners().iter().zip(b.corners().iter()).map(|(p, q)| p.distance(*q)).fold(0.0f64, f64::max)
 }
 
 /// Do the poses of a swept move between two samples `a` and `b` (where along it, the pose, its
-/// least separation; `body_sweep_clear`) keep `clearance`: by `sample_clear`'s bound (no point of
+/// least separation; `body_sweep_clear`) keep `clearance`: by `sample_step_clear`'s bound (no point of
 /// the body moves further than the largest corner displacement between the two), and where that
 /// bound is not enough but both samples are clear, by the two halves of the step, the pose
 /// between taken from `pose_sep` - the bound gives away up to half the displacement (a body
@@ -2379,7 +2412,7 @@ fn sweep_step_clear(pose_sep: &dyn Fn(f32) -> (Obb, f64), a: (f32, Obb, f64), b:
     if b.2 < clearance {
         return false;
     }
-    let shift = a.1.corners().iter().zip(b.1.corners().iter()).map(|(p, q)| p.distance(*q)).fold(0.0f64, f64::max);
+    let shift = corner_shift(&a.1, &b.1);
     if 0.5 * (a.2 + b.2 - shift) >= clearance {
         return true;
     }
@@ -2494,16 +2527,23 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         b
     };
     // (the least separation of a body so carried from my pose `b`: a span at both its ends)
-    let sep_of = |o: Obb, heading: f32, speed: f32, carry: Carry, d: f32, b: &Obb| -> f64 {
+    // (carried, a body keeps its axes: each box's are made once, `Obb::separation_with`)
+    // (`least`: the least separation found so far, `Obb::separation_from`: the value is exact under
+    // it, not under it otherwise, so a `least.min` of it is the same)
+    let sep_of = |o: Obb, o_axes: [DVec2; 2], heading: f32, speed: f32, carry: Carry, d: f32, b: &Obb, b_axes: [DVec2; 2], least: f64| -> f64 {
         match carry {
-            Carry::Span(brake) => at(o, heading, speed, Carry::AtSpeed, d).separation(b).min(at(o, heading, speed, Carry::ToStop(brake), d).separation(b)),
-            c => at(o, heading, speed, c, d).separation(b),
+            Carry::Span(brake) => at(o, heading, speed, Carry::AtSpeed, d).separation_from(o_axes, b, b_axes, least).min(at(o, heading, speed, Carry::ToStop(brake), d).separation_from(o_axes, b, b_axes, least)),
+            c => at(o, heading, speed, c, d).separation_from(o_axes, b, b_axes, least),
         }
     };
-    let near: Vec<(usize, Carry)> = sim.vehicles_near(me.pos, reach as f64).into_iter().filter_map(|j| {
+    // (each with its box, made once for every pose; only the others at my level, as every pose
+    // reads them)
+    let near: Vec<(usize, Carry, Obb, [DVec2; 2])> = sim.vehicles_near(me.pos, reach as f64).into_iter().filter_map(|j| {
         let o = &vehicles[j];
-        swept(o.state.speed, Some(o.state.lane), &o.obb()).map(|c| (j, c))
+        let ob = o.obb();
+        swept(o.state.speed, Some(o.state.lane), &ob).filter(|_| o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0).map(|c| (j, c, ob, ob.axes()))
     }).collect();
+    let others: Vec<(Obb, [DVec2; 2])> = parked.iter().chain(people).map(|o| (*o, o.axes())).collect();
     let clearance = SQUEEZE_CLEARANCE as f64;
     // (my body's pose `d` metres on and its least separation from what is swept)
     let pose_sep = |d: f32| -> (Obb, f64) {
@@ -2529,21 +2569,20 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
         let dir = (f + right * slope as f64).normalize();
         let b = Obb::vehicle(p + right * lat as f64, dir.x.atan2(dir.y).to_degrees(), st.front as f64, st.rear as f64, me.half_width as f64);
         // (the least separation of this pose from what is swept)
+        let b_axes = b.axes();
         let mut sep = f64::INFINITY;
-        for &(j, carried) in &near {
+        for &(j, carried, ob, ob_axes) in &near {
             let o = &vehicles[j];
-            if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
-                sep = sep.min(sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b));
-            }
+            sep = sep.min(sep_of(ob, ob_axes, o.heading, o.state.speed, carried, d, &b, b_axes, sep));
         }
         for pl in sim.players.iter().filter(|pl| (pl.pos.z - me.pos.z).abs() <= 3.0) {
             let pb = pl.obb(0.0, 0.0);
             if let Some(carry) = swept(pl.speed, None, &pb) {
-                sep = sep.min(sep_of(pb, pl.heading, pl.speed, carry, d, &b));
+                sep = sep.min(sep_of(pb, pb.axes(), pl.heading, pl.speed, carry, d, &b, b_axes, sep));
             }
         }
-        for o in parked.iter().chain(people) {
-            sep = sep.min(o.separation(&b));
+        for (o, o_axes) in &others {
+            sep = sep.min(o.separation_from(*o_axes, &b, b_axes, sep));
         }
         (b, sep)
     };
@@ -2560,13 +2599,11 @@ fn body_sweep_clear(net: &Network, sim: &Simulation, vehicles: &[Vehicle], me: &
             // (diagnostics: what the failing pose meets, `Plan::abort_detail`)
             SWEEP_BLOCKER.with(|c| {
                 let mut best: (f64, Option<SweepBlocker>) = (f64::INFINITY, None);
-                for &(j, carried) in &near {
+                for &(j, carried, ob, ob_axes) in &near {
                     let o = &vehicles[j];
-                    if o.id != me.id && (o.pos.z - me.pos.z).abs() <= 3.0 {
-                        let sp = sep_of(o.obb(), o.heading, o.state.speed, carried, d, &b);
-                        if sp < best.0 {
-                            best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried != Carry::Now, sp as f32, d)));
-                        }
+                    let sp = sep_of(ob, ob_axes, o.heading, o.state.speed, carried, d, &b, b.axes(), f64::INFINITY);
+                    if sp < best.0 {
+                        best = (sp, Some((0, o.id, o.state.lane, o.state.speed, carried != Carry::Now, sp as f32, d)));
                     }
                 }
                 for (kind, o) in parked.iter().map(|o| (1u8, o)).chain(people.iter().map(|o| (2u8, o))) {
@@ -3644,7 +3681,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 })
             };
             // (and as far as the piece's lane edges where the map tells them, L3-D6)
-            let (el, er) = net.lane_edge_sides(st.lane);
+            let (el, er) = sim.lane_edge_sides(net, st.lane);
             (el.map_or(half(p.left), |e| e.max(half(p.left))), er.map_or(half(p.right), |e| e.max(half(p.right))))
         } else {
             lane.drivable()
@@ -3662,7 +3699,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
                 }
             }
             if sign == towards_middle {
-                if let Some((opp, _, oside)) = net.opposite(st.lane, st.s) {
+                if let Some((opp, _, oside)) = *p.opposite.get_or_init(|| net.opposite(st.lane, st.s)) {
                     cap = cap.min(omsi_scenery::profile::neighbour_edge(oside.abs(), net.lanes[opp].width));
                 }
             }
@@ -3678,7 +3715,7 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
         let side_extent = |w: usize| -> f32 {
             let l = &net.lanes[w];
             let (dl, dr) = l.drivable();
-            let (el, er) = if l.source == 2 { net.lane_edge_sides(w) } else { (None, None) };
+            let (el, er) = if l.source == 2 { sim.lane_edge_sides(net, w) } else { (None, None) };
             if squeeze_side < 0.0 { el.map_or(dl, |e| e.max(dl)) } else { er.map_or(dr, |e| e.max(dr)) }
         };
         let way_extent = p.way.iter().filter(|w| w.1 < squeeze_reach + Passing::back_len_for(squeeze_side) && w.0 != st.lane && w.0 < net.lanes.len()).map(|w| side_extent(w.0)).fold(f32::INFINITY, f32::min);

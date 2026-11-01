@@ -876,11 +876,14 @@ fn in_way_of(js: &Junctions, a: &Claim, b: &Claim) -> bool {
 /// along `b`'s way through, its chain's): `b` cannot reach `at` before `a` has left the place.
 fn in_way_before(js: &Junctions, a: &Claim, b: &Claim, at: f32) -> bool {
     a.junction == b.junction
-        && js.foes_along_wide(b.junction, &b.chain).iter().filter(|(_, f)| f.mine.0 <= at).filter_map(|(_, f)| js.for_bodies(b.junction, f, b.body, Some(a.body))).any(|f| {
-            meets(&f, a, b) && a.chain.iter().any(|&(m, off)| {
-                let s = a.s - off;
-                m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
-            })
+        && js.foes_along_wide_any(b.junction, &b.chain, |_, f| {
+            f.mine.0 <= at
+                && js.for_bodies(b.junction, f, b.body, Some(a.body)).is_some_and(|f| {
+                    meets(&f, a, b) && a.chain.iter().any(|&(m, off)| {
+                        let s = a.s - off;
+                        m == f.movement && s + a.front >= f.theirs.0 && s - a.rear <= f.theirs.1
+                    })
+                })
         })
 }
 

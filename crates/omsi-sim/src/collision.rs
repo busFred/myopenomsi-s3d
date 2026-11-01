@@ -163,14 +163,29 @@ impl Obb {
     /// depth. A positive value is a lower bound of the true distance (exact where a face
     /// is nearest), which is what a clearance check wants.
     pub fn separation(&self, o: &Obb) -> f64 {
+        self.separation_with(self.axes(), o, o.axes())
+    }
+
+    /// [`Obb::separation`] with both boxes' [`Obb::axes`] given: for a box tested against many
+    /// (a swept body's poses against the bodies near), whose axes need making once.
+    pub fn separation_with(&self, axes: [DVec2; 2], o: &Obb, o_axes: [DVec2; 2]) -> f64 {
+        self.separation_from(axes, o, o_axes, f64::INFINITY)
+    }
+
+    /// [`Obb::separation_with`] where only a separation under `least` matters (the least of
+    /// several found so far): the separation when it is under `least`, else some value not under
+    /// it - the gap along the axes tried so far, each a lower bound of the separation (the widest
+    /// of them) - so `least.min(..)` is the same either way.
+    pub fn separation_from(&self, [ra, fa]: [DVec2; 2], o: &Obb, [rb, fb]: [DVec2; 2], least: f64) -> f64 {
         let d = o.center - self.center;
-        let (ra, fa) = (self.axes()[0], self.axes()[1]);
-        let (rb, fb) = (o.axes()[0], o.axes()[1]);
         let extent = |r: DVec2, f: DVec2, half: DVec2, axis: DVec2| r.dot(axis).abs() * half.x + f.dot(axis).abs() * half.y;
         let mut best = f64::MIN;
         for axis in [ra, fa, rb, fb] {
             let gap = d.dot(axis).abs() - extent(ra, fa, self.half, axis) - extent(rb, fb, o.half, axis);
             best = best.max(gap);
+            if best >= least {
+                return best;
+            }
         }
         best
     }

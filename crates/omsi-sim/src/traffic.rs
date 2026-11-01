@@ -389,14 +389,55 @@ impl Lane {
     /// Closest point of the lane's polyline to `p`: (distance along the lane, distance to it).
     pub fn nearest_point(&self, p: DVec3) -> Option<(f32, f64)> {
         let mut best: Option<(f32, f64)> = None;
+        // (the best's squared distance: a segment no nearer in squares is no nearer, the root being
+        // monotonic, and its root is not taken)
+        let mut best_sq = f64::INFINITY;
         for k in 0..self.points.len().saturating_sub(1) {
             let a = self.points[k];
             let b = self.points[k + 1];
             let ab = b - a;
             let t = ((p - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
-            let d = (a + ab * t - p).length();
+            let sq = (a + ab * t - p).length_squared();
+            if best.is_some() && sq >= best_sq {
+                continue;
+            }
+            let d = sq.sqrt();
             if best.map(|b| d < b.1).unwrap_or(true) {
                 best = Some((self.dist[k] + (self.dist[k + 1] - self.dist[k]) * t as f32, d));
+                best_sq = sq;
+            }
+        }
+        best
+    }
+
+    /// [`Lane::nearest_point`] for a caller that wants it only within `reach` (m) of `p`: the same
+    /// answer where the nearest point lies within `reach`; beyond, None or a point beyond `reach`.
+    /// A segment whose bounding box lies further than `reach` from `p` cannot hold that point, so
+    /// it is not measured.
+    pub fn nearest_point_within(&self, p: DVec3, reach: f64) -> Option<(f32, f64)> {
+        // (the box test errs on the side of measuring: a rounding of the box distance never
+        // drops a segment within reach)
+        let r = reach * (1.0 + 1e-9) + 1e-6;
+        let r_sq = r * r;
+        let mut best: Option<(f32, f64)> = None;
+        let mut best_sq = f64::INFINITY;
+        for k in 0..self.points.len().saturating_sub(1) {
+            let a = self.points[k];
+            let b = self.points[k + 1];
+            let out = (a.min(b) - p).max(p - a.max(b)).max(DVec3::ZERO);
+            if out.length_squared() > r_sq {
+                continue;
+            }
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
+            let sq = (a + ab * t - p).length_squared();
+            if best.is_some() && sq >= best_sq {
+                continue;
+            }
+            let d = sq.sqrt();
+            if best.map(|b| d < b.1).unwrap_or(true) {
+                best = Some((self.dist[k] + (self.dist[k + 1] - self.dist[k]) * t as f32, d));
+                best_sq = sq;
             }
         }
         best
@@ -1837,19 +1878,19 @@ impl Network {
         let cx = (p.x / GRID_CELL).floor() as i32;
         let cy = (p.y / GRID_CELL).floor() as i32;
         let mut best: Option<(usize, f32, f32)> = None;
-        let mut seen: Vec<usize> = Vec::new();
+        // (a lane in several of the cells is measured once, where it is first met)
+        let mut seen: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for &i in self.grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
-                    if i == lane || seen.contains(&i) {
+                    if i == lane || !seen.insert(i) {
                         continue;
                     }
-                    seen.push(i);
                     let o = &self.lanes[i];
                     if o.kind != LaneKind::Street || o.no_cars {
                         continue;
                     }
-                    let Some((os, d)) = o.nearest_point(p) else { continue };
+                    let Some((os, d)) = o.nearest_point_within(p, 7.0) else { continue };
                     if d > 7.0 || d < 1.5 {
                         continue;
                     }

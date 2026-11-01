@@ -357,6 +357,10 @@ pub struct Perception {
     /// past people): what a timetable bus between its stops takes.
     pub parked_swerve: Option<f32>,
     pub oncoming: Option<OncomingView>,
+    /// [`Network::opposite`] at the vehicle's place, once worked out this frame (for `oncoming`;
+    /// the plan's squeeze reads it too): the lane, the place and the vehicle are the same from the
+    /// perception to the plan.
+    pub opposite: std::sync::OnceLock<Option<(usize, f32, f32)>>,
     /// A player's vehicle ahead indicating to pull out towards the traffic: the distance
     /// from my origin to its rear.
     pub letting_out: Option<f32>,
@@ -1499,8 +1503,9 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // crowd stepping onto a short walk a turn crosses 3 m on - goes through the ordinary
         // strip and body tests below like anybody; those
         // still walking up to it are approaching persons, above)
-        let on_covered_walk = covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
-        if on_covered_walk && on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS {
+        // (asked only of somebody on a crossing near enough)
+        let on_covered_walk = || covered_walks.iter().any(|&w| net.lanes.get(w).and_then(|wl| wl.nearest_point(p.pos).map(|(_, dd)| (dd as f32) < wl.width * 0.5 + crate::plan::PERSON_RADIUS)).unwrap_or(false));
+        if on_crossing && ahead_of_front < crate::plan::ZEBRA_PAST + crate::plan::PERSON_RADIUS && on_covered_walk() {
             if omsi_sim::collision::Obb::point(p.pos, crate::plan::PERSON_RADIUS as f64).separation(&me.obb()) < 0.0 {
                 holders.push(Holder { stop: st.front, along: st.front, axis: 0.0, swervable: false });
             }
@@ -1550,9 +1555,10 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // whose cut of my way the network does not list (viz2 j19 crossing 0 across #19609's
         // way). For a timed walker their projected step is not also taken by the strip and body
         // tests below (it stopped a car that passes first late, with its body across their path).
-        let on_cut_walk = zebras.iter().any(|z| net.lanes.get(z.walk).and_then(|wl| wl.nearest_point(p.pos)).is_some_and(|(_, dd)| (dd as f32) < net.lanes[z.walk].width * 0.5 + crate::plan::PERSON_RADIUS));
+        // (asked only of a walker whose leg is a crossing's)
+        let on_cut_walk = || zebras.iter().any(|z| net.lanes.get(z.walk).and_then(|wl| wl.nearest_point(p.pos)).is_some_and(|(_, dd)| (dd as f32) < net.lanes[z.walk].width * 0.5 + crate::plan::PERSON_RADIUS));
         let crossing_leg = p.leg.is_some_and(|l| sim.junctions.of_foot_lane.contains_key(&l));
-        let across = (crossing_leg && !on_crossing && !on_cut_walk && !p.at_kerb && !p.waiting_for_bus && p.approach.is_none() && !at_kerb_of_stop && !my_waiter && p.vel.length() >= STEP_SPEED as f64)
+        let across = (crossing_leg && !on_crossing && !on_cut_walk() && !p.at_kerb && !p.waiting_for_bus && p.approach.is_none() && !at_kerb_of_stop && !my_waiter && p.vel.length() >= STEP_SPEED as f64)
             .then(|| walk_across(way, p.pos.truncate(), p.vel, half, st.rear + crate::plan::PERSON_RADIUS, reach + st.front))
             .flatten();
         let mut timed = false;
@@ -2418,8 +2424,13 @@ fn lane_end(net: &Network, sim: &Simulation, me: &Vehicle, way: &[(usize, f32)],
 /// `occupants(lane, f)`: `f(s, vehicle)` for each but me (`sim_occupants` for a vehicle of the
 /// simulation).
 fn oncoming(net: &Network, sim: &Simulation, me: &Vehicle, occupants: &dyn Fn(usize, &mut dyn FnMut(f32, &Vehicle)), pass_len: f32) -> Option<OncomingView> {
+    oncoming_of(net, sim, me, net.opposite(me.state.lane, me.state.s), occupants, pass_len)
+}
+
+/// [`oncoming`] with the lane's [`Network::opposite`] at the vehicle's place given.
+fn oncoming_of(net: &Network, sim: &Simulation, me: &Vehicle, opposite: Option<(usize, f32, f32)>, occupants: &dyn Fn(usize, &mut dyn FnMut(f32, &Vehicle)), pass_len: f32) -> Option<OncomingView> {
     let st = &me.state;
-    let (opp, os, side) = net.opposite(st.lane, st.s)?;
+    let (opp, os, side) = opposite?;
     let ol = &net.lanes[opp];
     // a lane the car could not drive on anyway (a footpath, a bus lane closed to its
     // group), or one beyond a strip wider than two lanes' edges ever are, is no lane to
@@ -2721,7 +2732,8 @@ pub fn perceive(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize)
             if (standing || me.passing.is_some()) && left.is_none() && right.is_none() {
                 let obstacle = p.leader.map(|l| l.gap + l.length).unwrap_or(10.0);
                 let pass_len = obstacle + st.front + st.rear + 6.0;
-                p.oncoming = oncoming(net, sim, me, &sim_occupants(sim, vehicles, i), pass_len);
+                let opposite = *p.opposite.get_or_init(|| net.opposite(st.lane, st.s));
+                p.oncoming = oncoming_of(net, sim, me, opposite, &sim_occupants(sim, vehicles, i), pass_len);
             }
         }
     }
