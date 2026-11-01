@@ -2157,24 +2157,6 @@ pub fn zebra_queue_stop(me: &Vehicle, cut: f32) -> Option<f32> {
     (at > st.front - 0.3 && at - STOP_LINE_GAP <= cut - 0.3).then_some(at)
 }
 
-/// The stop point for a hold whose last waiting place short of the stretch's start
-/// (`stretch_start`) is `at` (`legal_before`): there, or where the car can stop gently
-/// (`gentle_stop`) if it comes to rest there (the stop point less `STOP_LINE_GAP`) with its body on
-/// no band (`bands`) and its front short of the stretch; never past either, braking as hard as it
-/// must instead. A car
-/// already past `at` stops where it is (its front less 0.3 m), wherever its body stands.
-pub fn gentle_hold(bands: &[(f32, f32)], me: &Vehicle, at: f32, stretch_start: f32) -> f32 {
-    let held = at.max(me.state.front - 0.3);
-    let gentle = held.max(gentle_stop(me));
-    // (where it comes to rest: the stop point less `STOP_LINE_GAP`, the gap the controller leaves)
-    let rest = gentle - STOP_LINE_GAP;
-    if rest <= stretch_start && (rest <= held || legal_before(bands, me, rest) == Some(rest)) {
-        gentle
-    } else {
-        held
-    }
-}
-
 fn gentle_stop(me: &Vehicle) -> f32 {
     let v = me.state.speed;
     me.state.front + if v < STANDING_SPEED { 0.0 } else { STOP_LINE_GAP + STOP_BRAKE_MARGIN * v * v / (2.0 * INSIDE_BRAKE_FACTOR * me.state.decel) }
@@ -2279,13 +2261,13 @@ pub fn plan(net: &Network, sim: &Simulation, vehicles: &[Vehicle], i: usize, p: 
             // (past the last waiting place a rolling car stops where it gently can, a little
             // further on: a hold released while it crept off and bound again for the next foe,
             // upstream, put the place at its front and braked it from ~1 m/s at the emergency
-            // brake. Never with its body on a band nor its front past the stretch's start: where
-            // the gentle place would be, it stops at the last waiting place, as hard as it must -
-            // `gentle_hold`. One already past that place stops where it is, its body on a band
-            // if it stands on one: the exposure left, carried to round 12 - the order should be
-            // settled before the car leaves its last waiting place)
+            // brake. The gentle stop comes first (user decision R-D2): where it lies past the last
+            // waiting place, the car may come to rest with its body on a crossing band or its front
+            // a little inside the merge stretch, rather than brake at ~8 m/s². That happens when
+            // the order flips after the car has left its last waiting place; deciding there is
+            // carried to round 12)
             if let Some(at) = legal_before(&wait_bands(net, sim, j), me, st.front + d) {
-                min_stop(&mut out.stop, &mut out.why, Some(gentle_hold(&wait_bands(net, sim, j), me, at, st.front + d)), Why::Junction);
+                min_stop(&mut out.stop, &mut out.why, Some(at.max(st.front - 0.3).max(gentle_stop(me))), Why::Junction);
             }
         }
         // SUMO's waiting positions: where following the foe ahead brings the car
@@ -3111,22 +3093,5 @@ mod stop_place_tests {
         assert_eq!(zebra_queue_stop(&me, cut), Some(comfortable));
         // with room for the gentle stop short of the cut, that one
         assert_eq!(zebra_queue_stop(&me, front + 2.0), Some(gentle_stop(&me) + 0.3));
-    }
-
-    /// A zipper hold is never moved by the gentle stop onto a band or past the stretch's start:
-    /// the car stops at the last waiting place then, as hard as it must.
-    #[test]
-    fn a_zipper_hold_never_puts_the_stop_on_a_band_or_into_the_stretch() {
-        let fast = car(9.0);
-        let bands = [(10.0, 12.0)];
-        // the gentle place lies on the band: the waiting place before it
-        assert!(gentle_stop(&fast) > 10.0);
-        assert_eq!(gentle_hold(&bands, &fast, 9.0, 20.0), 9.0);
-        // the gentle place lies past the stretch's start: the waiting place
-        let slow = car(7.0);
-        assert!(gentle_stop(&slow) > 5.0);
-        assert_eq!(gentle_hold(&[], &slow, 5.0, 5.0), 5.0);
-        // free of both: the gentle place
-        assert_eq!(gentle_hold(&[], &slow, 3.0, 20.0), gentle_stop(&slow));
     }
 }
