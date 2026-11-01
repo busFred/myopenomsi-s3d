@@ -574,7 +574,7 @@ fn a_step_out_late_in_its_signal_is_swept_from_its_change_less_pose() {
                 let (fwd, left) = (glam::DVec2::new(hr.sin(), hr.cos()), glam::DVec2::new(-hr.cos(), hr.sin()));
                 let corner = body.corners().into_iter().max_by(|a, b| ((*a - pos.truncate()).dot(fwd) + (*a - pos.truncate()).dot(left)).total_cmp(&((*b - pos.truncate()).dot(fwd) + (*b - pos.truncate()).dot(left)))).unwrap();
                 let q = corner + left * 0.15;
-                people.push(omsi_traffic::Person { pos: glam::DVec3::new(q.x, q.y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None });
+                people.push(omsi_traffic::Person { pos: glam::DVec3::new(q.x, q.y, 0.0), vel: glam::DVec2::ZERO, on_crossing: false, still: 10.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: None, approach: None, leg: None });
                 placed = true;
             }
         }

@@ -1071,7 +1071,7 @@ pub struct Traffic {
     /// Everybody on foot on the ground: position, velocity, whether they are waiting at a
     /// stop, and for how long they have stood still (set every frame) - the cars stop for
     /// anybody in their way, not only on a crossing.
-    pub people: Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>)>,
+    pub people: Vec<(DVec3, DVec2, bool, f32, bool, bool, Option<i64>, u32, Option<(DVec2, f32, f32)>, Option<usize>)>,
     /// No car has been placed yet: the first population may fill the view.
     initial: bool,
     /// Seconds of the last tick (the lamp scripts run in `sync`).
@@ -4142,7 +4142,7 @@ impl Traffic {
         self.others_still.retain(|id, _| others.iter().any(|o| o.0 == *id));
         self.sim.players = views;
         self.sim.stand_in = self.stand_in.filter(|_| player.is_some()).map(|vehicle| omsi_traffic::StandIn { vehicle, player: PLAYER_VIEW_ID });
-        self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb, waits_at, id, approach)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb, waits_at, id: Some(id), approach }).collect();
+        self.sim.people = self.people.iter().map(|&(pos, vel, waiting, still, on_crossing, at_kerb, waits_at, id, approach, leg)| Person { pos, vel, on_crossing, still, waiting_for_bus: waiting, at_kerb, waits_at, id: Some(id), approach, leg }).collect();
         // (indexed now: a bus put back on its route below asks the people test, `people_hold_here`)
         self.sim.index_people();
         self.sim.walkers = self.walkers.clone();
@@ -6709,7 +6709,7 @@ mod spawn_people_tests {
         let probe = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), None);
         let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
         let mut refused = |p: DVec3| {
-            sim.people = vec![Person { pos: p, vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+            sim.people = vec![Person { pos: p, vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None, leg: None }];
             sim.index_people();
             omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe, &|_, _| {})
         };
@@ -6730,7 +6730,7 @@ mod spawn_people_tests {
         net.build_grid();
         let mut sim = omsi_traffic::Simulation::new(&net, Vec::new());
         // 2.6 m right of the lane (+x facing north), 0.3 m ahead of the front of a car parked there
-        sim.people = vec![Person { pos: DVec3::new(2.6, 2.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None }];
+        sim.people = vec![Person { pos: DVec3::new(2.6, 2.6, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None, leg: None }];
         sim.index_people();
         let at_lane = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), None);
         let parked = spawn_probe(&net, VehicleClass::Car, (2.3, 2.3, 0.9), DVec3::ZERO, 0.0, (0, 50.0), Some((2.6, 30.0)));
@@ -6757,7 +6757,7 @@ mod spawn_people_tests {
         // somebody just off the lane's paint on its right, outside the car's body and in its strip
         // (1.18 m off the axis: half width 0.9 m and PERSON_RADIUS outside, within 0.9 + 0.3 m), ahead
         // of its front: a 0.5 m shift left, towards the oncoming lane, clears them
-        let person = |x: f64| Person { pos: DVec3::new(x, 4.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None };
+        let person = |x: f64| Person { pos: DVec3::new(x, 4.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: false, at_kerb: false, waits_at: None, id: Some(1), approach: None, leg: None };
         sim.people = vec![person(1.18)];
         sim.index_people();
         let free = omsi_traffic::perception::people_hold_at_rest(&net, &sim, &probe, &|_, _| {});

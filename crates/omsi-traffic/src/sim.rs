@@ -80,6 +80,11 @@ pub struct Person {
     /// (`MSLink::getLeaderInfo`'s approaching persons).
     #[serde(default)]
     pub approach: Option<(DVec2, f32, f32)>,
+    /// The footpath lane of the leg a stroller walks now (`humans::PedWalk`; None for anybody
+    /// else): a piece of a junction's crossing (`Junctions::of_foot_lane`) is their way across the
+    /// road - SUMO's person whose route uses the crossing.
+    #[serde(default)]
+    pub leg: Option<usize>,
 }
 
 /// A parked car beside a lane.

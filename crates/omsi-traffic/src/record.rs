@@ -221,7 +221,7 @@ fn is_false(v: &bool) -> bool {
 impl PersonRecord {
     /// The person as the frame sees them.
     pub fn person(&self) -> Person {
-        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb, waits_at: self.waits_at, id: self.id, approach: self.approach }
+        Person { pos: self.pos, vel: self.vel, on_crossing: self.on_crossing, still: self.still, waiting_for_bus: self.waiting_for_bus, at_kerb: self.at_kerb, waits_at: self.waits_at, id: self.id, approach: self.approach, leg: self.leg.map(|l| l.0) }
     }
 
     /// A record of somebody the game told nothing more about.
@@ -986,10 +986,10 @@ mod tests {
         light.request = vec![true, false];
         let lights = vec![light];
         let players = vec![PlayerView { id: 0, pos: DVec3::new(1.5, -2.25, 0.1), heading: 33.3, half_len: 6.0, half_width: 1.2, speed: -0.7, still: 0.0, blinker: 2, signalling: 1.5, priority: true }];
-        let mut walker = PersonRecord::from_person(&Person { pos: DVec3::new(10.1, 20.2, 0.0), vel: DVec2::new(0.3, -0.1), on_crossing: true, still: 0.4, waiting_for_bus: false, at_kerb: true, waits_at: Some(7), id: None, approach: None });
+        let mut walker = PersonRecord::from_person(&Person { pos: DVec3::new(10.1, 20.2, 0.0), vel: DVec2::new(0.3, -0.1), on_crossing: true, still: 0.4, waiting_for_bus: false, at_kerb: true, waits_at: Some(7), id: None, approach: None, leg: None });
         walker.leg = Some((3, 1.25, 8.5));
         walker.decision = Some(Cow::Borrowed("red light"));
-        let people = vec![walker, PersonRecord::from_person(&Person { pos: DVec3::new(-5.0, 6.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: true, at_kerb: false, waits_at: None, id: None, approach: None })];
+        let people = vec![walker, PersonRecord::from_person(&Person { pos: DVec3::new(-5.0, 6.0, 0.0), vel: DVec2::ZERO, on_crossing: false, still: 0.0, waiting_for_bus: true, at_kerb: false, waits_at: None, id: None, approach: None, leg: None })];
         let externals = vec![(7u64, External { priority: true, ..Default::default() })];
         let steer = vec![(9u64, Steer { signal: 1, signal_time: 0.5, lateral_target: -1.5, lateral_ramp: (0.1, 0.2, 0.3, 0.4) })];
         let order = vec![3u64, 1, 2];
