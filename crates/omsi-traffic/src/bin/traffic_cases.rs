@@ -4176,8 +4176,8 @@ struct Score {
     /// Vehicles whose front crossed a lit lane's stop line (its start) while the light was red.
     red_cross: u64,
     /// Crossings while the light was red that `red_cross` leaves out: the light went from a go
-    /// state straight to red (no amber) and the vehicle could not stop before the line then
-    /// (see `cannot_stop`). Not part of GATE.
+    /// state straight to red (no amber) and the vehicle could not stop before the line then even
+    /// at `HARD_BRAKE` (see `cannot_stop`). Not part of GATE.
     red_noamber: u64,
     /// All such crossings (any colour), counted once per vehicle and light: what `red_cross` is a part of.
     lit_cross: u64,
@@ -4444,14 +4444,17 @@ fn standing_and_heads(r: &Replay, near: &dyn Fn(DVec3) -> bool) -> (Vec<usize>, 
     (all, heads)
 }
 
-/// A vehicle at `speed` (m/s) cannot stop before a line `dist` m ahead of its front when the
-/// distance it needs at its comfortable deceleration `comfort_brake` (m/s^2), v^2 / (2 b),
-/// exceeds `dist`. SUMO lets such a vehicle pass: a signal that turns red without a yellow
-/// phase puts it in the dilemma zone, where it cannot stop at its comfortable braking.
-/// The user's decision (round 11) applies it to the `red_cross` metric: such a crossing is
-/// counted in `red_noamber`, not in `red_cross`.
-fn cannot_stop(speed: f64, comfort_brake: f64, dist: f64) -> bool {
-    comfort_brake > 0.0 && speed * speed / (2.0 * comfort_brake) > dist
+/// A vehicle at `speed` (m/s) when its light went from a go state straight to red cannot stop
+/// before the line `dist` m ahead of its front even at `HARD_BRAKE`: the AI's own light rule
+/// (`plan::cannot_stop`, which `light_call` asks at red), so the metric exempts exactly the
+/// crossings the controller lets through. SUMO brakes at red: with `jmDriveAfterRedTime` unset
+/// `ignoreRed` is false (MSVehicle.cpp:7610-7621) and the red link is not opened; its
+/// `canBrake`, `brakeGap(v, getMaxDecel())`, decides only at yellow (MSVehicle.cpp:3779-3784).
+/// A red with no amber before it gives a car no yellow to decide on, so the user's decision
+/// (round 11) counts a crossing the car could not have stopped for at its hard braking in
+/// `red_noamber`, not in `red_cross`.
+fn cannot_stop(speed: f64, dist: f64) -> bool {
+    omsi_traffic::plan::cannot_stop(speed as f32, dist as f32, omsi_traffic::plan::HARD_BRAKE)
 }
 
 /// The stop line of a lit lane: a segment through the lane's start, across it, as wide as
@@ -4508,7 +4511,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
     // to red (0..=5) and is still red, each vehicle's (speed, comfort brake, distance of its
     // front before the light's stop lines) at that frame)
     let mut light_prev: HashMap<(usize, usize), i32> = HashMap::new();
-    let mut red_onset: HashMap<(usize, usize), HashMap<u64, (f64, f64, f64)>> = HashMap::new();
+    let mut red_onset: HashMap<(usize, usize), HashMap<u64, (f64, f64)>> = HashMap::new();
     let mut touching: HashSet<(u64, u64)> = HashSet::new();
     let mut spawn_pairs: HashSet<(u64, u64)> = HashSet::new();
     let mut first_seen: HashMap<u64, f64> = HashMap::new();
@@ -4798,15 +4801,15 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
             if !matches!(state, 0..=5) {
                 red_onset.remove(&ll.light);
             } else if was.is_some_and(|w| matches!(w, 6..=8)) {
-                let mut snap: HashMap<u64, (f64, f64, f64)> = HashMap::new();
+                let mut snap: HashMap<u64, (f64, f64)> = HashMap::new();
                 for v in &r.vehicles {
                     let h = (v.heading as f64).to_radians();
                     let front = v.pos.truncate() + glam::DVec2::new(h.sin(), h.cos()) * v.state.front as f64;
                     for l2 in lit.iter().filter(|l2| l2.light == ll.light) {
                         let d = -(front - l2.p0).dot(l2.fwd);
                         if d >= 0.0 && (front - l2.p0).dot(l2.right).abs() <= l2.half {
-                            let e = snap.entry(v.id).or_insert((v.state.speed as f64, v.params.comfort_brake as f64, d));
-                            e.2 = e.2.min(d);
+                            let e = snap.entry(v.id).or_insert((v.state.speed as f64, d));
+                            e.1 = e.1.min(d);
                         }
                     }
                 }
@@ -4907,7 +4910,7 @@ fn ab_run(fixture: &Path, radius: f64, min_head: usize, free_run: bool, pedtouch
                         sc.lit_cross += 1;
                         // (the light's state this frame is the one the vehicle moved by)
                         if r.sim.lights.get(ll.light.0).is_some_and(|ctl| matches!(ctl.state(ll.light.1), 0..=5)) {
-                            let exempt = red_onset.get(&ll.light).and_then(|m| m.get(&v.id)).is_some_and(|&(sp, b, d)| cannot_stop(sp, b, d));
+                            let exempt = red_onset.get(&ll.light).and_then(|m| m.get(&v.id)).is_some_and(|&(sp, d)| cannot_stop(sp, d));
                             if exempt {
                                 sc.red_noamber += 1;
                                 continue;
@@ -7794,12 +7797,13 @@ mod red_noamber_tests {
     use super::cannot_stop;
 
     #[test]
-    fn dilemma_zone() {
-        // the d24 case12 event: 3.1 m from the line at 6.4 m/s, b = 2: needs 10.2 m
-        assert!(cannot_stop(6.4, 2.0, 3.1));
-        // the same speed 15 m out can stop (needs 10.2 m)
-        assert!(!cannot_stop(6.4, 2.0, 15.0));
+    fn no_amber_red_exempts_only_what_hard_braking_cannot_stop() {
+        // the d24 case12 event: 3.1 m from the line at 6.4 m/s; at HARD_BRAKE (6.4 m/s²) it
+        // needs 3.2 m
+        assert!(cannot_stop(6.4, 3.1));
+        // 5 m out it could stop hard (it needed 10.2 m at a comfortable 2 m/s²: no longer exempt)
+        assert!(!cannot_stop(6.4, 5.0));
         // a standing vehicle always can
-        assert!(!cannot_stop(0.0, 2.0, 0.0));
+        assert!(!cannot_stop(0.0, 0.0));
     }
 }
