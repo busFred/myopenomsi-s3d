@@ -6303,6 +6303,10 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
     let from: f64 = opt(args, "--from").map(|s| s.parse()).transpose()?.unwrap_or(f64::NEG_INFINITY);
     let to: f64 = opt(args, "--to").map(|s| s.parse()).transpose()?.unwrap_or(f64::INFINITY);
     let every: f64 = opt(args, "--every").map(|s| s.parse()).transpose()?.unwrap_or(0.5);
+    let near: Option<(glam::DVec2, f64)> = opt(args, "--near").and_then(|s| {
+        let v: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (v.len() == 3).then(|| (glam::DVec2::new(v[0], v[1]), v[2]))
+    });
     let mut r = Replay::load(fixture)?;
     r.free_run = !args.iter().any(|a| a == "--reset");
     if !r.at(0) {
@@ -6324,6 +6328,14 @@ fn watch(fixture: &Path, args: &[String]) -> Res<()> {
         }
         r.sim.update_positions(&r.net, &mut r.vehicles);
         let mut found: Vec<usize> = ids.iter().filter_map(|id| r.vehicles.iter().position(|v| v.id == *id)).collect();
+        // (`--near x,y,r`: every vehicle whose origin lies within r m of (x, y) as well)
+        if let Some((c, rad)) = near {
+            for (k, v) in r.vehicles.iter().enumerate() {
+                if !found.contains(&k) && (v.pos.truncate() - c).length() <= rad {
+                    found.push(k);
+                }
+            }
+        }
         // (`--chain`: the watched vehicles' leads, one after the other, to the head of the queue)
         if args.iter().any(|a| a == "--chain") {
             let mut k = 0;
