@@ -157,8 +157,8 @@ fn edge_in_sight_default() -> bool {
 }
 
 /// How far along the road (m) `Network::ends_at_loaded_edge` looks for the
-/// edge of the loaded tiles: SUMO's `lcStrategicLookahead` default, how far a vehicle's best lanes
-/// look along its way (sumo.md; omsi-traffic's `LC_STRATEGIC_LOOKAHEAD`).
+/// edge of the loaded tiles: the same distance as omsi-traffic's `LC_STRATEGIC_LOOKAHEAD` (SUMO's
+/// motorway bound on its best lanes' look-ahead; see there).
 pub const EDGE_LOOKAHEAD: f64 = 3000.0;
 
 /// Priority of a path without a `[rule] priority`.
@@ -4076,10 +4076,15 @@ fn default_signal_before_change() -> f32 {
     SIGNAL_BEFORE_CHANGE
 }
 
-/// SUMO's `lcStrategicLookahead` (m, default 3000): how far LC2013's best lanes, and so the
-/// distance a lane beside runs on (`neighDist`), are looked along; a random car with no trip end
-/// draws one at the first fork within it (`AiState::plan_next`), where SUMO's best lanes would
-/// see the route's split.
+/// How far (m) a car's strategic look along its way reaches: the best lanes and so the
+/// distance a lane beside runs on (`neighDist`), and the first fork within it where a random car
+/// with no trip end draws one (`AiState::plan_next`), where SUMO's best lanes would see the
+/// route's split. SUMO's `lcStrategicLookahead` is unset by default
+/// (MSAbstractLaneChangeModel.cpp:139, `UNDEFINED_LOOKAHEAD`); `MSVehicle::updateBestLanes` then
+/// looks on while within 4 edges or under max(brake gap, 3000 m) ("motorway") and within 8 edges
+/// or under max(brake gap, 200 m) ("urban"; MSVehicle.cpp:6212-6215), so in a town it usually
+/// stops at the ninth edge past 200 m. Ours is the motorway bound alone, a reach of our own about
+/// 15 times SUMO's urban one.
 pub const LC_STRATEGIC_LOOKAHEAD: f32 = 3000.0;
 
 /// The road (m) an S-curve sideways by `offset` metres takes (`AiState::lateral_ramp`): 8 m

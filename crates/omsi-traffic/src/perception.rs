@@ -1476,9 +1476,12 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
     // crossing overlaps mine - my front reaching the cut to my rear leaving it, as I am timed to
     // a crossing (`crossing_time`: inside the junction at max(v, 1 m/s), approaching it at my
     // arrival up to my lane's limit) - within `JM_TIMEGAP_MINOR` and I can still brake for the
-    // stop at my comfortable deceleration (`MSLink::blockedAtTime`'s persons); (2) past the zebra
+    // stop at my comfortable deceleration (`MSLink::blockedAtTime`'s persons; SUMO's brake test
+    // there is `dist > brakeGap(v, getMaxDecel())`, MSLink.cpp:1108, ours the comfortable
+    // brake); (2) past the zebra
     // stop, short of the cut, when I reach the cut (`crossing_time`) later than they step on
-    // (`getLeaderInfo`: "breaking for approaching person"), `JM_STOPLINE_CROSSING_GAP` before it
+    // (`getLeaderInfo`: "breaking for approaching person", which SUMO asks only of ego inside the
+    // junction; ours of a car past its zebra stop too), `JM_STOPLINE_CROSSING_GAP` before it
     let approaching = if zebras.is_empty() { Vec::new() } else { sim.people_near(me.pos, radius + ZEBRA_WAY as f64).into_iter().filter(|&k| sim.people[k].approach.is_some()).collect::<Vec<_>>() };
     for z in zebras.iter().filter(|z| z.along > st.front) {
         let Some(walk) = net.lanes.get(z.walk) else { continue };
@@ -1576,10 +1579,12 @@ fn people_ahead(net: &Network, sim: &Simulation, me: &Vehicle, lanes: &[(usize, 
         // lane's limit; braking, at my braking, `rear_clears`). Where they reach my strip ahead of
         // my front, the two windows within `JM_TIMEGAP_MINOR` of each other
         // (`MSLink::blockedAtTime`'s persons) hold me `PERSON_STOP_SHORT` short of that point
-        // while I can brake for it at my comfortable deceleration; past that point they hold me
+        // while I can brake for it at my comfortable deceleration (SUMO's test there is
+        // `brakeGap(v, getMaxDecel())`, MSLink.cpp:1108; ours the comfortable brake); past that point they hold me
         // only when my rear does not clear their line before they reach my strip (SUMO's
         // "breaking for approaching person" in `MSLink::getLeaderInfo` brakes when the vehicle
-        // arrives after the person; the rear, not the front: the walkers do not yield to a car's
+        // arrives after the person, there only for ego inside the junction; ours past that point
+        // on the approach too; the rear, not the front: the walkers do not yield to a car's
         // flank). Where their line crosses my body, a moving car whose rear clears it before they
         // reach my strip passes first (SUMO's time slots: the vehicle that passes before the foe
         // arrives is the leader); one whose line crosses my body while my rear does not clear
