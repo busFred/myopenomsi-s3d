@@ -1092,6 +1092,13 @@ fn red_foe(ctx: &Context, c: &Claim, o: &Claim) -> bool {
     }
 }
 
+/// The start of the first meeting place of `foes` (along `c`'s way through, the chain's) still
+/// ahead of `c`'s front by more than the half metre of the committed test (`Simulation::tick`'s
+/// `next_ahead`); INFINITY: none.
+fn next_place<'a>(c: &Claim, foes: impl Iterator<Item = &'a crate::junction::Foe>) -> f32 {
+    foes.map(|f| f.mine.0).filter(|&d| d - (c.s + c.front) > 0.5).fold(f32::INFINITY, f32::min)
+}
+
 /// Does the refused claim `ok` (its grant `g`) come to rest short of `before` (a distance along
 /// its own way through, the chain's)? It stops at the last place short of the stretch it waits for
 /// (`Grant::at`) where its body lies on none of its crossing meeting places, from a metre before
@@ -1622,11 +1629,38 @@ fn decide_in(ctx: &Context, js: &Junctions, claims: &[Claim], plain: Option<&[Gr
                 // opposing left-turner standing in the box at the end of its green). Inside both is geometry, the same from
                 // either side, so exactly one of the two goes.
                 let me_inside = c.s + c.front >= foe.mine.0 && c.s - c.rear <= foe.mine.1;
+                // Commitment is per meeting place (SUMO's per link: a vehicle that can no longer
+                // brake before its link is committed to it): of two inside one place, neither can
+                // stop short of it, so the one that can still stop short of its next meeting place
+                // (`next_place`, `plan::cannot_stop` with the claim's brake and the 0.6 m of the
+                // committed test, `Simulation::tick`) waits for the other - there, at that next
+                // place's waiting position, not at this place behind its front (the plan gives a
+                // waiting place behind the front no stop, `plan::STOP_BEHIND_FRONT`, and the car
+                // rolled on into the foe: viz4 case04 j10 #16578/#19779); the other leads.
                 if me_inside && their_inside && !o.absolute && !c.absolute {
                     let they_yield = node.movements[foe.movement].foes.iter().chain(&node.movements[foe.movement].wide).any(|f| f.movement == my_piece && f.yields);
                     let (my_left, their_left) = (foe.mine.1 - (c.s - c.rear), foe.theirs.1 - (o.s - o.rear));
-                    let i_lead = if foe.yields != they_yield { they_yield } else { my_left < their_left || (my_left == their_left && c.vehicle < o.vehicle) };
+                    let oc = &claims[ok];
+                    let their_foes: Vec<crate::junction::Foe> = js.foes_along_wide(oc.junction, &oc.chain).into_iter().filter_map(|(_, f)| js.for_bodies_among(oc.junction, &f, oc.body, ctx.present())).collect();
+                    let my_next = next_place(c, my_foes.iter().map(|(_, f)| f));
+                    let their_next = next_place(oc, their_foes.iter());
+                    let can_wait = |x: &Claim, next: f32| !crate::plan::cannot_stop(x.speed, next - (x.s + x.front) - 0.6, x.brake);
+                    let (i_can, they_can) = (can_wait(c, my_next), can_wait(oc, their_next));
+                    let i_lead = if i_can != they_can {
+                        !i_can
+                    } else if foe.yields != they_yield {
+                        they_yield
+                    } else {
+                        my_left < their_left || (my_left == their_left && c.vehicle < o.vehicle)
+                    };
                     if i_lead {
+                        continue;
+                    }
+                    if i_can && my_next.is_finite() {
+                        if wait_for.map(|w| their_out < w.1).unwrap_or(true) {
+                            wait_for = Some((o.vehicle, their_out));
+                        }
+                        hold_at = hold_at.min(my_next);
                         continue;
                     }
                 }

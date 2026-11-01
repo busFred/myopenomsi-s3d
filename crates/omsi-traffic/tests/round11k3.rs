@@ -275,3 +275,61 @@ fn k3_a_car_behind_a_body_across_its_way_rests_short_of_the_meeting_places() {
     assert!(c.state.speed < 0.3, "the car stands: {:?}", c.state);
     assert!(c.state.s + c.state.front <= band + 0.3, "its front at {:.1} m, piece 1's band from {band:.1} m", c.state.s + c.state.front);
 }
+
+/// Two pieces side by side (A: movements 0 then 1, B: 2 then 3) that block each other over their
+/// first 9-10 m (a `[blockpath]` pair, the K3 rigid-rigid place of viz4 j10 3767 x 3760) and merge
+/// side by side further on (A's 15.5..19, B's 16.5..20; J3's wide pair of two buses).
+fn block_then_side_merge() -> Junctions {
+    use omsi_traffic::junction::{Foe, FoeKind, Junction, Movement};
+    let foe = |movement: usize, kind: FoeKind, mine: (f32, f32), theirs: (f32, f32)| Foe { movement, kind, mine, theirs, yields: false, side: kind == FoeKind::Merge, apart: 0.0, classes: None, shift: 0.0 };
+    let mv = |lane: usize, continues: Vec<usize>, foes: Vec<Foe>| {
+        let (start, end) = foes.iter().fold((f32::INFINITY, 0.0f32), |(s, e), f| (s.min(f.mine.0), e.max(f.mine.1)));
+        Movement { lane, kind: LaneKind::Street, entries: Vec::new(), exits: Vec::new(), continues, light: None, foes, conflict_end: end, conflict_start: start, converge: Vec::new(), converge_with: Vec::new(), wide: Vec::new() }
+    };
+    let movements = vec![
+        mv(0, vec![1], vec![foe(2, FoeKind::Block, (0.0, 9.0), (0.0, 9.9))]),
+        mv(1, Vec::new(), vec![foe(3, FoeKind::Merge, (6.5, 10.0), (6.5, 10.0))]),
+        mv(2, vec![3], vec![foe(0, FoeKind::Block, (0.0, 9.9), (0.0, 9.0))]),
+        mv(3, Vec::new(), vec![foe(1, FoeKind::Merge, (6.5, 10.0), (6.5, 10.0))]),
+    ];
+    let mut js = Junctions::default();
+    js.nodes.push(Junction { key: ((0, 0), 9), movements, crossings: Vec::new(), class_meets: Vec::new() });
+    for m in 0..4 {
+        js.of_lane.insert(m, (0, m));
+    }
+    js
+}
+
+/// Commitment is per meeting place (SUMO's per link): of two buses inside one place, the one that
+/// can still stop short of its next meeting place waits for the other there, never at this place
+/// behind its front, where the plan gives it no stop and it rolls on into the foe (viz4 case04 j10:
+/// #16578 at 5.2 m/s, 1 m from the end of the block, refused there for #19779 slowing inside it,
+/// rolled on and the two touched in the side merge). The one that cannot stop short of its next
+/// leads.
+#[test]
+fn k3_of_two_buses_inside_one_meeting_place_the_one_that_can_stop_short_of_its_next_waits() {
+    let js = block_then_side_merge();
+    let bus = |lane: usize, vehicle: usize, s: f32, speed: f32| {
+        let mut c = standing(&js, lane, vehicle, s, SWEPT_RIGID);
+        c.front = 5.8;
+        c.rear = 5.8;
+        c.speed = speed;
+        c.was_standing = false;
+        c.chain = if lane == 0 { vec![(0, 0.0), (1, 9.0)] } else { vec![(2, 0.0), (3, 10.0)] };
+        c
+    };
+    // A 3.1 m in at 5.2 m/s (its front 8.9, the side merge 6.6 m on: it can stop short of it);
+    // B 4.2 m in at 8 m/s (its front 10.0, the side merge 6.5 m on: it cannot)
+    let (a, b) = (bus(0, 1, 3.1, 5.2), bus(2, 2, 4.2, 8.0));
+    let g = resolve(&js, &[a.clone(), b.clone()]);
+    let (ga, gb) = (g.iter().find(|g| g.vehicle == 1).unwrap(), g.iter().find(|g| g.vehicle == 2).unwrap());
+    assert!(gb.go, "B, which cannot stop short of the side merge, waits: {gb:?}");
+    assert!(!ga.go && ga.wait_for == Some(2), "A, which can, does not wait: {ga:?}");
+    assert!(ga.at.is_some_and(|at| at >= 9.0 + 6.5 - 0.01), "A waits at the block it is in, behind its front: {ga:?}");
+    // (both able to stop short of their next: the table, then the one further along, as before -
+    // and the waiter still waits at its next place)
+    let slow_b = Claim { speed: 2.0, ..b };
+    let g = resolve(&js, &[a, slow_b]);
+    let w = g.iter().find(|g| !g.go).expect("one waits");
+    assert!(w.at.is_some_and(|at| at >= 9.0 + 6.5 - 0.01 || at >= 10.0 + 6.5 - 0.01), "{g:?}");
+}
