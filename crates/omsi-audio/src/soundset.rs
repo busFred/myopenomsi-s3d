@@ -40,11 +40,20 @@ struct RuntimeSound {
     /// [ROLLBACK doorlatch-52] A triggered entry's gain at the moment its trigger fired: it is
     /// held for the whole playback (see `update_fired`).
     latched: Option<f32>,
+    /// Where the variables this entry reads by name (its conditions', its volume curves', its
+    /// pitch variable) stand in the caller's table (`SoundSet::bind`): each name by its address
+    /// and length in `def`, which is never changed, and its slot.
+    slots: Vec<(usize, usize, Option<usize>)>,
 }
 
 impl RuntimeSound {
     fn new(def: SoundEntry, clip: Option<Arc<Clip>>) -> RuntimeSound {
-        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0, latched: None }
+        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0, latched: None, slots: Vec::new() }
+    }
+
+    /// The names this entry reads variables by.
+    fn var_names(&self) -> impl Iterator<Item = &str> {
+        self.def.conditions.iter().map(|c| c.variable.as_str()).chain(self.def.vol_curves.iter().map(|vc| vc.variable.as_str())).chain(std::iter::once(self.def.pitch_variable.as_str()))
     }
 }
 
@@ -80,6 +89,9 @@ pub struct SoundSet {
     /// pusher like the MB C2 G that is where the engine is - and plays it on the triggers
     /// and variables of the scripts it shares with the front (see [`SoundSet::update_parts`]).
     pub parts: Vec<(usize, SoundSet)>,
+    /// The generation of the caller's variable table the entries' slots were taken at
+    /// (`SoundSet::bind`), `None` before.
+    bound: Option<usize>,
 }
 
 /// The file a `(T.F.)` trigger names, as Omsi.exe opens it (0x74f2e8 through 0x7eed78): the
@@ -216,6 +228,62 @@ impl SoundSet {
             mix_state: None,
             parts: Vec::new(),
             other_section: false,
+            bound: None,
+        }
+    }
+
+    /// Find where every variable the entries (and the coupled parts' entries) read by name stands
+    /// in the caller's table: `slot_of(name)` - the slot whose value is what the caller's
+    /// `var(name)` reads - taken again only when the table's `generation` changes (a table that
+    /// only grows: its length). `update_fired_bound` then reads the values by slot instead of by
+    /// name (a name looked up is lower-cased and hashed, for every entry every frame).
+    pub fn bind(&mut self, generation: usize, slot_of: &dyn Fn(&str) -> Option<usize>) {
+        if self.bound != Some(generation) {
+            for s in &mut self.sounds {
+                s.slots = s.var_names().map(|n| (n.as_ptr() as usize, n.len(), slot_of(n))).collect();
+            }
+            self.bound = Some(generation);
+        }
+        for (_, p) in &mut self.parts {
+            p.bind(generation, slot_of);
+        }
+    }
+
+    /// `update_fired` reading the variables by the slots `bind` found at `generation` of the
+    /// caller's table, from `values`: the same values `var` reads by name. Unbound (or bound at
+    /// another generation), by name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_fired_bound(
+        &mut self,
+        engine: &AudioEngine,
+        generation: usize,
+        values: &[f32],
+        var: &dyn Fn(&str) -> Option<f32>,
+        object_to_world: &Mat4,
+        triggers: &[String],
+        at_fire: &dyn Fn(&str, &str) -> Option<f32>,
+    ) {
+        let by_slot = (self.bound == Some(generation)).then_some(values);
+        self.update_entries(engine, var, by_slot, object_to_world, triggers, at_fire);
+    }
+
+    /// `update_parts_fired` reading the variables as `update_fired_bound` does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_parts_fired_bound(
+        &mut self,
+        engine: &AudioEngine,
+        generation: usize,
+        values: &[f32],
+        var: &dyn Fn(&str) -> Option<f32>,
+        part_to_world: &dyn Fn(usize) -> Option<Mat4>,
+        triggers: &[String],
+        at_fire: &dyn Fn(&str, &str) -> Option<f32>,
+    ) {
+        for (i, p) in &mut self.parts {
+            match part_to_world(*i) {
+                Some(xf) => p.update_fired_bound(engine, generation, values, var, &xf, triggers, at_fire),
+                None => p.stop_all(engine),
+            }
         }
     }
 
@@ -490,11 +558,45 @@ impl SoundSet {
         triggers: &[String],
         at_fire: &dyn Fn(&str, &str) -> Option<f32>,
     ) {
+        self.update_entries(engine, var, None, object_to_world, triggers, at_fire);
+    }
+
+    /// `update_fired`, with `by_slot` the values of the slots `bind` found (`update_fired_bound`):
+    /// an entry's own names are read from them, anything else by `var`.
+    fn update_entries(
+        &mut self,
+        engine: &AudioEngine,
+        var: &dyn Fn(&str) -> Option<f32>,
+        by_slot: Option<&[f32]>,
+        object_to_world: &Mat4,
+        triggers: &[String],
+        at_fire: &dyn Fn(&str, &str) -> Option<f32>,
+    ) {
         if !engine.enabled {
             return;
         }
         let ctx = self.ctx(engine);
+        // (which of the voices are playing, taken once for all the entries: no entry's update
+        // starts or stops another entry's voice)
+        let playing = engine.playing_now();
         for s in self.sounds.iter_mut() {
+            // (the entry's own names by their slots: the name's address in `def` and its length
+            // pick the slot `bind` found for it)
+            let slots = std::mem::take(&mut s.slots);
+            let entry_var = |n: &str| match by_slot.and_then(|vals| slots.iter().find(|e| e.0 == n.as_ptr() as usize && e.1 == n.len()).map(|e| e.2.map(|i| vals[i]))) {
+                Some(v) => v,
+                None => var(n),
+            };
+            let var: &dyn Fn(&str) -> Option<f32> = &entry_var;
+            Self::update_entry(engine, &ctx, &playing, s, var, object_to_world, triggers, at_fire);
+            s.slots = slots;
+        }
+    }
+
+    /// One entry of `update_entries`.
+    #[allow(clippy::too_many_arguments)]
+    fn update_entry(engine: &AudioEngine, ctx: &Ctx, playing: &crate::mixer::PlayingVoices, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4, triggers: &[String], at_fire: &dyn Fn(&str, &str) -> Option<f32>) {
+        {
             // How the exe plays an entry (`TSound` update, 2.2.032):
             // * with a `[trigger]`: once each time the trigger fires, from the start, never
             //   looped (a `[loopsound]` too) and without looking at its conditions;
@@ -512,29 +614,31 @@ impl SoundSet {
                     s.active_since = Some(std::time::Instant::now());
                 }
             }
-            let Some(clip) = s.clip.clone() else { continue };
+            let Some(clip) = s.clip.clone() else { return };
             let fired_by = if triggered {
                 triggers.iter().find(|t| s.def.triggers.iter().any(|d| d.trim().eq_ignore_ascii_case(t)))
             } else {
                 None
             };
             let fired = fired_by.is_some();
+            // (with the conditions as just tested: an untriggered entry is evaluated on `var`, as
+            // they were, and a triggered one takes none)
             let e = match fired_by {
-                Some(t) => ctx.eval(s, &|n| at_fire(t, n).or_else(|| var(n)), object_to_world),
-                None => ctx.eval(s, var, object_to_world),
+                Some(t) => ctx.eval_holding(s, &|n| at_fire(t, n).or_else(|| var(n)), object_to_world, holds),
+                None => ctx.eval_holding(s, var, object_to_world, holds),
             };
             if e.wrong_view {
                 // "Stopped Sound ... globalstop/wrongview"
                 if let Some(id) = s.voice.take() {
                     engine.stop(id);
                 }
-                continue;
+                return;
             }
             if !triggered && !s.def.no_loop {
                 let params = ctx.params(s, &e, true, object_to_world);
                 match (s.voice, e.audible) {
                     (Some(id), true) => {
-                        if engine.is_playing(id) {
+                        if playing.contains(id) {
                             engine.set_params(id, params);
                         } else {
                             s.voice = Some(engine.play_from_random_place(clip, params));
@@ -548,16 +652,16 @@ impl SoundSet {
                     (None, true) => s.voice = Some(engine.play_from_random_place(clip, params)),
                     (None, false) => {}
                 }
-                continue;
+                return;
             }
             // one-shot: started by its trigger or by its conditions starting to hold; the
             // volume follows the curves while it plays
             let params = ctx.params(s, &e, false, object_to_world);
             if (fired || rising) && e.audible {
                 if let Some(id) = s.voice {
-                    if s.def.only_one && engine.is_playing(id) {
+                    if s.def.only_one && playing.contains(id) {
                         engine.set_params(id, params);
-                        continue;
+                        return;
                     }
                     engine.stop(id);
                 }
@@ -567,7 +671,7 @@ impl SoundSet {
                 // after a door's hit), which silenced the sound within a frame of its start
                 s.latched = (fired && triggered && LATCH_TRIGGERED).then_some(params.gain);
             } else if let Some(id) = s.voice {
-                if engine.is_playing(id) {
+                if playing.contains(id) {
                     let mut params = params;
                     if let Some(g) = s.latched {
                         params.gain = g;
@@ -759,6 +863,13 @@ impl Ctx {
     /// One entry this frame (`TSound` update 0x750340): its volume and pitch as DirectSound
     /// takes them, and whether it can be started.
     fn eval(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4) -> Eval {
+        let holds = !s.def.triggers.is_empty() || SoundSet::conditions_hold(&s.def, var);
+        self.eval_holding(s, var, object_to_world, holds)
+    }
+
+    /// `eval` with the entry's `holds` given: triggered, or its conditions holding on `var` (the
+    /// caller has just tested them on the same variables).
+    fn eval_holding(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4, holds: bool) -> Eval {
         // [ROLLBACK introvol-122] An entry that is not playing starts on a buffer of its own, at 0 dB
         // (as `play_file_trigger` has it): the volume a request over 0 dB is refused at is no
         // stale one from a moment before - the engine still starting, the camera changed - and
@@ -795,7 +906,7 @@ impl Ctx {
             (None, _) => 0.0,
         };
         // (an untriggered entry whose conditions fail is at volume 0)
-        let mut vol = if triggered || SoundSet::conditions_hold(def, var) { def.volume * self.master } else { 0.0 };
+        let mut vol = if holds { def.volume * self.master } else { 0.0 };
         for vc in &def.vol_curves {
             if let Some(x) = SoundSet::curve_input(vc, var, active, facing) {
                 vol *= curve(&vc.points, x);
@@ -1074,7 +1185,7 @@ mod tests {
         assert_eq!(eval(&ctx(2, true), hit.clone(), &now).gain, 0.0, "read at the frame's end: silent");
         let fired = |n: &str| at_fire("ev_doorhitclose_0", n).or_else(|| now(n));
         assert_eq!(eval(&ctx(2, true), hit.clone(), &fired).gain, 1.0);
-        let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, ambient: false, mix: None, mix_state: None, parts: Vec::new(), other_section: false };
+        let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, ambient: false, mix: None, mix_state: None, parts: Vec::new(), other_section: false, bound: None };
         assert_eq!(set.curve_triggers(), vec!["ev_doorhitclose_0".to_string()]);
     }
 

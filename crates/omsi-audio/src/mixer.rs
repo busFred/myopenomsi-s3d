@@ -25,6 +25,16 @@ impl Clip {
 
 pub type VoiceId = u64;
 
+/// The voices playing at one moment (`AudioEngine::playing_now`).
+pub struct PlayingVoices(Vec<VoiceId>);
+
+impl PlayingVoices {
+    /// Whether voice `id` was playing (`AudioEngine::is_playing` at that moment).
+    pub fn contains(&self, id: VoiceId) -> bool {
+        self.0.binary_search(&id).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VoiceParams {
     pub gain: f32,
@@ -779,6 +789,16 @@ impl AudioEngine {
             .lock()
             .iter()
             .any(|v| v.id == id && !v.finished)
+    }
+
+    /// The voices playing now (`is_playing` of every voice), taken under one lock in one pass: for
+    /// a caller asking about many voices in a row (a sound set's entries every frame), where
+    /// `is_playing` takes the lock the mixer holds while it mixes and walks every voice once per
+    /// voice asked about.
+    pub fn playing_now(&self) -> PlayingVoices {
+        let mut ids: Vec<VoiceId> = self.shared.voices.lock().iter().filter(|v| !v.finished).map(|v| v.id).collect();
+        ids.sort_unstable();
+        PlayingVoices(ids)
     }
 
     pub fn stop(&self, id: VoiceId) {

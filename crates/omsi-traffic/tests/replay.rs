@@ -86,7 +86,7 @@ fn record(mut net: Network, lights: Vec<TrafficLightController>, mut cars: Vec<V
             .map(|p| PersonRecord { state: Cow::Borrowed("WalkStreet"), decision: Some(Cow::Borrowed("go")), ..PersonRecord::from_person(p) })
             .collect();
         let steer: Vec<(u64, Steer)> = cars.iter().filter(|c| c.id == 1).map(|c| (c.id, Steer::of(&c.state))).collect();
-        rec.frame(&sim, DT, &cars, &people, &steer, &|i| format!("car {}", cars[i].id));
+        rec.frame(&sim, DT, &cars, people, &steer, &|i| format!("car {}", cars[i].id));
         sim.tick(&net, DT, &mut cars);
         for &i in &sim.removed {
             cars.swap_remove(i);
@@ -256,8 +256,9 @@ fn the_recorder_costs_little_per_frame() {
     let frames = 600;
     let (mut spent, mut worst) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for _ in 0..frames {
+        let frame_people = people.clone();
         let t0 = std::time::Instant::now();
-        rec.frame(&sim, DT, &cars, &people, &[], &|_| "car".into());
+        rec.frame(&sim, DT, &cars, frame_people, &[], &|_| "car".into());
         spent += t0.elapsed();
         worst = worst.max(t0.elapsed());
         // (everybody moves: the file's size is that of a real frame's)

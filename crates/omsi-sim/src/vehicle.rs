@@ -1485,12 +1485,8 @@ impl VehicleInstance {
     /// Omsi.exe takes a number as that index (the scenery objects' `[texttexture]` do the same,
     /// see `resolve_scenery_freetex_name`); taken for a variable's name it matches nothing and
     /// the plate stays empty. See `Program::text_texture_var`.
-    pub fn text_texture_string(&self, field: &str) -> String {
-        self.ty
-            .program
-            .text_texture_var(field)
-            .map(|i| self.state.str_vars[i as usize].clone())
-            .unwrap_or_default()
+    pub fn text_texture_str(&self, field: &str) -> &str {
+        self.ty.program.text_texture_var(field).map_or("", |i| self.state.str_vars[i as usize].as_str())
     }
 
     /// Re-render changed text textures; returns the indices with a pending image.
@@ -1500,13 +1496,15 @@ impl VehicleInstance {
         if let Some(id) = self.ty.program.var("Refresh_Strings") {
             self.state.vars[id as usize] = 0.0;
         }
-        for i in 0..self.text_textures.len() {
-            let field = self.text_textures[i].def.variable.clone();
-            let text = self.text_texture_string(&field);
-            if self.text_textures[i].update(&text) {
+        // (each string read where it stands, `text_texture_str`, not copied out: drawn again only
+        // when it changed, `TextTexture::update`)
+        let mut tts = std::mem::take(&mut self.text_textures);
+        for (i, t) in tts.iter_mut().enumerate() {
+            if t.update(self.text_texture_str(&t.def.variable)) {
                 changed.push(i);
             }
         }
+        self.text_textures = tts;
         changed
     }
 
@@ -2096,6 +2094,12 @@ impl VehicleInstance {
     pub fn var(&self, name: &str) -> Option<f32> {
         omsi_script::compile::with_lower(name, |k| self.var_index.get(k).copied())
             .map(|i| self.state.vars[i as usize])
+    }
+
+    /// How many variables the vehicle has by name: the table only grows (`set_engine_var`), so a
+    /// slot `var_slot` gave stays the one `var` reads while this is unchanged.
+    pub fn var_count(&self) -> usize {
+        self.var_index.len()
     }
 
     /// Whether variable `name` was declared in the vehicle's script set (as opposed to built-in host variables).
@@ -3951,8 +3955,7 @@ impl TrailerPart {
     pub fn update_text_textures(&mut self, main: &VehicleInstance) -> Vec<usize> {
         let mut changed = Vec::new();
         for (i, t) in self.text_textures.iter_mut().enumerate() {
-            let text = main.text_texture_string(&t.def.variable);
-            if t.update(&text) {
+            if t.update(main.text_texture_str(&t.def.variable)) {
                 changed.push(i);
             }
         }
@@ -3990,6 +3993,20 @@ impl TrailerPart {
             return self.body_rotation() * onto_plane([lift, 0.0, 0.0]) * xf;
         }
         self.body_rotation() * xf
+    }
+
+    /// `mesh_local_transform` of every mesh `i` of the part, its body's rotation made once (a
+    /// sync of all its meshes made it once a mesh).
+    pub fn mesh_local_transformer(&self) -> impl Fn(usize) -> Mat4 + '_ {
+        let rot = self.body_rotation();
+        move |i| {
+            let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
+            if is_shadow_mesh(&self.ty, i) {
+                let lift = if self.ty.def.is_rail() { 0.0 } else { -self.ground_lift };
+                return rot * onto_plane([lift, 0.0, 0.0]) * xf;
+            }
+            rot * xf
+        }
     }
 
     /// Where this part hangs on the one in front: the coupling point in the frame of the
@@ -4367,6 +4384,21 @@ impl VehicleInstance {
             return self.body_rotation() * onto_plane(self.contact_plane()) * xf;
         }
         self.body_rotation() * xf
+    }
+
+    /// `mesh_local_transform` of every mesh `i` of the vehicle, its body's rotation made once
+    /// and the plane its wheels stand on (`contact_plane`, the ground asked under every wheel)
+    /// once for all its shadow meshes: a sync of all its meshes made both once a mesh.
+    pub fn mesh_local_transformer(&self) -> impl Fn(usize) -> Mat4 + '_ {
+        let rot = self.body_rotation();
+        let plane = std::cell::OnceCell::new();
+        move |i| {
+            let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
+            if is_shadow_mesh(&self.ty, i) {
+                return rot * onto_plane(*plane.get_or_init(|| self.contact_plane())) * xf;
+            }
+            rot * xf
+        }
     }
 
     /// The plane the wheels stand on, in the body frame: z = p[0] + p[1]·x + p[2]·y (m).

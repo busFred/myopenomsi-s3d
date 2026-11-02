@@ -4421,6 +4421,8 @@ impl Traffic {
         let t_rec = std::time::Instant::now();
         let cars = &self.cars;
         self.recorder.note_people_gone(&std::mem::take(&mut self.people_gone));
+        // (handed to the recording: the people's records are made anew every frame)
+        let people_records = std::mem::take(&mut self.people_records);
         let type_of = |i: usize| cars.get(i).map(|c| c.vehicle.ty.def.path.file_name().unwrap_or_default().to_string_lossy().into_owned()).unwrap_or_default();
         // (the bus driving the player's, `stand_in`, is recorded once, as the player - the
         // player's box the frame carries: a replay knows no stand-in and would have two bodies
@@ -4430,9 +4432,9 @@ impl Traffic {
                 let kept: Vec<usize> = (0..drivers.len()).filter(|&i| i != si).collect();
                 let recorded: Vec<AiVehicle> = kept.iter().map(|&i| drivers[i].clone()).collect();
                 let steer: Vec<_> = steer.iter().filter(|(id, _)| Some(*id) != self.stand_in).cloned().collect();
-                self.recorder.frame(&self.sim, dt, &recorded, &self.people_records, &steer, &|k| type_of(kept[k]));
+                self.recorder.frame(&self.sim, dt, &recorded, people_records, &steer, &|k| type_of(kept[k]));
             }
-            None => self.recorder.frame(&self.sim, dt, &drivers, &self.people_records, &steer, &type_of),
+            None => self.recorder.frame(&self.sim, dt, &drivers, people_records, &steer, &type_of),
         }
         let t_sim = std::time::Instant::now();
         self.sim.tick(&self.net, dt, &mut drivers);
@@ -5032,9 +5034,15 @@ impl Traffic {
                     let vals = &fired_vars.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(t))?.1;
                     v.var_slot(n).and_then(|i| vals.get(i).copied())
                 };
-                ss.update_fired(audio, &|n| v.var(n), &xf, &fired, &at_fire);
-                ss.update_parts_fired(
+                // (the entries' variables read by slot: `var_slot` gives the slot `var` reads, and
+                // the slots stand while the vehicle's table keeps its length, `var_count`)
+                let generation = v.var_count();
+                ss.bind(generation, &|n| v.var_slot(n));
+                ss.update_fired_bound(audio, generation, &v.state.vars, &|n| v.var(n), &xf, &fired, &at_fire);
+                ss.update_parts_fired_bound(
                     audio,
+                    generation,
+                    &v.state.vars,
                     &|n| v.var(n),
                     &|i| v.trailers.get(i).map(|t| t.world_transform()),
                     &fired,
@@ -5652,6 +5660,9 @@ impl Traffic {
                 c.vehicle.set_var("Envir_Brightness", b);
             }
         }
+        // (each mesh's slot alphas as the vehicle asks for them, opaque slots held at 1: made in
+        // this one buffer, not a new list for every mesh of every vehicle)
+        let mut alpha: Vec<f32> = Vec::new();
         for c in &mut self.cars {
             // out of sight (`tick` decided): hidden once, then left alone until it comes
             // into view again - its many per-mesh updates were a third of this stage
@@ -5711,12 +5722,13 @@ impl Traffic {
                     );
                 }
             }
+            let mesh_xf = c.vehicle.mesh_local_transformer();
             for (i, inst) in c.render.instances.iter().enumerate() {
                 renderer.set_transform(
                     scene,
                     *inst,
                     c.vehicle.position,
-                    c.vehicle.mesh_local_transform(i),
+                    mesh_xf(i),
                 );
                 let p = &c.vehicle.mesh_props[i];
                 let def = &c.vehicle.ty.model.meshes[c.vehicle.ty.meshes[i].def_index];
@@ -5728,7 +5740,8 @@ impl Traffic {
                 // translucent and reveals the interior through its panels.  Opaque slots
                 // are never allowed to be faded by a dynamic alpha value; windows and
                 // explicitly alpha-tested/blended slots retain their authored behavior.
-                let mut alpha = p.slot_alpha.clone();
+                alpha.clear();
+                alpha.extend_from_slice(&p.slot_alpha);
                 for (slot, mat) in scene.instances[*inst].materials.iter().enumerate() {
                     if scene
                         .materials
@@ -5746,13 +5759,15 @@ impl Traffic {
                 renderer.set_interior(scene, *inst, p.interior);
             }
             for (t, r) in c.vehicle.trailers.iter().zip(&c.trailer_renders) {
+                let mesh_xf = t.mesh_local_transformer();
                 for (i, inst) in r.instances.iter().enumerate() {
-                    renderer.set_transform(scene, *inst, t.position, t.mesh_local_transform(i));
+                    renderer.set_transform(scene, *inst, t.position, mesh_xf(i));
                     let p = &t.mesh_props[i];
                     let def = &t.ty.model.meshes[t.ty.meshes[i].def_index];
                     let vp = def.viewpoint;
                     let vp_ok = vp == 0 || vp & 4 != 0;
-                    let mut alpha = p.slot_alpha.clone();
+                    alpha.clear();
+                alpha.extend_from_slice(&p.slot_alpha);
                     for (slot, mat) in scene.instances[*inst].materials.iter().enumerate() {
                         if scene
                             .materials
